@@ -64,6 +64,7 @@ import {
 } from "../src/lib/beads/config.mjs";
 import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
+import { parseDepCycles } from "../src/lib/beads/cycles.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import {
   buildDrift,
@@ -1439,12 +1440,25 @@ function bdList(repo, extra) {
   return exec("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], budgetMs("network"));
 }
 
-/** bd's listing as an array, or null when this build's output can't be parsed. */
+/** The authoritative cycle query, through the same project-scoped runner as the board listing. */
+function bdDepCycles(repo) {
+  const exec = scopedBdRunner(repo, readDoltMetadata(repo));
+  return exec("bd", ["-C", repo, "dep", "cycles", "--json"], budgetMs("network"));
+}
+
+/**
+ * bd's listing as an array, or null when this build's output can't be parsed. bd --json returns
+ * either a top-level array or a `{ <key>: [...] }` envelope — mirrors src/lib/beads/bd-json.ts's
+ * `asArray`, which this CLI bundle can't import (that file is TS; this is a plain-Node launcher).
+ */
 function parseBoard(stdout) {
   try {
     const parsed = JSON.parse(stdout || "[]");
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed?.issues)) return parsed.issues;
+    if (Array.isArray(parsed?.results)) return parsed.results;
     // bd omits the key entirely on an empty board rather than emitting [].
-    return Array.isArray(parsed) ? parsed : [];
+    return [];
   } catch {
     return null;
   }
@@ -1474,21 +1488,58 @@ function readBoard(repo) {
           : all.error.message,
     };
   }
+
+  let work;
   if (all.status === 0) {
-    const board = parseBoard(all.stdout);
-    return board ? { board } : { error: "bd returned output this build can't parse." };
+    work = parseBoard(all.stdout);
+    if (!work) return { error: "bd returned output this build can't parse." };
+  } else {
+    const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
+    const failed = [open, closed].some((r) => r.error || r.status !== 0);
+    // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
+    // the useful message is why `--status all` was refused, not why the second guess was.
+    if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+
+    const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+    if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
+    const byId = new Map();
+    for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+    work = [...byId.values()];
   }
 
-  const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
-  const failed = [open, closed].some((r) => r.error || r.status !== 0);
-  // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
-  // the useful message is why `--status all` was refused, not why the second guess was.
-  if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+  // bd omits pipeline gates from ordinary listings while retaining blocks edges that point to them.
+  // The structural rule needs the target record to distinguish a real gate from a dangling blocker.
+  const known = new Set(work.map((bead) => bead.id));
+  const needsGates = work.some((bead) =>
+    (bead.dependencies ?? []).some((dep) => dep?.type === "blocks" && !known.has(dep.depends_on_id)),
+  );
+  if (!needsGates) return { board: work };
 
-  const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
-  if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
-  const byId = new Map();
-  for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  const gates = bdList(repo, ["--status", "all", "--type", "gate"]);
+  let parsedGates;
+  if (gates.error) {
+    return { error: gates.error.message };
+  } else if (gates.status === 0) {
+    parsedGates = parseBoard(gates.stdout);
+  } else {
+    // Gates are omitted from the regular list, so they need the same status compatibility fallback.
+    // Otherwise `/shape` supports the work listing but hard-fails when its graph has a gate edge.
+    const [open, closed] = [
+      bdList(repo, ["--type", "gate"]),
+      bdList(repo, ["--status", "closed", "--type", "gate"]),
+    ];
+    if ([open, closed].some((result) => result.error || result.status !== 0)) {
+      return { error: (gates.stderr ?? "").trim() || `bd list --type gate exited ${gates.status}` };
+    }
+    const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+    if (listings.some((listing) => listing === null)) return { error: "bd returned output this build can't parse." };
+    const byId = new Map();
+    for (const gate of listings.flat()) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+    parsedGates = [...byId.values()];
+  }
+  if (!parsedGates) return { error: "bd returned output this build can't parse." };
+  const byId = new Map(work.map((bead) => [bead.id, bead]));
+  for (const gate of parsedGates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
   return { board: [...byId.values()] };
 }
 
@@ -1524,8 +1575,21 @@ function cmdBoardCheck(args) {
       console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${error}`));
       return 1;
     }
+    const cycleResult = bdDepCycles(repo);
+    if (cycleResult.error || cycleResult.status !== 0) {
+      const detail = cycleResult.error?.code === "ENOENT"
+        ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+        : cycleResult.error?.message || (cycleResult.stderr ?? "").trim() || `bd dep cycles exited ${cycleResult.status}`;
+      console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
+      return 1;
+    }
+    const cycles = parseDepCycles(cycleResult.stdout);
+    if (cycles === null) {
+      console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
+      return 1;
+    }
 
-    const report = buildStructureReport(board);
+    const report = buildStructureReport(board, { cycles });
     blocking += report.blocking;
     console.log(formatStructureReport(report, repos.length > 1 ? repo : ""));
     console.log("");

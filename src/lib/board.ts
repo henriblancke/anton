@@ -360,7 +360,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     recordedPlan,
     picker,
   ] = await Promise.all([
-    readAllIssues(project.repoPath, opts),
+    readAllIssues(project.repoPath, { ...opts, withCycles: true }),
     readHygiene(project),
     readScanHealth(project),
     readDeferrals(project),

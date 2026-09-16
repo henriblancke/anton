@@ -145,7 +145,7 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       // from — a transient bd failure would put an ask in front of a founder against work whose gate
       // has actually cleared. Failing the read instead is an ordinary pass retry, and it holds the
       // filing path to the same bar the apply path already reads at (gardener/armed.ts).
-      const board = await loadAllIssues(repo, { strictGates: true });
+      const board = await loadAllIssues(repo, { strictGates: true, withCycles: true });
       await ctx.heartbeat();
 
       // One filer for both tiers: one board, one fence, own emission each — so the judgment pass is

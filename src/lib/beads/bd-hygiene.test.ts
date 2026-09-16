@@ -391,6 +391,11 @@ describe("parseDepCycles", () => {
       { ids: [], raw: { weird: 1 } },
     ]);
   });
+
+  it("throws on malformed or non-array output rather than treating it as cycle-free", () => {
+    expect(() => parseDepCycles("not json")).toThrow(/refusing to report unreadable cycle evidence/);
+    expect(() => parseDepCycles(JSON.stringify({ cycles: [] }))).toThrow(/could not read its --json output/);
+  });
 });
 
 describe("parseDuplicateGroups", () => {

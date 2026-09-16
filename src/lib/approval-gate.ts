@@ -23,6 +23,7 @@
  * besides, which a merged list cannot express.
  */
 import { beads } from "./beads/bd";
+import { cycleEvidenceFor } from "./beads/cycle-evidence";
 import { contractGaps, formatContractGaps } from "./beads/contract";
 import { formatStructureViolations, structureGaps } from "./beads/structure";
 import type { Bead } from "./beads/types";
@@ -61,6 +62,7 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
   const tickets = ticketIndex(board, cards);
   const graph = computeEpicGraph(board);
   const unitNodes = new Map(graph.epics.map((node) => [node.id, node]));
+  const cycles = cycleEvidenceFor(board);
 
   return {
     gapsFor: (target) => [
@@ -74,9 +76,13 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
       ...contractGaps(contractGatedBeads(target, tickets.get(target.id) ?? []), "blocking").map(
         (gap): ApprovalGap => ({ rule: "contract", message: formatContractGaps([gap]) }),
       ),
+      // A snapshot without bd's cycle result cannot support a startable verdict: a cycle elsewhere in
+      // this target's run is invisible to the ordinary bead listing. Read-side displays may degrade,
+      // but every projection that calls this gate must say it cannot establish approval.
+      ...(cycles === undefined ? [missingCycleEvidenceGap()] : []),
       // The tier taxonomy, scoped to this target's subtree exactly as the route scopes it: a stray
       // chore three branches away is not this target's fault and must not withdraw its approval.
-      ...structureGaps(target.id, board).blocking.map(
+      ...structureGaps(target.id, board, { cycles }).blocking.map(
         (violation): ApprovalGap => ({
           rule: "structure",
           message: formatStructureViolations([violation]),
@@ -84,6 +90,14 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
       ),
       ...blockedGap(target, board, unitNodes),
     ],
+  };
+}
+
+function missingCycleEvidenceGap(): ApprovalGap {
+  return {
+    rule: "structure",
+    message:
+      "board → authoritative `bd dep cycles` evidence is unavailable — cannot confirm this run is cycle-free, so it cannot be approved or started",
   };
 }
 

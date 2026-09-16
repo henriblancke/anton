@@ -70,7 +70,7 @@ export default async function ProjectSettingsPage({
     // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
     // no work look identical downstream, and the work policy panel must not let an operator arm a
     // fallback policy fitted to a read failure.
-    allIssues(project.repoPath, { blockOnPendingWrite: false }).then(
+    allIssues(project.repoPath, { blockOnPendingWrite: false, withCycles: true }).then(
       (issues) => ({ issues, ok: true }),
       () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
     ),

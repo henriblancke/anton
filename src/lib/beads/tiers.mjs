@@ -70,6 +70,30 @@ const isFeature = (bead) => bead.issue_type === "feature";
 export const isContainer = (bead, board) =>
   isEpic(bead) && board.some((c) => c.issue_type === "feature" && parentOf(c) === bead.id);
 
+/**
+ * The card (a `feature`, or a non-container `epic` in the pre-tier fallback) whose run actually
+ * dispatches `bead` as one of its tickets — the same ancestor `ticket-view.boardCards.cardOf`
+ * resolves, reimplemented here rather than imported because `tiers.mjs` ships standalone in the
+ * release bundle (see file banner) and can't pull in the TS view layer.
+ *
+ * Undefined means no run dispatches this bead's PARENT alongside it: either a container epic sits
+ * on the chain (the existing `ticket-under-container-epic` fault), or the walk runs off a parentless
+ * bead first — the shape of a task/bug's own child, since `selectRunTickets` executes a parentless
+ * task/bug as a run of one (`[target]`) and never groups its children the way a feature does.
+ */
+function dispatchOwnerOf(bead, byId, board) {
+  const seen = new Set([bead.id]);
+  let parentId = parentOf(bead);
+  while (parentId && !seen.has(parentId)) {
+    const parent = byId.get(parentId);
+    if (!parent) return undefined;
+    if (isFeature(parent) || (isEpic(parent) && !isContainer(parent, board))) return parent.id;
+    seen.add(parentId);
+    parentId = parentOf(parent);
+  }
+  return undefined;
+}
+
 /** A bead is judged only while it is live work: closed is history, abandoned is a won't-do. */
 function isJudged(bead) {
   return (
@@ -87,9 +111,10 @@ function isJudged(bead) {
  * epic whose only feature child is closed is still a container, so its loose tickets are still dead.
  * Only the *offender* has to be live ({@link isJudged}); its context does not.
  */
-export function validateBoardStructure(board) {
+export function validateBoardStructure(board, { cycles } = {}) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
+  const { memberships: cycleMemberships, unreadable: unreadableCycles } = cycleMembers(byId, cycles);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -98,6 +123,89 @@ export function validateBoardStructure(board) {
     if (!isJudged(bead)) continue;
     const parentId = parentOf(bead);
     const parent = parentId ? byId.get(parentId) : undefined;
+
+    // The `blocks` edges THIS bead owns (bd inlines only the issue_id === bead.id side — see
+    // beads.edgesOf). Every one of these is checked against the same three mechanical faults a
+    // human would catch by eye: waiting on itself, waiting on nothing that exists, and waiting on
+    // a bead the parent-child edge already orders. `byId` here is the WHOLE board, unfiltered —
+    // a target that resolves to a `gate` or any other pipeline bead is still FOUND, so it is never
+    // "dangling"; only an id this board carries nowhere at all is.
+    for (const dep of bead.dependencies ?? []) {
+      if (dep?.type !== "blocks" || !dep.issue_id || !dep.depends_on_id) continue;
+      const blockerId = dep.depends_on_id;
+
+      if (blockerId === bead.id) {
+        fault(
+          bead.id,
+          "blocks-edge-self",
+          "blocking",
+          `blocks-depends on itself — a bead can never wait on its own close, so this edge can ` +
+            `never resolve and the run stalls on it forever. Drop it ` +
+            `(\`bd dep remove ${bead.id} ${bead.id}\`).`,
+        );
+        continue;
+      }
+
+      const blocker = byId.get(blockerId);
+      if (!blocker) {
+        fault(
+          bead.id,
+          "blocks-edge-dangling",
+          "blocking",
+          `blocks-depends on ${blockerId}, which is not on this board — bd can never resolve a ` +
+            `blocker that does not exist, so this edge holds the run back forever. Remove the ` +
+            `stale edge (\`bd dep remove ${bead.id} ${blockerId}\`), then add the real one if a ` +
+            `live prerequisite exists (\`bd dep add ${bead.id} <blocker-id>\`).`,
+        );
+        continue;
+      }
+
+      const partnerOfParent = parentOf(bead) === blockerId ? "parent" : parentOf(blocker) === bead.id ? "child" : null;
+      // Ticket nesting assigns ownership, not dispatch order: a feature run dispatches both a task and
+      // its subtask, so their explicit `blocks` edge is the only order the executor can observe. Type
+      // alone can't tell that apart from a parentless task/bug (a run of ONE — `selectRunTickets`
+      // executes `[target]`, never the task's own children): typing both endpoints as tickets is true
+      // in both shapes, so the exemption must also require they land in the SAME dispatched ticket set
+      // ({@link dispatchOwnerOf}), not merely that both carry a ticket-tier type.
+      const dispatchOwner = dispatchOwnerOf(bead, byId, board);
+      const bothDispatchedTickets =
+        isTicketType(bead) &&
+        isTicketType(blocker) &&
+        dispatchOwner !== undefined &&
+        dispatchOwner === dispatchOwnerOf(blocker, byId, board);
+      if (partnerOfParent && !bothDispatchedTickets) {
+        fault(
+          bead.id,
+          "blocks-duplicates-parent",
+          "blocking",
+          `blocks-depends on ${blockerId}, already its ${partnerOfParent} — a parent never waits ` +
+            `on its own child, and the tier already orders the two, so the edge is redundant and ` +
+            `only doubles the wait. Drop it (\`bd dep remove ${bead.id} ${blockerId}\`).`,
+        );
+      }
+    }
+
+    for (const cycle of cycleMemberships.get(bead.id) ?? []) {
+      // Prefer the edge bd's own reported path actually walks (`next`), not just any `blocks` edge
+      // into the cycle's member set: a bead can hold a chord into the same cycle (e.g. `a -> c` on
+      // top of the real loop `a -> b -> c -> a`), and picking that chord names a `bd dep remove`
+      // that leaves the reported loop fully intact. Falls back to the old any-member search only
+      // when the path edge isn't found on this bead (bd's report and the board disagreeing).
+      const edges = (bead.dependencies ?? []).filter((dep) => dep?.type === "blocks");
+      const onPath = edges.find((dep) => dep.depends_on_id === cycle.next.get(bead.id));
+      const partner = (onPath ?? edges.find((dep) => cycle.members.has(dep.depends_on_id)))
+        ?.depends_on_id;
+      fault(
+        bead.id,
+        "blocks-cycle",
+        "blocking",
+        `sits in a blocks cycle${partner ? ` with ${partner}` : ""} — each bead on the loop waits ` +
+          `(directly or transitively) on the next, so none of them can ever become ready and the ` +
+          `run deadlocks. Break the loop by dropping one edge on it ` +
+          `(\`bd dep remove ${bead.id} ${partner ?? "<blocker-id>"}\`), then re-add whichever order ` +
+          `is actually correct (\`bd dep add <blocked> <blocker>\`).`,
+      );
+    }
 
     // A parent id pointing at a bead this board doesn't contain — a bd-level inconsistency, not a
     // shape one (a re-parent that lost its target, a hand-edited export). The one rule here that
@@ -203,6 +311,21 @@ export function validateBoardStructure(board) {
     }
   }
 
+  // `bd dep cycles` may report a real graph cycle in an encoding whose bead ids this version of
+  // anton cannot read. That is still blocking evidence, not an empty answer: put it on a stable
+  // board-level id so the CLI refuses instead of silently calling the board healthy.
+  for (const cycle of unreadableCycles) {
+    fault(
+      "board",
+      "blocks-cycle",
+      "blocking",
+      `bd dep cycles reported a blocks cycle whose bead ids anton could not map: ${cycleMetadata(cycle)}. ` +
+        "The graph is unsafe to dispatch until you inspect bd's cycle report and break one edge " +
+        "(`bd dep remove <blocked> <blocker>`), then restore the intended order " +
+        "(`bd dep add <blocked> <blocker>`).",
+    );
+  }
+
   return violations;
 }
 
@@ -218,13 +341,62 @@ export function validateBoardStructure(board) {
  * {@link validateBoardStructure} sweeps over the whole board — a quadratic walk each, since
  * container-ness is read per bead. Returning the split removes the choice rather than documenting it.
  */
-export function structureGaps(targetId, board) {
+export function structureGaps(targetId, board, options) {
   const subtree = descendantsOf(targetId, board);
-  const owned = validateBoardStructure(board).filter((v) => subtree.has(v.id));
+  // `v.id === "board"` is a DELIBERATE departure from subtree scoping, not an oversight of it. Every
+  // other fault here names a bead this function can place in (or out of) `targetId`'s subtree; the
+  // unreadable-cycle fault (see the `unreadableCycles` loop above) exists exactly because bd reported
+  // a real cycle whose members this version of anton COULD NOT MAP — there is no subtree to test
+  // membership against, since the id is synthetic. Scoping it away (as `dangling-parent` correctly is
+  // — that fault names a real, known bead, and a target whose subtree can't reach it was never going
+  // to see it here regardless) would silently clear it for every target, which is precisely the
+  // "empty answer" `validateBoardStructure`'s own comment refuses to give. Fail-safe over
+  // availability: an unmapped cycle blocks every approval until a human reads bd's raw report,
+  // exactly like `structure.test.ts`'s "blocks on an unreadable bd cycle record" case one layer down,
+  // now also covered at this (`structureGaps`) layer below.
+  const owned = validateBoardStructure(board, options).filter((v) => v.id === "board" || subtree.has(v.id));
   return {
     blocking: owned.filter((v) => v.severity === "blocking"),
     advisory: owned.filter((v) => v.severity === "advisory"),
   };
+}
+
+/**
+ * The cycle answer belongs to bd, not a local traversal: its graph includes every dependency source
+ * and it owns the definition of a cycle. `cycles` is the parsed `bd dep cycles --json` result; raw
+ * entries are deliberately retained so a format bd adds later cannot turn into a clean report.
+ */
+function cycleMembers(byId, cycles) {
+  const memberships = new Map();
+  const unreadable = [];
+  for (const cycle of cycles ?? []) {
+    const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
+    const mapped = ids.filter((id) => byId.has(id));
+    const members = new Set(mapped);
+    // bd reports the loop IN ORDER — id[i] waits on id[i+1], wrapping back to id[0] — so this
+    // adjacency is the one real edge per member the loop actually walks, as opposed to `members`
+    // (a Set) which can't distinguish that edge from an unrelated chord into the same cycle.
+    const next = new Map(ids.map((id, i) => [id, ids[(i + 1) % ids.length]]));
+    const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length };
+    for (const id of mapped) {
+      const memberCycles = memberships.get(id);
+      if (memberCycles) memberCycles.push(evidence);
+      else memberships.set(id, [evidence]);
+    }
+    // The cycle query is authoritative. Even when the listing raced and no longer carries every
+    // edge, each mapped member must block; only the missing members need a board-level fallback.
+    if (!evidence.complete) unreadable.push(cycle?.raw ?? cycle);
+  }
+  return { memberships, unreadable };
+}
+
+/** Keep unfamiliar authoritative metadata diagnosable without letting an unexpected value throw. */
+function cycleMetadata(raw) {
+  try {
+    return JSON.stringify(raw);
+  } catch {
+    return String(raw);
+  }
 }
 
 /** Children by parent id, in board order — the parent graph both walks below read. */
@@ -293,9 +465,21 @@ export function formatStructureViolations(violations) {
   return violations.map((v) => `${v.id} → ${v.message}`).join("; ");
 }
 
+/**
+ * The four mechanical `blocks`-edge faults — an author reads these differently from a tier fault:
+ * "this edge is broken" versus "this bead is in the wrong place". `formatStructureReport` uses this
+ * to keep the two apart instead of interleaving them in board order.
+ */
+const ORDERING_RULES = new Set([
+  "blocks-edge-self",
+  "blocks-edge-dangling",
+  "blocks-duplicates-parent",
+  "blocks-cycle",
+]);
+
 /** The board's tier conformance, for `anton board-check` and `/shape`'s Phase 5 audit. */
-export function buildStructureReport(board) {
-  const violations = validateBoardStructure(board);
+export function buildStructureReport(board, options) {
+  const violations = validateBoardStructure(board, options);
   return {
     judged: board.filter(isJudged).length,
     blocking: violations.filter((v) => v.severity === "blocking").length,
@@ -304,14 +488,22 @@ export function buildStructureReport(board) {
   };
 }
 
-/** The report as text: a headline, then one line per violation, worst severity first. */
+/**
+ * The report as text: a headline, then violations grouped so an ordering fault (a broken `blocks`
+ * edge) never interleaves with a tier fault (a bead in the wrong place) — the two need different
+ * fixes and reading them shuffled together buries whichever group is smaller. Worst severity first
+ * within each group.
+ */
 export function formatStructureReport(report, label = "") {
   const head = `${label ? `${label}: ` : ""}${report.judged} live beads — ${report.blocking} blocking, ${report.advisory} advisory`;
   if (report.violations.length === 0) return `${head}\n  ✓ epic → feature → ticket holds`;
-  const lines = ["blocking", "advisory"].flatMap((severity) =>
-    report.violations
-      .filter((v) => v.severity === severity)
-      .map((v) => `  ${severity === "blocking" ? "✗" : "!"} ${v.id} [${v.rule}] ${v.message}`),
-  );
-  return [head, ...lines].join("\n");
+
+  const line = (v) => `  ${v.severity === "blocking" ? "✗" : "!"} ${v.id} [${v.rule}] ${v.message}`;
+  const bySeverity = (vs) => ["blocking", "advisory"].flatMap((s) => vs.filter((v) => v.severity === s));
+  const section = (title, vs) => (vs.length === 0 ? [] : [`${title}:`, ...bySeverity(vs).map(line)]);
+
+  const ordering = report.violations.filter((v) => ORDERING_RULES.has(v.rule));
+  const tier = report.violations.filter((v) => !ORDERING_RULES.has(v.rule));
+
+  return [head, ...section("ordering faults", ordering), ...section("tier faults", tier)].join("\n");
 }
