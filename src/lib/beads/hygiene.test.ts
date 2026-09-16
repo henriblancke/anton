@@ -175,8 +175,10 @@ describe("parseDepCycles", () => {
     expect(parseDepCycles(JSON.stringify([{ weird: 1 }]))).toEqual([{ ids: [], raw: { weird: 1 } }]);
   });
 
-  it("treats a non-array top level as no cycles rather than throwing", () => {
-    expect(parseDepCycles('{"not": "an array"}')).toEqual([]);
+  it("throws on a non-array top level rather than treating it as cycle-free", () => {
+    expect(() => parseDepCycles('{"not": "an array"}')).toThrow(
+      /could not read its --json output/,
+    );
   });
 });
 
