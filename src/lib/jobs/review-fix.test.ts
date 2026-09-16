@@ -476,6 +476,8 @@ process.exit(0);
     expect(reaction!.join(" ")).toContain("repos/o/r/pulls/comments/100/reactions");
     expect(reaction).toContain("content=+1");
     expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+    const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
+    expect(reply).toBeDefined();
   });
 
   it("reacts -1 on a declined (left) finding's anchor comment, without resolving the thread", async () => {
@@ -486,6 +488,8 @@ process.exit(0);
     expect(reaction).toContain("content=-1");
     // no resolveReviewThread mutation for a left thread
     expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(false);
+    const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
+    expect(reply).toBeDefined();
   });
 
   it("reacts eyes on a needs-human finding — handled explicitly, distinct from fixed/left", async () => {
