@@ -62,6 +62,8 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     formula: null,
     formulaVariant: null,
     baseForkSha: null,
+    baseRefreshOutcome: null,
+    baseRefreshSha: null,
     status: "parked",
     reviewScore: null,
     attempts: 1,

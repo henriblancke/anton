@@ -113,6 +113,7 @@ suite("preserveTimedOutWork (real git)", () => {
       baseBranch: "main",
       baseRef: "origin/main",
       baseForkSha: "f0f0f0forkcommit",
+      alreadyShippedBase: "f0f0f0forkcommit",
       target: ticket,
       settings,
     };
@@ -840,6 +841,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -945,6 +947,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -1075,6 +1078,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -1200,6 +1204,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: { testCommand: "true" } satisfies ProjectSettings,
   });

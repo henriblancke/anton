@@ -128,17 +128,21 @@ export async function repairBlockedTicket(args: {
         : kind === "already-shipped"
         ? await repairAlreadyShipped({
             repoPath: repo,
-            // The COMMIT this checkout forked from, pinned at worktree CREATION (PR #238 review):
-            // `run.baseForkSha`, not a fork point recomputed here from the movable `run.baseRef`.
-            // `origin/<base>` can be force-reset BACKWARD along the same history after the worktree
-            // was cut, and re-running `merge-base` then resolves the rewound tip rather than the
-            // checkout's original fork — a survivor commit between the two is present in the base the
-            // checkout was created from but absent from the recomputed older history, so
-            // verifyShippedClaim would search only that history and reject a valid already-shipped
-            // claim. The persisted SHA is the immutable commit the branch actually forked from — the
-            // fork point AT THE WRITE the retirement has to hold against — so it is what the check
-            // verifies against, unchanged across resumes and any base rewind.
-            base: run.baseForkSha,
+            // `run.alreadyShippedBase`, not `run.baseForkSha` and not a fork point recomputed here
+            // from the movable `run.baseRef` (PR #238, PR #279 review). `origin/<base>` can be
+            // force-reset BACKWARD along the same history after the worktree was cut, and re-running
+            // `merge-base` then resolves the rewound tip rather than the checkout's original fork — a
+            // survivor commit between the two is present in the base the checkout was created from
+            // but absent from the recomputed older history, so verifyShippedClaim would search only
+            // that history and reject a valid already-shipped claim. `baseForkSha` itself guards
+            // against exactly that by staying pinned at the checkout's original fork across resumes —
+            // but a resumed run's refresh (anton-s55u) can bring newer base commits into the branch
+            // AFTER that pin was taken, and a claim citing one of those is then truthfully reachable
+            // from the tree this attempt actually holds while still failing against the older pin.
+            // `alreadyShippedBase` is that refreshed base when a clean refresh applied one, and
+            // `baseForkSha` otherwise (see its doc comment on StepContext) — so the check always runs
+            // against the base the tree this attempt is actually built on.
+            base: run.alreadyShippedBase,
             bead: fresh,
             // The contract the reporting agent was PROMPTED with (PR #238 review): `fresh` is read
             // after the report, so an edit landing mid-session is already in it, and a fence starting
