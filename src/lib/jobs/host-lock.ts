@@ -118,27 +118,28 @@ async function retire(
 }
 
 /**
- * Remove a directory that looks abandoned without letting the destructive step itself resolve the
+ * Remove a path that looks abandoned without letting the destructive step itself resolve the
  * pathname fresh against whatever a peer put there in the meantime. Renaming to a reap-private
  * tombstone first means the actual `rm` always targets a name nothing else can be racing against —
  * it narrows, though (without an fd-relative removal syscall Node doesn't expose) can't fully close,
  * the window between the caller's identity check and the `rename` itself: a decider can reap this
- * same stale gate and `mkdir` a fresh one at this path in that gap, so the rename can move the
- * replacement rather than the gate `expected` names. Bind the reap to that checked identity by
- * re-verifying it against what actually got moved, and putting back anything that doesn't match
- * instead of deleting a gate that may be live.
+ * same stale path and recreate a fresh one at it in that gap, so the rename can move the replacement
+ * rather than the instance `expected` names. Bind the reap to that checked identity by re-verifying
+ * it against what actually got moved, and putting back anything that doesn't match instead of
+ * deleting something that may be live. Used for both `.reclaiming` gates and an acquirer's own
+ * just-created (and possibly since-repopulated) lock directory.
  */
-async function reapGate(gate: string, expected: Stats): Promise<void> {
-  const tombstone = `${gate}.reaped-${randomUUID()}`;
+async function reapStalePath(path: string, expected: Stats): Promise<void> {
+  const tombstone = `${path}.reaped-${randomUUID()}`;
   try {
-    await rename(gate, tombstone);
+    await rename(path, tombstone);
   } catch {
     return; // already gone, or already reaped by someone else
   }
   if (!sameIdentity(expected, await safeStat(tombstone))) {
-    // Moved a successor's fresh gate instead of the stale one `expected` names — restore it rather
-    // than deleting a decider's live gate out from under it.
-    await rename(tombstone, gate).catch(() => {});
+    // Moved a successor's fresh occupant instead of the stale one `expected` names — restore it
+    // rather than deleting something that may still be live.
+    await rename(tombstone, path).catch(() => {});
     return;
   }
   await rm(tombstone, { recursive: true, force: true }).catch(() => {});
@@ -175,7 +176,7 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
       // mutual exclusion on `dir`.
       const recheck = await safeStat(gate);
       if (recheck !== undefined && sameIdentity(gateStat, recheck)) {
-        await reapGate(gate, recheck);
+        await reapStalePath(gate, recheck);
       }
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
@@ -194,11 +195,11 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     }
     // Re-verify this decider still owns the gate immediately before the destructive retire: if this
     // decider was suspended long enough for a peer to reap its gate as stale (or, transitively, for
-    // reapGate's own restore-on-mismatch to lose a race and strand a *different* decider's gate —
-    // see reapGate above), a fresh decider can already have reclaimed this same orphan under its own
-    // token and re-acquired `dir` as a live successor. Retiring by pathname without this check would
-    // rename that successor's live directory away instead of the orphan this decision was made
-    // against.
+    // reapStalePath's own restore-on-mismatch to lose a race and strand a *different* decider's gate
+    // — see reapStalePath above), a fresh decider can already have reclaimed this same orphan under
+    // its own token and re-acquired `dir` as a live successor. Retiring by pathname without this
+    // check would rename that successor's live directory away instead of the orphan this decision
+    // was made against.
     if (!sameIdentity(ownGateStat, await safeStat(gate))) {
       return false;
     }
@@ -232,7 +233,7 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
   } finally {
     const ownRecheck = await safeStat(gate);
     if (ownRecheck !== undefined && sameIdentity(ownGateStat, ownRecheck)) {
-      await reapGate(gate, ownRecheck);
+      await reapStalePath(gate, ownRecheck);
     }
   }
 }
@@ -368,13 +369,16 @@ export async function withHostLock<T>(
       // holder it retired turns out to still be alive — its restore then races this still-
       // unpublished directory next. Recheck the gate now, before writing anything, so a pending
       // restore always finds `dir` either vacant or gone rather than colliding with metadata we
-      // already wrote. Guard the abandon itself with an identity check: by the time we act, the
-      // restore may already have replaced this same path with the holder it put back, and a blind
-      // rm would destroy that instead of our own (still-empty) directory.
+      // already wrote. A plain stat-then-rm here would leave its own gap open: a pending restore can
+      // land its own `rename` into `dir` between our identity stat and the pathname-based `rm`, and
+      // the `rm` would then recursively delete the restored live holder instead of our own empty
+      // directory. reapStalePath moves `dir` to a private path first and verifies identity against
+      // what actually got moved, so it either reaps our own directory or restores a holder it grabbed
+      // by mistake — it never deletes one out from under a restore.
       const gateAfterMkdir = await safeStat(reclaimGate);
       if (gateAfterMkdir !== undefined && Date.now() - gateAfterMkdir.mtimeMs <= STALE_AFTER_MS) {
-        if (sameIdentity(freshDirStat, await safeStat(dir))) {
-          await rm(dir, { recursive: true, force: true }).catch(() => {});
+        if (freshDirStat !== undefined) {
+          await reapStalePath(dir, freshDirStat);
         }
         continue;
       }
@@ -499,11 +503,50 @@ export async function withHostLock<T>(
     if (await isOurDir()) {
       const current = await readHolder(metaPath);
       if (!current || current.token === token) {
-        // Pass ourDirStat, not just the isOurDir()/readHolder checks above: those can pass and
-        // then this call still be suspended past a successor's reclaim before it reaches retire()'s
-        // own rename. retire() verifies ourDirStat against whatever that rename actually grabbed and
-        // restores it on a mismatch, so the successor is moved back instead of staying stranded.
-        await retire(dir, token, ourDirStat);
+        // Unlike the normal release below, `dir` never published metadata here, so any peer's
+        // isAbandoned() check has only dir-mtime to go on and can treat it as fair game the moment
+        // STALE_AFTER_MS elapses — no heartbeat to wait out first. If this call is suspended past
+        // that window, a peer's reclaim() can mint its own token (ours was never published for it to
+        // reuse), rename `dir` away, and publish a live successor before we reach retire()'s own
+        // rename. Because the tokens differ, our rename below wouldn't collide with theirs and fail
+        // outright the way same-token retirements do — it would grab the successor's live directory
+        // by mistake instead, and without holding the same gate reclaim() uses, a third acquirer
+        // could mkdir into the path while we restore it, stranding the successor and leaving two
+        // holders running `fn` at once. Take the `.reclaiming` gate first — every other acquirer's
+        // poll loop already waits out a fresh one — so this retire (including any restore) runs with
+        // the same exclusion reclaim() gives its own.
+        let gotGate = false;
+        try {
+          await mkdir(reclaimGate);
+          gotGate = true;
+        } catch {
+          // A live decision already owns `dir` (an in-progress reclaim, or a stale gate not yet
+          // reaped) — leave retirement to it rather than fighting for the gate.
+        }
+        if (gotGate) {
+          const ownGateStat = await safeStat(reclaimGate);
+          try {
+            // Re-check ownership: a peer's reclaim could have already finished and freed the gate
+            // (which is why our own mkdir just above succeeded) before we got here.
+            if (await isOurDir()) {
+              // Pass ourDirStat, not just the isOurDir()/readHolder checks above: those can pass and
+              // then this call still be suspended past a successor's reclaim before it reaches
+              // retire()'s own rename. retire() verifies ourDirStat against whatever that rename
+              // actually grabbed and restores it on a mismatch, so the successor is moved back
+              // instead of staying stranded.
+              await retire(dir, token, ourDirStat);
+            }
+          } finally {
+            const ownRecheck = await safeStat(reclaimGate);
+            if (
+              ownGateStat !== undefined &&
+              ownRecheck !== undefined &&
+              sameIdentity(ownGateStat, ownRecheck)
+            ) {
+              await reapStalePath(reclaimGate, ownRecheck);
+            }
+          }
+        }
       }
     }
     return fn();
