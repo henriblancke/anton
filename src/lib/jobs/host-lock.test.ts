@@ -80,11 +80,6 @@ vi.mock("node:fs/promises", async (importOriginal) => {
     // `ourDirStat` right after our own mkdir(dir) resolved. Simulates a peer reclaiming `dir` and
     // re-acquiring it before this creator ever gets to observe its own, correct identity.
     //
-    // Fires on the 2nd stat(gate) for the retire-race test — reclaim()'s own re-verification of its
-    // gate immediately before calling retire(). Simulates a peer reaping this decider's gate as
-    // stale, a fresh decider (D2) fully reclaiming the same orphan under its own token, and D2
-    // re-acquiring `dir` live — all inside the window between this decider's abandonment check and
-    // its retire call.
     stat: async (path: unknown, ...rest: unknown[]) => {
       if (typeof path === "string" && (path.includes(RESUME_MARKER) || path.includes(FIRST_STAT_MARKER))) {
         const n = (statCalls.get(path) ?? 0) + 1;
@@ -92,44 +87,6 @@ vi.mock("node:fs/promises", async (importOriginal) => {
         const fireAt = path.includes(FIRST_STAT_MARKER) ? 1 : 2;
         if (n === fireAt) {
           await installSuccessor(path);
-        }
-      }
-      if (typeof path === "string" && path.includes(RETIRE_RACE_MARKER) && path.endsWith(".reclaiming")) {
-        const n = (statCalls.get(path) ?? 0) + 1;
-        statCalls.set(path, n);
-        if (n === 2) {
-          const dir = path.slice(0, -".reclaiming".length);
-          // Peer reaps this decider's gate as stale...
-          await actual.rm(path, { recursive: true, force: true }).catch(() => {});
-          // ...a fresh decider (D2) wins the gate, decides the same orphan is abandoned, and retires
-          // it under its own token...
-          await actual.mkdir(path);
-          await actual.rename(dir, `${dir}.retired-d2-reclaim`);
-          await actual.rm(path, { recursive: true, force: true }).catch(() => {}); // D2's own cleanup
-          // ...and re-acquires `dir` as a live successor before this decider resumes.
-          await actual.mkdir(dir);
-          await actual.writeFile(
-            `${dir}/owner.json`,
-            JSON.stringify({ token: D2_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "d2" }),
-            "utf8",
-          );
-        }
-      }
-      // Fires on the 2nd stat(gate) for the republish-race test — reclaim()'s own re-verification
-      // of its gate immediately before its final metadata re-check. Simulates the suspended creator
-      // resuming and publishing owner.json into `dir` in that exact gap: `dir`'s own device+inode
-      // never changes when its contents do, so this must be caught by re-reading the metadata, not
-      // by the gate or directory identity checks alone.
-      if (typeof path === "string" && path.includes(REPUBLISH_MARKER) && path.endsWith(".reclaiming")) {
-        const n = (statCalls.get(path) ?? 0) + 1;
-        statCalls.set(path, n);
-        if (n === 2) {
-          const dir = path.slice(0, -".reclaiming".length);
-          await actual.writeFile(
-            `${dir}/owner.json`,
-            JSON.stringify({ token: CREATOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "resumed-creator" }),
-            "utf8",
-          );
         }
       }
       // Fires on the 3rd stat(dir) (bare path, no suffix) for the late-publish-race test —
@@ -206,6 +163,63 @@ vi.mock("node:fs/promises", async (importOriginal) => {
           const gate = `${dir}.reclaiming`;
           await actual.rm(gate, { recursive: true, force: true }).catch(() => {});
           await actual.mkdir(gate);
+        }
+      }
+      // Fires on the 1st readFile of a gate's token file for the retire-race test — reclaim()'s own
+      // pre-retire re-verification that it still owns the gate (now bound to the generation token,
+      // not gate identity, per anton-nd2n: an inode-recycling filesystem could otherwise make a
+      // successor's gate identity-match ours). Simulates a peer reaping this decider's gate as
+      // stale, a fresh decider (D2) fully reclaiming the same orphan under its own token, and D2
+      // re-acquiring `dir` live — all inside the window between this decider's abandonment check
+      // and its retire call.
+      if (
+        typeof path === "string" &&
+        path.includes(RETIRE_RACE_MARKER) &&
+        path.includes(".reclaiming") &&
+        path.endsWith("/token")
+      ) {
+        const n = (readFileCalls.get(path) ?? 0) + 1;
+        readFileCalls.set(path, n);
+        if (n === 1) {
+          const gate = path.slice(0, -"/token".length);
+          const dir = gate.slice(0, -".reclaiming".length);
+          // Peer reaps this decider's gate as stale...
+          await actual.rm(gate, { recursive: true, force: true }).catch(() => {});
+          // ...a fresh decider (D2) wins the gate, decides the same orphan is abandoned, and retires
+          // it under its own token...
+          await actual.mkdir(gate);
+          await actual.rename(dir, `${dir}.retired-d2-reclaim`);
+          await actual.rm(gate, { recursive: true, force: true }).catch(() => {}); // D2's own cleanup
+          // ...and re-acquires `dir` as a live successor before this decider resumes.
+          await actual.mkdir(dir);
+          await actual.writeFile(
+            `${dir}/owner.json`,
+            JSON.stringify({ token: D2_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "d2" }),
+            "utf8",
+          );
+        }
+      }
+      // Fires on the 1st readFile of a gate's token file for the republish-race test —
+      // reclaim()'s own re-verification that it still owns the gate, immediately before its final
+      // metadata re-check. Simulates the suspended creator resuming and publishing owner.json into
+      // `dir` in that exact gap: `dir`'s own device+inode never changes when its contents do, so
+      // this must be caught by re-reading the metadata, not by the gate ownership check alone.
+      if (
+        typeof path === "string" &&
+        path.includes(REPUBLISH_MARKER) &&
+        path.includes(".reclaiming") &&
+        path.endsWith("/token")
+      ) {
+        const n = (readFileCalls.get(path) ?? 0) + 1;
+        readFileCalls.set(path, n);
+        if (n === 1) {
+          const gate = path.slice(0, -"/token".length);
+          const dir = gate.slice(0, -".reclaiming".length);
+          await actual.writeFile(
+            `${dir}/owner.json`,
+            JSON.stringify({ token: CREATOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "resumed-creator" }),
+            "utf8",
+          );
         }
       }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
@@ -638,12 +652,13 @@ describe("withHostLock", () => {
     const dir = join(LOCK_ROOT, name);
 
     // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
-    // reclaim(). The injected stat() above fires on reclaim()'s own re-verification of its gate,
-    // right after this decider has already decided the orphan is abandoned — simulating a peer
-    // reaping this decider's gate, a fresh decider (D2) fully reclaiming the same orphan under its
-    // own token, and D2 re-acquiring `dir` live, all before this decider reaches its own retire
-    // call. Without re-checking gate ownership immediately before retire, this decider would rename
-    // D2's live directory away by pathname alone.
+    // reclaim(). The injected readFile() above fires on reclaim()'s own re-verification of its gate
+    // (a generation-token comparison, not identity), right after this decider has already decided
+    // the orphan is abandoned — simulating a peer reaping this decider's gate, a fresh decider (D2)
+    // fully reclaiming the same orphan under its own token, and D2 re-acquiring `dir` live, all
+    // before this decider reaches its own retire call. Without re-checking gate ownership
+    // immediately before retire, this decider would rename D2's live directory away by pathname
+    // alone.
     await mkdir(dir, { recursive: true });
     const old = new Date(Date.now() - 120_000);
     await utimes(dir, old, old);
@@ -666,10 +681,10 @@ describe("withHostLock", () => {
     const dir = join(LOCK_ROOT, name);
 
     // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
-    // reclaim(). The injected stat() above fires on reclaim()'s own gate re-verification, right
+    // reclaim(). The injected readFile() above fires on reclaim()'s own gate re-verification, right
     // after this decider has already judged the directory abandoned, and simulates the suspended
     // creator resuming and publishing owner.json in that exact gap — the race the finding
-    // describes: `dir`'s device+inode never changes when its contents do, so without a fresh
+    // describes: `dir`'s own state doesn't reveal the gate is still ours, so without a fresh
     // metadata re-check immediately before retire(), this decider would still evict the creator
     // that just legitimately claimed the lease.
     await mkdir(dir, { recursive: true });

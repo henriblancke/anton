@@ -27,6 +27,18 @@ const STALE_AFTER_MS = 60_000;
 /** Metadata filename inside a lock directory. */
 const OWNER_FILE = "owner.json";
 
+/**
+ * Generation-token filename inside a `.reclaiming` gate. A gate carries no other content, so unlike
+ * `dir` (which has `owner.json` to cross-check against inode identity) it has nothing to fall back
+ * on if `dev`/`ino` are reused — and some filesystems (overlayfs observed in practice) recycle an
+ * inode number immediately on removal. Two gate generations at the same path could then compare
+ * equal by `sameIdentity` alone, letting a live decider's later ownership re-check pass against a
+ * successor it doesn't own, or letting a stale-gate reap grab a successor instead of the orphan it
+ * judged abandoned. This token is unique per `mkdir` and is the authoritative "still my gate" check;
+ * `dev`/`ino` are no longer trusted for gates on their own.
+ */
+const GATE_TOKEN_FILE = "token";
+
 /** Poll interval while waiting for a peer to release. */
 const POLL_MS = 2_000;
 
@@ -128,8 +140,20 @@ async function retire(
  * it against what actually got moved, and putting back anything that doesn't match instead of
  * deleting something that may be live. Used for both `.reclaiming` gates and an acquirer's own
  * just-created (and possibly since-repopulated) lock directory.
+ *
+ * `verify`, when given, runs after the rename and the identity check both pass, against whatever the
+ * rename actually moved to `dest` — the same second, content-based signal `retire()` uses for `dir`.
+ * It matters most for `.reclaiming` gates: a bare directory has no content of its own, so `expected`'s
+ * `dev`/`ino` is the only thing distinguishing "the stale gate I judged abandoned" from "a fresh
+ * generation a live decider just created at the same path" — and some filesystems recycle a freed
+ * inode immediately, so identity alone can be fooled into treating the replacement as the original.
+ * Callers pass a generation-token comparison here to catch that a plain identity match can miss.
  */
-async function reapStalePath(path: string, expected: Stats): Promise<void> {
+async function reapStalePath(
+  path: string,
+  expected: Stats,
+  verify?: (dest: string) => Promise<boolean>,
+): Promise<void> {
   const tombstone = `${path}.reaped-${randomUUID()}`;
   try {
     await rename(path, tombstone);
@@ -139,6 +163,12 @@ async function reapStalePath(path: string, expected: Stats): Promise<void> {
   if (!sameIdentity(expected, await safeStat(tombstone))) {
     // Moved a successor's fresh occupant instead of the stale one `expected` names — restore it
     // rather than deleting something that may still be live.
+    await rename(tombstone, path).catch(() => {});
+    return;
+  }
+  if (verify && !(await verify(tombstone))) {
+    // Identity matched anyway (recycled inode) but the content didn't — this is a successor's
+    // generation wearing the orphan's old identity, not the orphan itself. Restore it.
     await rename(tombstone, path).catch(() => {});
     return;
   }
@@ -165,28 +195,31 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     // A live decision never outlives STALE_AFTER_MS (it's a handful of local fs ops), so reap a
     // gate older than that: worst case we race a genuinely live decider and lose the reap's own
     // mkdir, which is harmless since that decider's `finally` still removes it.
+    const gateToken = await readGateToken(gate);
     const gateStat = await safeStat(gate);
     if (gateStat !== undefined && Date.now() - gateStat.mtimeMs > STALE_AFTER_MS) {
-      // Re-check identity, not mtime, immediately before deleting. The age check above and this
-      // reap are two separate awaits, and a legitimate decider can reap this same stale gate and
-      // `mkdir` a fresh one at this path in the gap between them — comfortably within the same
-      // mtime tick, so a repeated mtime comparison can mistake that successor's gate for the one
-      // we judged stale. Device+inode identifies the exact instance, so it can't make that mistake
-      // — which would otherwise let two deciders run the reclaim decision concurrently and break
-      // mutual exclusion on `dir`.
+      // Re-check the generation token, not identity, immediately before deleting. The age check
+      // above and this reap are two separate awaits, and a legitimate decider can reap this same
+      // stale gate and `mkdir` a fresh one at this path in the gap between them — comfortably
+      // within the same mtime tick, so a repeated mtime comparison can mistake that successor's
+      // gate for the one we judged stale. `sameIdentity`'s dev+ino can be fooled the same way on a
+      // filesystem that recycles a freed inode immediately (overlayfs), so the token — unique per
+      // `mkdir`, unaffected by inode reuse — is what actually tells the successor's gate from ours.
+      const recheckToken = await readGateToken(gate);
       const recheck = await safeStat(gate);
-      if (recheck !== undefined && sameIdentity(gateStat, recheck)) {
-        await reapStalePath(gate, recheck);
+      if (recheck !== undefined && recheckToken === gateToken) {
+        await reapStalePath(gate, recheck, async (dest) => (await readGateToken(dest)) === gateToken);
       }
     }
     return false; // let the caller's normal deadline/poll path retry reclaim() next iteration
   }
-  // This decider's own gate identity, captured right after our `mkdir` created it. If we (the
+  // This decider's own gate generation, stamped right after our `mkdir` created it. If we (the
   // owner) pause past STALE_AFTER_MS before reaching `finally`, the reap branch above can treat
   // our gate as abandoned, remove it, and let a new decider `mkdir` a fresh one at the same path —
-  // likely within the same mtime tick as ours, so comparing mtime alone can't tell our gate from
-  // that successor's. Device+inode can: re-verify identity, not mtime, before removing.
-  const ownGateStat = await safeStat(gate);
+  // likely within the same mtime tick as ours, and possibly even the same recycled inode, so only
+  // the token can tell our gate from that successor's.
+  const ownToken = randomUUID();
+  await writeFile(join(gate, GATE_TOKEN_FILE), ownToken, "utf8").catch(() => {});
   try {
     const holder = await readHolder(metaPath);
     const dirCreatedAt = holder ? 0 : await dirMtimeMs(dir);
@@ -199,8 +232,9 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
     // — see reapStalePath above), a fresh decider can already have reclaimed this same orphan under
     // its own token and re-acquired `dir` as a live successor. Retiring by pathname without this
     // check would rename that successor's live directory away instead of the orphan this decision
-    // was made against.
-    if (!sameIdentity(ownGateStat, await safeStat(gate))) {
+    // was made against. Bound to the generation token rather than `sameIdentity`: a recycled inode
+    // could otherwise let this decider's own gate identity match a later generation by coincidence.
+    if ((await readGateToken(gate)) !== ownToken) {
       return false;
     }
     const token = holder?.token ?? randomUUID();
@@ -231,9 +265,13 @@ async function reclaim(dir: string, metaPath: string): Promise<boolean> {
       isStillAuthorized(await readHolder(join(dest, OWNER_FILE))),
     );
   } finally {
-    const ownRecheck = await safeStat(gate);
-    if (ownRecheck !== undefined && sameIdentity(ownGateStat, ownRecheck)) {
-      await reapStalePath(gate, ownRecheck);
+    // Token-bound, same reasoning as the pre-retire re-check above: a recycled inode could make a
+    // successor's gate identity-match ours, and cleaning up here means deleting it.
+    if ((await readGateToken(gate)) === ownToken) {
+      const ownRecheck = await safeStat(gate);
+      if (ownRecheck !== undefined) {
+        await reapStalePath(gate, ownRecheck, async (dest) => (await readGateToken(dest)) === ownToken);
+      }
     }
   }
 }
@@ -263,6 +301,19 @@ function isAlive(pid: number): boolean {
 async function readHolder(metaPath: string): Promise<LockFile | undefined> {
   try {
     return JSON.parse(await readFile(metaPath, "utf8")) as LockFile;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read a `.reclaiming` gate's generation token; undefined when unreadable (gate gone, or a decider
+ * killed between its `mkdir` and this write — treated the same as "no token published yet", the gate
+ * equivalent of a metadata-less lock dir).
+ */
+async function readGateToken(gate: string): Promise<string | undefined> {
+  try {
+    return await readFile(join(gate, GATE_TOKEN_FILE), "utf8");
   } catch {
     return undefined;
   }
@@ -524,7 +575,12 @@ export async function withHostLock<T>(
           // reaped) — leave retirement to it rather than fighting for the gate.
         }
         if (gotGate) {
-          const ownGateStat = await safeStat(reclaimGate);
+          // Stamped right after our own `mkdir` created this gate — the reap in `finally` below binds
+          // to this token rather than `sameIdentity`'s dev+ino, since a filesystem that recycles a
+          // freed inode immediately (overlayfs) could otherwise let a later generation at this same
+          // path match our stale identity and get deleted out from under a live decider.
+          const ownGateToken = randomUUID();
+          await writeFile(join(reclaimGate, GATE_TOKEN_FILE), ownGateToken, "utf8").catch(() => {});
           try {
             // Re-check ownership: a peer's reclaim could have already finished and freed the gate
             // (which is why our own mkdir just above succeeded) before we got here.
@@ -537,13 +593,15 @@ export async function withHostLock<T>(
               await retire(dir, token, ourDirStat);
             }
           } finally {
-            const ownRecheck = await safeStat(reclaimGate);
-            if (
-              ownGateStat !== undefined &&
-              ownRecheck !== undefined &&
-              sameIdentity(ownGateStat, ownRecheck)
-            ) {
-              await reapStalePath(reclaimGate, ownRecheck);
+            if ((await readGateToken(reclaimGate)) === ownGateToken) {
+              const ownRecheck = await safeStat(reclaimGate);
+              if (ownRecheck !== undefined) {
+                await reapStalePath(
+                  reclaimGate,
+                  ownRecheck,
+                  async (dest) => (await readGateToken(dest)) === ownGateToken,
+                );
+              }
             }
           }
         }
