@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  draftRefusal,
   findingKey,
   initialDraft,
   isDraftComplete,
@@ -75,6 +76,33 @@ describe("isDraftComplete", () => {
     expect(isDraftComplete({ ...DRAFT, ticketId: "" })).toBe(false);
     expect(isDraftComplete({ ...DRAFT, summary: "   " })).toBe(false);
     expect(isDraftComplete({ ...DRAFT, instructions: "" })).toBe(false);
+  });
+});
+
+describe("draftRefusal", () => {
+  const none = new Set<string>();
+
+  it("is silent on an adequate draft — one that states a step", () => {
+    expect(draftRefusal(DRAFT, [BLOCKING], none)).toBeNull();
+  });
+
+  it("refuses instructions that are only list markers, naming what is missing", () => {
+    // "- " passes isDraftComplete (it is not blank) and would file with no criterion.
+    const refusal = draftRefusal({ ...DRAFT, instructions: "- \n1. " }, [BLOCKING], none);
+    expect(refusal).toMatch(/only list markers/);
+    expect(refusal).toMatch(/no finding is attached/);
+  });
+
+  it("lifts the refusal once a finding is ticked — the finding becomes the criterion", () => {
+    const thin = { ...DRAFT, instructions: "- " };
+    expect(draftRefusal(thin, [BLOCKING, ADVISORY], new Set([findingKey(ADVISORY)]))).toBeNull();
+    // A finding that exists but is not ticked is not attached, so it rescues nothing.
+    expect(draftRefusal(thin, [BLOCKING, ADVISORY], none)).not.toBeNull();
+  });
+
+  it("stays silent while the instructions are blank — that gap is isDraftComplete's to show", () => {
+    expect(draftRefusal({ ...DRAFT, instructions: "   " }, [], none)).toBeNull();
+    expect(isDraftComplete({ ...DRAFT, instructions: "   " })).toBe(false);
   });
 });
 

@@ -30,11 +30,20 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Same pin as claude-code-review.yml: the action hardcodes CLI 2.1.267, which crashes
+      # ~500ms after init (anthropics/claude-code-action#1759). Remove once fixed upstream.
+      - name: Install Claude Code 2.1.263
+        run: |
+          npm install --global @anthropic-ai/claude-code@2.1.263
+          echo "CLAUDE_BIN=$(command -v claude)" >> "$GITHUB_ENV"
+          claude --version
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_claude_code_executable: ${{ env.CLAUDE_BIN }}
 
           # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
