@@ -14,12 +14,12 @@
  * node from PATH is what made the heal aim at the wrong ABI in the first place.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { chmod, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { delimiter, join } from "node:path";
 
-import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, nodeShimDir, resolveJsBin, runLocalPinnedToThisNode } from "./anton.mjs";
+import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, nodeShimDir, resolveJsBin, runLocalPinnedToThisNode, shQuote } from "./anton.mjs";
 
 import { exists, pathWith, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
 
@@ -193,6 +193,79 @@ describe("runLocalPinnedToThisNode (source checkout → drizzle-kit under THIS n
       env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ""}` },
     });
     expect(ran.stdout.trim()).toBe(process.execPath);
+  });
+
+  it("shims whenever this runtime is not itself node, even with a sibling named node", async () => {
+    // A sibling `node` is NOT evidence it is this runtime (PR #298 review): under Bun in a shared
+    // prefix (/usr/local/bin, a conda env) it is some OTHER one, and trusting it hands lifecycle
+    // scripts the exact ABI the pin exists to avoid. This calls the REAL nodeShimDir with a
+    // Bun-shaped execPath — an earlier draft re-implemented its rule inline and so stayed green
+    // when production was reverted to the sibling check.
+    const dir = await tempDir("anton-shim-sim-");
+    try {
+      const fakeRt = join(dir, "bin");
+      await mkdir(fakeRt, { recursive: true });
+      const fakeBun = join(fakeRt, "bun");
+      await writeFile(fakeBun, `#!/bin/sh\nexec ${process.execPath} "$@"\n`);
+      await chmod(fakeBun, 0o755);
+      // The decoy: a real, DIFFERENT runtime sitting right beside it, as in a shared prefix.
+      const decoy = join(fakeRt, "node");
+      await writeFile(decoy, `#!/bin/sh\necho DECOY-NODE\n`);
+      await chmod(decoy, 0o755);
+
+      const shimDir = nodeShimDir(fakeBun);
+      // It must NOT hand back the runtime's own directory — that is where the decoy lives.
+      expect(shimDir, "reused a directory whose `node` is a different runtime").not.toBe(fakeRt);
+
+      const ran = spawnSync("sh", ["-c", 'node -e "console.log(process.execPath)"'], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${shimDir}${delimiter}${fakeRt}${delimiter}${process.env.PATH ?? ""}` },
+      });
+      // Through the shim → this runtime, not the decoy that PATH would otherwise have found.
+      expect(ran.stdout).not.toContain("DECOY");
+      expect(ran.stdout.trim()).toBe(process.execPath);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reuses its own directory when this runtime really is node, writing no shim", async () => {
+    // The common case must stay free: a real node needs no shim, and writing one per invocation
+    // would leave tmp litter for nothing.
+    const dir = await tempDir("anton-shim-real-");
+    try {
+      const realish = join(dir, "node");
+      await writeFile(realish, `#!/bin/sh\nexec ${process.execPath} "$@"\n`);
+      await chmod(realish, 0o755);
+      expect(nodeShimDir(realish)).toBe(dir);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes a shim that survives a runtime path containing shell metacharacters", async () => {
+    // `JSON.stringify` escapes `"` and `\` but NOT `$` or a backtick, both live inside sh double
+    // quotes — the previous shim would have expanded them instead of exec'ing (PR #298 review).
+    // Verified directly: `sh -c 'echo "/opt/we$irdHOME/node"'` yields "/opt/we/node".
+    const dir = await tempDir("anton-shim-meta-");
+    try {
+      // Uses the REAL shQuote, not a reimplementation of it — a local copy would pass no matter
+      // what production does, which is how an earlier test in this PR went green against the very
+      // code it was meant to reject.
+      for (const weird of ["/opt/we$irdHOME/x", "/opt/back`tick`/x", "/opt/it's here/x", "/plain/x"]) {
+        const r = spawnSync("sh", ["-c", `set -- ${shQuote(weird)}\nprintf "%s" "$1"`], { encoding: "utf8" });
+        expect(r.stdout, `${weird} was mangled by the shell`).toBe(weird);
+      }
+      // And the shim body production actually writes carries the path through intact.
+      const shimBody = `#!/bin/sh\nset -- ${shQuote("/opt/we$ird/bun")} "$@"\nprintf "%s" "$1"\n`;
+      const shim = join(dir, "node");
+      await writeFile(shim, shimBody);
+      await chmod(shim, 0o755);
+      const ran = spawnSync(shim, [], { encoding: "utf8" });
+      expect(ran.stdout).toBe("/opt/we$ird/bun");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("does not interpolate the command name into a shell string", async () => {

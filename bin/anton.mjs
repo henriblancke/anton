@@ -24,6 +24,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -31,6 +32,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
   unlinkSync,
@@ -447,22 +449,47 @@ function runLocalPinnedToThisNode(bin, args, env = {}) {
  * `dirname(process.execPath)`, which is correct whenever anton runs under a real node.
  */
 let nodeShimDirCache;
-function nodeShimDir() {
-  if (nodeShimDirCache !== undefined) return nodeShimDirCache;
-  const own = dirname(process.execPath);
-  // A real node next to us already answers `node` — nothing to shim.
-  if (basename(process.execPath) === "node" || existsSync(join(own, "node"))) return (nodeShimDirCache = own);
+function nodeShimDir(execPath = process.execPath) {
+  // `execPath` is injected ONLY by tests: this machine runs a real node, where the shim is correctly
+  // a no-op, so the Bun-shaped branch is otherwise unreachable and its rule untestable. The cache is
+  // bypassed for an injected path so a case cannot poison the process-wide one (PR #298 review).
+  const caching = execPath === process.execPath;
+  if (caching && nodeShimDirCache !== undefined) return nodeShimDirCache;
+  const remember = (dir) => (caching ? (nodeShimDirCache = dir) : dir);
+  const own = dirname(execPath);
+  // Reuse our own directory ONLY when this runtime IS node. A sibling file named `node` is not
+  // evidence: under Bun in a shared prefix (/usr/local/bin, a conda env) that sibling is some OTHER
+  // runtime, and trusting it hands lifecycle scripts the very ABI we are trying to avoid — the
+  // rebuild then targets it while the server runs on Bun (PR #298 review). When in doubt, shim.
+  if (basename(execPath).replace(/\.exe$/i, "") === "node") return remember(own);
   try {
     const dir = mkdtempSync(join(tmpdir(), "anton-node-shim-"));
     const shim = join(dir, "node");
-    // `exec` so signals and the exit code pass straight through, and "$@" quoted so arguments with
-    // spaces survive — this stands in for node in every lifecycle script that calls it.
-    writeFileSync(shim, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+    // The exec target is passed as a POSITIONAL PARAMETER, never interpolated into the script body.
+    // JSON.stringify escapes `"` and `\` but NOT `$` or a backtick, both live inside sh double
+    // quotes — a runtime path containing one would be expanded instead of executed, silently
+    // breaking the shim. Same argv-not-a-string fix resolveJsBin took (PR #298 review). The heredoc
+    // is quoted ('EOF') so the path is written verbatim, and `shift` drops it before "$@".
+    writeFileSync(shim, `#!/bin/sh\nset -- ${shQuote(execPath)} "$@"\nexec "$@"\n`);
     chmodSync(shim, 0o755);
-    return (nodeShimDirCache = dir);
+    // Best-effort cleanup: the shim outlives any child that needs it, so it goes at exit rather
+    // than being left for tmp reapers (PR #298 review). `exit` also fires after a normal return.
+    process.on("exit", () => {
+      try { rmSync(dir, { recursive: true, force: true }); } catch {}
+    });
+    return remember(dir);
   } catch {
-    return (nodeShimDirCache = own); // best-effort: the JS-exec pin above still holds
+    return remember(own); // best-effort: the JS-exec pin above still holds
   }
+}
+
+/**
+ * A string as ONE literal POSIX shell word: wrap in single quotes, and end/reopen the quoting around
+ * any single quote inside. Nothing within single quotes is special to the shell — no `$`, no
+ * backtick, no backslash — so the value survives verbatim however strange the path.
+ */
+function shQuote(value) {
+  return `'${String(value).split("'").join(`'\\''`)}'`;
 }
 
 /**
@@ -489,7 +516,16 @@ function resolveJsBin(bin) {
   if (!candidate || !existsSync(candidate)) return null;
   try {
     const target = realpathSync(candidate);
-    const head = readFileSync(target, "utf8").slice(0, 64);
+    // Bounded read: this path also runs for PATH entries that turn out to be real binaries, and
+    // decoding a multi-MB executable as UTF-8 to inspect 64 bytes is wasted work (PR #298 review).
+    const fd = openSync(target, "r");
+    let head;
+    try {
+      const buf = Buffer.alloc(64);
+      head = buf.toString("utf8", 0, readSync(fd, buf, 0, 64, 0));
+    } finally {
+      closeSync(fd);
+    }
     return /^#!.*\bnode\b/.test(head) ? target : null;
   } catch {
     return null; // unreadable or binary — fall back to spawning the bin itself
@@ -2571,6 +2607,7 @@ export {
   healNativeAbi,
   resolveJsBin,
   nodeShimDir,
+  shQuote,
   cmdDev,
   runLocalPinnedToThisNode,
 };
