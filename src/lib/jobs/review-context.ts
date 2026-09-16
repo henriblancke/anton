@@ -662,6 +662,12 @@ function diffSection(
     diff.patch,
     "```",
     ``,
+    // A board-only ticket whose branch ALSO carries an incidental tree change still has confirmed
+    // evidence to show (PR #284 review): `boardEvidenceByTicket` is only ever populated by a
+    // CONFIRMED board-only delivery, so surfacing it here is never a false claim, and omitting it
+    // just because the diff happens to be nonempty would leave the reviewer with only the unrelated
+    // patch and no way to check Acceptance against the bd writes that were the actual deliverable.
+    ...boardEvidenceSection(tickets, boardEvidenceByTicket),
     ...deletionsBlock(diff),
   ];
 }

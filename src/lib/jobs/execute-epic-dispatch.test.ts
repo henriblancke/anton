@@ -958,7 +958,7 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
     });
     hasCommitMock.mockResolvedValue(true);
 
-    await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
 
     expect(runTicketMock).not.toHaveBeenCalled();
     expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
@@ -967,6 +967,12 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
       ["anton-eb1"],
       false,
     );
+    // The companion fix in the `if (delivery)` branch above records the stale-pending ids into the
+    // ledger BEFORE clearing them (`ledger.boardEvidence.set(ticket.id, stalePending)`) — asserted
+    // here too so a regression that drops that call while leaving the cleanup call intact still
+    // fails: `boardEvidenceByTicket` is what `review-context.ts`'s `boardEvidenceSection` reads to
+    // show the reviewer which beads this ticket's confirmed evidence covers.
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
   });
 
   it("does nothing when the ticket carries no pending marker and no preserved baseline", async () => {
