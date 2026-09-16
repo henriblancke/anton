@@ -23,9 +23,11 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -34,7 +36,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { arch as osArch, homedir, platform as osPlatform } from "node:os";
+import { arch as osArch, homedir, platform as osPlatform, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
@@ -417,17 +419,50 @@ function runLocal(bin, args, env = {}) {
  * rather than failing outright.
  */
 function runLocalPinnedToThisNode(bin, args, env = {}) {
-  const runtimeDir = dirname(process.execPath);
   // Prepend to the PATH the child would otherwise get — a caller-supplied one when there is one,
   // this process's own otherwise. Rebuilding it from process.env unconditionally would silently
   // drop an override and send the child looking down the wrong PATH entirely.
   const base = env.PATH ?? process.env.PATH ?? "";
+  const runtimeDir = nodeShimDir() ?? dirname(process.execPath);
   const pinned = { ...env, PATH: base ? `${runtimeDir}${delimiter}${base}` : runtimeDir };
   const script = resolveJsBin(bin);
   if (!script) return runLocal(bin, args, pinned);
   // `process.execPath` with the script as argv[1] — the shebang is bypassed entirely, so this holds
   // under Bun and under any node whose directory is not on PATH.
   return runLocal(process.execPath, [script, ...args], pinned);
+}
+
+/**
+ * A directory holding a `node` that IS this runtime, first on a child's PATH.
+ *
+ * Executing a bin's JS ourselves pins that one process, and no further (PR #298 review). `npm
+ * rebuild` runs package lifecycle scripts, and node-pty's is literally
+ * `node scripts/prebuild.js || node-gyp rebuild` — a bare `node` npm resolves from PATH. Under Bun
+ * there is no `node` beside `process.execPath` to find, so those grandchildren compile the addon
+ * for ambient Node while the server runs on the runtime we healed: the same ABI split, one process
+ * deeper, and invisible because the rebuild still reports success.
+ *
+ * So when this runtime is not itself reachable as `node`, write a shim that execs it and hand the
+ * child THAT directory. Cached per process, and best-effort — an unwritable tmpdir falls back to
+ * `dirname(process.execPath)`, which is correct whenever anton runs under a real node.
+ */
+let nodeShimDirCache;
+function nodeShimDir() {
+  if (nodeShimDirCache !== undefined) return nodeShimDirCache;
+  const own = dirname(process.execPath);
+  // A real node next to us already answers `node` — nothing to shim.
+  if (basename(process.execPath) === "node" || existsSync(join(own, "node"))) return (nodeShimDirCache = own);
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "anton-node-shim-"));
+    const shim = join(dir, "node");
+    // `exec` so signals and the exit code pass straight through, and "$@" quoted so arguments with
+    // spaces survive — this stands in for node in every lifecycle script that calls it.
+    writeFileSync(shim, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
+    chmodSync(shim, 0o755);
+    return (nodeShimDirCache = dir);
+  } catch {
+    return (nodeShimDirCache = own); // best-effort: the JS-exec pin above still holds
+  }
 }
 
 /**
@@ -445,7 +480,11 @@ function runLocalPinnedToThisNode(bin, args, env = {}) {
 function resolveJsBin(bin) {
   if (bin.includes("/") || bin.includes("\\")) return null; // already a path — caller means it literally
   const vendored = join(BIN, bin);
-  const onPath = spawnSync("sh", ["-c", `command -v ${bin}`], { encoding: "utf8" });
+  // argv, not a shell string: `sh -c "command -v ${bin}"` interpolated `bin` unquoted, which every
+  // present caller makes safe by passing a literal but the signature does not promise (PR #298
+  // review). `command` is a shell builtin, so the lookup runs through `sh` with bin as a separate
+  // ARGUMENT — nothing in it can be read as syntax.
+  const onPath = spawnSync("sh", ["-c", 'command -v "$1"', "sh", bin], { encoding: "utf8" });
   const candidate = existsSync(vendored) ? vendored : (onPath.stdout ?? "").trim();
   if (!candidate || !existsSync(candidate)) return null;
   try {
@@ -2531,6 +2570,7 @@ export {
   ensureBetterSqlite3,
   healNativeAbi,
   resolveJsBin,
+  nodeShimDir,
   cmdDev,
   runLocalPinnedToThisNode,
 };

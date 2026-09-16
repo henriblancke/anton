@@ -15,9 +15,11 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { chmod, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { delimiter, join } from "node:path";
 
-import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, resolveJsBin, runLocalPinnedToThisNode } from "./anton.mjs";
+import { applyMigrations, cmdDev, ensureBetterSqlite3, ensureMigrated, healNativeAbi, NODE_DEV, nodeBand, nodeShimDir, resolveJsBin, runLocalPinnedToThisNode } from "./anton.mjs";
 
 import { exists, pathWith, REPO_ROOT, tempDir, withDb } from "./anton.fixture";
 
@@ -169,6 +171,48 @@ describe("runLocalPinnedToThisNode (source checkout → drizzle-kit under THIS n
 
     expect(runLocalPinnedToThisNode(probe, [], { PATH: pathWith(dir), ANTON_PIN_SEEN: seen })).toBe(0);
     expect(await readFile(seen, "utf8")).toBe(process.execPath);
+  });
+
+  it("puts a real `node` on the child's PATH, for lifecycle scripts we do not execute ourselves", async () => {
+    // Executing a bin's JS pins THAT process and no further (PR #298 review). `npm rebuild` runs
+    // package lifecycle scripts, and node-pty's is literally `node scripts/prebuild.js ||
+    // node-gyp rebuild` — a bare `node` npm resolves from PATH. So the pinned dir must actually
+    // ANSWER to `node`, or the grandchildren compile the addon for ambient Node while the server
+    // runs on the healed runtime: the same split one process deeper, and silent, since the rebuild
+    // still reports success.
+    const dir = nodeShimDir();
+    const resolved = spawnSync("sh", ["-c", 'command -v node'], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ""}` },
+    });
+    expect(resolved.status).toBe(0);
+    // Whatever that `node` is, running it must land on THIS runtime — a real sibling node under a
+    // node execPath, or the shim that execs process.execPath under a Bun one.
+    const ran = spawnSync("sh", ["-c", 'node -e "console.log(process.execPath)"'], {
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${dir}${delimiter}${process.env.PATH ?? ""}` },
+    });
+    expect(ran.stdout.trim()).toBe(process.execPath);
+  });
+
+  it("does not interpolate the command name into a shell string", async () => {
+    // resolveJsBin looked it up with `sh -c \`command -v ${bin}\``, unquoted. Every call site
+    // passes a literal, so it was not reachable — but the signature promises nothing, and a future
+    // caller with a configurable name would have had an injection primitive (PR #298 review).
+    // The payload must contain NO slash: `bin.includes("/")` bails out first, so a /tmp/ path would
+    // make this pass for the wrong reason (it did, on the first draft — verified by running the
+    // vulnerable form directly, which DID create the marker). Run from a cwd the probe can write to
+    // and use a bare filename, so only the shell-quoting fix can prevent it.
+    const dir = await tempDir("anton-injection-");
+    const cwd = process.cwd();
+    try {
+      process.chdir(dir);
+      expect(resolveJsBin("npm;touch PWNED")).toBe(null);
+      expect(existsSync(join(dir, "PWNED")), "resolveJsBin executed injected shell syntax").toBe(false);
+    } finally {
+      process.chdir(cwd);
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it("prepends to PATH rather than replacing it, so the child keeps the rest of its tools", async () => {
