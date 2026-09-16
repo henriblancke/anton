@@ -341,13 +341,14 @@ export async function withHostLock<T>(
   // running `fn`, believing it never lost the lock) stranded under the tombstone while we also
   // start running — two holders in the protected section at once. `${dir}.reclaiming` is mkdir'd
   // before the decision starts and only removed after retire() (including any restore) finishes, so
-  // waiting out a *fresh* gate instead of racing narrows that vacancy down to a single mkdir
-  // syscall's worth of unavoidable slop, the same order of race every other primitive in this file
-  // already accepts. Only a fresh gate counts: a live decision never outlives STALE_AFTER_MS (per
-  // reclaim()'s own reaping logic below), so a gate older than that is an orphan from a killed
-  // decider, not a decision in progress — falling through to the normal contended path lets
-  // reclaim()'s existing stale-gate reap run, same as before this check existed. Treating every gate
-  // as a reason to wait would starve that reap forever, since nothing here would ever attempt it.
+  // waiting out a *fresh* gate instead of racing narrows that vacancy down to the gap between this
+  // check and our own mkdir(dir) below — the one remaining sliver is closed by rechecking the gate
+  // again right after that mkdir succeeds, before this acquisition publishes anything. Only a fresh
+  // gate counts: a live decision never outlives STALE_AFTER_MS (per reclaim()'s own reaping logic
+  // below), so a gate older than that is an orphan from a killed decider, not a decision in progress
+  // — falling through to the normal contended path lets reclaim()'s existing stale-gate reap run,
+  // same as before this check existed. Treating every gate as a reason to wait would starve that
+  // reap forever, since nothing here would ever attempt it.
   const reclaimGate = `${dir}.reclaiming`;
 
   while (!held) {
@@ -361,6 +362,22 @@ export async function withHostLock<T>(
     try {
       // mkdir is atomic and fails when the directory exists — the acquire primitive.
       await mkdir(dir);
+      const freshDirStat = await safeStat(dir);
+      // The gate check above can still miss a decision that starts in the gap right before this
+      // mkdir: retire() renames `dir` aside, we mkdir into the vacancy it opens, and — if the
+      // holder it retired turns out to still be alive — its restore then races this still-
+      // unpublished directory next. Recheck the gate now, before writing anything, so a pending
+      // restore always finds `dir` either vacant or gone rather than colliding with metadata we
+      // already wrote. Guard the abandon itself with an identity check: by the time we act, the
+      // restore may already have replaced this same path with the holder it put back, and a blind
+      // rm would destroy that instead of our own (still-empty) directory.
+      const gateAfterMkdir = await safeStat(reclaimGate);
+      if (gateAfterMkdir !== undefined && Date.now() - gateAfterMkdir.mtimeMs <= STALE_AFTER_MS) {
+        if (sameIdentity(freshDirStat, await safeStat(dir))) {
+          await rm(dir, { recursive: true, force: true }).catch(() => {});
+        }
+        continue;
+      }
       held = true;
       break;
     } catch {

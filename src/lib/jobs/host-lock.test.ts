@@ -28,6 +28,7 @@ const {
   WRITE_FAIL_MARKER,
   REPUBLISH_MARKER,
   LATE_PUBLISH_MARKER,
+  MKDIR_GATE_RACE_MARKER,
   SUCCESSOR_TOKEN,
   D2_TOKEN,
   CREATOR_TOKEN,
@@ -43,6 +44,7 @@ const {
   WRITE_FAIL_MARKER: "test-write-fail",
   REPUBLISH_MARKER: "test-republish-race",
   LATE_PUBLISH_MARKER: "test-late-publish-race",
+  MKDIR_GATE_RACE_MARKER: "test-mkdir-gate-race",
   SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
   D2_TOKEN: "22222222-2222-4222-8222-222222222222",
   CREATOR_TOKEN: "33333333-3333-4333-8333-333333333333",
@@ -56,6 +58,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const statCalls = new Map<string, number>();
   const readFileCalls = new Map<string, number>();
   const renameCalls = new Map<string, number>();
+  const mkdirCalls = new Map<string, number>();
 
   const installSuccessor = async (dir: string) => {
     await actual.rename(dir, `${dir}.retired-${SUCCESSOR_TOKEN}`);
@@ -235,6 +238,28 @@ vi.mock("node:fs/promises", async (importOriginal) => {
       }
       // @ts-expect-error -- forwarding whatever arguments the caller passed
       return actual.writeFile(path, ...rest);
+    },
+    // Fires on the 1st mkdir(dir) for the mkdir-gate-race test — the acquire primitive itself,
+    // right after the loop's own gate check found nothing live. Simulates a reclaimer creating its
+    // gate in the gap between that check and this mkdir: by the time this acquisition's mkdir
+    // resolves, a decision is already in flight for the same `dir`.
+    mkdir: async (path: unknown, ...rest: unknown[]) => {
+      if (
+        typeof path === "string" &&
+        path.includes(MKDIR_GATE_RACE_MARKER) &&
+        !path.endsWith(".reclaiming")
+      ) {
+        const n = (mkdirCalls.get(path) ?? 0) + 1;
+        mkdirCalls.set(path, n);
+        if (n === 1) {
+          // @ts-expect-error -- forwarding whatever arguments the caller passed
+          const result = await actual.mkdir(path, ...rest);
+          await actual.mkdir(`${path}.reclaiming`);
+          return result;
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.mkdir(path, ...rest);
     },
   };
 });
@@ -772,6 +797,38 @@ describe("withHostLock", () => {
     await rm(gate, { recursive: true, force: true });
     await run;
     expect(started).toBe(true);
+  });
+
+  it("backs off a fresh mkdir(dir) when a reclaim gate appears right after it, instead of publishing into it", async () => {
+    const name = `${MKDIR_GATE_RACE_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+
+    // The injected mkdir() above fires right after this acquisition's own mkdir(dir) succeeds and
+    // plants a fresh reclaiming gate for the same `dir` — modeling a reclaimer whose gate creation
+    // raced in during the gap between the loop's gate check and this mkdir. Without a recheck right
+    // after mkdir, this acquisition would go on to publish owner.json while that decision is still
+    // live, and a restore it later triggers would find `dir` non-empty and fail, stranding the
+    // legitimate holder while this acquisition keeps running unaware — two holders at once. The fix
+    // must instead abandon this still-empty directory and wait out the gate like any other fresh one.
+    let started = false;
+    const run = withHostLock(name, async () => {
+      started = true;
+    }, { maxWaitMs: 2000 });
+
+    await sleep(150);
+    // Must have backed off rather than entered the section while the gate is live.
+    expect(started).toBe(false);
+    await expect(readFile(join(dir, "owner.json"), "utf8")).rejects.toThrow();
+
+    // The decision completes and releases the gate; the retry now succeeds normally.
+    await rm(gate, { recursive: true, force: true });
+    await run;
+    expect(started).toBe(true);
+    // A real acquire-then-release retires `dir` to a token-specific tombstone on the way out — a
+    // fingerprint the advisory-unlocked fallback never produces, since it never touches `dir` at all.
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
   });
 
   it("does not let a stale reclaiming gate block acquisition forever", async () => {
