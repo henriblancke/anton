@@ -12,7 +12,7 @@ import { resolveReviewConfig } from "../projects";
 import { updateRun } from "../runs";
 import { isForeignRunOwner, isPoisonError } from "./errors";
 import { ReviewBlockedError } from "./execute-epic-errors";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { RunPreparation } from "./execute-epic-prepare";
 import {
   orphanClause,
