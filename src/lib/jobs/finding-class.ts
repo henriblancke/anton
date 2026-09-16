@@ -30,7 +30,7 @@ type Matcher = RegExp | ((note: string) => boolean);
  * instead of "is"/"was" is still a work-loss finding.
  */
 const WORK_LOSS_SUBJECT =
-  "(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?";
+  "(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update|work)s?";
 const WORK_LOSS_RETRY =
   "(?:retry|retried|retries|requeue|requeued|re-?queue|re-?queued|redeliver|redelivered|reprocess|reprocessed)";
 const WORK_LOSS_SIGNAL = `(?:${WORK_LOSS_SUBJECT}|${WORK_LOSS_RETRY})`;
@@ -89,6 +89,12 @@ const WORK_LOSS_PREPOSITIONAL_OBJECT =
 // character", not "a request". Reject any gap containing one rather than crediting the noun to the
 // loss verb just because no clause-breaking punctuation sits between them.
 const WORK_LOSS_INTERVENING_GERUND = /\b\w+ing\b/i;
+// A clause-boundary word in the gap ("is dropped when the batch job finishes") means the candidate
+// noun belongs to an unrelated subordinate clause describing timing, not to this verb — "job" there
+// is the subject of "finishes", not what got dropped. CLAUSE_GAP already excludes hard punctuation
+// boundaries (comma/semicolon/colon/dash/period), but "when"/"if"/etc introduce a clause without any
+// of those, so they need their own rejection the same way the gerund check does.
+const WORK_LOSS_INTERVENING_CLAUSE_BOUNDARY = /\b(?:when|if|while|before|after|because|although)\b/i;
 
 function matchesWorkLossPassive(note: string): boolean {
   // A manual exec loop, not matchAll: a rejected match ("For each request the queued job is
@@ -105,7 +111,7 @@ function matchesWorkLossPassive(note: string): boolean {
   }
   for (const match of note.matchAll(WORK_LOSS_VERB_FIRST)) {
     const gap = match[1] ?? "";
-    if (!WORK_LOSS_INTERVENING_GERUND.test(gap)) return true;
+    if (!WORK_LOSS_INTERVENING_GERUND.test(gap) && !WORK_LOSS_INTERVENING_CLAUSE_BOUNDARY.test(gap)) return true;
   }
   return false;
 }

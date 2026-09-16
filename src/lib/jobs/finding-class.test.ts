@@ -496,4 +496,19 @@ describe("classifyFindingClass", () => {
     const note = "The parser validation returns true for malformed input when decoding throws.";
     expect(classifyFindingClass(finding(note))).toBe("other");
   });
+
+  it("classifies a passive 'work is dropped' finding using 'work' itself as the lost value", () => {
+    const note = "The pending work is dropped when processing fails, with no retry and no log of the failure.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a passive 'work is discarded' finding using 'work' itself as the lost value", () => {
+    const note = "Queued work is discarded after the handler throws, so the caller's submission never completes.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("does not classify an ordinary cleanup finding as work-loss when a clause-boundary word separates the verb from an unrelated signal noun", () => {
+    const note = "The temp file is dropped when the batch job finishes, which is expected cleanup behavior.";
+    expect(classifyFindingClass(finding(note))).toBe("other");
+  });
 });
