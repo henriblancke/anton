@@ -12,6 +12,7 @@ import {
   type RunClaudeOptions,
 } from "../claude/driver";
 import { loadSkill } from "../claude/prompt";
+import { quotaMeterKey } from "../quota-meter";
 import { resolveScanSeverity, type ProjectSettings } from "../projects";
 import { parseTriageOutcome, type TriageOutcome } from "../scan-health";
 import {
@@ -71,7 +72,7 @@ export async function runTriage(opts: {
   logPath: string;
   signal: AbortSignal;
   /** The runner's spend signal — the triage session is the one place this job invokes Claude. */
-  claudeReached: () => Promise<void>;
+  claudeReached: (meterKey?: string) => Promise<void>;
   onEvent: (e: ClaudeEvent) => void;
   /**
    * The claude driver, so the pass hands in a METERED one (anton-77l9) — a nightly triage spends
@@ -88,12 +89,13 @@ export async function runTriage(opts: {
     boardSection,
   });
 
-  await opts.claudeReached();
+  const routing = claudeRouting(settings);
+  await opts.claudeReached(quotaMeterKey(settings));
   const claudeResult = await (opts.claude ?? runClaude)({
     cwd: project.repoPath,
     prompt,
     model: resolveModel(settings, { jobType: "nightly-stringer" }),
-    routing: claudeRouting(settings),
+    routing,
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     signal: opts.signal,
     onEvent: opts.onEvent,

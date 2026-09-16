@@ -21,6 +21,7 @@ import {
   type ProjectSettings,
 } from "../projects";
 import { claudeRouting } from "../claude/driver-routing";
+import { quotaMeterKey } from "../quota-meter";
 import {
   ANTHROPIC_DEFAULT_ENDPOINT_HOST,
   createRun,
@@ -28,7 +29,7 @@ import {
   findOpenRunForEpic,
   updateRun,
 } from "../runs";
-import { PoisonEpic } from "./errors";
+import { PoisonEpic, RouteAdmissionStaleError } from "./errors";
 import { blockedRunPoison, runReadiness } from "./execute-epic-board";
 import { humanTargetPoison } from "./execute-epic-human-gate";
 import { makeRunLease } from "./execute-epic-lease";
@@ -63,6 +64,25 @@ export async function beginEpicRun(args: {
 
   const repo = project.repoPath;
   const settings = await getProjectSettings(db, projectId);
+
+  // Budget admission (the governor's per-tick `budgetGate`, narrowed by one more revalidation read
+  // right before lease — see `revalidateAdmittedGovernorMeters`) ran against a settings snapshot
+  // that can still be stale by the time this run takes its OWN read, closest to the point it would
+  // actually hold anything (PR #269 review). Compare against the meter that snapshot admitted: a
+  // mismatch means routing moved again after that last check, so the meter this run is about to
+  // dispatch through never cleared `budgetGate` — refuse now rather than spend an unvalidated
+  // (possibly exhausted) pool. `undefined` means this project's admission carries no meter to
+  // compare against (ungoverned, or budget pacing isn't wired) — proceed as before.
+  if (ctx.admittedMeterKey !== undefined) {
+    const currentMeterKey = quotaMeterKey(settings);
+    if (currentMeterKey !== ctx.admittedMeterKey) {
+      throw new RouteAdmissionStaleError(
+        `project ${projectId} routing changed from admitted meter "${ctx.admittedMeterKey}" to ` +
+          `"${currentMeterKey}" before dispatch`,
+      );
+    }
+  }
+
   const userAgentIds = await discoverUserAgents(repo);
 
   // `loadAllIssues`, not a bare `bd list`: bd OMITS gate beads from every ordinary listing while

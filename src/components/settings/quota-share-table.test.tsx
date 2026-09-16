@@ -23,6 +23,7 @@ function project(overrides: Partial<QuotaShareProject> & { id: string }): QuotaS
     sharePct: 50,
     declared: true,
     governed: true,
+    meterKey: "anthropic",
     reserved: false,
     eligible: true,
     spentWeeklyPct: null,

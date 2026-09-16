@@ -23,19 +23,23 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  closeSync,
   copyFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { arch as osArch, homedir, platform as osPlatform } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { arch as osArch, homedir, platform as osPlatform, tmpdir } from "node:os";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import {
@@ -368,7 +372,13 @@ function nextArgs(sub, args) {
   return port ? [sub, "-p", String(port)] : [sub];
 }
 
-/** Run a local package bin (next / drizzle-kit) from APP_ROOT, inheriting stdio. Returns exit code. */
+/**
+ * Run a local package bin from APP_ROOT, inheriting stdio. Returns exit code.
+ *
+ * Plumbing for `runLocalPinnedToThisNode` below, which is what callers use: every bin this launcher
+ * spawns (`next`, `drizzle-kit`) loads better-sqlite3, so every one of them needs the pin. Calling
+ * this directly leaves the child free to resolve a different node than the one anton healed for.
+ */
 function runLocal(bin, args, env = {}) {
   const exe = join(BIN, bin);
   const target = existsSync(exe) ? exe : bin; // fall back to PATH if not vendored
@@ -378,6 +388,149 @@ function runLocal(bin, args, env = {}) {
     env: { ...process.env, ...serverRootEnv(), ...env },
   });
   return r.status ?? 1;
+}
+
+/**
+ * `runLocal` for a bin that loads better-sqlite3, run by THIS runtime.
+ *
+ * That is every bin this launcher spawns: `drizzle-kit` opens the DB to migrate, and `next` (dev,
+ * build and start alike) reaches it through instrumentation as the server boots. Pinning only the
+ * migration would heal an ABI the server then fails to load, moving the same crash one step later
+ * — migrations pass, the server dies reporting the mismatch with the numbers reversed (PR #298
+ * review).
+ *
+ * Those bins start with `#!/usr/bin/env node`, so left alone they resolve node from PATH — which is
+ * not necessarily the runtime running anton. That split is routine rather than exotic: with nvm
+ * installed alongside Homebrew, nvm's shim wins in an interactive shell and /opt/homebrew/bin sorts
+ * first in a login shell, so the same command in the same directory can resolve either one.
+ *
+ * It matters because better-sqlite3's addon is per-ABI: `ensureBetterSqlite3` can only heal for one
+ * runtime, and it heals for the one it is running in. Let the child resolve its own and the heal
+ * aims at the wrong ABI — we download a binary for OURS and the child still fails to load it,
+ * reporting the mismatch with the numbers the other way round.
+ *
+ * So the bin's JS is handed to `process.execPath` DIRECTLY, and its shebang never gets a vote.
+ * Prepending `dirname(process.execPath)` to PATH instead — the first version of this — pins nothing
+ * when anton runs under Bun: `process.execPath` is then `bun`, whose directory holds no executable
+ * named `node`, so the child falls through to ambient Node while the heal targeted Bun's ABI. That
+ * is this very bug wearing a different hat (PR #298 review). Executing the file removes the
+ * question: the process that loads the addon is the process we healed for, by construction.
+ *
+ * The PATH prepend is KEPT on top, because it is still load-bearing for a bin that shells out to
+ * `node` itself, and it costs nothing. A `.bin` entry that is not a readable JS file (a binary, or
+ * a shim shape we do not recognise) falls back to spawning it as before — degraded to the PATH pin
+ * rather than failing outright.
+ */
+function runLocalPinnedToThisNode(bin, args, env = {}) {
+  // Prepend to the PATH the child would otherwise get — a caller-supplied one when there is one,
+  // this process's own otherwise. Rebuilding it from process.env unconditionally would silently
+  // drop an override and send the child looking down the wrong PATH entirely.
+  const base = env.PATH ?? process.env.PATH ?? "";
+  const runtimeDir = nodeShimDir() ?? dirname(process.execPath);
+  const pinned = { ...env, PATH: base ? `${runtimeDir}${delimiter}${base}` : runtimeDir };
+  const script = resolveJsBin(bin);
+  if (!script) return runLocal(bin, args, pinned);
+  // `process.execPath` with the script as argv[1] — the shebang is bypassed entirely, so this holds
+  // under Bun and under any node whose directory is not on PATH.
+  return runLocal(process.execPath, [script, ...args], pinned);
+}
+
+/**
+ * A directory holding a `node` that IS this runtime, first on a child's PATH.
+ *
+ * Executing a bin's JS ourselves pins that one process, and no further (PR #298 review). `npm
+ * rebuild` runs package lifecycle scripts, and node-pty's is literally
+ * `node scripts/prebuild.js || node-gyp rebuild` — a bare `node` npm resolves from PATH. Under Bun
+ * there is no `node` beside `process.execPath` to find, so those grandchildren compile the addon
+ * for ambient Node while the server runs on the runtime we healed: the same ABI split, one process
+ * deeper, and invisible because the rebuild still reports success.
+ *
+ * So when this runtime is not itself reachable as `node`, write a shim that execs it and hand the
+ * child THAT directory. Cached per process, and best-effort — an unwritable tmpdir falls back to
+ * `dirname(process.execPath)`, which is correct whenever anton runs under a real node.
+ */
+let nodeShimDirCache;
+function nodeShimDir(execPath = process.execPath) {
+  // `execPath` is injected ONLY by tests: this machine runs a real node, where the shim is correctly
+  // a no-op, so the Bun-shaped branch is otherwise unreachable and its rule untestable. The cache is
+  // bypassed for an injected path so a case cannot poison the process-wide one (PR #298 review).
+  const caching = execPath === process.execPath;
+  if (caching && nodeShimDirCache !== undefined) return nodeShimDirCache;
+  const remember = (dir) => (caching ? (nodeShimDirCache = dir) : dir);
+  const own = dirname(execPath);
+  // Reuse our own directory ONLY when this runtime IS node. A sibling file named `node` is not
+  // evidence: under Bun in a shared prefix (/usr/local/bin, a conda env) that sibling is some OTHER
+  // runtime, and trusting it hands lifecycle scripts the very ABI we are trying to avoid — the
+  // rebuild then targets it while the server runs on Bun (PR #298 review). When in doubt, shim.
+  if (basename(execPath).replace(/\.exe$/i, "") === "node") return remember(own);
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "anton-node-shim-"));
+    const shim = join(dir, "node");
+    // The exec target is passed as a POSITIONAL PARAMETER, never interpolated into the script body.
+    // JSON.stringify escapes `"` and `\` but NOT `$` or a backtick, both live inside sh double
+    // quotes — a runtime path containing one would be expanded instead of executed, silently
+    // breaking the shim. Same argv-not-a-string fix resolveJsBin took (PR #298 review). The heredoc
+    // is quoted ('EOF') so the path is written verbatim, and `shift` drops it before "$@".
+    writeFileSync(shim, `#!/bin/sh\nset -- ${shQuote(execPath)} "$@"\nexec "$@"\n`);
+    chmodSync(shim, 0o755);
+    // Best-effort cleanup: the shim outlives any child that needs it, so it goes at exit rather
+    // than being left for tmp reapers (PR #298 review). `exit` also fires after a normal return.
+    process.on("exit", () => {
+      try { rmSync(dir, { recursive: true, force: true }); } catch {}
+    });
+    return remember(dir);
+  } catch {
+    return remember(own); // best-effort: the JS-exec pin above still holds
+  }
+}
+
+/**
+ * A string as ONE literal POSIX shell word: wrap in single quotes, and end/reopen the quoting around
+ * any single quote inside. Nothing within single quotes is special to the shell — no `$`, no
+ * backtick, no backslash — so the value survives verbatim however strange the path.
+ */
+function shQuote(value) {
+  return `'${String(value).split("'").join(`'\\''`)}'`;
+}
+
+/**
+ * The real JS file behind a `node`-shebang command, or null when it is not one.
+ *
+ * Two places are searched, vendored first: `node_modules/.bin/<bin>`, which npm/bun link to the
+ * package's own script (`next` → `next/dist/bin/next`), then PATH — which is how `npm` itself is
+ * found, a symlink to `npm-cli.js`. Either way the target is ordinary JS that any runtime can
+ * execute directly, which is what lets the caller bypass the shebang.
+ *
+ * Returns null for an explicit path (the caller means it literally), a command that is nowhere, or
+ * a file that does not start with a `node` shebang — a real binary, or a wrapper shape we do not
+ * recognise. The caller then spawns it the old way rather than guessing at it.
+ */
+function resolveJsBin(bin) {
+  if (bin.includes("/") || bin.includes("\\")) return null; // already a path — caller means it literally
+  const vendored = join(BIN, bin);
+  // argv, not a shell string: `sh -c "command -v ${bin}"` interpolated `bin` unquoted, which every
+  // present caller makes safe by passing a literal but the signature does not promise (PR #298
+  // review). `command` is a shell builtin, so the lookup runs through `sh` with bin as a separate
+  // ARGUMENT — nothing in it can be read as syntax.
+  const onPath = spawnSync("sh", ["-c", 'command -v "$1"', "sh", bin], { encoding: "utf8" });
+  const candidate = existsSync(vendored) ? vendored : (onPath.stdout ?? "").trim();
+  if (!candidate || !existsSync(candidate)) return null;
+  try {
+    const target = realpathSync(candidate);
+    // Bounded read: this path also runs for PATH entries that turn out to be real binaries, and
+    // decoding a multi-MB executable as UTF-8 to inspect 64 bytes is wasted work (PR #298 review).
+    const fd = openSync(target, "r");
+    let head;
+    try {
+      const buf = Buffer.alloc(64);
+      head = buf.toString("utf8", 0, readSync(fd, buf, 0, 64, 0));
+    } finally {
+      closeSync(fd);
+    }
+    return /^#!.*\bnode\b/.test(head) ? target : null;
+  } catch {
+    return null; // unreadable or binary — fall back to spawning the bin itself
+  }
 }
 
 /**
@@ -729,6 +882,25 @@ function ensureBetterSqlite3(appRoot = APP_ROOT) {
 }
 
 /**
+ * `ensureBetterSqlite3` for a caller that must REPORT rather than throw. Returns an exit code.
+ *
+ * The heal throws when there is no prebuilt for this Node/platform, and `main` is invoked as
+ * `Promise.resolve(main(...)).then(...)` with no top-level catch — so an uncaught throw here
+ * surfaces as an unhandled rejection and a raw stack, which is precisely the ERR_DLOPEN_FAILED
+ * wall of text this bead exists to replace with one line of advice (PR #298 review).
+ */
+function healNativeAbi(appRoot = APP_ROOT) {
+  try {
+    ensureBetterSqlite3(appRoot);
+    return 0;
+  } catch (e) {
+    console.log(c.red("\n✗ better-sqlite3 cannot be loaded under this Node."));
+    console.log(c.red(`  ${String(e.message ?? e)}`));
+    return 1;
+  }
+}
+
+/**
  * Apply the committed drizzle migration SQL directly via better-sqlite3 (a production dep), so a
  * prebuilt bundle needs no drizzle-kit (a devDep we don't ship). Idempotent: tracks applied files
  * in `__anton_migrations` and only runs new ones. Mirrors the SQL-splitting in src/lib/db/testing.ts.
@@ -768,9 +940,17 @@ function applyMigrations(dbPath, opts = {}) {
  * Apply any pending DB migrations before the server serves — so `anton start` never runs on a
  * stale schema and operators don't have to remember `anton setup`. Mirrors cmdSetup's branching:
  * a prebuilt bundle applies the committed SQL in-process (no drizzle-kit devDep is shipped), while
- * a source checkout uses drizzle-kit. Idempotent — a start with nothing pending is a clean no-op.
+ * a source checkout uses drizzle-kit. BOTH branches heal the native better-sqlite3 ABI first —
+ * the bundle inside applyMigrations, the source checkout here — because drizzle-kit loads the same
+ * addon and would otherwise die on a Node the binary was not built for (anton-m6pg6).
+ * Idempotent — a start with nothing pending is a clean no-op.
  * Throws on failure so the caller can abort rather than serve a stale schema. (The bundle DAEMON
  * path migrates in startDaemon; this covers source `start` and bundle `--foreground`.)
+ *
+ * `heal` and `run` are injected so the source branch is testable without a real ABI break or a real
+ * migrate — the same seam `ensureFreshBuild` takes its `build` through. The defaults are the whole
+ * point of the branch, so a test that stubs them asserts the ORDER (heal, then spawn); that the
+ * default spawn is the PINNED one is asserted structurally, in the guard over this file's call sites.
  */
 function ensureMigrated(opts = {}) {
   const isBundle = opts.isBundle ?? IS_BUNDLE;
@@ -780,9 +960,14 @@ function ensureMigrated(opts = {}) {
     if (ran) console.log(c.dim(`applied ${ran} migration(s) → ${dbPath}`));
     return { ran };
   }
-  // Source checkout: drizzle-kit tracks applied migrations in __drizzle_migrations, so re-running
-  // with nothing pending is a no-op. A non-zero exit (bad SQL, unreachable DB) must fail start.
-  const rc = runLocal("drizzle-kit", ["migrate"]);
+  // Source checkout: drizzle-kit opens the DB through the same native better-sqlite3 the bundle
+  // branch heals inside applyMigrations, so heal here too (anton-m6pg6). Without this the ABI
+  // mismatch surfaces from INSIDE drizzle-kit as a raw ERR_DLOPEN_FAILED stack, which reads as a
+  // migration bug rather than the one-command environment fix it actually is.
+  (opts.heal ?? ensureBetterSqlite3)(opts.appRoot);
+  // drizzle-kit tracks applied migrations in __drizzle_migrations, so re-running with nothing
+  // pending is a no-op. A non-zero exit (bad SQL, unreachable DB) must fail start.
+  const rc = (opts.run ?? runLocalPinnedToThisNode)("drizzle-kit", ["migrate"]);
   if (rc !== 0) throw new Error("drizzle-kit migrate failed — see output above");
   return { ran: null };
 }
@@ -827,7 +1012,10 @@ async function startDaemon(args) {
   const spawnArgs = useStandalone
     ? [standaloneServer]
     : [join(APP_ROOT, "node_modules", "next", "dist", "bin", "next"), "start", "-p", String(port)];
-  const child = spawn("node", spawnArgs, {
+  // `process.execPath`, not "node": applyMigrations above healed the addon for THIS node's ABI, and
+  // a bare "node" would resolve PATH's — which on a two-node machine is the other one, leaving the
+  // daemon to die on the mismatch the heal just fixed (PR #298 review).
+  const child = spawn(process.execPath, spawnArgs, {
     cwd: APP_ROOT,
     detached: true,
     stdio: ["ignore", out, err],
@@ -1087,8 +1275,12 @@ async function cmdUpdate() {
 
   if (wasRunning) {
     console.log(c.dim("restarting…"));
-    // Re-exec the freshly installed launcher so the new runtime serves.
-    spawnSync("node", [join(runtime, "bin", "anton.mjs"), "start"], { stdio: "inherit" });
+    // Re-exec the freshly installed launcher so the new runtime serves — under THIS runtime, not
+    // whichever one PATH happens to answer with. Found by sweeping for siblings after the review
+    // caught this same class three times (PR #298 review): a bare "node" here restarts the server
+    // on a different ABI than the one that just healed and migrated, which is this bead's bug
+    // reappearing at the end of an upgrade, when the operator is least likely to connect the two.
+    spawnSync(process.execPath, [join(runtime, "bin", "anton.mjs"), "start"], { stdio: "inherit" });
   }
   return 0;
 }
@@ -1117,6 +1309,38 @@ async function cmdUninstall(args = []) {
   return 0;
 }
 
+/**
+ * The two Node floors, which are deliberately different and must not be conflated.
+ *
+ * NODE_MIN is what anton RUNS on: the bundle self-heals its native modules per ABI during setup,
+ * so any current major works and the README says so. NODE_DEV is what this repo DEVELOPS against —
+ * `.nvmrc`, `engines.node`, and the Node `release.yml` builds the bundle with, pinned together so a
+ * three-ABI machine (nvm, Homebrew, bun's embedded) has one answer. Both are declared here so the
+ * check, the warning, and the docs cannot drift apart again (PR #298 review).
+ *
+ * Note that `ci.yml` pins NO Node: every gate there runs under Bun, so NODE_DEV is enforced by the
+ * RELEASE build, not by a PR check. A Node-ABI regression therefore surfaces at release time — which
+ * is why `ensureBetterSqlite3` heals at runtime rather than trusting any pin (PR #298 review).
+ */
+const NODE_MIN = 20;
+const NODE_DEV = "24.21.0";
+
+/**
+ * Which band a Node version falls in: "unsupported" | "below-dev" | "ok". Pure and exported, so the
+ * decision is testable without mocking `process.versions` (PR #298 review) — the same reason
+ * `cmdDev` and `ensureMigrated` take injected seams.
+ *
+ * The floor is MAJOR-only, matching how the bundle's ABI heal actually works: a prebuilt exists per
+ * Node major, so 20.0.0 and 20.11.0 are the same question. The dev pin is compared in FULL, because
+ * it is a pin — `.nvmrc` and `release.yml` name 24.21.0 exactly, and 24.0.0 is genuinely below what
+ * this repo builds against, so the major-only test would have waved it through silently.
+ */
+function nodeBand(version) {
+  const major = Number(String(version).replace(/^v/, "").split(".")[0]);
+  if (!(major >= NODE_MIN)) return "unsupported";
+  return compareVersions(version, NODE_DEV) < 0 ? "below-dev" : "ok";
+}
+
 /** Prereq check. Returns true when all *required* tools are present. */
 function checkPrereqs() {
   console.log(c.bold("\nChecking prerequisites:"));
@@ -1137,11 +1361,17 @@ function checkPrereqs() {
     console.log(`  ${present && !bdTooOld ? "✓" : "✗"} ${p.cmd.padEnd(9)} ${tag}  ${c.dim(p.why)}`);
     if ((!present || bdTooOld) && p.required) ok = false;
   }
-  const node = process.versions.node.split(".").map(Number);
-  const nodeOk = node[0] >= 20;
+  const band = nodeBand(process.versions.node);
+  const nodeOk = band !== "unsupported";
   console.log(
-    `  ${nodeOk ? "✓" : "✗"} ${"node".padEnd(9)} ${nodeOk ? c.green(process.versions.node) : c.red(process.versions.node + " (need ≥20)")}`,
+    `  ${nodeOk ? "✓" : "✗"} ${"node".padEnd(9)} ${nodeOk ? c.green(process.versions.node) : c.red(`${process.versions.node} (need ≥${NODE_MIN})`)}` +
+      (band === "below-dev" ? c.yellow(`  ! below the ${NODE_DEV} this repo develops and releases against`) : ""),
   );
+  // Named, not failed: a bundle self-heals its native modules for any Node ≥ NODE_MIN, so a 20–23
+  // machine is supported and must not be told otherwise. But `engines`/.nvmrc pin NODE_DEV, and a
+  // package manager run with --engine-strict enforces that pin — so doctor passing in silence is
+  // how "doctor says you're fine" turns into an install-time failure nothing warned about
+  // (PR #298 review). The warning is the honest middle: supported, not what we build against.
   return ok && nodeOk;
 }
 
@@ -1608,7 +1838,11 @@ async function cmdSetup(args = []) {
     }
   } else {
     console.log(c.bold("\nApplying database migrations (drizzle-kit migrate):"));
-    const migrated = runLocal("drizzle-kit", ["migrate"]);
+    // Same heal the bundle branch gets via applyMigrations (anton-m6pg6) — and reported the same
+    // way, since the bundle branch wraps its own in a try/catch and this one throws too.
+    const healed = healNativeAbi();
+    if (healed !== 0) return healed;
+    const migrated = runLocalPinnedToThisNode("drizzle-kit", ["migrate"]);
     if (migrated !== 0) {
       console.log(c.red("migration failed — see output above."));
       return migrated;
@@ -1616,8 +1850,19 @@ async function cmdSetup(args = []) {
 
     // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
     // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
+    //
+    // Pinned like every other child, and through the SAME helper (PR #298 review). npm resolves its
+    // own node from PATH, so on the two-runtime split this bead is about it would rebuild node-pty
+    // for the OTHER runtime — and the server, now pinned to this one, loads that addon when an
+    // interactive session opens. Setup and start both pass; the terminal fails on first use.
+    //
+    // A PATH prepend alone is NOT enough, which was this fix's first draft: under Bun that prepends
+    // a directory with no `node` in it, so npm's own `#!/usr/bin/env node` still finds ambient Node.
+    // runLocalPinnedToThisNode already solves exactly that by executing the resolved JS
+    // (npm → npm-cli.js) with process.execPath, so the rebuild goes through it rather than
+    // re-deriving a weaker version of the same pin.
     console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
-    const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], { cwd: APP_ROOT, stdio: "inherit" });
+    const rebuilt = { status: runLocalPinnedToThisNode("npm", ["rebuild", "node-pty"]) };
     if ((rebuilt.status ?? 1) !== 0) {
       console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
       console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));
@@ -2163,9 +2408,26 @@ async function cmdServerMode(args = []) {
   return 0;
 }
 
-function cmdDev(args) {
+/**
+ * `next dev`, healed then pinned — in that order (PR #298 review).
+ *
+ * The heal is not optional once the spawn is pinned. Unpinned, `next dev` resolved its own node and
+ * could happen to land on the one the installed addon was built for; pinning takes that coincidence
+ * away, so a dev server whose ABI nobody healed now fails where it used to boot. Every other
+ * command that spawns a better-sqlite3 child already heals first — `cmdSetup` before drizzle-kit,
+ * `cmdStart` via ensureMigrated, `startDaemon` via applyMigrations — and dev is the one run most.
+ *
+ * It heals WITHOUT migrating: `next dev` is the one command that should come up against whatever
+ * schema is on disk, so a developer can start the server on a branch mid-migration.
+ *
+ * `heal`/`run` are injected for the same reason `ensureMigrated` takes them — to assert the order
+ * without a real ABI break or a real dev server.
+ */
+function cmdDev(args, opts = {}) {
+  const healed = (opts.heal ?? healNativeAbi)();
+  if (healed !== 0) return healed;
   console.log(c.dim("anton dev — starting Next.js dev server (runner + scheduler auto-start)…"));
-  return runLocal("next", nextArgs("dev", args));
+  return (opts.run ?? runLocalPinnedToThisNode)("next", nextArgs("dev", args));
 }
 
 /**
@@ -2217,7 +2479,7 @@ const MAX_BUILD_ATTEMPTS = 3;
 function ensureFreshBuild({
   appRoot,
   isBundle,
-  build = () => runLocal("next", ["build", "--webpack"]),
+  build = () => runLocalPinnedToThisNode("next", ["build", "--webpack"]),
   readIdentity = readBuildIdentity,
   liveServers = () => liveBuildRecords(resolveAntonDb(), appRoot),
 }) {
@@ -2296,7 +2558,7 @@ async function cmdStart(args) {
   // STATE_DIR (the same env startDaemon passes), so it opens the DB ensureMigrated() just migrated
   // rather than falling back to a stray anton.db under the cwd. Source checkouts resolve their own DB.
   const serverEnv = IS_BUNDLE ? bundleStateEnv() : {};
-  return runLocal("next", nextArgs("start", args), serverEnv);
+  return runLocalPinnedToThisNode("next", nextArgs("start", args), serverEnv);
 }
 
 const USAGE = `${c.bold("anton")} — local autonomous-coding orchestrator
@@ -2398,9 +2660,18 @@ export {
   REQUIRED_SKILLS,
   INSTALLED_SKILLS,
   compareVersions,
+  NODE_MIN,
+  NODE_DEV,
+  nodeBand,
   platformLabel,
   fetchLatestRelease,
   applyMigrations,
   ensureMigrated,
   ensureBetterSqlite3,
+  healNativeAbi,
+  resolveJsBin,
+  nodeShimDir,
+  shQuote,
+  cmdDev,
+  runLocalPinnedToThisNode,
 };

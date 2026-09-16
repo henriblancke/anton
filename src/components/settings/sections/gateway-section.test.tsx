@@ -28,7 +28,12 @@ import type { SettingsForm } from "@/components/settings/use-settings-form";
 function renderSection() {
   const set = vi.fn();
   const form = {
-    draft: { claudeBaseUrl: "", claudeAuthTokenEnv: "", claudeGatewayModelDiscovery: false },
+    draft: {
+      claudeBaseUrl: "",
+      claudeAuthTokenEnv: "",
+      claudeGatewayModelDiscovery: false,
+      routerConnectionId: "",
+    },
     set,
   } as unknown as SettingsForm;
   render(<GatewaySection form={form} />);
@@ -97,9 +102,14 @@ describe("gateway section — the mechanism stays generic (anton-dxs6)", () => {
     expect(heading.textContent).not.toMatch(/9Router/i);
   });
 
-  it("labels the three fields generically", () => {
+  it("labels the four fields generically", () => {
     renderSection();
-    for (const label of ["Base URL", "Auth token env var", "Discover models from the gateway"]) {
+    for (const label of [
+      "Base URL",
+      "Auth token env var",
+      "Router connection id",
+      "Discover models from the gateway",
+    ]) {
       const field = screen.getByLabelText(label);
       expect(field, `missing generic field: ${label}`).toBeTruthy();
     }
@@ -111,6 +121,17 @@ describe("gateway section — the mechanism stays generic (anton-dxs6)", () => {
   it("says the mechanism is any Anthropic-compatible gateway", () => {
     renderSection();
     expect(screen.getByText(/Anthropic-compatible gateway/i)).toBeTruthy();
+  });
+
+  /**
+   * anton-m5oc: a router fronts N provider connections but this project meters on exactly one of
+   * them, and that collapse rule must be stated in the UI, not left for the operator to infer from
+   * a single unlabelled text field.
+   */
+  it("states the N-connections-to-one-snapshot collapse rule", () => {
+    renderSection();
+    expect(flatText()).toMatch(/exactly one/i);
+    expect(flatText()).toMatch(/never sums or averages across/i);
   });
 
   it("confines the vendor to the worked example", () => {

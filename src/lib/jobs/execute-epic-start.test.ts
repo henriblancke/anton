@@ -20,7 +20,8 @@ import { LABELS, type Bead } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { proposalFingerprint } from "../gardener/detections";
 import type { ProjectSettings } from "../projects";
-import { PoisonEpic } from "./errors";
+import { quotaMeterKey } from "../quota-meter";
+import { PoisonEpic, RouteAdmissionStaleError } from "./errors";
 
 const loadAllIssuesMock = vi.fn();
 const createRunMock = vi.fn();
@@ -82,11 +83,18 @@ function proposal(id: string, kind: "stale" | "low-value" = "stale"): Bead {
 }
 
 /** Start a run against `board`, and hand back whatever it refused with. */
-async function start(board: Bead[], targetId: string): Promise<unknown> {
+async function start(
+  board: Bead[],
+  targetId: string,
+  opts: { admittedMeterKey?: string } = {},
+): Promise<unknown> {
   loadAllIssuesMock.mockResolvedValue(board);
   return beginEpicRun({
     db: {} as never,
-    ctx: { payload: { projectId: "p1", epicBeadId: targetId } } as never,
+    ctx: {
+      payload: { projectId: "p1", epicBeadId: targetId },
+      admittedMeterKey: opts.admittedMeterKey,
+    } as never,
   }).then(
     (run) => run,
     (e: unknown) => e,
@@ -202,6 +210,56 @@ describe("beginEpicRun — the created run records its endpoint host (anton-oom5
     expect(createRunMock).not.toHaveBeenCalled();
     expect(updateRunMock).toHaveBeenCalledTimes(1);
     expect(updateRunMock.mock.calls[0][3]).toMatchObject({ endpointHost: "router.local:20128" });
+  });
+});
+
+describe("beginEpicRun — refuses a start whose routing outran its budget admission (PR #269 review)", () => {
+  // Budget admission (the governor's per-tick check) is granted against a meterKey snapshot that can
+  // still be stale by the time a start takes its OWN settings read, closest to the point it would
+  // actually hold anything. The admitted meter is carried through the lease as `ctx.admittedMeterKey`
+  // so a mismatch here — routing moved again since admission — refuses the start rather than
+  // dispatching through a meter that never cleared `budgetGate`.
+  it("refuses when the current route no longer matches what admitted this tick", async () => {
+    projectSettings = {
+      claudeBaseUrl: "https://token@router.local:20128/v1",
+      claudeAuthTokenEnv: "GATEWAY_TOKEN",
+      routerConnectionId: "conn-1",
+    };
+
+    const refusal = await start([bead("t1")], "t1", { admittedMeterKey: "anthropic" });
+
+    expect(refusal).toBeInstanceOf(RouteAdmissionStaleError);
+    expect((refusal as Error).message).toContain("anthropic");
+    // Nothing held: no run row means no lease, no worktree and no claim can follow.
+    expect(createRunMock).not.toHaveBeenCalled();
+  });
+
+  it("proceeds when the current route still matches the admitted meter", async () => {
+    projectSettings = {
+      claudeBaseUrl: "https://token@router.local:20128/v1",
+      claudeAuthTokenEnv: "GATEWAY_TOKEN",
+      routerConnectionId: "conn-1",
+    };
+
+    const refusal = await start([bead("t1")], "t1", {
+      admittedMeterKey: quotaMeterKey(projectSettings),
+    });
+
+    expect(refusal).not.toBeInstanceOf(Error);
+    expect(createRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("proceeds unchecked when the tick admitted nothing to compare against (ungoverned project)", async () => {
+    projectSettings = {
+      claudeBaseUrl: "https://token@router.local:20128/v1",
+      claudeAuthTokenEnv: "GATEWAY_TOKEN",
+      routerConnectionId: "conn-1",
+    };
+
+    const refusal = await start([bead("t1")], "t1");
+
+    expect(refusal).not.toBeInstanceOf(Error);
+    expect(createRunMock).toHaveBeenCalledTimes(1);
   });
 });
 

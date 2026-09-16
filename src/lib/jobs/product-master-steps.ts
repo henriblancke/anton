@@ -11,6 +11,7 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { claudeRouting } from "../claude/driver";
+import { quotaMeterKey } from "../quota-meter";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
 import { resolveModel } from "./model-routing";
 import { applyArmedProposals, movedTheBoard, reportUnsettledProposals } from "../gardener/armed";
@@ -247,12 +248,13 @@ export async function judgeBoard(scope: PassScope, input: JudgeInput): Promise<P
     `[product-master] judging ${boardInput.board.length} bead(s) with the ${reasoningFrom.kind === "prompt" ? "operator's prompt" : "shipped contract"}\n`,
   );
 
-  await scope.ctx.claudeReached();
+  const routing = claudeRouting(settings);
+  await scope.ctx.claudeReached(quotaMeterKey(settings));
   const result = await claude({
     cwd: scope.project.repoPath,
     prompt,
     model: resolveModel(settings, { jobType: "product-master" }),
-    routing: claudeRouting(settings),
+    routing,
     permissionMode: settings.permissionMode ?? "bypassPermissions",
     disallowedTools: PM_DENIED_TOOLS,
     signal: scope.ctx.signal,

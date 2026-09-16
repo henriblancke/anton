@@ -510,7 +510,7 @@ describe("isBudgetAwareEnabledAnywhere (anton-7mpv.1)", () => {
 });
 
 describe("budgetAwareProjectPolicies (anton-81x2)", () => {
-  it("carries each project's quota share, so the nudge reads the ceiling the runner enforces", async () => {
+  it("carries each Anthropic project's quota share, so the nudge reads the ceiling the runner enforces", async () => {
     // This suite shares one db, so disarm what earlier blocks armed: the split's denominator IS
     // every budget-aware project, and a stray one would silently change every share below.
     for (const p of await listProjects()) {
@@ -531,6 +531,24 @@ describe("budgetAwareProjectPolicies (anton-81x2)", () => {
       full * 0.25,
       full * 0.75,
     ]);
+  });
+
+  it("excludes routed projects from the Anthropic shaping nudge", async () => {
+    for (const p of await listProjects()) {
+      await updateProjectSettings(p.slug, { budgetAware: false });
+    }
+    const account = await addProject({ name: "Account", repoPath: makeRepoDir("nudge-account") });
+    const routed = await addProject({ name: "Routed", repoPath: makeRepoDir("nudge-routed") });
+    await updateProjectSettings(account.slug, { budgetAware: true, quotaSharePct: 100 });
+    await updateProjectSettings(routed.slug, {
+      budgetAware: true,
+      quotaSharePct: 100,
+      claudeBaseUrl: "https://router.example/v1",
+      claudeAuthTokenEnv: "ROUTER_TOKEN",
+      routerConnectionId: "conn_1",
+    });
+
+    expect(await budgetAwareProjectPolicies()).toHaveLength(1);
   });
 });
 
