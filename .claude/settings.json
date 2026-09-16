@@ -89,11 +89,8 @@
   ],
   "permissions": {
     "allow": [
-      "Bash(npx @nanonets/graft:*)",
       "Bash(graft:*)",
-      "Bash(npx graft:*)",
-      "Bash(graft-dev:*)",
-      "Bash(node dist/cli.js:*)"
+      "Bash(npx @nanonets/graft:*)"
     ]
   }
 }
