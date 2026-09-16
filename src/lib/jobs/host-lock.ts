@@ -334,8 +334,30 @@ export async function withHostLock<T>(
 
   let held = false;
   let notifiedWait = false;
+  // A reclaim decision in flight (see reclaim()) can hold `dir` moved aside at a restore tombstone
+  // between retire()'s rename and its own mismatch/verify-failure restore — a window with no
+  // process standing at `dir` at all. Racing a fresh mkdir(dir) into that vacancy would grab the
+  // path out from under the pending restore and leave the legitimate holder (who may already be
+  // running `fn`, believing it never lost the lock) stranded under the tombstone while we also
+  // start running — two holders in the protected section at once. `${dir}.reclaiming` is mkdir'd
+  // before the decision starts and only removed after retire() (including any restore) finishes, so
+  // waiting out a *fresh* gate instead of racing narrows that vacancy down to a single mkdir
+  // syscall's worth of unavoidable slop, the same order of race every other primitive in this file
+  // already accepts. Only a fresh gate counts: a live decision never outlives STALE_AFTER_MS (per
+  // reclaim()'s own reaping logic below), so a gate older than that is an orphan from a killed
+  // decider, not a decision in progress — falling through to the normal contended path lets
+  // reclaim()'s existing stale-gate reap run, same as before this check existed. Treating every gate
+  // as a reason to wait would starve that reap forever, since nothing here would ever attempt it.
+  const reclaimGate = `${dir}.reclaiming`;
 
   while (!held) {
+    const gateStat = await safeStat(reclaimGate);
+    if (gateStat !== undefined && Date.now() - gateStat.mtimeMs <= STALE_AFTER_MS) {
+      const remaining = deadline - Date.now();
+      if (opts.signal?.aborted || remaining <= 0) break; // advisory: run unlocked
+      await new Promise((r) => setTimeout(r, Math.min(POLL_MS, remaining)));
+      continue;
+    }
     try {
       // mkdir is atomic and fails when the directory exists — the acquire primitive.
       await mkdir(dir);

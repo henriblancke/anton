@@ -4,7 +4,7 @@
  * owner died. Lock names are unique per test because the lock root is a real shared /tmp directory.
  */
 import { describe, expect, it, vi } from "vitest";
-import { mkdir, readdir, readFile, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -746,5 +746,58 @@ describe("withHostLock", () => {
     // The live successor must end up back at `dir`, not the empty newcomer that raced in.
     const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
     expect(holder.token).toBe(SUCCESSOR_TOKEN);
+  });
+
+  it("waits for a live reclaim decision's gate instead of racing mkdir into its restore vacancy", async () => {
+    const name = `test-reclaim-gate-fence-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // A fresh reclaiming gate with no `dir` standing at all models the exact vacancy this fix
+    // closes: retire() has renamed `dir` away to a restore tombstone (e.g. on a verify failure) and
+    // hasn't put it back yet. Racing mkdir(dir) into that gap, as the old code did, would grab the
+    // path out from under the pending restore and leave the legitimate holder stranded while a
+    // second acquirer also believes it holds the lock.
+    await mkdir(gate, { recursive: true });
+
+    let started = false;
+    const run = withHostLock(name, async () => {
+      started = true;
+    }, { maxWaitMs: 2000 });
+
+    await sleep(150);
+    // Must be waiting on the fresh gate, not racing an empty mkdir(dir) into the vacancy.
+    expect(started).toBe(false);
+
+    // The decision completes and releases the gate; the path is free for a fresh acquisition.
+    await rm(gate, { recursive: true, force: true });
+    await run;
+    expect(started).toBe(true);
+  });
+
+  it("does not let a stale reclaiming gate block acquisition forever", async () => {
+    const name = `test-reclaim-gate-fence-stale-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // An orphaned gate old enough that no live decision could still be behind it (a live decision
+    // never outlives STALE_AFTER_MS) must not be treated as a reason to wait — otherwise every
+    // future acquirer would poll out its full budget and fall back to advisory-unlocked forever,
+    // instead of falling through to the normal path that reaps it.
+    await mkdir(gate, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(gate, old, old);
+
+    let ran = false;
+    const start = Date.now();
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+    const elapsedMs = Date.now() - start;
+
+    expect(ran).toBe(true);
+    expect(elapsedMs).toBeLessThan(1000);
+    // Acquired and released normally (not just an advisory unlocked fallback that never touches
+    // `dir` at all) — the release retires it to a token-specific tombstone.
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
   });
 });
