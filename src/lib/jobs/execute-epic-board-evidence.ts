@@ -145,6 +145,34 @@ export function fingerprintBoard(board: readonly Bead[]): BoardFingerprint {
 }
 
 /**
+ * `board`, with every bead's description populated before it is fingerprinted (PR #284 review).
+ * `mustReadBoard` goes through the same list read the rest of the app does, and on bd variants that
+ * omit `description` from `bd list --json` that comes back `undefined` on every bead — which
+ * `fingerprintOf` folds to `""` on BOTH the baseline and the post-run read alike. A board-only
+ * ticket whose sole deliverable edits another bead's description would then fingerprint as
+ * unchanged: `""` before, `""` after, no diff, on a board that genuinely changed.
+ *
+ * Deliberately NOT `ensureDescription` (issues.ts), which closes the same gap for a single detail
+ * view by memoizing the `bd show` per bead — right there, wrong here. That memo is invalidated only
+ * by a write THIS app makes through `bd.ts`, and the docstring atop this module explains why that
+ * never happens for the writes this check exists to catch: the agent runs `bd` directly in its own
+ * worktree process. Sharing that cache across the baseline and post-run reads would serve the
+ * baseline's stale description right back on the post-run read, hiding exactly the description-only
+ * edit this hydration exists to surface. A fresh, uncached `bd show` per read is the correct (if
+ * costlier) fix; a failed show leaves that bead's description empty rather than failing the whole
+ * board read, matching `ensureDescription`'s own missing-field fallback.
+ */
+function hydrateDescriptions(repo: string, board: readonly Bead[]): Promise<Bead[]> {
+  return Promise.all(
+    board.map(async (b) => {
+      if (b.description !== undefined) return b;
+      const full = await beads.show(repo, b.id).catch(() => undefined);
+      return { ...b, description: full?.description ?? "" };
+    }),
+  );
+}
+
+/**
  * Every bead id whose CONTENT differs between two fingerprints — created, edited or deleted.
  * Pure, so the diff rule is unit-testable without a board read on either side.
  */
@@ -193,7 +221,7 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
   const preserved = ticket && beads.boardEvidenceBaseline(ticket);
   if (preserved) return deserializeFingerprint(preserved);
   const board = await mustReadBoard(repo);
-  return board ? fingerprintBoard(board) : null;
+  return board ? fingerprintBoard(await hydrateDescriptions(repo, board)) : null;
 }
 
 /** What the post-run board read found, relative to the baseline. */
@@ -361,7 +389,7 @@ export async function readBoardEvidence(
     }
     return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
   }
-  const freshIds = boardEvidence(baseline, fingerprintBoard(board));
+  const freshIds = boardEvidence(baseline, fingerprintBoard(await hydrateDescriptions(repo, board)));
   const pending = beads.pendingBoardEvidence(ticket);
   const ids = [...new Set([...pending, ...freshIds])].toSorted();
   if (ids.length === 0) return { found: false, ids: [], synced: false };

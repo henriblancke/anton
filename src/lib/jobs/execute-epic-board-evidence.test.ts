@@ -17,6 +17,10 @@ const setBoardEvidenceBaselineMock = vi.fn<
   (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
 >();
 const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// `ensureDescription`'s fallback for a bead the LIST read omitted a description for (PR #284
+// review) — mocked so the hydration tests below exercise that fallback, not a live `bd show`
+// against a fake "/repo".
+const showMock = vi.fn<(repo: string, id: string) => Promise<Bead | undefined>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -28,6 +32,7 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidencePending: setBoardEvidencePendingMock,
       setBoardEvidenceBaseline: setBoardEvidenceBaselineMock,
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
+      show: showMock,
     },
   };
 });
@@ -257,6 +262,40 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     const baseline = await readBoardBaseline("/repo", bead("t-fresh"));
     expect(baseline).toEqual(fingerprintBoard([bead("z")]));
   });
+
+  it(
+    "hydrates a bead's description via `bd show` before fingerprinting when the list read omits " +
+      "it (PR #284 review) — a bd variant that drops `description` from `bd list --json` must not " +
+      "fold every bead's description to the same empty string",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("hydrate-a", { description: undefined })]);
+      showMock.mockResolvedValueOnce(bead("hydrate-a", { description: "real description" }));
+      const baseline = await readBoardBaseline("/repo");
+      expect(baseline).toEqual(
+        fingerprintBoard([bead("hydrate-a", { description: "real description" })]),
+      );
+      expect(showMock).toHaveBeenCalledWith("/repo", "hydrate-a");
+    },
+  );
+
+  it(
+    "catches a description-only edit end-to-end even though the list read omits the field on both " +
+      "sides (PR #284 review) — the exact false negative a board-only ticket whose sole deliverable " +
+      "is a description edit would otherwise hit, and why hydration must re-read fresh rather than " +
+      "reuse `ensureDescription`'s memo across the baseline and post-run reads",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("hydrate-b", { description: undefined })]);
+      showMock.mockResolvedValueOnce(bead("hydrate-b", { description: "before" }));
+      const baseline = (await readBoardBaseline("/repo"))!;
+
+      loadAllIssuesMock.mockResolvedValueOnce([bead("hydrate-b", { description: undefined })]);
+      showMock.mockResolvedValueOnce(bead("hydrate-b", { description: "after" }));
+      pushMock.mockResolvedValueOnce("synced");
+      await expect(
+        readBoardEvidence("/repo", baseline, bead("t-hydrate")),
+      ).resolves.toEqual({ found: true, ids: ["hydrate-b"], synced: true });
+    },
+  );
 
   const ticket = bead("t-1");
 
