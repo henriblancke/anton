@@ -445,4 +445,19 @@ describe("classifyFindingClass", () => {
     const note = "When the permission lookup fails, the middleware allows the request through instead of denying access.";
     expect(classifyFindingClass(finding(note))).toBe("fail-open");
   });
+
+  it("classifies a get-passive 'gets discarded' work-loss finding", () => {
+    const note = "The queued job gets discarded when processing fails, with no requeue and no log.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies a get-passive 'got dropped' work-loss finding", () => {
+    const note = "The pending batch got dropped after the worker crashed mid-flight, losing the submission.";
+    expect(classifyFindingClass(finding(note))).toBe("work-loss");
+  });
+
+  it("classifies an 'overly broad' scope finding", () => {
+    const note = "This glob is overly broad and scans generated files that were never meant to be included.";
+    expect(classifyFindingClass(finding(note))).toBe("scope");
+  });
 });

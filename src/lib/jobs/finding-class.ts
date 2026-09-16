@@ -24,9 +24,10 @@ type Matcher = RegExp | ((note: string) => boolean);
  * task, queue, ...) or a retry/requeue signal is the verb's actual subject or object — adjacent
  * with no clause boundary in between — not merely mentioned nearby: "while parsing a request, the
  * first character is dropped" has "request" in an earlier, unrelated clause. Past-tense, perfect-
- * passive, and modal auxiliaries ("were discarded", "has been discarded", "will be discarded",
- * "can be dropped") count the same as "is/are" — a finding describing loss that already happened,
- * or that could/will happen, is still a work-loss finding, not just one phrased in the present tense.
+ * passive, modal, and get-passive auxiliaries ("were discarded", "has been discarded", "will be
+ * discarded", "can be dropped", "gets discarded", "got dropped") count the same as "is/are" — a
+ * finding describing loss that already happened, could/will happen, or is phrased with "gets"/"got"
+ * instead of "is"/"was" is still a work-loss finding.
  */
 const WORK_LOSS_SUBJECT =
   "(?:job|task|queue|batch|record|item|request|message|event|payload|entry|entries|submission|update)s?";
@@ -55,7 +56,7 @@ const DATA_LOSS_CONTEXT = new RegExp(
 // loss-on-error-path behavior as the present/past/perfect forms below — a finding phrased as what
 // *will* or *can* happen on failure is still reporting work-loss, not a lesser claim.
 const WORK_LOSS_PASSIVE_AUX =
-  "(?:is|are|was|were|has been|have been|had been|will be|can be|may be|might be|could be|shall be|must be)";
+  "(?:is|are|was|were|has been|have been|had been|will be|can be|may be|might be|could be|shall be|must be|gets?|got)";
 const WORK_LOSS_VERB_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|(?:lost|dropped) (?:after|when))`;
 const WORK_LOSS_OBJECT_AFTER = `(?:${WORK_LOSS_PASSIVE_AUX} (?:silently )?(?:discarded|lost|dropped)|silently drops?)`;
 // Whitespace only, not CLAUSE_GAP: "the record delimiter is dropped" and "the item count is
@@ -336,7 +337,7 @@ const PATTERNS: Array<{ klass: Exclude<FindingClass, "other">; pattern: Matcher 
   {
     klass: "scope",
     pattern:
-      /over-?broad|too broad|scope creep|matches too (?:broadly|much)|too permissive (?:glob|regex|match|pattern)|unintended (?:match|files|scope)|wildcard matches more than/i,
+      /overly broad|over-?broad|too broad|scope creep|matches too (?:broadly|much)|too permissive (?:glob|regex|match|pattern)|unintended (?:match|files|scope)|wildcard matches more than/i,
   },
 ];
 
