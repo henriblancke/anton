@@ -24,12 +24,18 @@ vi.mock("./jobs/service", () => ({
   cancelRunForTarget: (...args: unknown[]) => cancelRunMock(...args),
 }));
 
+const freshDetailMock = vi.fn().mockResolvedValue({ id: "detail" });
+const bareDetailMock = vi.fn().mockResolvedValue({ id: "bare-detail" });
+
 vi.mock("./ticket-detail", () => ({
-  freshDetail: vi.fn().mockResolvedValue({ id: "detail" }),
+  freshDetail: (...args: unknown[]) => freshDetailMock(...args),
+  bareDetail: (...args: unknown[]) => bareDetailMock(...args),
 }));
 
+const nudgeSyncMock = vi.fn();
+
 vi.mock("./beads/sync-nudge", () => ({
-  nudgeSync: vi.fn(),
+  nudgeSync: (...args: unknown[]) => nudgeSyncMock(...args),
 }));
 
 const { closeHumanTicket, NotCloseableError } = await import("./close-human");
@@ -60,6 +66,9 @@ describe("closeHumanTicket", () => {
     listMock.mockReset();
     closeMock.mockReset().mockResolvedValue(undefined);
     cancelRunMock.mockReset().mockResolvedValue(false);
+    freshDetailMock.mockReset().mockResolvedValue({ id: "detail" });
+    bareDetailMock.mockReset().mockResolvedValue({ id: "bare-detail" });
+    nudgeSyncMock.mockReset();
   });
 
   it("rejects a held human child ticket without cancelling the run it lives under", async () => {
@@ -215,6 +224,23 @@ describe("closeHumanTicket", () => {
 
     expect(cancelRunMock).not.toHaveBeenCalled();
     expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "step-1");
+  });
+
+  it("does not report a committed close as failed when hydrating the response afterwards fails", async () => {
+    // Codex review (PR #288): `bd close` already succeeded by this point, so a transient failure in
+    // the read-after-write board hydration (freshDetail) must not read back as a failed close, must
+    // still nudge sync, and must degrade to bareDetail rather than throwing.
+    const target = makeBead({ id: "target" });
+    listMock.mockResolvedValue([target]);
+    showMock.mockResolvedValueOnce(target).mockResolvedValueOnce({ ...target, status: "closed" });
+    freshDetailMock.mockRejectedValue(new Error("bd: connection refused"));
+
+    const detail = await closeHumanTicket(project, "target");
+
+    expect(closeMock).toHaveBeenCalledWith("/tmp/anton", "target");
+    expect(nudgeSyncMock).toHaveBeenCalledWith(project, "close-human");
+    expect(bareDetailMock).toHaveBeenCalledWith(project, { ...target, status: "closed" });
+    expect(detail).toEqual({ id: "bare-detail" });
   });
 
   it("does not cancel a standalone task's run for its own agent:human child — that run never touches it", async () => {

@@ -12,7 +12,7 @@ import { openBlockersOf } from "./jobs/execute-epic-human-gate";
 import { cancelRunForTarget } from "./jobs/service";
 import { nudgeSync } from "./beads/sync-nudge";
 import { runMembers } from "./rework-target";
-import { freshDetail } from "./ticket-detail";
+import { bareDetail, freshDetail } from "./ticket-detail";
 import { liveRunTargetOf, openWorkUnder } from "./ticket-view";
 import type { Project, TicketDetail } from "./types";
 
@@ -77,6 +77,12 @@ const messageOf = (e: unknown): string => (e instanceof Error ? e.message : Stri
  * the gap since (→ 409). Any OTHER failure from `bd close` — the executable missing, a timeout,
  * Dolt unhealthy — is not a verdict on the bead and is left to propagate as-is, so the caller's
  * infrastructure failure stays a retryable error rather than reading as permanently unclosable.
+ *
+ * Once `bd close` itself has succeeded, nothing after it may turn the outcome into a failure: sync
+ * is nudged immediately off the write, and a failure hydrating the response detail (a cold board
+ * snapshot hitting a transient bd/Dolt error) degrades to {@link bareDetail} rather than reporting
+ * an already-committed close as a 500 — which would also skip the nudge above and leave a retry
+ * facing 409 on a bead the close already settled (PR #288 review).
  */
 export async function closeHumanTicket(project: Project, id: string): Promise<TicketDetail> {
   const repo = project.repoPath;
@@ -152,11 +158,19 @@ export async function closeHumanTicket(project: Project, id: string): Promise<Ti
     }
     return beads.show(repo, id);
   });
-  // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the closed
-  // state it just wrote, so the response never reflects the board's stale snapshot.
-  const detail = await freshDetail(project, written);
+  // The close already landed inside the lock; schedule sync propagation now, before anything below
+  // (which reads the board, not bd) gets a chance to fail and swallow it.
   nudgeSync(project, "close-human");
-  return detail;
+  // Read-after-write, like setTicketDeferred: the `bd show` bead is authoritative for the closed
+  // state it just wrote, so the response never reflects the board's stale snapshot. Best-effort: the
+  // close has already committed above, so a failure here degrades to bareDetail instead of failing
+  // the whole response.
+  try {
+    return await freshDetail(project, written);
+  } catch (e) {
+    console.error(`[close-human] ${id} closed, but failed to hydrate its fresh detail`, e);
+    return bareDetail(project, written);
+  }
 }
 
 /** A bead that is already closed has a settled outcome — closing it again would rewrite history. */

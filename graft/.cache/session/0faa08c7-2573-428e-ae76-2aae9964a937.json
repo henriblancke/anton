@@ -1,0 +1,13 @@
+{
+  "lastQuery": "<task-notification>\n<task-id>b0qbf4rsb</task-id>\n<tool-use-id>toolu_01D64E2MWMWxqfsNSGuvuxek</tool-use-id>\n<output-file>/private/tmp/claude-501/-Users-henriblancke-Documents-personal--anton-worktrees-anton-anton-anton-fgqr/0faa08c7-2573-428e-ae76-2aae9964a937/tasks/b0qbf4rsb.output</output-file>\n<status>completed</status>\n<summary>Background command \"npx vitest run 2&gt;&amp;1 | tail -40\" completed (exit code 0)</summary>\n</task-notification>",
+  "perAgentQuery": {},
+  "graftReads": 0,
+  "sourceReads": 5,
+  "savedTokens": 0,
+  "injectedPointers": [],
+  "nudges": 0,
+  "host": "claude-code",
+  "inputCostMicros": 636933,
+  "inputTokensBilled": 2291336,
+  "lastBillingUuid": "4dc69fdb-0df3-4ce9-b274-68025afe80da"
+}

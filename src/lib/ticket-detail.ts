@@ -129,6 +129,18 @@ export async function freshDetail(project: Project, bead: Bead): Promise<TicketD
 }
 
 /**
+ * Detail built straight off one bead read, skipping the board entirely — no epic title/assignee,
+ * and `holdsRun`/`hasOpenDescendants`/`hasOpenBlockers` answered off `[bead]` alone rather than the
+ * real board. The degrade-safe fallback for a caller whose write has ALREADY committed: unlike
+ * {@link freshDetail}, this cannot fail on a transient board read, so a caller that must not let
+ * hydration failure erase a landed write (close-human.ts's post-close response, PR #288 review) can
+ * fall back to it instead of propagating that failure as the write's own outcome.
+ */
+export async function bareDetail(project: Project, bead: Bead): Promise<TicketDetail> {
+  return withPrUrl(project, bead, bead, undefined, [bead]);
+}
+
+/**
  * Apply a field patch to the bead and return the refreshed detail. The bead is read first so
  * label edits diff against its current labels (preserving the approved, stage, and source
  * control labels); an empty patch writes nothing.
