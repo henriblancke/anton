@@ -13,9 +13,20 @@
  * converges on the identical report rather than accumulating. Acting on a finding (resume, escalate)
  * is the follow-up job (anton-wvcy).
  *
- * Off by default: the schedule is seeded disabled (schedules.ts), so a project opts in.
+ * Scheduled by default (schedules.ts): board outages need one project-level escalation without an
+ * operator first opting into the detector.
  */
-import { beads, gateReason as bdGateReason, LABELS, type Bead, type Gate } from "../beads/bd";
+import {
+  beads,
+  boardUnreachableCause,
+  gateReason as bdGateReason,
+  LABELS,
+  type Bead,
+  type BoardUnreachableCause,
+  type Gate,
+} from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
+import { BOARD_UNREACHABLE_FINDING_PREFIX } from "../escalation-kinds";
 import { getPrActivity, prNumberFromRef, type PrActivity } from "../git/pr";
 import {
   DEFAULT_MAX_RETRIES,
@@ -24,8 +35,14 @@ import {
   resolveRunHealthThresholds,
 } from "../projects";
 import { listRunsByStatus, type RunRow } from "../runs";
-import { saveRunHealthReport, type RunHealthFinding } from "../run-health";
-import { parkedAskGateIds, poisonBlockerIds, PoisonError } from "./errors";
+import { getRunHealthReport, saveRunHealthReport, type RunHealthFinding } from "../run-health";
+import {
+  BoardUnreachableError,
+  isBoardUnreachableError,
+  parkedAskGateIds,
+  poisonBlockerIds,
+  PoisonError,
+} from "./errors";
 import { beadBlockedByGate, runTargetAbove } from "./gate-targets";
 import {
   activeExecuteEpicKeys,
@@ -210,6 +227,102 @@ export function detectDeadLeases(
   return findings;
 }
 
+/** The runner's own `failed N×:` park marker, stripped so what's left is the underlying cause. */
+const EXHAUSTED_PARK_MARKER = /^failed \d+×:\s*/;
+
+/**
+ * What a park's lastError is actually complaining about, with the runner's own wrapping (the
+ * poison prefix or the `failed N×:` marker) peeled off. Two jobs hit by the identical board outage
+ * carry different job types and attempt counts in their full `lastError`, so grouping has to compare
+ * the CAUSE underneath that wrapping, not the wrapped text.
+ */
+function underlyingCause(lastError: string, poisoned: boolean): string {
+  return poisoned
+    ? lastError.slice(POISON_PARK_PREFIX.length).trim()
+    : lastError.replace(EXHAUSTED_PARK_MARKER, "");
+}
+
+/** What a human does about each board-unreachable cause — the escalation's whole reason is this. */
+const BOARD_OUTAGE_REMEDY: Record<BoardUnreachableCause, { target: string; remedy: string }> = {
+  "identity-mismatch": {
+    target: "this project's Dolt database",
+    remedy: "check .beads/metadata.json names the right host/port/database for this project",
+  },
+  "server-unreachable": {
+    target: "the shared Dolt server",
+    remedy: "check the server is up and reachable",
+  },
+  "dolt-missing": {
+    target: "the dolt binary on this machine",
+    remedy: "install dolt, or restore it to PATH",
+  },
+  "disk-full": {
+    target: "the host's disk",
+    remedy: "free up disk space",
+  },
+  "database-unreadable": {
+    target: "this project's Dolt database on the shared server",
+    remedy:
+      "check .beads/metadata.json names the database this project's board actually lives in, and that its database account may read it",
+  },
+  "board-timeout": {
+    target: "bd itself",
+    remedy:
+      "check for a wedged Dolt server or a stuck process holding the local Dolt lock, and restart it if needed",
+  },
+};
+
+/**
+ * Marks a legacy migration-aid aggregate's key as distinct from the live outage's (PR #277 review).
+ * Both start from the same `BOARD_UNREACHABLE_FINDING_PREFIX`, so `isBoardUnreachableFindingKey`
+ * still buckets them together in the UI — but sharing the exact key let a legacy aggregate collide
+ * with an open live-outage row: `raiseEscalation` looks up the open row by key alone and returns it
+ * unchanged when found, so the row stayed jobless (no Resume/Abandon) even once a still-parked
+ * representative job was known. Distinct keys mean the legacy aggregate always raises (or keeps) its
+ * own row, and the live row is freed to retire on the next successful board read.
+ */
+const LEGACY_OUTAGE_KEY_SUFFIX = ":legacy";
+
+/** One board-wide outage's still-growing tally, kept while the job loop finds more of its jobs. */
+interface OutageGroup {
+  cause: BoardUnreachableCause;
+  /** The earliest-parked job in the group — its `since` is the outage's own start. */
+  representative: JobRow;
+  since: number;
+  count: number;
+}
+
+/**
+ * One live board outage finding. Unlike the legacy parked-job aggregation, this is created at the
+ * failed board read itself, while affected jobs remain queued with their attempts refunded.
+ */
+export function boardUnreachableFinding(
+  projectId: string,
+  cause: BoardUnreachableCause,
+  nowMs: number,
+  since = nowMs,
+): RunHealthFinding {
+  const { target, remedy } = BOARD_OUTAGE_REMEDY[cause];
+  return {
+    kind: "exhausted-job",
+    key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${projectId}:${cause}`,
+    reason: `${target} is unreachable. ${remedy}.`,
+    since,
+    ageMs: Math.max(0, nowMs - since),
+  };
+}
+
+/** Keep one continuing outage's original observation time, so dismissals match it across probes. */
+export function outageSince(
+  findings: RunHealthFinding[],
+  projectId: string,
+  cause: BoardUnreachableCause,
+  nowMs: number,
+): number {
+  const key = `${BOARD_UNREACHABLE_FINDING_PREFIX}${projectId}:${cause}`;
+  return findings.find((finding) => finding.key === key)?.since ?? nowMs;
+}
+
 /**
  * Jobs the runner has stopped retrying — recoverable only by a human, so they sit forever unless
  * something surfaces them. Three shapes qualify:
@@ -229,6 +342,27 @@ export function detectDeadLeases(
  *
  * A job parked with attempts still on the clock for any OTHER reason (quota backoff, a held lease)
  * is excluded: those refund the attempt and come back by themselves.
+ *
+ * Jobs parked on a BOARD-WIDE cause (anton-ifz2) — the board itself unreachable, or one project's
+ * identity mismatch — collapse onto ONE finding per project per cause instead of one per job: an
+ * hour-long outage stops every job that touches the board at once, and reporting each independently
+ * is what turned one outage into 1,183 rows and buried the handful of genuinely different failures
+ * in the noise. Keyed on the project AND the cause, so two projects hit by the same outage still
+ * raise their own — the claim is "one escalation per outage IN ONE PROJECT" — and a different cause
+ * (an identity mismatch is one project's own misconfiguration, not the shared server being down)
+ * always raises its own row rather than being folded into an unrelated outage's.
+ *
+ * This grouping is a MIGRATION AID, not the live outage path, and is expected to see no new members
+ * after this ships: `nextAction`'s `board-unreachable` branch always reschedules with the attempt
+ * refunded, never parks (that's `boardUnreachableFinding`'s job — raised directly at the failed board
+ * read in the run-health handler, from jobs still `queued`). The only production `park()` call site
+ * is gated by `nextAction`'s `poison`/`error` outcomes, neither of which board-unreachable ever
+ * produces. So a row `outages` groups can only be one that parked with board-unreachable text BEFORE
+ * this PR — e.g. the 1,183-row incident above — or, in principle, a `poison` whose message coincides
+ * with a board-outage cause string for an unrelated reason. Once every such legacy row has been
+ * resolved, this branch never fires again; it stays rather than being deleted so an upgraded
+ * installation's still-parked pre-migration rows get the same one-escalation-per-outage treatment
+ * instead of flooding the report one row per job.
  */
 export function detectExhaustedJobs(
   jobs: JobRow[],
@@ -236,6 +370,8 @@ export function detectExhaustedJobs(
   nowMs: number,
 ): RunHealthFinding[] {
   const findings: RunHealthFinding[] = [];
+  const outages = new Map<string, OutageGroup>();
+
   for (const job of jobs) {
     if (job.status !== "parked" && job.status !== "failed") continue;
     const lastError = job.lastError?.trim() || "no error recorded";
@@ -247,6 +383,19 @@ export function detectExhaustedJobs(
     const budget = spentBudget ?? maxAttempts;
     if (!poisoned && spentBudget === undefined && job.attempts < maxAttempts) continue;
     const since = toMs(job.updatedAt) ?? nowMs;
+
+    const cause = boardUnreachableCause(underlyingCause(lastError, poisoned));
+    if (cause) {
+      const key = `${job.projectId ?? ""}::${cause}`;
+      const outage = outages.get(key);
+      if (!outage || since < outage.since) {
+        outages.set(key, { cause, representative: job, since, count: (outage?.count ?? 0) + 1 });
+      } else {
+        outage.count += 1;
+      }
+      continue;
+    }
+
     findings.push({
       kind: "exhausted-job",
       key: `exhausted-job:${job.id}`,
@@ -259,6 +408,23 @@ export function detectExhaustedJobs(
       beadId: epicBeadIdOf(job.payloadJson),
     });
   }
+
+  for (const outage of outages.values()) {
+    const { target, remedy } = BOARD_OUTAGE_REMEDY[outage.cause];
+    const { representative, since, count } = outage;
+    findings.push({
+      kind: "exhausted-job",
+      key: `${BOARD_UNREACHABLE_FINDING_PREFIX}${representative.projectId ?? "?"}:${outage.cause}${LEGACY_OUTAGE_KEY_SUFFIX}`,
+      reason:
+        `${target} is unreachable — ${count} job${count === 1 ? "" : "s"} parked on the same ` +
+        `outage. ${remedy}.`,
+      since,
+      ageMs: Math.max(0, nowMs - since),
+      jobId: representative.id,
+      beadId: epicBeadIdOf(representative.payloadJson),
+    });
+  }
+
   return findings;
 }
 
@@ -440,12 +606,59 @@ export function makeRunHealthHandler(deps: RunHealthDeps): JobHandler {
     // ordinary listing (only `--type gate` / `bd gate list` carries them) while the `blocks` edge a
     // gate puts on the bead it gates IS carried by the plain list — so the gates come from one read
     // and the work they block from the other. Open gates only, which is `gate list`'s default.
-    // NOT best-effort: a swallowed gate read reads as "no human is waiting", which is exactly the
-    // false all-clear this sweep exists to prevent. A rejection retries the sweep instead.
-    const [board, gates] = await Promise.all([
-      beads.list(project.repoPath, ["--status", "all"]),
-      beads.gateList(project.repoPath),
-    ]);
+    // A classified board failure is the exceptional partial report: saving it makes the project-wide
+    // outage visible while the runner refunds affected jobs, then rethrowing preserves that slow probe.
+    let board: Bead[];
+    let gates: Gate[];
+    try {
+      [board, gates] = await Promise.all([
+        beads.list(project.repoPath, ["--status", "all"]),
+        beads.gateList(project.repoPath),
+      ]);
+    } catch (e) {
+      // These two reads bypass preflightSharedServer entirely, so on a shared server they ARE the
+      // board-read boundary — same reasoning preflight applies to its own probes: nothing else here
+      // touches the board, so ANY failure is a board outage by context, not just the ones bd's raw
+      // text happens to match. Without this an unmatched diagnostic (e.g. a bare "dial tcp ...
+      // connection refused" that never went through preflight) surfaced as a plain Error, so
+      // run-health rethrew instead of raising the outage report and unstick had nothing to escalate
+      // (PR #277 review). Embedded-mode errors keep the old, stricter gate.
+      const serverMode = isServerMode(project.repoPath);
+      if (!isBoardUnreachableError(e) && !serverMode) throw e;
+      // The thrower's own classification wins when it set one: it knows structurally which probe
+      // failed, or that bd itself hung, rather than this reparsing raw text that a preflight's own
+      // wrapper message (or an unmatched diagnostic like "database not found") would silently miss
+      // (PR #277 review). Text parsing is next; an unmatched shared-server failure still falls back
+      // to "database-unreadable" — these ARE reads, just like BOARD_READ_PROBE's own fallback.
+      // bd's summary includes stderr only; the raw process seam retains stdout on the error too.
+      const err = e as Error & { stdout?: unknown; stderr?: unknown; boardCause?: BoardUnreachableCause };
+      const output = [
+        err.message,
+        typeof err.stdout === "string" ? err.stdout : "",
+        typeof err.stderr === "string" ? err.stderr : "",
+      ].join("\n");
+      const cause = err.boardCause ?? boardUnreachableCause(output) ?? (serverMode ? "database-unreadable" : undefined);
+      if (!cause) throw e;
+      const previous = await getRunHealthReport(db, projectId);
+      await saveRunHealthReport(db, clock, {
+        projectId,
+        jobId: ctx.jobId,
+        findings: [
+          boardUnreachableFinding(
+            projectId,
+            cause,
+            nowMs,
+            outageSince(previous?.findings ?? [], projectId, cause, nowMs),
+          ),
+        ],
+      });
+      // Rethrow as a board outage the runner recognizes, so it refunds this attempt instead of
+      // spending it: an unmatched shared-server diagnostic reaches this branch as a plain Error
+      // (`isBoardUnreachableError(e)` false), and left as-is the runner would burn the ordinary retry
+      // budget and can still park run-health outright, exactly what saving the report above exists to
+      // prevent (PR #277 review).
+      throw isBoardUnreachableError(e) ? e : new BoardUnreachableError(err.message, { cause: e, boardCause: cause });
+    }
     const [parkedRuns, settledJobs, activeEpicKeys] = await Promise.all([
       listRunsByStatus(db, projectId, ["parked"]),
       listJobsByStatus(db, projectId, ["parked", "failed"]),

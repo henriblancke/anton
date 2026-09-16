@@ -47,6 +47,14 @@ import {
 export { PROJECT_SCOPED_BD_ENV, scopedPasswordVar, serverScopedPasswordVar };
 
 /**
+ * The exact refusal text bd's own project-identity guard prints (see the header above) when a bd
+ * spawn resolves to another project's database. Exported so a caller classifying a raw bd failure
+ * — `isBoardUnreachableOutput` in dolt-sync.ts — matches this text once, rather than re-deriving
+ * the string bd actually prints.
+ */
+export const IDENTITY_MISMATCH_TEXT = "PROJECT IDENTITY MISMATCH — refusing to connect";
+
+/**
  * Which env var an operator must set to give `repoPath`'s bd a password — the per-user form when
  * metadata.json names a user, the shared one otherwise. Used by the server preflight's failure
  * message: naming the wrong variable is the difference between a one-line fix and an hour lost.
