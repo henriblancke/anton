@@ -431,19 +431,25 @@ function runLocalPinnedToThisNode(bin, args, env = {}) {
 }
 
 /**
- * The real JS file behind a vendored `node_modules/.bin` entry, or null when it is not one.
+ * The real JS file behind a `node`-shebang command, or null when it is not one.
  *
- * npm/bun link these to the package's own `bin` script (`next` → `next/dist/bin/next`), so the
- * target is ordinary JS that any runtime can execute directly. Returns null for a bare command
- * name meant to come off PATH, a missing entry, or a file that does not start with a `node`
- * shebang — the caller then spawns it the old way rather than guessing.
+ * Two places are searched, vendored first: `node_modules/.bin/<bin>`, which npm/bun link to the
+ * package's own script (`next` → `next/dist/bin/next`), then PATH — which is how `npm` itself is
+ * found, a symlink to `npm-cli.js`. Either way the target is ordinary JS that any runtime can
+ * execute directly, which is what lets the caller bypass the shebang.
+ *
+ * Returns null for an explicit path (the caller means it literally), a command that is nowhere, or
+ * a file that does not start with a `node` shebang — a real binary, or a wrapper shape we do not
+ * recognise. The caller then spawns it the old way rather than guessing at it.
  */
 function resolveJsBin(bin) {
   if (bin.includes("/") || bin.includes("\\")) return null; // already a path — caller means it literally
-  const exe = join(BIN, bin);
-  if (!existsSync(exe)) return null;
+  const vendored = join(BIN, bin);
+  const onPath = spawnSync("sh", ["-c", `command -v ${bin}`], { encoding: "utf8" });
+  const candidate = existsSync(vendored) ? vendored : (onPath.stdout ?? "").trim();
+  if (!candidate || !existsSync(candidate)) return null;
   try {
-    const target = realpathSync(exe);
+    const target = realpathSync(candidate);
     const head = readFileSync(target, "utf8").slice(0, 64);
     return /^#!.*\bnode\b/.test(head) ? target : null;
   } catch {
@@ -1702,16 +1708,18 @@ async function cmdSetup(args = []) {
     // node-pty ships prebuilts that don't always match the local node ABI (DESIGN setup note).
     // Rebuild it best-effort so the interactive xterm works; a failure here is a warning, not fatal.
     //
-    // Pinned like every other child (PR #298 review): npm resolves its own node from PATH, so on
-    // the two-runtime split this bead is about it would rebuild node-pty for the OTHER runtime —
-    // and the server, now pinned to this one, loads that addon when an interactive session opens.
-    // Setup and start would both pass, and the terminal would fail on first use instead.
+    // Pinned like every other child, and through the SAME helper (PR #298 review). npm resolves its
+    // own node from PATH, so on the two-runtime split this bead is about it would rebuild node-pty
+    // for the OTHER runtime — and the server, now pinned to this one, loads that addon when an
+    // interactive session opens. Setup and start both pass; the terminal fails on first use.
+    //
+    // A PATH prepend alone is NOT enough, which was this fix's first draft: under Bun that prepends
+    // a directory with no `node` in it, so npm's own `#!/usr/bin/env node` still finds ambient Node.
+    // runLocalPinnedToThisNode already solves exactly that by executing the resolved JS
+    // (npm → npm-cli.js) with process.execPath, so the rebuild goes through it rather than
+    // re-deriving a weaker version of the same pin.
     console.log(c.bold("\nRebuilding node-pty for this node ABI:"));
-    const rebuilt = spawnSync("npm", ["rebuild", "node-pty"], {
-      cwd: APP_ROOT,
-      stdio: "inherit",
-      env: { ...process.env, PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}` },
-    });
+    const rebuilt = { status: runLocalPinnedToThisNode("npm", ["rebuild", "node-pty"]) };
     if ((rebuilt.status ?? 1) !== 0) {
       console.log(c.yellow("node-pty rebuild skipped/failed — interactive sessions may not work until you run:"));
       console.log(c.dim("  cd node_modules/node-pty && npx node-gyp rebuild"));

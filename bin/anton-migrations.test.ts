@@ -347,16 +347,33 @@ describe("every bin this launcher spawns is pinned to anton's own node", () => {
     expect(bare).toEqual([]);
   });
 
-  it("rebuilds node-pty under the pinned runtime, not PATH's npm", async () => {
+  it("rebuilds node-pty through the pinned helper, not a bare or PATH-pinned npm", async () => {
     // node-pty is the OTHER per-ABI addon here, and `npm rebuild` resolves its own node from PATH —
     // so on the two-runtime split this bead is about, setup would build it for the runtime the
     // server is no longer using. Setup and start both pass; the interactive terminal fails on first
-    // open instead, which is the same bug displaced into the one surface nothing here tests
-    // (PR #298 review). Structural for the same reason as the guards above: no second runtime in CI.
+    // open instead, which is the same bug displaced into the one surface nothing here tests.
+    //
+    // It must go through `runLocalPinnedToThisNode`, not a hand-rolled PATH prepend — that was this
+    // fix's first draft and it is the WEAKER pin: under Bun it prepends a directory containing no
+    // `node`, so npm's own `#!/usr/bin/env node` still finds ambient Node (PR #298 review).
     const src = await readFile(join(REPO_ROOT, "bin", "anton.mjs"), "utf8");
-    const call = /spawnSync\("npm", \["rebuild", "node-pty"\], \{[\s\S]{0,400}?\}\);/.exec(src);
-    expect(call, "the node-pty rebuild call moved — update this guard").not.toBeNull();
-    expect(call![0]).toContain("dirname(process.execPath)");
+    expect(src).toContain('runLocalPinnedToThisNode("npm", ["rebuild", "node-pty"])');
+    expect(src).not.toContain('spawnSync("npm", ["rebuild", "node-pty"]');
+  });
+
+  it("resolves a PATH-only node script, so `npm` is pinnable at all", () => {
+    // The rebuild pin rests on this: npm is NOT vendored in node_modules/.bin, so resolveJsBin has
+    // to find it on PATH and follow the symlink to npm-cli.js. If this returned null, the rebuild
+    // would silently fall back to the PATH prepend — the exact weaker pin the case above forbids.
+    const npm = resolveJsBin("npm");
+    expect(npm, "npm did not resolve to a JS file — the rebuild pin degrades to a PATH prepend").not.toBeNull();
+    expect(npm).toMatch(/\.(js|cjs|mjs)$/);
+  });
+
+  it("returns null for a real binary, which must keep being spawned directly", () => {
+    // `git` is a compiled executable, not a node script: executing it with process.execPath would
+    // be nonsense, so the fallback has to hold for anything without a node shebang.
+    expect(resolveJsBin("git")).toBe(null);
   });
 
   it("daemonizes the server with process.execPath, not a PATH-resolved node", async () => {
