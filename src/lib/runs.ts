@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -206,6 +206,10 @@ export type RunPatch = Partial<{
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
+  /** A clean verdict's resume key (anton-qmuyt) — see the column's own note. */
+  reviewKey: string | null;
+  /** The clean verdict's advisories, serialized — restored into the carry when a resume skips. */
+  reviewKeyAdvisories: string | null;
   /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
   attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
@@ -278,6 +282,82 @@ export async function findRunBaseForkShaForBranch(
     .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
     .limit(1);
   return rows[0]?.baseForkSha ?? undefined;
+}
+
+/** A clean verdict's resume key, as {@link findRunReviewKeyForBranch} recovers it for a fresh row. */
+export interface RecordedReviewKey {
+  reviewKey: string;
+  reviewKeyAdvisories: string | null;
+  /** The score that verdict earned — restored onto the skipping row so it reads as reviewed, not a gap. */
+  reviewScore: number | null;
+}
+
+/**
+ * The clean-verdict resume key the most recent OTHER attempt on this epic's BRANCH recorded,
+ * whatever became of that run (anton-nyz1v) — the review-key half of
+ * {@link findRunBaseForkShaForBranch}.
+ *
+ * A git fault at step:pr is an ordinary Error: execute-epic-settle's catch-all settles the row
+ * `failed`, which `findOpenRunForEpic` excludes (`ACTIVE_RUN_STATUSES` has no `failed`). The
+ * runner's automatic retry then opens a FRESH row while deliberately reusing this branch and
+ * worktree — so a resume-key check keyed to `existing` alone never fires on exactly the fault this
+ * key exists to make cheap. Scoped by branch instead, for the same reason `findRunFormulaForBranch`
+ * and `findRunBaseForkShaForBranch` are: attempts do not all share a row, but they do share a branch.
+ *
+ * `excludeRunId` MUST be this call's own run id: a formula may run `step:review` more than once in
+ * ONE attempt (the floor constrains omission and order, never extension), and the first step's
+ * clean verdict writes ITS key onto this very row before the second step ever runs. Without the
+ * exclusion, the second step's lookup would find its own attempt's row and skip itself against a
+ * verdict that never actually judged the (possibly still-open) advisories a second gate exists to
+ * re-check — turning a two-gate formula into a one-gate one. A genuine cross-attempt retry is
+ * unaffected: its fresh row carries a DIFFERENT id than the failed one it is meant to recover.
+ *
+ * That exclusion alone does not stop a DIFFERENT cross-step mixup: a failed attempt's row still
+ * carries whichever step's key was written onto it LAST, and a retry's second `step:review` could
+ * otherwise find that recovered row (excluded is only the retry's OWN id) and treat a verdict the
+ * FIRST gate produced as its own. `computeReviewKey`'s fingerprint is bound to the step's id for
+ * exactly this reason (anton-nyz1v) — a token computed for one step's occurrence cannot equal one
+ * computed for another's, so a mismatched recovery falls through to a real review, same as no key
+ * at all.
+ *
+ * Otherwise safe to consult unconditionally — a stale key from an unrelated earlier attempt on this
+ * branch simply fails the token comparison in `runReviewStep` and the gate reviews in full, exactly
+ * as a row with no key at all does.
+ */
+export async function findRunReviewKeyForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+  excludeRunId: string,
+): Promise<RecordedReviewKey | undefined> {
+  const rows = await db
+    .select({
+      reviewKey: schema.runs.reviewKey,
+      reviewKeyAdvisories: schema.runs.reviewKeyAdvisories,
+      reviewScore: schema.runs.reviewScore,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.reviewKey),
+        ne(schema.runs.id, excludeRunId),
+      ),
+    )
+    // Ordered exactly as findRunFormulaForBranch is, and for its reason: `updatedAt` is
+    // second-granular, so `writeSeq` breaks a tie by which attempt settled last.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
+    .limit(1);
+  const row = rows[0];
+  if (!row?.reviewKey) return undefined;
+  return {
+    reviewKey: row.reviewKey,
+    reviewKeyAdvisories: row.reviewKeyAdvisories,
+    reviewScore: row.reviewScore,
+  };
 }
 
 /**

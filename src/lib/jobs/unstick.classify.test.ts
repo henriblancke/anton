@@ -64,6 +64,8 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     baseForkSha: null,
     status: "parked",
     reviewScore: null,
+    reviewKey: null,
+    reviewKeyAdvisories: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",
