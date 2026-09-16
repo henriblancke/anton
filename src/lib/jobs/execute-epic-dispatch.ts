@@ -1127,6 +1127,14 @@ async function dispatchTicket(
     // `hasPreservedBaseline` lets the retry reach it even when no ids are pending at all.
     const stalePending = beads.pendingBoardEvidence(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    // Recorded into the ledger BEFORE the clear, mirroring the fresh-run path below (PR #284
+    // review): these ids are exactly the confirmed evidence the reviewer's board-only section
+    // cross-checks, and `deliveredTickets` carries this ticket into `ReviewRun.tickets`
+    // regardless of this fast path — so without this, the ticket lands in the board-only run
+    // with no per-ticket evidence line, silently undercutting that cross-check.
+    if (stalePending.length > 0) {
+      ledger.boardEvidence.set(ticket.id, stalePending);
+    }
     if (stalePending.length > 0 || hasPreservedBaseline) {
       await clearBoardEvidencePending(repo, ticket.id, stalePending, hasPreservedBaseline);
     }

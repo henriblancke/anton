@@ -504,11 +504,14 @@ export async function assertDelivered(
  * change (a stray generated file, an accidental edit) must not let it take the tree-based "commit
  * exists" path and settle delivered without the board ever being checked (PR #284 review round 2).
  *
- * Mirrors the shape of the tree-based gate on purpose: a verified `satisfied` claim settles first
+ * Mirrors the shape of the tree-based gate on purpose, with one deliberate difference: a
+ * `satisfied` claim settles first ONLY when it is backed by confirmed pending board evidence
  * (still meaningful here — e.g. this ticket's own previously recorded attribution commit from an
- * earlier dispatch), a `delivered` claim settles on confirmed board evidence, and everything else
- * (an honest `blocked`, a missing line, or an unverified `satisfied`) is the same false-success
- * shape a plain zero diff is, regardless of what — if anything — the tree happened to pick up.
+ * earlier dispatch); a `delivered` claim, or a `satisfied` one with nothing pending, settles on
+ * confirmed board evidence via {@link evidence.checkBoardEvidence}; and everything else (an
+ * honest `blocked`, a missing line, or a claim neither of those confirms) is the same
+ * false-success shape a plain zero diff is, regardless of what — if anything — the tree happened
+ * to pick up.
  */
 async function assertBoardOnlyDelivered(
   ticket: Bead,
@@ -526,18 +529,26 @@ async function assertBoardOnlyDelivered(
     selfReport.commit &&
     (await branchAdded(selfReport.commit))
   ) {
-    // Carry forward any pending board evidence a PRIOR attempt already confirmed and left on this
-    // ticket (PR #284 review round 10): a `satisfied` resume settles on the branch alone and never
-    // calls `checkBoardEvidence`, so without this `progress.boardEvidenceIds` stays unset and
-    // `runTicket`'s cleanup never calls `clearBoardEvidencePending` — the marker (and its preserved
-    // baseline) survive this ticket's close/transition with nothing left to release them, exactly
-    // the stale record a later reopen could misread as current evidence for no new work.
+    // Settle here ONLY when confirmed pending board evidence backs the claim (PR #284 review
+    // round 11): `branchAdded` proves a commit with this sha exists on the branch, never that IT
+    // — or anything else — actually delivered this ticket's board-only work. A commit an EARLIER,
+    // failed attempt left behind (its own incidental tree change, or any other commit that
+    // happens to share the name) satisfies `branchAdded` too, so accepting the claim on that
+    // alone would close a board-only ticket whose deliverable never landed. Carrying forward
+    // pending evidence when present is still needed (PR #284 review round 10): a `satisfied`
+    // resume settles on the branch alone and never calls `checkBoardEvidence`, so without this
+    // `progress.boardEvidenceIds` stays unset and `runTicket`'s cleanup never calls
+    // `clearBoardEvidencePending` — the marker (and its preserved baseline) survive this ticket's
+    // close/transition with nothing left to release them. With nothing pending, fall through to
+    // the same evidence check a `delivered` claim needs, rather than accepting the claim on trust.
     const pending = beads.pendingBoardEvidence(ticket);
-    if (pending.length > 0) progress.boardEvidenceIds = pending;
-    progress.delivered = true;
-    return;
+    if (pending.length > 0) {
+      progress.boardEvidenceIds = pending;
+      progress.delivered = true;
+      return;
+    }
   }
-  if (selfReport?.outcome === "delivered") {
+  if (selfReport?.outcome === "delivered" || selfReport?.outcome === "satisfied") {
     const result = await evidence.checkBoardEvidence();
     if (result.found && result.synced && !result.markerUnpersisted) {
       // The evidence is confirmed but the handoff isn't done yet — the marker stays on the bead
