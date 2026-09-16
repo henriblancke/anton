@@ -5,7 +5,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { eq } from "drizzle-orm";
+
 import { schema } from "../../db";
+import { isVerifyGateFailedError } from "../errors";
 import type { ReviewGateResult } from "../review-gate";
 import { closeSandbox, openSandbox } from "./step.fixture";
 
@@ -60,6 +63,71 @@ describe("step:verify", () => {
 
     const rows = await sandbox.tdb.db.select().from(schema.sessions);
     expect(rows[0].status).toBe("failed");
+  });
+
+  /** What the run row currently remembers about a red gate. */
+  const recordOf = async (): Promise<string | null> => {
+    const [row] = await sandbox.tdb.db
+      .select()
+      .from(schema.runs)
+      .where(eq(schema.runs.id, sandbox.runId));
+    return row.lastGateFailure;
+  };
+
+  const RECORD = JSON.stringify({
+    label: "tests",
+    command: "bun run test",
+    code: 1,
+    output: "FAIL",
+    beadId: "anton-8d0f",
+  });
+
+  const remember = async () =>
+    sandbox.tdb.db
+      .update(schema.runs)
+      .set({ lastGateFailure: RECORD })
+      .where(eq(schema.runs.id, sandbox.runId));
+
+  // The gate is green, so a failure the row still remembers describes a tree that no longer exists
+  // — and the next attempt would be sent after a bug that is already fixed (anton-vynb8).
+  it("forgets a recorded gate failure once the gates pass", async () => {
+    await remember();
+
+    await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
+
+    expect(await recordOf()).toBeNull();
+  });
+
+  // Nothing proved anything green here, so the record is left for the settle/resume to carry.
+  it("leaves the record alone when the gate goes red", async () => {
+    await remember();
+
+    await expect(
+      verifyStep(sandbox.context({ settings: { testCommand: "exit 1" } })),
+    ).rejects.toSatisfy(isVerifyGateFailedError);
+
+    expect(await recordOf()).toBe(RECORD);
+  });
+
+  // A project that pins no gates proves nothing green either — the step returns before it could.
+  it("leaves the record alone when the project pins no gates", async () => {
+    await remember();
+
+    await verifyStep(sandbox.context());
+
+    expect(await recordOf()).toBe(RECORD);
+  });
+
+  // The record has to say WHERE it went red, or a re-attempt cannot act on it.
+  it("names the bead and the formula step the red gate ran under", async () => {
+    const e = await verifyStep(
+      sandbox.context({
+        settings: { testCommand: "exit 1" },
+        step: { id: "verify", labels: ["step:verify"] },
+      }),
+    ).catch((err: unknown) => err);
+
+    expect(isVerifyGateFailedError(e) && e.site).toEqual({ beadId: "anton-8d0f", stepId: "verify" });
   });
 });
 

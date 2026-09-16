@@ -19,6 +19,7 @@ import {
   PoisonEpic,
 } from "./errors";
 import { reopenAbsorbedTimeouts } from "./execute-epic-board";
+import { encodeGateFailure } from "./gate-failure-record";
 import {
   askSettleError,
   BlockedTailError,
@@ -125,9 +126,18 @@ async function releaseRunChildren(run: EpicRun, raw: unknown): Promise<void> {
   if (!ctx.signal.aborted) await reopenAbsorbedTimeouts(repo, epicBeadId, timedOut);
 }
 
+/**
+ * The `lastGateFailure` half of a settle patch: present only when this stop WAS a red verify gate,
+ * absent otherwise so `updateRun` leaves the column untouched (anton-vynb8).
+ */
+function gateFailurePatch(e: unknown, beadId: string): { lastGateFailure?: string } {
+  const encoded = encodeGateFailure(e, { beadId });
+  return encoded ? { lastGateFailure: encoded } : {};
+}
+
 /** Pick the row status this stop deserves, write it, and compose what the runner sees. */
 async function settleRunRow(run: EpicRun, raw: unknown): Promise<RunSettlement> {
-  const { db, clock, ctx, runId, orphanNotice } = run;
+  const { db, clock, ctx, runId, orphanNotice, targetId: epicBeadId } = run;
   // Resolved HERE — after the release awaits, immediately before the settle that would arm the
   // gate — so a kill landing mid-unwind still converts (anton-287p). Nothing before this line
   // branches on the distinction (the release runs the same for either error), so the late read
@@ -196,6 +206,14 @@ async function settleRunRow(run: EpicRun, raw: unknown): Promise<RunSettlement> 
       error: `${e instanceof Error ? e.message : String(e)}${orphanNotice}`,
       structuralError: `${structural}${orphanNotice}`,
       endedAt: clock.now(),
+      // A red verify gate is recorded structurally beside the sentence (anton-vynb8), read off the
+      // typed error the gate threw rather than parsed back out of `error` — which is prose, is
+      // reworded for operators, and is cleared by the very resume this record has to outlive. The
+      // run target is the fallback subject for a gate thrown without a site; a ticket-phase verify
+      // names its own ticket. Undefined for any other failure, which leaves whatever the row
+      // already remembers: a run that dies in commit or push has learned nothing new about its
+      // gates, and blanking the record there would send the next attempt in blind.
+      ...gateFailurePatch(e, epicBeadId),
     });
   }
   // Hand back the worktree this attempt warmed (anton-hrun.1). Delivery is not the only outcome

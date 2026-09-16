@@ -19,8 +19,16 @@ import type { ReasoningAttribution } from "../claude-invocations";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
+import { MAX_GATE_OUTPUT_CHARS, tailLines } from "./gate-output";
 import { labelValue } from "./review-fix-context";
 import type { VerifyGateOutcome } from "./shell";
+
+/**
+ * The gate-output rule (the cap, and the tail that applies it) moved to its own module so the
+ * run-row recorder can share it without pulling this file's dependency graph into `src/lib/runs.ts`
+ * (anton-vynb8). Re-exported so existing importers keep asking review-context for it.
+ */
+export { MAX_GATE_OUTPUT_CHARS, tailLines };
 
 /** The project's own enforced rules, read at the base revision and inlined into the review context. */
 export const PRINCIPLES_PATH = ".product/principles.md";
@@ -40,13 +48,6 @@ export const INSTRUCTION_FILENAMES = ["CLAUDE.md", "AGENTS.md"];
 /** Bounds on inlined text, so one huge bead or rules file can't crowd out the diff. */
 const MAX_BEAD_FIELD_CHARS = 4000;
 const MAX_PRINCIPLES_CHARS = 8000;
-/**
- * Per verify gate. Enough for a runner's failure list and its summary, which is all the reviewer
- * needs from a check it did not have to run — and small enough that four green gates cannot crowd
- * out the diff they are evidence about. Exported so a recorded gate failure gets the same cap one
- * stage earlier, in a re-attempt's dispatch prompt (anton-ahsja).
- */
-export const MAX_GATE_OUTPUT_CHARS = 3000;
 /**
  * Per instruction file, and across all of them — a deep tree can carry many.
  *
@@ -1153,28 +1154,6 @@ function truncate(text: string, max: number): string {
   const trimmed = text.trim();
   if (trimmed.length <= max) return trimmed;
   return `${trimmed.slice(0, max)}${TRUNCATION_MARKER}`;
-}
-
-/**
- * The LAST `max` characters, cut on a line boundary — the opposite end from {@link truncate}.
- *
- * A test runner prints its failures and its totals last and its progress dots first, so keeping the
- * head of a suite log keeps the part that says nothing. Cutting mid-line would leave a half-written
- * path that reads as a real one, so the cut moves forward to the next newline.
- *
- * Unless there ISN'T one (PR #254 review): a tail that holds no newline is a single long line — one
- * JSON blob, one minified stack — and the only ways to end it on a boundary are to keep the whole
- * line, which breaks the budget this function exists to enforce, or to drop it entirely, which
- * throws away the only output there is. So the cap wins and the cut lands mid-line; the
- * `… [earlier output omitted]` marker already tells the reader the text is truncated.
- */
-export function tailLines(text: string, max: number): string {
-  const trimmed = text.trim();
-  if (!trimmed) return "(no output)";
-  if (trimmed.length <= max) return trimmed;
-  const cut = trimmed.length - max;
-  const nl = trimmed.indexOf("\n", cut);
-  return `… [earlier output omitted]\n${trimmed.slice(nl === -1 ? cut : nl + 1)}`;
 }
 
 /** True iff `f` is a usable finding: a known severity and a note a fixer can act on. */

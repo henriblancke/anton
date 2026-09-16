@@ -410,11 +410,23 @@ export function isStaleCheckoutDeferral(error: string | undefined): boolean {
  */
 export class VerifyGateFailedError extends Error {
   readonly outcome: VerifyGateOutcome;
-  constructor(message: string, outcome: VerifyGateOutcome) {
+  readonly site?: VerifyGateSite;
+  constructor(message: string, outcome: VerifyGateOutcome, site?: VerifyGateSite) {
     super(message);
     this.name = "VerifyGateFailedError";
     this.outcome = outcome;
+    this.site = site;
   }
+}
+
+/**
+ * WHERE a gate went red — the bead it ran under and, when it ran as a formula step, that step's id.
+ * The gate runner itself knows neither, so the caller that does names them at the throw; a caller
+ * that doesn't leaves it absent and the recorder falls back to the run target (anton-vynb8).
+ */
+export interface VerifyGateSite {
+  beadId: string;
+  stepId?: string;
 }
 
 export function isVerifyGateFailedError(e: unknown): e is VerifyGateFailedError {

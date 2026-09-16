@@ -4,7 +4,7 @@
  */
 import { spawn } from "node:child_process";
 import { appendSessionLog } from "../sessions";
-import { VerifyGateFailedError } from "./errors";
+import { VerifyGateFailedError, type VerifyGateSite } from "./errors";
 import { VERIFY_GATE_LOCK, withHostLock } from "./host-lock";
 import type { VerifyGate } from "../projects";
 
@@ -289,6 +289,11 @@ export async function captureVerifyGates(
  * non-zero exit — the same fail path as the historical single test gate. `onFail` builds the
  * caller-specific error message (execute-epic names the ticket; review-fix names the PR). An empty
  * gate list is a no-op, preserving unchanged behavior when nothing is configured.
+ *
+ * `site` names WHERE the gates ran — the bead, and the formula step when there is one — so a red
+ * gate recorded against the run row says which ticket it failed under (anton-vynb8). The runner
+ * cannot know either, and a caller that doesn't pass one leaves the thrower's own fallback to fill
+ * it in.
  */
 export async function runVerifyGates(
   gates: VerifyGate[],
@@ -296,7 +301,8 @@ export async function runVerifyGates(
   signal: AbortSignal | undefined,
   logPath: string,
   onFail: (gate: VerifyGate, code: number | null) => string,
+  site?: VerifyGateSite,
 ): Promise<void> {
   const red = (await captureVerifyGates(gates, cwd, signal, logPath)).find((o) => !o.ok);
-  if (red) throw new VerifyGateFailedError(onFail(red, red.code), red);
+  if (red) throw new VerifyGateFailedError(onFail(red, red.code), red, site);
 }

@@ -5,6 +5,7 @@
 import { and, count, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
+import { decodeGateFailure, type RecordedGateFailure } from "./jobs/gate-failure-record";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
   ACTIVE_RUN_STATUSES,
@@ -216,6 +217,13 @@ export type RunPatch = Partial<{
   error: string | null;
   /** Anton's own account of why the run stopped, held apart from `error` above (anton-4kvp) — see schema. */
   structuralError: string | null;
+  /**
+   * The last red verify gate, JSON-encoded (anton-vynb8) — see the column's own note. Deliberately
+   * NOT rewritten by the resume that clears `error`/`reviewScore`/`attemptStartedAt`: it is the one
+   * value the NEXT attempt is meant to inherit. Written by the settle that records a gate failure,
+   * `null` by the gate that passes and by the settle that finishes the run.
+   */
+  lastGateFailure: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
   /** A clean verdict's resume key (anton-qmuyt) — see the column's own note. */
@@ -264,6 +272,29 @@ export async function getRunBaseForkSha(db: AntonDb, runId: string): Promise<str
     .where(eq(schema.runs.id, runId))
     .limit(1);
   return rows[0]?.baseForkSha ?? undefined;
+}
+
+/**
+ * The verify-gate failure a previous attempt on this run recorded (anton-vynb8), or undefined when
+ * there is none — a first attempt, a run whose gates last went green, or a row written before the
+ * column existed. Read at dispatch so a re-attempt opens with the gate that failed last time instead
+ * of starting blind.
+ *
+ * Keyed by run id alone, unlike {@link findRunBaseForkShaForBranch}: a gate failure describes THIS
+ * attempt sequence over this row, and the resume that reuses the row is exactly the reader it exists
+ * for. A fresh row for the same branch is a new sequence whose tree the old failure may no longer
+ * describe.
+ */
+export async function getRunGateFailure(
+  db: AntonDb,
+  runId: string,
+): Promise<RecordedGateFailure | undefined> {
+  const rows = await db
+    .select({ lastGateFailure: schema.runs.lastGateFailure })
+    .from(schema.runs)
+    .where(eq(schema.runs.id, runId))
+    .limit(1);
+  return decodeGateFailure(rows[0]?.lastGateFailure);
 }
 
 /**
