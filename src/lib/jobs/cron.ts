@@ -1,7 +1,7 @@
 /**
  * Minimal standard-cron parser + `nextRun` computation (anton-3t2.1). Supports the classic
  * 5-field crontab syntax — `minute hour day-of-month month day-of-week` — with `*`, lists (`,`),
- * ranges (`a-b`), and steps (`*​/n`, `a-b/n`). No seconds field, no `@daily` macros, no `L`/`#`
+ * ranges (`a-b`), and steps (`*\/n`, `a-b/n`). No seconds field, no `@daily` macros, no `L`/`#`
  * extensions: schedules here are operator-configured and only need the common cases.
  *
  * Semantics follow POSIX cron: when BOTH day-of-month and day-of-week are restricted (neither is
@@ -35,7 +35,7 @@ const FIELDS: FieldSpec[] = [
   { min: 0, max: 7 }, // day of week (0 and 7 = Sunday)
 ];
 
-/** Parse one cron field (e.g. `*​/15`, `1-5`, `0,30`) into the set of values it matches. */
+/** Parse one cron field (e.g. `*\/15`, `1-5`, `0,30`) into the set of values it matches. */
 function parseField(field: string, spec: FieldSpec): Set<number> {
   const out = new Set<number>();
   for (const part of field.split(",")) {
