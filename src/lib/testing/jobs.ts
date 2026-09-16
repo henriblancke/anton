@@ -18,7 +18,23 @@ import {
   type JobStatus,
   type JobType,
 } from "@/lib/jobs/queue";
-import { JobRunner, type JobHandler, type RunnerConfig } from "@/lib/jobs/runner";
+import {
+  JobRunner,
+  type JobHandler,
+  type RunnerConfig,
+  type SelfFreshnessReader,
+} from "@/lib/jobs/runner";
+
+/**
+ * A process that is running its own latest code — the default for every test runner built here
+ * (anton-kqst).
+ *
+ * The real reader fetches a git remote and reads the lockfile, node_modules and anton.db against
+ * `process.cwd()`, which for a test process is the anton checkout itself: left unstubbed, every job
+ * suite would gate on whether the DEVELOPER's tree happens to be current, and a suite run on a branch
+ * behind origin would defer instead of dispatching. A suite that is about the gate injects its own.
+ */
+export const FRESH_CHECKOUT: SelfFreshnessReader = async () => undefined;
 
 export interface DriveJobOptions {
   db: AntonDb;
@@ -32,6 +48,8 @@ export interface DriveJobOptions {
   payload?: unknown;
   /** Merged over `{ maxConcurrent: 1 }` — e.g. `leaseMs`, `quotaCooloffMs`. */
   config?: Partial<RunnerConfig>;
+  /** Defaults to {@link FRESH_CHECKOUT}; override to drive the dispatch staleness gate. */
+  readSelfCheckoutRefusal?: SelfFreshnessReader;
 }
 
 /**
@@ -40,11 +58,20 @@ export interface DriveJobOptions {
  * shape. `driveJob` is this plus enqueue/tick/settle.
  */
 export function makeJobRunner(
-  opts: Pick<DriveJobOptions, "db" | "clock" | "type" | "handler" | "config">,
+  opts: Pick<
+    DriveJobOptions,
+    "db" | "clock" | "type" | "handler" | "config" | "readSelfCheckoutRefusal"
+  >,
 ): JobRunner {
-  const { db, clock, type, handler, config } = opts;
+  const { db, clock, type, handler, config, readSelfCheckoutRefusal } = opts;
 
-  const runner = new JobRunner({ db, clock, config: { maxConcurrent: 1, ...config }, log: TEST_LOG });
+  const runner = new JobRunner({
+    db,
+    clock,
+    config: { maxConcurrent: 1, ...config },
+    log: TEST_LOG,
+    readSelfCheckoutRefusal: readSelfCheckoutRefusal ?? FRESH_CHECKOUT,
+  });
   runner.registerHandler(type, handler({ db, clock }));
   return runner;
 }
