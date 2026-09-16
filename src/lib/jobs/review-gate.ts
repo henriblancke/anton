@@ -152,6 +152,8 @@ export interface ReviewGateArgs {
   target: Bead;
   /** Every ticket the run implemented, in execution order. */
   tickets: Bead[];
+  /** See {@link import("./steps/context").StepContext.boardEvidenceByTicket}. */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
   settings: ProjectSettings;
   /** The run's worktree: where the diff is read and the fixes land. */
   worktreePath: string;
@@ -342,6 +344,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       runId,
       target,
       tickets,
+      boardEvidenceByTicket: args.boardEvidenceByTicket,
       settings,
       worktreePath,
       baseRev,
@@ -478,6 +481,8 @@ async function runReviewSession(args: {
   runId?: string;
   target: Bead;
   tickets: Bead[];
+  /** See {@link ReviewGateArgs.boardEvidenceByTicket}. */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
   settings: ProjectSettings;
   worktreePath: string;
   /** The pinned fork-point commit: the patch AND the reviewer's trusted inputs both come from it. */
@@ -596,6 +601,7 @@ async function runReviewSession(args: {
         target,
         tickets,
         diff,
+        boardEvidenceByTicket: args.boardEvidenceByTicket,
         settings,
         projectDir: worktreePath,
         // Literally the same commit the diff is taken from — a pinned SHA, not the movable base ref

@@ -46,6 +46,48 @@ export interface SystemPromptLayers {
   agentPrompt?: string;
   /** The project's user-editable seed prompt (settingsJson.seedPrompt). */
   seedPrompt?: string;
+  /**
+   * True when anton classified THIS ticket's delivery as board-only ({@link
+   * import("../jobs/execute-epic-board-evidence").isBoardOnlyRun}) — its deliverable is `bd`
+   * writes to the board, never a git diff. The base's "Never report `delivered` on an unchanged
+   * tree" rule was written for the tree-based ticket it always used to be, so a compliant
+   * board-only agent that made exactly the bd writes it was asked for — and left the tree
+   * untouched, as it should — has no outcome left to report under that rule but `blocked`, which
+   * is the false failure a review of the anton-fc5x PR caught: the run's own board-evidence gate
+   * only inspects `selfReport.outcome === "delivered"`, so a compliant `blocked` report makes it
+   * reject genuine board work without ever reading the board. This flag adds the one carve-out the
+   * base cannot state for itself, since it is a fact about THIS run's classification of THIS
+   * ticket, not a project or agent preference — so it is layered as part of the contract, ahead of
+   * the agent/seed layers, rather than as a customization that could be mistaken for one.
+   */
+  boardOnly?: boolean;
+}
+
+/** The carve-out from the base's unchanged-tree rule for a ticket anton classified as board-only —
+ * a fact about THIS run, so it rides with the contract rather than the customizable layers below
+ * it (see {@link SystemPromptLayers.boardOnly}). */
+function boardOnlySection(): string {
+  return [
+    "## This ticket is board-only",
+    "",
+    "anton classified this ticket's delivery as **board-only** (`delivery:board`): its deliverable",
+    "is `bd` writes to the board, not a git diff. Editing the working tree is neither required nor",
+    "expected, and an unchanged tree is the normal, successful shape of this ticket's work.",
+    "",
+    "This carves out the base contract's \"Never report `delivered` on an unchanged tree\" rule",
+    "above, for this ticket only: once you have made the bd write(s) this ticket's acceptance",
+    "calls for, report",
+    "",
+    "```",
+    "ANTON-RESULT: delivered",
+    "```",
+    "",
+    "even though the working tree is unchanged. anton verifies a board-only `delivered` against the",
+    "board itself — a fresh read compared against the read taken before you started — never against",
+    "the branch, so this is not the false-success shape the base rule exists to catch. If you could",
+    "not make the required writes, report `blocked` or `needs-human` exactly as you would for any",
+    "other ticket.",
+  ].join("\n");
 }
 
 /**
@@ -58,6 +100,10 @@ export function composeSystemPrompt(layers: SystemPromptLayers): string {
   if (!base) throw new Error("composeSystemPrompt: base is required and must be non-empty");
 
   const sections: string[] = [base];
+
+  // The board-only carve-out rides with the contract, ahead of the agent/seed layers, since it is
+  // part of what the base itself means for THIS ticket rather than a customization of it.
+  if (layers.boardOnly) sections.push(boardOnlySection());
 
   const agent = layers.agentPrompt?.trim();
   if (agent) {
@@ -91,7 +137,13 @@ export function composeSystemPrompt(layers: SystemPromptLayers): string {
 export async function buildExecutionSystemPrompt(opts: {
   agentPrompt?: string;
   seedPrompt?: string;
+  boardOnly?: boolean;
 }): Promise<string> {
   const base = await loadBaseSystemPrompt();
-  return composeSystemPrompt({ base, agentPrompt: opts.agentPrompt, seedPrompt: opts.seedPrompt });
+  return composeSystemPrompt({
+    base,
+    agentPrompt: opts.agentPrompt,
+    seedPrompt: opts.seedPrompt,
+    boardOnly: opts.boardOnly,
+  });
 }

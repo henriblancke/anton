@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 7e8368fe1280
+version: 7b655b464b7b
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -110,8 +110,22 @@ under it. **Never re-type an existing bead to "migrate" it.**
 | `agent:`  | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, … or `human`; or omitted | which specialist fits; `human` names the one specialist anton does not have — see below |
 | `size:`   | `S`, `M`, `L`                                              | sanity check; `L` on a ticket is a smell — split it |
 | `source:` | `stringer`, `gardener`, or omitted                         | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup, and gardener proposals `gardener:<class>:<hash>` (an open or declined fingerprint stops the patrol re-asking) |
+| `delivery:` | `board`, or omitted                                      | `board` = the entire deliverable is bd writes, never a git diff — see below |
 
 (Model routing is the executor's concern — shaping does not set a `model:` label.)
+
+### `delivery:board` — the deliverable is the board, not the tree
+
+Set this on a run target ONLY when its whole job is bd writes — updating other beads' fields,
+closing superseded ones, filing follow-ups — and it will leave no git diff by design (anton-fc5x).
+Without it, anton's zero-diff guard reads a clean git tree as a false success and blocks the ticket
+for a human, and a `blocked` bead is not claimable, so the very ticket that finished its job wedges
+itself out of the next run. With it, anton checks the BOARD for evidence instead of the tree — a
+fresh read taken before dispatch, diffed against one taken after, confirmed synced.
+
+This is a shaping-time decision, never inferred from the agent's own report: an agent cannot opt
+its own ticket out of the zero-diff guard, only shaping can, before the run ever claims it. If a
+ticket mixes code and board work, leave it unlabeled — the git diff already covers it.
 
 ### `agent:human` — work no agent can finish
 

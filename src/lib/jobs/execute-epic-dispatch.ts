@@ -25,6 +25,7 @@ import {
   worktreeHasCommitFor,
   type SatisfiedClaim,
 } from "../git/ops";
+import { clearBoardEvidencePending } from "./execute-epic-board-evidence";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -74,6 +75,13 @@ export interface DispatchOutcome {
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
   skipped: Map<string, SkipCause>;
   /**
+   * The bead ids a board-only ticket's CONFIRMED evidence covered, by ticket id (PR #284 review round
+   * 11) — so the review gate can tell the reviewer which beads a ticket actually changed instead of
+   * only that a board write happened somewhere. Absent for a ticket that is not board-only, or whose
+   * evidence never confirmed.
+   */
+  boardEvidenceByTicket: Map<string, string[]>;
+  /**
    * The run's ONLY ticket was its standalone target, and THIS attempt verified and retired it as
    * already shipped (PR #238 review). There is nothing to review, no pull request to open, and
    * nothing left for a person to decide — the target is already closed as superseded with anton's
@@ -106,6 +114,8 @@ interface DispatchLedger {
   onBranch: Set<string>;
   /** Tickets that settled on an earlier commit of the run — see {@link DispatchOutcome.satisfied}. */
   satisfied: Map<string, SatisfiedSettlement>;
+  /** See {@link DispatchOutcome.boardEvidenceByTicket}. */
+  boardEvidence: Map<string, string[]>;
 }
 
 /** Dispatch every ticket this run may run, then answer what it delivered. */
@@ -158,6 +168,7 @@ export async function dispatchRunTickets(
     // ticket and skip valid work behind it.
     onBranch: new Set(run.retired.map((r) => r.id)),
     satisfied: new Map(),
+    boardEvidence: new Map(),
   };
   const recordSkipped = makeSkipRecorder(run, ledger);
 
@@ -191,6 +202,7 @@ export async function dispatchRunTickets(
     targetRetired: verdict.targetRetired,
     satisfied: ledger.satisfied,
     skipped: ledger.skipped,
+    boardEvidenceByTicket: ledger.boardEvidence,
   };
 }
 
@@ -1100,6 +1112,32 @@ async function dispatchTicket(
     );
   }
   if (delivery) {
+    // A prior attempt's board-evidence cleanup can fail (bd keeps refusing the write) AFTER this
+    // ticket already closed/transitioned — `runTicket` throws `PoisonEpic` and halts that attempt,
+    // but `runTicket` is the only caller of `clearBoardEvidencePending` and this resume just skipped
+    // it. Retry the cleanup here so a stale pending marker does not survive past the run that halted
+    // on it: `doneOnBoard` (required for `delivery` to be set at all) means this ticket's
+    // close/in-review transition already landed, the same post-condition `runTicket` gates the
+    // cleanup on, so retrying it now is exactly as safe as the original call was. A no-op for every
+    // ticket with nothing pending — not board-only, or one whose marker already cleared.
+    //
+    // Checked as two independent survivors, not just the marker (PR #284 review): a prior halt can
+    // clear the marker and then exhaust its retries on the preserved baseline, so `stalePending`
+    // alone reads as "nothing left to do" while the baseline is still stranded on the bead. Passing
+    // `hasPreservedBaseline` lets the retry reach it even when no ids are pending at all.
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    // Recorded into the ledger BEFORE the clear, mirroring the fresh-run path below (PR #284
+    // review): these ids are exactly the confirmed evidence the reviewer's board-only section
+    // cross-checks, and `deliveredTickets` carries this ticket into `ReviewRun.tickets`
+    // regardless of this fast path — so without this, the ticket lands in the board-only run
+    // with no per-ticket evidence line, silently undercutting that cross-check.
+    if (stalePending.length > 0) {
+      ledger.boardEvidence.set(ticket.id, stalePending);
+    }
+    if (stalePending.length > 0 || hasPreservedBaseline) {
+      await clearBoardEvidencePending(repo, ticket.id, stalePending, hasPreservedBaseline);
+    }
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review
       // on a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't
@@ -1178,6 +1216,9 @@ async function dispatchTicket(
     // standalone target is never closed here, and a bd that refused the close left the bead open.
     if (settlement.how === "satisfied") {
       ledger.satisfied.set(ticket.id, { ...settlement.by, closed: settlement.closed });
+    }
+    if (settlement.boardEvidenceIds?.length) {
+      ledger.boardEvidence.set(ticket.id, settlement.boardEvidenceIds);
     }
   } catch (e) {
     // A ticket anton RETIRED as already shipped is absorbed too (anton-5bpd). The repair verified

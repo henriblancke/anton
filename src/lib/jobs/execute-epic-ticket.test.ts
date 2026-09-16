@@ -16,6 +16,9 @@ const branchAddedCommitMock = vi.fn();
 const describeCommitMock = vi.fn();
 const finishTicketMock = vi.fn();
 const settleFailedTicketMock = vi.fn();
+const readBoardBaselineMock = vi.fn();
+const readBoardEvidenceMock = vi.fn();
+const clearBoardEvidencePendingMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
@@ -36,6 +39,21 @@ vi.mock("./execute-epic-ticket-bookends", async () => {
     openTicketSession: async () => ({ sessionId: "s1", logPath: "/dev/null" }),
     readTicketBaseline: async () => null,
     finishTicket: (...args: unknown[]) => finishTicketMock(...args),
+  };
+});
+
+vi.mock("./execute-epic-board-evidence", async () => {
+  const actual = await vi.importActual<typeof import("./execute-epic-board-evidence")>(
+    "./execute-epic-board-evidence",
+  );
+  return {
+    ...actual,
+    // `isBoardOnlyRun` is left as the real implementation — it just reads the `delivery:board`
+    // label, and forcing it here would silently flip every OTHER test in this file onto the
+    // board-only path too. Only the board reads/writes below it are faked.
+    readBoardBaseline: (...args: unknown[]) => readBoardBaselineMock(...args),
+    readBoardEvidence: (...args: unknown[]) => readBoardEvidenceMock(...args),
+    clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
   };
 });
 
@@ -72,6 +90,9 @@ function run(): Omit<StepContext, "tickets"> {
     baseRef: "main",
     db: {},
     clock: { now: () => 0 },
+    // Read by isBoardOnlyRun's target-side check (anton-fc5x review round 1) — an ordinary,
+    // non-board-only run target, since none of this suite's cases concern board-only delivery.
+    target: ticket,
   } as unknown as Omit<StepContext, "tickets">;
 }
 
@@ -99,7 +120,7 @@ describe("runTicket — the deadline is honoured through the gate's branch read 
   beforeEach(() => {
     vi.resetAllMocks();
     describeCommitMock.mockResolvedValue({ sha: EARLIER, subject: "anton-t1: Add the schema" });
-    finishTicketMock.mockResolvedValue({ closed: true });
+    finishTicketMock.mockResolvedValue({ closed: true, transitioned: true });
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -187,5 +208,70 @@ describe("runTicket — the deadline is honoured through the gate's branch read 
       true,
       expect.objectContaining({ how: "satisfied" }),
     );
+  });
+});
+
+/**
+ * PR #284 review round 7: `finishTicket` answers `transitioned` (not just `closed`) precisely so the
+ * pending board-evidence marker is released only once the write that ends the ticket's handoff
+ * actually landed — clearing it on an unconditional `finishTicket` return would strand a confirmed
+ * board-only delivery's only recovery record on a bd write that never happened.
+ */
+describe("runTicket — releases the board-evidence marker only once the handoff lands (PR #284 review round 7)", () => {
+  const boardTicket = { ...ticket, labels: ["delivery:board"] } as Bead;
+
+  function deliveredCommitStep(): ResolvedStep {
+    const facts: StepFacts = { committed: true, selfReport: { outcome: "delivered" } };
+    return {
+      step: { id: "commit" },
+      definition: {
+        name: "commit",
+        class: "git",
+        summary: "fake board-only commit",
+        producesDiff: false,
+        handler: async () => ({ ok: true, facts }),
+      },
+    } as unknown as ResolvedStep;
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
+    readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x1"], synced: true });
+    settleFailedTicketMock.mockImplementation(async () => {
+      throw new Error("settled as a failure");
+    });
+  });
+
+  it("clears the pending marker once finishTicket confirms the transition landed", async () => {
+    finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
+
+    await runTicket({
+      run: run(),
+      steps: [deliveredCommitStep()],
+      ticket: boardTicket,
+      runTicketIds: [boardTicket.id],
+      timeoutMs: 5_000,
+    });
+
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", boardTicket.id, ["anton-x1"]);
+  });
+
+  it("fails loud instead of returning success when bd refused the requested transition — a " +
+    "child ticket's already-landed board edits must stay recoverable, not settle as delivered " +
+    "with a stale marker on a bead that never closed", async () => {
+    finishTicketMock.mockResolvedValue({ closed: false, transitioned: false });
+
+    await expect(
+      runTicket({
+        run: run(),
+        steps: [deliveredCommitStep()],
+        ticket: boardTicket,
+        runTicketIds: [boardTicket.id],
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/board evidence was confirmed/);
+
+    expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
   });
 });

@@ -1217,6 +1217,7 @@ describe("landableTicketIds — which prerequisites this run can still land (ant
     skipped: new Map(),
     onBranch: new Set<string>(),
     satisfied: new Map(),
+    boardEvidence: new Map(),
   });
   const board = () => [ticket("schema"), ticket("api"), ticket("wiring")];
 
@@ -1862,6 +1863,307 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     expect(refused?.message).toBe(expected);
     expect(claimed).toMatchObject({ committed: true, delivered: false });
   });
+});
+
+describe("assertDelivered — a board-only ticket settles on the board, never the git tree (anton-fc5x)", () => {
+  const ticket: Bead = {
+    id: "anton-board",
+    title: "assertDelivered settles a board-only ticket on board evidence",
+    status: "in_progress",
+    issue_type: "task",
+    labels: [LABELS.boardOnly],
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    delivered: false,
+    selfReport,
+  });
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a board-only ticket");
+  };
+  const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
+
+  it("settles delivered once the board shows evidence that is confirmed synced", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+
+    await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, check)).resolves.toBeUndefined();
+    expect(p).toMatchObject({ committed: false, delivered: true });
+  });
+
+  it(
+    "records the confirmed ids on `progress.boardEvidenceIds` (anton-fc5x review round 4) — the " +
+      "ticket's own success path reads this back to release the `board-evidence-pending:*` marker " +
+      "only once the handoff (attribution + close) actually completes, never from inside the check",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: true });
+
+      await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, check)).resolves.toBeUndefined();
+      expect(p.boardEvidenceIds).toEqual(["swept-1", "swept-2"]);
+    },
+  );
+
+  it(
+    "blocks and fails closed when the board-evidence check itself reports an unreadable baseline, " +
+      "rather than silently falling through to the tree-based zero-diff path (anton-fc5x review round " +
+      "4, finding 1/3: a board-only ticket whose baseline read failed must never be treated as an " +
+      "ordinary ticket, even when an incidental commit exists on the branch)",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: false, ids: [], synced: false, baselineUnavailable: true });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).toMatch(/pre-dispatch board baseline could not be read/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
+  it(
+    "blocks and fails closed — with a distinct message — when the POST-run board read is the one " +
+      "that failed (PR #284 review), never folded into the plain not-found branch: that branch " +
+      "asserts nothing differs, which is false when no comparison was ever made",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: false, ids: [], synced: false, evidenceUnavailable: true });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).toMatch(/post-run board read could not be read/);
+      expect(err?.message).not.toMatch(/nothing differs/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
+  it(
+    "names a prior attempt's already-pending ids in the evidenceUnavailable message, rather than " +
+      "silently dropping them, when THIS attempt's post-run read fails",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({
+        found: true,
+        ids: ["swept-1"],
+        synced: false,
+        evidenceUnavailable: true,
+      });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.message).toMatch(/swept-1/);
+      expect(err?.message).toMatch(/prior attempt/);
+    },
+  );
+
+  it(
+    "records the branch's empty attribution commit and flips `committed` true once the board is " +
+      "confirmed (anton-fc5x review round 3) — a board-only delivery otherwise leaves the branch " +
+      "identical to its base, and the run's `step:pr` fails `gh pr create` on that empty diff",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+      let recorded = false;
+      const recordBoardAttribution = async () => {
+        recorded = true;
+      };
+
+      await expect(
+        assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution),
+      ).resolves.toBeUndefined();
+
+      expect(recorded).toBe(true);
+      expect(p).toMatchObject({ committed: true, delivered: true });
+    },
+  );
+
+  it("never records an attribution commit when the board shows no confirmed evidence", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: false, ids: [], synced: false });
+    const recordBoardAttribution = async () => {
+      throw new Error("recordBoardAttribution ran without confirmed board evidence");
+    };
+
+    await expect(
+      failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution)),
+    ).resolves.toBeInstanceOf(Error);
+  });
+
+  it("blocks when the board shows no evidence at all, naming the check it failed", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: false, ids: [], synced: false });
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+    expect(err?.name).toBe("PoisonError");
+    expect(err?.message).toMatch(/anton-board produced no delivery/);
+    expect(err?.message).toMatch(/no bd write landed on the board since the ticket started/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+  });
+
+  it(
+    "blocks and fails closed — rather than settling delivered — when the evidence marker itself " +
+      "could not be persisted (PR #284 review round 5): found+synced alone is not a settled verdict " +
+      "when the durable record of it never landed, since a crash right after this point would strand " +
+      "a genuinely-shipped delivery with nothing left to recover it from",
+    async () => {
+      const p = progress({ outcome: "delivered" });
+      const check = async () => ({
+        found: true,
+        ids: ["swept-1"],
+        synced: true,
+        markerUnpersisted: true,
+      });
+      const recordBoardAttribution = async () => {
+        throw new Error("recordBoardAttribution ran without a settled evidence verdict");
+      };
+
+      const err = await failure(
+        assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution),
+      );
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).toMatch(/pending-evidence marker/);
+      expect(err?.message).toMatch(/swept-1/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
+  it("blocks when the board changed but the sync could not be confirmed, naming the beads", async () => {
+    const p = progress({ outcome: "delivered" });
+    const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: false });
+
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+    expect(err?.message).toMatch(/swept-1, swept-2/);
+    expect(err?.message).toMatch(/could not be confirmed synced/);
+    expect(p).toMatchObject({ committed: false, delivered: false });
+  });
+
+  it("never checks the board on a missing or blocked self-report — the agent's word is required, not sufficient", async () => {
+    const check = async () => {
+      throw new Error("the board-only check ran without a `delivered` self-report");
+    };
+
+    const missing = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked, check));
+    expect(missing?.message).toMatch(/produced no delivery/);
+
+    const blocked = await failure(
+      assertDelivered(
+        ticket,
+        { committed: false },
+        progress({ outcome: "blocked", klass: "other", reason: "couldn't find anything to sweep" }),
+        neverAsked,
+        check,
+      ),
+    );
+    expect(blocked?.message).toMatch(/produced no delivery/);
+  });
+
+  it("leaves an ordinary (non-board-only) ticket's zero diff completely unaffected", async () => {
+    const codeTicket: Bead = { ...ticket, id: "anton-code", labels: [] };
+    const p = progress({ outcome: "delivered" });
+
+    // Production never passes checkBoardEvidence for a ticket whose delivery isn't board-only
+    // (see isBoardOnlyRun in execute-epic-board-evidence.ts) — assertDelivered trusts the
+    // parameter's mere presence rather than re-deriving board-only-ness from the ticket's own
+    // label (anton-fc5x review round 2, finding 1/3: that re-derivation is what missed a child
+    // ticket dispatched under a board-only-labelled run TARGET).
+    const err = await failure(assertDelivered(codeTicket, { committed: false }, p, neverAsked, undefined));
+    expect(err?.message).toBe(
+      "anton-code produced no delivery: claude exited cleanly and passed the verify gates but " +
+        "left no changes to commit (zero diff). Blocking the ticket for operator review and " +
+        "halting the epic — nothing landed, so closing it would be a false success. The agent " +
+        "self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.",
+    );
+  });
+
+  it(
+    "runs the board-only check for a ticket with no `delivery:board` label of its own, once " +
+      "checkBoardEvidence is passed — the caller (runTicket) resolves board-only-ness against the " +
+      "run TARGET too, so a child ticket inheriting the label is checked the same way a directly " +
+      "labelled one is (anton-fc5x review round 2, finding 1/3)",
+    async () => {
+      const inheritedChild: Bead = { ...ticket, id: "anton-inherited-child", labels: [] };
+      const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+      const p = progress({ outcome: "delivered" });
+
+      await expect(
+        assertDelivered(inheritedChild, { committed: false }, p, neverAsked, check),
+      ).resolves.toBeUndefined();
+      expect(p).toMatchObject({ committed: false, delivered: true });
+    },
+  );
+
+  describe(
+    "an incidental tree change never lets a board-only ticket skip its own evidence check " +
+      "(PR #284 review round 2) — the board check used to sit under `if (!committed)`, so a stray " +
+      "commit (an accidental generated file) fell straight to the tree-based path below and could " +
+      "settle delivered on a `delivered` self-report with NO bd write ever confirmed",
+    () => {
+      it("still requires confirmed board evidence when the tree also committed something", async () => {
+        const p = progress({ outcome: "delivered" });
+        const check = async () => ({ found: false, ids: [], synced: false });
+
+        const err = await failure(assertDelivered(ticket, { committed: true }, p, neverAsked, check));
+
+        expect(err?.name).toBe("PoisonError");
+        expect(err?.message).toMatch(/no bd write landed on the board since the ticket started/);
+        expect(p).toMatchObject({ committed: true, delivered: false });
+      });
+
+      it("blocks a missing self-report plus a stray commit rather than treating the commit as delivery", async () => {
+        const check = async () => {
+          throw new Error("the board-only check ran without a `delivered` self-report");
+        };
+
+        const err = await failure(assertDelivered(ticket, { committed: true }, progress(null), neverAsked, check));
+
+        expect(err?.message).toMatch(/produced no delivery/);
+      });
+
+      it("blocks a self-reported block plus a stray commit as a plain board no-delivery, not `BlockedByAgentError`", async () => {
+        const check = async () => {
+          throw new Error("the board-only check ran without a `delivered` self-report");
+        };
+        const blockedReport = { outcome: "blocked" as const, klass: "other" as const, reason: "nothing to sweep" };
+
+        const err = await failure(
+          assertDelivered(ticket, { committed: true }, progress(blockedReport), neverAsked, check),
+        );
+
+        expect(err?.name).toBe("PoisonError");
+        expect(err?.message).toMatch(/produced no delivery/);
+      });
+
+      it("still settles delivered on confirmed board evidence when the tree also committed something", async () => {
+        const p = progress({ outcome: "delivered" });
+        const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+
+        await expect(
+          assertDelivered(ticket, { committed: true }, p, neverAsked, check),
+        ).resolves.toBeUndefined();
+        expect(p).toMatchObject({ committed: true, delivered: true });
+      });
+
+      it("never records a redundant attribution commit when the tree already committed something", async () => {
+        const p = progress({ outcome: "delivered" });
+        const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
+        const recordBoardAttribution = async () => {
+          throw new Error("recordBoardAttribution ran even though the branch already had a commit");
+        };
+
+        await expect(
+          assertDelivered(ticket, { committed: true }, p, neverAsked, check, recordBoardAttribution),
+        ).resolves.toBeUndefined();
+        expect(p).toMatchObject({ committed: true, delivered: true });
+      });
+    },
+  );
 });
 
 /**
