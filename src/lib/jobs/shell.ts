@@ -4,6 +4,7 @@
  */
 import { spawn } from "node:child_process";
 import { appendSessionLog } from "../sessions";
+import { VerifyGateFailedError } from "./errors";
 import { VERIFY_GATE_LOCK, withHostLock } from "./host-lock";
 import type { VerifyGate } from "../projects";
 
@@ -297,5 +298,5 @@ export async function runVerifyGates(
   onFail: (gate: VerifyGate, code: number | null) => string,
 ): Promise<void> {
   const red = (await captureVerifyGates(gates, cwd, signal, logPath)).find((o) => !o.ok);
-  if (red) throw new Error(onFail(red, red.code));
+  if (red) throw new VerifyGateFailedError(onFail(red, red.code), red);
 }

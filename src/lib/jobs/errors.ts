@@ -4,6 +4,7 @@
  * plain retry — the runner never inspects error messages.
  */
 import type { BoardUnreachableCause } from "../beads/board-unreachable";
+import type { VerifyGateOutcome } from "./shell";
 
 /**
  * The handler hit an API/usage limit it cannot retry through. The runner PARKS the job and
@@ -394,4 +395,31 @@ export const STALE_CHECKOUT_REFUSAL_PREFIX =
  */
 export function isStaleCheckoutDeferral(error: string | undefined): boolean {
   return error !== undefined && error.startsWith(STALE_CHECKOUT_REFUSAL_PREFIX);
+}
+
+/**
+ * A verify gate came back red (anton-fuy5o) — `runVerifyGates`'s throwing half used to reduce the
+ * red {@link VerifyGateOutcome} `captureVerifyGates` already computed to one sentence and drop the
+ * rest (label, command, exit code, full combined output) on the floor. Carrying the outcome lets a
+ * caller act on WHAT failed instead of re-running the gate or re-parsing the message.
+ *
+ * `message` is still exactly what the caller's `onFail` built — every existing call site and
+ * operator-facing surface depends on that text staying byte-identical — so this only stops throwing
+ * the outcome away, it changes nothing about what is shown. Deliberately extends plain `Error` (not
+ * `PoisonError` or `UsageLimitError`): the runner's classification of a gate failure is unchanged.
+ */
+export class VerifyGateFailedError extends Error {
+  readonly outcome: VerifyGateOutcome;
+  constructor(message: string, outcome: VerifyGateOutcome) {
+    super(message);
+    this.name = "VerifyGateFailedError";
+    this.outcome = outcome;
+  }
+}
+
+export function isVerifyGateFailedError(e: unknown): e is VerifyGateFailedError {
+  return (
+    e instanceof VerifyGateFailedError ||
+    (e as { name?: string })?.name === "VerifyGateFailedError"
+  );
 }
