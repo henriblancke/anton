@@ -106,7 +106,8 @@ import {
   parseThreadReport,
   type ThreadOutcome,
 } from "./review-fix-context";
-import { IN_REVIEW, safe } from "./review-fix-board";
+import { IN_REVIEW } from "./review-fix-board";
+import { safe } from "./safe";
 import { finalizeMergedEpic } from "./review-fix-finalize";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
