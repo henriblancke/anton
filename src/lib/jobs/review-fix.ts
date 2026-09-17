@@ -428,7 +428,7 @@ async function handleEpic(args: {
   return withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts } = await prepareFixWorktree({
+    const { worktree, conflicts, alreadyAhead } = await prepareFixWorktree({
       ctx,
       repo,
       branch,
@@ -451,6 +451,7 @@ async function handleEpic(args: {
       pr,
       verdict,
       conflicts,
+      alreadyAhead,
       branch,
       number,
     });
@@ -475,7 +476,7 @@ async function prepareFixWorktree(args: {
   number: number;
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
-}): Promise<{ worktree: Worktree; conflicts: string[] }> {
+}): Promise<{ worktree: Worktree; conflicts: string[]; alreadyAhead: boolean }> {
   const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } =
     args;
 
@@ -518,6 +519,13 @@ async function prepareFixWorktree(args: {
     mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
+  // Snapshot "ahead of origin" right after the fast-forward sync above and BEFORE the premerge
+  // below — the premerge's own auto-merge commit (see its "clean auto-merge" comment) would
+  // otherwise put the branch ahead for a reason that has nothing to do with a prior session's or
+  // operator's own commits, and the caller uses this specifically to recognize THAT: a resume whose
+  // branch already carries committed work (anton-2wklm).
+  const alreadyAhead = await branchAheadOfRemote(repo, branch);
+
   // This premerge brings in a DIFFERENT ref than the sync above (`origin/${baseBranch}`, the PR's
   // base, not `origin/${branch}`), so it needs the identical incoming-ref-aware resolution — the
   // sync's own comment explains why resolveHooksPathOverride (answering "what does the CURRENT
@@ -534,7 +542,7 @@ async function prepareFixWorktree(args: {
   // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
   const conflicts = await premergeBase(repo, worktree.path, pr, baseBranch, number);
   await ctx.heartbeat();
-  return { worktree, conflicts };
+  return { worktree, conflicts, alreadyAhead };
 }
 
 /** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
@@ -577,6 +585,8 @@ async function runFixSession(args: {
   pr: PrReview;
   verdict: Actionable;
   conflicts: string[];
+  /** Ahead of origin before this run touched anything — see {@link prepareFixWorktree}. */
+  alreadyAhead: boolean;
   branch: string;
   number: number;
 }): Promise<boolean> {
@@ -592,6 +602,7 @@ async function runFixSession(args: {
     pr,
     verdict,
     conflicts,
+    alreadyAhead,
     branch,
     number,
   } = args;
@@ -610,6 +621,34 @@ async function runFixSession(args: {
   ctx.report({ sessionId, cwd: worktree.path, routing: claudeRouting(settings) });
 
   try {
+    // A resume can land here with the fix already committed on the branch — an operator resolving
+    // what a red gate named (a migration re-stamp, say) and hitting resume rather than a fresh
+    // claude session re-diagnosing feedback that's already handled. Detecting that BEFORE the claude
+    // dispatch is what makes the human loop cheap: the gates still gate (a red one parks exactly as
+    // it would after a claude run), but a green one pushes the operator's own commits straight
+    // through instead of paying for a session that would just re-produce them. `alreadyAhead` is
+    // snapshotted before `prepareFixWorktree`'s own premerge step, which can itself land an unpushed
+    // auto-merge commit — that must still go through claude + gates normally, not take this shortcut.
+    if (alreadyAhead) {
+      await appendSessionLog(
+        logPath,
+        `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
+      );
+      await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+      const pushed = await commitAndPushFix(
+        repo,
+        worktree.path,
+        epic.id,
+        branch,
+        number,
+        settings,
+        ctx.signal,
+      );
+      await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
+      await endSession(db, clock, sessionId, "done");
+      return pushed;
+    }
+
     await appendSessionLog(
       logPath,
       `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
