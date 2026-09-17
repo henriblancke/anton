@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "0d23397a-54c0-4ed2-ac2b-6618e2dd4006",
-  "prevId": "3214507f-9246-447b-8e6b-8ab0d3474062",
+  "id": "b9e2abbc-20ec-4a12-9a9b-e455296100fc",
+  "prevId": "6ea338cf-6199-49d0-8b62-868503269919",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -1492,6 +1492,20 @@
           "notNull": false,
           "autoincrement": false
         },
+        "base_refresh_outcome": {
+          "name": "base_refresh_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "base_refresh_sha": {
+          "name": "base_refresh_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "status": {
           "name": "status",
           "type": "text",
@@ -1517,6 +1531,13 @@
         "review_key_advisories": {
           "name": "review_key_advisories",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "review_key_score": {
+          "name": "review_key_score",
+          "type": "integer",
           "primaryKey": false,
           "notNull": false,
           "autoincrement": false

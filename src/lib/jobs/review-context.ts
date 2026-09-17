@@ -164,6 +164,31 @@ export interface InstructionFile {
 }
 
 /**
+ * Which reasoning contract this review runs with, and its resolved text — the precedence-resolved
+ * half of {@link buildReviewPrompt}, pulled out on its own because the resume key (anton-qmuyt) needs
+ * exactly this and nothing the concrete run context (diff, tickets) adds. Read at `baseRev` for the
+ * same reason the full prompt is: a project-local `.claude/agents/<id>.md` IS the reasoning contract,
+ * so resolving it from the worktree would let a run's own diff pick the standard it is graded
+ * against.
+ */
+export async function resolveReviewerContract(
+  settings: ProjectSettings,
+  projectDir: string,
+  baseRev: string,
+): Promise<{ reasoning: string; reviewer: ReviewerSource }> {
+  const config = resolveReviewConfig(settings);
+  if (config.agent) {
+    const reasoning = await loadTrustedAgentPrompt(config.agent, projectDir, baseRev);
+    if (reasoning) return { reasoning, reviewer: { kind: "agent", id: config.agent } };
+  }
+  const operatorPrompt = config.prompt?.trim();
+  if (operatorPrompt) {
+    return { reasoning: operatorPrompt, reviewer: { kind: "prompt" } };
+  }
+  return { reasoning: await loadSkill("review"), reviewer: { kind: "default" } };
+}
+
+/**
  * The full prompt handed to the reviewer: the reasoning contract, then the concrete run context.
  *
  * Reasoning resolves by precedence — a named review agent (`reviewAgent`) beats the operator's
@@ -198,22 +223,7 @@ export async function buildReviewPrompt(args: {
   gatesDiscarded?: boolean;
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
   const { target, tickets, diff, settings, projectDir, baseRev } = args;
-  const config = resolveReviewConfig(settings);
-
-  let reasoning: string | undefined;
-  let reviewer: ReviewerSource = { kind: "default" };
-  if (config.agent) {
-    reasoning = await loadTrustedAgentPrompt(config.agent, projectDir, baseRev);
-    if (reasoning) reviewer = { kind: "agent", id: config.agent };
-  }
-  if (!reasoning && config.prompt) {
-    reasoning = config.prompt.trim();
-    reviewer = { kind: "prompt" };
-  }
-  if (!reasoning) {
-    reasoning = await loadSkill("review");
-    reviewer = { kind: "default" };
-  }
+  const { reasoning, reviewer } = await resolveReviewerContract(settings, projectDir, baseRev);
 
   // Both rulebooks, always: principles don't supersede the instruction files, they sit beside them.
   // A project can state a standing rule in either, and the caveat below tells the reviewer that only

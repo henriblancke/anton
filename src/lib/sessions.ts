@@ -19,6 +19,12 @@ export type SessionKind =
   /** A pre-PR self-review round (anton-cbak); its fixes are recorded as `review-fix` sessions. */
   | "review"
   | "review-fix"
+  /**
+   * A resume whose worktree matched an earlier clean verdict's resume key (anton-qmuyt) — no
+   * claude session runs, so a row exists only when the skip actually happens, same as `gardener`
+   * and `worktree-reaper` below.
+   */
+  | "review-skip"
   | "nightly-stringer"
   | "orphan-grooming"
   /** A scheduled product-master pass (anton-d2sx) — judgment in, proposal beads out. */
