@@ -1242,6 +1242,27 @@ describe("getBoard — the operator queue", () => {
 
     expect((await getBoard(project)).operatorQueue).toEqual([]);
   });
+
+  it("does not flag a human ticket still `blocks`-linked to a resolved gate", async () => {
+    // PR #288 review: getBoard used to hand operatorQueue the pipeline-stripped `workBeads`, so a
+    // `blocks` edge onto a gate — closed or not — resolved against a lookup that never carried gates
+    // at all. A missing dependency reads as an open blocker (bd's own fail-safe), so this hid Mark
+    // done forever even though closeHumanTicket reloads gates and would accept the close.
+    listMock.mockResolvedValue([
+      makeBead({ id: "gate-1", title: "Approval gate", issue_type: "gate", status: "closed" }),
+      makeBead({
+        id: "task-1",
+        title: "Wire the payout",
+        labels: ["approved", "agent:human"],
+        dependencies: [{ issue_id: "task-1", depends_on_id: "gate-1", type: "blocks" }],
+      }),
+    ]);
+
+    const board = await getBoard(project);
+
+    expect(board.operatorQueue.map((i) => i.id)).toEqual(["task-1"]);
+    expect(board.operatorQueue[0].hasOpenBlockers).toBeUndefined();
+  });
 });
 
 /**
