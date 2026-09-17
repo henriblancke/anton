@@ -631,7 +631,16 @@ async function runFixSession(args: {
     // through instead of paying for a session that would just re-produce them. `alreadyAhead` is
     // snapshotted before `prepareFixWorktree`'s own premerge step, which can itself land an unpushed
     // auto-merge commit — that must still go through claude + gates normally, not take this shortcut.
-    if (alreadyAhead) {
+    //
+    // `alreadyAhead` only says the branch carries prior commits — it says nothing about that same
+    // premerge step, which runs unconditionally and can hand back a FRESH, unresolved conflict
+    // (literal markers + MERGE_HEAD) alongside it. Nothing in this fast path can resolve those
+    // markers — only claude does that, via the prompt built below — so a fresh conflict must fall
+    // through to the normal dispatch path even when the branch is already ahead. Skipping claude
+    // here would otherwise let the gate run against literal conflict text and, on a red result,
+    // have the next worktree reap silently discard the unresolved merge while notifyGateParked
+    // claims it was "resolved and committed locally".
+    if (alreadyAhead && conflicts.length === 0) {
       await appendSessionLog(
         logPath,
         `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
