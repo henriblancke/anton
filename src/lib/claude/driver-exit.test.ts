@@ -4,7 +4,12 @@
  * code — so each test here pins one rung of that ladder.
  */
 import { describe, expect, it } from "vitest";
-import { isRecoverableClaudeError, isUsageLimitError, type RecoverableClaudeError } from "../jobs/errors";
+import {
+  isPoisonError,
+  isRecoverableClaudeError,
+  isUsageLimitError,
+  type RecoverableClaudeError,
+} from "../jobs/errors";
 import { createStreamState, type StreamState } from "./driver-events";
 import { exitError, toClaudeResult, transientSignature, type ClaudeExit } from "./driver-exit";
 
@@ -72,6 +77,60 @@ describe("exitError", () => {
 
     expect(isRecoverableClaudeError(err)).toBe(false);
     expect(err?.message).toBe("claude exited with code 2: three tests fail");
+  });
+
+  it("parks a nonexistent/inaccessible model id on the first attempt, naming both remedies (anton-ggf6)", () => {
+    // Observed verbatim in anton.db — Claude Code's own refusal when --model doesn't resolve, which
+    // is also what an entitlement gap (valid id, no account/credential access) looks like (anton-r0tb
+    // review feedback on PR #278) — so the park must name both remedies, not just a bad id.
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr:
+          "There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not have access to it. Run --model to pick a different model.",
+      }),
+    );
+
+    expect(isPoisonError(err)).toBe(true);
+    expect(isRecoverableClaudeError(err)).toBe(false);
+    expect(err?.message).toContain("claude-opus-4-8");
+    expect(err?.message).toContain("General default model");
+    expect(err?.message).toContain("settings_json.modelRoutes");
+    expect(err?.message).toContain("Claude Code's own default configuration");
+    expect(err?.message).toContain("grant that account/credential access");
+  });
+
+  it("does not park on a model-authored result that merely quotes the refusal wording (anton-r0tb)", () => {
+    // The model actually ran (there's a result), so this is an ordinary deterministic failure, not
+    // a startup refusal — a failed session that quotes this diagnostic while testing/documenting it
+    // must not be poisoned into an unresolvable park.
+    const err = exitError(
+      exit({
+        code: 1,
+        stream: stream({
+          resultRaw: {
+            type: "result",
+            is_error: true,
+            result:
+              "Reproduced the bug: claude prints \"There's an issue with the selected model (claude-opus-4-8). It may not exist or you may not have access to it.\" on stderr.",
+          },
+        }),
+      }),
+    );
+
+    expect(isPoisonError(err)).toBe(false);
+  });
+
+  it("still retries a transient 5xx from the same endpoint rather than parking (anton-ggf6)", () => {
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr: "API Error: 503 Service Unavailable",
+      }),
+    );
+
+    expect(isPoisonError(err)).toBe(false);
+    expect(isRecoverableClaudeError(err)).toBe(true);
   });
 
   it("classifies a gateway [402] billing stop as a quota hit, not a resumed transient (anton-x96g)", () => {
