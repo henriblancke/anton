@@ -110,12 +110,29 @@ describe("operatorQueue — the set", () => {
     expect(operatorQueue(board)).toEqual([]);
   });
 
-  it("drops a human ticket under a closed run target — that work shipped", () => {
+  it("keeps a human ticket stranded under an already-closed run target — the run shipped, the ticket didn't", () => {
+    // PR #288 review: this used to drop the row entirely once the target settled, hiding exactly the
+    // ticket the ticket dialog's own Mark-done gate (ticket-detail.ts) now treats as real, actionable
+    // work via the same `liveRunTargetOf` predicate — the operator queue is the primary place to find
+    // it, and silently omitting the row left it undiscoverable there.
     const board = [
-      bead({ id: "f1", issue_type: "feature", labels: ["approved"], status: "closed" }),
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"], status: "closed" }),
       bead({ id: "f1.1", issue_type: "task", parent: "f1" }),
     ];
-    expect(operatorQueue(board)).toEqual([]);
+    const [item] = operatorQueue(board);
+    expect(item.id).toBe("f1.1");
+    expect(item.runTarget).toEqual({ id: "f1", title: "Ship billing" });
+    expect(item.holdsRun).toBe(false);
+  });
+
+  it("keeps a human ticket stranded under a deferred run target the same way", () => {
+    const board = [
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"], status: "deferred" }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1" }),
+    ];
+    const [item] = operatorQueue(board);
+    expect(item.id).toBe("f1.1");
+    expect(item.holdsRun).toBe(false);
   });
 
   it("names no run target for a target of its own", () => {

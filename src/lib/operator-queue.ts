@@ -21,6 +21,7 @@ import {
   hasOpenDescendants as computeHasOpenDescendants,
   isRunTicket,
   labelValue,
+  liveRunTargetOf,
   parseGoal,
 } from "./ticket-view";
 import type { OperatorQueueItem } from "./types";
@@ -63,8 +64,13 @@ function byNewestAsk(a: OperatorQueueItem, b: OperatorQueueItem): number {
  *
  * Approval is read off whichever bead carries the human gate for this work: a ticket has no
  * `approved` label of its own — its run target's approval is what puts it in front of an agent — so
- * a ticket under an unapproved (or closed, or abandoned) target is not queued for anyone yet. Every
- * other bead answers for itself.
+ * a ticket under an unapproved target is not queued for anyone yet. Every other bead answers for
+ * itself. A target that has since closed, been abandoned, or been deferred does NOT drop its ticket
+ * from the queue the same way: the run that would have reached the ticket never will now, but the
+ * ticket itself is still open and still someone's to do — the operator needs exactly this row to
+ * find it (`holdsRun: false`, same as `liveRunTargetOf` reports it to the ticket dialog's Mark-done
+ * gate). Only a still-`isTarget` row needs its OWN openness checked here; a ticket's already came
+ * from the `isOpenWork(bead)` check above.
  *
  * Container epics and pipeline plumbing are not work and never appear as a queue row: a container's
  * features each run on their own, and a molecule/gate coordinates work without being any. But `all`
@@ -85,13 +91,19 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
     if (!isTarget && !isRunTicket(bead, cards)) continue;
     const target = isTarget ? undefined : byId.get(cards.cardOf(bead) ?? "");
     const gate = target ?? bead;
-    if (!beads.isApproved(gate) || !isOpenWork(gate)) continue;
+    if (!beads.isApproved(gate)) continue;
+    // Only a target answering for ITSELF needs this: a ticket's own openness was already checked
+    // above, and its target settling doesn't undo the ticket (see the doc comment above).
+    if (isTarget && !isOpenWork(gate)) continue;
 
-    // A ticket only HOLDS a run if a run reaches it. When the target itself carries `agent:human`,
+    // A ticket only HOLDS a run if a run could still reach it — `liveRunTargetOf` (ticket-view.ts),
+    // the same predicate `closeHumanTicket` and the ticket dialog's Mark-done gate derive `holdsRun`
+    // from, so a target that has since closed, been abandoned, or been deferred reads as `false`
+    // here too instead of hiding the row outright. When the target itself carries `agent:human`,
     // execute-epic poisons it before dispatching anything under it (humanTargetPoison), so no gate
-    // is ever armed on this ticket — the row must not send the operator looking for an escalation
-    // that does not exist (PR #214 review).
-    const holdsRun = target ? !beads.isHumanWork(target) : false;
+    // is ever armed on this ticket either — the row must not send the operator looking for an
+    // escalation that does not exist (PR #214 review).
+    const holdsRun = liveRunTargetOf(bead, all) !== undefined;
     // Mark done closes THIS bead (item.id), not its run target, so it's this bead's own
     // descendants — not the target's — that decide whether `bd close` would refuse it. Shared with
     // `closeHumanTicket` (close-human.ts) and the ticket dialog's Mark-done gate (ticket-detail.ts),
