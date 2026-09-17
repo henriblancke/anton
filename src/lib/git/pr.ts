@@ -364,6 +364,20 @@ export async function commentOnPr(
   await gh(repoPath, ["pr", "comment", String(number), "--body", body], signal);
 }
 
+/**
+ * Existing top-level PR comments (the same surface `commentOnPr` posts to — not inline review
+ * comments), oldest first. Lets a caller dedupe its own status posts before adding another.
+ */
+export async function getPrComments(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const raw = await gh(repoPath, ["pr", "view", String(number), "--json", "comments"], signal);
+  const view = JSON.parse(raw) as { comments?: Array<{ body?: string }> };
+  return (view.comments ?? []).map((c) => c.body ?? "");
+}
+
 /** Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId). */
 export async function replyToReviewComment(
   repoPath: string,

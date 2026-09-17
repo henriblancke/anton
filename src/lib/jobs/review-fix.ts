@@ -70,6 +70,7 @@ import {
   ANTON_MARK,
   classifyReview,
   commentOnPr,
+  getPrComments,
   getPrReview,
   prNumberFromRef,
   reactToReviewComment,
@@ -110,7 +111,7 @@ import {
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
 import { finalizeMergedEpic } from "./review-fix-finalize";
-import { PoisonError } from "./errors";
+import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
@@ -742,8 +743,40 @@ async function runFixSession(args: {
     return true;
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
+    // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say
+    // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
+    // only a stale badge, not why anton stopped (anton-gvqk3).
+    if (isPoisonError(e)) {
+      await notifyGateParked({ repo, number, error: e, conflicts, signal: ctx.signal });
+    }
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/**
+ * Tell the PR why anton stopped: the gate/blocker a poison park named, plus whether a base-branch
+ * merge is already resolved and committed locally (unpushed) so the reader isn't left guessing what
+ * state the branch is in. Carries {@link ANTON_MARK} like every other anton comment, so the review
+ * sweep's own `threadsNeedingAttention` never mistakes it for a human's. Idempotent against the PR's
+ * comment history rather than any local state — a resumed job parking on the SAME gate is a fresh
+ * process with nothing of its own to remember, but the PR remembers what was already said on it.
+ */
+export async function notifyGateParked(args: {
+  repo: string;
+  number: number;
+  error: Error;
+  conflicts: string[];
+  signal: AbortSignal;
+}): Promise<void> {
+  const { repo, number, error, conflicts, signal } = args;
+  const mergeNote =
+    conflicts.length > 0
+      ? " The base branch merge was resolved and committed locally (not yet pushed)."
+      : "";
+  const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}`;
+  const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
+  if (existing.includes(body)) return;
+  await safe(() => commentOnPr(repo, number, body, signal));
 }
 
 /** The per-PR worker has no pipeline step; its target labels are its routing context. */

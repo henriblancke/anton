@@ -14,12 +14,13 @@ import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
 import { GH_BIN_ENV } from "../git/ops";
-import type { PrReview, ReviewThread } from "../git/pr";
+import { ANTON_MARK, type PrReview, type ReviewThread } from "../git/pr";
 import {
   applyThreadOutcomes,
   claimOwnerFor,
   inReviewEpics,
   makeReviewFixHandler,
+  notifyGateParked,
   parseThreadReport,
   resolveReviewFixModel,
   runTestGate,
@@ -563,5 +564,152 @@ describe("runTestGate (anton-h0hwc)", () => {
     const err: unknown = await promise.catch((e) => e);
     expect(err).not.toBeInstanceOf(PoisonError);
     expect((err as { name?: string })?.name).toBe("AbortError");
+  });
+});
+
+// anton-gvqk3: a gate parking the fix session must say so on the PR itself — the run-log entry
+// runTestGate already produces is invisible to a human reading only the PR, who otherwise sees a
+// stale CONFLICTING/CI badge and nothing about why anton stopped.
+describe("notifyGateParked (anton-gvqk3)", () => {
+  let sandbox: string;
+  let binDir: string;
+  let logFile: string;
+  let storeFile: string;
+  let prevGh: string | undefined;
+
+  // Fake gh with just enough state to prove dedup: posted comment bodies persist to `storeFile`, and
+  // `pr view --json comments` reads them back — so a second `notifyGateParked` call sees exactly what
+  // the first one posted, the same way the real PR would.
+  function installFakeGh(): void {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const a = process.argv.slice(2);
+const store = process.env.ANTON_TEST_COMMENTS_STORE;
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view' && a.includes('comments')) {
+  let bodies = [];
+  try { bodies = JSON.parse(fs.readFileSync(store, 'utf8')); } catch {}
+  process.stdout.write(JSON.stringify({ comments: bodies.map((b) => ({ body: b })) }));
+  process.exit(0);
+}
+if (a[0] === 'pr' && a[1] === 'comment') {
+  const body = a[a.indexOf('--body') + 1];
+  let bodies = [];
+  try { bodies = JSON.parse(fs.readFileSync(store, 'utf8')); } catch {}
+  bodies.push(body);
+  fs.writeFileSync(store, JSON.stringify(bodies));
+  fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+  }
+
+  const ghCalls = (): string[][] =>
+    readFileSync(logFile, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as string[]);
+
+  const postedComments = () => ghCalls().filter((c) => c[0] === "pr" && c[1] === "comment");
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-notify-parked-"));
+    binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+    logFile = join(sandbox, "gh-calls.log");
+    storeFile = join(sandbox, "comments.json");
+    writeFileSync(logFile, "");
+    writeFileSync(storeFile, "[]");
+    installFakeGh();
+    prevGh = process.env[GH_BIN_ENV];
+    process.env[GH_BIN_ENV] = join(binDir, "gh");
+    process.env.ANTON_TEST_GH_LOG = logFile;
+    process.env.ANTON_TEST_COMMENTS_STORE = storeFile;
+  });
+
+  afterEach(() => {
+    if (prevGh === undefined) delete process.env[GH_BIN_ENV];
+    else process.env[GH_BIN_ENV] = prevGh;
+    delete process.env.ANTON_TEST_GH_LOG;
+    delete process.env.ANTON_TEST_COMMENTS_STORE;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("posts exactly one comment naming the gate, starting with the anton marker", async () => {
+    const error = new PoisonError(
+      "tests gate failed after review-fix for PR #7 (exit 3)\n\nboom-output",
+    );
+    await notifyGateParked({
+      repo: sandbox,
+      number: 7,
+      error,
+      conflicts: ["src/a.ts"],
+      signal: new AbortController().signal,
+    });
+
+    const posted = postedComments();
+    expect(posted).toHaveLength(1);
+    const body = posted[0]![posted[0]!.indexOf("--body") + 1]!;
+    expect(body.startsWith(ANTON_MARK)).toBe(true);
+    expect(body).toContain("tests gate failed after review-fix for PR #7");
+    // Tells the reader the base merge is already resolved and committed locally, not just untouched.
+    expect(body).toContain("resolved and committed locally");
+  });
+
+  it("omits the base-merge note when the park had no base-branch conflicts to resolve", async () => {
+    const error = new PoisonError("tests gate failed after review-fix for PR #7 (exit 3)\n\nboom");
+    await notifyGateParked({
+      repo: sandbox,
+      number: 7,
+      error,
+      conflicts: [],
+      signal: new AbortController().signal,
+    });
+
+    const body = postedComments()[0]![postedComments()[0]!.indexOf("--body") + 1]!;
+    expect(body).not.toContain("resolved and committed locally");
+  });
+
+  it("a resumed job parking on the same gate does not repost an identical comment", async () => {
+    const error = new PoisonError(
+      "tests gate failed after review-fix for PR #7 (exit 3)\n\nboom-output",
+    );
+    const args = {
+      repo: sandbox,
+      number: 7,
+      error,
+      conflicts: [] as string[],
+      signal: new AbortController().signal,
+    };
+
+    await notifyGateParked(args);
+    await notifyGateParked(args); // a resume hitting the same red gate a second time
+
+    expect(postedComments()).toHaveLength(1);
+  });
+
+  it("a different gate failure on a later park still gets its own comment", async () => {
+    await notifyGateParked({
+      repo: sandbox,
+      number: 7,
+      error: new PoisonError("tests gate failed after review-fix for PR #7 (exit 3)\n\nboom"),
+      conflicts: [],
+      signal: new AbortController().signal,
+    });
+    await notifyGateParked({
+      repo: sandbox,
+      number: 7,
+      error: new PoisonError("lint gate failed after review-fix for PR #7 (exit 1)\n\nbad style"),
+      conflicts: [],
+      signal: new AbortController().signal,
+    });
+
+    expect(postedComments()).toHaveLength(2);
   });
 });
