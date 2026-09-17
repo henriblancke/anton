@@ -62,6 +62,7 @@ vi.mock("../stringer", async (importOriginal) => {
       scanFile,
       signals: [],
       collectorFailures: [{ name: "gitlog", error: "opening repo: broken" }],
+      worktree: { dropped: [], worktrees: [] },
       untracked: { dropped: [] },
       coupling: { dropped: [], recounted: [] },
       deadcode: { dropped: [] },
