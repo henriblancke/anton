@@ -12,6 +12,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
+import { sleepMs } from "../retry-helpers";
 
 const execFileAsync = promisify(execFile);
 
@@ -656,6 +657,21 @@ const MAX_STDERR_CHARS = 4096;
 function boundedStderr(child: ChildProcess): () => string {
   let text = "";
   child.stderr?.on("data", (chunk: Buffer) => {
+    if (text.length < MAX_STDERR_CHARS) text += chunk.toString("utf8");
+  });
+  return () => text.trim();
+}
+
+/**
+ * The push counterpart to {@link boundedStderr}: collects a spawned git's stdout, bounded the same
+ * way. Only {@link gitPush} pipes stdout at all — a `--porcelain` push writes the per-ref verdict
+ * {@link classifyPushFailure} reads there, and it must actually be drained or a chatty hook filling
+ * an unread pipe would block the push outright (the same reasoning that keeps `gitCommit` on
+ * `ignore`, where nothing reads stdout).
+ */
+function boundedStdout(child: ChildProcess): () => string {
+  let text = "";
+  child.stdout?.on("data", (chunk: Buffer) => {
     if (text.length < MAX_STDERR_CHARS) text += chunk.toString("utf8");
   });
   return () => text.trim();
@@ -1494,13 +1510,15 @@ function gitPush(
     }
 
     const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
-    // stdout is dropped rather than piped, same as gitCommit: nothing here reads it, and a chatty
-    // hook filling an unread pipe would block the push outright.
+    // stdout IS piped and drained here, unlike gitCommit: a `--porcelain` push writes the per-ref
+    // verdict {@link classifyPushFailure} needs there, and {@link boundedStdout} keeps it read as it
+    // arrives so a chatty hook cannot fill the pipe and block the push.
     const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
-      stdio: ["ignore", "ignore", "pipe"],
+      stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
     const stderr = boundedStderr(child);
+    const stdout = boundedStdout(child);
     const timeoutMs = pushTimeoutMs(requestedTimeoutMs);
     let killing = false;
     let settled = false;
@@ -1531,10 +1549,136 @@ function gitPush(
     child.on("close", (code) => {
       // A kill in flight owns the verdict: its group may still hold live writers.
       if (killing) return;
-      settle(() => (code === 0 ? resolvePromise() : reject(commitFailed(args, code, stderr()))));
+      settle(() => (code === 0 ? resolvePromise() : reject(pushFailed(args, code, stderr(), stdout()))));
     });
   });
 }
+
+/**
+ * The rejection git's own non-zero push exit carries — {@link commitFailed} extended with the
+ * `--porcelain` stdout {@link classifyPushFailure} reads. `stdout`/`stderr` ride on the error object
+ * (not just folded into its message) so {@link pushBranch}'s retry loop can classify the failure
+ * without re-parsing a formatted string.
+ */
+function pushFailed(args: string[], code: number | null, stderr: string, stdout: string): Error {
+  return Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr}`), {
+    code,
+    stderr,
+    stdout,
+  });
+}
+
+/** One push failure classifier's verdict: whether a retry might fix it, and why. */
+export interface PushFailureVerdict {
+  /**
+   * True only for a cause an identical retry can plausibly clear — a DNS blip, a reset connection, a
+   * transient 5xx from the remote's HTTP front end.
+   */
+  transient: boolean;
+  /** Human-readable cause, folded into the error {@link pushBranch} throws once it stops retrying. */
+  reason: string;
+}
+
+/**
+ * Tell a `git push --porcelain` failure a retry can fix from one it cannot (anton-1cjaw).
+ *
+ * Exit code alone does not separate the two: 128 holds a DNS blip (transient) next to a gpg
+ * misconfig or a held `index.lock` (both permanent, both 128 — measured on git 2.x/macOS via
+ * execFile), and 1 holds a `pre-receive` hook decline (permanent) next to a non-fast-forward
+ * (recoverable in principle, but not by retrying the SAME push — out of scope here). So this reads
+ * `--porcelain`'s own structural signal first: a `Done` line only appears once the transport
+ * actually ran, which is what tells a LOCAL `pre-push` hook decline (no `Done` — git never left the
+ * client) from a REMOTE decision (`Done`, with the per-ref status naming why). Only where porcelain
+ * has nothing to say — exit 128, where git never reached the transport at all — does this fall back
+ * to matching known stderr text.
+ *
+ * Fails to `transient: false` on anything not recognized — an unclassified cause is a permanent one,
+ * never a retried one: retrying blind risks looping 3 times on a fault backoff can never fix.
+ */
+export function classifyPushFailure(result: {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}): PushFailureVerdict {
+  const { code, stdout, stderr } = result;
+
+  if (code === 1) {
+    if (!/^Done\s*$/m.test(stdout)) {
+      return {
+        transient: false,
+        reason: `a local pre-push hook declined the push: ${stderr || "(hook printed nothing to stderr)"}`,
+      };
+    }
+    if (/\[rejected\]\s*\((?:fetch first|non-fast-forward)\)/.test(stdout)) {
+      return {
+        transient: false,
+        reason:
+          "the remote has commits this branch does not — a non-fast-forward rejection an identical retry cannot fix",
+      };
+    }
+    if (/\[remote rejected\]\s*\(.*hook declined.*\)/.test(stdout)) {
+      return {
+        transient: false,
+        reason: "the remote's pre-receive hook declined the push — remote policy, not a transport fault",
+      };
+    }
+    return {
+      transient: false,
+      reason: `the remote answered but rejected the push for a reason this classifier does not recognize: ${stdout || stderr}`,
+    };
+  }
+
+  if (code === 128) {
+    if (
+      /Could not resolve host/i.test(stderr) ||
+      /Connection reset/i.test(stderr) ||
+      /HTTP 5\d\d/.test(stderr) ||
+      // Git's own diagnostic for an HTTP remote that answers with a 5xx: confirmed against a real
+      // 503 with `git push -h`'s porcelain mode — "The requested URL returned error: 503" — which
+      // the `HTTP 5\d\d` form above never matches, so a transient 5xx was misclassified permanent.
+      /returned error: 5\d\d/.test(stderr)
+    ) {
+      return { transient: true, reason: `a transient transport failure reaching the remote: ${stderr}` };
+    }
+    if (
+      /could not read Username/i.test(stderr) ||
+      /Unable to create .*index\.lock/i.test(stderr) ||
+      /gpg failed to sign/i.test(stderr)
+    ) {
+      return { transient: false, reason: `a permanent local failure, not a transport fault: ${stderr}` };
+    }
+    return {
+      transient: false,
+      reason: `git never reached the remote (exit 128) for a reason this classifier does not recognize: ${stderr}`,
+    };
+  }
+
+  return { transient: false, reason: `git push failed (exit ${code}): ${stderr}` };
+}
+
+/**
+ * Whether a rejected {@link gitPush} carries a cause {@link classifyPushFailure} can place at all — a
+ * budget kill (`killed: true`) or a rejection with no numeric exit code (an abort, a spawn error) is
+ * never one, because there is no porcelain/stderr pair to classify.
+ */
+function classifyPushError(error: unknown): PushFailureVerdict | undefined {
+  const err = error as { killed?: boolean; code?: unknown; stdout?: unknown; stderr?: unknown } | null;
+  if (!err || err.killed === true || typeof err.code !== "number") return undefined;
+  return classifyPushFailure({
+    code: err.code,
+    stdout: typeof err.stdout === "string" ? err.stdout : "",
+    stderr: typeof err.stderr === "string" ? err.stderr : "",
+  });
+}
+
+/**
+ * Attempts a push gets before its caller sees the failure. Backoff runs only BETWEEN attempts (none
+ * before the first, none after the last spends its final try).
+ */
+const PUSH_MAX_ATTEMPTS = 3;
+
+/** Backoff waited before attempt 2 and attempt 3, respectively. */
+const PUSH_RETRY_BACKOFF_MS = [1_000, 3_000];
 
 /**
  * Push `branch` to `origin`, run from `cwd` — the run's WORKTREE when the caller has one, never the
@@ -1550,7 +1694,40 @@ function gitPush(
  * `timeoutMs` is optional so every existing caller keeps its current behavior (anton-o74nf); see
  * {@link gitPush} for what bounds it. `signal` gives cancellation the same whole-process-group
  * reap as a budget expiry, so a cancelled run cannot leave its pre-push hook behind.
+ *
+ * Retries up to {@link PUSH_MAX_ATTEMPTS} times, with backoff, but ONLY a cause
+ * {@link classifyPushFailure} calls transient spends an extra attempt (anton-1cjaw): a DNS blip or a
+ * reset connection might clear on a second try, but a declined hook, a non-fast-forward, or anything
+ * the classifier cannot place confidently will not — an unclassified cause is treated as permanent so
+ * a fault backoff can never fix is never looped on 3 times before the caller finds out. Success on
+ * any attempt is indistinguishable to the caller from success on the first.
  */
+/**
+ * Resolves after `ms` like {@link sleepMs}, but rejects the instant `signal` aborts instead of
+ * waiting out the rest of the delay — the same abort shape {@link gitPush} itself rejects with, so a
+ * caller cancelling mid-backoff sees the SAME error whether the abort landed during the sleep or
+ * during the push it wraps, rather than waiting up to {@link PUSH_RETRY_BACKOFF_MS}'s longest gap for
+ * `gitPush`'s own check at the top of the next attempt to notice.
+ */
+function sleepOrAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return sleepMs(ms);
+  if (signal.aborted) {
+    return Promise.reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    if (typeof timer.unref === "function") timer.unref();
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function pushBranch(
   cwd: string,
   branch: string,
@@ -1558,7 +1735,20 @@ export async function pushBranch(
   timeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
-  await gitPush(cwd, ["push", "-u", "origin", branch], hooksPath, timeoutMs, signal);
+  for (let attempt = 1; attempt <= PUSH_MAX_ATTEMPTS; attempt += 1) {
+    if (attempt > 1) await sleepOrAbort(PUSH_RETRY_BACKOFF_MS[attempt - 2], signal);
+    try {
+      await gitPush(cwd, ["push", "--porcelain", "-u", "origin", branch], hooksPath, timeoutMs, signal);
+      return;
+    } catch (error) {
+      const verdict = classifyPushError(error);
+      if (attempt < PUSH_MAX_ATTEMPTS && verdict?.transient) continue;
+      if (verdict && error instanceof Error) {
+        throw new Error(`${error.message} — ${verdict.reason}`, { cause: error });
+      }
+      throw error;
+    }
+  }
 }
 
 /**

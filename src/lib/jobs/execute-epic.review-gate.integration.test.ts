@@ -19,7 +19,7 @@ import { beads } from "../beads/bd";
 import { BD_BIN_ENV, resetBdBinCache, resolveBdBin } from "../beads/bd-bin";
 import { worktreePathFor } from "../git/worktree";
 import * as schema from "../db/schema";
-import { park } from "./queue";
+import { park, resumeJob } from "./queue";
 import { resetOperatorCache } from "../operator";
 import { REVIEW_SCORE_KIND } from "./review-score";
 import { describeBd } from "@/lib/testing/integration";
@@ -33,6 +33,7 @@ import {
   createExecuteEpicSandbox,
   makeEpicRunner,
   driveEpicRun,
+  tickToIdle,
   type ExecuteEpicSandbox,
 } from "./execute-epic.fixture";
 
@@ -1147,6 +1148,72 @@ process.exit(0);`,
     } finally {
       if (jobId1!) await park(tdb.db, clock, jobId1, "test cleanup: not re-dispatched");
       if (jobId2!) await park(tdb.db, clock, jobId2, "test cleanup: not re-dispatched");
+    }
+  });
+
+  it("skips the review on the automatic retry after a step:pr fault (anton-nyz1v)", async () => {
+    // A `gh pr create` fault is an ordinary Error: it settles the RUN row `failed` (not `parked`),
+    // which `findOpenRunForEpic` excludes — so the runner's automatic retry of the SAME job opens a
+    // FRESH run row while reusing the branch and worktree attempt 1 already reviewed clean. Without
+    // the branch-scoped resume key (anton-nyz1v), that fresh row's `existing` is undefined and the
+    // clean verdict is invisible to it, so the retry re-reviews from scratch — a second review
+    // session, a second spend, and a non-deterministic second verdict over work already passed.
+    await setReviewEnabled(true);
+    const targetId = await approvedTarget("PR-fault retry");
+
+    const failingGh = writeBin(binDir, "gh-fail-pr-retry", `console.error('gh boom');process.exit(1);`);
+    const okGh = process.env.ANTON_GH_BIN!;
+    process.env.ANTON_GH_BIN = failingGh;
+
+    const runner = makeEpicRunner(ctx);
+    let jobId: string;
+    try {
+      jobId = await driveEpicRun(runner, { projectId, epicBeadId: targetId });
+
+      // Attempt 1: implemented, reviewed clean, then failed at the PR step — the run row carries
+      // the clean verdict's resume key, but the JOB itself is queued for retry, not failed outright.
+      expect(dispatches()).toEqual(["implement", "review"]);
+      const run1 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
+      expect(run1.status).toBe("failed");
+      expect(run1.reviewKey).toBeTruthy();
+      expect(scoreComments(targetId)).toHaveLength(1);
+
+      // Resume with a working gh — the retry re-walks the pipeline from step 0, over the SAME
+      // branch and worktree, but as a fresh run row (findOpenRunForEpic ignores the failed one).
+      process.env.ANTON_GH_BIN = okGh;
+      expect(await park(tdb.db, clock, jobId, "test: simulate resume")).toBe(true);
+      expect(await resumeJob(tdb.db, clock, jobId)).toBe(true);
+      await tickToIdle(runner);
+
+      await expectJobStatus(tdb.db, jobId, "done");
+      const runsForTarget = (await tdb.db.select().from(schema.runs)).filter(
+        (r) => r.epicBeadId === targetId,
+      );
+      expect(runsForTarget.some((r) => r.status === "done")).toBe(true);
+      const target = await beads.show(repo, targetId);
+      expect(beads.getPrRef(target)).toBe("gh-42");
+
+      // No second implement (the ticket's own resume marker) and no second REVIEW dispatch — the
+      // gate skipped on the recovered key instead of re-judging byte-identical work. Sessions are
+      // matched by RUN id, not bead id: a skip's session (deferPassSession, execute-epic-review-
+      // step.ts) links only to its run, never to the bead.
+      expect(dispatches()).toEqual(["implement", "review"]);
+      const runIds = new Set(runsForTarget.map((r) => r.id));
+      const sessions = (await tdb.db.select().from(schema.sessions)).filter(
+        (s) => s.runId && runIds.has(s.runId),
+      );
+      expect(sessions.filter((s) => s.kind === "review")).toHaveLength(1);
+      expect(sessions.filter((s) => s.kind === "review-skip")).toHaveLength(1);
+
+      // The score the first attempt earned carries onto the settled (fresh) run row too — a
+      // skipped review must not read as an unscored gap to the score-regression breaker.
+      const doneRun = runsForTarget.find((r) => r.status === "done")!;
+      expect(doneRun.reviewScore).toBe(run1.reviewScore);
+      // And the board keeps exactly the one score series attempt 1 wrote — the skip writes none.
+      expect(scoreComments(targetId)).toHaveLength(1);
+    } finally {
+      process.env.ANTON_GH_BIN = okGh;
+      if (jobId!) await park(tdb.db, clock, jobId, "test cleanup: not re-dispatched");
     }
   });
 });

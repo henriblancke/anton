@@ -67,6 +67,22 @@ export const runs = sqliteTable("runs", {
   // freeze — a project on reviews that happened before those runs, or before the operator's last
   // re-arm. Recorded per attempt so the join cannot lie.
   reviewScore: integer("review_score"),
+  // What a CLEAN verdict passed on (anton-qmuyt): `<merge-base>:<HEAD>:<contract-fingerprint>`, so a
+  // resume can recompute the same tuple and skip a re-review that would judge byte-identical work.
+  // Written only on a clean verdict, never inferred or backfilled — a row with no key (every row
+  // written before this column existed, and every row whose review parked) always re-reviews. See
+  // review-key.ts.
+  reviewKey: text("review_key"),
+  // The advisory findings the clean verdict above left open, serialized — restored into the
+  // run-phase carry on a skip so `prBody` still shows them at the merge gate, exactly as a review
+  // that actually ran would have left them.
+  reviewKeyAdvisories: text("review_key_advisories"),
+  // The score THIS clean verdict earned, bound to `reviewKey` at the same write (anton-nyz1v #280
+  // review): `reviewScore` above is the row's mutable LATEST score, rewritten by every later
+  // `step:review` occurrence in the same formula — a resume that restores `reviewScore` off the row
+  // instead of off this column would hand an earlier gate's skip the score of a later, unrelated
+  // gate. Written only alongside `reviewKey`, on a clean verdict; never inferred or backfilled.
+  reviewKeyScore: integer("review_key_score"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),
