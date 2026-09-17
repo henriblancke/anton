@@ -3,14 +3,16 @@
  * that keep a scan off a huge node_modules and away from the 10-minute timeout) and signal counting,
  * against a fake stringer binary that records its argv and writes a canned scan file.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +27,7 @@ import {
   STRINGER_BIN_ENV,
   describeCollectorFailure,
   describeUntrackedFilter,
+  describeWorktreeFilter,
   extractSignals,
   formatTimeout,
   parseCollectorFailures,
@@ -33,11 +36,67 @@ import {
 import { isPoisonError } from "./jobs/errors";
 import { GH_BIN_ENV } from "./git/ops";
 
+// Passthrough by default -- only the deadline/abort tests for the per-worktree realpath probe
+// (PR #295 review, stringer.ts:721) flip this on, so the ~320 other tests in this file that exercise
+// real worktrees are unaffected.
+const fsProbeControl = vi.hoisted(() => ({ hangRealpath: false }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const realpath: typeof actual.realpath = ((path: string, options?: unknown) =>
+    fsProbeControl.hangRealpath
+      ? new Promise(() => {})
+      : // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (actual.realpath as any)(path, options)) as typeof actual.realpath;
+  return { ...actual, realpath };
+});
+
 let dir: string;
 let prevBin: string | undefined;
 let prevTimeout: string | undefined;
 let prevGhBin: string | undefined;
 let prevGithubToken: string | undefined;
+
+/**
+ * Minimal single-row CSV decoder mirroring Go's `encoding/csv` (what pflag's `StringSlice` actually
+ * parses `--exclude` with) -- just enough to prove a comma embedded in an exclude glob round-trips
+ * through the quoting `scan()` applies, rather than splitting into two entries the way a plain
+ * `split(",")` would.
+ */
+function decodeCsvRow(row: string): string[] {
+  const fields: string[] = [];
+  let i = 0;
+  while (i <= row.length) {
+    if (row[i] === '"') {
+      let field = "";
+      i++;
+      while (i < row.length) {
+        if (row[i] === '"' && row[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        if (row[i] === '"') {
+          i++;
+          break;
+        }
+        field += row[i];
+        i++;
+      }
+      fields.push(field);
+      i++; // skip the delimiter after the closing quote
+    } else {
+      const next = row.indexOf(",", i);
+      if (next === -1) {
+        fields.push(row.slice(i));
+        break;
+      }
+      fields.push(row.slice(i, next));
+      i = next + 1;
+    }
+  }
+  return fields;
+}
 
 /** Fake stringer with a scripted body (executable node script), for the failure-path tests. */
 function writeScript(name: string, body: string[]): string {
@@ -806,6 +865,572 @@ describe("scan", () => {
     });
   });
 
+  // anton-bqge fixed this for `.claude/worktrees/`; anton-fj1q generalizes it to a worktree checked
+  // out at ANY in-repo path, derived from `git worktree list` rather than a directory name list —
+  // the 2026-09-10 scan of this repo spent 759 of 894 signals on one checked out at `.worktrees/`.
+  describe("signals from a nested git worktree", () => {
+    /** A real git repo with a real nested worktree checked out at `sub` (repo-relative). */
+    function initRepoWithWorktree(files: Record<string, string>, sub: string): string {
+      const repo = join(dir, "repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      for (const [name, body] of Object.entries(files)) {
+        mkdirSync(join(repo, name, ".."), { recursive: true });
+        writeFileSync(join(repo, name), body, "utf8");
+      }
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      run("worktree", "add", "-q", "-b", "wt-branch", sub);
+      return repo;
+    }
+
+    const finding = (path: string, source = "todos", kind = "todo") => ({
+      Source: source,
+      Kind: kind,
+      FilePath: path,
+      Title: `finding at ${path}`,
+    });
+
+    // anton-fj1q PR #295 review: filtering signals after stringer exits is too late when a nested
+    // worktree is large enough to exhaust a collector's --collector-timeout budget — the collector
+    // times out mid-walk and omits its REAL findings too, not just the phantom ones. Excluding the
+    // worktree from stringer's OWN walk (its --exclude, built before execFileAsync spawns it) is
+    // the only fix that stops the cost from being paid at all.
+    it("excludes a nested worktree from stringer's own walk, not just from the signals read back", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      const globs = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1].split(",");
+      expect(globs).toContain(`${join(".worktrees", "pr252-threads")}/**`);
+    });
+
+    // PR #295 review (thread on stringer.ts:1160): stringer's `--exclude` is a Go pflag string-slice,
+    // parsed with `encoding/csv` -- a naive `split(",")` (what every other test in this file uses,
+    // since none of their globs contain a comma) would silently split a worktree path that DOES
+    // contain one into two patterns, truncating the exclude for that path. This decodes the argv
+    // value the same way stringer's own CSV parser would, so it proves the path round-trips whole.
+    it("keeps a comma in a nested worktree path from splitting into two --exclude patterns", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr,252-threads");
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      const excludeArg = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1];
+      const globs = decodeCsvRow(excludeArg);
+      expect(globs).toContain(`${join(".worktrees", "pr,252-threads")}/**`);
+    });
+
+    // PR #295 review (thread on stringer.ts:1256): stringer's glob matcher treats `[ ] { } * ?`
+    // as syntax, not literal characters. Verified empirically against a real stringer binary: an
+    // unescaped `[1]` in a path also matched an unrelated sibling directory (character-class
+    // semantics), and an unescaped `{a,b}` matched nothing at all -- silently failing to exclude
+    // the very worktree it named. Backslash-escaping each metacharacter keeps the glob literal.
+    it("escapes glob metacharacters in a nested worktree path so the exclude matches only that path", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/review[1]");
+      const argvDump = join(dir, "argv.json");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(argvDump, []);
+
+      await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      const excludeArg = argvOf(argvDump)[argvOf(argvDump).indexOf("--exclude") + 1];
+      const globs = decodeCsvRow(excludeArg);
+      expect(globs).toContain(`${join(".worktrees", "review\\[1\\]")}/**`);
+    });
+
+    // PR #295 review (thread on stringer.ts:1177): a worktree another process creates AFTER the
+    // pre-scan enumeration but WHILE stringer is still walking is in neither stringer's --exclude
+    // (built from that stale enumeration) nor the pre-scan `nested` snapshot -- only a
+    // re-enumeration after stringer exits, unioned with the pre-scan read, still catches it. The
+    // fake stringer below stands in for "another process": it creates the worktree itself, mid-run,
+    // before writing its own output and exiting.
+    it("catches a worktree created after stringer's walk started, via the post-scan re-enumeration", async () => {
+      const repo = join(dir, "repo-mid-scan");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      writeFileSync(join(repo, "src.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "init");
+
+      const bin = writeScript("late-worktree-stringer", [
+        "const { execFileSync } = require('child_process');",
+        "const fs = require('fs');",
+        "const repoPath = process.argv[3];",
+        "execFileSync('git', ['-C', repoPath, 'worktree', 'add', '-q', '-b', 'late-branch', '.worktrees/late']);",
+        "const i = process.argv.indexOf('-o');",
+        "fs.writeFileSync(process.argv[i + 1], JSON.stringify([" +
+          "{ Source: 'todos', Kind: 'todo', FilePath: '.worktrees/late/src.ts', Title: 'late todo' }" +
+          "]));",
+        "process.exit(0);",
+      ]);
+      process.env[STRINGER_BIN_ENV] = bin;
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(0);
+      expect(result.worktree.worktrees).toContain(join(".worktrees", "late"));
+      expect(result.worktree.dropped).toEqual([
+        { path: join(".worktrees", "late", "src.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
+
+    // PR #295 review (thread on stringer.ts:853): a transient failure in the PRE-scan lookup must not
+    // discard what the POST-scan retry resolved. `repoPath` isn't a git repo yet when the pre-scan
+    // `git worktree list` runs (it fails with "not a git repository"), so `mergeNestedWorktrees` gets
+    // one failed snapshot and one successful one -- an earlier version collapsed that into bare
+    // `unavailable` and skipped filtering entirely, letting every phantom signal under the worktree
+    // the post-scan lookup DID find straight through to triage. The fake stringer stands in for the
+    // repo coming into existence mid-scan: it inits the repo and adds the nested worktree itself,
+    // before writing output that names a path inside it.
+    it("still filters against the post-scan snapshot when the pre-scan lookup failed", async () => {
+      const repo = join(dir, "repo-not-yet-a-git-repo");
+      mkdirSync(repo, { recursive: true });
+
+      const bin = writeScript("preinit-worktree-stringer", [
+        "const { execFileSync } = require('child_process');",
+        "const fs = require('fs');",
+        "const path = require('path');",
+        "const repoPath = process.argv[3];",
+        "execFileSync('git', ['-C', repoPath, 'init', '-q']);",
+        "execFileSync('git', ['-C', repoPath, 'config', 'user.email', 't@example.com']);",
+        "execFileSync('git', ['-C', repoPath, 'config', 'user.name', 'test']);",
+        "fs.writeFileSync(path.join(repoPath, 'src.ts'), 'export {};\\n');",
+        "execFileSync('git', ['-C', repoPath, 'add', '-A']);",
+        "execFileSync('git', ['-C', repoPath, 'commit', '-qm', 'init']);",
+        "execFileSync('git', ['-C', repoPath, 'worktree', 'add', '-q', '-b', 'late-branch', '.worktrees/late']);",
+        "const i = process.argv.indexOf('-o');",
+        "fs.writeFileSync(process.argv[i + 1], JSON.stringify([" +
+          "{ Source: 'todos', Kind: 'todo', FilePath: '.worktrees/late/src.ts', Title: 'late todo' }" +
+          "]));",
+        "process.exit(0);",
+      ]);
+      process.env[STRINGER_BIN_ENV] = bin;
+      process.env.GITHUB_TOKEN = "operator-provided-token"; // skip the `gh auth token` lookup
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.worktree.unavailable).toBeTruthy();
+      expect(result.worktree.worktrees).toContain(join(".worktrees", "late"));
+      expect(result.signals).toHaveLength(0);
+      expect(result.worktree.dropped).toEqual([
+        { path: join(".worktrees", "late", "src.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
+
+    it("drops signals under a worktree checked out at a non-.claude path, whatever collector reported them", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
+      // The nested checkout is a real copy of the tracked tree, so the same file exists at both paths.
+      mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+      writeFileSync(join(repo, ".worktrees/pr252-threads/src/app.ts"), "export {};\n", "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding("src/app.ts", "complexity", "high-complexity"),
+        finding(".worktrees/pr252-threads/src/app.ts", "complexity", "high-complexity"),
+        finding(".worktrees/pr252-threads/src/app.ts", "duplication", "code-clone"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toMatchObject([{ FilePath: "src/app.ts" }]);
+      expect(result.worktree.worktrees).toEqual([join(".worktrees", "pr252-threads")]);
+      expect(result.worktree.dropped).toEqual([
+        {
+          path: join(".worktrees", "pr252-threads", "src", "app.ts"),
+          kind: "high-complexity",
+          severity: expect.any(String),
+        },
+        {
+          path: join(".worktrees", "pr252-threads", "src", "app.ts"),
+          kind: "code-clone",
+          severity: expect.any(String),
+        },
+      ]);
+      const written = JSON.parse(readFileSync(join(dir, "scan.json"), "utf8")) as { FilePath: string }[];
+      expect(written.map((s) => s.FilePath)).toEqual(["src/app.ts"]);
+    });
+
+    // PR #295 review (thread on stringer.ts:975): `insideRepo` compares an absolute signal path
+    // against `repoPath` with plain lexical `path.relative`, which never resolves symlinks itself.
+    // A collector reports a signal's `FilePath` as a canonical absolute path, so a `repoPath` handed
+    // in as a symlink made every nested-worktree signal compare as outside the repo and survive this
+    // filter -- exactly the class of phantom finding this whole describe block exists to drop.
+    it("drops a nested-worktree signal reported as a canonical absolute path, even when repoPath is a symlink", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/sym-wt");
+      const canonicalRepo = realpathSync(repo);
+      const repoLink = join(dir, "repo-link");
+      symlinkSync(canonicalRepo, repoLink);
+
+      const absoluteNestedPath = join(canonicalRepo, ".worktrees", "sym-wt", "src", "app.ts");
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(absoluteNestedPath),
+      ]);
+
+      const result = await scan({ repoPath: repoLink, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(0);
+      expect(result.worktree.dropped).toEqual([
+        { path: join(".worktrees", "sym-wt", "src", "app.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
+
+    it("leaves a directory that only looks like a worktree, and a same-named file, untouched", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/pr252-threads");
+      writeFileSync(join(repo, "worktrees.ts"), "export const x = 1;\n", "utf8");
+      mkdirSync(join(repo, "src/lib/worktrees"), { recursive: true });
+      writeFileSync(join(repo, "src/lib/worktrees/index.ts"), "export {};\n", "utf8");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding("worktrees.ts"),
+        finding("src/lib/worktrees/index.ts"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(2);
+      expect(result.worktree.dropped).toEqual([]);
+      expect(result.worktree.worktrees).toEqual([join(".worktrees", "pr252-threads")]);
+    });
+
+    it("scans a repo with no nested worktree exactly as it does today", async () => {
+      const repo = join(dir, "plain-repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      writeFileSync(join(repo, "src.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "init");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [finding("src.ts")]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
+    });
+
+    it("counts everything and reports why when git worktree list cannot be asked", async () => {
+      const notARepo = join(dir, "loose-wt");
+      mkdirSync(notARepo, { recursive: true });
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(".worktrees/x/src/app.ts"),
+      ]);
+
+      const result = await scan({ repoPath: notARepo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree.dropped).toEqual([]);
+      expect(result.worktree.unavailable).toBeTruthy();
+    });
+
+    // A cross-worktree clone group names its real checkout in FilePath and lists every location,
+    // real or phantom, only in Description (see scan-duplication.ts's parseLocations). Checking
+    // FilePath alone would keep the signal because the real checkout isn't itself nested — but the
+    // "duplicate" it reports is entirely the nested worktree mirroring that one real file.
+    describe("a duplication signal's clone locations, not just its FilePath", () => {
+      // Real, computing code (not a bare declaration) so it survives filterDuplicationSignals's own
+      // non-code filter downstream — this test is about the worktree filter, not that one. The
+      // reported block starts at line 2, below the signature, so every window line reads as the
+      // function's body.
+      const CODE_BLOCK = [
+        "export function total(a: number, b: number) {",
+        "  const sum = a + b;",
+        "  const doubled = sum * 2;",
+        "  const tripled = sum * 3;",
+        "  const quadrupled = sum * 4;",
+        "  const quintupled = sum * 5;",
+        "  return doubled;",
+        "}",
+        "",
+      ].join("\n");
+
+      const cloneFinding = (filePath: string, line: number, locations: string[]) => ({
+        Source: "duplication",
+        Kind: "code-clone",
+        FilePath: filePath,
+        Line: line,
+        Title: `Duplicated block (6 lines, ${locations.length} locations)`,
+        Description: `Duplicated code found in:\n${locations.map((l) => `  - ${l}`).join("\n")}\n`,
+      });
+
+      it("drops a clone group left with only one real location outside the nested worktree", async () => {
+        const repo = initRepoWithWorktree({ "src/app.ts": CODE_BLOCK }, ".worktrees/pr252-threads");
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/app.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding("src/app.ts", 2, ["src/app.ts:2", ".worktrees/pr252-threads/src/app.ts:2"]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(0);
+        expect(result.worktree.dropped).toEqual([
+          { path: "src/app.ts", kind: "code-clone", severity: expect.any(String) },
+        ]);
+      });
+
+      it("keeps a clone group that still has two real locations outside the nested worktree", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding("src/a.ts", 2, [
+            "src/a.ts:2",
+            "src/b.ts:2",
+            ".worktrees/pr252-threads/src/a.ts:2",
+          ]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        expect(result.worktree.dropped).toEqual([]);
+      });
+
+      // stringer emits ONE signal per clone GROUP, not one per location — its FilePath is just the
+      // Description's first-listed location (verified against a real 97-signal scan: every FilePath
+      // equals its own Description's first entry, see scan-duplication.d9eab116.fixture.json). So a
+      // group whose first-listed location happens to be the nested one still has two real locations
+      // to report, and there is no sibling signal to fall back on — dropping it outright would
+      // silently delete the whole finding. It must be re-anchored to a surviving real location
+      // instead.
+      it("re-anchors a clone group's signal when its own FilePath is the nested location but two real locations remain", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding(".worktrees/pr252-threads/src/a.ts", 2, [
+            ".worktrees/pr252-threads/src/a.ts:2",
+            "src/a.ts:2",
+            "src/b.ts:2",
+          ]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        expect(result.signals[0].FilePath).toBe("src/a.ts");
+        expect(result.signals[0].Line).toBe(2);
+        expect(result.worktree.dropped).toEqual([]);
+      });
+
+      // PR #295 review (thread on stringer.ts:801): re-anchoring FilePath/Line isn't enough on its
+      // own -- filterDuplicationSignals reparses Description right back off this same signal
+      // downstream (scan-duplication.ts's parseLocations) and gives every location it lists its own
+      // declaration/code vote. A nested mirror left in that list casts a second vote for whichever
+      // real location it copies, which can turn a genuine tie into a false declarative majority and
+      // drop a real clone -- so Description must drop the nested entry too, not just FilePath/Line.
+      it("drops the nested location from Description too, not just FilePath/Line", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+          cloneFinding(".worktrees/pr252-threads/src/a.ts", 2, [
+            ".worktrees/pr252-threads/src/a.ts:2",
+            "src/a.ts:2",
+            "src/b.ts:2",
+          ]),
+        ]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        const description = result.signals[0].Description as string;
+        expect(description).not.toContain(".worktrees/pr252-threads/src/a.ts:2");
+        expect(description).toContain("src/a.ts:2");
+        expect(description).toContain("src/b.ts:2");
+      });
+
+      // PR #295 review (thread on stringer.ts:884): a signal carrying only the lowercase
+      // `description` alias (or `Description: null` alongside it) must have THAT field rewritten,
+      // not `Description`. Writing `Description` unconditionally plants an empty string there, which
+      // outranks a populated `description` in parseLocations's own `Description ?? description ?? ""`
+      // fallback (`??` only yields to null/undefined, not to ""), so filterDuplicationSignals would
+      // reparse zero locations and fall back to a single FilePath -- silently losing the real
+      // location this re-anchor is supposed to preserve.
+      it("rewrites the lowercase description alias when that's the one that carried the locations", async () => {
+        const repo = initRepoWithWorktree(
+          { "src/a.ts": CODE_BLOCK, "src/b.ts": CODE_BLOCK },
+          ".worktrees/pr252-threads",
+        );
+        mkdirSync(join(repo, ".worktrees/pr252-threads/src"), { recursive: true });
+        writeFileSync(join(repo, ".worktrees/pr252-threads/src/a.ts"), CODE_BLOCK, "utf8");
+
+        const locations = [".worktrees/pr252-threads/src/a.ts:2", "src/a.ts:2", "src/b.ts:2"];
+        const lowercaseCloneFinding = {
+          Source: "duplication",
+          Kind: "code-clone",
+          FilePath: ".worktrees/pr252-threads/src/a.ts",
+          Line: 2,
+          Title: `Duplicated block (6 lines, ${locations.length} locations)`,
+          Description: null,
+          description: `Duplicated code found in:\n${locations.map((l) => `  - ${l}`).join("\n")}\n`,
+        };
+        process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [lowercaseCloneFinding]);
+
+        const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+        expect(result.signals).toHaveLength(1);
+        const kept = result.signals[0] as { Description: string | null; description?: string };
+        expect(kept.Description).toBeFalsy();
+        const description = kept.description as string;
+        expect(description).not.toContain(".worktrees/pr252-threads/src/a.ts:2");
+        expect(description).toContain("src/a.ts:2");
+        expect(description).toContain("src/b.ts:2");
+      });
+    });
+
+    // anton-2wvb / PR #295: a worktree deleted without `git worktree remove` leaves a `prunable`
+    // registration behind; if its path is later reused as an ordinary directory, that registration
+    // must not be read as a live nested checkout — doing so would drop every real signal under it.
+    it("does not exclude a path whose worktree registration is prunable", async () => {
+      const repo = initRepoWithWorktree({ "src/app.ts": "export {};\n" }, ".worktrees/stale");
+      rmSync(join(repo, ".worktrees/stale"), { recursive: true, force: true });
+      mkdirSync(join(repo, ".worktrees/stale"), { recursive: true });
+      writeFileSync(join(repo, ".worktrees/stale/real.ts"), "export {};\n", "utf8");
+      execFileSync("git", ["-C", repo, "add", "-A"]);
+      execFileSync("git", ["-C", repo, "commit", "-qm", "recreate"]);
+      expect(execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], { encoding: "utf8" })).toContain(
+        "prunable",
+      );
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(".worktrees/stale/real.ts"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
+    });
+
+    // PR #295 review (thread on stringer.ts:684): `should_prune_worktree` never reports `prunable`
+    // for a LOCKED worktree — this repo locks its own (worktree.ts:485-491) — so the prunable check
+    // alone misses this case. If a locked worktree is deleted outside git and its path reused as an
+    // ordinary tracked directory, the stale registration must still be recognized as dead by checking
+    // for a live checkout marker (a `.git` file), not just the absence of `prunable`.
+    it("does not exclude a path whose worktree registration is locked but no longer a checkout", async () => {
+      const repo = join(dir, "locked-repo");
+      mkdirSync(repo, { recursive: true });
+      const run = (...args: string[]) => execFileSync("git", ["-C", repo, ...args]);
+      run("init", "-q");
+      run("config", "user.email", "t@example.com");
+      run("config", "user.name", "test");
+      mkdirSync(join(repo, "src"), { recursive: true });
+      writeFileSync(join(repo, "src/app.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "init");
+      run("worktree", "add", "-q", "--lock", "-b", "wt-branch", ".worktrees/stale");
+      rmSync(join(repo, ".worktrees/stale"), { recursive: true, force: true });
+      mkdirSync(join(repo, ".worktrees/stale"), { recursive: true });
+      writeFileSync(join(repo, ".worktrees/stale/real.ts"), "export {};\n", "utf8");
+      run("add", "-A");
+      run("commit", "-qm", "recreate");
+      const porcelain = execFileSync("git", ["-C", repo, "worktree", "list", "--porcelain"], {
+        encoding: "utf8",
+      });
+      expect(porcelain).toContain("locked");
+      expect(porcelain).not.toContain("prunable");
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv-locked.json"), [
+        finding(".worktrees/stale/real.ts"),
+      ]);
+
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan-locked.json") });
+
+      expect(result.signals).toHaveLength(1);
+      expect(result.worktree).toEqual({ dropped: [], worktrees: [] });
+    });
+
+    // PR #295 review (thread on stringer.ts:679): `isWorktreeCheckout`'s `.git`-is-a-FILE marker is
+    // only true for a LINKED worktree. `git worktree list` always reports the MAIN worktree first,
+    // and its `.git` is an ordinary directory — so when `repoPath` names a linked worktree with the
+    // main checkout nested beneath it, requiring the file marker on every record wrongly excludes
+    // that main checkout from `nested`, leaving its real findings to double-report undropped.
+    it("excludes the main checkout when repoPath is a linked worktree with the main checkout nested beneath it", async () => {
+      const mainRepo = join(dir, "main");
+      mkdirSync(mainRepo, { recursive: true });
+      const runMain = (...args: string[]) => execFileSync("git", ["-C", mainRepo, ...args]);
+      runMain("init", "-q");
+      runMain("config", "user.email", "t@example.com");
+      runMain("config", "user.name", "test");
+      writeFileSync(join(mainRepo, "app.ts"), "export {};\n", "utf8");
+      runMain("add", "-A");
+      runMain("commit", "-qm", "init");
+
+      // Add the linked worktree at an empty directory, then move the main checkout underneath it
+      // and repoint the linked worktree's `.git` file marker at the main checkout's new location —
+      // reproducing a main checkout nested beneath the linked worktree that scans it.
+      const outer = join(dir, "outer");
+      mkdirSync(outer, { recursive: true });
+      runMain("worktree", "add", "-q", outer, "-b", "wt-branch");
+      const nestedMain = join(outer, "main-nested");
+      execFileSync("mv", [mainRepo, nestedMain]);
+      const gitFile = join(outer, ".git");
+      writeFileSync(gitFile, readFileSync(gitFile, "utf8").replace(mainRepo, nestedMain), "utf8");
+      expect(existsSync(join(nestedMain, ".git"))).toBe(true);
+
+      process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), [
+        finding(join("main-nested", "app.ts")),
+      ]);
+
+      const result = await scan({ repoPath: outer, scanFile: join(dir, "scan.json") });
+
+      expect(result.worktree.worktrees).toEqual(["main-nested"]);
+      expect(result.signals).toEqual([]);
+      expect(result.worktree.dropped).toEqual([
+        { path: join("main-nested", "app.ts"), kind: "todo", severity: expect.any(String) },
+      ]);
+    });
+  });
+
+  describe("describeWorktreeFilter", () => {
+    it("says nothing when nothing was dropped", () => {
+      expect(describeWorktreeFilter({ dropped: [], worktrees: [] })).toBeUndefined();
+      expect(describeWorktreeFilter({ dropped: [], worktrees: [".worktrees/x"] })).toBeUndefined();
+    });
+
+    it("names the dropped paths and the nested worktree(s) they sit under", () => {
+      const line = describeWorktreeFilter({
+        worktrees: [".worktrees/pr252-threads"],
+        dropped: [
+          { path: ".worktrees/pr252-threads/src/app.ts", kind: "high-complexity", severity: "medium" },
+        ],
+      });
+      expect(line).toContain("1 signal(s)");
+      expect(line).toContain(".worktrees/pr252-threads");
+      expect(line).toContain("src/app.ts");
+    });
+
+    it("warns when git worktree list could not be read, without claiming anything was dropped", () => {
+      const line = describeWorktreeFilter({ dropped: [], worktrees: [], unavailable: "not a git repo" });
+      expect(line).toContain("not a git repo");
+      expect(line).toContain("counted this pass");
+    });
+  });
 
   // anton-r016: `githygiene`'s secret detector matches on the SHAPE of an assignment — a name
   // holding "PASSWORD" with a string on the right — so every fake credential in anton's own test
@@ -8038,6 +8663,98 @@ describe("scan", () => {
     await expect(
       scan({ repoPath: "/repo", scanFile: join(dir, "s.json"), signal: ac.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  // PR #295 review (thread on stringer.ts:721): the git subprocess above is bounded by `timeout`/
+  // `signal`, but the `realpath` probe run per registered worktree afterward is a plain fs call with
+  // no timeout of its own. A registered worktree on a stalled mount must not be able to hang scan()
+  // past its own deadline just because that probe never returns.
+  it("bounds a stalled realpath probe by the scan's own deadline instead of hanging past it", async () => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+    writeFileSync(join(repo, "app.ts"), "export {};\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), []);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "100";
+    fsProbeControl.hangRealpath = true;
+    try {
+      // A permanently-hanging realpath must not hang scan() itself: the nested-worktree lookup's
+      // own withBudget wrapper times it out against the (tiny) scan deadline above, which then
+      // leaves nothing left for the rest of the scan to spend -- so this rejects promptly with a
+      // deadline error rather than hanging on the still-pending realpath call underneath.
+      await expect(scan({ repoPath: repo, scanFile: join(dir, "scan.json") })).rejects.toThrow(
+        /deadline/,
+      );
+    } finally {
+      fsProbeControl.hangRealpath = false;
+    }
+  });
+
+  it("propagates a caller abort raised while a realpath probe is pending, without hanging", async () => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+    writeFileSync(join(repo, "app.ts"), "export {};\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+
+    process.env[STRINGER_BIN_ENV] = writeFakeStringer(join(dir, "argv.json"), []);
+    fsProbeControl.hangRealpath = true;
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 50);
+    try {
+      await expect(
+        scan({ repoPath: repo, scanFile: join(dir, "scan.json"), signal: ac.signal }),
+      ).rejects.toMatchObject({ name: "AbortError" });
+    } finally {
+      fsProbeControl.hangRealpath = false;
+    }
+  });
+
+  // PR #295 review (thread on stringer.ts:768): the POST-scan re-enumeration isn't followed by any
+  // further deadline check the way the pre-scan one is (the `remainingMs <= 0` guard before spawning
+  // stringer) -- so if a deadline hit inside it were swallowed and papered over with a stale fallback
+  // path instead of propagated, scan() would resolve successfully having silently reported "nothing
+  // nested" rather than "couldn't tell". The realpath hang is switched on only after the pre-scan
+  // lookup (real fs, fast) has already finished, so it hits specifically the post-scan lookup that
+  // runs after the fake stringer's own delay.
+  it("reports the worktree filter unavailable when the post-scan re-enumeration hits its deadline, instead of a stale snapshot", async () => {
+    const repo = join(dir, "repo");
+    mkdirSync(repo, { recursive: true });
+    execFileSync("git", ["-C", repo, "init", "-q"]);
+    execFileSync("git", ["-C", repo, "config", "user.email", "t@example.com"]);
+    execFileSync("git", ["-C", repo, "config", "user.name", "test"]);
+    writeFileSync(join(repo, "app.ts"), "export {};\n", "utf8");
+    execFileSync("git", ["-C", repo, "add", "-A"]);
+    execFileSync("git", ["-C", repo, "commit", "-qm", "init"]);
+
+    process.env[STRINGER_BIN_ENV] = writeScript("delayed-stringer", [
+      "setTimeout(() => {",
+      "  const i = process.argv.indexOf('-o');",
+      "  require('fs').writeFileSync(process.argv[i + 1], JSON.stringify([]));",
+      "  process.exit(0);",
+      "}, 150);",
+    ]);
+    process.env.ANTON_STRINGER_TIMEOUT_MS = "500";
+    process.env.GITHUB_TOKEN = "operator-provided-token"; // skip the `gh auth token` lookup
+    setTimeout(() => {
+      fsProbeControl.hangRealpath = true;
+    }, 30);
+
+    try {
+      const result = await scan({ repoPath: repo, scanFile: join(dir, "scan.json") });
+      expect(result.worktree.unavailable).toBeTruthy();
+      expect(result.worktree.dropped).toEqual([]);
+    } finally {
+      fsProbeControl.hangRealpath = false;
+    }
   });
 
   it("rejects without launching stringer when gh auth token exhausts the scan deadline", async () => {

@@ -1,0 +1,23 @@
+name: bun install (with retry)
+description: >
+  Runs `bun install --frozen-lockfile`, retrying on failure. node-pty's postinstall shells out to
+  node-gyp, which fetches Node headers from nodejs.org — a bare network blip there once failed a
+  report-only job in 16s while sibling jobs installed fine on the same commit (PR #203, anton-auo7).
+  The same install runs in every job, so the same flake can hit any of them; centralizing the retry
+  here keeps them all covered without copy-pasted retry loops.
+runs:
+  using: composite
+  steps:
+    - name: Install
+      shell: bash
+      run: |
+        set -euo pipefail
+        for attempt in 1 2 3; do
+          if bun install --frozen-lockfile; then
+            exit 0
+          fi
+          echo "::warning::bun install failed (attempt ${attempt}/3), retrying…"
+          sleep $((attempt * 5))
+        done
+        echo "::error::bun install failed after 3 attempts"
+        exit 1

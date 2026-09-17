@@ -16,6 +16,7 @@ import {
   createRun,
   endpointHostFromBaseUrl,
   findRunFormulaForBranch,
+  findRunReviewKeyForBranch,
   getRunBaseForkSha,
   listDeliveriesByBead,
   listRecentRunOutcomes,
@@ -51,6 +52,10 @@ interface SeedRun {
   startedAt?: number;
   endedAt?: number;
   ticketBeadId?: string;
+  reviewKey?: string;
+  reviewKeyAdvisories?: string;
+  reviewScore?: number;
+  reviewKeyScore?: number;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -63,6 +68,10 @@ async function seed(run: SeedRun): Promise<void> {
     formula: run.formula,
     formulaVariant: run.formulaVariant,
     ticketBeadId: run.ticketBeadId,
+    reviewKey: run.reviewKey,
+    reviewKeyAdvisories: run.reviewKeyAdvisories,
+    reviewScore: run.reviewScore,
+    reviewKeyScore: run.reviewKeyScore,
     startedAt: new Date(run.startedAt ?? run.updatedAt),
     endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
@@ -155,6 +164,97 @@ describe("findRunFormulaForBranch", () => {
       variant: undefined,
     });
     expect(await findRunFormulaForBranch(t.db, "p2", "anton-zzz", BRANCH)).toBeUndefined();
+  });
+});
+
+describe("findRunReviewKeyForBranch (anton-nyz1v)", () => {
+  it("recovers the resume key a FAILED attempt recorded — the retry's row is not open", async () => {
+    await seed({
+      id: "r1",
+      status: "failed",
+      updatedAt: 1_000_000,
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewKeyScore: 8,
+    });
+
+    expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r2")).toEqual({
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewScore: 8,
+    });
+  });
+
+  it("reads the score bound to the key, never the row's mutable latest score (PR #280 review)", async () => {
+    // A second step:review in the same formula overwrote `reviewScore` on this very row after the
+    // first gate's clean verdict recorded `reviewKey`/`reviewKeyScore` — exactly what happens when a
+    // later gate blocks or only partially completes. The recovered score must stay bound to the key
+    // that matched, not follow the row's now-unrelated latest score.
+    await seed({
+      id: "r1",
+      status: "failed",
+      updatedAt: 1_000_000,
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewKeyScore: 8,
+      reviewScore: 3,
+    });
+
+    expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r2")).toEqual({
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewScore: 8,
+    });
+  });
+
+  it("takes the MOST RECENT attempt that recorded one, skipping rows that never got that far", async () => {
+    await seed({ id: "old", status: "failed", updatedAt: 1_000_000, reviewKey: "old:key:fp" });
+    await seed({ id: "newer", status: "failed", updatedAt: 2_000_000, reviewKey: "new:key:fp" });
+    // Crashed before the gate ever reported a verdict — it pins nothing, so the choice above stands.
+    await seed({ id: "newest", status: "running", updatedAt: 3_000_000 });
+
+    expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r-current")).toMatchObject({
+      reviewKey: "new:key:fp",
+    });
+  });
+
+  it("EXCLUDES the calling run's own row — a formula's second step:review must not skip off the first's write", async () => {
+    // Both steps run inside ONE attempt and therefore share ONE run id. The first step:review
+    // writes its clean verdict onto that row before the second ever runs; without the exclusion the
+    // second would find its own attempt's fresh write and skip itself.
+    await seed({ id: "this-attempt", status: "running", updatedAt: 2_000_000, reviewKey: "self:key:fp" });
+    await seed({ id: "earlier-attempt", status: "failed", updatedAt: 1_000_000, reviewKey: "prior:key:fp" });
+
+    expect(
+      await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "this-attempt"),
+    ).toMatchObject({ reviewKey: "prior:key:fp" });
+  });
+
+  it("selects nothing for a branch nothing has walked", async () => {
+    await seed({
+      id: "other-branch",
+      status: "failed",
+      updatedAt: 1_000_000,
+      branch: "anton/anton-xyz",
+      reviewKey: "other:key:fp",
+    });
+
+    expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r-current")).toBeUndefined();
+  });
+
+  it("never crosses epics or projects", async () => {
+    await seed({
+      id: "other-epic",
+      status: "failed",
+      updatedAt: 1_000_000,
+      epicBeadId: "anton-zzz",
+      reviewKey: "other:key:fp",
+    });
+
+    expect(
+      await findRunReviewKeyForBranch(t.db, PROJECT, "anton-zzz", BRANCH, "r-current"),
+    ).toMatchObject({ reviewKey: "other:key:fp" });
+    expect(await findRunReviewKeyForBranch(t.db, "p2", "anton-zzz", BRANCH, "r-current")).toBeUndefined();
   });
 });
 

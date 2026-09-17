@@ -104,6 +104,11 @@ function insertSchedule(
       cron: input.cron,
       enabled,
       nextRunAt: nextRunAt != null ? secDate(nextRunAt) : null,
+      // This row's `enabled` is a deliberate choice the instant it's created (the caller's own
+      // input, or today's DEFAULT_SCHEDULES) — never the stale default a later migration arm exists
+      // to fix. Stamping it here, not just on that arm, is what stops a schedule type whose default
+      // flips AFTER this row exists from re-arming a brand new row an operator has since disabled.
+      autoArmed: true,
     })
     .run();
   return id;
@@ -121,6 +126,7 @@ export async function createSchedule(
 export interface UpdateSchedulePatch {
   cron?: string;
   enabled?: boolean;
+  autoArmed?: boolean;
 }
 
 /**
@@ -131,8 +137,10 @@ export interface UpdateSchedulePatch {
 const TAKE_WRITE_LOCK = { behavior: "immediate" } as const;
 
 /**
- * Patch a schedule's cron/enabled. Recomputes `nextRunAt` whenever the cron changes or a disabled
- * schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it.
+ * Patch a schedule's cron/enabled/autoArmed. Recomputes `nextRunAt` whenever the cron changes or a
+ * disabled schedule is (re-)enabled; disabling clears `nextRunAt` so the loop skips it. `autoArmed`
+ * is set in this same transaction so a one-time migration arm (see {@link backfillDefaultSchedules})
+ * can never commit `enabled` without its durable marker landing atomically alongside it.
  *
  * The read and the write are ONE synchronous transaction, because this is a read-modify-write over a
  * row two callers reach at once: the settings panel patches `enabled` on the same row a cadence
@@ -163,6 +171,7 @@ export async function updateSchedule(
     const enabled = patch.enabled ?? current.enabled;
 
     const set: Partial<ScheduleRow> = { cron, enabled };
+    if (patch.autoArmed !== undefined) set.autoArmed = patch.autoArmed;
     if (!enabled) {
       set.nextRunAt = null;
     } else if (patch.cron !== undefined || (patch.enabled === true && !current.enabled)) {
@@ -282,18 +291,16 @@ export async function listSchedules(
  * bd, so this cadence is the one wait gates cannot replace — see review-fix.ts's header.
  *
  * `enabled: false` seeds the ROW without arming it — the operator sees the automation in settings
- * and turns it on deliberately. run-health (anton-4ks0) ships that way: it reports on work a human
- * must then judge, so an operator who never asked for it shouldn't start accruing reports. unstick
- * (anton-wvcy) is armed by default but is a strict no-op until run-health has written a report, so
- * turning the sweep on is the single switch that arms the whole detect → act loop. The alternative —
- * shipping both disabled — trades an idle hourly job (one report read, no bd, no writes) for an
- * operator who enables the sweep and silently gets findings nothing ever acts on. An operator who
- * won't use run-health can turn unstick off independently; the settings row says as much.
+ * and turns it on deliberately. run-health (anton-4ks0) and unstick (anton-wvcy) are exceptions:
+ * together they detect and surface board outages, so both are armed by default. Existing
+ * installations are re-armed at boot as part of the same upgrade path, because the former
+ * run-health default left the outage detector silent. An operator can still turn either automation
+ * off independently in settings.
  *
- * gardener (anton-3nv7) ships disabled for run-health's reason and one more: it is the only recurring
- * job that WRITES to the board unprompted (it closes epics bd judges done and repairs the blocked
- * flag). An operator who never asked for a patrol should not find work closed on their board — so
- * arming it is a deliberate act, and the report it produces is what earns the trust to leave it on.
+ * gardener (anton-3nv7) ships disabled because it is the only recurring job that WRITES to the
+ * board unprompted (it closes epics bd judges done and repairs the blocked flag). An operator who
+ * never asked for a patrol should not find work closed on their board — so arming it is a deliberate
+ * act, and the report it produces is what earns the trust to leave it on.
  * Its judgment tier also carries the re-judgement of parked work (anton-dsnr): daily is a fine
  * cadence for a 90-day silence, and it needs no switch of its own because it costs no session and
  * files nothing a founder has not already left parked for a quarter.
@@ -335,7 +342,7 @@ export const DEFAULT_SCHEDULES: Array<{
   { type: "review-fix", cron: "*/15 * * * *" }, // poll open PRs for review events every 15 min
   { type: "nightly-stringer", cron: "0 3 * * *" }, // scan + triage nightly at 03:00
   { type: "orphan-grooming", cron: "0 4 * * 1" }, // bucket loose tickets weekly, Mon 04:00
-  { type: "run-health", cron: "0 * * * *", enabled: false }, // sweep for stalls hourly; opt-in
+  { type: "run-health", cron: "0 * * * *" }, // sweep for stalls and board outages hourly
   { type: "unstick", cron: "10 * * * *" }, // act on the sweep's findings, 10 min after it
   { type: "gate-check", cron: "*/10 * * * *" }, // close satisfied gates + resume their work
   { type: "gardener", cron: "0 5 * * *", enabled: false }, // board hygiene patrol daily 05:00; opt-in
@@ -389,17 +396,26 @@ export async function seedDefaultSchedules(
 export interface ScheduleBackfill {
   projectId: string;
   created: ScheduledJobType[];
+  /** The formerly opt-in outage detector that this release deliberately makes essential. */
+  armedRunHealth: boolean;
 }
 
 /**
  * Seed every registered project's missing default schedules — the upgrade path for schedule types
- * shipped after a project was added.
+ * shipped after a project was added. It also upgrades the former opt-in `run-health` row: board
+ * outages must be detected for existing projects too, and {@link updateSchedule} restores the
+ * scheduler's `nextRunAt` instead of leaving an enabled-but-never-due row.
  *
- * {@link seedDefaultSchedules} otherwise runs only while INSERTING a project, and no migration
- * backfills schedule rows, so on an existing installation a newly-shipped type simply never exists:
- * turning on `run-health` from settings creates just that row and leaves `unstick` unscheduled,
- * accruing reports with nothing to act on them. Run at boot (jobs/service.ts). Safe to repeat — it
- * only inserts types the project is missing, so a schedule an operator disabled stays disabled.
+ * The arm is ONE-TIME, gated on `autoArmed` rather than on `enabled` alone: without it, an operator
+ * who explicitly disables run-health again would have it silently re-enabled on the very next boot,
+ * because a disabled row looks identical to the pre-migration default this backfill exists to fix.
+ * `autoArmed` is what tells the two apart — it is set the moment a row's `enabled` reflects a
+ * deliberate choice (this arm, or the row's own creation; see `insertSchedule`), so only a row that
+ * has never once been through either stays eligible.
+ *
+ * Other existing rows remain exactly as their operator left them. Safe to repeat: after the first
+ * pass the row is marked `autoArmed`, so later boots make no change even if the operator disables it
+ * again.
  */
 export async function backfillDefaultSchedules(
   db: AntonDb,
@@ -409,7 +425,31 @@ export async function backfillDefaultSchedules(
   const backfills: ScheduleBackfill[] = [];
   for (const project of projects) {
     const created = await seedDefaultSchedules(db, clock, project.id);
-    if (created.length > 0) backfills.push({ projectId: project.id, created });
+    const runHealth = await db
+      .select({
+        id: schema.schedules.id,
+        enabled: schema.schedules.enabled,
+        autoArmed: schema.schedules.autoArmed,
+      })
+      .from(schema.schedules)
+      .where(
+        and(
+          eq(schema.schedules.projectId, project.id),
+          eq(schema.schedules.type, "run-health"),
+        ),
+      )
+      .limit(1);
+    const armedRunHealth = runHealth[0]?.enabled === false && runHealth[0]?.autoArmed === false;
+    if (armedRunHealth) {
+      // enabled and autoArmed land in the SAME transaction (updateSchedule): if only `enabled`
+      // committed and the process died (or a second write failed) before `autoArmed` did, the row
+      // would read exactly like the pre-migration default this backfill targets, and the next boot
+      // would re-arm it even after an operator deliberately disabled it again.
+      await updateSchedule(db, clock, runHealth[0].id, { enabled: true, autoArmed: true });
+    }
+    if (created.length > 0 || armedRunHealth) {
+      backfills.push({ projectId: project.id, created, armedRunHealth });
+    }
   }
   return backfills;
 }

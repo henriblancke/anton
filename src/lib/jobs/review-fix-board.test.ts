@@ -22,7 +22,7 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
-const { memoisedShow, olderOf, ridesOn, safe, stateOf, tryList, tryShow } =
+const { memoisedShow, olderOf, ridesOn, stateOf, tryList, tryShow } =
   await import("./review-fix-board");
 
 const bead = (id: string, parent?: string, extra: Partial<Bead> = {}): Bead => ({
@@ -37,20 +37,6 @@ const bead = (id: string, parent?: string, extra: Partial<Bead> = {}): Bead => (
 beforeEach(() => {
   showMock.mockReset();
   listMock.mockReset();
-});
-
-describe("safe", () => {
-  it("answers true when the effect completed", async () => {
-    expect(await safe(async () => undefined)).toBe(true);
-  });
-
-  it("swallows a failure and answers false", async () => {
-    expect(
-      await safe(async () => {
-        throw new Error("bd is down");
-      }),
-    ).toBe(false);
-  });
 });
 
 describe("tryShow / tryList", () => {

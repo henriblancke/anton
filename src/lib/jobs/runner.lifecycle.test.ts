@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
-import { PoisonError, UsageLimitError } from "./errors";
+import { BoardUnreachableError, PoisonError, UsageLimitError } from "./errors";
 import { complete, getJob, park, reschedule, toMs } from "./queue";
 import { CONFIG, useRunnerHarness, waitUntil } from "./runner.fixture";
 
@@ -174,6 +174,25 @@ describe("JobRunner lifecycle (live, in-memory db)", () => {
     expect(await r.tickOnce()).toBe(1);
     await r.whenIdle();
     expect(ranAfter).toBe(true);
+  });
+
+  it("refunds an arbitration board outage and reschedules it on the probe cadence", async () => {
+    const r = h.runner(
+      async () => {
+        throw new BoardUnreachableError("Dolt server unreachable during run-lease arbitration");
+      },
+      { maxAttempts: 1, boardUnreachableRetryMs: 45_000 },
+    );
+    const id = await r.enqueue({ type: "execute-epic" });
+
+    await r.tickOnce();
+    await r.whenIdle();
+
+    const job = await getJob(h.db, id);
+    expect(job?.status).toBe("queued");
+    expect(job?.attempts).toBe(0);
+    expect(toMs(job?.runAt)).toBe(h.clock.now() + 45_000);
+    expect(job?.lastError).toContain("Dolt server unreachable during run-lease arbitration");
   });
 
   it("reclaims a crashed (lease-expired) running job on the next tick", async () => {

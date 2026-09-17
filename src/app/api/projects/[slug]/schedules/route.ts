@@ -32,6 +32,11 @@ export async function GET(_request: Request, { params }: { params: Promise<{ slu
  * message and leaves the stored row untouched. updateSchedule recomputes nextRunAt off the new
  * cron, and the scheduler re-reads schedules every tick — so an edited cadence takes effect without
  * a restart. The response carries the full row, including that recomputed nextRunAt.
+ *
+ * Always patches `autoArmed: true` alongside whatever the operator sent: this PATCH firing at all
+ * means they authored cron and/or enabled themselves, so the row must never again read as the
+ * untouched legacy state {@link backfillDefaultSchedules} silently re-enables — even when they only
+ * edited the cron while leaving the schedule disabled (PR #277 review).
  */
 export async function PATCH(request: Request, { params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
@@ -88,7 +93,9 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ sl
         enabled: enabled ?? known.enabled,
       }));
     // ensureSchedule already created the row from this patch; only patch an existing one.
-    if (existing) await updateSchedule(db, systemClock, id, { cron: nextCron, enabled });
+    if (existing) {
+      await updateSchedule(db, systemClock, id, { cron: nextCron, enabled, autoArmed: true });
+    }
 
     const schedule = (await listSchedules(project.id)).find((s) => s.id === id);
     return NextResponse.json({ schedule, created: !existing });
