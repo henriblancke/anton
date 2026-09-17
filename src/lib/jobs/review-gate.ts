@@ -94,6 +94,12 @@ export type ReviewGateOutcome =
 
 export interface ReviewGateResult {
   outcome: ReviewGateOutcome;
+  /**
+   * The fork-point commit every round was judged against — pinned once, up front (see the comment
+   * at its resolution below), so a caller persisting a resume key off a `clean` verdict reuses this
+   * SHA rather than re-resolving the movable branch ref after the gate returns.
+   */
+  baseRev: string;
   /** Every round that ran, in order — each with its validated score for the call-site to persist. */
   rounds: ReviewRound[];
   /**
@@ -387,7 +393,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
     // A reviewer that never reported, or reported an unusable score, has told us nothing about the
     // work — the run is handed back with whatever findings were salvaged, never as a clean review.
-    if (!review.report.ok) return { outcome: "protocol-violation", rounds, unresolved, reviewer };
+    if (!review.report.ok) return { outcome: "protocol-violation", baseRev, rounds, unresolved, reviewer };
 
     // The score-regression alarm (anton-i98r), read across every round so far. Checked BEFORE the
     // clean and cap exits, and so ahead of both: a run the reviewer has scored low K times running
@@ -397,14 +403,14 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // score that isn't moving) is the more useful thing to say about why the run stopped.
     const regression = detectScoreRegression(rounds, config.scoreAlarm);
     if (regression) {
-      return { outcome: "score-regression", rounds, unresolved, reviewer, score: review.report.score, regression };
+      return { outcome: "score-regression", baseRev, rounds, unresolved, reviewer, score: review.report.score, regression };
     }
 
     if (blocking.length === 0) {
-      return { outcome: "clean", rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "clean", baseRev, rounds, unresolved, reviewer, score: review.report.score };
     }
     if (round === config.maxRounds) {
-      return { outcome: "unresolved", rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: review.report.score };
     }
 
     // Replaces, never accumulates: this round was shown the previous carry and restated whatever
@@ -443,7 +449,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
     if (!fix.committed) {
-      return { outcome: "stalled", rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "stalled", baseRev, rounds, unresolved, reviewer, score: review.report.score };
     }
   }
 

@@ -66,6 +66,7 @@ describe("step:verify", () => {
 describe("step:review", () => {
   const verdict = (outcome: ReviewGateResult["outcome"]): ReviewGateResult => ({
     outcome,
+    baseRev: "base-sha",
     rounds: [],
     unresolved: [],
     reviewer: { kind: "default" },

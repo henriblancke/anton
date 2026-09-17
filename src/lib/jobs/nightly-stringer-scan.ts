@@ -19,6 +19,7 @@ import { summarizeSignals, type ScanCounts } from "../scan-health";
 import {
   describeCollectorFailure,
   describeUntrackedFilter,
+  describeWorktreeFilter,
   rejectWithBaselineRestored,
   scan,
   type DeltaState,
@@ -115,6 +116,18 @@ async function reportScanDiagnostics(
     const detail = describeCollectorFailure(failure);
     await appendSessionLog(logPath, `[stringer] WARNING: ${detail}\n`);
     console.warn(`[nightly-stringer] ${project.slug}: ${detail}`);
+  }
+
+  // Signals about a path inside another checkout of this same repo — a worktree at ANY in-repo path,
+  // not just `.claude/worktrees/` (anton-bqge, generalized by anton-fj1q). Every real finding under
+  // one is double-counted unless dropped, so this is said out loud the same way the rest are.
+  const worktreeLine = describeWorktreeFilter(result.worktree);
+  if (worktreeLine) {
+    const prefix = result.worktree.unavailable ? "WARNING: " : "";
+    await appendSessionLog(logPath, `[stringer] ${prefix}${worktreeLine}\n`);
+    if (result.worktree.unavailable) {
+      console.warn(`[nightly-stringer] ${project.slug}: ${worktreeLine}`);
+    }
   }
 
   // Signals dropped for naming a file git doesn't track (anton-j2zg).

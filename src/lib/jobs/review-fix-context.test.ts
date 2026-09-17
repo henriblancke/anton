@@ -4,8 +4,8 @@
  * The end-to-end flow is covered by review-fix.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import { labelValue, parseThreadReport, reviewFixContext } from "./review-fix-context";
-import type { PrReview } from "../git/pr";
+import { CLUSTERED_FINDINGS_THRESHOLD, labelValue, parseThreadReport, reviewFixContext } from "./review-fix-context";
+import type { PrReview, ReviewThread } from "../git/pr";
 import type { Bead } from "../beads/bd";
 
 const epic = { id: "anton-x1", title: "Ship X" } as Bead;
@@ -98,6 +98,41 @@ describe("reviewFixContext", () => {
     expect(out).toContain("Merge conflicts:");
     expect(out).toContain("- src/a.ts");
     expect(out).toContain("- src/b.ts");
+  });
+
+  function threadOn(path: string, id: string): ReviewThread {
+    return {
+      id,
+      isResolved: false,
+      isOutdated: false,
+      path,
+      comments: [{ id: 1, author: "alice", body: "problem" }],
+    };
+  }
+
+  it("names a path carrying at least the threshold count of findings, asking for root cause", () => {
+    expect(CLUSTERED_FINDINGS_THRESHOLD).toBe(3);
+    const threads = Array.from({ length: CLUSTERED_FINDINGS_THRESHOLD }, (_, i) =>
+      threadOn("src/broken.ts", `RT_${i}`),
+    );
+    const out = reviewFixContext(epic, makePr({ threads }), ["unresolved review threads"]);
+    expect(out).toContain("## Clustered findings");
+    expect(out).toContain(`src/broken.ts (${CLUSTERED_FINDINGS_THRESHOLD} findings)`);
+    expect(out).toContain("root cause");
+  });
+
+  it("omits the cluster section just below the threshold", () => {
+    const threads = Array.from({ length: CLUSTERED_FINDINGS_THRESHOLD - 1 }, (_, i) =>
+      threadOn("src/almost.ts", `RT_${i}`),
+    );
+    const out = reviewFixContext(epic, makePr({ threads }), ["unresolved review threads"]);
+    expect(out).not.toContain("## Clustered findings");
+  });
+
+  it("omits the cluster section when findings are spread one per file", () => {
+    const threads = [threadOn("src/a.ts", "RT_1"), threadOn("src/b.ts", "RT_2"), threadOn("src/c.ts", "RT_3")];
+    const out = reviewFixContext(epic, makePr({ threads }), ["unresolved review threads"]);
+    expect(out).not.toContain("## Clustered findings");
   });
 });
 

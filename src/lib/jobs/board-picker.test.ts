@@ -42,6 +42,7 @@ import { PoisonError } from "./errors";
 import { enqueue, enqueueScheduledTypeIfAbsent, queuedJobId, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { makeBoardPickerHandler } from "./board-picker";
+import { BOARD_PICKER_BRAKES } from "./board-picker-brakes";
 import { BoardPickerNudge, PICKER_NUDGE_WINDOW_MS } from "./picker-nudge";
 import type {
   ConfirmStart,
@@ -987,6 +988,25 @@ describe("makeBoardPickerHandler", () => {
   it("parks a payload naming a project that is gone rather than retrying it forever", async () => {
     const handler = makeBoardPickerHandler({ db: t.db, clock });
     await expect(handler(fakeCtx({ payload: { projectId: "ghost" } }))).rejects.toThrow(PoisonError);
+  });
+});
+
+/**
+ * anton-7p5x: the brake sequence is a REGISTERED LIST rather than a chain inlined in the handler —
+ * pinned here by name so a reorder (or a brake quietly dropped) shows up as a diff on this array
+ * rather than only as a behavior change buried in the tests above.
+ */
+describe("BOARD_PICKER_BRAKES", () => {
+  it("asks the registered brakes in this order — the sequence every unattended pass runs", () => {
+    expect(BOARD_PICKER_BRAKES.map((brake) => brake.name)).toEqual([
+      "failure-streak",
+      "score-slide",
+      "wip-hold",
+      "disarm",
+      "track-record",
+      "armed-policy",
+      "earned-autonomy",
+    ]);
   });
 });
 

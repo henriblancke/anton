@@ -17,7 +17,7 @@ import type { DispatchOutcome } from "./execute-epic-dispatch";
 import { armMergeGate } from "./execute-epic-merge-gate";
 import { runReviewStep } from "./execute-epic-review-step";
 import type { RunPhaseCarry, RunStepDispatch } from "./execute-epic-run-step";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import {
   readVerifiedStandaloneRetirement,
   verifiedStandaloneRetirementStillHeld,

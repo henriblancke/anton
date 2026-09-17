@@ -48,7 +48,8 @@ import {
   TicketRetiredError,
   TicketTimeoutError,
 } from "./execute-epic-errors";
-import { mustPersist, mustRead, mustReadBoard, safe } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
+import { safe } from "./safe";
 import { runTargetAbove } from "./gate-targets";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
