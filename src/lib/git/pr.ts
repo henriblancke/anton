@@ -381,6 +381,31 @@ export async function replyToReviewComment(
   );
 }
 
+/** Reaction content the reactions endpoint accepts for a triaged finding's outcome. */
+export type PrReactionContent = "+1" | "-1" | "eyes";
+
+/**
+ * React to an inline review comment (REST reactions endpoint, keyed by the same databaseId the
+ * reply path uses). The free calibration signal reviewers ask for on every finding — `+1` for
+ * fixed, `-1` for declined, `eyes` for needs-human. Best-effort, matching replyToReviewComment: a
+ * failed reaction must never fail the run, since the reply (not the reaction) is what stops
+ * re-triage.
+ */
+export async function reactToReviewComment(
+  repoPath: string,
+  commentId: number,
+  content: PrReactionContent,
+  signal?: AbortSignal,
+): Promise<void> {
+  const nwo = await nameWithOwner(repoPath, signal);
+  if (!nwo) return;
+  await gh(
+    repoPath,
+    ["api", "--method", "POST", `repos/${nwo}/pulls/comments/${commentId}/reactions`, "-f", `content=${content}`],
+    signal,
+  );
+}
+
 /** Mark a review thread resolved (GraphQL — thread ids come from getReviewThreads). */
 export async function resolveReviewThread(
   repoPath: string,
