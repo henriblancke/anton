@@ -1082,7 +1082,7 @@ function truncate(text: string, max: number): string {
  * throws away the only output there is. So the cap wins and the cut lands mid-line; the
  * `… [earlier output omitted]` marker already tells the reader the text is truncated.
  */
-function tailLines(text: string, max: number): string {
+export function tailLines(text: string, max: number): string {
   const trimmed = text.trim();
   if (!trimmed) return "(no output)";
   if (trimmed.length <= max) return trimmed;

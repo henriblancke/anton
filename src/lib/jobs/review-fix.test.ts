@@ -22,9 +22,11 @@ import {
   makeReviewFixHandler,
   parseThreadReport,
   resolveReviewFixModel,
+  runTestGate,
   type ThreadOutcome,
 } from "./review-fix";
 import { LABELS, type Bead } from "../beads/bd";
+import { PoisonError } from "./errors";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
 const listMock = vi.fn();
@@ -514,5 +516,52 @@ process.exit(0);
 
     const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
     expect(reply).toBeDefined();
+  });
+});
+
+// anton-h0hwc: a review-fix session already ran and already committed everything it has
+// authority over, so a red gate here can only be reproduced identically by a retry — poison it on
+// attempt 1 instead of burning three attempts (fati-87h). A genuinely transient failure (abort,
+// kill) must still retry.
+describe("runTestGate (anton-h0hwc)", () => {
+  let dir: string;
+  let logPath: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "anton-review-fix-gate-test-"));
+    logPath = join(dir, "session.log");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("resolves when every gate exits zero", async () => {
+    const settings = { testCommand: "true" };
+    await expect(
+      runTestGate(settings, dir, new AbortController().signal, logPath, 7),
+    ).resolves.toBeUndefined();
+  });
+
+  it("raises a PoisonError on the first attempt, naming the gate, its exit code and output tail", async () => {
+    const settings = { testCommand: "echo boom-output && exit 3" };
+    const err = await runTestGate(settings, dir, new AbortController().signal, logPath, 7).catch(
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(PoisonError);
+    // Opening sentence is unchanged — existing readers of this message keep working.
+    expect(err.message.startsWith("tests gate failed after review-fix for PR #7 (exit 3)")).toBe(
+      true,
+    );
+    expect(err.message).toContain("boom-output");
+  });
+
+  it("does not poison an aborted signal — the runner still retries it", async () => {
+    const ac = new AbortController();
+    const promise = runTestGate({ testCommand: "sleep 5" }, dir, ac.signal, logPath, 7);
+    ac.abort();
+    const err: unknown = await promise.catch((e) => e);
+    expect(err).not.toBeInstanceOf(PoisonError);
+    expect((err as { name?: string })?.name).toBe("AbortError");
   });
 });

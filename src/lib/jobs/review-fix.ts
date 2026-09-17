@@ -97,7 +97,8 @@ import {
   resolveVerifyGates,
   type ProjectSettings,
 } from "../projects";
-import { runVerifyGates } from "./shell";
+import { captureVerifyGates } from "./shell";
+import { tailLines } from "./review-context";
 import { findOpenRunForEpic } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
@@ -750,24 +751,38 @@ export function resolveReviewFixModel(settings: ProjectSettings, epic: Pick<Bead
   return resolveModel(settings, { jobType: "review-fix-pr", labels: epic.labels });
 }
 
+/** Cap on the gate output a poison park carries — enough to act on, not the whole log. */
+const GATE_FAILURE_OUTPUT_CHARS = 3000;
+
 /**
  * Optional verify gates before pushing (same mechanism as execution, anton-3oh8): tests +
- * operator-pinned lint/typecheck/build. Absent → no gates run. Throws on the first non-zero exit.
+ * operator-pinned lint/typecheck/build. Absent → no gates run.
+ *
+ * A red gate here poisons on the spot instead of throwing a plain (retryable) error. Unlike a
+ * ticket attempt, this fix session already ran and already committed everything it has authority
+ * over — a retry re-dispatches claude against the exact same tree and base, which can only
+ * reproduce the exact same failure (fati-87h burned three identical attempts on a deterministic
+ * gate this way). `captureVerifyGates` (not `runVerifyGates`) is called directly so the failure
+ * carries the gate's output, not just its label and exit code.
+ *
+ * Genuinely transient failures — an aborted signal, a killed process — never reach the check
+ * below: `captureVerifyGates` REJECTS for those (it never returns a red outcome for them), so they
+ * propagate as an ordinary error the runner still retries.
  */
-async function runTestGate(
+export async function runTestGate(
   settings: ProjectSettings,
   cwd: string,
   signal: AbortSignal,
   logPath: string,
   number: number,
 ): Promise<void> {
-  await runVerifyGates(
-    resolveVerifyGates(settings),
-    cwd,
-    signal,
-    logPath,
-    (gate, code) =>
-      `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
+  const outcomes = await captureVerifyGates(resolveVerifyGates(settings), cwd, signal, logPath);
+  const red = outcomes.find((o) => !o.ok);
+  if (!red) return;
+  // Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
+  throw new PoisonError(
+    `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
+      tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
   );
 }
 
