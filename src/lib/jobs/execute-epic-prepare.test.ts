@@ -201,6 +201,7 @@ beforeEach(() => {
     checkout: { state: "current" },
     dependencies: { state: "match" },
     build: { state: "current" },
+    schema: { state: "current" },
   });
   // No human work by default: nothing written, nothing adopted.
   preflightHumanTicketsMock.mockImplementation((args: { board: Bead[] }) =>
@@ -376,6 +377,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "behind", behind: 3, upstream: "origin/main" },
       dependencies: { state: "match" },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -399,6 +401,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "current" },
       dependencies: { state: "drift", packages: ["drizzle-orm", "next"] },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -417,6 +420,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "current" },
       dependencies: { state: "match" },
       build: { state: "drifted", drift: "outdated" },
+      schema: { state: "current" },
     });
 
     const error = await refusalFrom(clean);
@@ -425,6 +429,26 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
     expect(error).not.toBeInstanceOf(PoisonEpic);
     expect(error.message).toContain("moved past the build it is running");
     expect(error.message).toContain("restart anton");
+    expect(warmRunWorktreeMock).not.toHaveBeenCalled();
+  });
+
+  it("defers a new start when migrations are pending, filesystem and build clean (anton-sm1l)", async () => {
+    // The exact gap the observed failures fell through: a pull moves the code and the migration
+    // files together, so the other three halves all read current while the schema the process
+    // queries is one the code on disk has already outgrown.
+    checkSelfFreshnessMock.mockResolvedValue({
+      checkout: { state: "current" },
+      dependencies: { state: "match" },
+      build: { state: "current" },
+      schema: { state: "pending", migrations: ["0007_add_dismissed_at.sql"] },
+    });
+
+    const error = await refusalFrom(clean);
+
+    expect(error).toBeInstanceOf(StaleCheckoutError);
+    expect(error).not.toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain("pending migrations");
+    expect(error.message).toContain("0007_add_dismissed_at.sql");
     expect(warmRunWorktreeMock).not.toHaveBeenCalled();
   });
 
@@ -443,6 +467,7 @@ describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)",
       checkout: { state: "unreachable", reason: "connection refused" },
       dependencies: { state: "unknown", reason: "bun.lock could not be read" },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const prep = await prepareEpicRun(run(clean));
@@ -479,6 +504,7 @@ describe("assertPreStartPoisonIsFresh — a stale process does not park permanen
       checkout: { state: "behind", behind: 2, upstream: "origin/main" },
       dependencies: { state: "match" },
       build: { state: "current" },
+      schema: { state: "current" },
     });
 
     const error = await assertPreStartPoisonIsFresh(poison).then(
@@ -511,6 +537,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "behind", behind: 2, upstream: "origin/main" },
         dependencies: { state: "match" },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -528,6 +555,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "current" },
         dependencies: { state: "drift", packages: ["left-pad"] },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -544,6 +572,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "current" },
         dependencies: { state: "match" },
         build: { state: "drifted", drift: "outdated" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -560,6 +589,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
         checkout: { state: "current" },
         dependencies: { state: "replaced" },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -568,12 +598,50 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
     expect(message).toContain("restart anton");
   });
 
+  it("names the pending migrations and the remedy when the schema has migrations pending (anton-sm1l)", () => {
+    // The gap the other three halves cannot see: a pull moves the code and the migration files
+    // together, so this is the only half that catches a schema the code on disk has already
+    // outgrown.
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "match" },
+        build: { state: "current" },
+        schema: { state: "pending", migrations: ["0007_add_dismissed_at.sql"] },
+      },
+      ROOT,
+    );
+
+    expect(message).toContain("pending migrations");
+    expect(message).toContain("0007_add_dismissed_at.sql");
+    expect(message).toContain("apply them");
+  });
+
+  it("does not duplicate 'restart anton' when schema is the only stale half (PR #281 review)", () => {
+    // The trailing clause the message always closes with already names the restart once, for every
+    // stale half joined into it. The schema half used to name it a second time, so a schema-only
+    // deferral read "...apply them, then restart anton in /path, then restart anton." — a duplicate
+    // that no `.toContain` assertion above would have caught.
+    const message = staleCheckoutRefusal(
+      {
+        checkout: { state: "current" },
+        dependencies: { state: "match" },
+        build: { state: "current" },
+        schema: { state: "pending", migrations: ["0007_add_dismissed_at.sql"] },
+      },
+      ROOT,
+    );
+
+    expect(message?.match(/restart anton/g)).toHaveLength(1);
+  });
+
   it("names BOTH when the checkout is behind AND dependencies drifted", () => {
     const message = staleCheckoutRefusal(
       {
         checkout: { state: "behind", behind: 1, upstream: "origin/main" },
         dependencies: { state: "drift", packages: ["next"] },
         build: { state: "current" },
+        schema: { state: "current" },
       },
       ROOT,
     );
@@ -589,6 +657,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "current" },
           dependencies: { state: "match" },
           build: { state: "current" },
+          schema: { state: "current" },
         },
         ROOT,
       ),
@@ -602,6 +671,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "no-upstream" },
           dependencies: { state: "unknown", reason: "x" },
           build: { state: "current" },
+          schema: { state: "current" },
         },
         ROOT,
       ),
@@ -612,6 +682,7 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "unreachable", reason: "x" },
           dependencies: { state: "match" },
           build: { state: "current" },
+          schema: { state: "current" },
         },
         ROOT,
       ),
@@ -624,6 +695,20 @@ describe("staleCheckoutRefusal — the message names the staleness and its fix (
           checkout: { state: "current" },
           dependencies: { state: "match" },
           build: { state: "unknown", reason: "lsof: command not found" },
+          schema: { state: "current" },
+        },
+        ROOT,
+      ),
+    ).toBeUndefined();
+    // A database that could not be opened is not a database proven current — the same fail-open
+    // rule every other half here follows (anton-sm1l).
+    expect(
+      staleCheckoutRefusal(
+        {
+          checkout: { state: "current" },
+          dependencies: { state: "match" },
+          build: { state: "current" },
+          schema: { state: "unknown", reason: "anton.db could not be located" },
         },
         ROOT,
       ),
