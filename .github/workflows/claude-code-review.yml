@@ -59,6 +59,25 @@ jobs:
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
 
+      # claude-code-action always forces `enableAllProjectMcpServers: true` on the settings it
+      # writes (base-action/src/setup-claude-code-settings.ts — it overwrites this key after
+      # merging any `settings:` input we could pass, so it cannot be turned off from here). This
+      # repo's root `.mcp.json` declares the `graft` server as `command: "graft"`, a bare binary
+      # this job never installs — every review since `.claude/settings.json` picked up the graft
+      # wiring (#299) died in ~500ms with zero API cost: the CLI fails to spawn the configured MCP
+      # server before the first turn starts, and that's fatal in headless `-p` mode, not a soft
+      # warning. This review never uses `mcp__graft__*` tools (see the `allowedTools` list below)
+      # — installing the binary here exists solely so the forced auto-connect has something to
+      # connect to.
+      - name: Install graft (pinned)
+        env:
+          GRAFT_VERSION: '0.18.0'
+        run: |
+          set -euo pipefail
+          npm install -g "@nanonets/graft@${GRAFT_VERSION}"
+          graft --version | grep -qx "${GRAFT_VERSION}" || {
+            echo "::error::graft version mismatch — expected ${GRAFT_VERSION}, got: $(graft --version)"; exit 1; }
+
       - name: Run Claude Code Review
         id: claude-review
         env:
