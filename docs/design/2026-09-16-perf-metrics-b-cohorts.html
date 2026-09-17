@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>anton — Performance · Compare (Variant B)</title>
+<style>
+  :root{
+    color-scheme: light;
+    --canvas:#f6f4ef; --card:#ffffff; --fg:#1b1a16; --muted-fg:#6a675f; --subtle:#9a968d;
+    --border:#e6e2da; --raised:#efece5; --primary:#6355e0;
+    --cohort-a:#6355e0; --cohort-b:#eb6834;
+    --ok:#2c9d68; --warn:#b7801f; --crit:#d1483d;
+    --grid:#ebe7df; --radius:0.625rem;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      color-scheme: dark;
+      --canvas:#131210; --card:#1c1a17; --fg:#f3f0ea; --muted-fg:#a5a199; --subtle:#726e66;
+      --border:#2e2b27; --raised:#24221e; --primary:#8f82ff;
+      --cohort-a:#7a6ce8; --cohort-b:#d95926;
+      --ok:#4fc08a; --warn:#e6a94b; --crit:#f2685e;
+      --grid:#262421;
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --canvas:#131210; --card:#1c1a17; --fg:#f3f0ea; --muted-fg:#a5a199; --subtle:#726e66;
+    --border:#2e2b27; --raised:#24221e; --primary:#8f82ff;
+    --cohort-a:#7a6ce8; --cohort-b:#d95926;
+    --ok:#4fc08a; --warn:#e6a94b; --crit:#f2685e;
+    --grid:#262421;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--canvas); color:var(--fg);
+    font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    padding-block: env(safe-area-inset-top,0px) env(safe-area-inset-bottom,0px);
+  }
+  .wrap{max-width:1000px; margin:0 auto; padding:24px 16px 64px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+  header.page{display:flex; flex-wrap:wrap; align-items:baseline; gap:10px; margin-bottom:4px}
+  header.page h1{font-size:17px; font-weight:600; margin:0; letter-spacing:-.01em}
+  header.page .crumb{font-size:12px; color:var(--subtle)}
+  .lede{font-size:12.5px; color:var(--muted-fg); margin:0 0 18px; max-width:78ch}
+
+  /* ---- cohort pickers ---- */
+  .pickers{display:grid; grid-template-columns:1fr auto 1fr; gap:10px; align-items:stretch; margin-bottom:8px}
+  .pick{
+    background:var(--card); border:1px solid var(--border); border-radius:var(--radius);
+    padding:11px 13px; border-top:2px solid var(--pc); min-width:0;
+  }
+  .pick.a{--pc:var(--cohort-a)} .pick.b{--pc:var(--cohort-b)}
+  .pick .lbl{
+    font-size:10.5px; text-transform:uppercase; letter-spacing:.07em; color:var(--subtle);
+    display:flex; align-items:center; gap:6px; margin-bottom:6px;
+  }
+  .swatch{width:9px; height:9px; border-radius:2.5px; background:var(--pc); flex:none}
+  .pick select{
+    appearance:none; width:100%; background:var(--raised); color:var(--fg);
+    border:1px solid var(--border); border-radius:7px; padding:7px 28px 7px 9px;
+    font:500 12.5px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace; cursor:pointer;
+    background-image:linear-gradient(45deg,transparent 50%,var(--subtle) 50%),linear-gradient(135deg,var(--subtle) 50%,transparent 50%);
+    background-position:calc(100% - 15px) 52%, calc(100% - 10px) 52%;
+    background-size:5px 5px,5px 5px; background-repeat:no-repeat;
+  }
+  .pick select:focus-visible{outline:2px solid var(--primary); outline-offset:1px}
+  .pick .meta{font-size:11.5px; color:var(--muted-fg); margin-top:6px; font-variant-numeric:tabular-nums}
+  .vs{
+    display:flex; align-items:center; justify-content:center; padding:0 2px;
+    font-size:11px; color:var(--subtle); font-weight:500; letter-spacing:.06em;
+  }
+
+  .card{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); margin-bottom:8px}
+  .card > h2{
+    font-size:12.5px; font-weight:600; margin:0; padding:11px 14px;
+    border-bottom:1px solid var(--border); display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  }
+  .card > h2 .hint{font-weight:400; font-size:11.5px; color:var(--subtle)}
+  .body{padding:13px 14px}
+
+  /* ---- config diff ---- */
+  .diff{margin:0; padding:0; display:grid; gap:0}
+  .diff li{
+    list-style:none; display:grid; grid-template-columns:168px 1fr;
+    gap:12px; font-size:12px; padding:7px 0; border-bottom:1px solid var(--border); align-items:baseline;
+  }
+  .diff li:last-child{border-bottom:0}
+  .diff .k{color:var(--muted-fg); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px}
+  .diff .val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; word-break:break-word}
+  .was{color:var(--subtle); text-decoration:line-through; text-decoration-thickness:1px}
+  .arrow{color:var(--subtle); padding:0 6px}
+  .same{font-size:11.5px; color:var(--subtle); padding-top:9px}
+
+  /* ---- metric rows: paired bars, one axis per row, normalized ---- */
+  .mrow{
+    display:grid; grid-template-columns:150px 1fr 96px;
+    gap:12px; align-items:center; padding:11px 0; border-bottom:1px solid var(--border);
+  }
+  .mrow:last-child{border-bottom:0}
+  .mname .n{font-size:12.5px; font-weight:500; display:block}
+  .mname .u{font-size:11px; color:var(--subtle); display:block; margin-top:1px}
+  .bars{display:grid; gap:5px; min-width:0}
+  .bar{display:grid; grid-template-columns:1fr auto; gap:9px; align-items:center}
+  .track{position:relative; height:15px; background:var(--raised); border-radius:4px; overflow:hidden}
+  .fill{
+    position:absolute; left:0; top:0; bottom:0; border-radius:4px;
+    transition:width .3s cubic-bezier(.4,0,.2,1);
+  }
+  .fill.a{background:var(--cohort-a)} .fill.b{background:var(--cohort-b)}
+  .bar .bv{
+    font-size:11.5px; font-variant-numeric:tabular-nums; font-weight:500;
+    min-width:64px; text-align:right; color:var(--fg);
+  }
+  .delta{text-align:right; white-space:nowrap}
+  .delta .p{font-size:13.5px; font-weight:600; font-variant-numeric:tabular-nums}
+  .delta .w{font-size:10.5px; color:var(--subtle); display:block; margin-top:1px}
+  .better{color:var(--ok)} .worse{color:var(--crit)} .neutral{color:var(--muted-fg)}
+
+  /* ---- composition warning ---- */
+  .warnbox{
+    border:1px solid color-mix(in srgb, var(--warn) 34%, var(--border));
+    background:color-mix(in srgb, var(--warn) 7%, var(--card));
+    border-radius:var(--radius); padding:12px 14px; margin-bottom:8px;
+  }
+  .warnbox h3{
+    font-size:12.5px; font-weight:600; margin:0 0 7px;
+    display:flex; align-items:center; gap:7px; color:var(--warn);
+  }
+  .warnbox .ico{flex:none; width:15px; height:15px}
+  .warnbox p{margin:0 0 9px; font-size:12px; color:var(--fg); line-height:1.6; max-width:74ch}
+  .comp{display:grid; gap:7px}
+  .comprow{display:grid; grid-template-columns:104px 1fr 1fr; gap:10px; align-items:center; font-size:11.5px}
+  .comprow .cl{color:var(--muted-fg); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px}
+  .stackbar{display:flex; height:13px; border-radius:3px; overflow:hidden; background:var(--raised); gap:2px}
+  .seg-s{background:color-mix(in srgb, var(--cohort-a) 100%, transparent)}
+  .seg-m{background:color-mix(in srgb, var(--cohort-a) 62%, var(--card))}
+  .seg-l{background:color-mix(in srgb, var(--cohort-a) 30%, var(--card))}
+  .comprow.b .seg-s{background:var(--cohort-b)}
+  .comprow.b .seg-m{background:color-mix(in srgb, var(--cohort-b) 62%, var(--card))}
+  .comprow.b .seg-l{background:color-mix(in srgb, var(--cohort-b) 30%, var(--card))}
+  .complegend{display:flex; gap:12px; font-size:10.5px; color:var(--subtle); margin-top:8px; flex-wrap:wrap}
+  .complegend span{display:flex; align-items:center; gap:5px}
+  .complegend i{width:9px; height:9px; border-radius:2px; display:block}
+
+  /* ---- verdict ---- */
+  .verdict{
+    background:var(--card); border:1px solid var(--border); border-left:2px solid var(--primary);
+    border-radius:var(--radius); padding:13px 15px; margin-bottom:8px;
+  }
+  .verdict h3{font-size:12.5px; font-weight:600; margin:0 0 5px}
+  .verdict p{margin:0; font-size:12.5px; line-height:1.65; color:var(--fg); max-width:76ch}
+  .verdict em{color:var(--muted-fg); font-style:normal}
+
+  /* ---- table ---- */
+  details.tv{background:var(--card); border:1px solid var(--border); border-radius:var(--radius)}
+  details.tv summary{
+    padding:10px 14px; font-size:12.5px; font-weight:500; cursor:pointer; list-style:none;
+    display:flex; align-items:center; gap:7px;
+  }
+  details.tv summary::-webkit-details-marker{display:none}
+  details.tv summary::before{content:"▸"; color:var(--subtle); font-size:10px; transition:transform .14s}
+  details.tv[open] summary::before{transform:rotate(90deg)}
+  details.tv summary:focus-visible{outline:2px solid var(--primary); outline-offset:-2px; border-radius:var(--radius)}
+  .tscroll{overflow-x:auto; border-top:1px solid var(--border)}
+  table{border-collapse:collapse; width:100%; font-size:12px; min-width:560px}
+  th,td{text-align:right; padding:6px 12px; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; white-space:nowrap}
+  th:first-child,td:first-child{text-align:left; font-variant-numeric:normal}
+  thead th{font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--subtle); font-weight:500}
+  tbody tr:hover{background:var(--raised)}
+
+  .note{
+    margin-top:18px; font-size:12px; color:var(--muted-fg); line-height:1.65;
+    border-left:2px solid var(--border); padding:2px 0 2px 12px; max-width:78ch;
+  }
+  .note strong{color:var(--fg); font-weight:600}
+
+  .tip{
+    position:fixed; z-index:20; pointer-events:none; opacity:0;
+    background:var(--card); border:1px solid var(--border); border-radius:8px;
+    padding:7px 10px; font-size:12px; box-shadow:0 6px 24px rgb(0 0 0 / .13);
+    transition:opacity .1s; max-width:250px;
+  }
+  .tip .t-h{font-size:11px; color:var(--subtle); margin-bottom:3px}
+  .tip .t-v{font-variant-numeric:tabular-nums; font-weight:500}
+
+  @media (max-width:680px){
+    .pickers{grid-template-columns:1fr}
+    .vs{padding:2px 0}
+    .mrow{grid-template-columns:1fr; gap:7px}
+    .delta{text-align:left}
+    .diff li{grid-template-columns:1fr; gap:2px}
+    .comprow{grid-template-columns:76px 1fr 1fr; gap:7px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <h1>Compare configurations</h1>
+  <span class="crumb">anton · variant B — cohort board</span>
+</header>
+<p class="lede">
+  Pick two config fingerprints. What changed sits at the top; what it did to the numbers sits below —
+  as per-unit rates, with the cohorts' composition checked before any claim is made.
+</p>
+
+<div class="pickers">
+  <div class="pick a">
+    <div class="lbl"><span class="swatch"></span> Cohort A — baseline</div>
+    <select aria-label="Cohort A config">
+      <option selected>b7e204 · 09-03 → 09-09</option>
+      <option>a3f9c1 · 08-21 → 09-03</option>
+    </select>
+    <div class="meta">12 runs · 38 invocations · opus on review-fix</div>
+  </div>
+  <div class="vs">VS</div>
+  <div class="pick b">
+    <div class="lbl"><span class="swatch"></span> Cohort B — candidate</div>
+    <select aria-label="Cohort B config">
+      <option selected>c41a88 · 09-09 → now</option>
+      <option>b7e204 · 09-03 → 09-09</option>
+    </select>
+    <div class="meta">9 runs · 31 invocations · sonnet on review-fix</div>
+  </div>
+</div>
+
+<section class="card">
+  <h2>What actually changed <span class="hint">resolved config, not just settings.json</span></h2>
+  <div class="body">
+    <ul class="diff">
+      <li><span class="k">model · review-fix</span>
+        <span class="val"><span class="was">cc/claude-opus-5[1m]</span><span class="arrow">→</span>cc/claude-sonnet-5[1m]</span></li>
+      <li><span class="k">reviewMaxRounds</span>
+        <span class="val"><span class="was">3</span><span class="arrow">→</span>4</span></li>
+      <li><span class="k">skills/review-fix</span>
+        <span class="val"><span class="was">9c02fe41…</span><span class="arrow">→</span>d7a1b380…</span></li>
+    </ul>
+    <div class="same">17 other resolved keys identical · 4 other skill digests identical</div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Per-unit rates <span class="hint">normalized per run — totals would only tell you B ran less</span></h2>
+  <div class="body" id="metrics"></div>
+</section>
+
+<div class="warnbox">
+  <h3>
+    <svg class="ico" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 1.6 15 14H1L8 1.6Z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+      <path d="M8 6.2v3.4M8 11.6v.9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    These cohorts ran different work
+  </h3>
+  <p>
+    B skews small and carries no <code class="mono">risk:high</code> tickets. Some of the −24% token
+    gap is the ticket mix, not the model. Treat the cost win as <strong>directional, not measured</strong> —
+    the review-score drop is the more trustworthy signal, since it moved against the size advantage.
+  </p>
+  <div class="comp">
+    <div class="comprow">
+      <span class="cl">size · A</span>
+      <div class="stackbar" title="A: 25% S, 42% M, 33% L">
+        <i class="seg-s" style="width:25%"></i><i class="seg-m" style="width:42%"></i><i class="seg-l" style="width:33%"></i>
+      </div>
+      <div class="stackbar" title="A: 33% risk:high"><i class="seg-s" style="width:33%"></i><i class="seg-l" style="width:67%"></i></div>
+    </div>
+    <div class="comprow b">
+      <span class="cl">size · B</span>
+      <div class="stackbar" title="B: 67% S, 22% M, 11% L">
+        <i class="seg-s" style="width:67%"></i><i class="seg-m" style="width:22%"></i><i class="seg-l" style="width:11%"></i>
+      </div>
+      <div class="stackbar" title="B: 0% risk:high"><i class="seg-l" style="width:100%"></i></div>
+    </div>
+  </div>
+  <div class="complegend">
+    <span><i style="background:var(--cohort-a)"></i> size:S</span>
+    <span><i style="background:color-mix(in srgb,var(--cohort-a) 62%,var(--card))"></i> size:M</span>
+    <span><i style="background:color-mix(in srgb,var(--cohort-a) 30%,var(--card))"></i> size:L</span>
+    <span style="margin-left:6px; color:var(--muted-fg)">right column: share of risk:high</span>
+  </div>
+</div>
+
+<div class="verdict">
+  <h3>Read</h3>
+  <p>
+    Sonnet on review-fix is <strong>cheaper and faster</strong>, and <strong>costs about a point of
+    review score</strong> — at a 4th review round it still doesn't recover. <em>n=9 vs 12 with a skewed
+    mix: enough to act on, not enough to settle. To confirm, re-run with the size filter pinned to
+    </em><code class="mono">size:M</code><em>.</em>
+  </p>
+</div>
+
+<details class="tv">
+  <summary>Table view — both cohorts, every measure</summary>
+  <div class="tscroll">
+    <table>
+      <thead><tr>
+        <th scope="col">Measure</th><th scope="col">A · b7e204</th><th scope="col">B · c41a88</th>
+        <th scope="col">Δ</th><th scope="col">A n</th><th scope="col">B n</th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</details>
+
+<p class="note">
+  <strong>Why this shape.</strong> A cohort board only earns trust if it can say "don't trust this."
+  The composition block is the load-bearing part — without it, a fingerprint comparison is a
+  confident-looking way to credit the model for a difference the ticket mix produced. Every figure
+  here is a per-unit rate for the same reason, and the read at the bottom names its own weakness
+  rather than leaving you to infer it.
+</p>
+
+<div class="tip" id="tip" role="status" aria-live="polite"></div>
+
+<script>
+/* per-unit rates only — totals are excluded on purpose, see the note */
+const METRICS = [
+  { n:"Tokens / run",      u:"input + output",         a:241000, b:184000, good:-1,
+    fmt:v=>(v/1000).toFixed(0)+"k", tfmt:v=>Math.round(v).toLocaleString()+" tokens" },
+  { n:"Cost / run",        u:"derived from tokens",    a:3.12,   b:1.41,   good:-1,
+    fmt:v=>"$"+v.toFixed(2), tfmt:v=>"$"+v.toFixed(2)+" per run" },
+  { n:"Duration / run",    u:"wall clock",             a:1180,   b:702,    good:-1,
+    fmt:v=>Math.floor(v/60)+"m", tfmt:v=>Math.floor(v/60)+"m "+Math.round(v%60)+"s" },
+  { n:"Review score",      u:"self-review, 0–10",      a:8.1,    b:7.2,    good:+1,
+    fmt:v=>v.toFixed(1), tfmt:v=>v.toFixed(1)+" / 10" },
+  { n:"Failure rate",      u:"runs ending failed",     a:0.083,  b:0.222,  good:-1,
+    fmt:v=>(v*100).toFixed(0)+"%", tfmt:v=>(v*100).toFixed(1)+"% of runs" },
+  { n:"Review rounds / run", u:"fix cycles before clean", a:1.4, b:2.1,    good:-1,
+    fmt:v=>v.toFixed(1), tfmt:v=>v.toFixed(1)+" rounds" },
+];
+
+const host = document.getElementById("metrics");
+const tip  = document.getElementById("tip");
+
+METRICS.forEach(m => {
+  const max = Math.max(m.a, m.b);
+  const pct = ((m.b - m.a) / m.a) * 100;
+  const cls = Math.abs(pct) < 2 ? "neutral" : (Math.sign(pct) === m.good ? "better" : "worse");
+
+  const row = document.createElement("div");
+  row.className = "mrow";
+  row.innerHTML = `
+    <div class="mname"><span class="n">${m.n}</span><span class="u">${m.u}</span></div>
+    <div class="bars">
+      <div class="bar" data-c="A" data-v="${m.a}">
+        <div class="track"><div class="fill a" style="width:${(m.a/max*100).toFixed(1)}%"></div></div>
+        <span class="bv">${m.fmt(m.a)}</span>
+      </div>
+      <div class="bar" data-c="B" data-v="${m.b}">
+        <div class="track"><div class="fill b" style="width:${(m.b/max*100).toFixed(1)}%"></div></div>
+        <span class="bv">${m.fmt(m.b)}</span>
+      </div>
+    </div>
+    <div class="delta">
+      <span class="p ${cls}">${pct>0?"+":""}${pct.toFixed(0)}%</span>
+      <span class="w">${cls==="better"?"B better":cls==="worse"?"B worse":"no change"}</span>
+    </div>`;
+
+  /* per-mark hover; hit target is the whole bar row, not the 15px fill */
+  row.querySelectorAll(".bar").forEach(bar => {
+    bar.style.cursor = "default";
+    bar.addEventListener("pointermove", e => {
+      const c = bar.dataset.c;
+      tip.innerHTML =
+        `<div class="t-h">Cohort ${c} · ${c === "A" ? "b7e204" : "c41a88"}</div>` +
+        `<div class="t-v">${m.n}: ${m.tfmt(+bar.dataset.v)}</div>`;
+      tip.style.opacity = 1;
+      const tw = tip.offsetWidth || 200;
+      tip.style.left = Math.min(window.innerWidth - tw - 10, e.clientX + 14) + "px";
+      tip.style.top  = Math.max(8, e.clientY - 46) + "px";
+    });
+    bar.addEventListener("pointerleave", () => tip.style.opacity = 0);
+  });
+
+  host.appendChild(row);
+});
+
+/* table view mirrors the chart exactly */
+document.getElementById("tbody").innerHTML = METRICS.map(m => {
+  const pct = ((m.b - m.a) / m.a) * 100;
+  return `<tr>
+    <td>${m.n}</td><td>${m.fmt(m.a)}</td><td>${m.fmt(m.b)}</td>
+    <td>${pct>0?"+":""}${pct.toFixed(0)}%</td><td>12</td><td>9</td></tr>`;
+}).join("");
+</script>
+</body>
+</html>

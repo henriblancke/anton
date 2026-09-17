@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>anton — Performance · Timeline (Variant A)</title>
+<style>
+  :root{
+    color-scheme: light;
+    --canvas:#f6f4ef; --card:#ffffff; --fg:#1b1a16; --muted-fg:#6a675f; --subtle:#9a968d;
+    --border:#e6e2da; --raised:#efece5; --primary:#6355e0;
+    --series-1:#6355e0; --series-2:#eb6834;
+    --ok:#2c9d68; --warn:#b7801f; --crit:#d1483d;
+    --grid:#ebe7df; --radius:0.625rem;
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      color-scheme: dark;
+      --canvas:#131210; --card:#1c1a17; --fg:#f3f0ea; --muted-fg:#a5a199; --subtle:#726e66;
+      --border:#2e2b27; --raised:#24221e; --primary:#8f82ff;
+      --series-1:#7a6ce8; --series-2:#d95926;
+      --ok:#4fc08a; --warn:#e6a94b; --crit:#f2685e;
+      --grid:#262421;
+    }
+  }
+  :root[data-theme="dark"]{
+    color-scheme: dark;
+    --canvas:#131210; --card:#1c1a17; --fg:#f3f0ea; --muted-fg:#a5a199; --subtle:#726e66;
+    --border:#2e2b27; --raised:#24221e; --primary:#8f82ff;
+    --series-1:#7a6ce8; --series-2:#d95926;
+    --ok:#4fc08a; --warn:#e6a94b; --crit:#f2685e;
+    --grid:#262421;
+  }
+
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--canvas); color:var(--fg);
+    font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+    padding-block: env(safe-area-inset-top,0px) env(safe-area-inset-bottom,0px);
+  }
+  .wrap{max-width:1120px; margin:0 auto; padding:24px 16px 64px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+
+  /* ---- header ---- */
+  header.page{display:flex; flex-wrap:wrap; align-items:baseline; gap:10px; margin-bottom:4px}
+  header.page h1{font-size:17px; font-weight:600; margin:0; letter-spacing:-.01em}
+  header.page .crumb{font-size:12px; color:var(--subtle)}
+  .lede{font-size:12.5px; color:var(--muted-fg); margin:0 0 18px; max-width:78ch}
+
+  /* ---- one filter row above everything it scopes ---- */
+  .filters{
+    display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+    padding:10px 12px; background:var(--card); border:1px solid var(--border);
+    border-radius:var(--radius); margin-bottom:8px;
+  }
+  .seg{display:flex; background:var(--raised); border-radius:7px; padding:2px}
+  .seg button{
+    appearance:none; border:0; background:transparent; color:var(--muted-fg);
+    font:500 12px/1 inherit; padding:6px 11px; border-radius:5px; cursor:pointer;
+    transition:background .14s, color .14s;
+  }
+  .seg button[aria-pressed="true"]{background:var(--card); color:var(--fg); box-shadow:0 0 0 1px var(--border)}
+  .seg button:focus-visible{outline:2px solid var(--primary); outline-offset:1px}
+  .flabel{font-size:11px; color:var(--subtle); text-transform:uppercase; letter-spacing:.06em; margin-right:2px}
+  .spacer{flex:1 1 auto; min-width:8px}
+
+  /* ---- the chart stack ---- */
+  .stack{background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden}
+  .stack-head{
+    display:flex; align-items:center; gap:8px; padding:11px 14px;
+    border-bottom:1px solid var(--border);
+  }
+  .stack-head h2{font-size:13px; font-weight:600; margin:0}
+  .stack-head .hint{font-size:11.5px; color:var(--subtle)}
+
+  .row{
+    display:grid; grid-template-columns:132px 1fr 116px;
+    align-items:center; gap:12px;
+    padding:9px 14px; border-bottom:1px solid var(--border);
+  }
+  .row:last-of-type{border-bottom:0}
+  .row .name{min-width:0}
+  .row .name .m{font-size:12.5px; font-weight:500; display:block}
+  .row .name .u{font-size:11px; color:var(--subtle); display:block; margin-top:1px}
+  .plot{position:relative; min-width:0}
+  .plot svg{display:block; width:100%; height:44px; overflow:visible}
+  .readout{text-align:right; white-space:nowrap}
+  .readout .v{font-size:14px; font-weight:600; font-variant-numeric:tabular-nums}
+  .readout .d{font-size:11.5px; font-variant-numeric:tabular-nums; margin-top:1px; display:block}
+  .up{color:var(--ok)} .down{color:var(--crit)} .flat{color:var(--muted-fg)}
+
+  /* axis band lives INSIDE the container so nothing clips */
+  .axis{
+    display:grid; grid-template-columns:132px 1fr 116px; gap:12px;
+    padding:2px 14px 11px; border-top:1px solid var(--border);
+  }
+  .axis .ticks{display:flex; justify-content:space-between; font-size:10.5px; color:var(--subtle); font-variant-numeric:tabular-nums}
+
+  /* ---- config annotation rail ---- */
+  .rail{
+    display:grid; grid-template-columns:132px 1fr 116px; gap:12px;
+    padding:10px 14px 4px;
+  }
+  .railtrack{position:relative; height:22px}
+  .cfgmark{
+    position:absolute; top:0; transform:translateX(-50%);
+    appearance:none; border:0; background:transparent; padding:0; margin:0; font:inherit;
+    display:flex; flex-direction:column; align-items:center; gap:3px; cursor:pointer;
+  }
+  .cfgmark .dot{
+    width:9px; height:9px; border-radius:50%;
+    background:var(--card); border:2px solid var(--muted-fg);
+  }
+  .cfgmark[data-active="true"] .dot{border-color:var(--primary); background:var(--primary)}
+  .cfgmark .tag{
+    font:500 10.5px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    color:var(--muted-fg); white-space:nowrap;
+  }
+  .cfgmark[data-active="true"] .tag{color:var(--fg)}
+  .cfgmark:focus-visible{outline:2px solid var(--primary); outline-offset:3px; border-radius:4px}
+
+  /* ---- crosshair + tooltip ---- */
+  .xhair{position:absolute; inset:0; pointer-events:none}
+  .xhair line{stroke:var(--subtle); stroke-width:1; opacity:0}
+  .tip{
+    position:fixed; z-index:20; pointer-events:none; opacity:0;
+    background:var(--card); border:1px solid var(--border); border-radius:8px;
+    padding:8px 10px; font-size:12px; box-shadow:0 6px 24px rgb(0 0 0 / .13);
+    min-width:170px; transition:opacity .1s;
+  }
+  .tip .t-d{font-size:11px; color:var(--subtle); margin-bottom:5px; font-variant-numeric:tabular-nums}
+  .tip .t-r{display:flex; justify-content:space-between; gap:14px; padding:1.5px 0}
+  .tip .t-r span:first-child{color:var(--muted-fg)}
+  .tip .t-r span:last-child{font-variant-numeric:tabular-nums; font-weight:500}
+  .tip .t-cfg{margin-top:6px; padding-top:6px; border-top:1px solid var(--border); font-size:11px; color:var(--muted-fg)}
+
+  /* ---- config detail panel ---- */
+  .panel{
+    margin-top:8px; background:var(--card); border:1px solid var(--border);
+    border-radius:var(--radius); padding:13px 14px;
+  }
+  .panel h3{font-size:12.5px; font-weight:600; margin:0 0 3px; display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+  .fp{
+    font:500 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    background:var(--raised); border:1px solid var(--border); border-radius:5px; padding:3px 6px;
+  }
+  .panel .when{font-size:11.5px; color:var(--subtle); font-weight:400}
+  .diff{margin:9px 0 0; display:grid; gap:4px}
+  .diff li{
+    list-style:none; display:grid; grid-template-columns:150px 1fr;
+    gap:10px; font-size:12px; padding:4px 0; border-top:1px solid var(--border);
+  }
+  .diff li .k{color:var(--muted-fg); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px}
+  .diff li .val{font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11.5px; word-break:break-word}
+  .was{color:var(--subtle); text-decoration:line-through; text-decoration-thickness:1px}
+  .arrow{color:var(--subtle); padding:0 5px}
+
+  /* ---- table view ---- */
+  details.tv{margin-top:8px; background:var(--card); border:1px solid var(--border); border-radius:var(--radius)}
+  details.tv summary{
+    padding:10px 14px; font-size:12.5px; font-weight:500; cursor:pointer; list-style:none;
+    display:flex; align-items:center; gap:7px;
+  }
+  details.tv summary::-webkit-details-marker{display:none}
+  details.tv summary::before{content:"▸"; color:var(--subtle); font-size:10px; transition:transform .14s}
+  details.tv[open] summary::before{transform:rotate(90deg)}
+  details.tv summary:focus-visible{outline:2px solid var(--primary); outline-offset:-2px; border-radius:var(--radius)}
+  .tscroll{overflow-x:auto; border-top:1px solid var(--border)}
+  table{border-collapse:collapse; width:100%; font-size:12px; min-width:620px}
+  th,td{text-align:right; padding:6px 12px; border-bottom:1px solid var(--border); font-variant-numeric:tabular-nums; white-space:nowrap}
+  th:first-child,td:first-child{text-align:left; font-variant-numeric:normal}
+  thead th{font-size:10.5px; text-transform:uppercase; letter-spacing:.05em; color:var(--subtle); font-weight:500; position:sticky; top:0; background:var(--card)}
+  tbody tr:hover{background:var(--raised)}
+  tr[data-cfgrow="true"] td{border-top:1.5px solid var(--primary)}
+
+  .note{
+    margin-top:18px; font-size:12px; color:var(--muted-fg); line-height:1.65;
+    border-left:2px solid var(--border); padding:2px 0 2px 12px; max-width:78ch;
+  }
+  .note strong{color:var(--fg); font-weight:600}
+  @media (max-width:640px){
+    .row,.axis,.rail{grid-template-columns:96px 1fr 62px; gap:8px; padding-inline:10px}
+    .readout .v{font-size:13px}
+    .readout .d{font-size:11px}
+    /* the fingerprint is already on the rail and in the panel — drop the echo rather than clip it */
+    .readout .since{display:none}
+    .diff li{grid-template-columns:1fr}
+    .axis .ticks span:nth-child(even){display:none}
+    .cfgmark .tag{font-size:9.5px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="page">
+  <h1>Performance</h1>
+  <span class="crumb">anton · variant A — metric-first timeline</span>
+</header>
+<p class="lede">
+  Five metrics, one shared time axis. Every config change is a marker across all five rows, so you
+  see what a change moved — and what it moved in the wrong direction — in one pass.
+</p>
+
+<!-- one filter row, scopes everything below -->
+<div class="filters">
+  <span class="flabel">Window</span>
+  <div class="seg" role="group" aria-label="Time window">
+    <button type="button" aria-pressed="false">7d</button>
+    <button type="button" aria-pressed="true">21d</button>
+    <button type="button" aria-pressed="false">90d</button>
+  </div>
+  <span class="flabel" style="margin-left:6px">Step</span>
+  <div class="seg" role="group" aria-label="Formula step">
+    <button type="button" aria-pressed="true">all</button>
+    <button type="button" aria-pressed="false">implement</button>
+    <button type="button" aria-pressed="false">review</button>
+    <button type="button" aria-pressed="false">review-fix</button>
+  </div>
+  <span class="spacer"></span>
+  <span class="mono" style="font-size:11px;color:var(--subtle)">n = 1,036 invocations · 94 runs</span>
+</div>
+
+<section class="stack" aria-label="Metrics over time">
+  <div class="stack-head">
+    <h2>Per-run rates</h2>
+    <span class="hint">normalized per run — totals move with volume, rates move with configuration</span>
+  </div>
+
+  <!-- config annotation rail: aligned to the same x-scale as every plot below -->
+  <div class="rail">
+    <div style="font-size:10.5px;color:var(--subtle);text-transform:uppercase;letter-spacing:.06em">Config</div>
+    <div class="railtrack" id="rail"></div>
+    <div></div>
+  </div>
+
+  <div id="rows"></div>
+
+  <div class="axis">
+    <div></div>
+    <div class="ticks" id="ticks"></div>
+    <div></div>
+  </div>
+</section>
+
+<div class="panel" id="panel"></div>
+
+<details class="tv">
+  <summary>Table view — every value, WCAG-clean</summary>
+  <div class="tscroll">
+    <table id="tbl">
+      <thead><tr>
+        <th scope="col">Date</th><th scope="col">Runs</th><th scope="col">Tokens / run</th>
+        <th scope="col">$ / run</th><th scope="col">Duration / run</th>
+        <th scope="col">Failure rate</th><th scope="col">Review score</th><th scope="col">Config</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</details>
+
+<p class="note">
+  <strong>Why this shape.</strong> The question isn't "what did I spend" — <code>/spend</code> already
+  answers that. It's "did my change help, and what did it cost elsewhere?" A shared x-axis with one
+  annotation rail makes the tradeoff visible: on 09-09 the model swap cut tokens per run by a third,
+  and the failure rate climbed with it. Two rows apart, same vertical line. That pairing is invisible
+  on any single-metric chart.
+</p>
+
+<div class="tip" id="tip" role="status" aria-live="polite"></div>
+
+<script>
+/* ---------------------------------------------------------------
+   Mock series shaped from the real anton.db distribution:
+   ~6 models across steps, 50k–450k tokens/invocation, 300–2400s.
+   --------------------------------------------------------------- */
+const DAYS = [
+  /* d, runs, tokens/run, $/run, sec/run, failRate, score */
+  ["08-27", 4, 268000, 3.42, 1180, 0.08, 8.4],
+  ["08-28", 6, 274000, 3.51, 1240, 0.11, 8.2],
+  ["08-29", 3, 259000, 3.30, 1120, 0.06, 8.6],
+  ["08-30", 5, 281000, 3.60, 1290, 0.13, 8.1],
+  ["08-31", 2, 263000, 3.36, 1150, 0.09, 8.5],
+  ["09-01", 7, 277000, 3.55, 1260, 0.10, 8.3],
+  ["09-02", 6, 288000, 3.69, 1330, 0.14, 8.0],
+  ["09-03", 5, 246000, 3.15, 1080, 0.07, 8.7],   /* cfg b7e204 → prompt tighten */
+  ["09-04", 8, 231000, 2.96, 1010, 0.06, 8.8],
+  ["09-05", 6, 226000, 2.89,  985, 0.05, 8.9],
+  ["09-06", 4, 234000, 3.00, 1030, 0.08, 8.6],
+  ["09-07", 7, 229000, 2.93, 1000, 0.06, 8.8],
+  ["09-08", 5, 223000, 2.85,  970, 0.05, 8.9],
+  ["09-09", 9, 158000, 1.31,  720, 0.14, 7.9],   /* cfg c41a88 → opus→sonnet on review-fix */
+  ["09-10", 11, 149000, 1.24,  690, 0.19, 7.4],
+  ["09-11", 8, 152000, 1.26,  705, 0.17, 7.6],
+  ["09-12", 10, 146000, 1.21,  680, 0.21, 7.2],
+  ["09-13", 12, 151000, 1.25,  700, 0.18, 7.5],
+  ["09-14", 9, 147000, 1.22,  685, 0.20, 7.3],
+  ["09-15", 13, 150000, 1.24,  695, 0.19, 7.4],
+  ["09-16", 10, 148000, 1.23,  688, 0.18, 7.5],
+];
+
+const CONFIGS = [
+  { i:0,  fp:"a3f9c1", when:"active since 08-21",
+    diff:[["model (implement)","claude-opus-5","claude-opus-5"]], head:true,
+    note:"Baseline — no change recorded in window." },
+  { i:7,  fp:"b7e204", when:"09-03 · 14:22",
+    diff:[
+      ["skills/review","16ad2066…","4e91bb07…"],
+      ["reviewMinScore","7","8"],
+    ],
+    note:"Review contract tightened; score floor raised." },
+  { i:13, fp:"c41a88", when:"09-09 · 09:41",
+    diff:[
+      ["model (review-fix)","cc/claude-opus-5[1m]","cc/claude-sonnet-5[1m]"],
+      ["reviewMaxRounds","3","4"],
+    ],
+    note:"Model swap on the review-fix step, rounds raised to compensate." },
+];
+
+/* metric definitions — `good` says which direction is an improvement */
+const METRICS = [
+  { key:2, name:"Tokens / run",   unit:"input + output",       good:-1, fmt:v=>(v/1000).toFixed(0)+"k",   tfmt:v=>Math.round(v).toLocaleString()+" tok" },
+  { key:3, name:"Cost / run",     unit:"derived from tokens",  good:-1, fmt:v=>"$"+v.toFixed(2),          tfmt:v=>"$"+v.toFixed(2) },
+  { key:4, name:"Duration / run", unit:"wall clock",           good:-1, fmt:v=>Math.round(v/60)+"m",      tfmt:v=>Math.floor(v/60)+"m "+Math.round(v%60)+"s" },
+  { key:5, name:"Failure rate",   unit:"runs ending failed",   good:-1, fmt:v=>(v*100).toFixed(0)+"%",    tfmt:v=>(v*100).toFixed(1)+"%" },
+  { key:6, name:"Review score",   unit:"self-review, 0–10",    good:+1, fmt:v=>v.toFixed(1),              tfmt:v=>v.toFixed(1)+" / 10" },
+];
+
+const W = 1000, H = 44, PAD = 3;            // viewBox units; scales to container width
+const xAt = i => PAD + (i/(DAYS.length-1)) * (W - PAD*2);
+
+/* ---------- build the metric rows ---------- */
+const rowsEl = document.getElementById("rows");
+METRICS.forEach((m, mi) => {
+  const vals = DAYS.map(d => d[m.key]);
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const span = (hi - lo) || 1;
+  const yAt = v => H - 6 - ((v - lo)/span) * (H - 14);
+  const pts = vals.map((v,i) => [xAt(i), yAt(v)]);
+  const d = pts.map((p,i) => (i?"L":"M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+  const area = d + ` L ${xAt(DAYS.length-1).toFixed(1)} ${H} L ${PAD} ${H} Z`;
+
+  /* delta measured from the last config change, not from the window edge */
+  const cut = CONFIGS[CONFIGS.length-1].i;
+  const before = vals.slice(Math.max(0,cut-6), cut).reduce((a,b)=>a+b,0) / Math.min(6,cut);
+  const after  = vals.slice(cut).reduce((a,b)=>a+b,0) / (vals.length-cut);
+  const pct = ((after-before)/before)*100;
+  const dir = Math.abs(pct) < 1.5 ? "flat" : (Math.sign(pct) === m.good ? "up" : "down");
+
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML = `
+    <div class="name"><span class="m">${m.name}</span><span class="u">${m.unit}</span></div>
+    <div class="plot" data-mi="${mi}">
+      <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+           aria-label="${m.name} over 21 days, ${m.fmt(vals[0])} to ${m.fmt(vals.at(-1))}">
+        <line x1="0" y1="${H-.5}" x2="${W}" y2="${H-.5}" stroke="var(--grid)" stroke-width="1" vector-effect="non-scaling-stroke"/>
+        ${CONFIGS.filter(c=>!c.head).map(c=>`
+          <line x1="${xAt(c.i).toFixed(1)}" y1="0" x2="${xAt(c.i).toFixed(1)}" y2="${H}"
+                stroke="var(--subtle)" stroke-width="1" opacity=".42" vector-effect="non-scaling-stroke"/>`).join("")}
+        <path d="${area}" fill="var(--series-1)" opacity=".10"/>
+        <path d="${d}" fill="none" stroke="var(--series-1)" stroke-width="2"
+              stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+        <circle class="dot" r="0" fill="var(--series-1)" stroke="var(--card)" stroke-width="2"
+                vector-effect="non-scaling-stroke" opacity="0"/>
+      </svg>
+      <svg class="xhair" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">
+        <line y1="0" y2="${H}" vector-effect="non-scaling-stroke"/>
+      </svg>
+    </div>
+    <div class="readout">
+      <span class="v">${m.fmt(vals.at(-1))}</span>
+      <span class="d ${dir}">${pct>0?"+":""}${pct.toFixed(0)}%<span class="since"> since c41a88</span></span>
+    </div>`;
+  rowsEl.appendChild(row);
+});
+
+/* ---------- x-axis ticks ---------- */
+document.getElementById("ticks").innerHTML =
+  [0, 5, 10, 15, DAYS.length-1].map(i => `<span>${DAYS[i][0]}</span>`).join("");
+
+/* ---------- config rail ---------- */
+const rail = document.getElementById("rail");
+CONFIGS.filter(c=>!c.head).forEach(c => {
+  const el = document.createElement("button");
+  el.className = "cfgmark";
+  el.type = "button";
+  el.style.left = ((xAt(c.i)/W)*100).toFixed(2) + "%";
+  el.dataset.fp = c.fp;
+  el.setAttribute("aria-label", `Config ${c.fp}, ${c.when}`);
+  el.innerHTML = `<span class="dot"></span><span class="tag">${c.fp}</span>`;
+  el.onclick = () => showConfig(c.fp);
+  rail.appendChild(el);
+});
+
+function showConfig(fp){
+  const c = CONFIGS.find(x=>x.fp===fp);
+  document.querySelectorAll(".cfgmark").forEach(m =>
+    m.dataset.active = String(m.dataset.fp === fp));
+  document.getElementById("panel").innerHTML = `
+    <h3><span class="fp">${c.fp}</span> <span class="when">${c.when}</span></h3>
+    <div style="font-size:12px;color:var(--muted-fg)">${c.note}</div>
+    <ul class="diff">
+      ${c.diff.map(([k,was,now]) => `
+        <li><span class="k">${k}</span>
+        <span class="val"><span class="was">${was}</span><span class="arrow">→</span>${now}</span></li>`).join("")}
+    </ul>`;
+}
+showConfig("c41a88");
+
+/* ---------- table view ---------- */
+document.querySelector("#tbl tbody").innerHTML = DAYS.map((d,i) => {
+  const c = CONFIGS.find(x=>x.i===i && !x.head);
+  return `<tr${c?' data-cfgrow="true"':''}>
+    <td>${d[0]}</td><td>${d[1]}</td><td>${Math.round(d[2]).toLocaleString()}</td>
+    <td>$${d[3].toFixed(2)}</td><td>${Math.round(d[4]/60)}m</td>
+    <td>${(d[5]*100).toFixed(0)}%</td><td>${d[6].toFixed(1)}</td>
+    <td class="mono" style="font-size:11px">${c ? c.fp : ""}</td></tr>`;
+}).join("");
+
+/* ---------- shared crosshair + tooltip ---------- */
+const tip = document.getElementById("tip");
+const plots = [...document.querySelectorAll(".plot")];
+
+function moveTo(clientX, clientY, hostRect){
+  const t = Math.max(0, Math.min(1, (clientX - hostRect.left) / hostRect.width));
+  const i = Math.round(t * (DAYS.length - 1));
+  const x = xAt(i);
+
+  plots.forEach(p => {
+    const svg = p.querySelector("svg:not(.xhair)");
+    const mi  = +p.dataset.mi;
+    const v   = DAYS[i][METRICS[mi].key];
+    const vals = DAYS.map(d=>d[METRICS[mi].key]);
+    const lo = Math.min(...vals), hi = Math.max(...vals), span = (hi-lo)||1;
+    const y = H - 6 - ((v - lo)/span) * (H - 14);
+    const dot = svg.querySelector(".dot");
+    dot.setAttribute("cx", x); dot.setAttribute("cy", y);
+    dot.setAttribute("r", 4); dot.setAttribute("opacity", 1);
+    const xh = p.querySelector(".xhair line");
+    xh.setAttribute("x1", x); xh.setAttribute("x2", x);
+    xh.style.opacity = ".5";
+  });
+
+  const cfg = CONFIGS.find(c => c.i === i && !c.head);
+  tip.innerHTML =
+    `<div class="t-d">${DAYS[i][0]} · ${DAYS[i][1]} runs</div>` +
+    METRICS.map(m => `<div class="t-r"><span>${m.name}</span><span>${m.tfmt(DAYS[i][m.key])}</span></div>`).join("") +
+    (cfg ? `<div class="t-cfg">▸ config → <strong>${cfg.fp}</strong></div>` : "");
+  tip.style.opacity = 1;
+  const tw = tip.offsetWidth || 190;
+  tip.style.left = Math.min(window.innerWidth - tw - 10, clientX + 14) + "px";
+  tip.style.top  = Math.min(window.innerHeight - 190, clientY - 10) + "px";
+}
+
+function clear(){
+  tip.style.opacity = 0;
+  plots.forEach(p => {
+    p.querySelector(".dot").setAttribute("opacity", 0);
+    p.querySelector(".xhair line").style.opacity = 0;
+  });
+}
+
+/* hover anywhere in the stack drives every row (hit target = the whole row band) */
+document.querySelectorAll(".row").forEach(row => {
+  const host = row.querySelector(".plot");
+  row.addEventListener("pointermove", e => moveTo(e.clientX, e.clientY, host.getBoundingClientRect()));
+  row.addEventListener("pointerleave", clear);
+});
+
+/* keyboard path: focus the stack, arrow through days — same readout as hover */
+let kbi = DAYS.length - 1;
+const stack = document.querySelector(".stack");
+stack.tabIndex = 0;
+stack.setAttribute("aria-label", "Metric timeline. Use left and right arrow keys to step through days.");
+stack.addEventListener("keydown", e => {
+  if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+  e.preventDefault();
+  kbi = Math.max(0, Math.min(DAYS.length-1, kbi + (e.key === "ArrowRight" ? 1 : -1)));
+  const host = plots[0].getBoundingClientRect();
+  moveTo(host.left + (kbi/(DAYS.length-1))*host.width, host.top + 40, host);
+});
+stack.addEventListener("blur", clear);
+
+/* segmented controls are inert in the mock — keep the pressed state honest */
+document.querySelectorAll(".seg").forEach(seg =>
+  seg.addEventListener("click", e => {
+    if (e.target.tagName !== "BUTTON") return;
+    [...seg.children].forEach(b => b.setAttribute("aria-pressed", String(b === e.target)));
+  }));
+</script>
+</body>
+</html>
