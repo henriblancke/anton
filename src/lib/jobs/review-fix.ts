@@ -650,6 +650,16 @@ async function runFixSession(args: {
       );
     }
 
+    // premergeBase left any base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for
+    // this same session to resolve alongside the review feedback. Commit that resolution NOW, before
+    // the gates run: a red gate below still throws and parks the branch, but the merge itself is
+    // already landed rather than sitting as an uncommitted resolution the next re-run's fresh
+    // worktree would simply discard (anton-vtex7). Nothing is pushed here — publication stays behind
+    // the gates. No conflicts to resolve → nothing to commit yet → this run is unchanged.
+    if (conflicts.length > 0) {
+      await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal);
+    }
+
     await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
 
     const pushed = await commitAndPushFix(
@@ -723,12 +733,13 @@ async function runTestGate(
 }
 
 /**
- * Commit claude's fix and push the branch. Pushes if this run committed OR a prior attempt left
- * commits unpushed (e.g. a push failed after committing, then the retry's claude produced no new
- * diff). Otherwise there is genuinely nothing to send — a clean no-op, not a silent skip of
- * pending work. Returns whether anything was pushed.
+ * Stage whatever is in the worktree and commit it, with the recovery a commit timeout needs. Split
+ * out of `commitAndPushFix` (anton-vtex7) so `runFixSession` can land a resolved base merge BEFORE
+ * the verify gates run, while the push itself still waits behind them. Returns whether a commit
+ * exists to push (this call made one, or the tree had nothing new to add) and the hooksPath
+ * resolved for it, which `commitAndPushFix` reuses for the push.
  */
-async function commitAndPushFix(
+async function commitFix(
   repo: string,
   worktreePath: string,
   epicId: string,
@@ -736,7 +747,7 @@ async function commitAndPushFix(
   number: number,
   settings: ProjectSettings,
   signal: AbortSignal,
-): Promise<boolean> {
+): Promise<{ committed: boolean; hooksPath: string | undefined }> {
   // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
   // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
   // INDEX, and claude's fix session may have checked a hooks-path submodule out at a new commit
@@ -778,6 +789,34 @@ async function commitAndPushFix(
     }
     committed = true;
   }
+  return { committed, hooksPath };
+}
+
+/**
+ * Commit claude's fix and push the branch. Pushes if this run committed (here, or already via the
+ * pre-gate `commitFix` call in `runFixSession` for a conflicted PR) OR a prior attempt left commits
+ * unpushed (e.g. a push failed after committing, then the retry's claude produced no new diff).
+ * Otherwise there is genuinely nothing to send — a clean no-op, not a silent skip of pending work.
+ * Returns whether anything was pushed.
+ */
+async function commitAndPushFix(
+  repo: string,
+  worktreePath: string,
+  epicId: string,
+  branch: string,
+  number: number,
+  settings: ProjectSettings,
+  signal: AbortSignal,
+): Promise<boolean> {
+  const { committed, hooksPath } = await commitFix(
+    repo,
+    worktreePath,
+    epicId,
+    branch,
+    number,
+    settings,
+    signal,
+  );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
   // pre-push hook that inspects the working tree must see the branch actually being pushed. The
