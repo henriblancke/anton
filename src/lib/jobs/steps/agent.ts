@@ -7,6 +7,7 @@ import { beads, labelValueOf, type Bead } from "../../beads/bd";
 import { loadAgentPrompt } from "../../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
 import { readPreservedCommitFor } from "../../git/ops";
+import { getRunGateFailure } from "../../runs";
 import type { StepContext } from "./context";
 import { dispatchClaude } from "./dispatch";
 import { stepTaskBlock, ticketPrompt, type TicketPreserved } from "./prompts";
@@ -21,11 +22,19 @@ import type { StepResult, StepResultWith } from "./result";
  * The bead's notes are re-read at dispatch, not taken from the run's opening snapshot: an operator's
  * steer (anton-bfy4) can land while an earlier ticket is still running. The BRANCH is read here too
  * (anton-16pq) — a resume whose earlier attempt timed out is dispatched onto that attempt's
- * preserved work, and is told so rather than left to rediscover it.
+ * preserved work, and is told so rather than left to rediscover it. And the RUN's recorded gate
+ * failure (anton-vynb8 / anton-pm3kv) is read here too, for the same reason: a resume dispatched
+ * onto a red gate is told so rather than left to start blind.
  */
 export async function implementStep(ctx: StepContext): Promise<StepResultWith<"sessionIds">> {
   const sessionIds: string[] = [];
   let last: StepResult = { ok: true };
+  // Once per call, not once per ticket: the record is keyed by run id alone (getRunGateFailure), so
+  // asking it per ticket would just repeat the same read. Read here rather than carried on
+  // StepContext so a multi-ticket walk sees a gate cleared mid-run by an earlier ticket's own
+  // passing verify (step:verify's `lastGateFailure: null`) instead of the value the run STARTED
+  // with.
+  const gateFailure = await getRunGateFailure(ctx.db, ctx.runId);
   for (const ticket of ctx.tickets) {
     ctx.assertLeaseHeld?.();
     const agentTag = labelValueOf(ticket.labels, "agent");
@@ -40,9 +49,13 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
     // a resume can carry one for some tickets and not others. The fork point lets the continuation
     // range span the whole preserved delta, self-committed work beneath an empty marker included.
     const preserved = await readPreservedCommitFor(ctx.worktreePath, ticket.id, ctx.baseRef);
+    // The recorded failure names the bead its gate ran under (a ticket-phase verify names the
+    // ticket, a run-phase one names the run target) — shown only to the ticket it actually
+    // describes, not blasted across every ticket this call happens to cover.
+    const recordedFailure = gateFailure?.beadId === ticket.id ? gateFailure : undefined;
     last = await dispatchClaude(ctx, {
       beadId: ticket.id,
-      prompt: ticketPrompt(dispatched, preserved),
+      prompt: ticketPrompt(dispatched, preserved, recordedFailure),
       appendSystemPrompt,
       // The tag resolved a few lines up, handed to the ledger rather than re-read from the bead:
       // which specialist ran is a per-ticket fact that `runs.agent_tag` records once for the run.
