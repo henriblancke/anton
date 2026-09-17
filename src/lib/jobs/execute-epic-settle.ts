@@ -12,6 +12,7 @@ import { releaseChildren } from "../beads/child-assign";
 import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
 import {
+  isBoardUnreachableError,
   isForeignRunOwner,
   isRunAlreadyLiveError,
   isUsageLimitError,
@@ -152,6 +153,19 @@ async function settleRunRow(run: EpicRun, raw: unknown): Promise<RunSettlement> 
     await updateRun(db, clock, runId, {
       status: "parked",
       error: `run-live-elsewhere${orphanNotice}`,
+    });
+  } else if (isBoardUnreachableError(e)) {
+    settledAs = "parked";
+    // A typed board outage during the initial lease publish (anton-jz1 / PR #277 review) is not
+    // this run's own failure — the board being unreachable says nothing about whether the run
+    // should die. FAILED would close this row for good (`findOpenRunForEpic` only looks at
+    // queued/running/parked), so the runner's board-probe reschedule would open a brand new row
+    // on every retry — one failed run per five-minute probe for the length of the outage. Parked
+    // with no endedAt keeps this exact row open for `findOpenRunForEpic` to hand back once the
+    // board is reachable again, so a prolonged outage accumulates one parked row, not one per probe.
+    await updateRun(db, clock, runId, {
+      status: "parked",
+      error: `board-unreachable${orphanNotice}`,
     });
   } else if (e instanceof NeedsHumanError) {
     // Delegated whole, because this is the one branch that writes to the BOARD before it writes the

@@ -18,6 +18,7 @@ import {
 
 const result = (over: Partial<ReviewGateResult> = {}): ReviewGateResult => ({
   outcome: "clean",
+  baseRev: "base-sha",
   rounds: [{ round: 1, reviewSessionId: "s1", score: 9, blocking: 0, advisory: 0 }],
   unresolved: [],
   reviewer: { kind: "default" },

@@ -37,8 +37,15 @@ export async function bootPreflight(log: RunnerLogger): Promise<void> {
   // unscheduled, piling up reports with nothing acting on them. Best-effort: a scheduling hiccup
   // must not block boot, exactly as it doesn't block project creation.
   try {
-    for (const { projectId, created } of await backfillDefaultSchedules(getDb(), systemClock)) {
-      log.info(`seeded missing schedules for ${projectId}: ${created.join(", ")}`);
+    for (const { projectId, created, armedRunHealth } of await backfillDefaultSchedules(
+      getDb(),
+      systemClock,
+    )) {
+      const changes = [
+        ...(created.length > 0 ? [`seeded missing schedules: ${created.join(", ")}`] : []),
+        ...(armedRunHealth ? ["armed run-health for board-outage detection"] : []),
+      ];
+      log.info(`${projectId}: ${changes.join("; ")}`);
     }
   } catch (e) {
     log.error("backfilling default schedules failed", e);

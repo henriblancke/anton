@@ -5,3 +5,12 @@
 --
 -- Reverse:
 --   DELETE FROM `quota_attempts` WHERE `id` LIKE 'legacy:%';
+--
+-- The decision above is the whole content of this migration: there is nothing to backfill. But a
+-- migration file has to carry at least one statement — drizzle-orm's migrator rejects a
+-- comment-only file outright ("The supplied SQL string contains no statements") and, because
+-- `drizzle-kit migrate` surfaces that as a bare non-zero exit, it reads as a hang and blocks every
+-- LATER migration on an upgrading machine. So state the no-op explicitly rather than implying it.
+--
+-- Reverse: none — this statement changes nothing.
+SELECT 1;

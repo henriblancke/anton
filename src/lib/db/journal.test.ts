@@ -10,6 +10,15 @@
  *
  * Nothing else catches it: the test harness (`testing.ts`) and the packaged runner both apply the
  * .sql files in FILENAME order and never read `when`. So this suite guards the ordering directly.
+ *
+ * The same asymmetry hides a second trap, which is why the statement check below lives here too.
+ * Those two appliers hand the file to `sqlite.exec()`, which accepts a string of pure comments as a
+ * successful no-op — so a migration recording a DECISION rather than a change (we looked, and there
+ * is deliberately nothing to backfill) passes tests and ships in a bundle. drizzle-orm's migrator
+ * does not: it rejects a comment-only file with "The supplied SQL string contains no statements",
+ * and `drizzle-kit migrate` reports that as a bare non-zero exit behind a spinner. The result is a
+ * migration that is fine everywhere it is tested and fatal on a source checkout, where it also
+ * blocks every LATER migration — exactly how 0041 shipped in v0.5.0.
  */
 import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
@@ -52,5 +61,24 @@ describe("drizzle journal", () => {
 
     expect(journal.entries.map((e) => e.tag)).toEqual(files);
     expect(journal.entries.map((e) => e.idx)).toEqual(files.map((_, i) => i));
+  });
+
+  it("gives every migration at least one statement drizzle-kit can run", () => {
+    // A file of pure comments is a no-op to `sqlite.exec()` and a hard error to drizzle-orm's
+    // migrator, so it passes here and fails on a source checkout. A migration that exists only to
+    // record a decision still has to say so in SQL — `SELECT 1;` is the house no-op (see 0041).
+    const empty = readdirSync(DRIZZLE_DIR)
+      .filter((f) => f.endsWith(".sql"))
+      .sort()
+      .filter((f) => {
+        const body = readFileSync(join(DRIZZLE_DIR, f), "utf8")
+          .split("\n")
+          // Drizzle's own `--> statement-breakpoint` separators are comments too: not statements.
+          .filter((line) => line.trim() && !line.trim().startsWith("--"));
+        return body.length === 0;
+      });
+
+    // Named rather than counted: the fix is to add a statement to a specific file.
+    expect(empty).toEqual([]);
   });
 });

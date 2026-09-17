@@ -10,12 +10,18 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { readFile, writeFile, mkdir, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { readFile, writeFile, mkdir, realpath, rm, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { annotateSignal, collectorOf, severityOfSignal, type ScanSignal } from "./scan-severity";
 import { filterCouplingSignals, type CouplingFilter } from "./scan-coupling";
 import { filterDeadcodeSignals, type DeadcodeFilter } from "./scan-deadcode";
-import { filterDuplicationSignals, type DuplicationFilter } from "./scan-duplication";
+import {
+  filterDuplicationSignals,
+  parseLocations,
+  insideRepo,
+  DUPLICATION_COLLECTOR,
+  type DuplicationFilter,
+} from "./scan-duplication";
 import { filterSecretSignals, type SecretFilter } from "./scan-secrets";
 import { PoisonError } from "./jobs/errors";
 import { GH_BIN_ENV } from "./git/ops";
@@ -174,6 +180,12 @@ export interface ScanResult {
   signals: ScanSignal[];
   /** Collectors that died during the scan — their signals are silently absent from the JSON. */
   collectorFailures: CollectorFailure[];
+  /**
+   * What the nested-worktree filter removed from `signals` before anyone counted them — every
+   * collector's findings about a path inside another checkout of this same repo (see
+   * {@link dropWorktreeSignals}).
+   */
+  worktree: WorktreeFilter;
   /** What the untracked-file filter removed from `signals` before anyone counted them. */
   untracked: UntrackedFilter;
   /**
@@ -490,16 +502,12 @@ async function readTrackedPaths(repoPath: string): Promise<Set<string> | { unava
 /**
  * A signal's path as git would spell it, or undefined when it isn't one git can be asked about:
  * no path, the repo root itself (collectors spell it `.`), or a path outside the scanned repo.
- * None of those is evidence of anything.
+ * None of those is evidence of anything. Containment itself is {@link insideRepo} — shared with
+ * scan-duplication.ts's location parsing rather than a second copy of the same check.
  */
 function repoRelativePath(repoPath: string, signal: ScanSignal): string | undefined {
   const raw = signal.FilePath ?? signal.filePath;
-  if (typeof raw !== "string" || !raw) return undefined;
-  // normalize, not a `./` strip: it also collapses mid-path traversals, so a collector spelling a
-  // tracked file `src/../app.ts` matches the index instead of missing it and losing a real finding.
-  const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
-  if (!rel || rel === "." || rel === ".." || rel.startsWith(`..${sep}`)) return undefined;
-  return rel;
+  return typeof raw === "string" && raw ? insideRepo(repoPath, raw) : undefined;
 }
 
 /** What a signal says it found, falling back to its collector when it named no kind. */
@@ -560,11 +568,29 @@ async function dropUntrackedSignals(
 }
 
 /**
+ * "path (severity kind, severity kind); path2 (...)" for a set of dropped signals, grouped by path
+ * and capped at 10 path entries with a `(+N more)` tail — the shared body every `describe*Filter`
+ * below renders. Each caller owns its own drop-count/filter-specific preamble; this only formats
+ * what was lost, because that's what an operator triages on: a dropped `medium large-binary` is the
+ * phantom a filter exists for, a dropped `critical committed-secret` is anton going quiet about a
+ * leaked key and wants a look.
+ */
+function formatDroppedSignals(dropped: readonly DroppedSignal[]): { paths: number; list: string } {
+  const byPath = new Map<string, Set<string>>();
+  for (const { path, kind, severity } of dropped) {
+    const kinds = byPath.get(path) ?? new Set<string>();
+    kinds.add(`${severity} ${kind}`);
+    byPath.set(path, kinds);
+  }
+  // "; " between paths, since each entry already spends ", " on its kinds.
+  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
+  const shown = entries.slice(0, 10);
+  const rest = entries.length - shown.length;
+  return { paths: byPath.size, list: `${shown.join("; ")}${rest > 0 ? ` (+${rest} more)` : ""}` };
+}
+
+/**
  * What the untracked filter removed, and what each drop CLAIMED; undefined when it removed nothing.
- *
- * Each path carries its findings' severity and kind, because that is what an operator triages on: a
- * dropped `medium large-binary` is the phantom this filter exists for, a dropped `critical
- * committed-secret` is anton going quiet about a leaked key and wants a look.
  */
 export function describeUntrackedFilter(filter: UntrackedFilter): string | undefined {
   if (filter.unavailable) {
@@ -574,20 +600,423 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
     );
   }
   if (filter.dropped.length === 0) return undefined;
-  const byPath = new Map<string, Set<string>>();
-  for (const { path, kind, severity } of filter.dropped) {
-    const kinds = byPath.get(path) ?? new Set<string>();
-    kinds.add(`${severity} ${kind}`);
-    byPath.set(path, kinds);
-  }
-  // "; " between paths, since each entry already spends ", " on its kinds.
-  const entries = [...byPath].map(([path, kinds]) => `${path} (${[...kinds].join(", ")})`);
-  const shown = entries.slice(0, 10);
-  const rest = entries.length - shown.length;
+  const { paths, list } = formatDroppedSignals(filter.dropped);
   return (
-    `dropped ${filter.dropped.length} signal(s) about ${byPath.size} path(s) git does not track: ` +
-    `${shown.join("; ")}${rest > 0 ? ` (+${rest} more)` : ""}`
+    `dropped ${filter.dropped.length} signal(s) about ${paths} path(s) git does not track: ${list}`
   );
+}
+
+/**
+ * A git worktree checked out INSIDE the repo it scans is a second full copy of the tree: every real
+ * finding under it is also reported at its own path, so it must never reach triage. `.claude/**`
+ * already excludes Claude Code's own isolation worktrees (anton-bqge) from the walk, but a worktree
+ * at any OTHER in-repo path — `.worktrees/<name>/`, or wherever the next tool picks — was still
+ * walked in full (anton-fj1q: 759 of 894 signals in the 2026-09-10 scan of this repo).
+ *
+ * `git worktree list` is what actually distinguishes a second checkout from a directory that merely
+ * looks like one (`src/lib/worktrees/`, a file named `worktrees.ts`) — a name list has to be kept
+ * current by hand and misses the next tool; asking git what a worktree IS does not.
+ */
+export interface WorktreeFilter {
+  /** The signals dropped because they describe a path inside a nested worktree. */
+  dropped: DroppedSignal[];
+  /** The nested worktrees this scan found, repo-relative — whether or not they held any signals. */
+  worktrees: string[];
+  /**
+   * Why `git worktree list` could not be FULLY asked, when it couldn't be. Set whenever at least
+   * one of the pre-/post-scan lookups failed, even if the other one resolved: `dropped`/`worktrees`
+   * still reflect whatever that other lookup found, filtered as usual (see
+   * {@link mergeNestedWorktrees}) — a worktree only the failed half would have seen is the one thing
+   * still uncaught, so this under-filters rather than the reverse. Only when BOTH lookups fail are
+   * `dropped`/`worktrees` themselves empty, leaving every signal counted.
+   */
+  unavailable?: string;
+}
+
+function isAbortError(err: unknown): boolean {
+  const e = err as { name?: string; code?: unknown } | null;
+  return e?.name === "AbortError" || e?.code === "ABORT_ERR";
+}
+
+/**
+ * Normalizes an abort into an identity `isAbortError` recognizes, no matter what the signal's own
+ * `reason` carries. `AbortSignal.timeout()` sets `reason` to a `TimeoutError`, and a caller's own
+ * `abort(customReason)` can set it to anything -- neither satisfies `isAbortError`, so a probe
+ * racing {@link withBudget} against such a signal would reject with a value `listNestedWorktrees`
+ * can't recognize as cancellation, converting a real abort into a plain lookup failure
+ * ("unavailable") that can let an already-cancelled scan report success (PR #295 review).
+ */
+function toAbortError(reason: unknown): Error {
+  if (isAbortError(reason)) return reason as Error;
+  return new DOMException("This operation was aborted", "AbortError");
+}
+
+/**
+ * Thrown by {@link withBudget} on deadline expiry (as opposed to the promise it's racing rejecting
+ * on its own). Distinguished from a genuine filesystem lookup failure (ENOENT, EACCES, ...) so
+ * callers can rethrow it like an abort instead of falling back to an unresolved path: falling back
+ * here would let `scan()` return an incomplete worktree snapshot *and* still report success past its
+ * own deadline, exactly the silent overrun {@link withBudget} exists to prevent.
+ */
+class ProbeDeadlineExceededError extends Error {
+  constructor() {
+    super("filesystem probe exceeded the scan deadline");
+    this.name = "ProbeDeadlineExceededError";
+  }
+}
+
+function isDeadlineError(err: unknown): boolean {
+  return err instanceof ProbeDeadlineExceededError;
+}
+
+/**
+ * Race a promise against what's left of `deadline` and the caller's `signal`, so a caller waiting on
+ * it can't be made to hang past either. This does NOT cancel the underlying operation — Node gives
+ * no way to interrupt a pending `stat`/`realpath` mid-syscall — it only stops the caller from
+ * waiting on it, which is the actual guarantee a deadline/abort makes to its caller.
+ */
+function withBudget<T>(promise: Promise<T>, deadline: number, signal?: AbortSignal): Promise<T> {
+  if (signal?.aborted) return Promise.reject(toAbortError(signal.reason));
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return Promise.reject(new ProbeDeadlineExceededError());
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(toAbortError(signal?.reason));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      reject(new ProbeDeadlineExceededError());
+    }, remaining);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function isWorktreeCheckout(path: string, deadline: number, signal?: AbortSignal): Promise<boolean> {
+  try {
+    return (await withBudget(stat(join(path, ".git")), deadline, signal)).isFile();
+  } catch (err) {
+    if (isAbortError(err) || isDeadlineError(err)) throw err;
+    return false;
+  }
+}
+
+/**
+ * Every OTHER checkout of this repo, repo-relative. `git worktree list --porcelain` lists the main
+ * worktree first, then linked worktrees — not necessarily the checkout named by `repoPath`: when
+ * `repoPath` is itself a linked worktree and the main worktree sits beneath it, the main checkout
+ * would be misread as nested if we dropped by list position. So each entry is compared by resolved
+ * path against `repoPath` instead — only the entry that IS the scanned checkout is excluded; a path
+ * git names outside `repoPath` (a worktree of some other repo entirely — not possible in practice,
+ * but not this filter's claim to make) is dropped too.
+ *
+ * Resolved through `realpath` on both sides before comparing: git reports worktree paths with
+ * symlinks resolved, but `repoPath` itself may not be (a symlinked checkout, or — on macOS — a temp
+ * dir under `/var`, itself a symlink to `/private/var`). Comparing one resolved path against one
+ * unresolved path would find no common prefix at all and read every nested worktree as outside the
+ * repo, silently disabling the whole filter.
+ *
+ * Parsed with `--porcelain -z`: an in-repo worktree path containing a newline would truncate on a
+ * plain `\n` split, so `realpath` and the containment check below would silently miss everything
+ * under it. `-z` NUL-terminates each attribute instead of newline-terminating it, and ends a record
+ * with an empty field where plain `--porcelain` writes a blank line — so paths are read whole, and
+ * since NUL, not whitespace, is the delimiter, a path is used as-is rather than trimmed (a trailing
+ * space in a real path is significant and must survive).
+ *
+ * Parsed as whole RECORDS rather than isolated `worktree ` lines, so a `prunable` attribute in the
+ * same block is seen: a registration can outlive its checkout — deleted without `git worktree
+ * remove` — and git keeps reporting it (marked `prunable gitdir file points to non-existent
+ * location`) even once the path has been recreated as an ordinary directory (see `worktree.ts`'s own
+ * `existsSync` check for the same fact, anton-2wvb). Reading only the `worktree ` field would treat
+ * that stale registration as a live nested checkout and drop every real signal under a path that is
+ * no longer a worktree at all — so a prunable record is excluded before its path is even resolved.
+ *
+ * `prunable` alone isn't enough, though: `should_prune_worktree` never reports it for a *locked*
+ * worktree (this repo locks its own, see `worktree.ts:485-491`), so a locked worktree deleted
+ * outside git and reused as an ordinary tracked directory still passes the prunable check — git
+ * keeps citing `locked` for a registration that no longer points at a checkout. A LINKED worktree
+ * always has a `.git` FILE (not directory) at its root pointing back at the main repo's
+ * `.git/worktrees/<name>`; a reused-as-ordinary directory doesn't. `isWorktreeCheckout` verifies
+ * that marker before a resolved path is trusted, so a stale locked registration is dropped from
+ * `nested` the same as a prunable one — real findings under its path keep flowing to triage.
+ *
+ * That marker check is skipped for the MAIN worktree specifically: git guarantees `worktree list`
+ * reports it first regardless of which checkout `repoPath` names, and its `.git` is an ordinary
+ * DIRECTORY, not the file marker a linked worktree has — so when `repoPath` is itself a linked
+ * worktree with the main checkout nested beneath it, requiring the file marker on every record
+ * would fail `isWorktreeCheckout` for that main checkout and leave it out of `--exclude` entirely,
+ * silently letting its whole tree double-report every real finding (anton-fj1q PR #295 review).
+ * The main worktree can't be a stale registration the way a linked one can — it's the checkout the
+ * repo's own `.git` lives in — so skipping the marker check for it only widens what's excluded, it
+ * never lets a fake one in.
+ *
+ * Bounded by (and cancellable via) the caller's own scan deadline/signal, same reasoning as
+ * {@link githubToken}: this runs before `scan()`'s deadline clock starts, so the caller passes a
+ * budget already charged against the outer timeout rather than an independent one — otherwise an
+ * already-cancelled scan (or a near-zero ANTON_STRINGER_TIMEOUT_MS) could sit here regardless.
+ *
+ * That budget covers the whole lookup, not just the `git worktree list` subprocess: the `realpath`/
+ * `stat` probes below it (per registered worktree) run against the actual filesystem, and neither
+ * fs API takes a timeout — `realpath` doesn't accept a `signal` at all, and `stat`'s only checks one
+ * at the call's start, not while the syscall is in flight. Left unbounded, a registered worktree on
+ * a stalled mount (or an abort that lands while these are pending) could still hang `scan()` past
+ * `ANTON_STRINGER_TIMEOUT_MS` after the subprocess above already returned. {@link withBudget} races
+ * each probe against what's left of the deadline and the caller's signal instead.
+ */
+async function listNestedWorktrees(
+  repoPath: string,
+  opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<string[] | { unavailable: string }> {
+  // Same "budget already spent" guard as githubToken's own `if (timeoutMs <= 0) return undefined`:
+  // without it, `Math.max(1, Math.min(30_000, opts.timeoutMs))` below floors the subprocess timeout
+  // at 1ms instead of skipping the spawn, so a call made after the deadline has already passed still
+  // shells out to `git worktree list` rather than reporting unavailable immediately (PR #295 review).
+  if (opts.timeoutMs <= 0) return { unavailable: "no time budget remaining for the nested-worktree lookup" };
+  const deadline = Date.now() + Math.max(0, opts.timeoutMs);
+  try {
+    const { stdout } = await execFileAsync(
+      "git",
+      ["-C", repoPath, "worktree", "list", "--porcelain", "-z"],
+      { timeout: Math.max(1, Math.min(30_000, opts.timeoutMs)), maxBuffer: 8 * 1024 * 1024, signal: opts.signal },
+    );
+    const records: string[][] = [[]];
+    for (const field of stdout.split("\0")) {
+      if (field === "") {
+        if (records[records.length - 1].length > 0) records.push([]);
+        continue;
+      }
+      records[records.length - 1].push(field);
+    }
+
+    const resolvedRepo = await withBudget(realpath(repoPath), deadline, opts.signal).catch((err) => {
+      if (isAbortError(err) || isDeadlineError(err)) throw err;
+      return repoPath;
+    });
+    const nested: string[] = [];
+    for (const [index, record] of records.entries()) {
+      const worktreeLine = record.find((l) => l.startsWith("worktree "));
+      if (!worktreeLine) continue;
+      if (record.some((l) => l === "prunable" || l.startsWith("prunable "))) continue;
+      const wt = worktreeLine.slice("worktree ".length);
+      const resolvedWt = await withBudget(realpath(wt), deadline, opts.signal).catch((err) => {
+        if (isAbortError(err) || isDeadlineError(err)) throw err;
+        return wt;
+      });
+      if (resolvedWt === resolvedRepo) continue;
+      // git always lists the main worktree first, and only LINKED worktrees carry the `.git`
+      // file marker — see the doc comment above for why the main entry skips this check.
+      const isMainWorktree = index === 0;
+      if (!isMainWorktree && !(await isWorktreeCheckout(resolvedWt, deadline, opts.signal))) continue;
+      const rel = relative(resolvedRepo, resolvedWt);
+      if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)) nested.push(rel);
+    }
+    return nested;
+  } catch (err) {
+    // A caller abort must propagate, not collapse into "unavailable": swallowing it here would let
+    // scan() proceed as if nothing were nested instead of short-circuiting as cancellation (mirrors
+    // githubToken's own AbortError check, for the same reason). A deadline hit inside the
+    // realpath/stat probes above lands here too, as a plain Error — reported as "unavailable" the
+    // same as any other lookup failure, not silently swallowed into an empty `nested` list.
+    if (isAbortError(err)) throw err;
+    return { unavailable: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Union two `listNestedWorktrees` snapshots into one the post-scan backstop can filter against.
+ * The pre-scan snapshot alone is stale by the time stringer exits: a worktree another process
+ * creates mid-scan is in neither the `--exclude` list (built before stringer ran) nor an unrefreshed
+ * `nested`, so its signals would sail through the one filter meant to catch what `--exclude` missed
+ * (anton-fj1q PR #295 review). Unioning misses nothing either lookup saw.
+ *
+ * A transient failure in ONE snapshot must not discard what the OTHER one resolved. An earlier
+ * version returned bare `{ unavailable }` the moment either side failed, which meant a flaky
+ * pre-scan lookup followed by a successful post-scan retry threw away that retry's list too —
+ * `dropWorktreeSignals` then received "unavailable" instead of the worktrees the retry actually
+ * found, and every signal under one of them survived to triage as a phantom finding (anton-fj1q PR
+ * #295 review). So the worktrees either side resolved are always unioned into the result;
+ * `unavailable`, when set, rides alongside as a caveat rather than replacing that list —
+ * `dropWorktreeSignals` still filters against what's there, and {@link describeWorktreeFilter}
+ * reports the partial failure separately from whatever got dropped.
+ */
+function mergeNestedWorktrees(
+  before: string[] | { unavailable: string },
+  after: string[] | { unavailable: string },
+): { worktrees: string[]; unavailable?: string } {
+  const worktrees = Array.from(
+    new Set([...(Array.isArray(before) ? before : []), ...(Array.isArray(after) ? after : [])]),
+  );
+  const failures = [before, after]
+    .filter((snapshot): snapshot is { unavailable: string } => !Array.isArray(snapshot))
+    .map((snapshot) => snapshot.unavailable);
+  return failures.length === 0 ? { worktrees } : { worktrees, unavailable: failures.join("; ") };
+}
+
+/**
+ * Drop every `  - path:line` entry from a duplication signal's `Description` whose raw text isn't
+ * in `keep` (see {@link parseLocations} for the format this mirrors). Matched against the RAW
+ * location text stringer emitted, not a resolved/repo-relative form, since that's what's actually
+ * in the string being edited. Everything else — the preamble line, blank lines, indentation — is
+ * left untouched.
+ */
+function reanchorDescription(description: string, keep: Set<string>): string {
+  return description
+    .split("\n")
+    .filter((line) => {
+      const match = /^\s*-\s+(.+):(\d+)\s*$/.exec(line);
+      return match === null || keep.has(`${match[1]}:${match[2]}`);
+    })
+    .join("\n");
+}
+
+/**
+ * Drop the signals describing a path inside another checkout of this same repo, and say how many.
+ * Runs BEFORE annotation, same as {@link dropUntrackedSignals} — a filter applied downstream of it
+ * would leave the trend charting findings the agent never saw. `nested` is precomputed by the
+ * caller ({@link scan} needs it before spawning stringer, to build `--exclude`) — this filter is a
+ * backstop against whatever a glob exclude doesn't catch, not the primary defense.
+ *
+ * Unlike {@link dropUntrackedSignals} this runs over every collector's signals, not just
+ * `githygiene`'s: the 2026-09-10 scan of this repo split its phantom signals across complexity,
+ * patterns, duplication, coupling AND todos (759 of 894 total) — a nested worktree is never a valid
+ * finding for ANY collector on the tree that ships.
+ *
+ * A `duplication` signal gets its own rule: it reports a GROUP of locations (in `Description`, see
+ * {@link parseLocations}), and its own `FilePath` is only ONE of them — specifically, the FIRST one
+ * stringer listed (verified against a 97-signal real scan, fixture at
+ * `scan-duplication.d9eab116.fixture.json`: 97 signals, 97 distinct Descriptions, every `FilePath`
+ * equal to its own Description's first location — one signal per clone GROUP, not one per
+ * location). Checking `FilePath` alone would keep a clone whose "duplicate" is entirely the nested
+ * worktree mirroring the real file, so once a signal names two or more locations, the vote runs
+ * over ALL of them: it survives only if at least two locations sit outside every nested worktree,
+ * because one real location left is not a duplicate of anything the tree still has.
+ *
+ * Because there is only ONE signal per group, a group that survives the vote must be KEPT even when
+ * its own `FilePath` happens to be the nested location — there is no sibling signal for the
+ * surviving real locations to carry the finding through on its own. Dropping it unconditionally,
+ * as an earlier version of this filter did, silently deleted every valid clone group whose
+ * representative happened to be listed first-and-nested (anton-fj1q PR #295 review). Instead the
+ * signal is re-anchored: `FilePath`/`Line` are rewritten to a surviving real location, so triage
+ * still points at a file whose edits ship.
+ *
+ * `Description` is rewritten the same way, dropping any nested location from its list, not just
+ * `FilePath`/`Line`. {@link filterDuplicationSignals} reparses `Description` downstream
+ * ({@link parseLocations}) and gives every location it lists its own declaration/code vote — left
+ * unrewritten, the nested copy (identical text to the real location it mirrors) casts a second vote
+ * for the same class, which can turn a genuine tie between two real locations into a false
+ * declarative majority and drop a real clone. Whichever casing alias actually held the text
+ * (`Description` or the lowercase `description` stringer sometimes emits) is the one rewritten, in
+ * `parseLocations`'s own `??` order — writing `Description` unconditionally would plant an empty
+ * string there that outranks a populated `description` in that same fallback chain, since `??` only
+ * yields to null/undefined, not to `""` (anton-fj1q PR #295 review).
+ */
+async function dropWorktreeSignals(
+  repoPath: string,
+  signals: ScanSignal[],
+  nested: { worktrees: string[]; unavailable?: string },
+): Promise<{ kept: ScanSignal[]; worktree: WorktreeFilter }> {
+  const { worktrees, unavailable } = nested;
+  // Whatever either lookup resolved is still filtered, even when the OTHER one failed — see
+  // `mergeNestedWorktrees`. Only when neither resolved anything (worktrees is empty) is there
+  // nothing to filter against; `unavailable`, if set, still rides along as a caveat.
+  if (worktrees.length === 0) {
+    return { kept: signals, worktree: { dropped: [], worktrees: [], ...(unavailable ? { unavailable } : {}) } };
+  }
+
+  const isNested = (path: string) => worktrees.some((wt) => path === wt || path.startsWith(`${wt}${sep}`));
+
+  const dropped: DroppedSignal[] = [];
+  const kept = signals.filter((signal) => {
+    if (collectorOf(signal) === DUPLICATION_COLLECTOR) {
+      const locations = parseLocations(signal);
+      if (locations.length >= 2) {
+        const withResolved = locations.map((loc) => {
+          const resolvedPath = insideRepo(repoPath, loc.path);
+          return { raw: loc, resolved: resolvedPath === undefined ? undefined : { path: resolvedPath, line: loc.line } };
+        });
+        const real = withResolved.filter((loc) => loc.resolved !== undefined && !isNested(loc.resolved.path));
+        if (real.length >= 2) {
+          const ownPath = repoRelativePath(repoPath, signal);
+          if (ownPath === undefined || isNested(ownPath)) {
+            signal.FilePath = real[0].resolved!.path;
+            signal.Line = real[0].resolved!.line;
+          }
+          if (real.length < locations.length) {
+            const keep = new Set(real.map((loc) => `${loc.raw.path}:${loc.raw.line}`));
+            // Rewrite whichever alias actually supplied the text `parseLocations` read (its own
+            // `Description ?? description` order), not `Description` unconditionally: a signal that
+            // only ever carried the lowercase alias has `Description` as null/undefined, and writing
+            // an empty string there would outrank `description` in that same `??` chain downstream
+            // (`??` only falls through on null/undefined, not on ""), silently blanking the
+            // locations `filterDuplicationSignals` re-parses (anton-fj1q PR #295 review).
+            if (signal.Description !== undefined && signal.Description !== null) {
+              signal.Description = reanchorDescription(signal.Description, keep);
+            } else if (signal.description !== undefined && signal.description !== null) {
+              signal.description = reanchorDescription(signal.description, keep);
+            }
+          }
+          return true;
+        }
+        const ownPath = repoRelativePath(repoPath, signal);
+        dropped.push({
+          path: ownPath ?? withResolved[0]?.resolved?.path ?? "",
+          kind: kindOf(signal),
+          severity: severityOfSignal(signal),
+        });
+        return false;
+      }
+      // Description carried fewer than two locations (or none stringer's list format covers), so
+      // there is nothing to vote over — fall back to the single-path check every other signal gets.
+    }
+
+    const path = repoRelativePath(repoPath, signal);
+    const under = path !== undefined && isNested(path);
+    if (!under) return true;
+    dropped.push({ path: path as string, kind: kindOf(signal), severity: severityOfSignal(signal) });
+    return false;
+  });
+  return { kept, worktree: { dropped, worktrees, ...(unavailable ? { unavailable } : {}) } };
+}
+
+/**
+ * What the worktree filter removed, and which nested checkouts it found; undefined when there is
+ * nothing to say (no nested worktree found, nothing dropped, and both lookups succeeded).
+ *
+ * `dropped`/`worktrees` and `unavailable` are reported independently rather than one gating the
+ * other: a partial failure (one of the pre-/post-scan lookups down, the other one resolved) can
+ * carry both at once — see {@link mergeNestedWorktrees} — and collapsing that case into just the
+ * "unavailable" branch would silently drop the record of what the successful half actually found
+ * and filtered (anton-fj1q PR #295 review).
+ */
+export function describeWorktreeFilter(filter: WorktreeFilter): string | undefined {
+  const parts: string[] = [];
+  if (filter.dropped.length > 0) {
+    const { paths, list } = formatDroppedSignals(filter.dropped);
+    parts.push(
+      `dropped ${filter.dropped.length} signal(s) under ${filter.worktrees.length} nested worktree(s) ` +
+        `(${filter.worktrees.join(", ")}) about ${paths} path(s): ${list}`,
+    );
+  }
+  if (filter.unavailable) {
+    parts.push(
+      `git worktree list could not be fully read (${filter.unavailable}) — findings under a nested ` +
+        `checkout neither lookup saw, if any, are still counted this pass`,
+    );
+  }
+  return parts.length === 0 ? undefined : parts.join("; ");
 }
 
 /**
@@ -611,9 +1040,21 @@ export function describeUntrackedFilter(filter: UntrackedFilter): string | undef
 async function readAnnotatedSignals(
   scanFile: string,
   repoPath: string,
-  opts: { exclude: readonly string[]; abort?: AbortSignal },
+  opts: {
+    exclude: readonly string[];
+    /**
+     * The union of {@link scan}'s pre-scan enumeration (it already needs one to build stringer's
+     * --exclude) and its post-scan re-enumeration, via {@link mergeNestedWorktrees} — not the
+     * pre-scan snapshot alone, or a worktree created mid-scan would be invisible to this backstop too.
+     */
+    nested: { worktrees: string[]; unavailable?: string };
+    /** The scan's own outer deadline (absolute), charged against the `realpath` probe below. */
+    deadline: number;
+    abort?: AbortSignal;
+  },
 ): Promise<{
   signals: ScanSignal[];
+  worktree: WorktreeFilter;
   untracked: UntrackedFilter;
   coupling: CouplingFilter;
   duplication: DuplicationFilter;
@@ -649,25 +1090,54 @@ async function readAnnotatedSignals(
     );
   }
 
-  const { kept: tracked, untracked } = await dropUntrackedSignals(repoPath, signals);
+  // Canonicalized once, up front: every filter below classifies an absolute signal `FilePath`
+  // against this root via `insideRepo`'s plain `path.relative`, which is lexical and never resolves
+  // symlinks itself. `listNestedWorktrees` already resolves the same repo for its own comparison, so
+  // a `repoPath` handed in as a symlink (or a macOS `/tmp` vs `/private/tmp` spelling) would otherwise
+  // make a real nested-worktree signal's canonical absolute path compare as outside the repo and
+  // survive every filter here. Falls back to the given path on a deadline hit or a genuine
+  // filesystem error, unlike the per-worktree probes in `listNestedWorktrees` that rethrow those —
+  // since (unlike that lookup) there is no "unavailable" state for this step to report: an
+  // unresolved path only degrades the lexical lookup below to what `insideRepo` already does
+  // without canonicalization, so failing the whole scan over it would be worse than the drift it
+  // guards against. A caller abort is rethrown rather than swallowed into that fallback, though:
+  // none of the filters below check `opts.abort` themselves, so an empty scan (or one without
+  // deadcode signals) would otherwise sail through to a reported success after its caller already
+  // cancelled it (PR #295 review). Raced against the scan's own deadline/abort via `withBudget` so
+  // a stalled mount can't hang this call forever the way a plain `realpath` would — this runs AFTER
+  // stringer has already exited, so nothing else is left running to blame for the hang.
+  const resolvedRepoPath = await withBudget(realpath(repoPath), opts.deadline, opts.abort).catch(
+    (err) => {
+      if (isAbortError(err)) throw err;
+      return repoPath;
+    },
+  );
+
+  // Nested-worktree signals first, over every collector: a phantom path is never worth the cost the
+  // filters below pay to read its content. `scan()` already excluded these paths from the walk
+  // itself, so this is now a backstop rather than the primary defense — `opts.nested` is the union
+  // of scan()'s pre- and post-scan enumerations, not just its first (pre-scan) result, so a worktree
+  // created mid-scan is still caught here even though it slipped stringer's `--exclude`.
+  const { kept: real, worktree } = await dropWorktreeSignals(resolvedRepoPath, signals, opts.nested);
+  const { kept: tracked, untracked } = await dropUntrackedSignals(resolvedRepoPath, real);
   // Secrets next, while the githygiene findings are together: it reads the flagged line, so it
   // should never be paid for a finding the index already contradicted.
-  const { kept: unfaked, secrets } = await filterSecretSignals(repoPath, tracked);
+  const { kept: unfaked, secrets } = await filterSecretSignals(resolvedRepoPath, tracked);
   // Coupling after that: it reads the source of the modules a signal names, so it should never be
   // paid for a finding the index already contradicted.
-  const { kept: coupled, coupling } = await filterCouplingSignals(repoPath, unfaked);
+  const { kept: coupled, coupling } = await filterCouplingSignals(resolvedRepoPath, unfaked);
   // Same reason, same order: reading the source at a reported clone window is only worth paying for
   // a finding the index hasn't already contradicted.
-  const { kept: deduped, duplication } = await filterDuplicationSignals(repoPath, coupled);
+  const { kept: deduped, duplication } = await filterDuplicationSignals(resolvedRepoPath, coupled);
   // Deadcode last: one `git grep` per symbol is cheap but not free, so it runs over only what every
   // cheaper filter left.
-  const { kept, deadcode } = await filterDeadcodeSignals(repoPath, deduped, {
+  const { kept, deadcode } = await filterDeadcodeSignals(resolvedRepoPath, deduped, {
     exclude: opts.exclude,
     abort: opts.abort,
   });
   for (const signal of kept) annotateSignal(signal);
   await writeFile(scanFile, JSON.stringify(withSignals(parsed, kept)), "utf8");
-  return { signals: kept, untracked, coupling, duplication, secrets, deadcode };
+  return { signals: kept, worktree, untracked, coupling, duplication, secrets, deadcode };
 }
 
 /**
@@ -694,8 +1164,13 @@ async function readAnnotatedSignals(
  *
  * Bounded by (and cancellable via) the caller's own scan deadline/signal — this lookup must not
  * outlive a scan a caller already gave up on, so it never adds its own independent wait past that.
+ * `timeoutMs` is the caller's REMAINING budget, not a fresh one: a budget already exhausted by an
+ * earlier step (the nested-worktree lookup) must skip the `gh` call outright rather than spawn it
+ * with a zero/negative timeout, which `execFile` would read as "no timeout" and hang past the
+ * scan's own deadline (anton-fj1q PR #295 review).
  */
 async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<string | undefined> {
+  if (timeoutMs <= 0) return undefined;
   const gh = process.env[GH_BIN_ENV] ?? "gh";
   try {
     // stringer's github collector always calls api.github.com, never an enterprise host -- so
@@ -716,6 +1191,32 @@ async function githubToken(timeoutMs: number, signal?: AbortSignal): Promise<str
     if (e?.name === "AbortError" || e?.code === "ABORT_ERR") throw err;
     return undefined;
   }
+}
+
+/**
+ * stringer's `-e/--exclude` is a Go pflag string-slice: every value handed to it (including the
+ * single comma-joined argument `scan()` builds) is parsed with `encoding/csv`, not a naive
+ * `string.split(",")`. A glob with an unescaped comma -- e.g. a nested worktree checked out at a
+ * path containing one -- would otherwise split into two patterns, silently truncating the exclude
+ * and leaving stringer free to walk (and pay the cost of) whatever the truncated remainder names.
+ * Quote only when a glob actually needs it, so every existing plain glob's argv stays byte-identical.
+ */
+function csvEscapeExclude(glob: string): string {
+  if (!/[",\r\n]/.test(glob)) return glob;
+  return `"${glob.replace(/"/g, '""')}"`;
+}
+
+/**
+ * stringer's glob matcher treats `\ * ? [ ] { }` as syntax, not literal characters -- so
+ * interpolating a raw filesystem path (e.g. a nested worktree's checkout dir) into a glob without
+ * escaping those risks the exact opposite of the intended exclude. Verified empirically against
+ * stringer: an unescaped `[1]` in a path (`weird[1]`) also matched an unrelated sibling `weird1`
+ * (character-class semantics), silently over-excluding real source; an unescaped `{a,b}` matched
+ * *nothing at all*, silently under-excluding the very directory it named. Backslash-escaping each
+ * metacharacter makes the glob match only the literal path regardless of its contents.
+ */
+function globEscapePath(path: string): string {
+  return path.replace(/[\\*?[\]{}]/g, "\\$&");
 }
 
 export async function scan(opts: {
@@ -739,41 +1240,73 @@ export async function scan(opts: {
   const unwind = async (): Promise<string | undefined> =>
     baseline ? restoreBaseline(opts.repoPath, baseline) : undefined;
 
+  // Computed BEFORE the nested-worktree lookup below, not after: that lookup shells out to git and
+  // must be charged against the scan's own deadline/signal like every other step, not given an
+  // independent wait on top of it (anton-fj1q PR #295 review).
+  const timeoutMs = scanTimeoutMs();
+  const deadline = Date.now() + timeoutMs;
+
+  // Enumerated BEFORE stringer is spawned, not after it exits: excluding a nested worktree from the
+  // walk is the only fix that actually keeps it from costing anything. Filtering its signals out
+  // afterward (dropWorktreeSignals, below) is too late once a large one has already run every
+  // collector past its --collector-timeout budget — a collector that times out mid-walk omits its
+  // REAL findings too, not just the phantom ones (anton-fj1q: a 60s budget, and 759 phantom signals
+  // from one nested checkout). This snapshot is re-taken after stringer exits (below, right before
+  // `readAnnotatedSignals`) and the two are unioned, so a worktree created after this lookup but
+  // before stringer finishes walking still gets caught by the post-scan backstop.
+  const nested = await listNestedWorktrees(opts.repoPath, {
+    timeoutMs: deadline - Date.now(),
+    signal: opts.signal,
+  });
+
   const args = ["scan", opts.repoPath, "--format", "json", "-o", opts.scanFile];
   if (delta) args.push("--delta");
   // Skip build output / caches so the walk stays on source (the .next build dir alone made this scan
   // time out), and cap each collector so a runaway one can't hang the whole scan past the timeout.
-  const exclude = [...DEFAULT_SCAN_EXCLUDES, ...(opts.exclude ?? [])];
-  args.push("--exclude", exclude.join(","));
+  const exclude = [
+    ...DEFAULT_SCAN_EXCLUDES,
+    ...(Array.isArray(nested) ? nested.map((wt) => `${globEscapePath(wt)}/**`) : []),
+    ...(opts.exclude ?? []),
+  ];
+  args.push("--exclude", exclude.map(csvEscapeExclude).join(","));
   args.push("--collector-timeout", COLLECTOR_TIMEOUT);
   // Keep stderr free of ANSI escapes so the collector-failure parse stays reliable when a TTY leaks in.
   args.push("--no-color");
-
-  const timeoutMs = scanTimeoutMs();
-  const deadline = Date.now() + timeoutMs;
   // A caller's own GITHUB_TOKEN (CI, an operator's shell) wins — `gh auth token` is only a
-  // fallback for when nothing already set it, and only set when it actually resolves. Bounded by
-  // and cancellable via the same deadline/signal as the scan itself, so a slow credential store
-  // can't add its own wait on top of (or outlive) an already-cancelled/short-deadline scan.
+  // fallback for when nothing already set it, and only set when it actually resolves. Charged
+  // against what's LEFT of the deadline, not the outer timeoutMs again: the nested-worktree lookup
+  // above already spent part of that budget, and handing this call the full timeoutMs would let a
+  // short ANTON_STRINGER_TIMEOUT_MS be exceeded by another full lookup on top of it (anton-fj1q PR
+  // #295 review).
   const env = { ...process.env };
+  // Tracks whichever preflight step actually ran last, so the deadline-exhaustion error below (if
+  // any) names the real culprit instead of always blaming `gh auth token`: when GITHUB_TOKEN is
+  // already set, or the budget is already gone before this step starts (githubToken's own
+  // `timeoutMs <= 0` guard then skips the spawn entirely), `gh` is never invoked and staying pinned
+  // to it points operators at the wrong CLI (PR #295 review).
+  let lastPreflightStep = "the nested-worktree lookup (git worktree list)";
   if (!env.GITHUB_TOKEN) {
-    const token = await githubToken(timeoutMs, opts.signal);
-    if (token) env.GITHUB_TOKEN = token;
+    const tokenBudget = deadline - Date.now();
+    if (tokenBudget > 0) {
+      lastPreflightStep = "the gh auth token lookup";
+      const token = await githubToken(tokenBudget, opts.signal);
+      if (token) env.GITHUB_TOKEN = token;
+    }
   }
   // The lookup above can itself consume part of the outer deadline -- charge that against what's
   // left rather than handing stringer the full timeoutMs again, or a slow `gh auth token` lets the
   // whole scan overrun ANTON_STRINGER_TIMEOUT_MS by however long the lookup took.
   const remainingMs = deadline - Date.now();
   // execFile treats `timeout: 0` as "no timeout" (Node and Bun both), so a budget already
-  // exhausted by the token lookup must reject here instead of spawning stringer uncapped. This is
+  // exhausted by a preflight step must reject here instead of spawning stringer uncapped. This is
   // BEFORE the try below on purpose: stringer never ran, so the baseline is untouched and doesn't
   // need unwinding -- routing it through rejectWithBaselineRestored would risk turning a harmless
-  // credential-lookup timeout into a poison error if that (unneeded) restore itself failed.
+  // preflight timeout into a poison error if that (unneeded) restore itself failed.
   if (remainingMs <= 0) {
     // Not toScanError -- that formatter's message says stringer was killed, but stringer was
     // never spawned here; blaming it would send an operator chasing the wrong executable.
     throw new Error(
-      `gh auth token lookup consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
+      `${lastPreflightStep} consumed the scan's ${formatTimeout(timeoutMs)} deadline before stringer could start (no output written).`,
     );
   }
   let stderr = "";
@@ -799,8 +1332,23 @@ export async function scan(opts: {
 
   let read: Awaited<ReturnType<typeof readAnnotatedSignals>>;
   try {
+    // Re-enumerated AFTER stringer exits, inside the same try as the read below: the pre-scan
+    // `nested` above is a snapshot from before the walk started, so a worktree another process
+    // creates while stringer runs is invisible to it — passing that stale snapshot to the post-scan
+    // backstop would mean the backstop can't recognize the very race it exists to catch (anton-fj1q
+    // PR #295 review). A caller abort during this second lookup must unwind the baseline exactly
+    // like one during the read itself, hence sharing this try rather than its own.
+    const nestedAfter = await listNestedWorktrees(opts.repoPath, {
+      timeoutMs: deadline - Date.now(),
+      signal: opts.signal,
+    });
+    // Filtered against the union of both reads, not the fresher one alone, so a worktree that
+    // existed pre-scan but (for whatever reason) drops out of this second listing is still caught.
+    const nestedForFilter = mergeNestedWorktrees(nested, nestedAfter);
     read = await readAnnotatedSignals(opts.scanFile, opts.repoPath, {
       exclude,
+      nested: nestedForFilter,
+      deadline,
       abort: opts.signal,
     });
   } catch (err) {
@@ -817,6 +1365,7 @@ export async function scan(opts: {
     scanFile: opts.scanFile,
     signals: read.signals,
     collectorFailures: parseCollectorFailures(stderr),
+    worktree: read.worktree,
     untracked: read.untracked,
     coupling: read.coupling,
     duplication: read.duplication,
