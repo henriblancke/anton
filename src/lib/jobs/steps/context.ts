@@ -13,6 +13,7 @@ import type { ReviewFinding } from "../review-context";
 import type { ReviewRound } from "../review-gate";
 import type { AntonDb, Clock } from "../queue";
 import type { JobContext } from "../runner";
+import type { RunNarrative } from "./result";
 
 /**
  * A satisfied ticket as the run's ledger holds it: the commit it settled on, and whether the close
@@ -138,6 +139,12 @@ export interface StepContext {
    * SECOND `review` is seeded with them so its own verdict speaks for the whole open set.
    */
   advisories?: ReviewFinding[];
+  /**
+   * The run's PR narrative, set from an earlier `describe` step's report (anton-fpkk8). `pr` reads it
+   * for the body it opens (sibling ticket); a SECOND `describe` overwrites it with its own, same as
+   * advisories — a later describer's report is the whole story, not an addition to an earlier one.
+   */
+  narrative?: RunNarrative;
   /**
    * Where a step records progress the caller still needs when the step THROWS. The review gate's
    * completed rounds are the only user: a gate that dies mid-flight returns nothing, but the founder

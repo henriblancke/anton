@@ -27,7 +27,7 @@ import type { RunPhaseCarry, RunStepDispatch } from "./execute-epic-run-step";
 import { deferPassSession } from "./pass-preamble";
 import { persistPartialReviewScores, persistReviewScores } from "./review-score";
 import { blockingFindings, type ReviewRound } from "./review-gate";
-import { computeReviewKey, parseRecordedAdvisories, reviewKeyToken } from "./review-key";
+import { computeReviewKey, parseRecordedAdvisories, parseRecordedNarrative, reviewKeyToken } from "./review-key";
 
 /** The pre-PR self-review gate: dispatch it, then act on the verdict it returns. */
 export async function runReviewStep(
@@ -59,7 +59,12 @@ export async function runReviewStep(
   // the branch-scoped lookup covers every row this attempt did NOT resume in place. A row with no
   // key anywhere on the branch, or a stale one, always reviews — no backfill, no inference.
   const recordedKey = existing?.reviewKey
-    ? { reviewKey: existing.reviewKey, reviewKeyAdvisories: existing.reviewKeyAdvisories, reviewScore: existing.reviewKeyScore }
+    ? {
+        reviewKey: existing.reviewKey,
+        reviewKeyAdvisories: existing.reviewKeyAdvisories,
+        reviewScore: existing.reviewKeyScore,
+        narrative: existing.narrative,
+      }
     : await findRunReviewKeyForBranch(db, projectId, epicBeadId, branch, runId);
   if (recordedKey) {
     try {
@@ -85,6 +90,13 @@ export async function runReviewStep(
         // score-regression breaker (picker-score-breaker.ts's `readScoreSeries`, one entry per
         // target's NEWEST attempt).
         carry.advisories = parseRecordedAdvisories(recordedKey.reviewKeyAdvisories);
+        // The narrative rides the same recovered row (anton-fpkk8): `describe` runs right after this
+        // step, and a resume that skips THIS review must not let a failed re-describe (its own
+        // contract costs only itself — see `steps/describe.ts`) erase what an earlier attempt on the
+        // identical tree already earned. Unconditional, like advisories above: a matched key is the
+        // authoritative record of what that tree produced, including a describer that reported
+        // nothing.
+        carry.narrative = parseRecordedNarrative(recordedKey.narrative);
         await updateRun(db, clock, runId, { reviewScore: recordedKey.reviewScore });
         const session = deferPassSession(db, clock, { ctx, projectId, runId, kind: "review-skip" });
         await session.log(

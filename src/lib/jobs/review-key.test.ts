@@ -10,7 +10,13 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Bead } from "../beads/types";
 import type { ProjectSettings } from "../projects";
-import { computeReviewKey, parseRecordedAdvisories, reviewKeyToken, type ReviewKey } from "./review-key";
+import {
+  computeReviewKey,
+  parseRecordedAdvisories,
+  parseRecordedNarrative,
+  reviewKeyToken,
+  type ReviewKey,
+} from "./review-key";
 
 function bead(overrides: Partial<Bead> & Pick<Bead, "id">): Bead {
   return { title: overrides.id, status: "open", issue_type: "task", ...overrides };
@@ -40,6 +46,27 @@ describe("parseRecordedAdvisories", () => {
   it("reads malformed or non-array JSON as no advisories rather than throwing", () => {
     expect(parseRecordedAdvisories("{not json")).toEqual([]);
     expect(parseRecordedAdvisories('{"not":"an array"}')).toEqual([]);
+  });
+});
+
+describe("parseRecordedNarrative", () => {
+  it("round-trips a serialized narrative", () => {
+    const narrative = { summary: "what changed", spotlight: "look here", risks: "none found" };
+    expect(parseRecordedNarrative(JSON.stringify(narrative))).toEqual(narrative);
+  });
+
+  it("reads absent as no narrative, never a failure", () => {
+    expect(parseRecordedNarrative(null)).toBeUndefined();
+    expect(parseRecordedNarrative(undefined)).toBeUndefined();
+    expect(parseRecordedNarrative("")).toBeUndefined();
+  });
+
+  it("reads malformed, non-object, or shape-missing JSON as no narrative rather than throwing", () => {
+    expect(parseRecordedNarrative("{not json")).toBeUndefined();
+    expect(parseRecordedNarrative("[1,2,3]")).toBeUndefined();
+    expect(parseRecordedNarrative("null")).toBeUndefined();
+    expect(parseRecordedNarrative('{"spotlight":"no summary field"}')).toBeUndefined();
+    expect(parseRecordedNarrative('{"summary":""}')).toBeUndefined();
   });
 });
 

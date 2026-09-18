@@ -38,6 +38,7 @@ import { readWorktreeState } from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings, type ReviewConfig, type VerifyGate } from "../projects";
 import { resolveModel } from "./model-routing";
 import { resolveReviewerContract, type ReviewFinding, type ReviewerSource } from "./review-context";
+import type { RunNarrative } from "./steps/result";
 
 export interface ReviewKey {
   baseRev: string;
@@ -160,5 +161,29 @@ export function parseRecordedAdvisories(raw: string | null | undefined): ReviewF
     return Array.isArray(parsed) ? (parsed as ReviewFinding[]) : [];
   } catch {
     return [];
+  }
+}
+
+/**
+ * The narrative a resumed run restores into the run-phase carry (anton-fpkk8), mirroring
+ * {@link parseRecordedAdvisories}'s tolerance: a null column, an empty string, garbled JSON, or a
+ * shape missing the one required field all yield no narrative rather than throwing — a misread
+ * narrative here costs a PR body, never a run.
+ */
+export function parseRecordedNarrative(raw: string | null | undefined): RunNarrative | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as Record<string, unknown>).summary === "string" &&
+      (parsed as Record<string, unknown>).summary
+    ) {
+      return parsed as RunNarrative;
+    }
+    return undefined;
+  } catch {
+    return undefined;
   }
 }

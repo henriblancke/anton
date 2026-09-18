@@ -25,6 +25,7 @@ import {
 import type { RunPreparation } from "./execute-epic-prepare";
 import { stalePrBodyNote, stalePrBodyRunError } from "./execute-epic-review";
 import type { EpicRun } from "./execute-epic-run";
+import { parseRecordedNarrative } from "./review-key";
 
 
 /** Walk the formula's post-commit steps, then finalize the run and release its checkout. */
@@ -33,7 +34,15 @@ export async function walkRunPhase(
   prep: Extract<RunPreparation, { done: false }>,
   dispatched: DispatchOutcome,
 ): Promise<void> {
-  const carry: RunPhaseCarry = { advisories: [], staleBodyFallback: null };
+  const carry: RunPhaseCarry = {
+    advisories: [],
+    // Restored from THIS row, not branch-scoped like the review key's own advisories (anton-fpkk8):
+    // a resumed-in-place row (a park a human cleared) is the case this covers; a retry that opened a
+    // fresh row after an ordinary failure re-describes, exactly as it re-reviews without a branch
+    // lookup of its own key.
+    narrative: parseRecordedNarrative(run.existing?.narrative),
+    staleBodyFallback: null,
+  };
   // A standalone target THIS attempt verified and retired as already shipped has nothing for these
   // steps to speak for (PR #238 review): the bead is closed as superseded with anton's evidence on
   // it, and no commit is on the branch — so there is no diff to review and no pull request to open
@@ -52,10 +61,15 @@ export async function walkRunPhase(
         satisfied: dispatched.satisfied,
         step: cooked,
         advisories: carry.advisories,
+        narrative: carry.narrative,
       },
     };
     if (definition.name === "review") {
       await runReviewStep(run, prep, dispatch, carry);
+      continue;
+    }
+    if (definition.name === "describe") {
+      await runDescribeStep(run, dispatch, carry);
       continue;
     }
     if (definition.name === "pr") {
@@ -113,6 +127,36 @@ async function runPrStep(
   if (!standaloneRun) {
     await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
     await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+  }
+}
+
+/**
+ * Write the run's PR narrative (anton-fpkk8): dispatch the describer, then carry and persist
+ * whatever it reports.
+ *
+ * A describer that fails reports `ok: true` with no narrative — its own contract (`steps/describe.ts`
+ * header): a thrown git error, a quota exhaustion, an unparseable report all cost the narrative and
+ * nothing else, never the run. That failure must not overwrite a narrative an earlier attempt on
+ * this same row already earned, so ONLY a reported narrative replaces the carry — unlike advisories,
+ * whose review verdict always speaks for the whole open set even when it resolves to none. A
+ * describer that DOES report one overwrites whatever was carried in, same as advisories: a second
+ * `step:describe` in one formula speaks for the run same as a second `step:review` does.
+ */
+async function runDescribeStep(run: EpicRun, dispatch: RunStepDispatch, carry: RunPhaseCarry): Promise<void> {
+  const { db, clock, runId, targetId: epicBeadId } = run;
+  const { cooked, definition, stepCtx } = dispatch;
+  const result = await definition.handler(stepCtx);
+  if (!result.ok) {
+    throw new Error(
+      result.detail ?? `formula step "${cooked.id}" (step:describe) failed for ${epicBeadId}`,
+    );
+  }
+  if (result.facts?.narrative) {
+    carry.narrative = result.facts.narrative;
+    // Best-effort, like every other resume bookkeeping write: a failed write just means the next
+    // resume that doesn't re-describe finds nothing to restore, the same safe default as a run
+    // whose describer never reported one at all.
+    await safe(() => updateRun(db, clock, runId, { narrative: JSON.stringify(carry.narrative) }));
   }
 }
 

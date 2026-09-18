@@ -56,6 +56,7 @@ function run(id: string, o: Partial<RunRow> = {}): RunRow {
     reviewKey: null,
     reviewKeyAdvisories: null,
     reviewKeyScore: null,
+    narrative: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: null,

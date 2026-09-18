@@ -19,6 +19,7 @@ const beadsNoteMock = vi.fn();
 const computeReviewKeyMock = vi.fn<(...args: unknown[]) => Promise<ReviewKey>>();
 const reviewKeyTokenMock = vi.fn<(key: ReviewKey) => string>();
 const parseRecordedAdvisoriesMock = vi.fn<(raw: string | null | undefined) => ReviewFinding[]>();
+const parseRecordedNarrativeMock = vi.fn<(raw: string | null | undefined) => unknown>();
 const deferPassSessionMock = vi.fn();
 const sessionLogMock = vi.fn(async () => {});
 const sessionEndMock = vi.fn(async () => {});
@@ -55,6 +56,7 @@ vi.mock("./review-key", () => ({
   computeReviewKey: (...a: unknown[]) => computeReviewKeyMock(...a),
   reviewKeyToken: (...a: [ReviewKey]) => reviewKeyTokenMock(...a),
   parseRecordedAdvisories: (...a: [string | null | undefined]) => parseRecordedAdvisoriesMock(...a),
+  parseRecordedNarrative: (...a: [string | null | undefined]) => parseRecordedNarrativeMock(...a),
 }));
 
 vi.mock("./pass-preamble", () => ({
@@ -89,6 +91,7 @@ function epicRun(
     reviewKey: string | null;
     reviewKeyAdvisories: string | null;
     reviewKeyScore: number | null;
+    narrative: string | null;
   }>,
 ): EpicRun {
   return {
@@ -102,7 +105,14 @@ function epicRun(
     branch: `anton/${TARGET}`,
     settings: {},
     existing: existing
-      ? { id: RUN_ID, reviewKey: null, reviewKeyAdvisories: null, reviewKeyScore: null, ...existing }
+      ? {
+          id: RUN_ID,
+          reviewKey: null,
+          reviewKeyAdvisories: null,
+          reviewKeyScore: null,
+          narrative: null,
+          ...existing,
+        }
       : undefined,
     orphanNotice: "",
   } as unknown as EpicRun;
@@ -172,15 +182,26 @@ describe("runReviewStep — resume key", () => {
     reviewKeyTokenMock.mockReturnValue("base1:head1:fp1");
     const recorded: ReviewFinding[] = [{ severity: "advisory", location: "y.ts:2", note: "nit" }];
     parseRecordedAdvisoriesMock.mockReturnValue(recorded);
+    const recordedNarrative = { summary: "what changed" };
+    parseRecordedNarrativeMock.mockReturnValue(recordedNarrative);
 
     const handler = vi.fn();
-    const run = epicRun({ reviewKey: "base1:head1:fp1", reviewKeyAdvisories: "[...]", reviewKeyScore: 8 });
+    const run = epicRun({
+      reviewKey: "base1:head1:fp1",
+      reviewKeyAdvisories: "[...]",
+      reviewKeyScore: 8,
+      narrative: "{...}",
+    });
     const c = carry();
 
     await runReviewStep(run, prep(), dispatch(handler), c);
 
     expect(handler).not.toHaveBeenCalled();
     expect(c.advisories).toEqual(recorded);
+    // The narrative rides the same recovered row as the advisories — a resume that skips review
+    // must not let a failed re-describe erase what an earlier attempt on this tree already earned.
+    expect(parseRecordedNarrativeMock).toHaveBeenCalledWith("{...}");
+    expect(c.narrative).toEqual(recordedNarrative);
     // `existing` on the row is consulted first — a branch-wide scan is unnecessary work when this
     // attempt resumed the very row that earned the verdict.
     expect(findRunReviewKeyForBranchMock).not.toHaveBeenCalled();
@@ -207,10 +228,13 @@ describe("runReviewStep — resume key", () => {
     reviewKeyTokenMock.mockReturnValue("base5:head5:fp5");
     const recorded: ReviewFinding[] = [{ severity: "advisory", location: "w.ts:1", note: "nit" }];
     parseRecordedAdvisoriesMock.mockReturnValue(recorded);
+    const recordedNarrative = { summary: "earlier attempt's narrative" };
+    parseRecordedNarrativeMock.mockReturnValue(recordedNarrative);
     findRunReviewKeyForBranchMock.mockResolvedValue({
       reviewKey: "base5:head5:fp5",
       reviewKeyAdvisories: "[...]",
       reviewScore: 7,
+      narrative: "{...}",
     });
 
     const handler = vi.fn();
@@ -228,6 +252,11 @@ describe("runReviewStep — resume key", () => {
     );
     expect(handler).not.toHaveBeenCalled();
     expect(c.advisories).toEqual(recorded);
+    // Restored off the branch-scoped row too — a `step:pr` fault opens a fresh run row, and the
+    // narrative an earlier attempt earned before that fault must survive it the same way its
+    // advisories do (anton-fpkk8).
+    expect(parseRecordedNarrativeMock).toHaveBeenCalledWith("{...}");
+    expect(c.narrative).toEqual(recordedNarrative);
     expect(updateRunMock).toHaveBeenCalledWith(run.db, run.clock, RUN_ID, { reviewScore: 7 });
     expect(sessionEndMock).toHaveBeenCalledWith("done");
   });
