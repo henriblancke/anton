@@ -202,6 +202,9 @@ export type RunPatch = Partial<{
   formulaVariant: string | null;
   /** The commit this run's branch forked from, pinned at worktree creation (anton-5bpd) — see schema. */
   baseForkSha: string | null;
+  /** What refreshOntoBase did to a reused checkout at warm, and the base it settled on (anton-s55u) — see schema. */
+  baseRefreshOutcome: string | null;
+  baseRefreshSha: string | null;
   attempts: number;
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */

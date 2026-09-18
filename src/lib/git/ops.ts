@@ -1279,6 +1279,29 @@ export async function isAncestor(
 }
 
 /**
+ * Whether `a` and `b` share ANY common history — the check `isAncestor` alone can't make, since a
+ * diverged branch and one with a wholly unrelated history both answer its question "no" (exit 1).
+ * A rebase treats the two very differently: onto a diverged base it replays only the commits unique
+ * to the branch, but onto an unrelated one — origin's `<base>` force-pushed or recreated with a new
+ * root — git still accepts the operation and replays the branch's ENTIRE history, root commit
+ * included, on top of a tree that has nothing to do with it. Callers that mean to rebase must check
+ * this FIRST and refuse when it's false, rather than let git's own permissiveness stand in for it.
+ */
+export async function hasCommonHistory(
+  worktreePath: string,
+  a: string,
+  b: string,
+): Promise<boolean> {
+  try {
+    await git(worktreePath, ["merge-base", a, b]);
+    return true;
+  } catch (e) {
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
  * Record an EMPTY commit — a marker that carries a message and no diff.
  *
  * The callers are `step:commit` and the ticket-timeout preserve, both adopting work an agent

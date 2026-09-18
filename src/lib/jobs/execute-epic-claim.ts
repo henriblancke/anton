@@ -9,6 +9,9 @@
 import { beads, LABELS, unclaimableStatus } from "../beads/bd";
 import { ownerOf } from "../beads/claim";
 import { assignChildren, formatReservedChildren } from "../beads/child-assign";
+import { latestBlockNoteCommit } from "../beads/block-note";
+import { parseTicketNotes } from "../beads/notes";
+import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
@@ -37,13 +40,29 @@ export function claimOwnerFor(runId: string): string {
 export async function warmRunWorktree(
   run: EpicRun,
 ): Promise<{ worktree: Worktree; runStep: Omit<StepContext, "tickets"> }> {
-  const { db, clock, ctx, projectId, repo, runId, branch, project, settings, lease, target } = run;
+  const {
+    db,
+    clock,
+    ctx,
+    projectId,
+    repo,
+    runId,
+    branch,
+    project,
+    settings,
+    lease,
+    target,
+    tickets,
+    existing,
+  } = run;
   // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
   // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
   // whose local base is stale still starts at the remote tip; it's best-effort and falls back
-  // to the local base offline. On resume this is moot — createWorktree short-circuits to the
-  // existing worktree, so the base is never re-applied mid-run. Note the PR `base` below stays
-  // the plain branch name (gh needs a branch, not a remote-tracking ref).
+  // to the local base offline. On resume, createWorktree short-circuits to the existing
+  // worktree, but the `refresh: true` below (anton-s55u) still brings a reused checkout up to
+  // this freshly-resolved base before returning it — see refreshOntoBase's own doc comment for
+  // how. Note the PR `base` below stays the plain branch name (gh needs a branch, not a
+  // remote-tracking ref).
   const baseBranch = settings.baseBranch ?? project.defaultBranch;
   // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
   // the remote-tracking ref is the accurate fork point even when the local base has drifted.
@@ -56,6 +75,47 @@ export async function warmRunWorktree(
   const worktreeClaim = claimOwnerFor(runId);
   run.worktreeClaim = worktreeClaim;
   await acquireWorktreeClaim(repo, branch, worktreeClaim);
+  // Commits a satisfied-note already cites as this ticket's evidence (anton-8h4b), for THIS branch —
+  // a note from elsewhere proves nothing here (the same filter notedSatisfaction applies). A refresh
+  // that rebased one of these out from under the board would leave the note pointing at an object
+  // the branch no longer carries (PR #279 review), so refreshOntoBase merges instead when it finds one.
+  const satisfiedShas = tickets
+    .map((t) => latestSatisfiedRecord(t.notes))
+    .filter((record): record is NonNullable<typeof record> => record !== undefined && record.branch === branch)
+    .map((record) => record.commit);
+  // A block note's committed sha is just as durable a reference as a satisfied note's (PR #279
+  // review): a ticket that fails after committing, or times out with preserved work, records its
+  // branch tip via `blockNoteEvidence`; a human later closing or reopening that ticket leaves the
+  // note in place while a clean resume can still rebase the branch onto an advanced base. Without
+  // this, only satisfied-note shas were protected, so the rebase would rewrite the commit the
+  // still-durable block note names and its review evidence would go unreachable.
+  const blockNoteShas = tickets
+    .map((t) =>
+      latestBlockNoteCommit(
+        parseTicketNotes(t.notes)
+          .filter((n) => n.source === "system")
+          .map((n) => n.text),
+      ),
+    )
+    .filter(
+      (record): record is { committed: true; branch: string; head: string } =>
+        record !== undefined && record.committed && record.branch === branch && record.head !== undefined,
+    )
+    .map((record) => record.head);
+  const preserveShas = [...satisfiedShas, ...blockNoteShas];
+  // The fork commit a PRIOR ATTEMPT on this branch already pinned, if any (PR #279 review) —
+  // resolved BEFORE the checkout is created/reused so a REUSED checkout's refresh below can rebase
+  // with `--onto` that exact boundary instead of the plain one-argument form, which would otherwise
+  // replay commits from the ORIGINAL base as if they were this branch's own once `baseBranch` has
+  // been rewritten past the branch's true fork point (see refreshOntoBase's `forkSha` doc). Branch-
+  // scoped only, not this run's own row too: THIS row is fresh far more often than not (a retry after
+  // an ordinary failure opens one), and re-reading it here as well would consume the same pin-read
+  // the try block below performs as its own atomic setup step — harmless when it succeeds, but a
+  // rejection there is exactly what the try block's own cleanup path exists to catch, and firing it a
+  // second time earlier would answer to a checkout this call hasn't created yet. Harmless to resolve
+  // even when the checkout turns out to be freshly created: refreshOntoBase never runs for one, so
+  // the value is simply unused.
+  const knownForkSha = await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch);
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -65,6 +125,13 @@ export async function warmRunWorktree(
     // A cold install can run for minutes; without the job's signal an operator's kill would wait
     // it out, holding the run's concurrency slot the whole time.
     signal: ctx.signal,
+    // anton-s55u: a resumed run must implement against the tree it will merge into, not whatever
+    // base a parked or failed prior attempt cut this branch from. Safe here specifically: this
+    // branch tracks `baseBranch` by construction (unlike review-fix's PR branches, which diverge
+    // from base by design and must never be rebased underneath an already-pushed PR).
+    refresh: true,
+    preserveShas,
+    forkSha: knownForkSha,
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
@@ -89,6 +156,16 @@ export async function warmRunWorktree(
   // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
   let storedFork: string | undefined;
   let baseForkSha: string;
+  // The last EFFECTIVE (non-`skipped_dirty`) refresh this branch received, from a resume before this
+  // one — read off the row as this attempt found it, before the write below can overwrite it (PR #279
+  // review). A later resume's `skipped_dirty` records that THIS attempt didn't move the branch, not
+  // that no attempt ever did; without this, that skip would stomp a prior success's record with the
+  // fresh base it was never brought up to, losing the only base a truthful already-shipped claim
+  // naming that success's commits could still be checked against.
+  const priorEffectiveRefreshSha =
+    existing?.baseRefreshOutcome && existing.baseRefreshOutcome !== "skipped_dirty"
+      ? (existing.baseRefreshSha ?? undefined)
+      : undefined;
   try {
     // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither
     // must be removed, or a retry could reuse its branch and derive a fork from a moved base.
@@ -129,6 +206,20 @@ export async function warmRunWorktree(
       // checkout retains its own pin, but a recreated branch must replace a stale row pin: that old
       // value describes the deleted checkout and could widen delivery evidence on a later retry.
       ...(!reusedCheckout || !storedFork ? { baseForkSha } : {}),
+      // What refreshOntoBase did to a reused checkout at this warm (anton-s55u) — the only durable
+      // record of whether this attempt implemented against a stale tree that got fixed. Undefined
+      // (a fresh creation, or a caller that didn't opt into refresh) leaves the row's prior value
+      // alone rather than overwriting it with a claim this attempt never made. A `skipped_dirty`
+      // following a prior EFFECTIVE refresh is likewise left alone (PR #279 review): the branch still
+      // carries that refresh's commits, so overwriting its record with this attempt's non-move would
+      // erase the only durable evidence of it.
+      ...(worktree.refreshOutcome &&
+      !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
+        ? {
+            baseRefreshOutcome: worktree.refreshOutcome.outcome,
+            baseRefreshSha: worktree.refreshOutcome.baseSha,
+          }
+        : {}),
     });
   } catch (error) {
     // A newly-created checkout without a pinned fork is unsafe to reuse: any setup failure before
@@ -156,6 +247,20 @@ export async function warmRunWorktree(
   }
   await ctx.heartbeat();
 
+  // What an `already-shipped` claim is checked against (PR #279 review). `baseForkSha` above is
+  // deliberately frozen across resumes for dispatch partitioning; a refresh that actually moved this
+  // reused checkout onto a newer base (anything but `skipped_dirty` — that outcome left the branch
+  // untouched) brought commits into the branch's history that a claim can truthfully cite, so the
+  // verifier checks against the base the tree was JUST refreshed onto rather than the older, frozen
+  // fork it would otherwise reject a true claim against. A `skipped_dirty` THIS attempt falls back to
+  // the last EFFECTIVE refresh a prior resume already applied and left recorded on the row, not
+  // straight to `baseForkSha` (PR #279 review) — `skipped_dirty` means only that this attempt didn't
+  // move the branch, and the commits an earlier resume's refresh brought in are still on it.
+  const alreadyShippedBase =
+    worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
+      ? worktree.refreshOutcome.baseSha
+      : (priorEffectiveRefreshSha ?? baseForkSha);
+
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
   // dispatched in the order the project's formula declares. This is what they all operate on; each
   // dispatch adds the ticket(s) in scope (and, per ticket, that ticket's session) plus the formula
@@ -172,6 +277,7 @@ export async function warmRunWorktree(
     baseBranch,
     baseRef: freshBase,
     baseForkSha,
+    alreadyShippedBase,
     target,
     settings,
     assertLeaseHeld: lease.assertHeld,

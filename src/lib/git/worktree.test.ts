@@ -200,6 +200,517 @@ suite("worktree manager (real git)", () => {
     expect(existsSync(second.path)).toBe(true);
   });
 
+  // anton-s55u: a reused worktree/branch kept whatever base it was cut from — a resumed run could
+  // silently implement, test, and self-review against a tree many commits behind main.
+  describe("refreshing a reused checkout onto a fresh base", () => {
+    /** The repo's own default branch — `git init` doesn't guarantee "main" across environments. */
+    const defaultBranch = () =>
+      execFileSync("git", ["-C", repo, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }).trim();
+
+    /** Commit a change directly onto the repo's default branch, simulating main advancing. */
+    function advanceDefaultBranch(file: string, content: string, message: string): void {
+      writeFileSync(join(repo, file), content);
+      execFileSync("git", ["-C", repo, "add", file]);
+      execFileSync("git", ["-C", repo, "commit", "-q", "-m", message]);
+    }
+
+    function headOf(worktreePath: string): string {
+      return execFileSync("git", ["-C", worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    }
+
+    function branchTip(branch: string): string {
+      return execFileSync("git", ["-C", repo, "rev-parse", branch], { encoding: "utf8" }).trim();
+    }
+
+    it("leaves a reused checkout untouched without `refresh: true` (review-fix's PR branches)", async () => {
+      // review-fix reuses an already-pushed PR branch whose divergence from base is the whole
+      // point, not staleness — rebasing it here would rewrite history out from under an open PR.
+      // The refresh must stay opt-in so that caller's `createWorktree` calls are unaffected.
+      const branch = "anton/refresh-opt-out";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("opt-out.txt", "advance 0\n", "advance main (opt-out)");
+
+      const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch() });
+
+      expect(second.path).toBe(first.path);
+      expect(headOf(second.path)).toBe(beforeSha);
+      expect(existsSync(join(second.path, "opt-out.txt"))).toBe(false);
+      expect(second.refreshOutcome).toBeUndefined();
+    });
+
+    it("reports a noop outcome when a reused checkout is already at the fresh base", async () => {
+      const branch = "anton/refresh-noop";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const currentMain = branchTip(defaultBranch());
+
+      const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+      expect(second.path).toBe(first.path);
+      expect(second.refreshOutcome).toEqual({ outcome: "noop", baseSha: currentMain });
+    });
+
+    it("fast-forwards a reused worktree with no unique commits onto the fresh base", async () => {
+      const branch = "anton/refresh-ff";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeMain = branchTip(defaultBranch());
+      advanceDefaultBranch("ff.txt", "advance 1\n", "advance main (ff)");
+      const freshMain = branchTip(defaultBranch());
+      expect(freshMain).not.toBe(beforeMain);
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        expect(headOf(second.path)).toBe(freshMain);
+        expect(branchTip(branch)).toBe(freshMain);
+        expect(log.mock.calls.flat().join(" ")).toContain("fast-forwarded");
+        // anton-s55u: the outcome is returned, not just logged — a caller persists this onto the
+        // run row so a stale-tree resume is queryable later, not only visible in that attempt's
+        // stdout.
+        expect(second.refreshOutcome).toEqual({ outcome: "fast_forwarded", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("rebases a reused branch's unique commits onto the fresh base instead of discarding them", async () => {
+      const branch = "anton/refresh-rebase";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+      const uniqueSha = headOf(first.path);
+
+      advanceDefaultBranch("rebase-base.txt", "advance 2\n", "advance main (rebase)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        // The unique commit survived, now sitting on top of the fresh base — not lost, not reset.
+        const rebaseLog = execFileSync(
+          "git",
+          ["-C", second.path, "log", "--oneline", `${freshMain}..HEAD`],
+          { encoding: "utf8" },
+        );
+        expect(rebaseLog).toContain("unique ticket commit");
+        expect(existsSync(join(second.path, "rebase-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        expect(headOf(second.path)).not.toBe(uniqueSha); // rebased onto a new base commit
+        expect(log.mock.calls.flat().join(" ")).toContain("rebased");
+        expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    // anton-s55u (PR #279 review): the plain one-argument `git rebase <base>` above replays
+    // `merge-base(base, branch)..branch`, the branch's own fork point only while `baseBranch` still
+    // contains it. Once `baseBranch` is force-pushed or recreated past an older shared ancestor, that
+    // merge-base lands BEFORE the real fork and the plain form would resurrect commits that were part
+    // of the ORIGINAL base — never touched by this run — as if they were the branch's own work.
+    // Isolated in its own repo: it rewrites the default branch's history, which the shared `repo`
+    // fixture other cases in this `describe` build on cumulatively.
+    it("rebases with --onto the pinned fork point, so a rewritten base does not resurrect a dropped base commit", async () => {
+      const ontoRepo = mkdtempSync(join(tmpdir(), "anton-wt-onto-repo-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.name", "anton-test"], { cwd: ontoRepo });
+        writeFileSync(join(ontoRepo, "README.md"), "# tmp\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "."]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "init"]);
+        const ontoDefaultBranch = execFileSync(
+          "git",
+          ["-C", ontoRepo, "symbolic-ref", "--short", "HEAD"],
+          { encoding: "utf8" },
+        ).trim();
+
+        // Main advances to `sharedBase` — the commit the ticket branch will fork from.
+        writeFileSync(join(ontoRepo, "shared-base.txt"), "shared\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "shared-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (later dropped)"]);
+        const sharedBase = execFileSync("git", ["-C", ontoRepo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        const branch = "anton/refresh-onto-pin";
+        const first = await createWorktree({ repoPath: ontoRepo, branch, baseBranch: ontoDefaultBranch });
+        expect(first.forkSha).toBe(sharedBase);
+
+        writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+        execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+        execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+
+        // Force-push/recreate main: drop `sharedBase` (and its file) back to the ORIGINAL root, then
+        // commit a new, unrelated tip — main and the ticket branch now only share that root commit.
+        execFileSync("git", ["-C", ontoRepo, "reset", "--hard", `${sharedBase}~1`]);
+        writeFileSync(join(ontoRepo, "rewritten-base.txt"), "rewritten\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "rewritten-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (rewritten)"]);
+        const freshMain = execFileSync("git", ["-C", ontoRepo, "rev-parse", ontoDefaultBranch], {
+          encoding: "utf8",
+        }).trim();
+        expect(freshMain).not.toBe(sharedBase);
+
+        const log = vi.spyOn(console, "log").mockImplementation(() => {});
+        try {
+          const second = await createWorktree({
+            repoPath: ontoRepo,
+            branch,
+            baseBranch: ontoDefaultBranch,
+            refresh: true,
+            forkSha: first.forkSha,
+          });
+
+          expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
+          const rebaseLog = execFileSync(
+            "git",
+            ["-C", second.path, "log", "--oneline", `${freshMain}..HEAD`],
+            { encoding: "utf8" },
+          );
+          expect(rebaseLog).toContain("unique ticket commit");
+          expect(rebaseLog).not.toContain("advance main (later dropped)");
+          expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+          expect(existsSync(join(second.path, "rewritten-base.txt"))).toBe(true);
+          // The dropped base commit must never be replayed back in as if it were the branch's own work.
+          expect(existsSync(join(second.path, "shared-base.txt"))).toBe(false);
+          expect(log.mock.calls.flat().join(" ")).toContain("rebased");
+        } finally {
+          log.mockRestore();
+        }
+      } finally {
+        rmSync(ontoRepo, { recursive: true, force: true });
+      }
+    });
+
+    // anton-s55u (PR #279 review): a prior attempt can push the branch via `pushBranch` and then
+    // fail before `gh pr create` completes; the resumed run's refresh must not rewrite those
+    // already-public commits, or the retry's own non-forcing push rejects the rebased branch forever.
+    it("merges instead of rebasing when the branch's unique commits are already on origin", async () => {
+      const branch = "anton/refresh-published";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const uniqueSha = headOf(first.path);
+      // Simulate a prior `pushBranch` having already published this tip — no real remote is set up
+      // in this suite, so a bare remote-tracking ref stands in for what a real push would leave.
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, uniqueSha], { cwd: repo });
+
+      advanceDefaultBranch("published-base.txt", "advance 5\n", "advance main (published)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "published-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        // The already-pushed commit is untouched (still reachable as-is), not rewritten by a rebase.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", uniqueSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(uniqueSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    // anton-s55u (PR #279 review, second round): a retry can merge a newer base into an already-
+    // pushed branch and then fail before pushing that merge — `origin/<branch>` is then an ANCESTOR
+    // of the local tip, not equal to it. Exact-equality would misclassify that as unpublished and
+    // rebase it, so the next retry's own non-forcing push is rejected as non-fast-forward forever.
+    it("merges instead of rebasing when origin's tip is an ancestor of the branch, not equal to it", async () => {
+      const branch = "anton/refresh-published-ancestor";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const pushedSha = headOf(first.path);
+      // A prior `pushBranch` published this tip...
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, pushedSha], { cwd: repo });
+      // ...then a later attempt merged a newer base into the branch locally but failed before it
+      // could push that merge — the branch has moved past what origin knows about.
+      writeFileSync(join(first.path, "unpushed-merge.txt"), "merged but not yet pushed\n");
+      execFileSync("git", ["-C", first.path, "add", "unpushed-merge.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unpushed merge commit"]);
+      const unpushedSha = headOf(first.path);
+      expect(unpushedSha).not.toBe(pushedSha);
+
+      advanceDefaultBranch("published-ancestor-base.txt", "advance 5b\n", "advance main (published ancestor)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "published-ancestor-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "unpushed-merge.txt"))).toBe(true);
+        // Both the published commit and the unpushed one on top of it are untouched, not rewritten.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", pushedSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(pushedSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    // anton-s55u (PR #279 review): a satisfied-note (anton-8h4b) can cite a commit that hasn't been
+    // pushed yet — the run settled a sibling ticket against it before parking. Rewriting that
+    // commit's sha in a later resume's refresh would leave the board's note pointing at an object
+    // the branch no longer carries, so this must merge instead of rebase, just like an already-
+    // pushed commit does.
+    it("merges instead of rebasing when a bead already cites one of the branch's commits as evidence", async () => {
+      const branch = "anton/refresh-preserved";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "cited ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "cited ticket commit"]);
+      const citedSha = headOf(first.path);
+
+      advanceDefaultBranch("preserved-base.txt", "advance 6\n", "advance main (preserved)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          preserveShas: [citedSha],
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "preserved-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        // The cited commit is untouched — still reachable as-is, not rewritten by a rebase.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", citedSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(citedSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    // anton-s55u (PR #279 review): git accepts `rebase <base>` even across unrelated histories,
+    // replaying the branch's entire history — root commit included — onto a tree that shares nothing
+    // with it, rather than rejecting the operation. That's what a force-pushed or recreated
+    // `origin/<baseBranch>` looks like from here, so this must fail closed instead of duplicating history.
+    it("refuses to rebase onto a base sharing no history with the branch", async () => {
+      const branch = "anton/refresh-unrelated";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+      const uniqueSha = headOf(first.path);
+
+      // A root commit with no parent, built entirely with plumbing so the shared `repo` checkout
+      // (which every other case in this suite reuses) is never touched — as if origin/<base> had
+      // been force-pushed or recreated onto a history sharing nothing with this branch.
+      const unrelatedBase = "anton/unrelated-base";
+      const emptyTree = execFileSync("git", ["-C", repo, "hash-object", "-t", "tree", "/dev/null"], {
+        encoding: "utf8",
+      }).trim();
+      const unrelatedRoot = execFileSync(
+        "git",
+        ["-C", repo, "commit-tree", emptyTree, "-m", "unrelated root commit"],
+        { encoding: "utf8" },
+      ).trim();
+      execFileSync("git", ["-C", repo, "update-ref", `refs/heads/${unrelatedBase}`, unrelatedRoot]);
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: unrelatedBase, refresh: true }),
+      ).rejects.toThrow(/share no common history/);
+
+      // Never touched — no rebase attempted, no residue.
+      expect(branchTip(branch)).toBe(uniqueSha);
+      const status = execFileSync("git", ["-C", first.path, "status"], { encoding: "utf8" });
+      expect(status).not.toContain("rebase in progress");
+    });
+
+    // anton-s55u (PR #279 review): a process killed between the rebase/merge call and its own
+    // `catch`'s abort leaves `rebase-merge`/`rebase-apply`/`MERGE_HEAD` on disk with HEAD detached
+    // while `branch` still points at its pre-rebase tip. `status --porcelain` alone can't tell that
+    // apart from ordinary parked edits, so this must be caught and aborted before the dirty-tree
+    // escape ever sees it — never dispatched into.
+    it("aborts and fails loud when a reused checkout has an unfinished rebase left by a killed process", async () => {
+      const branch = "anton/refresh-unfinished-rebase";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("unfinished-rebase-base.txt", "advance 8\n", "advance main (unfinished rebase)");
+
+      // A linked worktree's `.git` is a FILE (a gitdir pointer), not a directory, so the real
+      // per-worktree git-dir must be resolved the same way `unfinishedGitOperation` itself does —
+      // writing straight to `.git/rebase-merge` here would just fail with ENOTDIR.
+      const rebaseMergePath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"],
+        { encoding: "utf8" },
+      ).trim();
+      mkdirSync(rebaseMergePath, { recursive: true });
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/had an unfinished git rebase in progress/);
+
+      // Never dispatched into — the branch itself is untouched.
+      expect(branchTip(branch)).toBe(beforeSha);
+    });
+
+    it("aborts and fails loud when a reused checkout has an unfinished merge left by a killed process", async () => {
+      const branch = "anton/refresh-unfinished-merge";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("unfinished-merge-base.txt", "advance 9\n", "advance main (unfinished merge)");
+
+      const mergeHeadPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(mergeHeadPath, `${beforeSha}\n`);
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/had an unfinished git merge in progress/);
+
+      // Never dispatched into — the branch itself is untouched.
+      expect(branchTip(branch)).toBe(beforeSha);
+    });
+
+    it("fails loud on a conflicting divergence and never discards the branch's commits", async () => {
+      const branch = "anton/refresh-conflict";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "README.md"), "run's own edit\n");
+      execFileSync("git", ["-C", first.path, "add", "README.md"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "run's conflicting commit"]);
+      const uniqueSha = headOf(first.path);
+
+      // Advance main touching the SAME line so the rebase cannot apply cleanly.
+      advanceDefaultBranch("README.md", "main's conflicting edit\n", "advance main (conflict)");
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/diverges from .* could not be rebased/);
+
+      // The branch's commit is intact — never reset or discarded — and the rebase left no residue.
+      expect(branchTip(branch)).toBe(uniqueSha);
+      const status = execFileSync("git", ["-C", first.path, "status"], { encoding: "utf8" });
+      expect(status).not.toContain("rebase in progress");
+    });
+
+    it("skips refreshing a dirty reused worktree instead of discarding its uncommitted work", async () => {
+      // A dirty reused checkout is what a run parked on a usage limit or a `needs-human` ask leaves
+      // behind on purpose (PR #279 review) — refusing the whole resume here would strand it forever,
+      // since every later attempt reuses the same worktree and hits the same dirty tree.
+      const branch = "anton/refresh-dirty";
+      const first = await createWorktree({ repoPath: repo, branch });
+      advanceDefaultBranch("dirty-base.txt", "advance 3\n", "advance main (dirty)");
+      const freshMain = branchTip(defaultBranch());
+      writeFileSync(join(first.path, "README.md"), "uncommitted local edit\n");
+      const beforeSha = headOf(first.path);
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+        expect(second.path).toBe(first.path);
+        // Left exactly as it was — no reset, no stash, no discarded edit.
+        expect(readFileSync(join(first.path, "README.md"), "utf8")).toBe("uncommitted local edit\n");
+        expect(headOf(second.path)).toBe(beforeSha);
+        expect(second.refreshOutcome).toEqual({ outcome: "skipped_dirty", baseSha: freshMain });
+        expect(log.mock.calls.flat().join(" ")).toContain("skipping refresh");
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("refreshes onto the fresh base even when only the branch survives (worktree dir was removed)", async () => {
+      const branch = "anton/refresh-recreated";
+      const first = await createWorktree({ repoPath: repo, branch });
+      rmSync(first.path, { recursive: true, force: true });
+      advanceDefaultBranch("recreated-base.txt", "advance 4\n", "advance main (recreated)");
+      const freshMain = branchTip(defaultBranch());
+
+      const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+
+      expect(second.path).toBe(first.path);
+      expect(headOf(second.path)).toBe(freshMain);
+      expect(branchTip(branch)).toBe(freshMain);
+    });
+
+    // anton-s55u (PR #279 review): the directory-removed reuse path recreates the checkout via a
+    // separate `git worktree add ... branch` call, so it reaches `refreshOntoBase` through different
+    // code than the "directory still exists" path above — `preserveShas` must be forwarded there too,
+    // or a resume through exactly this scenario can still rebase away a commit a bead's satisfied-
+    // note cites as evidence, silently breaking the board's note-to-object link.
+    it("merges instead of rebasing a cited commit when only the branch survives (worktree dir was removed)", async () => {
+      const branch = "anton/refresh-recreated-preserved";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "cited ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "cited ticket commit"]);
+      const citedSha = headOf(first.path);
+      rmSync(first.path, { recursive: true, force: true });
+
+      advanceDefaultBranch(
+        "recreated-preserved-base.txt",
+        "advance 7\n",
+        "advance main (recreated preserved)",
+      );
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          preserveShas: [citedSha],
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(existsSync(join(second.path, "recreated-preserved-base.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        // The cited commit is untouched — still reachable as-is, not rewritten by a rebase.
+        const mergeBase = execFileSync(
+          "git",
+          ["-C", second.path, "merge-base", citedSha, branch],
+          { encoding: "utf8" },
+        ).trim();
+        expect(mergeBase).toBe(citedSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+  });
+
   // The symlink-into-the-worktree + info/exclude bridge was replaced with a `-c
   // core.hooksPath=<absolute>` override passed on every git invocation against a worktree (see
   // resolveHooksPathOverride in ops.ts) — so createWorktree itself now has nothing to materialize

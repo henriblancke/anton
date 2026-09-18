@@ -70,7 +70,7 @@ const WORKTREE = "/tmp/wt";
 const FRESH_BASE = "origin/main";
 const clock: Clock = { now: () => 1_800_000_000_000 };
 
-function makeRun(runId = RUN_ID): EpicRun {
+function makeRun(runId = RUN_ID, overrides: Partial<EpicRun> = {}): EpicRun {
   return {
     db: t.db,
     clock,
@@ -84,6 +84,8 @@ function makeRun(runId = RUN_ID): EpicRun {
     settings: {},
     lease: { assertHeld: () => {} },
     target: { id: EPIC, title: EPIC } as Bead,
+    tickets: [],
+    ...overrides,
   } as unknown as EpicRun;
 }
 
@@ -276,6 +278,87 @@ it("preserves a reused checkout and branch when fork-pin persistence fails", asy
 
   expect(releaseClaimMock).not.toHaveBeenCalled();
   expect(removeWorktreeMock).not.toHaveBeenCalled();
+});
+
+it("pins alreadyShippedBase to baseForkSha on a fresh creation — nothing to refresh", async () => {
+  const { runStep } = await warmRunWorktree(makeRun());
+
+  expect(runStep.alreadyShippedBase).toBe(runStep.baseForkSha);
+});
+
+it("advances alreadyShippedBase to the refreshed base when a stale reused checkout was brought forward (PR #279 review)", async () => {
+  // A resume reuses a branch pinned to an OLD fork — baseForkSha stays frozen at it, by design, so
+  // dispatch keeps partitioning against the checkout's true fork. But the refresh that just merged
+  // this checkout onto the freshly-fetched base brought commits into its history that a truthful
+  // already-shipped claim can now cite, and alreadyShippedBase must track that newer base rather
+  // than reject a claim the tree actually already contains.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, { baseForkSha: "old-fork-commit" });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "merged", baseSha: "fresh-base-commit" },
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun());
+
+  expect(runStep.baseForkSha).toBe("old-fork-commit");
+  expect(runStep.alreadyShippedBase).toBe("fresh-base-commit");
+});
+
+it("keeps alreadyShippedBase at the frozen fork when the refresh skipped a dirty tree", async () => {
+  // `skipped_dirty` means the branch was NOT actually brought forward — the checkout dispatches
+  // against whatever it already had, so the base it verifies already-shipped claims against must
+  // stay the one the tree actually reflects.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, { baseForkSha: "old-fork-commit" });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "fresh-base-commit" },
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun());
+
+  expect(runStep.alreadyShippedBase).toBe("old-fork-commit");
+});
+
+it("falls back alreadyShippedBase to a prior resume's recorded refresh when this attempt is skipped_dirty, without clobbering that record (PR #279 review)", async () => {
+  // Attempt 1 refreshed this reused checkout onto a fresh base (recorded as `merged` on the row).
+  // Attempt 2 (this one) finds the checkout dirty — `refreshOntoBase` reports `skipped_dirty`, its
+  // own no-op. `alreadyShippedBase` must fall back to attempt 1's recorded base, not the frozen
+  // `baseForkSha`, and the write must leave attempt 1's record alone rather than overwrite it with
+  // this attempt's non-move.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "prior-base",
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "this-attempt-dirty-base" },
+  });
+
+  const { runStep } = await warmRunWorktree(
+    makeRun(RUN_ID, {
+      existing: { baseRefreshOutcome: "merged", baseRefreshSha: "prior-base" } as EpicRun["existing"],
+    }),
+  );
+
+  expect(runStep.baseForkSha).toBe("old-fork-commit");
+  expect(runStep.alreadyShippedBase).toBe("prior-base");
+
+  const row = await actualRuns.getRunById(t.db, RUN_ID);
+  expect(row?.baseRefreshOutcome).toBe("merged");
+  expect(row?.baseRefreshSha).toBe("prior-base");
 });
 
 it("poisons the run when failed fork-pin cleanup cannot prove complete removal", async () => {
