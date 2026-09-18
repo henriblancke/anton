@@ -14,6 +14,7 @@ import type { BranchDiff, PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { SatisfiedSettlement, StepContext } from "./context";
+import type { RunNarrative } from "./result";
 
 /** A ticket in scope whose previous attempt left preserved work on the branch (anton-16pq). */
 export interface TicketPreserved {
@@ -364,7 +365,80 @@ function ticketPromptClosing(ticketId: string, preserved: boolean): string {
   ].join("\n");
 }
 
+/** An ATX heading, recognized the same way CommonMark does at block level: up to 3 leading spaces,
+ * then 1-6 `#`, then whitespace or end of line. */
+const HEADING_LINE = /^ {0,3}#{1,6}(?:[ \t]|$)/;
+/** An opening or closing code fence: up to 3 leading spaces, then a run of 3+ backticks or tildes. */
+const FENCE_LINE = /^ {0,3}(?:`{3,}|~{3,})/;
+/** The leading run of spaces plus the single structural character a heading or fence line opens with. */
+const STRUCTURAL_PREFIX = /^( {0,3})([#`~])/;
+
 /**
+ * Defuse a line of untrusted prose (a describer's narrative) that would itself parse as a markdown
+ * heading or a fenced-code delimiter, so it can't forge one of anton's own `##`/`###` sections below
+ * it, or open a fence that swallows the rest of the body as literal code (anton-7x273). A backslash
+ * before the leading `#`/backtick/tilde keeps the character on the page while pulling the line out
+ * of CommonMark's block-level grammar — the same trick `formatHumanNote` uses against a forged
+ * `[human-note …]` header (beads/notes.ts).
+ */
+function defuseStructuralLines(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) =>
+      HEADING_LINE.test(line) || FENCE_LINE.test(line) ? line.replace(STRUCTURAL_PREFIX, "$1\\$2") : line,
+    )
+    .join("\n");
+}
+
+/** Untrusted prose (describer narrative, a bead's free text) as it may safely reach a PR body: bounded
+ * by the same field cap every inlined ticket field carries ({@link truncateField}), then defused. */
+const renderUntrusted = (text: string): string => defuseStructuralLines(truncateField(text));
+
+/**
+ * `summary`, then "Review these first" (`spotlight`) and "Risks", each present only when the
+ * describer reported one (anton-7x273). Exported so the stale-body salvage
+ * (`stalePrBodyNote` in execute-epic-review.ts) can carry the same narrative when a `gh` refresh
+ * fails and the PR body itself is stuck on an earlier attempt's text — the narrative would
+ * otherwise be lost with nowhere else to land.
+ */
+export function narrativeFieldLines(narrative: RunNarrative | undefined): string[] {
+  if (!narrative) return [];
+  const spotlight = narrative.spotlight?.trim();
+  const risks = narrative.risks?.trim();
+  return [
+    renderUntrusted(narrative.summary),
+    ``,
+    ...(spotlight ? [`### Review these first`, ``, renderUntrusted(spotlight), ``] : []),
+    ...(risks ? [`### Risks`, ``, renderUntrusted(risks), ``] : []),
+  ];
+}
+
+/**
+ * What `prBody` opens with when a describer reported a narrative: what changed and why, what to
+ * check first, what could break, then the run target's own `## Out of scope` — read off the BEAD
+ * (`outOfScopeBody`), not the describer, so a swapped reasoning contract can never change what the
+ * PR claims is deliberately left out.
+ *
+ * Absent entirely when there is no narrative: a project with no `step:describe` (or one whose
+ * describer never reported) gets exactly today's body, Out of scope included — the two ride
+ * together rather than Out of scope standing alone on a run that never opted into narration.
+ */
+function narrativeOpening(target: Bead, narrative: RunNarrative | undefined): string[] {
+  if (!narrative) return [];
+  const outOfScope = outOfScopeBody(target)?.trim();
+  return [
+    ...narrativeFieldLines(narrative),
+    ...(outOfScope ? [`## Out of scope`, ``, renderUntrusted(outOfScope), ``] : []),
+    `---`,
+    ``,
+  ];
+}
+
+/**
+ * `narrative` — what the describer reported for this run (anton-7x273), opening the body when
+ * present, the run target's `## Out of scope` alongside it. Absent entirely when there is no
+ * narrative, so a project without `step:describe` sees exactly today's body ({@link narrativeOpening}).
+ *
  * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
@@ -381,11 +455,13 @@ export function prBody(
   tickets: Bead[],
   advisory: ReviewFinding[] = [],
   satisfied: ReadonlyMap<string, SatisfiedSettlement> = new Map(),
+  narrative?: RunNarrative,
 ): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const committed = tickets.filter((t) => !satisfied.has(t.id));
   const lines = [
+    ...narrativeOpening(target, narrative),
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
     ...(standalone || committed.length === 0
