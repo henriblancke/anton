@@ -17,6 +17,7 @@ const untagMock = vi.fn(async () => "");
 const setStatusMock = vi.fn(async () => "");
 const noteMock = vi.fn(async () => "");
 const showMock = vi.fn();
+const tagMock = vi.fn(async () => "");
 const repairMock = vi.fn();
 
 vi.mock("../beads/bd", async () => {
@@ -31,6 +32,7 @@ vi.mock("../beads/bd", async () => {
       setStatus: (...args: unknown[]) => setStatusMock(...(args as [])),
       note: (...args: unknown[]) => noteMock(...(args as [])),
       show: (...args: unknown[]) => showMock(...(args as [])),
+      tag: (...args: unknown[]) => tagMock(...(args as [])),
     },
   };
 });
@@ -395,4 +397,68 @@ describe("settling a ticket the repair reported OVERTAKEN", () => {
     expect(untagMock).not.toHaveBeenCalled();
     expect(setStatusMock).not.toHaveBeenCalled();
   });
+});
+
+// A board-only ticket that fails its own zero-diff guard is left `open` (not `blocked`) so a
+// resumed run can reclaim it (see releaseFailedTicket's own docstring). That `open` write is what
+// makes the ticket claimable again — the release right after it unassigns the bead regardless of
+// whether the write landed (PR #284 review) — so a swallowed transient failure here could leave the
+// ticket `in_progress` with no assignee: unowned, and unclaimable since bd's claim gate refuses
+// anything but `open`.
+describe("settling a board-only ticket's own no-delivery guard (PR #284 review)", () => {
+  const boardOnlyTicket = { ...ticket, labels: [LABELS.boardOnly] } as Bead;
+  const boardOnlyRun = () =>
+    ({ ...run(), target: { id: "anton-f1", labels: [] } }) as unknown as Omit<StepContext, "tickets">;
+  const settleBoardOnly = () =>
+    settleFailedTicket({
+      run: boardOnlyRun(),
+      ticket: boardOnlyTicket,
+      runTicketIds: [boardOnlyTicket.id],
+      session: { sessionId: "s1", logPath: "/dev/null" } as never,
+      ranOutOfTime: false,
+      baseline: null,
+      progress: {
+        committed: false,
+        delivered: false,
+        selfReport: { outcome: "blocked", klass: "other", reason: "no board evidence found" },
+      },
+      timeoutMs: 60_000,
+      standalone: false,
+      e: new NoDeliveryError("no diff"),
+    });
+
+  beforeEach(() => {
+    for (const m of [unassignMock, untagMock, setStatusMock, noteMock, tagMock, repairMock]) m.mockReset();
+    unassignMock.mockResolvedValue("");
+    untagMock.mockResolvedValue("");
+    noteMock.mockResolvedValue("");
+    tagMock.mockResolvedValue("");
+    repairMock.mockResolvedValue(undefined);
+  });
+
+  it("retries the `open` write and completes the release once it lands", async () => {
+    setStatusMock.mockRejectedValueOnce(new Error("dolt contention")).mockResolvedValueOnce("");
+
+    await expect(settleBoardOnly()).rejects.toBeInstanceOf(NoDeliveryError);
+
+    const calls = setStatusMock.mock.calls.slice(-2);
+    expect(calls[0]).toEqual(["/tmp/anton", "anton-a", "open"]);
+    expect(calls[1]).toEqual(["/tmp/anton", "anton-a", "open"]);
+    // The release proceeds once the retried write lands.
+    expect(unassignMock).toHaveBeenCalledWith("/tmp/anton", "anton-a");
+  });
+
+  it(
+    "halts before releasing the claim when bd refuses the `open` write on every retry — a " +
+      "swallowed failure here would leave the bead in_progress but unassigned, unclaimable by a " +
+      "resumed run",
+    async () => {
+      setStatusMock.mockRejectedValue(new Error("dolt contention"));
+
+      await expect(settleBoardOnly()).rejects.toThrow(PoisonEpic);
+      await expect(settleBoardOnly()).rejects.toThrow(/return it to `open`/);
+
+      expect(unassignMock).not.toHaveBeenCalled();
+    },
+  );
 });

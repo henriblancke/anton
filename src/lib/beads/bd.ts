@@ -139,13 +139,40 @@ export const LABELS = {
    * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
    */
   agentHuman: `agent:${HUMAN_AGENT}`,
+  /**
+   * This run target's entire deliverable is board writes — bd updates to the Dolt DB, which
+   * `.beads/.gitignore` deliberately keeps out of the tree (`refs/dolt/data` is the sync channel,
+   * not the tree; see CLAUDE.md and anton-fc5x). Set at SHAPING time, on the bead, like
+   * `agentHuman` — never inferred from the agent's own report, because an agent claiming its own
+   * ticket is exempt from the zero-diff guard is exactly the false success that guard exists to
+   * catch. Read by {@link beads.isBoardOnly} and consulted only where a clean git tree would
+   * otherwise be read as "nothing delivered" (execute-epic-ticket.ts `assertDelivered`).
+   */
+  boardOnly: "delivery:board",
+  /**
+   * Board-only evidence (anton-fc5x) a PRIOR attempt found changed but could not confirm synced —
+   * `board-evidence-pending:<id>,<id>,...`. Carries the ids across a park/resume: `readBoardBaseline`
+   * takes a FRESH board read on every attempt, so a resumed ticket whose agent makes no further
+   * board writes (because the prior attempt's writes already landed, just unsynced) would otherwise
+   * diff its new baseline against an unchanged board and read as no evidence at all — even once the
+   * sync channel recovers. Prefix-diffed like `reviewScore`, so the value stays single (the latest
+   * known set), never inferred from the agent's own report for the same reason `boardOnly` itself
+   * isn't. See {@link beads.pendingBoardEvidence} / {@link beads.setBoardEvidencePending}.
+   */
+  boardEvidencePending: (ids: readonly string[]) => `board-evidence-pending:${ids.join(",")}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
-const RUN_LEASE_PREFIX = "run-lease:";
+export const RUN_LEASE_PREFIX = "run-lease:";
 
 /** Prefix of the review-score label (see LABELS.reviewScore). */
-const REVIEW_SCORE_PREFIX = "review-score:";
+export const REVIEW_SCORE_PREFIX = "review-score:";
+
+/** Prefix of the board-evidence-pending label (see LABELS.boardEvidencePending). */
+export const BOARD_EVIDENCE_PENDING_PREFIX = "board-evidence-pending:";
+
+/** Prefix of the stage label (see LABELS.stage). */
+export const STAGE_PREFIX = "stage:";
 
 /**
  * Shape of a GitHub PR pointer (`gh-<number>`). The ONLY `external_ref` value anton treats as a PR:
@@ -159,6 +186,34 @@ export const GH_PR_REF = /^gh-\d+$/i;
  * {@link beads.retirePrRef}. Deliberately NOT `pr`: nothing may read it as a live pointer.
  */
 const RETIRED_PR_KEY = "retiredPr";
+
+/**
+ * Metadata key holding a board-only ticket's PRESERVED pre-dispatch board fingerprint (PR #284
+ * review) — see {@link beads.setBoardEvidenceBaseline} / {@link beads.boardEvidenceBaseline}. Set
+ * only when a post-run board read fails outright, so a resumed attempt can diff against the
+ * ORIGINAL baseline instead of a fresh one that may already have absorbed this ticket's own
+ * writes through an unrelated sync pass (the heartbeat backstop, a write-nudged push) that runs
+ * independently of this check's own confirming push.
+ *
+ * The value is a fingerprint of the WHOLE board, not just this ticket's beads (PR #284 review round
+ * 11 follow-up) — diffing a future read against it needs every bead's prior content, not only the
+ * ones already known to differ. On a board with hundreds/thousands of beads that is a real per-row
+ * cost, and it lands only when the board is already contended (a failed read is the trigger), i.e.
+ * exactly when it is least welcome. Accepted for now because this path is a recovery fallback, not
+ * the common case; a cheaper representation (e.g. only the ids seen so far plus a per-bead content
+ * hash) would need `bd` support this module does not currently have — see this file's own docstring
+ * on the equivalent per-write-attribution gap.
+ */
+const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
+
+/**
+ * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
+ * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
+ * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
+ * everything else in the object as real, fingerprintable data — the same shape as the
+ * `*_PREFIX` label exclusions above, just for metadata keys instead of label prefixes.
+ */
+export const ANTON_METADATA_KEYS: readonly string[] = ["pr", RETIRED_PR_KEY, BOARD_EVIDENCE_BASELINE_KEY];
 
 /**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
@@ -936,6 +991,68 @@ export const beads = {
       LABELS.reviewScore(score),
     ]),
 
+  /** The bead's existing `board-evidence-pending:*` label — the stale set
+   * {@link beads.setBoardEvidencePending} replaces (anton-fc5x). */
+  boardEvidencePendingLabels: (b: Bead): string[] =>
+    (b.labels ?? []).filter((l) => l.startsWith(BOARD_EVIDENCE_PENDING_PREFIX)),
+
+  /** Ids a PRIOR attempt found changed but could not confirm synced, parsed back off the bead's own
+   * label (anton-fc5x) — empty when none is pending. See {@link LABELS.boardEvidencePending}. */
+  pendingBoardEvidence: (b: Bead): string[] => {
+    const label = beads.boardEvidencePendingLabels(b)[0];
+    return label
+      ? label
+          .slice(BOARD_EVIDENCE_PENDING_PREFIX.length)
+          .split(",")
+          .filter(Boolean)
+      : [];
+  },
+
+  /**
+   * Publish the board-only evidence still awaiting sync confirmation as a state label in ONE
+   * update, like {@link beads.setReviewScore}: drop every prior `board-evidence-pending:*` (pass
+   * them as `stale`) and add the new set. An empty `ids` with a non-empty `stale` clears the marker
+   * (confirmed synced) without adding a replacement.
+   */
+  setBoardEvidencePending: (cwd: string, id: string, ids: readonly string[], stale: string[] = []) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      ...stale.flatMap((l) => ["--remove-label", l]),
+      ...(ids.length > 0 ? ["--add-label", LABELS.boardEvidencePending(ids)] : []),
+    ]),
+
+  /**
+   * A prior attempt's PRESERVED pre-dispatch board fingerprint (PR #284 review), parsed back off
+   * the bead's own metadata — `undefined` when none was ever preserved, or the stored value is
+   * unreadable JSON (read as "nothing preserved" rather than thrown, since a malformed value is no
+   * worse than one that was never written). See {@link BOARD_EVIDENCE_BASELINE_KEY}.
+   */
+  boardEvidenceBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
+   * pre-dispatch baseline. */
+  setBoardEvidenceBaseline: (cwd: string, id: string, fingerprint: Record<string, string>) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--set-metadata",
+      `${BOARD_EVIDENCE_BASELINE_KEY}=${JSON.stringify(fingerprint)}`,
+    ]),
+
+  /** Release a preserved baseline once the handoff it backed has completed. */
+  clearBoardEvidenceBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_KEY]),
+
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
    * which a plain close leaves blank. Deliberately NOT the abandon path: a reason here describes
@@ -1376,6 +1493,13 @@ export const beads = {
    * the runner agree at every level of the tree.
    */
   isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
+
+  /**
+   * A run target shaped as board-only (`delivery:board`, {@link LABELS.boardOnly}): its deliverable
+   * is bd writes, never a git diff. `assertDelivered`'s zero-diff guard reads this to decide whether
+   * a clean git tree needs board evidence instead of a commit before it can settle as delivered.
+   */
+  isBoardOnly: (b: Bead) => b.labels?.includes(LABELS.boardOnly) ?? false,
 
   isEpic: (b: Bead) => b.issue_type === "epic",
 

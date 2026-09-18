@@ -47,6 +47,17 @@ vi.mock("../git/ops", async () => {
   };
 });
 
+const clearBoardEvidencePendingMock = vi.fn();
+vi.mock("./execute-epic-board-evidence", async () => {
+  const actual = await vi.importActual<typeof import("./execute-epic-board-evidence")>(
+    "./execute-epic-board-evidence",
+  );
+  return {
+    ...actual,
+    clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
+  };
+});
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -164,6 +175,7 @@ const abandoned = (id: string): Bead =>
 beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
+  clearBoardEvidencePendingMock.mockReset();
   hasCommitMock.mockReset().mockResolvedValue(false);
   satisfiedByMock.mockReset().mockResolvedValue(undefined);
   branchAddedMock.mockReset().mockResolvedValue(true);
@@ -930,4 +942,69 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(reopenMock).not.toHaveBeenCalled();
     expect(runTicketMock).not.toHaveBeenCalled();
   });
+});
+
+// A prior attempt's `clearBoardEvidencePending` call (execute-epic-ticket.ts) can exhaust its
+// retries and throw PoisonEpic AFTER this ticket already closed — `runTicket` is the only caller
+// of that cleanup, and a resume that finds the ticket's own commit already on the branch skips
+// `runTicket` entirely (the ordinary resumeSkipped fast path, distinct from the retirement/reopen
+// cases above). Without a retry here, the stale marker a failed cleanup left behind would never
+// clear: a later reopen of this same ticket would read it as CURRENT evidence for no new work.
+describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x review)", () => {
+  it("retries the cleanup once this ticket's own commit is found already on the branch", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb1"])],
+    });
+    hasCommitMock.mockResolvedValue(true);
+
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      "anton-a",
+      ["anton-eb1"],
+      false,
+    );
+    // The companion fix in the `if (delivery)` branch above records the stale-pending ids into the
+    // ledger BEFORE clearing them (`ledger.boardEvidence.set(ticket.id, stalePending)`) — asserted
+    // here too so a regression that drops that call while leaving the cleanup call intact still
+    // fails: `boardEvidenceByTicket` is what `review-context.ts`'s `boardEvidenceSection` reads to
+    // show the reviewer which beads this ticket's confirmed evidence covers.
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+  });
+
+  it("does nothing when the ticket carries no pending marker and no preserved baseline", async () => {
+    const child = bead("anton-a", { status: "closed", labels: [LABELS.boardOnly] });
+    hasCommitMock.mockResolvedValue(true);
+
+    await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+  });
+
+  it(
+    "retries the cleanup for a surviving preserved baseline alone, even with no pending marker " +
+      "(PR #284 review) — a prior halt can clear the marker and then exhaust its retries on just " +
+      "the baseline, so the resume must still reach it",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(true);
+
+      return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+          "/tmp/anton-repo",
+          "anton-a",
+          [],
+          true,
+        );
+      });
+    },
+  );
 });

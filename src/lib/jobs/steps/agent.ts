@@ -34,6 +34,7 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
     const appendSystemPrompt = await buildExecutionSystemPrompt({
       agentPrompt: await loadAgentPrompt(agentTag, { projectDir: ctx.worktreePath }),
       seedPrompt: ctx.settings.seedPrompt,
+      boardOnly: ctx.boardOnly,
     });
     const dispatched = await readForDispatch(ctx.repoPath, ticket);
     // Asked per ticket, not once per run: the answer is about THIS bead's own preserved commit, and
@@ -87,7 +88,10 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
       "",
       stepTaskBlock({ ...ctx, tickets: dispatchedTickets }, stepId, preserved),
     ].join("\n"),
-    appendSystemPrompt: await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt }),
+    appendSystemPrompt: await buildExecutionSystemPrompt({
+      seedPrompt: ctx.settings.seedPrompt,
+      boardOnly: ctx.boardOnly,
+    }),
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });
   // A generic step can report `already-shipped`, so its report carries the contract it received.

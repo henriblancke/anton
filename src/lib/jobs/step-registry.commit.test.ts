@@ -54,6 +54,10 @@ suite("commitStep (real git)", () => {
   let sandbox: string;
   let repo: string;
   let tdb: TestDb;
+  // The real commit `BRANCH` forked from, so `recordAttribution`'s bounded idempotency lookup
+  // (`baseForkSha..HEAD`, excluding `baseRef`) has a genuine range to walk instead of a
+  // placeholder sha `git log` would just fail to resolve.
+  let forkSha: string;
 
   const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
   const out = (args: string[]) =>
@@ -82,8 +86,10 @@ suite("commitStep (real git)", () => {
       worktreePath: repo,
       branch: BRANCH,
       baseBranch: "main",
-      baseRef: "origin/main",
-      baseForkSha: "f0f0f0forkcommit",
+      // No `origin` remote exists in this sandbox, so the local `main` (untouched since the fork)
+      // stands in for the remote-tracking ref real runs diff against.
+      baseRef: "main",
+      baseForkSha: forkSha,
       target: ticket,
       tickets: [ticket],
       settings: {} satisfies ProjectSettings,
@@ -102,6 +108,7 @@ suite("commitStep (real git)", () => {
     write("README.md", "# sandbox\n");
     g(["add", "-A"]);
     g(["commit", "-q", "-m", "init"]);
+    forkSha = head();
     g(["checkout", "-q", "-b", BRANCH]);
   });
 

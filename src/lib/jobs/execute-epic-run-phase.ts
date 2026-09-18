@@ -50,6 +50,7 @@ export async function walkRunPhase(
         ...prep.runStep,
         tickets: dispatched.delivered,
         satisfied: dispatched.satisfied,
+        boardEvidenceByTicket: dispatched.boardEvidenceByTicket,
         step: cooked,
         advisories: carry.advisories,
       },
