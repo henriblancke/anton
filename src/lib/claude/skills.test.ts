@@ -25,7 +25,7 @@ function frontmatter(raw: string): { name?: string; description?: string } {
 describe("required skill assets", () => {
   it("ships exactly the expected required set", () => {
     expect([...REQUIRED_SKILLS].sort()).toEqual(
-      ["bd", "review", "review-fix", "scan-triage", "shape", "product-master"].sort(),
+      ["bd", "review", "review-fix", "scan-triage", "shape", "product-master", "describe"].sort(),
     );
   });
 
