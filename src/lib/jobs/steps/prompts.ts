@@ -7,10 +7,10 @@
  * handler should be a dozen lines of orchestration, not a paragraph of prose.
  */
 import type { Bead } from "../../beads/bd";
-import { acceptanceBody } from "../../beads/contract";
+import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
 import { shortSha } from "../../beads/satisfied-note";
-import type { PreservedCommit } from "../../git/ops";
+import type { BranchDiff, PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { SatisfiedSettlement, StepContext } from "./context";
@@ -466,4 +466,117 @@ function satisfiedGroup(
 /** `<short sha> "<subject>"` — the subject is the attribution, since anton's commits are named for their ticket. */
 function satisfiedByLine(by: SatisfiedSettlement): string {
   return by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
+}
+
+/**
+ * The context appended beneath the describer's reasoning contract (anton-aucch): the run target,
+ * every ticket with its contract, and the diff under description — plus the reporting format the
+ * narrative is parsed back out of (`parseNarrativeReport` in `steps/describe.ts`).
+ *
+ * A standalone run (epic-of-one) lists its bead once, the same rule {@link prBody} applies — repeating
+ * it as "ticket 1" would read as two separate contracts to describe against.
+ */
+export function describeContext(args: { target: Bead; tickets: Bead[]; diff: BranchDiff }): string {
+  const { target, tickets, diff } = args;
+  const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
+  return [
+    `## This run`,
+    ``,
+    `Run target: ${target.id} — ${target.title}`,
+    `Tickets in this run: ${tickets.length}`,
+    `Files changed: ${diff.files.length}`,
+    ``,
+    ...describeBeadBlock(target, "Run target"),
+    ...(standalone ? [] : tickets.flatMap((t) => describeBeadBlock(t, "Ticket"))),
+    ...describeDiffBlock(diff),
+    ...narrativeReportFormat(),
+  ].join("\n");
+}
+
+/** One bead's contract, in the same four sections a reviewer is shown ({@link acceptanceSection} and siblings). */
+function describeBeadBlock(bead: Bead, label: string): string[] {
+  const field = (heading: string, body: string | undefined): string[] => [
+    `**${heading}**`,
+    body?.trim() ? truncateField(body) : `(none stated)`,
+    ``,
+  ];
+  return [
+    `### ${label}: ${bead.id} — ${bead.title}`,
+    ``,
+    ...field("Goal", goalBody(bead)),
+    ...field("Acceptance", acceptanceBody(bead)),
+    ...field("Out of scope", outOfScopeBody(bead)),
+    ...field("Verify", verifyBody(bead)),
+  ];
+}
+
+/** The diff itself, mirroring review-context.ts's own rendering — same file list, same rescued deletions. */
+function describeDiffBlock(diff: BranchDiff): string[] {
+  if (diff.files.length === 0) {
+    return [`## The diff`, ``, `This run produced NO changes against its base.`, ``];
+  }
+  return [
+    `## The diff`,
+    ``,
+    `Changed files (${diff.files.length}):`,
+    ...diff.files.map((f) => `- ${f}`),
+    ``,
+    ...(diff.truncated
+      ? [`The patch below is truncated — read the files in the worktree for anything it cuts off.`, ``]
+      : []),
+    "```diff",
+    diff.patch,
+    "```",
+    ``,
+    ...describeDeletionsBlock(diff),
+  ];
+}
+
+/**
+ * The deletions a truncated patch may have cut off, repeated in full — a file this run DELETED is
+ * not in the worktree to read, same reasoning as the reviewer's own rescue.
+ */
+function describeDeletionsBlock(diff: BranchDiff): string[] {
+  if (!diff.deletions && !diff.deletionsIncomplete && !diff.deletionsUnshown) return [];
+  return [
+    `### Files this run DELETED`,
+    ``,
+    `Repeated here because the patch above is truncated and a deleted file is not in the worktree to read.`,
+    ``,
+    ...(diff.deletions ? ["```diff", diff.deletions, "```", ``] : []),
+    ...(diff.deletionsIncomplete
+      ? [`Some deletions could not be recovered — anton's own git read failed partway through.`, ``]
+      : []),
+    ...(diff.deletionsUnshown
+      ? [`${diff.deletionsUnshown} deleted file(s) are named above but not shown — the budget ran out.`, ``]
+      : []),
+  ];
+}
+
+/**
+ * The report format the describer is asked to end its final message with — DEFINED here and PARSED
+ * in `steps/describe.ts`'s `parseNarrativeReport`, so a swapped reasoning contract (a `prompt:<id>`,
+ * a `skill:<id>`, an operator's `describePrompt`) can never break the protocol anton relies on.
+ *
+ * Unlike the reviewer's report, nothing here is mandatory but `summary`: this step never blocks the
+ * run, so there is nothing to be strict about — a short, an empty, or an absent report all cost the
+ * narrative alone.
+ */
+function narrativeReportFormat(): string[] {
+  return [
+    `## Reporting format (required)`,
+    ``,
+    `End your final message with a fenced json block, in exactly this shape:`,
+    ``,
+    "```json",
+    `{"narrative":{"summary":"what changed and why","spotlight":"what to look at first, and why (may be omitted)","risks":"what could break, and under what conditions — or that you found nothing (may be omitted)"}}`,
+    "```",
+    ``,
+    `\`summary\` is the only required field. \`spotlight\` and \`risks\` may be omitted, or left brief,`,
+    `when you are short on budget or certainty — write what you're sure of and stop, per the guidance`,
+    `above; do not invent detail to fill either section.`,
+    ``,
+    `This step never blocks the run and cannot fail it: if you emit no report, or one anton cannot`,
+    `parse, the pull request simply carries no narrative. Report what you have rather than nothing.`,
+  ];
 }

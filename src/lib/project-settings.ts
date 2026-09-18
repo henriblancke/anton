@@ -352,6 +352,14 @@ export interface ProjectSettings {
    */
   productMasterPrompt?: string;
   /**
+   * Operator-editable reasoning prompt for `step:describe` (anton-aucch), mirroring
+   * {@link reviewFixPrompt}: it replaces anton's shipped `describe` skill, and anton appends the
+   * run's diff and beads beneath it. Ranks BELOW a `prompt:<id>`/`skill:<id>` label on the formula
+   * step itself — the same most-specific-override-first precedence {@link resolveReviewConfig}
+   * establishes for the reviewer's own agent/prompt pair. Empty = shipped default.
+   */
+  describePrompt?: string;
+  /**
    * How far a pass may go with the proposals it files, per detection kind (anton-nbyy). Absent → the
    * shipped {@link DEFAULT_PROPOSAL_AUTONOMY_POLICY} (`propose` for everything, i.e. no behaviour
    * change); a stored value need only carry the kinds the operator armed. Validated with
@@ -649,6 +657,22 @@ export interface ProductMasterConfig {
  */
 export function resolveProductMasterConfig(settings: ProjectSettings): ProductMasterConfig {
   return { prompt: settings.productMasterPrompt?.trim() || undefined };
+}
+
+/** A project's resolved describer configuration (anton-aucch) — never partial. */
+export interface DescribeConfig {
+  /** Operator prompt replacing the shipped `describe` skill; absent → the shipped contract. */
+  prompt?: string;
+}
+
+/**
+ * `step:describe`'s settings with defaults applied, the same tiny seam {@link
+ * resolveProductMasterConfig} gives its own swappable contract. Ranks below a `prompt:<id>` /
+ * `skill:<id>` label on the formula step itself — see `resolveDescribeContract` in
+ * `steps/describe.ts`, which reads both against the base revision.
+ */
+export function resolveDescribeConfig(settings: ProjectSettings): DescribeConfig {
+  return { prompt: settings.describePrompt?.trim() || undefined };
 }
 
 /**

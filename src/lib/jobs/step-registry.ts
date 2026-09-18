@@ -53,6 +53,7 @@ export {
   type StepDeps,
 } from "./steps/context";
 export {
+  type RunNarrative,
   type StepClass,
   type StepDefinition,
   type StepFacts,
@@ -61,10 +62,10 @@ export {
   type StepResultWith,
 } from "./steps/result";
 export { claudeStep, implementStep, readForDispatch } from "./steps/agent";
-export { describeStep } from "./steps/describe";
+export { describeStep, parseNarrativeReport } from "./steps/describe";
 export { reviewStep, verifyStep } from "./steps/gates";
 export { commitStep, prStep } from "./steps/git";
-export { prBody, ticketPrompt, truncateField } from "./steps/prompts";
+export { describeContext, prBody, ticketPrompt, truncateField } from "./steps/prompts";
 export { stepName, STEP_LABEL_PREFIX, type StepRegistry } from "./steps/resolve";
 
 /**

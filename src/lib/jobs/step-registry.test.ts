@@ -251,10 +251,12 @@ describe("resolveStep", () => {
       expect(MODEL_ROUTABLE_STEP_IDS).toContain("describe");
     });
 
-    it("is a no-op until its handler ticket lands — reports success with no narrative", async () => {
+    // Full coverage of the describer's dispatch, precedence and parsing lives in steps/describe.test.ts;
+    // this only pins that the registry wires the SAME never-fails contract every caller depends on.
+    it("never fails or throws — a broken context still reports ok:true with no narrative", async () => {
       const result = await describeStep({} as StepContext);
       expect(result.ok).toBe(true);
-      expect(result.facts).toBeUndefined();
+      expect(result.facts?.narrative).toBeUndefined();
     });
   });
 
