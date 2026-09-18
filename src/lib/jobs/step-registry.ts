@@ -37,6 +37,7 @@
  * See `.product/decisions/2026-08-01-no-step-shell.md`.
  */
 import { claudeStep, implementStep } from "./steps/agent";
+import { describeStep } from "./steps/describe";
 import { reviewStep, verifyStep } from "./steps/gates";
 import { commitStep, prStep } from "./steps/git";
 import { resolveStepIn } from "./steps/resolve";
@@ -60,6 +61,7 @@ export {
   type StepResultWith,
 } from "./steps/result";
 export { claudeStep, implementStep, readForDispatch } from "./steps/agent";
+export { describeStep } from "./steps/describe";
 export { reviewStep, verifyStep } from "./steps/gates";
 export { commitStep, prStep } from "./steps/git";
 export { prBody, ticketPrompt, truncateField } from "./steps/prompts";
@@ -104,6 +106,15 @@ export const BUILTIN_STEPS: Readonly<Record<BuiltinStepId, StepDefinition>> = Ob
     summary: "commit the run's work — git is the evidence of record",
     producesDiff: false,
     handler: commitStep,
+  },
+  describe: {
+    name: "describe",
+    class: "default-on",
+    summary: "write the run's PR narrative from its committed diff",
+    // The describer writes nothing to the worktree at all — no commit of its own to make, unlike
+    // the review gate, which sits in this same post-commit slot because IT commits its own fixes.
+    producesDiff: false,
+    handler: describeStep,
   },
   pr: {
     name: "pr",

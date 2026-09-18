@@ -18,11 +18,13 @@ import type { ProjectSettings } from "../projects";
 import { ANTON_REPO_URL } from "../repo";
 import { isPoisonError, isUsageLimitError, RunAlreadyLiveError, UsageLimitError } from "./errors";
 import type { Clock } from "./queue";
+import { BUILTIN_STEP_IDS, MODEL_ROUTABLE_STEP_IDS } from "./step-ids";
 import {
   BUILTIN_STEPS,
   REQUIRED_STEP_NAMES,
   claudeStep,
   commitStep,
+  describeStep,
   implementStep,
   prBody,
   prStep,
@@ -231,9 +233,29 @@ describe("resolveStep", () => {
     expect(BUILTIN_STEPS.pr.class).toBe("required");
     expect(BUILTIN_STEPS.verify.class).toBe("default-on");
     expect(BUILTIN_STEPS.review.class).toBe("default-on");
+    expect(BUILTIN_STEPS.describe.class).toBe("default-on");
     expect(BUILTIN_STEPS.claude.class).toBe("additive");
     // The floor the validator (anton-6b99) enforces — a formula may not omit these.
     expect([...REQUIRED_STEP_NAMES].sort()).toEqual(["commit", "implement", "pr"]);
+  });
+
+  describe("step:describe", () => {
+    it("is registered as default-on, produces no diff, and carries a one-line summary", () => {
+      expect(BUILTIN_STEPS.describe.producesDiff).toBe(false);
+      expect(BUILTIN_STEPS.describe.summary).toBeTruthy();
+      expect(BUILTIN_STEPS.describe.summary.split("\n")).toHaveLength(1);
+    });
+
+    it("appears in both BUILTIN_STEP_IDS and MODEL_ROUTABLE_STEP_IDS", () => {
+      expect(BUILTIN_STEP_IDS).toContain("describe");
+      expect(MODEL_ROUTABLE_STEP_IDS).toContain("describe");
+    });
+
+    it("is a no-op until its handler ticket lands — reports success with no narrative", async () => {
+      const result = await describeStep({} as StepContext);
+      expect(result.ok).toBe(true);
+      expect(result.facts).toBeUndefined();
+    });
   });
 
   it("parks on an unregistered step, naming the step id, the label and the formula file", () => {

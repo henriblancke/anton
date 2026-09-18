@@ -71,6 +71,28 @@ describe("the floor accepts", () => {
       true,
     );
   });
+
+  it("a formula omitting `step:describe` — default-on means a project may opt out", () => {
+    expect(
+      check([
+        step("implement", "implement"),
+        step("commit", "commit"),
+        step("review", "review"),
+        step("pr", "pr"),
+      ]).ok,
+    ).toBe(true);
+  });
+
+  it("`step:describe` between commit and pr — the slot where the committed diff exists", () => {
+    expect(
+      check([
+        step("implement", "implement"),
+        step("commit", "commit"),
+        step("describe", "describe"),
+        step("pr", "pr"),
+      ]).ok,
+    ).toBe(true);
+  });
 });
 
 describe("the floor rejects an omitted required step, naming it", () => {
@@ -134,6 +156,24 @@ describe("the floor rejects broken ordering", () => {
     ]);
 
     expect(violations.map((v) => [v.kind, v.step])).toEqual([["diff-after-commit", "implement"]]);
+  });
+
+  it("but rejects `step:claude` in describe's own slot — it writes to the worktree, describe doesn't", () => {
+    const { ok, violations } = check([
+      step("implement", "implement"),
+      step("commit", "commit"),
+      step("narrate", "claude"),
+      step("pr", "pr"),
+    ]);
+
+    expect(ok).toBe(false);
+    expect(violations.map((v) => v.kind)).toEqual(["diff-after-commit"]);
+    expect(violations[0].step).toBe("narrate");
+    expect(violations[0].detail).toBe(
+      `step "narrate" (\`step:claude\`) writes to the worktree but runs after "commit" — its work ` +
+        `would never be committed, so the run would report success on changes no one can see. Move it ` +
+        `before the commit`,
+    );
   });
 
   it("but accepts the review gate after the commit — it commits its own fixes", () => {
