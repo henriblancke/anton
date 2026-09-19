@@ -62,21 +62,36 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
   // `enforceDescriberReadOnly`.
   const before = await readWorktreeState(ctx.worktreePath);
 
-  const { result, text } = await dispatchAndCapture(ctx, {
-    beadId: ctx.target.id,
-    prompt,
-    appendSystemPrompt,
-    failure: (t) => `describer reported an error for ${ctx.target.id}: ${t ?? "unknown"}`,
-    // The describer writes prose, never code — see `DESCRIBE_DENIED_TOOLS`.
-    disallowedTools: [...DESCRIBE_DENIED_TOOLS],
-    // This step describes the RUN, so its model route resolves against the run's whole label context
-    // rather than its ticket count (PR #303 review).
-    runLevelLabels: true,
-    // NOT `execute` (the default): an `execute` session settled `done` is delivery evidence
-    // (`listDeliveriesByBead` in runs.ts), and this step delivers nothing — it writes no code, makes
-    // no commit, and cannot fail the run. See the `describe` kind's own note in sessions.ts.
-    sessionKind: "describe",
-  });
+  let dispatch: { result: StepResult; text: string | undefined };
+  try {
+    dispatch = await dispatchAndCapture(ctx, {
+      beadId: ctx.target.id,
+      prompt,
+      appendSystemPrompt,
+      failure: (t) => `describer reported an error for ${ctx.target.id}: ${t ?? "unknown"}`,
+      // The describer writes prose, never code — see `DESCRIBE_DENIED_TOOLS`.
+      disallowedTools: [...DESCRIBE_DENIED_TOOLS],
+      // This step describes the RUN, so its model route resolves against the run's whole label
+      // context rather than its ticket count (PR #303 review).
+      runLevelLabels: true,
+      // NOT `execute` (the default): an `execute` session settled `done` is delivery evidence
+      // (`listDeliveriesByBead` in runs.ts), and this step delivers nothing — it writes no code,
+      // makes no commit, and cannot fail the run. See the `describe` kind's own note in sessions.ts.
+      sessionKind: "describe",
+    });
+  } catch (e) {
+    // A describer that wrote and then DIED — quota exhaustion, the job's deadline, a lost lease —
+    // left exactly the dirt one that survived would have, and this is the only path that reaches it:
+    // the module-level catch turns the throw into `{ ok: true }` without ever seeing the worktree.
+    // The reviewer reverts on its own throw path for the same reason (`discardSessionWrites`).
+    //
+    // A failed revert must not mask the failure that got us here, which is the one the runner
+    // classifies (a `UsageLimitError` has to reach it as itself to reschedule rather than burn an
+    // attempt), so the original error is rethrown either way.
+    await enforceDescriberReadOnly(ctx, before).catch(() => {});
+    throw e;
+  }
+  const { result, text } = dispatch;
 
   // Only a SUCCEEDED dispatch can speak for the branch (PR #303 review). `dispatchClaude` returns
   // `{ ok: false }` for a claude result that failed without throwing — a non-transient error result,

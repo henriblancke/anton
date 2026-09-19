@@ -223,6 +223,26 @@ describe("step:describe", () => {
       expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
     });
 
+    it("reverts a describer that wrote and then DIED", async () => {
+      // The module-level catch turns a throw into `{ ok: true }` without ever seeing the worktree,
+      // so the dispatch's own catch is the only path that reaches the dirt. A quota exhaustion here
+      // is the realistic case: the run is rescheduled and resumes on whatever tree this left.
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const dies = async (): Promise<never> => {
+        writeFileSync(join(dir, "src/feature.ts"), "export const feature = false; // half-done\n");
+        throw new UsageLimitError("quota exhausted", Math.floor(Date.now() / 1000) + 60);
+      };
+
+      const result = await describeStep(ctx({ deps: { runClaude: dies } }));
+
+      expect(result.ok).toBe(true);
+      expect(result.facts?.narrative).toBeUndefined();
+      expect(execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+      expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
+    });
+
     it("leaves an honest describer's tree and narrative alone", async () => {
       checkoutRun();
       commitFile("src/feature.ts", "export const feature = true;\n");
