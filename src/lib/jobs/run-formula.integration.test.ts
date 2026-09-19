@@ -99,6 +99,7 @@ describeBd("run formula (real bd)", () => {
       "verify",
       "commit",
       "review",
+      "describe",
       "pr",
     ]);
     expect(validated.steps.map((s) => s.definition.name)).toEqual([
@@ -106,6 +107,7 @@ describeBd("run formula (real bd)", () => {
       "verify",
       "commit",
       "review",
+      "describe",
       "pr",
     ]);
   });
@@ -122,6 +124,7 @@ describeBd("run formula (real bd)", () => {
       "verify",
       "commit",
       "review",
+      "describe",
       "pr",
     ]);
   });

@@ -145,10 +145,39 @@ export function writeBin(dir: string, name: string, body: string): string {
 }
 
 /**
+ * The marker that identifies a `step:describe` dispatch from its prompt alone: the `narrative` key in
+ * the report shape `narrativeReportFormat()` (steps/prompts.ts) asks the describer to emit. Unique to
+ * that prompt — `## Reporting format (required)`, the obvious candidate, is shared verbatim with the
+ * REVIEW prompt (review-context.ts), so a fake keying on that classifies a describe dispatch as a
+ * review round.
+ */
+const DESCRIBE_PROMPT_MARKER = '{"narrative":';
+
+/**
  * Wrap a fake-claude body so it reads the task prompt from stdin and the composed system prompt from
  * the file named by `--append-system-prompt-file` — matching the driver, which keeps both off argv so
  * no bead/contract text is visible in `ps` (anton-14tj). Inside `inner`, `fs`/`path` are required and
  * `prompt` (stdin), `append` (system-prompt file contents), `a` (argv), and `get(flag)` are in scope.
+ *
+ * A `step:describe` dispatch NEVER reaches `inner` (anton-aucch). The describer runs once per run on
+ * the committed diff, so every suite here gained a dispatch none of them scripted — and because its
+ * prompt renders each ticket as `### Ticket: <id>`, the `/Ticket: (\S+)/` most of these fakes
+ * classify on matches it and logs the describe dispatch as an implementation of whichever ticket
+ * happens to be first. That corrupts a dispatch ledger (a ticket counted twice, or one the case
+ * asserts was never dispatched), advances the in-worktree counters several fakes use to decide which
+ * invocation fails, and — worst — writes `AGENT_WORK.md` into the worktree AFTER the commit, which the
+ * step declares it never does (`producesDiff: false`, step-registry.ts). Short-circuiting here fixes
+ * all of that in one place rather than teaching sixteen fakes the same new branch.
+ *
+ * The short-circuit ends with `process.exit(0)` rather than returning, exactly as every `inner` body
+ * does: these fakes do not exit on their own once stdin has ended, so falling off the end of the
+ * handler leaves the process alive and the dispatch hangs until the job's 150s deadline.
+ *
+ * The canned answer reports NO narrative, which is a legal describer outcome the step handles
+ * explicitly ("describer produced no parseable narrative" ⇒ `ok: true`, steps/describe.ts). So every
+ * PR body these suites assert on stays byte-identical to what it was before the step existed. The
+ * narrative actually reaching a PR body is proven by the case that scripts one — see
+ * `describeNarrativeClaude` below.
  */
 export function fakeClaudeReadingStdin(inner: string): string {
   return `const fs=require('fs');const path=require('path');
@@ -159,8 +188,58 @@ let prompt='';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data',c=>{prompt+=c;});
 process.stdin.on('end',()=>{
+if(prompt.includes(${JSON.stringify(DESCRIBE_PROMPT_MARKER)})){
+  const d=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+  d({type:'system',subtype:'init',session_id:'describe'});
+  d({type:'assistant',message:{content:[{type:'text',text:'read the diff; no narrative to report'}]}});
+  d({type:'result',subtype:'success',result:'no narrative',session_id:'describe',num_turns:1,is_error:false});
+  process.exit(0);
+}
 ${inner}
 });`;
+}
+
+/**
+ * A fake claude that ANSWERS the describe dispatch with a scripted narrative, instead of the
+ * no-narrative default {@link fakeClaudeReadingStdin} short-circuits every describe dispatch with.
+ *
+ * The short-circuit is what keeps the other suites' ledgers and PR bodies unchanged, so it also makes
+ * the narrative-reaches-the-PR-body path unreachable from any of them. This is the seam that proves
+ * it end to end: the describer reports a real narrative, and the caller asserts it on the body `gh`
+ * was actually invoked with. Implementation dispatches take the normal path — append the work file
+ * and succeed — so a run using this fake still delivers its tickets.
+ */
+export function describeNarrativeClaude(
+  binDir: string,
+  name: string,
+  narrative: { summary: string; spotlight?: string; risks?: string },
+): string {
+  // NOT built through `fakeClaudeReadingStdin`: its describe short-circuit would answer the dispatch
+  // before this body ever saw it. Reading stdin is duplicated here for that reason alone.
+  const report = JSON.stringify(JSON.stringify({ narrative }));
+  // Built from char codes, not written literally: this string is interpolated into a TEMPLATE literal
+  // below, where a backtick would terminate the template rather than land in the generated script.
+  const tick = String.fromCharCode(96).repeat(3);
+  return writeBin(
+    binDir,
+    name,
+    `const fs=require('fs');const path=require('path');
+let prompt='';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data',c=>{prompt+=c;});
+process.stdin.on('end',()=>{
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+let text='implemented the ticket';
+if(prompt.includes(${JSON.stringify(DESCRIBE_PROMPT_MARKER)})){
+  text=${JSON.stringify(`${tick}json`)}+'\\n'+${report}+'\\n'+${JSON.stringify(tick)};
+}else{
+  fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+Date.now()+'\\n');
+}
+e({type:'system',subtype:'init',session_id:'narr'});
+e({type:'assistant',message:{content:[{type:'text',text}]}});
+e({type:'result',subtype:'success',result:text,session_id:'narr',num_turns:1,is_error:false});
+});`,
+  );
 }
 
 /**

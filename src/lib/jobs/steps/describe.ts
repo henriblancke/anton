@@ -56,6 +56,10 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
     prompt,
     appendSystemPrompt,
     failure: (t) => `describer reported an error for ${ctx.target.id}: ${t ?? "unknown"}`,
+    // NOT `execute` (the default): an `execute` session settled `done` is delivery evidence
+    // (`listDeliveriesByBead` in runs.ts), and this step delivers nothing — it writes no code, makes
+    // no commit, and cannot fail the run. See the `describe` kind's own note in sessions.ts.
+    sessionKind: "describe",
   });
 
   const narrative = parseNarrativeReport(text);

@@ -178,7 +178,12 @@ export function parseRecordedNarrative(raw: string | null | undefined): RunNarra
       typeof parsed === "object" &&
       parsed !== null &&
       typeof (parsed as Record<string, unknown>).summary === "string" &&
-      (parsed as Record<string, unknown>).summary
+      // TRIMMED-non-empty, exactly as `isRunNarrative` (steps/describe.ts) requires of a freshly
+      // parsed report: a whitespace-only summary is not a narrative, and restoring one as if it were
+      // would open the PR body with a blank opening instead of falling back to today's body.
+      // Unreachable through the normal write path (`sanitizeNarrativeField` trims before persisting),
+      // so this is symmetry with the parser it mirrors rather than a live bug — PR #303 review.
+      ((parsed as Record<string, unknown>).summary as string).trim()
     ) {
       return parsed as RunNarrative;
     }

@@ -67,6 +67,10 @@ describe("parseRecordedNarrative", () => {
     expect(parseRecordedNarrative("null")).toBeUndefined();
     expect(parseRecordedNarrative('{"spotlight":"no summary field"}')).toBeUndefined();
     expect(parseRecordedNarrative('{"summary":""}')).toBeUndefined();
+    // Whitespace-only reads the same as empty, matching `isRunNarrative`'s trimmed check on a fresh
+    // report (PR #303 review): a blank summary restored as valid would open the PR body with nothing.
+    expect(parseRecordedNarrative('{"summary":"   "}')).toBeUndefined();
+    expect(parseRecordedNarrative('{"summary":"\\n\\t"}')).toBeUndefined();
   });
 });
 
