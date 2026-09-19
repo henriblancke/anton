@@ -7,6 +7,7 @@
 import type { Bead, CookedStep } from "../../beads/bd";
 import type { SatisfiedBy } from "../../beads/satisfied-note";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
+import type { WorktreeState } from "../../git/ops";
 import type { ProjectSettings } from "../../projects";
 import { startJobSession, type JobSession, type SessionKind } from "../../sessions";
 import type { ReviewFinding } from "../review-context";
@@ -57,6 +58,14 @@ export interface StepDeps {
   runClaude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   /** True when `runClaude` meters each internal retry, so dispatch must not add an outer row. */
   recordsEachAttempt?: boolean;
+  /**
+   * The worktree fingerprint a read-only step guards with (`step:describe`), and the restore it puts
+   * the tree back with. Production passes neither; the seam exists so a test can drive the failure
+   * paths — an unreadable tree, a revert that cannot complete — which are the ones that decide
+   * whether the guard fails open. The review gate exposes the same two.
+   */
+  readWorktreeState?: (worktreePath: string) => Promise<WorktreeState>;
+  restoreWorktreeState?: (worktreePath: string, state: WorktreeState) => Promise<void>;
 }
 
 /**

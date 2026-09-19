@@ -174,13 +174,26 @@ describe("step:describe", () => {
       await describeStep(ctx({ deps: { runClaude: claude.run } }));
 
       // Deny rules outrank the permission mode, so these BIND a `bypassPermissions` session.
+      // `Task` is on the list because a subagent is a fresh tool context (same list the other
+      // read-only pass denies — `PM_DENIED_TOOLS`).
       expect(claude.calls[0].disallowedTools).toEqual([
         "Write",
         "Edit",
         "MultiEdit",
         "NotebookEdit",
         "Bash",
+        "Task",
       ]);
+    });
+
+    it("loads only the operator's settings, not the described tree's", async () => {
+      // `.claude/settings.json` is source-controlled and registers hooks that run shell commands —
+      // a write path the deny list cannot see, in the very tree this session is describing.
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
+
+      await describeStep(ctx({ deps: { runClaude: claude.run } }));
+
+      expect(claude.calls[0].settingSources).toEqual(["user"]);
     });
 
     it("reverts a describer that edited the tree anyway, and drops its narrative", async () => {
@@ -286,6 +299,67 @@ describe("step:describe", () => {
       expect(result.ok).toBe(true);
       expect(result.facts?.narrative).toBeUndefined();
       expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
+    });
+
+    it("still reverts when the post-dispatch fingerprint cannot be READ", async () => {
+      // Unknown is not clean. The read runs git and can fail on a momentarily unreadable or
+      // lock-contended tree; treating that as "unchanged" would skip the revert on exactly the tree
+      // most likely to need one.
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const restored: string[] = [];
+      let reads = 0;
+
+      const result = await describeStep(
+        ctx({
+          deps: {
+            runClaude: async () => ({
+              ok: true as const,
+              text: report(JSON.stringify({ narrative: { summary: "x" } })),
+              modelUsage: [],
+            }),
+            // First read is the baseline; the one AFTER the dispatch throws.
+            readWorktreeState: async () => {
+              if (reads++ > 0) throw new Error("git status: unable to read index");
+              return { head: "abc123", ref: "refs/heads/run", status: "" };
+            },
+            restoreWorktreeState: async (wt) => {
+              restored.push(wt);
+            },
+          },
+        }),
+      );
+
+      // Reverted despite never having a readable "after" to compare against.
+      expect(restored).toEqual([dir]);
+      expect(result.ok).toBe(true);
+      expect(result.facts?.narrative).toBeUndefined();
+    });
+
+    it("PARKS when the tree is unreadable AND the revert fails — the state may be either", async () => {
+      checkoutRun();
+      let reads = 0;
+
+      await expect(
+        describeStep(
+          ctx({
+            deps: {
+              runClaude: async () => ({
+                ok: true as const,
+                text: report(JSON.stringify({ narrative: { summary: "x" } })),
+                modelUsage: [],
+              }),
+              readWorktreeState: async () => {
+                if (reads++ > 0) throw new Error("git status: unable to read index");
+                return { head: "abc123", ref: "refs/heads/run", status: "" };
+              },
+              restoreWorktreeState: async () => {
+                throw new Error("reset --hard failed");
+              },
+            },
+          }),
+        ),
+      ).rejects.toThrow(/could not be read/);
     });
 
     it("leaves an honest describer's tree and narrative alone", async () => {

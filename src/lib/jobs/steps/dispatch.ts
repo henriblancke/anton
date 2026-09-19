@@ -54,6 +54,14 @@ export async function dispatchClaude(
      * — which is what makes it usable as a guard by a step that must not write (`step:describe`).
      */
     disallowedTools?: string[];
+    /**
+     * Which settings files this session loads (`--setting-sources`). Omitted → Claude Code's default
+     * of `user,project,local`, which reads `.claude/settings.json` FROM THE WORKTREE — source-
+     * controlled, and able to register hooks that run shell commands. A session that must not write
+     * passes `["user"]`, leaving it configured only by the machine anton runs on (the reviewer does
+     * the same, via `REVIEW_SETTING_SOURCES`).
+     */
+    settingSources?: Array<"user" | "project" | "local">;
   },
 ): Promise<StepResult> {
   // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
@@ -98,6 +106,7 @@ export async function dispatchClaude(
       routing,
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
       ...(args.disallowedTools ? { disallowedTools: args.disallowedTools } : {}),
+      ...(args.settingSources ? { settingSources: args.settingSources } : {}),
       signal: ctx.ctx.signal,
       onEvent: session.onEvent,
     });

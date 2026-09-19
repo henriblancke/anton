@@ -70,7 +70,7 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
   const appendSystemPrompt = await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt });
   // The tree as it stands BEFORE the describer runs — the commit the PR step is about to push. See
   // `enforceDescriberReadOnly`.
-  const before = await readWorktreeState(ctx.worktreePath);
+  const before = await (ctx.deps?.readWorktreeState ?? readWorktreeState)(ctx.worktreePath);
 
   let dispatch: { result: StepResult; text: string | undefined };
   try {
@@ -81,6 +81,11 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
       failure: (t) => `describer reported an error for ${ctx.target.id}: ${t ?? "unknown"}`,
       // The describer writes prose, never code — see `DESCRIBE_DENIED_TOOLS`.
       disallowedTools: [...DESCRIBE_DENIED_TOOLS],
+      // Only the operator's settings. The default would load `.claude/settings.json` from the tree
+      // under description — source-controlled, and able to register hooks that run shell commands,
+      // which is a write path no tool-name filter can see. Same reasoning as the reviewer's
+      // `REVIEW_SETTING_SOURCES`.
+      settingSources: ["user"],
       // This step describes the RUN, so its model route resolves against the run's whole label
       // context rather than its ticket count (PR #303 review).
       runLevelLabels: true,
@@ -136,10 +141,16 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
  * tool that writes bytes — so every write-shaped tool is denied outright (PR #303 review).
  *
  * The reviewer denies the same four plus `Bash(git:*)`, keeping `Bash` because its contract asks it
- * to run the project's own checks; that concession is what forces the reviewer's OS-level sandbox
- * (jobs/review-sandbox), since a shell writes bytes with none of these tools. The describer has no
- * such need, so `Bash` goes too — closing the shell hole by removing the shell rather than
- * containing it, which is why this step needs no sandbox of its own.
+ * to run the project's own checks. The describer has no such need — its entire input is the diff,
+ * the file list and the beads — so `Bash` and `Task` go too, matching the other read-only pass in
+ * this codebase (`PM_DENIED_TOOLS`). `Task` because a subagent is a fresh tool context, and `Bash`
+ * outright rather than by command prefix because a prefix filter cannot cover every path to a write.
+ *
+ * This does NOT mean no shell can run in the session, which is why `settingSources` is narrowed to
+ * `user` at the call site: Claude Code's default would load `.claude/settings.json` from the very
+ * worktree being described, and settings register hooks that run shell commands. Reading stays open
+ * throughout (`Read`/`Grep`/`Glob`) — a truncated diff tells the describer to read the files, and a
+ * read changes nothing.
  *
  * It matters because the describer runs under the EXECUTION system prompt, which tells the agent it
  * is implementing a ticket and should edit the working tree, at the project's configured permission
@@ -148,7 +159,7 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
  * dirt that breaks a pre-push hook and strands the run, or — worse — commit code that the review
  * gate, which has already run by this point, never saw.
  */
-const DESCRIBE_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] as const;
+const DESCRIBE_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash", "Task"] as const;
 
 /**
  * The second half of the guard above: catch a describer that wrote ANYWAY and put the tree back.
@@ -171,15 +182,28 @@ const DESCRIBE_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Ba
  * reviewer's `discardSessionWrites` makes on the same evidence.
  */
 async function enforceDescriberReadOnly(ctx: StepContext, before: WorktreeState): Promise<boolean> {
-  const after = await readWorktreeState(ctx.worktreePath);
-  if (sameWorktreeState(after, before)) return false;
+  // A fingerprint that cannot be READ does not short-circuit the restore (PR #303 review). The read
+  // runs git and can fail on a momentarily unreadable or lock-contended tree; treating that as
+  // "unchanged" would skip the revert entirely on the one tree most likely to need it. Unknown is
+  // not clean — fall through and reset unconditionally, exactly as `discardSessionWrites` does.
+  const readState = ctx.deps?.readWorktreeState ?? readWorktreeState;
+  const restoreState = ctx.deps?.restoreWorktreeState ?? restoreWorktreeState;
+  let after: WorktreeState | undefined;
   try {
-    await restoreWorktreeState(ctx.worktreePath, before);
+    after = await readState(ctx.worktreePath);
+  } catch {
+    after = undefined;
+  }
+  if (after && sameWorktreeState(after, before)) return false;
+  try {
+    await restoreState(ctx.worktreePath, before);
   } catch (e) {
-    if (after.head !== before.head || after.ref !== before.ref) {
+    // A state nobody could read may be either, so it parks with the stuck cases rather than passing
+    // for survivable dirt.
+    if (after === undefined || after.head !== before.head || after.ref !== before.ref) {
       throw new PoisonError(
         `the describer of ${ctx.target.id} WROTE to its own worktree and the revert failed (${errorText(e)}): ` +
-          `${ctx.worktreePath} is at ${after.ref ?? "detached"}@${after.head.slice(0, 12)}, not the reviewed ` +
+          `${ctx.worktreePath} is ${after ? `at ${after.ref ?? "detached"}@${after.head.slice(0, 12)}` : "in a state that could not be read"}, not the reviewed ` +
           `${before.ref ?? "detached"}@${before.head.slice(0, 12)}. Parked instead of continued — opening the PR ` +
           `from here would push a commit the review gate never saw. Reset the worktree by hand, then resume.`,
       );
