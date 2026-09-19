@@ -14,6 +14,7 @@ import { AgentsSection } from "@/components/settings/sections/agents-section";
 import { AutomationSection } from "@/components/settings/sections/automation-section";
 import { AutopilotSection } from "@/components/settings/sections/autopilot-section";
 import { DangerSection } from "@/components/settings/sections/danger-section";
+import { DescribeSection } from "@/components/settings/sections/describe-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
 import { GatewaySection } from "@/components/settings/sections/gateway-section";
@@ -172,6 +173,7 @@ export function SettingsView({
     repairs: <RepairsSection form={form} projectSlug={project.slug} />,
     gates: <GatesSection form={form} />,
     review: <ReviewSection form={form} agents={agents} />,
+    describe: <DescribeSection form={form} />,
     "review-fix": <ReviewFixSection form={form} />,
     automation: (
       <AutomationSection form={form} schedules={automationSchedules} defaultCrons={defaultCrons} />

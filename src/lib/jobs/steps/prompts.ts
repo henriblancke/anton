@@ -7,13 +7,14 @@
  * handler should be a dozen lines of orchestration, not a paragraph of prose.
  */
 import type { Bead } from "../../beads/bd";
-import { acceptanceBody } from "../../beads/contract";
+import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../../beads/contract";
 import { humanNotesPromptBlock } from "../../beads/notes";
 import { shortSha } from "../../beads/satisfied-note";
-import type { PreservedCommit } from "../../git/ops";
+import type { BranchDiff, PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import { findingLines, type ReviewFinding } from "../review-context";
 import type { SatisfiedSettlement, StepContext } from "./context";
+import type { RunNarrative } from "./result";
 
 /** A ticket in scope whose previous attempt left preserved work on the branch (anton-16pq). */
 export interface TicketPreserved {
@@ -364,7 +365,80 @@ function ticketPromptClosing(ticketId: string, preserved: boolean): string {
   ].join("\n");
 }
 
+/** An ATX heading, recognized the same way CommonMark does at block level: up to 3 leading spaces,
+ * then 1-6 `#`, then whitespace or end of line. */
+const HEADING_LINE = /^ {0,3}#{1,6}(?:[ \t]|$)/;
+/** An opening or closing code fence: up to 3 leading spaces, then a run of 3+ backticks or tildes. */
+const FENCE_LINE = /^ {0,3}(?:`{3,}|~{3,})/;
+/** The leading run of spaces plus the single structural character a heading or fence line opens with. */
+const STRUCTURAL_PREFIX = /^( {0,3})([#`~])/;
+
 /**
+ * Defuse a line of untrusted prose (a describer's narrative) that would itself parse as a markdown
+ * heading or a fenced-code delimiter, so it can't forge one of anton's own `##`/`###` sections below
+ * it, or open a fence that swallows the rest of the body as literal code (anton-7x273). A backslash
+ * before the leading `#`/backtick/tilde keeps the character on the page while pulling the line out
+ * of CommonMark's block-level grammar — the same trick `formatHumanNote` uses against a forged
+ * `[human-note …]` header (beads/notes.ts).
+ */
+function defuseStructuralLines(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) =>
+      HEADING_LINE.test(line) || FENCE_LINE.test(line) ? line.replace(STRUCTURAL_PREFIX, "$1\\$2") : line,
+    )
+    .join("\n");
+}
+
+/** Untrusted prose (describer narrative, a bead's free text) as it may safely reach a PR body: bounded
+ * by the same field cap every inlined ticket field carries ({@link truncateField}), then defused. */
+const renderUntrusted = (text: string): string => defuseStructuralLines(truncateField(text));
+
+/**
+ * `summary`, then "Review these first" (`spotlight`) and "Risks", each present only when the
+ * describer reported one (anton-7x273). Exported so the stale-body salvage
+ * (`stalePrBodyNote` in execute-epic-review.ts) can carry the same narrative when a `gh` refresh
+ * fails and the PR body itself is stuck on an earlier attempt's text — the narrative would
+ * otherwise be lost with nowhere else to land.
+ */
+export function narrativeFieldLines(narrative: RunNarrative | undefined): string[] {
+  if (!narrative) return [];
+  const spotlight = narrative.spotlight?.trim();
+  const risks = narrative.risks?.trim();
+  return [
+    renderUntrusted(narrative.summary),
+    ``,
+    ...(spotlight ? [`### Review these first`, ``, renderUntrusted(spotlight), ``] : []),
+    ...(risks ? [`### Risks`, ``, renderUntrusted(risks), ``] : []),
+  ];
+}
+
+/**
+ * What `prBody` opens with when a describer reported a narrative: what changed and why, what to
+ * check first, what could break, then the run target's own `## Out of scope` — read off the BEAD
+ * (`outOfScopeBody`), not the describer, so a swapped reasoning contract can never change what the
+ * PR claims is deliberately left out.
+ *
+ * Absent entirely when there is no narrative: a project with no `step:describe` (or one whose
+ * describer never reported) gets exactly today's body, Out of scope included — the two ride
+ * together rather than Out of scope standing alone on a run that never opted into narration.
+ */
+function narrativeOpening(target: Bead, narrative: RunNarrative | undefined): string[] {
+  if (!narrative) return [];
+  const outOfScope = outOfScopeBody(target)?.trim();
+  return [
+    ...narrativeFieldLines(narrative),
+    ...(outOfScope ? [`## Out of scope`, ``, renderUntrusted(outOfScope), ``] : []),
+    `---`,
+    ``,
+  ];
+}
+
+/**
+ * `narrative` — what the describer reported for this run (anton-7x273), opening the body when
+ * present, the run target's `## Out of scope` alongside it. Absent entirely when there is no
+ * narrative, so a project without `step:describe` sees exactly today's body ({@link narrativeOpening}).
+ *
  * `advisory` — findings the self-review reported and did NOT fix (anton-omum). They never hold the PR
  * back, so the merge gate is the only place the founder would ever see them; putting them in the body
  * is what makes "self-reviewed" mean something they can act on rather than trust blindly.
@@ -381,11 +455,13 @@ export function prBody(
   tickets: Bead[],
   advisory: ReviewFinding[] = [],
   satisfied: ReadonlyMap<string, SatisfiedSettlement> = new Map(),
+  narrative?: RunNarrative,
 ): string {
   // Standalone run (epic-of-one): the single ticket IS the target, so listing it again is noise.
   const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
   const committed = tickets.filter((t) => !satisfied.has(t.id));
   const lines = [
+    ...narrativeOpening(target, narrative),
     `Autonomous run for **${target.id}** — ${target.title}.`,
     ``,
     ...(standalone || committed.length === 0
@@ -466,4 +542,117 @@ function satisfiedGroup(
 /** `<short sha> "<subject>"` — the subject is the attribution, since anton's commits are named for their ticket. */
 function satisfiedByLine(by: SatisfiedSettlement): string {
   return by.subject ? `${shortSha(by.commit)} "${by.subject}"` : shortSha(by.commit);
+}
+
+/**
+ * The context appended beneath the describer's reasoning contract (anton-aucch): the run target,
+ * every ticket with its contract, and the diff under description — plus the reporting format the
+ * narrative is parsed back out of (`parseNarrativeReport` in `steps/describe.ts`).
+ *
+ * A standalone run (epic-of-one) lists its bead once, the same rule {@link prBody} applies — repeating
+ * it as "ticket 1" would read as two separate contracts to describe against.
+ */
+export function describeContext(args: { target: Bead; tickets: Bead[]; diff: BranchDiff }): string {
+  const { target, tickets, diff } = args;
+  const standalone = tickets.length === 1 && tickets[0]?.id === target.id;
+  return [
+    `## This run`,
+    ``,
+    `Run target: ${target.id} — ${target.title}`,
+    `Tickets in this run: ${tickets.length}`,
+    `Files changed: ${diff.files.length}`,
+    ``,
+    ...describeBeadBlock(target, "Run target"),
+    ...(standalone ? [] : tickets.flatMap((t) => describeBeadBlock(t, "Ticket"))),
+    ...describeDiffBlock(diff),
+    ...narrativeReportFormat(),
+  ].join("\n");
+}
+
+/** One bead's contract, in the same four sections a reviewer is shown ({@link acceptanceSection} and siblings). */
+function describeBeadBlock(bead: Bead, label: string): string[] {
+  const field = (heading: string, body: string | undefined): string[] => [
+    `**${heading}**`,
+    body?.trim() ? truncateField(body) : `(none stated)`,
+    ``,
+  ];
+  return [
+    `### ${label}: ${bead.id} — ${bead.title}`,
+    ``,
+    ...field("Goal", goalBody(bead)),
+    ...field("Acceptance", acceptanceBody(bead)),
+    ...field("Out of scope", outOfScopeBody(bead)),
+    ...field("Verify", verifyBody(bead)),
+  ];
+}
+
+/** The diff itself, mirroring review-context.ts's own rendering — same file list, same rescued deletions. */
+function describeDiffBlock(diff: BranchDiff): string[] {
+  if (diff.files.length === 0) {
+    return [`## The diff`, ``, `This run produced NO changes against its base.`, ``];
+  }
+  return [
+    `## The diff`,
+    ``,
+    `Changed files (${diff.files.length}):`,
+    ...diff.files.map((f) => `- ${f}`),
+    ``,
+    ...(diff.truncated
+      ? [`The patch below is truncated — read the files in the worktree for anything it cuts off.`, ``]
+      : []),
+    "```diff",
+    diff.patch,
+    "```",
+    ``,
+    ...describeDeletionsBlock(diff),
+  ];
+}
+
+/**
+ * The deletions a truncated patch may have cut off, repeated in full — a file this run DELETED is
+ * not in the worktree to read, same reasoning as the reviewer's own rescue.
+ */
+function describeDeletionsBlock(diff: BranchDiff): string[] {
+  if (!diff.deletions && !diff.deletionsIncomplete && !diff.deletionsUnshown) return [];
+  return [
+    `### Files this run DELETED`,
+    ``,
+    `Repeated here because the patch above is truncated and a deleted file is not in the worktree to read.`,
+    ``,
+    ...(diff.deletions ? ["```diff", diff.deletions, "```", ``] : []),
+    ...(diff.deletionsIncomplete
+      ? [`Some deletions could not be recovered — anton's own git read failed partway through.`, ``]
+      : []),
+    ...(diff.deletionsUnshown
+      ? [`${diff.deletionsUnshown} deleted file(s) are named above but not shown — the budget ran out.`, ``]
+      : []),
+  ];
+}
+
+/**
+ * The report format the describer is asked to end its final message with — DEFINED here and PARSED
+ * in `steps/describe.ts`'s `parseNarrativeReport`, so a swapped reasoning contract (a `prompt:<id>`,
+ * a `skill:<id>`, an operator's `describePrompt`) can never break the protocol anton relies on.
+ *
+ * Unlike the reviewer's report, nothing here is mandatory but `summary`: this step never blocks the
+ * run, so there is nothing to be strict about — a short, an empty, or an absent report all cost the
+ * narrative alone.
+ */
+function narrativeReportFormat(): string[] {
+  return [
+    `## Reporting format (required)`,
+    ``,
+    `End your final message with a fenced json block, in exactly this shape:`,
+    ``,
+    "```json",
+    `{"narrative":{"summary":"what changed and why","spotlight":"what to look at first, and why (may be omitted)","risks":"what could break, and under what conditions — or that you found nothing (may be omitted)"}}`,
+    "```",
+    ``,
+    `\`summary\` is the only required field. \`spotlight\` and \`risks\` may be omitted, or left brief,`,
+    `when you are short on budget or certainty — write what you're sure of and stop, per the guidance`,
+    `above; do not invent detail to fill either section.`,
+    ``,
+    `This step never blocks the run and cannot fail it: if you emit no report, or one anton cannot`,
+    `parse, the pull request simply carries no narrative. Report what you have rather than nothing.`,
+  ];
 }

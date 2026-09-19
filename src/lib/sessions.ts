@@ -20,6 +20,15 @@ export type SessionKind =
   | "review"
   | "review-fix"
   /**
+   * The PR describer (anton-aucch) — the one run-level dispatch that reads the committed diff and
+   * writes the narrative. Its OWN kind rather than `execute` because an `execute` session settled
+   * `done` is read as DELIVERY evidence (`listDeliveriesByBead` in runs.ts, which the picker's
+   * failure breaker weighs repair stamps against), and the describer delivers nothing: it writes no
+   * code, makes no commit, and cannot fail the run. Filed as `execute` it would let a run that
+   * merely REACHED the describer spend a repair stamp its tickets never earned.
+   */
+  | "describe"
+  /**
    * A resume whose worktree matched an earlier clean verdict's resume key (anton-qmuyt) — no
    * claude session runs, so a row exists only when the skip actually happens, same as `gardener`
    * and `worktree-reaper` below.

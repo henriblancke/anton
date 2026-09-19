@@ -9,7 +9,7 @@ import { metered } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { quotaMeterKey } from "../../quota-meter";
-import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
+import { appendSessionLog, endSession, setSessionClaudeId, type SessionKind } from "../../sessions";
 import { resolveModel } from "../model-routing";
 import { stepName } from "./resolve";
 import { stepSession, type StepContext } from "./context";
@@ -29,6 +29,12 @@ export async function dispatchClaude(
     appendSystemPrompt: string;
     /** The message for a run claude itself reported as failed. */
     failure: (text: string | undefined) => string;
+    /**
+     * The session kind to record this dispatch under. Defaults to `execute` — a delivering step's
+     * kind, which `listDeliveriesByBead` (runs.ts) reads as delivery evidence. A step that dispatches
+     * an agent but delivers nothing passes its own kind (see `step:describe`).
+     */
+    sessionKind?: SessionKind;
   },
 ): Promise<StepResult> {
   // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
@@ -47,7 +53,7 @@ export async function dispatchClaude(
   const claude = ctx.deps?.recordsEachAttempt
     ? (ctx.deps.runClaude ?? runClaude)
     : metered(ctx.db, ctx.clock, dimensions, ctx.deps?.runClaude ?? runClaude);
-  const { session, owned } = await stepSession(ctx, args.beadId);
+  const { session, owned } = await stepSession(ctx, args.beadId, args.sessionKind);
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 
   try {

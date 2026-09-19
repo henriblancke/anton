@@ -56,6 +56,7 @@ interface SeedRun {
   reviewKeyAdvisories?: string;
   reviewScore?: number;
   reviewKeyScore?: number;
+  narrative?: string;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -72,6 +73,7 @@ async function seed(run: SeedRun): Promise<void> {
     reviewKeyAdvisories: run.reviewKeyAdvisories,
     reviewScore: run.reviewScore,
     reviewKeyScore: run.reviewKeyScore,
+    narrative: run.narrative,
     startedAt: new Date(run.startedAt ?? run.updatedAt),
     endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
@@ -182,6 +184,7 @@ describe("findRunReviewKeyForBranch (anton-nyz1v)", () => {
       reviewKey: "base:head:fp",
       reviewKeyAdvisories: "[]",
       reviewScore: 8,
+      narrative: null,
     });
   });
 
@@ -204,6 +207,26 @@ describe("findRunReviewKeyForBranch (anton-nyz1v)", () => {
       reviewKey: "base:head:fp",
       reviewKeyAdvisories: "[]",
       reviewScore: 8,
+      narrative: null,
+    });
+  });
+
+  it("recovers the narrative describe wrote on the same failed attempt (anton-fpkk8)", async () => {
+    await seed({
+      id: "r1",
+      status: "failed",
+      updatedAt: 1_000_000,
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewKeyScore: 8,
+      narrative: JSON.stringify({ summary: "what changed" }),
+    });
+
+    expect(await findRunReviewKeyForBranch(t.db, PROJECT, EPIC, BRANCH, "r2")).toEqual({
+      reviewKey: "base:head:fp",
+      reviewKeyAdvisories: "[]",
+      reviewScore: 8,
+      narrative: JSON.stringify({ summary: "what changed" }),
     });
   });
 

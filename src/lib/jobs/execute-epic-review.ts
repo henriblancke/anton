@@ -12,7 +12,8 @@ import { describeScoreRegression, formatScoreSeries } from "./review-alarm";
 import { findingLines, type ReviewFinding } from "./review-context";
 import { finalViolation, type ReviewGateResult } from "./review-gate";
 import type { SatisfiedSettlement } from "./steps/context";
-import { satisfiedLines } from "./steps/prompts";
+import { narrativeFieldLines, satisfiedLines } from "./steps/prompts";
+import type { RunNarrative } from "./steps/result";
 
 /**
  * Why the gate refused the PR, in one clause — shared by the park note and the thrown error so the
@@ -226,24 +227,28 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
 }
 
 /**
- * The salvage note for a reused PR whose body could not be refreshed: this run's advisory findings
- * and its satisfied attribution, plus the warning that the PR text belongs to an earlier attempt.
+ * The salvage note for a reused PR whose body could not be refreshed: this run's advisory findings,
+ * its satisfied attribution, and its narrative (anton-7x273), plus the warning that the PR text
+ * belongs to an earlier attempt.
  *
- * The PR body is the ONLY place either is written — the score comments carry counts, a verdict and
- * a rationale, not the notes, and no commit carries a satisfied ticket's name (PR #253 review) — so
+ * The PR body is the ONLY place any of these is written — the score comments carry counts, a
+ * verdict and a rationale, not the notes, no commit carries a satisfied ticket's name (PR #253
+ * review), and a narrative lives only on the run row until `pr` writes it into the body — so
  * without this a `gh pr edit` that failed on a permission or a network blip silently discards every
- * actionable detail this review produced and every attribution the branch cannot speak for, while
- * the founder reads a stale body at the merge gate as if it were current.
+ * actionable detail this review produced, every attribution the branch cannot speak for, and the
+ * narrative itself, while the founder reads a stale body at the merge gate as if it were current.
  */
 export function stalePrBodyNote(
   pr: PullRequest,
   advisory: ReviewFinding[],
   tickets: Bead[] = [],
   satisfied: ReadonlyMap<string, SatisfiedSettlement> = new Map(),
+  narrative?: RunNarrative,
 ): string {
   return [
     `anton: this run reused the PR at ${pr.url} but could NOT rewrite its title/body — what GitHub ` +
       `shows is an earlier attempt's text, not this run's. Read the findings below instead of the PR body.`,
+    ...withLeadingBlank(narrativeFieldLines(narrative)),
     ``,
     ...(advisory.length > 0
       ? [`Advisory findings from this run's self-review (${advisory.length}):`, ...findingLines(advisory)]

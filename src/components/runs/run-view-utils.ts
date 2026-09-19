@@ -21,6 +21,8 @@ export type SessionKind =
   | "review"
   | "review-fix"
   | "review-skip"
+  /** The PR describer (anton-aucch) — a run-level dispatch, so a run surfaces it. */
+  | "describe"
   | "interactive";
 
 export interface SessionSummary {

@@ -24,6 +24,21 @@ import type { StepContext } from "./context";
  */
 export type StepClass = "required" | "default-on" | "additive";
 
+/**
+ * `describe` — the run's narrative, parsed from the describer's report (anton-aucch). Every field is
+ * length-capped and stripped of control bytes and invisible unicode before it reaches here (see
+ * `sanitizeNarrativeField` in `steps/describe.ts`), since it is untrusted agent prose that a later
+ * step (the PR-body renderer) writes verbatim into a pull request.
+ */
+export interface RunNarrative {
+  /** What changed and why — the only field the describer's report must carry. */
+  summary: string;
+  /** What a reviewer should look at first, and why. Omitted when the describer found nothing to spotlight. */
+  spotlight?: string;
+  /** What could break, and under what conditions — "nothing found" is a legitimate value. Omitted when unreported. */
+  risks?: string;
+}
+
 /** What a step produced, for the caller's bookkeeping and for the steps that follow it. */
 export interface StepFacts {
   /** `implement` / `claude` — the agent's `ANTON-RESULT` self-report, when it emitted one. */
@@ -53,6 +68,8 @@ export interface StepFacts {
   pr?: PullRequest;
   /** `review` — the gate's full verdict; the caller owns the park / advisory handling. */
   review?: ReviewGateResult;
+  /** `describe` — the run's narrative, when the describer produced a parseable one. */
+  narrative?: RunNarrative;
   /** Every claude session this step recorded, in dispatch order. */
   sessionIds?: string[];
 }

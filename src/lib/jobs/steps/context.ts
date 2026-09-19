@@ -8,11 +8,12 @@ import type { Bead, CookedStep } from "../../beads/bd";
 import type { SatisfiedBy } from "../../beads/satisfied-note";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import type { ProjectSettings } from "../../projects";
-import { startJobSession, type JobSession } from "../../sessions";
+import { startJobSession, type JobSession, type SessionKind } from "../../sessions";
 import type { ReviewFinding } from "../review-context";
 import type { ReviewRound } from "../review-gate";
 import type { AntonDb, Clock } from "../queue";
 import type { JobContext } from "../runner";
+import type { RunNarrative } from "./result";
 
 /**
  * A satisfied ticket as the run's ledger holds it: the commit it settled on, and whether the close
@@ -139,6 +140,12 @@ export interface StepContext {
    */
   advisories?: ReviewFinding[];
   /**
+   * The run's PR narrative, set from an earlier `describe` step's report (anton-fpkk8). `pr` reads it
+   * for the body it opens (sibling ticket); a SECOND `describe` overwrites it with its own, same as
+   * advisories — a later describer's report is the whole story, not an addition to an earlier one.
+   */
+  narrative?: RunNarrative;
+  /**
    * Where a step records progress the caller still needs when the step THROWS. The review gate's
    * completed rounds are the only user: a gate that dies mid-flight returns nothing, but the founder
    * is still owed the rounds it finished.
@@ -164,16 +171,22 @@ export function stepSubject(ctx: Pick<StepContext, "tickets" | "target">): Bead 
  * The session a step records into: the caller's when it handed one in (`owned: false` — the caller
  * closes it), else one this step opens and closes itself. One rule for every step that produces
  * output, so a run never leaks a `running` session and never splits one ticket's record in two.
+ *
+ * `kind` defaults to `execute`, which is what a step that DELIVERS work records under — the kind
+ * `listDeliveriesByBead` (runs.ts) reads as delivery evidence. A step that dispatches an agent but
+ * delivers nothing passes its own kind instead, so its row is never mistaken for a delivery: see
+ * `step:describe`, which passes `"describe"`.
  */
 export async function stepSession(
   ctx: StepContext,
   beadId: string,
+  kind: SessionKind = "execute",
 ): Promise<{ session: JobSession; owned: boolean }> {
   if (ctx.session) return { session: ctx.session, owned: false };
   const session = await startJobSession(ctx.db, ctx.clock, {
     projectId: ctx.projectId,
     runId: ctx.runId,
-    kind: "execute",
+    kind,
     beadId,
   });
   return { session, owned: true };
