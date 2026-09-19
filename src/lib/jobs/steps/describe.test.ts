@@ -186,6 +186,26 @@ describe("step:describe", () => {
       expect(result.facts?.narrative).toBeUndefined();
     });
 
+    it("a FAILED claude result yields no narrative, even when its text carries one", async () => {
+      // `dispatchClaude` returns `{ ok: false }` for a claude result that failed without throwing —
+      // a non-transient error result, a session the driver settled `failed`. Its text can still
+      // contain a narrative-shaped block: a report the agent began and abandoned, or diagnostic
+      // prose quoting the format. Publishing that as the run's authoritative narrative while the
+      // session is recorded failed contradicts this step's contract (PR #303 review).
+      const claude = fakeClaude({
+        ok: false,
+        text: report(JSON.stringify({ narrative: { summary: "half-written, then the model errored" } })),
+        modelUsage: [],
+      });
+
+      const result = await describeStep(ctx({ deps: { runClaude: claude.run } }));
+
+      expect(result.ok).toBe(true);
+      expect(result.facts?.narrative).toBeUndefined();
+      // The step still reports WHY, so the run log distinguishes a failed describer from a silent one.
+      expect(result.detail).toContain("describer reported an error");
+    });
+
     it("a broken worktree (no git repo at all) reports ok:true with no narrative", async () => {
       rmSync(join(dir, ".git"), { recursive: true, force: true });
       const claude = fakeClaude("never reached");

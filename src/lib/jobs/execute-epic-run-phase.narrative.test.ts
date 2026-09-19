@@ -16,6 +16,8 @@ import type { EpicRun } from "./execute-epic-run";
 import type { RunNarrative, StepResult } from "./steps/result";
 
 const updateRunMock = vi.fn();
+/** The worktree HEAD the faked `readWorktreeState` reports — moved by a test that amends the branch. */
+const headMock = vi.fn(() => HEAD);
 const armMergeGateMock = vi.fn();
 const releaseRunResourcesMock = vi.fn();
 
@@ -46,10 +48,17 @@ vi.mock("./worktree-reaper", () => ({
   releaseRunResources: (...a: unknown[]) => releaseRunResourcesMock(...a),
 }));
 
+// The narrative is bound to the branch tip it was written against (PR #303 review), so the walk
+// reads HEAD on both the restore and the persist. Faked here like every other seam in this file.
+vi.mock("../git/ops", () => ({
+  readWorktreeState: async () => ({ head: headMock(), status: "", ref: `refs/heads/${TARGET}` }),
+}));
+
 const { walkRunPhase } = await import("./execute-epic-run-phase");
 
 const REPO = "/tmp/anton";
 const TARGET = "anton-fpkk8-target";
+const HEAD = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c";
 
 function targetBead(): Bead {
   return { id: TARGET, issue_type: "task", status: "open", labels: [] } as unknown as Bead;
@@ -113,6 +122,7 @@ const narrative = (summary: string): RunNarrative => ({ summary });
 
 beforeEach(() => {
   vi.clearAllMocks();
+  headMock.mockReturnValue(HEAD);
   updateRunMock.mockResolvedValue(undefined);
   armMergeGateMock.mockResolvedValue(undefined);
   releaseRunResourcesMock.mockResolvedValue(undefined);
@@ -134,7 +144,7 @@ describe("walkRunPhase — the PR narrative survives a resume", () => {
       expect.anything(),
       expect.anything(),
       "run-1",
-      expect.objectContaining({ narrative: JSON.stringify(n) }),
+      expect.objectContaining({ narrative: JSON.stringify({ ...n, head: HEAD }) }),
     );
   });
 
@@ -157,7 +167,9 @@ describe("walkRunPhase — the PR narrative survives a resume", () => {
     expect(prHandler).toHaveBeenCalledTimes(1);
     // Persisted once per successful describe — the second write is the one that survives.
     const narrativeWrites = updateRunMock.mock.calls.filter((c) => "narrative" in (c[3] ?? {}));
-    expect(narrativeWrites.at(-1)?.[3]).toEqual({ narrative: JSON.stringify(second) });
+    expect(narrativeWrites.at(-1)?.[3]).toEqual({
+      narrative: JSON.stringify({ ...second, head: HEAD }),
+    });
   });
 
   it("a row with no persisted narrative, and a describer that reports nothing, resumes with no narrative and no error", async () => {
@@ -193,13 +205,60 @@ describe("walkRunPhase — the PR narrative survives a resume", () => {
     });
 
     await walkRunPhase(
-      run(JSON.stringify(earned)),
+      run(JSON.stringify({ ...earned, head: HEAD })),
       prep([step("describe", describeHandler), step("pr", prHandler)]),
       dispatched(),
     );
 
     expect(prHandler).toHaveBeenCalledTimes(1);
     expect(describeHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it("a resume whose branch has moved since the narrative was written opens the PR without it", async () => {
+    // The case the binding exists for (PR #303 review): the run reached `describe`, failed opening
+    // the PR, and a human added or amended commits before resuming. This attempt's describer reports
+    // nothing — its contract — and `runDescribeStep` keeps whatever the carry holds, so an unbound
+    // restore would put prose about the PREVIOUS tree into the PR. Today's body is the right
+    // fallback: a plainer opening, describing nothing that isn't there.
+    const stale = narrative("written against a tree the human has since amended");
+    headMock.mockReturnValue("aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee");
+    const describeHandler = vi.fn(async () => ({ ok: true, facts: {} }));
+    const prHandler = vi.fn(async (ctx: { narrative?: RunNarrative }) => {
+      expect(ctx.narrative).toBeUndefined();
+      return { ok: true, facts: { pr: { ref: "gh-1", url: "https://example.com/pull/1", bodyStale: false } } };
+    });
+
+    await walkRunPhase(
+      run(JSON.stringify({ ...stale, head: HEAD })),
+      prep([step("describe", describeHandler), step("pr", prHandler)]),
+      dispatched(),
+    );
+
+    expect(prHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it("a describer that DOES report on the moved branch overwrites the discarded one", async () => {
+    // The discard costs only the restore — a describer that runs on the new tree still speaks for it.
+    const fresh = narrative("describes the branch as it stands now");
+    headMock.mockReturnValue("aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee");
+    const describeHandler = vi.fn(async () => ({ ok: true, facts: { narrative: fresh } }));
+    const prHandler = vi.fn(async (ctx: { narrative?: RunNarrative }) => {
+      expect(ctx.narrative).toEqual(fresh);
+      return { ok: true, facts: { pr: { ref: "gh-1", url: "https://example.com/pull/1", bodyStale: false } } };
+    });
+
+    await walkRunPhase(
+      run(JSON.stringify({ ...narrative("stale"), head: HEAD })),
+      prep([step("describe", describeHandler), step("pr", prHandler)]),
+      dispatched(),
+    );
+
+    expect(prHandler).toHaveBeenCalledTimes(1);
+    // Re-bound to the tip it was actually written against, not the one it replaced.
+    const narrativeWrites = updateRunMock.mock.calls.filter((c) => "narrative" in (c[3] ?? {}));
+    expect(narrativeWrites.at(-1)?.[3]).toEqual({
+      narrative: JSON.stringify({ ...fresh, head: "aaaaaaaabbbbbbbbccccccccddddddddeeeeeeee" }),
+    });
   });
 
   it("a garbled persisted narrative resumes with no narrative rather than throwing", async () => {

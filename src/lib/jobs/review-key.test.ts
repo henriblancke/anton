@@ -14,6 +14,8 @@ import {
   computeReviewKey,
   parseRecordedAdvisories,
   parseRecordedNarrative,
+  recordNarrative,
+  restorableNarrative,
   reviewKeyToken,
   type ReviewKey,
 } from "./review-key";
@@ -50,9 +52,19 @@ describe("parseRecordedAdvisories", () => {
 });
 
 describe("parseRecordedNarrative", () => {
-  it("round-trips a serialized narrative", () => {
+  it("round-trips a serialized narrative, and the tip it was written against", () => {
     const narrative = { summary: "what changed", spotlight: "look here", risks: "none found" };
-    expect(parseRecordedNarrative(JSON.stringify(narrative))).toEqual(narrative);
+    expect(parseRecordedNarrative(recordNarrative(narrative, "head1"))).toEqual({
+      narrative,
+      head: "head1",
+    });
+  });
+
+  it("reads a row written without a tip as a narrative with no binding", () => {
+    // Rows written before the head was recorded, and rows whose HEAD read failed at write time —
+    // both parse fine, and `restorableNarrative` is what declines to restore them.
+    const narrative = { summary: "what changed" };
+    expect(parseRecordedNarrative(JSON.stringify(narrative))).toEqual({ narrative });
   });
 
   it("reads absent as no narrative, never a failure", () => {
@@ -71,6 +83,76 @@ describe("parseRecordedNarrative", () => {
     // report (PR #303 review): a blank summary restored as valid would open the PR body with nothing.
     expect(parseRecordedNarrative('{"summary":"   "}')).toBeUndefined();
     expect(parseRecordedNarrative('{"summary":"\\n\\t"}')).toBeUndefined();
+  });
+});
+
+describe("restorableNarrative", () => {
+  let projectDir: string;
+
+  function git(...args: string[]): void {
+    execFileSync("git", ["-C", projectDir, ...args], { stdio: "pipe" });
+  }
+
+  function commitFile(relPath: string, contents: string): void {
+    const full = join(projectDir, relPath);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, contents);
+    git("add", "-A");
+    git("commit", "-qm", `add ${relPath}`);
+  }
+
+  function headSha(): string {
+    return execFileSync("git", ["-C", projectDir, "rev-parse", "HEAD"]).toString().trim();
+  }
+
+  const NARRATIVE = { summary: "what this run changed" };
+
+  beforeEach(() => {
+    projectDir = mkdtempSync(join(tmpdir(), "anton-narrative-"));
+    git("init", "--quiet", "-b", "main");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "test");
+    commitFile("README.md", "# project\n");
+  });
+
+  afterEach(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  it("restores a narrative bound to the tip the branch still stands on", async () => {
+    const raw = recordNarrative(NARRATIVE, headSha());
+    await expect(restorableNarrative(projectDir, raw)).resolves.toEqual(NARRATIVE);
+  });
+
+  it("discards a narrative whose tip has moved — a human amended or added commits", async () => {
+    // THE case this binding exists for (PR #303 review): a run reached `describe`, failed opening
+    // the PR, and a human fixed the branch before resuming. `runDescribeStep` keeps this restored
+    // value when the next describe reports nothing, so an unbound restore would open the PR with
+    // prose describing code that is no longer on the branch.
+    const raw = recordNarrative(NARRATIVE, headSha());
+    commitFile("src/widget.tsx", "export const Widget = () => null;\n");
+    await expect(restorableNarrative(projectDir, raw)).resolves.toBeUndefined();
+  });
+
+  it("discards an amended tip, not just an added commit", async () => {
+    const raw = recordNarrative(NARRATIVE, headSha());
+    git("commit", "-q", "--amend", "-m", "reworded");
+    await expect(restorableNarrative(projectDir, raw)).resolves.toBeUndefined();
+  });
+
+  it("discards a record carrying no tip at all — it cannot be bound to anything", async () => {
+    await expect(restorableNarrative(projectDir, JSON.stringify(NARRATIVE))).resolves.toBeUndefined();
+  });
+
+  it("reads an absent or unparseable record as no narrative, never a failure", async () => {
+    await expect(restorableNarrative(projectDir, null)).resolves.toBeUndefined();
+    await expect(restorableNarrative(projectDir, "{not json")).resolves.toBeUndefined();
+  });
+
+  it("discards rather than throws when HEAD cannot be read at all", async () => {
+    // The fallback is today's PR body — a nicer opening lost, never a run.
+    const raw = recordNarrative(NARRATIVE, "0".repeat(40));
+    await expect(restorableNarrative(join(tmpdir(), "anton-not-a-repo"), raw)).resolves.toBeUndefined();
   });
 });
 

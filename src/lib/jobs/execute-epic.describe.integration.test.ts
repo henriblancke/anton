@@ -110,13 +110,12 @@ console.log('https://github.com/acme/repo/pull/42');process.exit(0);`,
       expect(body).toContain(`## Out of scope\n\n${OUT_OF_SCOPE}`);
 
       // The narrative is persisted on the run row, which is what a resumed run restores it from
-      // (anton-fpkk8) when its own describer reports nothing.
+      // (anton-fpkk8) when its own describer reports nothing — bound to the branch tip it was
+      // written against (PR #303 review), so a resume whose branch has since moved declines it.
       const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === targetId)!;
-      expect(JSON.parse(run.narrative!)).toEqual({
-        summary: SUMMARY,
-        spotlight: SPOTLIGHT,
-        risks: RISKS,
-      });
+      const recorded = JSON.parse(run.narrative!) as Record<string, unknown>;
+      expect(recorded).toMatchObject({ summary: SUMMARY, spotlight: SPOTLIGHT, risks: RISKS });
+      expect(recorded.head).toMatch(/^[0-9a-f]{40}$/);
 
       // The describer's session is NOT an `execute` one: an `execute` session settled `done` reads as
       // delivery evidence (`listDeliveriesByBead` in runs.ts), and the describer delivered nothing.

@@ -9,6 +9,7 @@
  */
 import { beads, LABELS } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { readWorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import { releaseRunResources } from "./worktree-reaper";
@@ -25,7 +26,7 @@ import {
 import type { RunPreparation } from "./execute-epic-prepare";
 import { stalePrBodyNote, stalePrBodyRunError } from "./execute-epic-review";
 import type { EpicRun } from "./execute-epic-run";
-import { parseRecordedNarrative } from "./review-key";
+import { recordNarrative, restorableNarrative } from "./review-key";
 
 
 /** Walk the formula's post-commit steps, then finalize the run and release its checkout. */
@@ -40,7 +41,13 @@ export async function walkRunPhase(
     // a resumed-in-place row (a park a human cleared) is the case this covers; a retry that opened a
     // fresh row after an ordinary failure re-describes, exactly as it re-reviews without a branch
     // lookup of its own key.
-    narrative: parseRecordedNarrative(run.existing?.narrative),
+    //
+    // Conditional on the branch still standing where that describer left it (PR #303 review): the
+    // very resume this covers is one a human may have cleared by amending or adding commits, and
+    // `runDescribeStep` deliberately KEEPS this restored value when the next describer fails or
+    // reports nothing — so an unbound restore would open the PR describing the previous tree. See
+    // `restorableNarrative`.
+    narrative: await restorableNarrative(prep.worktree.path, run.existing?.narrative),
     staleBodyFallback: null,
   };
   // A standalone target THIS attempt verified and retired as already shipped has nothing for these
@@ -151,12 +158,22 @@ async function runDescribeStep(run: EpicRun, dispatch: RunStepDispatch, carry: R
       result.detail ?? `formula step "${cooked.id}" (step:describe) failed for ${epicBeadId}`,
     );
   }
-  if (result.facts?.narrative) {
-    carry.narrative = result.facts.narrative;
+  const reported = result.facts?.narrative;
+  if (reported) {
+    carry.narrative = reported;
+    // Bound to the tip the describer just read (PR #303 review), so a later resume can tell whether
+    // this narrative still describes the branch. Read here rather than reported by the step: the
+    // describer is a reader, and every other step in this walk leaves the tree where it found it —
+    // an unreadable HEAD just records the narrative unbound, which a resume then declines to restore.
+    const head = await readWorktreeState(stepCtx.worktreePath)
+      .then((state) => state.head)
+      .catch(() => undefined);
     // Best-effort, like every other resume bookkeeping write: a failed write just means the next
     // resume that doesn't re-describe finds nothing to restore, the same safe default as a run
     // whose describer never reported one at all.
-    await safe(() => updateRun(db, clock, runId, { narrative: JSON.stringify(carry.narrative) }));
+    await safe(() =>
+      updateRun(db, clock, runId, { narrative: recordNarrative(reported, head) }),
+    );
   }
 }
 

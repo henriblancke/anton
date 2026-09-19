@@ -62,7 +62,14 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
     sessionKind: "describe",
   });
 
-  const narrative = parseNarrativeReport(text);
+  // Only a SUCCEEDED dispatch can speak for the branch (PR #303 review). `dispatchClaude` returns
+  // `{ ok: false }` for a claude result that failed without throwing — a non-transient error result,
+  // a session the driver settled `failed` — and its `text` is that failure's output, which can still
+  // carry a narrative-shaped block: a partially-written report the agent abandoned, or diagnostic
+  // prose quoting the format. Parsing it would publish that as the run's authoritative narrative
+  // while the session is recorded failed, contradicting this step's own contract. A failed describer
+  // costs the narrative and nothing else — the same outcome as one that reported nothing at all.
+  const narrative = result.ok ? parseNarrativeReport(text) : undefined;
   return {
     ok: true,
     detail: narrative ? "wrote the run narrative" : (result.detail ?? "describer produced no parseable narrative"),

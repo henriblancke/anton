@@ -51,6 +51,30 @@ describe("the floor accepts", () => {
     expect(check([step("i", "implement"), step("c", "commit"), step("p", "pr")]).ok).toBe(true);
   });
 
+  it("a describer after the last review — the narrative describes the tree the PR carries", () => {
+    expect(
+      check([
+        step("implement", "implement"),
+        step("commit", "commit"),
+        step("review-1", "review"),
+        step("review-2", "review"),
+        step("describe", "describe"),
+        step("pr", "pr"),
+      ]).ok,
+    ).toBe(true);
+  });
+
+  it("a describer in a formula with no review at all — nothing can move the branch after it", () => {
+    expect(
+      check([
+        step("implement", "implement"),
+        step("commit", "commit"),
+        step("describe", "describe"),
+        step("pr", "pr"),
+      ]).ok,
+    ).toBe(true);
+  });
+
   it("a formula that ADDS three steps beyond the floor", () => {
     const extended = [
       step("plan", "claude"),
@@ -209,6 +233,41 @@ describe("the floor rejects broken ordering", () => {
       ["describe-before-commit", "describe"],
     ]);
     expect(violations[0].detail).toContain("ticket-phase result cannot reach the later PR step");
+  });
+
+  it("a describer placed before a review that still runs after it — the gate commits its own fixes", () => {
+    // `commit -> describe -> review -> pr` clears the before-commit rule and is still wrong: the
+    // self-review gate COMMITS the fixes it finds onto the branch, so the PR would carry a narrative
+    // describing the diff as it stood before them (PR #303 review).
+    const { ok, violations } = check([
+      step("implement", "implement"),
+      step("commit", "commit"),
+      step("describe", "describe"),
+      step("review", "review"),
+      step("pr", "pr"),
+    ]);
+
+    expect(ok).toBe(false);
+    expect(violations.map((v) => [v.kind, v.step])).toEqual([["describe-before-review", "describe"]]);
+    expect(violations[0].detail).toContain("COMMITS its fixes");
+  });
+
+  it("a describer after the FIRST review but before a second — every gate can move the branch", () => {
+    // A formula may name `step:review` more than once (anton-nyz1v), and each occurrence commits its
+    // own fixes, so the narrative is only safe once the LAST one has run.
+    const { ok, violations } = check([
+      step("implement", "implement"),
+      step("commit", "commit"),
+      step("review-1", "review"),
+      step("describe", "describe"),
+      step("review-2", "review"),
+      step("pr", "pr"),
+    ]);
+
+    expect(ok).toBe(false);
+    expect(violations.map((v) => [v.kind, v.step])).toEqual([["describe-before-review", "describe"]]);
+    // Named against the review it must follow — the LAST one, not the one it already follows.
+    expect(violations[0].detail).toContain('"review-2"');
   });
 
   it("any step after the PR — the completion marker would let a resume skip it", () => {
