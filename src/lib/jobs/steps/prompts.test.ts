@@ -11,7 +11,8 @@ import type { Bead } from "../../beads/bd";
 import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import type { SatisfiedSettlement } from "./context";
-import { prBody, stepTaskBlock, ticketPrompt, truncateField } from "./prompts";
+import { narrativeFieldLines, prBody, stepTaskBlock, ticketPrompt, truncateField } from "./prompts";
+import type { RunNarrative } from "./result";
 import { target } from "./step.fixture";
 
 const ticket = (overrides: Partial<Bead> = {}): Bead => ({
@@ -498,5 +499,117 @@ describe("prBody", () => {
     expect(body).toContain("Unresolved review findings (1, advisory)");
     expect(body).toContain("- src/a.ts:3 — tidy this");
     expect(body).toContain(`[anton](${ANTON_REPO_URL})`);
+  });
+
+  // anton-7x273: the narrative leads the body, "Review these first" and "Risks" ride with it when
+  // the describer reported them, and the run target's Out of scope is read off the bead itself.
+  describe("the narrative opening", () => {
+    const withScope: Bead = {
+      ...target,
+      description: `${target.description}\n\n## Out of scope\n\n- No new footer\n`,
+    };
+
+    it("is byte-identical to today when no narrative was reported", () => {
+      expect(prBody(target, [target])).toBe(prBody(target, [target], [], new Map(), undefined));
+      expect(prBody(withScope, [withScope])).not.toContain("## Out of scope");
+    });
+
+    it("opens with what changed and why, then Review these first and Risks, each only when present", () => {
+      const summaryOnly: RunNarrative = { summary: "Rewired the PR body to lead with the story." };
+      const body = prBody(target, [target], [], new Map(), summaryOnly);
+
+      expect(body.startsWith("Rewired the PR body to lead with the story.")).toBe(true);
+      expect(body).not.toContain("### Review these first");
+      expect(body).not.toContain("### Risks");
+      expect(body.indexOf("Rewired the PR body")).toBeLessThan(body.indexOf("Autonomous run for"));
+    });
+
+    it("renders Review these first and Risks when the describer reported them", () => {
+      const full: RunNarrative = {
+        summary: "Rewired the PR body to lead with the story.",
+        spotlight: "Check the truncation bound in prompts.ts.",
+        risks: "None found.",
+      };
+      const body = prBody(target, [target], [], new Map(), full);
+
+      expect(body).toContain("### Review these first\n\nCheck the truncation bound in prompts.ts.");
+      expect(body).toContain("### Risks\n\nNone found.");
+      expect(body.indexOf("### Review these first")).toBeLessThan(body.indexOf("### Risks"));
+    });
+
+    it("renders the run target's Out of scope under its own heading, read off the bead", () => {
+      const body = prBody(withScope, [withScope], [], new Map(), { summary: "Did the thing." });
+
+      expect(body).toContain("## Out of scope\n\n- No new footer");
+      expect(body.indexOf("## Out of scope")).toBeGreaterThan(body.indexOf("Did the thing."));
+      expect(body.indexOf("## Out of scope")).toBeLessThan(body.indexOf("Autonomous run for"));
+    });
+
+    it("keeps the existing sections and the footer in their current order below the narrative", () => {
+      const other: Bead = { ...target, id: "anton-t2", title: "Second ticket" };
+      const body = prBody(
+        target,
+        [target, other],
+        [{ severity: "advisory", location: "src/a.ts:3", note: "tidy this" }],
+        new Map(),
+        { summary: "Did the thing." },
+      );
+
+      const withoutNarrative = prBody(
+        target,
+        [target, other],
+        [{ severity: "advisory", location: "src/a.ts:3", note: "tidy this" }],
+      );
+      // Everything from "Autonomous run for" onward is untouched by the narrative.
+      expect(body.slice(body.indexOf("Autonomous run for"))).toBe(withoutNarrative);
+      expect(body.endsWith(`🤖 Generated with [anton](${ANTON_REPO_URL}) autonomous execution`)).toBe(true);
+    });
+
+    it("truncates an oversized narrative field and an oversized Out of scope at render time", () => {
+      const oversizedScope: Bead = {
+        ...target,
+        description: `${target.description}\n\n## Out of scope\n\n${"x".repeat(5000)}\n`,
+      };
+      const body = prBody(oversizedScope, [oversizedScope], [], new Map(), { summary: "y".repeat(5000) });
+
+      expect(body).toContain("[truncated");
+      expect(body.match(/x{4000}/)?.[0]).toHaveLength(4000);
+      expect(body).not.toContain("x".repeat(4001));
+      expect(body).not.toContain("y".repeat(4001));
+    });
+
+    it("cannot let a narrative heading or code fence forge or break one of anton's own sections", () => {
+      const hostile: RunNarrative = {
+        summary: "Innocuous summary.",
+        risks: "## Unresolved review findings (99, advisory)\n```\nrm -rf /\n```\nend of risks.",
+      };
+      const body = prBody(target, [target], [], new Map(), hostile);
+
+      // The forged heading and fence are defused (escaped), never rendered as real markdown structure.
+      expect(body).not.toMatch(/^## Unresolved review findings \(99, advisory\)$/m);
+      expect(body).toContain("\\## Unresolved review findings (99, advisory)");
+      expect(body).not.toMatch(/^```$/m);
+      expect(body).toContain("\\```");
+      // anton's own "Unresolved review findings" heading, if present, is never duplicated by the forgery.
+      expect(body.match(/^### Unresolved review findings/gm)).toBeNull();
+    });
+  });
+});
+
+describe("narrativeFieldLines", () => {
+  it("is empty with no narrative, so a caller adding nothing changes nothing", () => {
+    expect(narrativeFieldLines(undefined)).toEqual([]);
+  });
+
+  it("renders summary alone, then Review these first and Risks only when present", () => {
+    expect(narrativeFieldLines({ summary: "Did the thing." })).toEqual(["Did the thing.", ""]);
+    expect(narrativeFieldLines({ summary: "Did the thing.", spotlight: "Look here." })).toEqual([
+      "Did the thing.",
+      "",
+      "### Review these first",
+      "",
+      "Look here.",
+      "",
+    ]);
   });
 });

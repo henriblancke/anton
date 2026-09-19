@@ -38,6 +38,7 @@ import { readWorktreeState } from "../git/ops";
 import { resolveReviewConfig, resolveVerifyGates, type ProjectSettings, type ReviewConfig, type VerifyGate } from "../projects";
 import { resolveModel } from "./model-routing";
 import { resolveReviewerContract, type ReviewFinding, type ReviewerSource } from "./review-context";
+import type { RunNarrative } from "./steps/result";
 
 export interface ReviewKey {
   baseRev: string;
@@ -161,4 +162,83 @@ export function parseRecordedAdvisories(raw: string | null | undefined): ReviewF
   } catch {
     return [];
   }
+}
+
+/**
+ * A narrative as it is PERSISTED: the report plus the branch tip it was written against (PR #303
+ * review). The tip is what makes the restore safe — see {@link parseRecordedNarrative}.
+ */
+export interface RecordedNarrative {
+  narrative: RunNarrative;
+  /** The worktree HEAD the describer read, or undefined for a row written before this was recorded. */
+  head?: string;
+}
+
+/** Serialize a narrative for the run row, bound to the HEAD the describer actually described. */
+export function recordNarrative(narrative: RunNarrative, head: string | undefined): string {
+  return JSON.stringify({ ...narrative, ...(head ? { head } : {}) });
+}
+
+/**
+ * The narrative a resumed run restores into the run-phase carry (anton-fpkk8), mirroring
+ * {@link parseRecordedAdvisories}'s tolerance: a null column, an empty string, garbled JSON, or a
+ * shape missing the one required field all yield no narrative rather than throwing — a misread
+ * narrative here costs a PR body, never a run.
+ *
+ * Returns the recorded HEAD alongside the report so the caller can bind it to the branch as it
+ * stands NOW. Callers must not restore a narrative whose head has moved: see
+ * {@link restorableNarrative}, which is the only caller that should decide a restore.
+ */
+export function parseRecordedNarrative(raw: string | null | undefined): RecordedNarrative | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      typeof (parsed as Record<string, unknown>).summary === "string" &&
+      // TRIMMED-non-empty, exactly as `isRunNarrative` (steps/describe.ts) requires of a freshly
+      // parsed report: a whitespace-only summary is not a narrative, and restoring one as if it were
+      // would open the PR body with a blank opening instead of falling back to today's body.
+      // Unreachable through the normal write path (`sanitizeNarrativeField` trims before persisting),
+      // so this is symmetry with the parser it mirrors rather than a live bug — PR #303 review.
+      ((parsed as Record<string, unknown>).summary as string).trim()
+    ) {
+      const { head, ...narrative } = parsed as RunNarrative & { head?: unknown };
+      return {
+        narrative: narrative as RunNarrative,
+        ...(typeof head === "string" && head ? { head } : {}),
+      };
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The narrative a resume may actually USE: the recorded one, but only when the branch still stands
+ * where the describer left it (PR #303 review).
+ *
+ * The restore exists for a resumed-in-place row whose describer does not re-report — its own
+ * contract is that a failure costs the narrative and nothing else. But a run can be resumed after a
+ * human amends or adds commits (a park they cleared by fixing the branch themselves), and a failed
+ * re-describe would then let the PR open with a narrative describing the PREVIOUS tree — confidently
+ * wrong prose about code that is no longer there. Binding to HEAD keeps the restore for the case it
+ * was built for (same tree, describer didn't re-report) and discards it for the case it was never
+ * meant to cover.
+ *
+ * Discards rather than throws on every doubt — an unreadable HEAD, a record written without one —
+ * because the fallback is today's PR body, which costs a nicer opening and nothing else.
+ */
+export async function restorableNarrative(
+  worktreePath: string,
+  raw: string | null | undefined,
+): Promise<RunNarrative | undefined> {
+  const recorded = parseRecordedNarrative(raw);
+  if (!recorded?.head) return undefined;
+  const head = await readWorktreeState(worktreePath)
+    .then((state) => state.head)
+    .catch(() => undefined);
+  return head && head === recorded.head ? recorded.narrative : undefined;
 }

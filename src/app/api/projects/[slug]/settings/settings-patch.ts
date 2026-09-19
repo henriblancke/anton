@@ -179,6 +179,7 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("reviewFixPrompt", boundedString(MAX_PROMPT)),
     settingsField("productMasterPrompt", boundedString(MAX_PROMPT)),
     settingsField("reviewPrompt", boundedString(MAX_PROMPT)),
+    settingsField("describePrompt", boundedString(MAX_PROMPT)),
 
     settingsField("reviewAgent", knownAgent(agentIds)),
     settingsField("reviewEnabled", booleanValue),
