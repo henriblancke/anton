@@ -196,6 +196,21 @@ describe("the floor rejects broken ordering", () => {
     expect(violations[0].detail).toContain("merge-base..HEAD");
   });
 
+  it("a describer placed before the commit — its narrative cannot reach the PR", () => {
+    const { ok, violations } = check([
+      step("implement", "implement"),
+      step("describe", "describe"),
+      step("commit", "commit"),
+      step("pr", "pr"),
+    ]);
+
+    expect(ok).toBe(false);
+    expect(violations.map((v) => [v.kind, v.step])).toEqual([
+      ["describe-before-commit", "describe"],
+    ]);
+    expect(violations[0].detail).toContain("ticket-phase result cannot reach the later PR step");
+  });
+
   it("any step after the PR — the completion marker would let a resume skip it", () => {
     // The PR ref anton stamps at `step:pr` is the run's completion marker: a later step that failed
     // would be skipped on the next attempt, which would settle the run done regardless.

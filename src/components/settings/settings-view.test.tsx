@@ -2679,3 +2679,20 @@ describe("SettingsView review-fix concurrency (anton-kwi6)", () => {
     expect(body.reviewFixConcurrency).toBe(4);
   });
 });
+
+describe("SettingsView PR narrative", () => {
+  showing("describe");
+
+  it("round-trips the project describe prompt through the rendered settings panel", () => {
+    const fetchMock = stubFetch();
+    renderView({ describePrompt: "Lead with user impact." });
+
+    const field = screen.getByLabelText("Describe prompt") as HTMLTextAreaElement;
+    expect(field.value).toBe("Lead with user impact.");
+    fireEvent.change(field, { target: { value: "Lead with outcomes." } });
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.describePrompt).toBe("Lead with outcomes.");
+  });
+});

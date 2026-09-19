@@ -39,6 +39,7 @@ import {
 const COMMIT_STEP = "commit";
 const PR_STEP = "pr";
 const REVIEW_STEP = "review";
+const DESCRIBE_STEP = "describe";
 
 export type FloorViolationKind =
   | "unresolved-step"
@@ -48,6 +49,7 @@ export type FloorViolationKind =
   | "pr-before-commit"
   | "step-after-pr"
   | "review-before-commit"
+  | "describe-before-commit"
   | "diff-after-commit";
 
 export interface FloorViolation {
@@ -238,6 +240,29 @@ const refuseReviewBeforeCommit: FloorCheck = ({ steps, indexOf }) => {
   ];
 };
 
+/**
+ * Refuses a describer placed before the commit. Like self-review, it reads the committed run diff;
+ * before the commit, any narrative it produces cannot describe the work that reaches the PR, and
+ * the ticket-phase result is deliberately not carried into the run-phase PR step.
+ */
+const refuseDescribeBeforeCommit: FloorCheck = ({ steps, indexOf }) => {
+  const commitAt = indexOf(COMMIT_STEP);
+  const describeAt = indexOf(DESCRIBE_STEP);
+  if (describeAt < 0 || commitAt < 0 || describeAt > commitAt) return [];
+
+  return [
+    {
+      kind: "describe-before-commit",
+      step: steps[describeAt].step.id,
+      detail:
+        `step "${steps[describeAt].step.id}" writes the PR narrative before "${steps[commitAt].step.id}" ` +
+        `commits — the describer reads the run's committed diff, and its ticket-phase result cannot ` +
+        `reach the later PR step. The floor requires \`${STEP_LABEL_PREFIX}:${DESCRIBE_STEP}\` to run ` +
+        `after \`${STEP_LABEL_PREFIX}:${COMMIT_STEP}\``,
+    },
+  ];
+};
+
 /** Refuses a step that writes to the worktree after the commit — its work would never be committed. */
 const refuseDiffAfterCommit: FloorCheck = ({ steps, indexOf }) => {
   const commitAt = indexOf(COMMIT_STEP);
@@ -269,6 +294,7 @@ const FLOOR_CHECKS: readonly FloorCheck[] = [
   refusePrBeforeCommit,
   refuseStepsAfterPr,
   refuseReviewBeforeCommit,
+  refuseDescribeBeforeCommit,
   refuseDiffAfterCommit,
 ];
 
