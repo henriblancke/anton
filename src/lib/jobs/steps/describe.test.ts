@@ -1,7 +1,11 @@
 /**
  * Direct tests for `step:describe` (anton-aucch): the describer dispatches over the run's committed
- * diff under a swappable contract, and NEVER fails or parks the run — a throw, a timeout, an
- * exhausted quota, or an unparseable report all cost the narrative and nothing else.
+ * diff under a swappable contract, and NEVER fails the run — a throw, a timeout, an exhausted
+ * quota, or an unparseable report all cost the narrative and nothing else.
+ *
+ * It is also read-only (PR #303 review), which is a guard rather than a hope: write-shaped tools
+ * are denied, and a tree it changed anyway is reverted. The single case that parks is a revert that
+ * could not undo the describer's own commit — see "the describer is read-only" below.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -240,6 +244,47 @@ describe("step:describe", () => {
       expect(result.ok).toBe(true);
       expect(result.facts?.narrative).toBeUndefined();
       expect(execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+      expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
+    });
+
+    it("PARKS when the revert fails and the describer's own commit is stuck", async () => {
+      // The one failure this step does not swallow. Continuing would hand `step:pr` a worktree whose
+      // HEAD is a commit no review gate ever saw — the exact harm the guard exists to prevent.
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const committing = async (): Promise<{ ok: true; text: string; modelUsage: [] }> => {
+        commitFile("src/sneaky.ts", "export const ungraded = true;\n");
+        // The tree still READS fine — HEAD is the describer's own commit, on the same branch — but
+        // the revert cannot complete: the commit it must reset back onto is no longer readable.
+        rmSync(join(dir, ".git", "objects", head.slice(0, 2), head.slice(2)), { force: true });
+        return { ok: true, text: report(JSON.stringify({ narrative: { summary: "done" } })), modelUsage: [] };
+      };
+
+      await expect(describeStep(ctx({ deps: { runClaude: committing } }))).rejects.toThrow(
+        /WROTE to its own worktree and the revert failed/,
+      );
+    });
+
+    it("does not park over dirt it could not clean — the reviewed commit still ships", async () => {
+      // Uncommitted dirt is survivable: HEAD is unchanged, so `step:pr` still pushes exactly the
+      // commit the gate graded. Losing the narrative is the whole cost.
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const ctxWithDirt = ctx({
+        deps: {
+          runClaude: async () => {
+            writeFileSync(join(dir, "src/feature.ts"), "export const feature = false;\n");
+            return { ok: true as const, text: report(JSON.stringify({ narrative: { summary: "x" } })), modelUsage: [] };
+          },
+        },
+      });
+
+      const result = await describeStep(ctxWithDirt);
+
+      expect(result.ok).toBe(true);
+      expect(result.facts?.narrative).toBeUndefined();
       expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
     });
 

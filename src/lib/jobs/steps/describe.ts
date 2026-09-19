@@ -3,12 +3,17 @@
  * slot where the diff exists and the PR has not opened yet (anton-xl51z registers the step and its
  * slot between `step:commit` and `step:pr`).
  *
- * A describer that fails costs the narrative and nothing else: EVERYTHING here — a thrown error, a
- * timed-out or quota-exhausted dispatch, an unparseable report — is caught and turned into
- * `{ ok: true }` with no narrative. This step never parks the run and never fails it, which is why
- * it manages its own dispatch (borrowing `dispatchClaude`'s session/metering machinery through a
- * capturing `runClaude` rather than propagating its result) instead of letting the runner's usual
- * quota-backoff / poison-park classification see anything thrown from in here.
+ * A describer that fails costs the narrative and nothing else: a thrown error, a timed-out or
+ * quota-exhausted dispatch, an unparseable report are all caught and turned into `{ ok: true }` with
+ * no narrative. That is why this step manages its own dispatch (borrowing `dispatchClaude`'s
+ * session/metering machinery through a capturing `runClaude` rather than propagating its result)
+ * instead of letting the runner's usual quota-backoff / poison-park classification see what it
+ * throws.
+ *
+ * ONE failure is not the step's to swallow, and it is not about the narrative: a describer that
+ * WROTE to the worktree and whose write could not be reverted (see `enforceDescriberReadOnly`).
+ * This step sits between the review gate and the push, so continuing there would open the PR on a
+ * commit no review ever graded. That parks the run — the only case that does.
  */
 import { labelValueOf } from "../../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../../claude/agent-prompt";
@@ -27,6 +32,7 @@ import {
   type WorktreeState,
 } from "../../git/ops";
 import { isForbiddenCodePoint } from "../../invisible-unicode";
+import { isPoisonError, PoisonError } from "../errors";
 import { resolveDescribeConfig } from "../../projects";
 import { errorText } from "../../retry-helpers";
 import type { StepContext } from "./context";
@@ -38,8 +44,12 @@ export async function describeStep(ctx: StepContext): Promise<StepResult> {
   try {
     return await runDescriber(ctx);
   } catch (e) {
-    // ANY failure — a thrown git error, a quota exhaustion, an abort on the job's own deadline —
-    // costs the narrative and nothing else. See the module header.
+    // The ONE thing that is not just a lost narrative: a describer that wrote, and whose write could
+    // not be undone (`enforceDescriberReadOnly`). Swallowing that would hand `step:pr` a worktree
+    // carrying a commit no review gate ever saw — the exact harm the read-only guard exists to
+    // prevent — so it parks for a human instead. Every OTHER failure still costs the narrative and
+    // nothing else. See the module header.
+    if (isPoisonError(e)) throw e;
     return { ok: true, detail: `describer failed — no narrative (${errorText(e)})` };
   }
 }
@@ -85,10 +95,16 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
     // the module-level catch turns the throw into `{ ok: true }` without ever seeing the worktree.
     // The reviewer reverts on its own throw path for the same reason (`discardSessionWrites`).
     //
-    // A failed revert must not mask the failure that got us here, which is the one the runner
-    // classifies (a `UsageLimitError` has to reach it as itself to reschedule rather than burn an
-    // attempt), so the original error is rethrown either way.
-    await enforceDescriberReadOnly(ctx, before).catch(() => {});
+    // A revert that FAILS is poison and propagates as itself (see `enforceDescriberReadOnly`) —
+    // pushing an unrevertable commit is worse than losing this error. Anything else it throws is
+    // swallowed so it cannot mask the failure that got us here: that is the one the runner
+    // classifies, and a `UsageLimitError` must reach it as itself to reschedule rather than burn an
+    // attempt.
+    try {
+      await enforceDescriberReadOnly(ctx, before);
+    } catch (revertFailure) {
+      if (isPoisonError(revertFailure)) throw revertFailure;
+    }
     throw e;
   }
   const { result, text } = dispatch;
@@ -143,14 +159,35 @@ const DESCRIBE_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Ba
  * because the step runs on a COMMITTED tree (`step:commit` precedes it in the formula), so the
  * fingerprint's baseline has no legitimate dirt to discard.
  *
- * A write costs the narrative, exactly like every other describer failure: this step never parks and
- * never fails the run (see the module header), so the run continues with a PR body built from the
- * fallback rather than one written by a session that just broke its own contract.
+ * A write costs the narrative, exactly like every other describer failure: the run continues with a
+ * PR body built from the fallback rather than one written by a session that just broke its own
+ * contract.
+ *
+ * Unless the revert itself FAILS on a moved HEAD or a switched branch — the one case this step does
+ * park on, and the only one. Uncommitted dirt left behind is survivable (the tree is committed, so
+ * `step:pr` pushes the graded commit regardless), but a commit that could not be undone is precisely
+ * what the guard exists to keep out of the push: continuing would open the PR on code no review gate
+ * ever saw. Poison rather than a retry, because no re-run unsticks a worktree — the same call the
+ * reviewer's `discardSessionWrites` makes on the same evidence.
  */
 async function enforceDescriberReadOnly(ctx: StepContext, before: WorktreeState): Promise<boolean> {
   const after = await readWorktreeState(ctx.worktreePath);
   if (sameWorktreeState(after, before)) return false;
-  await restoreWorktreeState(ctx.worktreePath, before);
+  try {
+    await restoreWorktreeState(ctx.worktreePath, before);
+  } catch (e) {
+    if (after.head !== before.head || after.ref !== before.ref) {
+      throw new PoisonError(
+        `the describer of ${ctx.target.id} WROTE to its own worktree and the revert failed (${errorText(e)}): ` +
+          `${ctx.worktreePath} is at ${after.ref ?? "detached"}@${after.head.slice(0, 12)}, not the reviewed ` +
+          `${before.ref ?? "detached"}@${before.head.slice(0, 12)}. Parked instead of continued — opening the PR ` +
+          `from here would push a commit the review gate never saw. Reset the worktree by hand, then resume.`,
+      );
+    }
+    // Uncommitted dirt only: the commit `step:pr` pushes is still the reviewed one, so losing the
+    // narrative is the whole cost.
+    return true;
+  }
   return true;
 }
 
