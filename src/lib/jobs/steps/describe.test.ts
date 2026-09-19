@@ -23,6 +23,7 @@ const SKILL_ID = "anton-aucch-test-skill";
 
 describe("step:describe", () => {
   let dir: string;
+  let sessionsRoot: string;
   let priorSessionsRoot: string | undefined;
   let tdb: ReturnType<typeof makeProjectDb>;
   let runId: string;
@@ -78,7 +79,12 @@ describe("step:describe", () => {
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), "anton-steps-describe-"));
     priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
-    process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
+    // BESIDE the worktree, never inside it. Session logs are anton's own state, and in production
+    // they live under `.anton/` — gitignored, and outside the run's worktree entirely. Writing them
+    // into the tree under test would make every dispatch dirty it, which the read-only guard
+    // (`enforceDescriberReadOnly`) would then correctly report as the describer having written.
+    sessionsRoot = mkdtempSync(join(tmpdir(), "anton-steps-describe-sessions-"));
+    process.env.ANTON_SESSIONS_ROOT = sessionsRoot;
     tdb = makeProjectDb({ repoPath: dir });
     runId = randomUUID();
     await tdb.db.insert(schema.runs).values({
@@ -107,6 +113,7 @@ describe("step:describe", () => {
     if (priorSessionsRoot === undefined) delete process.env.ANTON_SESSIONS_ROOT;
     else process.env.ANTON_SESSIONS_ROOT = priorSessionsRoot;
     rmSync(dir, { recursive: true, force: true });
+    rmSync(sessionsRoot, { recursive: true, force: true });
   });
 
   /** The narrative's required JSON envelope, ready to interpolate a payload into. */
@@ -153,6 +160,124 @@ describe("step:describe", () => {
 
       expect(claude.calls[0].prompt).toContain("src/feature.ts");
       expect(claude.calls[0].prompt).toContain("export const feature = true;");
+    });
+  });
+
+  describe("the describer is read-only", () => {
+    it("denies every write-shaped tool, the shell included", async () => {
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
+
+      await describeStep(ctx({ deps: { runClaude: claude.run } }));
+
+      // Deny rules outrank the permission mode, so these BIND a `bypassPermissions` session.
+      expect(claude.calls[0].disallowedTools).toEqual([
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+      ]);
+    });
+
+    it("reverts a describer that edited the tree anyway, and drops its narrative", async () => {
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const claude = fakeClaude({
+        ok: true,
+        text: report(JSON.stringify({ narrative: { summary: "and I tidied up while I was in there" } })),
+        modelUsage: [],
+      });
+      // The describer writes while it runs — the tool filter is only as good as the names it lists,
+      // so the fingerprint is what proves the tree is untouched.
+      const writing = async (options: Parameters<typeof claude.run>[0]) => {
+        writeFileSync(join(dir, "src/feature.ts"), "export const feature = false; // helpfully fixed\n");
+        return claude.run(options);
+      };
+
+      const result = await describeStep(ctx({ deps: { runClaude: writing } }));
+
+      // Never fails the run — a write costs the narrative, like every other describer failure.
+      expect(result.ok).toBe(true);
+      expect(result.facts?.narrative).toBeUndefined();
+      expect(result.detail).toContain("MODIFIED the worktree");
+      // The tree the PR step is about to push is exactly the tree the review gate graded.
+      expect(execFileSync("git", ["-C", dir, "status", "--porcelain"], { encoding: "utf8" })).toBe("");
+      expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
+    });
+
+    it("reverts a describer that COMMITTED, so nothing bypasses the review gate", async () => {
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const head = execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+      const committing = async (): Promise<{ ok: true; text: string; modelUsage: [] }> => {
+        commitFile("src/sneaky.ts", "export const ungraded = true;\n");
+        return { ok: true, text: report(JSON.stringify({ narrative: { summary: "done" } })), modelUsage: [] };
+      };
+
+      const result = await describeStep(ctx({ deps: { runClaude: committing } }));
+
+      expect(result.ok).toBe(true);
+      expect(result.facts?.narrative).toBeUndefined();
+      // The commit is gone: a push here would otherwise carry code the review gate never saw.
+      expect(execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim()).toBe(head);
+    });
+
+    it("leaves an honest describer's tree and narrative alone", async () => {
+      checkoutRun();
+      commitFile("src/feature.ts", "export const feature = true;\n");
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "Adds the feature." } })));
+
+      const result = await describeStep(ctx({ deps: { runClaude: claude.run } }));
+
+      expect(result.facts?.narrative?.summary).toBe("Adds the feature.");
+      expect(result.detail).toBe("wrote the run narrative");
+    });
+  });
+
+  describe("model routing", () => {
+    it("routes on the run's whole label context, not its ticket count", async () => {
+      // An epic with exactly ONE child is the case the ticket-phase default gets wrong: it would
+      // route on the child's labels, so this `describe` route on the target would never fire.
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
+
+      await describeStep(
+        ctx({
+          step: { id: "describe", labels: ["step:describe"] },
+          target: { ...target, labels: ["risk:high"] },
+          tickets: [{ ...target, id: "anton-a", labels: ["risk:low"] }],
+          settings: {
+            model: "fallback",
+            modelRoutes: [{ jobType: "execute-epic", step: "describe", label: "risk:high", model: "careful" }],
+          },
+          deps: { runClaude: claude.run },
+        }),
+      );
+
+      expect(claude.calls[0].model).toBe("careful");
+    });
+
+    it("routes the same way once the run grows a second ticket", async () => {
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
+
+      await describeStep(
+        ctx({
+          step: { id: "describe", labels: ["step:describe"] },
+          target: { ...target, labels: ["risk:high"] },
+          tickets: [
+            { ...target, id: "anton-a", labels: ["risk:low"] },
+            { ...target, id: "anton-b", labels: ["risk:low"] },
+          ],
+          settings: {
+            model: "fallback",
+            modelRoutes: [{ jobType: "execute-epic", step: "describe", label: "risk:high", model: "careful" }],
+          },
+          deps: { runClaude: claude.run },
+        }),
+      );
+
+      // The model follows the work described, not how many beads it was split into.
+      expect(claude.calls[0].model).toBe("careful");
     });
   });
 

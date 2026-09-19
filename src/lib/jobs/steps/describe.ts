@@ -17,7 +17,15 @@ import { runClaude } from "../../claude/driver";
 import { loadSkill } from "../../claude/prompt";
 import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
 import { isForbiddenByte } from "../../control-bytes";
-import { diffAgainstBase, readFileAtRev, resolveMergeBase } from "../../git/ops";
+import {
+  diffAgainstBase,
+  readFileAtRev,
+  readWorktreeState,
+  resolveMergeBase,
+  restoreWorktreeState,
+  sameWorktreeState,
+  type WorktreeState,
+} from "../../git/ops";
 import { isForbiddenCodePoint } from "../../invisible-unicode";
 import { resolveDescribeConfig } from "../../projects";
 import { errorText } from "../../retry-helpers";
@@ -50,12 +58,20 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
     describeContext({ target: ctx.target, tickets: ctx.tickets, diff }),
   ].join("\n");
   const appendSystemPrompt = await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt });
+  // The tree as it stands BEFORE the describer runs — the commit the PR step is about to push. See
+  // `enforceDescriberReadOnly`.
+  const before = await readWorktreeState(ctx.worktreePath);
 
   const { result, text } = await dispatchAndCapture(ctx, {
     beadId: ctx.target.id,
     prompt,
     appendSystemPrompt,
     failure: (t) => `describer reported an error for ${ctx.target.id}: ${t ?? "unknown"}`,
+    // The describer writes prose, never code — see `DESCRIBE_DENIED_TOOLS`.
+    disallowedTools: [...DESCRIBE_DENIED_TOOLS],
+    // This step describes the RUN, so its model route resolves against the run's whole label context
+    // rather than its ticket count (PR #303 review).
+    runLevelLabels: true,
     // NOT `execute` (the default): an `execute` session settled `done` is delivery evidence
     // (`listDeliveriesByBead` in runs.ts), and this step delivers nothing — it writes no code, makes
     // no commit, and cannot fail the run. See the `describe` kind's own note in sessions.ts.
@@ -70,11 +86,57 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
   // while the session is recorded failed, contradicting this step's own contract. A failed describer
   // costs the narrative and nothing else — the same outcome as one that reported nothing at all.
   const narrative = result.ok ? parseNarrativeReport(text) : undefined;
+  // Runs whether the dispatch succeeded or not: a describer that wrote before it failed left the
+  // same dirt as one that survived.
+  const wrote = await enforceDescriberReadOnly(ctx, before);
   return {
     ok: true,
-    detail: narrative ? "wrote the run narrative" : (result.detail ?? "describer produced no parseable narrative"),
-    facts: { sessionIds: result.facts?.sessionIds, ...(narrative ? { narrative } : {}) },
+    detail: wrote
+      ? "describer MODIFIED the worktree — reverted, no narrative"
+      : narrative
+        ? "wrote the run narrative"
+        : (result.detail ?? "describer produced no parseable narrative"),
+    facts: { sessionIds: result.facts?.sessionIds, ...(narrative && !wrote ? { narrative } : {}) },
   };
+}
+
+/**
+ * The describer writes PROSE. It is handed the diff, the file list and the beads, and it needs no
+ * tool that writes bytes — so every write-shaped tool is denied outright (PR #303 review).
+ *
+ * The reviewer denies the same four plus `Bash(git:*)`, keeping `Bash` because its contract asks it
+ * to run the project's own checks; that concession is what forces the reviewer's OS-level sandbox
+ * (jobs/review-sandbox), since a shell writes bytes with none of these tools. The describer has no
+ * such need, so `Bash` goes too — closing the shell hole by removing the shell rather than
+ * containing it, which is why this step needs no sandbox of its own.
+ *
+ * It matters because the describer runs under the EXECUTION system prompt, which tells the agent it
+ * is implementing a ticket and should edit the working tree, at the project's configured permission
+ * mode (normally `bypassPermissions`). Deny rules are evaluated ahead of the permission mode, so
+ * they bind that session rather than merely asking it. An agent that followed the prompt would leave
+ * dirt that breaks a pre-push hook and strands the run, or — worse — commit code that the review
+ * gate, which has already run by this point, never saw.
+ */
+const DESCRIBE_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash"] as const;
+
+/**
+ * The second half of the guard above: catch a describer that wrote ANYWAY and put the tree back.
+ *
+ * The deny list is the prevention and this is the proof, for the same reason the reviewer keeps both
+ * — a tool filter is only as good as the tool names it enumerates, and this step runs between the
+ * review gate and the push, the one window where dirt reaches a PR ungraded. Restoring is safe here
+ * because the step runs on a COMMITTED tree (`step:commit` precedes it in the formula), so the
+ * fingerprint's baseline has no legitimate dirt to discard.
+ *
+ * A write costs the narrative, exactly like every other describer failure: this step never parks and
+ * never fails the run (see the module header), so the run continues with a PR body built from the
+ * fallback rather than one written by a session that just broke its own contract.
+ */
+async function enforceDescriberReadOnly(ctx: StepContext, before: WorktreeState): Promise<boolean> {
+  const after = await readWorktreeState(ctx.worktreePath);
+  if (sameWorktreeState(after, before)) return false;
+  await restoreWorktreeState(ctx.worktreePath, before);
+  return true;
 }
 
 /**
