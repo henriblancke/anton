@@ -114,6 +114,8 @@ export const BUILTIN_STEPS: Readonly<Record<BuiltinStepId, StepDefinition>> = Ob
     summary: "write the run's PR narrative from its committed diff",
     // The describer writes nothing to the worktree at all — no commit of its own to make, unlike
     // the review gate, which sits in this same post-commit slot because IT commits its own fixes.
+    // ENFORCED, not just declared: the step denies every write-shaped tool and reverts a tree it
+    // finds changed (`DESCRIBE_DENIED_TOOLS` / `enforceDescriberReadOnly` in steps/describe.ts).
     producesDiff: false,
     handler: describeStep,
   },
