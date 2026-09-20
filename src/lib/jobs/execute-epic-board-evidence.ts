@@ -181,15 +181,31 @@ export function fingerprintBoard(board: readonly Bead[], dispatchedTicketId = ""
  * comparison would then diff against that synthetic empty value as if the bead had changed, crediting
  * a board-only agent with evidence it never produced. The caller folds this the same way it already
  * folds a failed {@link mustReadBoard}: an unreadable comparison, never a fabricated one.
+ *
+ * Reads are bounded at {@link DESCRIPTION_HYDRATION_CONCURRENCY} in flight, not fired as one
+ * unbounded `Promise.all` (PR #284 review round 12): each needing hydration is a `bd show`
+ * SUBPROCESS with its own {@link mustRead} retries, and a board that omits descriptions from `bd
+ * list --json` needs one per bead. A board of hundreds or thousands would launch that many processes
+ * simultaneously, and a failed spawn/read then retries in the same synchronized herd — exhausting
+ * file descriptors/process slots or contending the Dolt database and making both this read and the
+ * one on the other side of the comparison consistently unavailable, blocking every board-only ticket
+ * even though the board itself is healthy. Beads that already carry a description (the common case)
+ * cost nothing — only the ones needing a `bd show` occupy a slot.
  */
+const DESCRIPTION_HYDRATION_CONCURRENCY = 4;
+
 async function hydrateDescriptions(repo: string, board: readonly Bead[]): Promise<Bead[] | undefined> {
-  const hydrated = await Promise.all(
-    board.map(async (b) => {
-      if (b.description !== undefined) return b;
-      const full = await mustRead(repo, b.id);
-      return full && { ...b, description: full.description ?? "" };
-    }),
-  );
+  const hydrated: (Bead | undefined)[] = [];
+  for (let i = 0; i < board.length; i += DESCRIPTION_HYDRATION_CONCURRENCY) {
+    const batch = await Promise.all(
+      board.slice(i, i + DESCRIPTION_HYDRATION_CONCURRENCY).map(async (b) => {
+        if (b.description !== undefined) return b;
+        const full = await mustRead(repo, b.id);
+        return full && { ...b, description: full.description ?? "" };
+      }),
+    );
+    hydrated.push(...batch);
+  }
   return hydrated.every((b): b is Bead => Boolean(b)) ? hydrated : undefined;
 }
 

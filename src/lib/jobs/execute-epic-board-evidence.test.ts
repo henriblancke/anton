@@ -343,6 +343,33 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "bounds concurrent `bd show` hydration reads instead of firing one subprocess per bead at " +
+      "once (PR #284 review round 12) — a board with more beads needing hydration than the " +
+      "concurrency limit must never have more than the limit in flight simultaneously",
+    async () => {
+      const needHydration = Array.from({ length: 10 }, (_, i) => bead(`bulk-${i}`, { description: undefined }));
+      loadAllIssuesMock.mockResolvedValueOnce(needHydration);
+      showMock.mockReset();
+
+      let inFlight = 0;
+      let maxInFlight = 0;
+      showMock.mockImplementation(async (_repo: string, id: string) => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return bead(id, { description: `resolved-${id}` });
+      });
+
+      await readBoardBaseline("/repo");
+
+      expect(showMock).toHaveBeenCalledTimes(10);
+      expect(maxInFlight).toBeLessThan(10);
+      showMock.mockReset();
+    },
+  );
+
   const ticket = bead("t-1");
 
   it(
