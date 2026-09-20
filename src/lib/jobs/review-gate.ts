@@ -13,7 +13,7 @@
  * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
  * wiring is what makes it unit-testable against a fake driver.
  */
-import { type Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -34,7 +34,12 @@ import { resolveCommitTimeoutMs, resolveReviewConfig, resolveVerifyGates, type P
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
-import { boardEvidence, fingerprintBoard, type BoardFingerprint } from "./execute-epic-board-evidence";
+import {
+  boardEvidence,
+  fingerprintBoard,
+  hydrateDescriptions,
+  type BoardFingerprint,
+} from "./execute-epic-board-evidence";
 import { mustReadBoard } from "./execute-epic-persist";
 import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
@@ -148,6 +153,12 @@ export interface ReviewGateDeps {
    * shelling out to a real `bd`, exactly like every other side effect in this list.
    */
   readBoardFingerprint?: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
+  /**
+   * Confirm a board-only fix's write actually reached the remote — the gate a board-only round's
+   * progress signal is required to clear (PR #284 review round 14). Overridable so a test can fake
+   * the sync channel without shelling out to a real `bd`, exactly like {@link readBoardFingerprint}.
+   */
+  syncBoard?: (repoPath: string) => Promise<boolean>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -330,6 +341,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
   const readBoard = args.deps?.readBoardFingerprint ?? defaultReadBoardFingerprint;
+  const syncBoard = args.deps?.syncBoard ?? defaultSyncBoard;
 
   // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
   // between rounds, and an unsandboxable host must fail the gate outright rather than after a review
@@ -468,6 +480,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       boardOnly,
       repoPath: args.repoPath,
       readBoardFingerprint: readBoard,
+      syncBoard,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
@@ -937,10 +950,31 @@ function describeTree(tree: string | undefined): string {
  * anton's own claim/heartbeat rewrites never read as this round's fix. Returns `undefined` on a read
  * failure (after `mustReadBoard`'s own retries) — folded by the caller into "no board signal this
  * round", same as it would answer before this existed.
+ *
+ * Descriptions are hydrated the same way {@link import("./execute-epic-board-evidence").readBoardEvidence}
+ * does before fingerprinting (PR #284 review): on a `bd` variant whose `bd list --json` omits
+ * `description`, every bead would otherwise fingerprint that field as `""` on both the before and
+ * after read, so a fixer whose sole repair is a description edit would fingerprint as unchanged and
+ * this loop would read a genuine repair as a stalled round. A hydration failure folds to `undefined`
+ * exactly like an unreadable board — this signal is best-effort, never a reason to fabricate a diff.
  */
 async function defaultReadBoardFingerprint(repoPath: string, ticketId: string): Promise<BoardFingerprint | undefined> {
   const board = await mustReadBoard(repoPath);
-  return board && fingerprintBoard(board, ticketId);
+  const hydrated = board && (await hydrateDescriptions(repoPath, board));
+  return hydrated && fingerprintBoard(hydrated, ticketId);
+}
+
+/**
+ * Confirm a board write actually reached the remote (PR #284 review round 14) — the same
+ * persisted-and-synced check {@link import("./execute-epic-board-evidence").readBoardEvidence} uses
+ * before trusting a board-only delivery. `false` on anything short of a confirmed push, including a
+ * push that fails outright: an unconfirmed write is not this round's progress, whatever the reason.
+ */
+async function defaultSyncBoard(repoPath: string): Promise<boolean> {
+  return beads
+    .push(repoPath)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
 }
 
 /**
@@ -993,6 +1027,8 @@ async function runGateFixSession(args: {
   repoPath?: string;
   /** See {@link ReviewGateDeps.readBoardFingerprint}. Only called when {@link boardOnly} and {@link repoPath} are both set. */
   readBoardFingerprint: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
+  /** See {@link ReviewGateDeps.syncBoard}. Only called when the board actually changed this round. */
+  syncBoard: (repoPath: string) => Promise<boolean>;
 }): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
@@ -1066,6 +1102,15 @@ async function runGateFixSession(args: {
       // authoritative board-evidence gate, which still runs at ticket settlement regardless of what
       // this round observed.
       const boardChanged = boardBefore && boardAfter ? boardEvidence(boardBefore, boardAfter).length > 0 : false;
+      // A board-only fix's write only reaches another machine — and this run's own best-effort final
+      // sync in `concludeRunAttempt`, which logs a push failure rather than surfacing it — once it is
+      // actually pushed (PR #284 review). Confirmed here rather than assumed: without this, a change
+      // that landed only in this worktree's LOCAL Dolt DB would still count as the round's progress,
+      // a subsequent clean review could open the PR on the strength of that unconfirmed write, and
+      // another machine (or `concludeRunAttempt`'s own failed sync) could settle the ticket having
+      // never actually seen the fix. Only attempted when the board actually changed — nothing to
+      // confirm otherwise.
+      const boardSynced = boardChanged ? await args.syncBoard(repoPath!) : false;
 
       // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
       // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
@@ -1119,8 +1164,12 @@ async function runGateFixSession(args: {
           : selfCommitted
             ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
             : boardChanged
-              ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed, which is this ` +
-                `run's actual deliverable (delivery:board)\n`
+              ? boardSynced
+                ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed and is ` +
+                  `confirmed synced, which is this run's actual deliverable (delivery:board)\n`
+                : `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed but could ` +
+                  `not be confirmed synced, so this round is NOT counted as progress until the sync ` +
+                  `channel recovers\n`
               : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
       if (!treeProven) {
@@ -1138,8 +1187,12 @@ async function runGateFixSession(args: {
         // `boardChanged` is this round's progress signal for a board-only run (PR #284 review round
         // 13): its fix leaves no git diff by design, so `committed`/`selfCommitted` alone would read
         // a genuine bd repair as `!committed` and the caller's stall check would park a healthy round
-        // as stalled — exactly the false negative this thread reported.
-        committed: committed || selfCommitted || boardChanged,
+        // as stalled — exactly the false negative this thread reported. Gated on `boardSynced` too
+        // (PR #284 review round 14): an unconfirmed local-only write must not count as progress
+        // either, since the next round's clean review — and a PR it opens — would then be reading
+        // evidence a resume on another machine, or this run's own best-effort final sync, may never
+        // actually see.
+        committed: committed || selfCommitted || (boardChanged && boardSynced),
         ...(treeProven ? { verified: gates } : {}),
       };
     } catch (e) {
@@ -1172,6 +1225,29 @@ async function runGateFixSession(args: {
           readState: args.readState,
           restoreState: args.restoreState,
         });
+        // A board-only fix writes directly to the LIVE board — there is no worktree copy of it for
+        // the revert above to touch (PR #284 review). A failure past that point (a stray branch, a
+        // red gate, a failed commit) can therefore leave unverified bd writes standing on the shared
+        // board with none of this round's own gates having passed on them. There is no generic
+        // un-apply for every write shape `bd` supports (labels, dependency edges, custom metadata,
+        // reparenting…) to safely restore from the fingerprint diff alone, so rather than let a
+        // later round — or this run's own best-effort final sync in `concludeRunAttempt` — silently
+        // treat that state as settled, the run parks here for a human to inspect and repair the
+        // board by hand.
+        if (boardOnly && repoPath && boardBefore) {
+          const boardOnFailure = await args.readBoardFingerprint(repoPath, target.id);
+          const changedOnFailure = boardOnFailure ? boardEvidence(boardBefore, boardOnFailure) : [];
+          if (changedOnFailure.length > 0) {
+            throw new PoisonError(
+              `the review fix for ${target.id} FAILED after writing directly to the board — bead(s) ` +
+                `${changedOnFailure.join(", ")} changed and cannot be safely auto-reverted. Parked ` +
+                `instead of retried — a retry could read that state as this round's own unverified fix ` +
+                `and count it as progress, and this run's own best-effort final sync could publish it ` +
+                `before anyone reviews it. Inspect and repair the board by hand, then resume. The ` +
+                `fixer itself failed with: ${String(e)}`,
+            );
+          }
+        }
       }
       throw e;
     }

@@ -581,12 +581,108 @@ describe("runReviewGate — bounds", () => {
           readState: worktree.readState,
           restoreState: worktree.restoreState,
           readBoardFingerprint,
+          syncBoard: async () => true, // the fix's board write is confirmed synced
         },
       });
 
       expect(out.outcome).toBe("clean");
       expect(out.rounds[0].fixCommitted).toBe(true);
       expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "does not count a board-only fix as progress until its write is confirmed synced " +
+      "(PR #284 review round 14) — a local-only Dolt write must not read as a clean round",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => false, // the confirming push never lands
+        },
+      });
+
+      expect(out.outcome).toBe("stalled");
+      expect(out.rounds[0].fixCommitted).toBe(false);
+      expect(calls).toHaveLength(2); // no confirming review dispatched on a stall
+    },
+  );
+
+  it(
+    "parks instead of retrying when a board-only fix FAILS after already writing to the live board " +
+      "(PR #284 review round 14) — the git side is reverted, but the bd write already landed on the " +
+      "shared board with none of this round's gates having passed on it, so the run halts for a human " +
+      "rather than letting a retry or the run's own best-effort sync treat it as settled",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      // First read is the pre-fix baseline; the second (from the catch block, after the fixer
+      // crashed) reports the bead already changed — the fixer's own `bd` write landed before it died.
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), new Error("claude crashed after writing to bd")]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/FAILED after writing directly to the board/);
+      expect((error as Error).message).toContain(boardOnlyTicket.id);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
     },
   );
 

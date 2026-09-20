@@ -601,7 +601,12 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `NOT specially safe here: with no baseline persisted anywhere, a same-machine resume falls back ` +
       `to the same fresh board read a different machine would, one that may already have absorbed this ` +
       `ticket's own already-synced writes as pre-existing, permanently rejecting an idempotent retry as ` +
-      `unchanged. Check the beads DB and the sync channel, then resume the run — the ticket is left ` +
+      `unchanged.` +
+      (evidence.ids.length > 0
+        ? ` A prior attempt already confirmed evidence on ${evidence.ids.join(", ")}, which stays ` +
+          `pending on the ticket and will be picked up once a healthy resume can compare it again.`
+        : "") +
+      ` Check the beads DB and the sync channel, then resume the run — the ticket is left ` +
       `open (not blocked) so that resume can reclaim it directly.`
     );
   }
@@ -613,7 +618,12 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `Halting the epic for operator review — RESUMING ON THIS SAME MACHINE is safe (the baseline ` +
       `landed locally regardless of the push), but resuming on a different one will not see this ` +
       `attempt's baseline and may silently absorb this ticket's own already-synced writes as ` +
-      `pre-existing, permanently rejecting an idempotent retry as unchanged. Check the beads DB and ` +
+      `pre-existing, permanently rejecting an idempotent retry as unchanged.` +
+      (evidence.ids.length > 0
+        ? ` A prior attempt already confirmed evidence on ${evidence.ids.join(", ")}, which stays ` +
+          `pending on the ticket and will be picked up once a healthy resume can compare it again.`
+        : "") +
+      ` Check the beads DB and ` +
       `the sync channel, then resume the run on this machine — the ticket is left open (not blocked) ` +
       `so that resume can reclaim it directly.`
     );

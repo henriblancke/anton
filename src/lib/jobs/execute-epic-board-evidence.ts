@@ -193,7 +193,7 @@ export function fingerprintBoard(board: readonly Bead[], dispatchedTicketId = ""
  */
 const DESCRIPTION_HYDRATION_CONCURRENCY = 4;
 
-async function hydrateDescriptions(repo: string, board: readonly Bead[]): Promise<Bead[] | undefined> {
+export async function hydrateDescriptions(repo: string, board: readonly Bead[]): Promise<Bead[] | undefined> {
   const hydrated: (Bead | undefined)[] = [];
   for (let i = 0; i < board.length; i += DESCRIPTION_HYDRATION_CONCURRENCY) {
     const batch = await Promise.all(
