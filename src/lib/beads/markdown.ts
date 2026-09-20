@@ -513,7 +513,9 @@ export function unterminatedCloser(source: string): string | undefined {
     for (const [lineIndex, line] of lines.entries()) {
       const fenced = line.fenced;
       let at = 0;
-      while (!fenced) {
+      // Raw HTML hides Markdown structure — a `<!--` inside `<script>`/`<style>`/etc. is literal
+      // content, not a comment opener, just as the fence fallback above already skips these lines.
+      while (!fenced && !inHtml[lineIndex]) {
         if (commentOpen) {
           const end = line.text.indexOf("-->", at);
           if (end === -1) break;

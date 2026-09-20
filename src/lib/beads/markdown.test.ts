@@ -453,6 +453,14 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("<script>\n```\n</script>")).toBeUndefined();
   });
 
+  it("does not read a `<!--` inside a closed raw HTML block as a comment opener", () => {
+    // `htmlBlockLines` already marks these lines as raw HTML content, hiding all Markdown
+    // structure — including comment syntax. Without consulting it, this fallback scan reported
+    // the block's own `<!--` as unterminated and appended a stray `-->` after the closing tag.
+    expect(unterminatedCloser("<script>\n<!--\n</script>")).toBeUndefined();
+    expect(unterminatedCloser("<pre>\n<!--\n</pre>")).toBeUndefined();
+  });
+
   it("is the closing tag of a persistent HTML block the body ends inside", () => {
     // These blocks end at their own closing text, not at a blank line, so anything appended after
     // one lands inside it — hidden in every renderer while this scanner still read the heading,
