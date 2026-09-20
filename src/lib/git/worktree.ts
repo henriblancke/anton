@@ -606,6 +606,30 @@ async function clearRefreshMarkerOrThrow(markerPath: string, describeSuccess: st
 }
 
 /**
+ * Writes the ownership marker before a merge/rebase that can leave conflicts in progress — fails
+ * loud instead of swallowing the write error (PR #279 review, P2). If this write failed silently and
+ * the merge/rebase below proceeded anyway, a process killed while it's in progress would leave
+ * `MERGE_HEAD`/`rebase-merge` on disk with nothing recording that THIS refresh (not an agent) started
+ * it — the next resume's `unfinishedGitOperation` guard would then misread the interrupted operation
+ * as an agent's own deliberately parked conflict and refuse to recover it, stranding the run until
+ * manual intervention. Refusing to start the git operation at all when the marker itself can't be
+ * written keeps that guarantee intact.
+ */
+async function writeRefreshMarkerOrThrow(markerPath: string, describeOperation: string): Promise<void> {
+  try {
+    await writeFile(markerPath, "", "utf8");
+  } catch (err) {
+    throw new Error(
+      `[worktree] could not write the refresh ownership marker at ${markerPath} before ${describeOperation} ` +
+        `(${gitError(err)}) — without it, a process killed mid-operation would leave a later resume unable ` +
+        `to tell this refresh's own interrupted operation apart from an agent's deliberately parked ` +
+        `conflict, and recovery would refuse to touch it. Refusing to start the operation. Inspect ` +
+        `${markerPath} and retry.`,
+    );
+  }
+}
+
+/**
  * Bring a REUSED checkout's branch up to `baseBranch` before anything is dispatched against it
  * (anton-s55u). Without this, a worktree/branch picked back up from a parked or failed run keeps
  * whatever base it was cut from — a resumed run can silently implement, test, and self-review
@@ -778,8 +802,16 @@ async function refreshOntoBase(opts: {
     );
   }
   // No unfinished operation — any marker left here is stale (an operation the marker recorded that
-  // has since concluded some other way, e.g. a resume that found the checkout already clean).
-  await rm(markerPath, { force: true }).catch(() => undefined);
+  // has since concluded some other way, e.g. a resume that found the checkout already clean). Failing
+  // loud on removal (PR #279 review, P2) rather than swallowing it: if this refresh goes on to return
+  // through the noop/skipped-dirty/fast-forward outcomes below with the stale marker still present, an
+  // agent later parking mid-conflict on this same checkout would have its own deliberate rebase/merge
+  // misread by the NEXT refresh as this one's interrupted operation and aborted, discarding whatever
+  // partial resolution parking exists to preserve.
+  await clearRefreshMarkerOrThrow(
+    markerPath,
+    `no unfinished git operation was found on ${branch}`,
+  );
 
   const dirty = await dirtyPaths(worktreePath);
   if (dirty.length > 0) {
@@ -1021,8 +1053,9 @@ async function refreshOntoBase(opts: {
         : "it carries a merge commit --rebase-merges could silently corrupt";
     // Written just before the call that can leave a conflicted merge in progress, so a later
     // resume's `unfinishedGitOperation` check can tell THIS merge apart from an agent's own
-    // (see `refreshMarkerPath`'s doc comment).
-    await writeFile(markerPath, "", "utf8").catch(() => undefined);
+    // (see `refreshMarkerPath`'s doc comment). Must succeed before the merge starts (PR #279
+    // review, P2) — see `writeRefreshMarkerOrThrow`'s own doc comment.
+    await writeRefreshMarkerOrThrow(markerPath, `merging ${baseBranch} into ${branch}`);
     // The caller's own write-ahead record, if any — awaited so it lands before the mutation it
     // describes (see `beforeMutate`'s own doc comment).
     await beforeMutate?.(baseSha, branchSha);
@@ -1091,7 +1124,9 @@ async function refreshOntoBase(opts: {
 
   // Same marker discipline as the merge above: written right before the call that can leave a
   // conflicted rebase in progress, so a later resume can tell this rebase apart from an agent's own.
-  await writeFile(markerPath, "", "utf8").catch(() => undefined);
+  // Must succeed before the rebase starts (PR #279 review, P2) — see `writeRefreshMarkerOrThrow`'s
+  // own doc comment.
+  await writeRefreshMarkerOrThrow(markerPath, `rebasing ${branch} onto ${baseBranch}`);
   // Same write-ahead record as the merge path above.
   await beforeMutate?.(baseSha, branchSha);
   try {

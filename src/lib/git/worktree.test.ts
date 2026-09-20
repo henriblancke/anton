@@ -18,17 +18,36 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
-/** Deterministically fails the refresh marker's own removal — see the "fails closed" test below. */
+/**
+ * Deterministically fails the refresh marker's own removal — see the "fails closed" test below.
+ * Only trips when the marker actually exists: a plain `rm(path, { force: true })` on a marker that
+ * was never written (the stale-marker cleanup a fresh refresh runs before anything else) succeeds
+ * trivially in real git, so simulating a failure there too would make this fail closed before the
+ * merge/rebase it's meant to test ever runs.
+ */
 const markerRemovalFailure = vi.hoisted(() => ({ enabled: false }));
+/** Deterministically fails the refresh marker's own write — see the "fails closed" write test below. */
+const markerWriteFailure = vi.hoisted(() => ({ enabled: false }));
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const { existsSync } = await import("node:fs");
   return {
     ...actual,
     rm(path: Parameters<typeof actual.rm>[0], opts?: Parameters<typeof actual.rm>[1]) {
-      if (markerRemovalFailure.enabled && String(path).endsWith("ANTON_REFRESH_IN_PROGRESS")) {
+      if (
+        markerRemovalFailure.enabled &&
+        String(path).endsWith("ANTON_REFRESH_IN_PROGRESS") &&
+        existsSync(path as string)
+      ) {
         return Promise.reject(new Error("simulated marker removal failure"));
       }
       return actual.rm(path, opts);
+    },
+    writeFile(path: Parameters<typeof actual.writeFile>[0], ...rest: unknown[]) {
+      if (markerWriteFailure.enabled && String(path).endsWith("ANTON_REFRESH_IN_PROGRESS")) {
+        return Promise.reject(new Error("simulated marker write failure"));
+      }
+      return (actual.writeFile as (...args: unknown[]) => Promise<void>)(path, ...rest);
     },
   };
 });
@@ -812,6 +831,70 @@ suite("worktree manager (real git)", () => {
       }).trim();
       expect(mergeBase).toBe(uniqueSha);
       expect(existsSync(join(first.path, "marker-cleanup-merge.txt"))).toBe(true);
+    });
+
+    // anton-s55u (PR #279 review, third round): a stale marker left by a CONCLUDED operation (one
+    // that finished some other way, e.g. a resume that found the checkout already clean) must fail
+    // loud on removal too, not just the post-merge/rebase success cleanup above. If this swallowed the
+    // error and the refresh went on to return through a noop/fast-forward outcome, the stale marker
+    // would survive on disk; an agent later parking its OWN conflicted merge or rebase on this same
+    // checkout would then have the NEXT refresh misread that as this refresh's own interrupted
+    // operation and abort it, discarding the agent's partial conflict resolution.
+    it("fails closed when clearing a stale marker fails before any merge or rebase runs", async () => {
+      const branch = "anton/refresh-stale-marker-cleanup-failure";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      // No unfinished rebase-merge/rebase-apply/MERGE_HEAD exists — this marker is stale, left behind
+      // by some earlier operation that already concluded, not a killed process mid-operation.
+      writeRefreshMarker(first.path);
+
+      markerRemovalFailure.enabled = true;
+      try {
+        await expect(
+          createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+        ).rejects.toThrow(/no unfinished git operation was found[\s\S]*could not clear the refresh ownership marker/);
+      } finally {
+        markerRemovalFailure.enabled = false;
+      }
+
+      // Never dispatched into — the branch itself is untouched, and no merge/rebase was attempted.
+      expect(branchTip(branch)).toBe(beforeSha);
+    });
+
+    // anton-s55u (PR #279 review, third round): if the marker's own write fails right before a merge
+    // or rebase that can leave conflicts in progress, silently proceeding anyway would leave a process
+    // killed mid-operation with nothing on disk recording that this refresh (not an agent) started it.
+    // The next resume's `unfinishedGitOperation` guard would then refuse to recover it, treating it as
+    // an agent's own deliberately parked conflict. Must fail loud and refuse to start the git operation
+    // at all, rather than starting it unprotected.
+    it("fails closed and never starts the rebase when writing the refresh marker fails", async () => {
+      const branch = "anton/refresh-marker-write-failure-rebase";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "unpublished ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unpublished ticket commit"]);
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("marker-write-failure-base.txt", "advance\n", "advance main (marker write failure)");
+
+      markerWriteFailure.enabled = true;
+      try {
+        await expect(
+          createWorktree({
+            repoPath: repo,
+            branch,
+            baseBranch: defaultBranch(),
+            refresh: true,
+            forkSha: first.forkSha,
+          }),
+        ).rejects.toThrow(/could not write the refresh ownership marker/);
+      } finally {
+        markerWriteFailure.enabled = false;
+      }
+
+      // Never dispatched into — the branch itself is untouched, and no rebase was ever started.
+      expect(branchTip(branch)).toBe(beforeSha);
+      const status = execFileSync("git", ["-C", first.path, "status"], { encoding: "utf8" });
+      expect(status).not.toContain("rebase in progress");
     });
 
     // anton-s55u (PR #279 review, second round): a retry can merge a newer base into an already-
