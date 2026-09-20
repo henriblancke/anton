@@ -15,7 +15,6 @@ import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 import {
-  branchContainsCommit,
   exitedWith,
   hasCommonHistory,
   isAncestor,
@@ -825,8 +824,15 @@ async function refreshOntoBase(opts: {
     // a descendant of `forkSha`, the ordinary safe case, nor an ancestor of it, the merely-stale-base
     // case); without one, a two-way divergence fails closed on the coarser check below instead of
     // guessing (PR #279 review, P1 re-review).
+    //
+    // `isAncestor`, not `branchContainsCommit` (PR #279 review, P1): the latter folds every git
+    // error, operational failures included, to `false` — an unrelated repo, a killed process, and a
+    // genuinely untrustworthy pin all read identically as "no trustworthy pin", which drops this
+    // guard onto the coarser divergence check below instead of leaving the pinned one in force.
+    // `isAncestor` answers the same reachability question but rethrows anything that isn't git's own
+    // "not an ancestor", so only genuine absence clears the pin.
     const trustedForkSha =
-      forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
+      forkSha && (await isAncestor(repoPath, forkSha, branch)) ? forkSha : undefined;
     if (trustedForkSha) {
       // Safe to leave untouched when the fork point descends from `baseSha` (the ordinary case), OR
       // when `baseSha` descends from the fork point but that reading is only a stale LOCAL fallback
@@ -998,10 +1004,17 @@ async function refreshOntoBase(opts: {
   // silently reintroduce exactly what the rewind was meant to drop. An authoritative rewind instead
   // falls through to the checks below, which rebase (or, for a published/preserved branch, refuse and
   // ask for manual resolution) using `baseSha` as the real, current truth.
+  //
+  // `isAncestor`, not `branchContainsCommit` (PR #279 review, P1): the latter folds every git error,
+  // operational failures included, to `false`, so a transient failure here reads exactly like
+  // `forkSha` genuinely being absent from `branch` — this check fails to trip, and the function falls
+  // through to the pinned-rewrite guard below with a stale `baseSha` a later, recovered git call would
+  // have rejected. `isAncestor` answers the same reachability question but rethrows anything that
+  // isn't git's own "not an ancestor", so only genuine absence skips this no-op.
   if (
     !baseIsAuthoritative &&
     forkSha &&
-    (await branchContainsCommit(repoPath, branch, forkSha)) &&
+    (await isAncestor(repoPath, forkSha, branch)) &&
     (await isAncestor(worktreePath, baseSha, forkSha))
   ) {
     console.log(
