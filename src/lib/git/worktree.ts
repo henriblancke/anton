@@ -1449,6 +1449,7 @@ async function materializeFreshWorktree(
   knownForkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
   beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
+  beforeCreate: ((createdBranch: boolean) => Promise<void>) | undefined,
 ): Promise<Worktree> {
   const path = worktreePathFor(repoPath, branch);
   await mkdir(dirname(path), { recursive: true });
@@ -1456,6 +1457,15 @@ async function materializeFreshWorktree(
   const branchAlreadyExisted = await branchExists(repoPath, branch);
   await assertForkableBranch(repoPath, branch, branchAlreadyExisted);
   const createdBranch = !branchAlreadyExisted;
+  // Fired under the same branch lock, BEFORE `git worktree add -b` below ever runs (anton-s55u, PR
+  // #279 review, P1 re-review): a caller recording branch-recreation evidence (e.g. the
+  // `BRANCH_RECREATED_REFRESH_TOMBSTONE` write in execute-epic-claim.ts) must land before the new
+  // branch can exist to survive a crash. Persisting it only after creation left a window where a
+  // process killed between the branch actually landing on disk and that later write meant a resume
+  // found the branch already present (so `createdBranch` reads false next time) with the tombstone
+  // never written — silently resurrecting the deleted branch's stale refresh boundary. Not
+  // best-effort, matching `beforeMutate`: a rejection here must stop the branch from ever being cut.
+  await beforeCreate?.(createdBranch);
   const { forkSha, resolved } = await addAndCaptureFork(repoPath, branch, baseBranch, path, claimed, createdBranch);
 
   // A pre-existing branch materialized onto a FRESH worktree directory is still a reuse
@@ -1493,6 +1503,7 @@ async function materializeClaimedWorktree(
   forkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
   beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
+  beforeCreate: ((createdBranch: boolean) => Promise<void>) | undefined,
 ): Promise<Worktree> {
   const { claimed, existing, baseBranch } = await resolveClaimForCreate(repoPath, branch, baseBranchOpt, claimedBy);
   const reused = await reuseIfPresent(
@@ -1520,6 +1531,7 @@ async function materializeClaimedWorktree(
     forkSha,
     baseIsAuthoritative,
     beforeMutate,
+    beforeCreate,
   );
 }
 
@@ -1556,6 +1568,16 @@ export async function createWorktree(opts: {
   baseIsAuthoritative?: boolean;
   /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
   beforeMutate?: (baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>;
+  /**
+   * Fires under the branch lock when there is no existing checkout to reuse, before `git worktree
+   * add` runs — `true` when it is about to cut a brand-new branch, `false` when it is materializing a
+   * fresh checkout for a branch that already exists. A caller that can tell a genuine
+   * deletion-and-recreation apart from this branch's first-ever creation (only it holds that older
+   * evidence) uses this to persist that durably before the branch can exist to survive a crash — see
+   * `materializeFreshWorktree`'s own doc comment. Not best-effort: a rejection propagates and the
+   * branch is never cut.
+   */
+  beforeCreate?: (createdBranch: boolean) => Promise<void>;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -1573,6 +1595,7 @@ export async function createWorktree(opts: {
       opts.forkSha,
       opts.baseIsAuthoritative,
       opts.beforeMutate,
+      opts.beforeCreate,
     ),
   );
 

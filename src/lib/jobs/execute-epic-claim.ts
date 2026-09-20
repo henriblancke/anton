@@ -281,6 +281,9 @@ export async function warmRunWorktree(
   ) {
     reconciledRefreshSha = pendingRefresh.sha;
   }
+  // Set from within `beforeCreate` below, before `createWorktree` ever cuts the branch — see that
+  // callback's own doc comment for why the write (and this flag) can no longer wait until after.
+  let isRecreatedBranch = false;
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -331,6 +334,30 @@ export async function warmRunWorktree(
         pendingRefreshKind: kind,
         priorBaseRefreshSha: reconciledRefreshSha ?? null,
       }),
+    // Fires BEFORE `createWorktree` cuts a new branch (PR #279 review, P1 re-review) — see
+    // `materializeFreshWorktree`'s own doc comment for why the write can no longer wait until after
+    // creation. `createdBranch` alone doesn't distinguish a genuine deletion-and-recreation from this
+    // branch's very first-ever creation, which is exactly as fresh as a brand-new row and has no
+    // older, potentially-stale pair to guard against — gated on actual evidence of an OLDER row for
+    // this branch (`knownForkSha`, `priorEffectiveRefreshSha`, or `pendingRefresh`, all resolved above,
+    // before this checkout existed). The tombstone (anton-nyz1v, PR #279 review, fifth round), not a
+    // plain null: a null `baseRefreshOutcome` is also what THIS row carried before this call ever ran
+    // (every row starts that way), so a later walk over this branch's rows can't tell "nothing
+    // recorded" from "deliberately cleared" without a value only a genuine recreation ever writes —
+    // see the constant's own doc comment for how `findRunBaseRefreshShaForBranch` reads it back. Not
+    // best-effort: a rejection here propagates out of `createWorktree` and the branch is never cut,
+    // rather than letting a recreated branch's stale pair survive unrecorded.
+    beforeCreate: (createdBranch) => {
+      if (!createdBranch) return Promise.resolve();
+      if (knownForkSha === undefined && priorEffectiveRefreshSha === undefined && pendingRefresh === undefined) {
+        return Promise.resolve();
+      }
+      isRecreatedBranch = true;
+      return updateRun(db, clock, runId, {
+        baseRefreshOutcome: BRANCH_RECREATED_REFRESH_TOMBSTONE,
+        baseRefreshSha: null,
+      });
+    },
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
@@ -376,30 +403,18 @@ export async function warmRunWorktree(
   // `forkSha` from the stale, pre-refresh pin instead.
   //
   // A freshly CREATED branch (`worktree.createdBranch`) forks straight off `freshBase` and never runs
-  // a refresh (see `materializeFreshWorktree`), so it has nothing of its own to record here — but THIS
-  // row can still carry a refresh an EARLIER attempt recorded before its checkout and branch were
-  // deleted and recreated (PR #279 review). Leaving that stale pair in place (by writing neither key)
-  // would let a later `findRunBaseRefreshShaForBranch` on this same branch prefer it over the
-  // recreated branch's fresh `baseForkSha` as the `--onto` rebase boundary, replaying whatever the
-  // deletion/recreation dropped. The tombstone (anton-nyz1v, PR #279 review, fifth round), not a
-  // plain null: a null `baseRefreshOutcome` is also what THIS row carried before this call ever ran
-  // (every row starts that way), so a later walk over this branch's rows can't tell "nothing
-  // recorded" from "deliberately cleared" without a value only a genuine recreation ever writes —
-  // see the constant's own doc comment for how `findRunBaseRefreshShaForBranch` reads it back.
-  //
-  // Gated on actual evidence of an OLDER row for this branch (`knownForkSha`, `priorEffectiveRefreshSha`,
-  // or `pendingRefresh`, all resolved above, before this checkout existed) — `createdBranch` alone
-  // doesn't distinguish a genuine deletion-and-recreation from this branch's very first-ever creation,
-  // which is exactly as fresh as a brand-new row and has no older, potentially-stale pair to guard
-  // against. Writing the tombstone unconditionally there left a first attempt's row reading as though
-  // something had been recreated when nothing ever existed to recreate.
-  const isRecreatedBranch =
-    worktree.createdBranch &&
-    (knownForkSha !== undefined || priorEffectiveRefreshSha !== undefined || pendingRefresh !== undefined);
-  const refreshFields = isRecreatedBranch
-    ? { baseRefreshOutcome: BRANCH_RECREATED_REFRESH_TOMBSTONE, baseRefreshSha: null }
-    : worktree.refreshOutcome &&
-        !(worktree.refreshOutcome.outcome === "skipped_dirty" && reconciledRefreshSha !== undefined)
+  // a refresh (see `materializeFreshWorktree`), so `worktree.refreshOutcome` is always undefined here
+  // and this has nothing of its own to record — but THIS row can still carry a refresh an EARLIER
+  // attempt recorded before its checkout and branch were deleted and recreated (PR #279 review). That
+  // stale pair is tombstoned already, by `beforeCreate` above, BEFORE `createWorktree` ever cut the
+  // branch (PR #279 review, P1 re-review) — see its own doc comment for why persisting it here, after
+  // the fact, left a crash window where the recreated branch could survive with the tombstone never
+  // written. `isRecreatedBranch` (set from within that callback) is read below only to skip the
+  // now-redundant write this block used to make.
+  const refreshFields =
+    !isRecreatedBranch &&
+    worktree.refreshOutcome &&
+    !(worktree.refreshOutcome.outcome === "skipped_dirty" && reconciledRefreshSha !== undefined)
       ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }
       : undefined;
   try {

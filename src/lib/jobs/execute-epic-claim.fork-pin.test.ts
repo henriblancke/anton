@@ -365,13 +365,16 @@ it("ignores a stale branch-scoped refresh record on a freshly RECREATED checkout
   });
   const RETRY = "run-2";
   await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
-  createWorktreeMock.mockResolvedValue({
-    path: WORKTREE,
-    branch: BRANCH,
-    baseBranch: FRESH_BASE,
-    createdBranch: true,
-    repoPath: "/repo",
-    forkSha: "recreated-branch-fork",
+  createWorktreeMock.mockImplementation(async (opts: { beforeCreate?: (createdBranch: boolean) => Promise<void> }) => {
+    await opts.beforeCreate?.(true);
+    return {
+      path: WORKTREE,
+      branch: BRANCH,
+      baseBranch: FRESH_BASE,
+      createdBranch: true,
+      repoPath: "/repo",
+      forkSha: "recreated-branch-fork",
+    };
   });
 
   const { runStep } = await warmRunWorktree(makeRun(RETRY));
@@ -390,21 +393,52 @@ it("clears a stale refresh record on its own row when its branch is recreated (P
   // `--onto` boundary, replaying whatever the deletion/recreation dropped. A tombstone is written
   // rather than a plain null (anton-nyz1v, PR #279 review, fifth round) — see
   // `BRANCH_RECREATED_REFRESH_TOMBSTONE`'s own doc comment for why a plain null can't do this job.
+  // Written via `beforeCreate`, BEFORE `createWorktree` resolves (PR #279 review, P1 re-review) — the
+  // mock invokes it itself, mirroring how the real `createWorktree` fires it ahead of `git worktree
+  // add -b` so the tombstone lands before the branch can exist to survive a crash.
   await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseRefreshOutcome: "merged",
     baseRefreshSha: "stale-recorded-base",
     branch: BRANCH,
   });
-  createWorktreeMock.mockResolvedValue({
-    path: WORKTREE,
-    branch: BRANCH,
-    baseBranch: FRESH_BASE,
-    createdBranch: true,
-    repoPath: "/repo",
-    forkSha: "recreated-branch-fork",
+  createWorktreeMock.mockImplementation(async (opts: { beforeCreate?: (createdBranch: boolean) => Promise<void> }) => {
+    await opts.beforeCreate?.(true);
+    return {
+      path: WORKTREE,
+      branch: BRANCH,
+      baseBranch: FRESH_BASE,
+      createdBranch: true,
+      repoPath: "/repo",
+      forkSha: "recreated-branch-fork",
+    };
   });
 
   await warmRunWorktree(makeRun(RUN_ID));
+
+  const row = await actualRuns.getRunById(t.db, RUN_ID);
+  expect(row?.baseRefreshOutcome).toBe(actualRuns.BRANCH_RECREATED_REFRESH_TOMBSTONE);
+  expect(row?.baseRefreshSha).toBeNull();
+});
+
+it("persists the recreation tombstone via beforeCreate before the branch can survive a crash, recoverable if the process dies before the fork-pin write (PR #279 review, P1 re-review)", async () => {
+  // The bug this closes: the old code wrote the tombstone only in the post-creation `updateRun` call,
+  // AFTER `createWorktree` had already cut the new branch on disk. A process killed in that window
+  // left the branch existing (so a resume's `createWorktree` treats it as already-there, not
+  // recreated) with the tombstone never written — silently resurrecting the deleted branch's stale
+  // `baseRefreshOutcome`/`baseRefreshSha` pair for a rebase `--onto` boundary the recreated branch
+  // never actually had. Simulating that crash directly: the mock's `beforeCreate` call must be the
+  // ONLY write that lands — nothing after it runs.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "stale-recorded-base",
+    branch: BRANCH,
+  });
+  createWorktreeMock.mockImplementation(async (opts: { beforeCreate?: (createdBranch: boolean) => Promise<void> }) => {
+    await opts.beforeCreate?.(true);
+    throw new Error("simulated crash right after the tombstone lands, before the branch materializes");
+  });
+
+  await expect(warmRunWorktree(makeRun(RUN_ID))).rejects.toThrow(/simulated crash/);
 
   const row = await actualRuns.getRunById(t.db, RUN_ID);
   expect(row?.baseRefreshOutcome).toBe(actualRuns.BRANCH_RECREATED_REFRESH_TOMBSTONE);
@@ -425,14 +459,19 @@ it("does not resurrect a pre-recreation refresh boundary once the recreation row
   });
   const RECREATED = "run-2";
   await createRun(t.db, clock, { id: RECREATED, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
-  createWorktreeMock.mockResolvedValueOnce({
-    path: WORKTREE,
-    branch: BRANCH,
-    baseBranch: FRESH_BASE,
-    createdBranch: true,
-    repoPath: "/repo",
-    forkSha: "recreated-branch-fork",
-  });
+  createWorktreeMock.mockImplementationOnce(
+    async (opts: { beforeCreate?: (createdBranch: boolean) => Promise<void> }) => {
+      await opts.beforeCreate?.(true);
+      return {
+        path: WORKTREE,
+        branch: BRANCH,
+        baseBranch: FRESH_BASE,
+        createdBranch: true,
+        repoPath: "/repo",
+        forkSha: "recreated-branch-fork",
+      };
+    },
+  );
   await warmRunWorktree(makeRun(RECREATED));
   const recreatedRow = await actualRuns.getRunById(t.db, RECREATED);
   expect(recreatedRow?.baseRefreshOutcome).toBe(actualRuns.BRANCH_RECREATED_REFRESH_TOMBSTONE);
