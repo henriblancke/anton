@@ -1554,6 +1554,19 @@ function gitPush(
       // kills (budget expiry, abort) return here, which is why the code-null branch downstream can
       // only ever describe a kill from OUTSIDE anton.
       if (killing) return;
+      if (code === null) {
+        // The signal killed `git` alone — a pre-push hook, or a worker it spawned, can still be
+        // alive in the group. Unlike the timeout/abort paths above, nothing has reaped it yet
+        // (#305 review): if the survivor has already closed or redirected the pipes it inherited,
+        // `close` fires immediately, and retrying without reaping first launches a second hook
+        // while the first is still consuming memory or writing files — worsening the exact
+        // OOM pressure a signal kill usually means.
+        killing = true;
+        void reapCommitGroup(child).then(() =>
+          settle(() => reject(pushFailed(args, code, killedBy, stderr(), stdout()))),
+        );
+        return;
+      }
       settle(() =>
         code === 0 ? resolvePromise() : reject(pushFailed(args, code, killedBy, stderr(), stdout())),
       );
@@ -1574,7 +1587,10 @@ const PUSH_VERDICT_BRAND = Symbol.for("anton.git.pushVerdict");
  * the failure without re-parsing a formatted string.
  *
  * A signal death leads the message with the signal's name rather than `exit null` (anton-ttlxp):
- * the exit code is the LESS informative half of the pair whenever a signal is present.
+ * the exit code is the LESS informative half of the pair whenever a signal is present. `code` is
+ * only ever null here alongside a null `signal` too (Node failed to report which signal it was,
+ * not that there wasn't one) — so that case still reads as a kill, not as the unhelpful `exit
+ * null` this fix exists to remove (#305 review).
  */
 function pushFailed(
   args: string[],
@@ -1583,7 +1599,7 @@ function pushFailed(
   stderr: string,
   stdout: string,
 ): Error {
-  const outcome = signal ? `killed by ${signal}` : `exit ${code}`;
+  const outcome = signal ? `killed by ${signal}` : code === null ? "killed by an unidentified signal" : `exit ${code}`;
   return Object.assign(new Error(`git ${args[0]} failed (${outcome}): ${stderr}`), {
     [PUSH_VERDICT_BRAND]: true as const,
     code,
@@ -1642,7 +1658,7 @@ export const SIGNAL_KILL_BACKOFF_ENV = "ANTON_GIT_PUSH_SIGNAL_BACKOFF_MS";
 
 function signalKillRetry(): PushRetryShape {
   const raw = Number(process.env[SIGNAL_KILL_BACKOFF_ENV]);
-  if (!Number.isFinite(raw) || raw < 0) return SIGNAL_KILL_RETRY;
+  if (!Number.isFinite(raw) || raw <= 0) return SIGNAL_KILL_RETRY;
   return { ...SIGNAL_KILL_RETRY, backoffMs: Math.min(SIGNAL_KILL_RETRY.backoffMs, raw) };
 }
 
@@ -1671,23 +1687,33 @@ export function classifyPushFailure(result: {
   const { code, signal, stdout, stderr } = result;
 
   // Something OUTSIDE anton killed the push (anton-ttlxp). Retried, not because the CAUSE is
-  // self-clearing, but because of the STATE it leaves: a kill before exit means git never reached
-  // the transport, so nothing was rejected and no ref moved — strictly safer to retry than the
-  // exit-128 transport faults retried below, which at least talked to a remote. anton's own two
-  // kills (budget expiry, abort) never reach here: both set `killing` and return before `gitPush`'s
-  // close handler forms a verdict at all.
+  // self-clearing, but because of the STATE it leaves: the signal says how the process died, not
+  // which phase it reached, so a kill can land after the remote already accepted the update and
+  // before `--porcelain` reported it back (#305 review) — the reason below must not claim more
+  // than the captured output proves. Retrying stays safe either way: a push that already landed is
+  // just a fast-forward no-op the second time, strictly safer than the exit-128 transport faults
+  // retried below, which at least talked to a remote. anton's own two kills (budget expiry, abort)
+  // never reach here: both set `killing` and return before `gitPush`'s close handler forms a
+  // verdict at all.
   if (code === null) {
     const named = signal ?? "an unidentified signal";
     const oom =
       signal === "SIGKILL"
         ? " — on a host under memory pressure this is most often the OOM killer taking the pre-push hook"
         : "";
+    // A `Done` line only appears once `--porcelain` heard back from the remote for every ref, so
+    // its presence is the one thing this can assert about ref state; its absence proves nothing —
+    // the signal could still have landed after the remote accepted the update but before the line
+    // was written back.
+    const refState = /^Done\s*$/m.test(stdout)
+      ? "the remote had already accepted the update when the signal arrived"
+      : "whether the remote accepted the update before the signal arrived is unknown";
     return {
       transient: true,
       retry: signalKillRetry(),
       reason:
         `the push was killed by ${named} from outside anton before git could exit${oom}. ` +
-        `Nothing was rejected and no ref moved: ${stderr || "(the push printed nothing to stderr)"}`,
+        `${refState}: ${stderr || "(the push printed nothing to stderr)"}`,
     };
   }
 

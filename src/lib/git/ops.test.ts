@@ -192,6 +192,55 @@ process.exit(r.status ?? 1);
   return binDir;
 }
 
+/**
+ * A git shim reproducing the OTHER external-kill shape (anton-ttlxp #305 review): a signal that
+ * kills only the immediate `git` process while a survivor it already spawned — standing in for a
+ * pre-push hook or one of its workers — lives on, unreaped, as a member of the same (detached)
+ * process group. The survivor is spawned with `stdio: 'ignore'`, never `inherit`, so it holds no
+ * reference to the pipe `gitPush` reads: the instant this shim dies, Node sees the pipe as fully
+ * closed and fires `close` immediately even though the survivor is still very much alive — the
+ * exact shape the P1 finding describes. It traps SIGTERM and writes `markerFile` only then, so
+ * seeing that file after `pushBranch` settles proves `reapCommitGroup`'s own group-wide signal
+ * reached it — the shim signals only ITSELF, never the survivor directly.
+ */
+function shimGitOrphaningSurvivorOnSignal(
+  sandboxDir: string,
+  startedFile: string,
+  markerFile: string,
+): string {
+  const binDir = join(sandboxDir, "orphan-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawn}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+if(a.includes('push')){
+  const survivor=spawn(process.execPath,['-e',\`
+    const fs=require('node:fs');
+    process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(markerFile)},'');process.exit(0)});
+    fs.writeFileSync(${JSON.stringify(startedFile)},'');
+    setInterval(()=>{},1000);
+  \`],{stdio:'ignore'});
+  survivor.unref();
+  const started=${JSON.stringify(startedFile)};
+  const deadline=Date.now()+10000;
+  const poll=()=>{
+    if(fs.existsSync(started)){process.kill(process.pid,'SIGTERM');return;}
+    if(Date.now()>deadline){process.exit(1);return;}
+    setTimeout(poll,20);
+  };
+  poll();
+  return;
+}
+process.exit(0);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
 // The disabling sentinel `resolveHooksPathOverrideForMerge` returns instead of `undefined` whenever
 // `core.hooksPath` IS configured but no source verified to match the incoming commit exists (PR #263
 // review, round 26): an absolute path guaranteed to not exist on disk, which git's own hook lookup
@@ -4043,11 +4092,26 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
       expect(verdict.reason).not.toMatch(/does not recognize/);
     });
 
-    it("says the kill came from outside anton and that no ref moved", () => {
+    it("says the kill came from outside anton without claiming to know whether the ref moved", () => {
       const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
 
       expect(verdict.reason).toMatch(/outside anton/);
-      expect(verdict.reason).toMatch(/no ref moved/);
+      // No porcelain `Done` line was captured, so the ref state is genuinely unknown — the
+      // classifier must say so instead of asserting nothing was rejected (#305 review).
+      expect(verdict.reason).toMatch(/unknown/);
+      expect(verdict.reason).not.toMatch(/no ref moved/);
+    });
+
+    it("says the remote already accepted the update when porcelain's Done line was captured", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "To origin\n*\trefs/heads/main:refs/heads/main\t[new branch]\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.reason).toMatch(/already accepted the update/);
+      expect(verdict.reason).not.toMatch(/unknown/);
     });
 
     it("points at the OOM killer for SIGKILL specifically — the measured cause on a loaded host", () => {
@@ -4070,7 +4134,7 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
       expect(verdict.reason).not.toMatch(/exit null/);
     });
 
-    it("is transient — git never reached the transport, so no ref moved and a retry is safe", () => {
+    it("is transient — an already-applied push is a safe no-op to retry either way", () => {
       const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
 
       expect(verdict.transient).toBe(true);
@@ -4100,6 +4164,47 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
       const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
 
       expect(verdict.reason).toMatch(/printed nothing to stderr/);
+    });
+
+    // anton-ttlxp #305 review: `ANTON_GIT_PUSH_SIGNAL_BACKOFF_MS` is a CAP on the 30s default, same
+    // contract as `ANTON_GIT_PUSH_TIMEOUT_MS` — `raw > 0` there, so this must reject `raw <= 0` too,
+    // not just `raw < 0`. An accepted `0` used to drive the post-kill backoff straight to 0ms,
+    // retrying immediately into the memory pressure the backoff exists to avoid.
+    describe("SIGNAL_KILL_BACKOFF_ENV as a cap, never an override", () => {
+      let prevEnv: string | undefined;
+
+      beforeEach(() => {
+        prevEnv = process.env[SIGNAL_KILL_BACKOFF_ENV];
+      });
+
+      afterEach(() => {
+        if (prevEnv === undefined) delete process.env[SIGNAL_KILL_BACKOFF_ENV];
+        else process.env[SIGNAL_KILL_BACKOFF_ENV] = prevEnv;
+      });
+
+      it("ignores an explicit 0 and keeps the 30s default instead of retrying with no delay", () => {
+        process.env[SIGNAL_KILL_BACKOFF_ENV] = "0";
+
+        const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+        expect(verdict.retry?.backoffMs).toBe(30_000);
+      });
+
+      it("ignores a negative value and keeps the 30s default", () => {
+        process.env[SIGNAL_KILL_BACKOFF_ENV] = "-5";
+
+        const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+        expect(verdict.retry?.backoffMs).toBe(30_000);
+      });
+
+      it("honors a valid positive override, capping the backoff at or below it", () => {
+        process.env[SIGNAL_KILL_BACKOFF_ENV] = "50";
+
+        const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+        expect(verdict.retry?.backoffMs).toBeLessThanOrEqual(50);
+      });
     });
   });
 });
@@ -4507,9 +4612,34 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
         const message = (failure as Error).message;
         expect(message).toMatch(/killed by SIGKILL/);
         expect(message).toMatch(/outside anton/);
-        expect(message).toMatch(/no ref moved/);
+        // No porcelain `Done` line came back from this shim, so the ref state is unknown — the
+        // message must not assert nothing was rejected (#305 review).
+        expect(message).toMatch(/unknown/);
+        expect(message).not.toMatch(/no ref moved/);
         // The exact string the bug produced, gone from the message the caller finally sees.
         expect(message).not.toMatch(/exit null/);
+      },
+    );
+
+    // anton-ttlxp #305 review: a signal from OUTSIDE anton can kill just the `git` process while a
+    // pre-push hook (or a worker it spawned) is still alive in the group. Unlike the timeout and
+    // abort kills `gitPush` triggers itself, nothing reaped that survivor before this fix — this
+    // proves the fix's own reap runs before the caller sees the rejection.
+    it.runIf(process.platform !== "win32")(
+      "reaps a survivor orphaned by a signal that killed only the git process",
+      async () => {
+        const started = join(sandbox, "orphan-started");
+        const marker = join(sandbox, "orphan-marker");
+        process.env.PATH = `${shimGitOrphaningSurvivorOnSignal(sandbox, started, marker)}:${prevPath}`;
+
+        const failure = await pushBranch(repo, "main").catch((e: unknown) => e);
+
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toMatch(/outside anton/);
+        // The shim signals only ITSELF, never the survivor directly — the survivor writes its
+        // marker only upon receiving TERM, so seeing it here proves reapCommitGroup's group-wide
+        // signal (not the shim's own self-kill) is what reached the orphaned survivor.
+        expect(existsSync(marker)).toBe(true);
       },
     );
   });
