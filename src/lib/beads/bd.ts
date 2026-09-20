@@ -220,6 +220,21 @@ const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
 const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
 
 /**
+ * Durable proof that a board-only ticket's delivery was confirmed and its cleanup completed (PR
+ * #284 review, "no record that this bead's board-only delivery ever happened") — set once, right
+ * beside the marker/baseline clear in {@link clearBoardEvidencePending}, and never cleared
+ * afterwards. Unlike the pending marker and preserved baseline, which exist only to recover an
+ * IN-FLIGHT confirmation and are deliberately wiped once it lands, this key's whole job starts
+ * where theirs ends: it is the one thing left on the bead once both are gone, and it lives in the
+ * synced board rather than on any one machine's git branch — so it answers "was this ticket ever
+ * confirmed delivered" long after the branch that carried its attribution commit is gone (a crash
+ * before that branch was pushed, a fresh worktree on another machine) and independently of whether
+ * this branch happens to carry that commit. See {@link beads.boardEvidenceConfirmed} /
+ * {@link beads.setBoardEvidenceConfirmed}.
+ */
+const BOARD_EVIDENCE_CONFIRMED_KEY = "boardEvidenceConfirmed";
+
+/**
  * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
  * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
  * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
@@ -231,6 +246,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   RETIRED_PR_KEY,
   BOARD_EVIDENCE_BASELINE_KEY,
   BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
+  BOARD_EVIDENCE_CONFIRMED_KEY,
 ];
 
 /**
@@ -1084,6 +1100,17 @@ export const beads = {
   /** Release the retry obligation once a later push actually confirms the cleanup reached the remote. */
   clearBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>
     bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]),
+
+  /** Whether this ticket's board-only delivery was ever confirmed and its cleanup completed —
+   * the durable proof that survives {@link beads.clearBoardEvidenceBaseline}/pending-marker
+   * clearing. See {@link BOARD_EVIDENCE_CONFIRMED_KEY}. */
+  boardEvidenceConfirmed: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY] === "true",
+
+  /** Record, permanently, that this ticket's board-only delivery was confirmed — written once,
+   * beside the pending-marker/baseline clear, and never unset. */
+  setBoardEvidenceConfirmed: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_CONFIRMED_KEY}=true`]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,

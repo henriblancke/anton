@@ -1121,16 +1121,23 @@ async function runGateFixSession(args: {
       // (PR #284 review round 16): folding it into "no board change" would let a board-capable
       // fixer's real write pass as a stalled round — skipping `syncBoard` below, and leaving a retry
       // to take a fresh baseline that silently absorbs the unconfirmed mutation before any review
-      // sees it. Thrown as `PoisonError` straight away, bypassing the retry path entirely, since a
-      // retry can't safely re-read this any better than the fixer's own session just did.
+      // sees it.
+      //
+      // Thrown as a plain `Error`, NOT `PoisonError` (PR #284 review, "restore git state before
+      // poisoning on an unreadable board") — a mixed fixer that also touched the git tree has an
+      // UNVERIFIED tree at this point (no gates have run, nothing is committed), and `PoisonError`
+      // is exactly what the catch below leaves untouched, on the assumption that a poison always
+      // means legitimate work parked on a stray branch. This one isn't that: routing it through the
+      // ordinary catch instead runs `discardSessionWrites` first, exactly as a red gate would, and
+      // its own board-only handling below re-reads the fingerprint and escalates to `PoisonError`
+      // itself if that confirms (or still can't rule out) a live board write — see the fail-closed
+      // handling there.
       if (boardBefore && !boardAfter) {
-        throw new PoisonError(
+        throw new Error(
           `the review fix for ${target.id} could not read the board fingerprint after round ${round} — ` +
             `\`mustReadBoard\` exhausted its retries. Refusing to treat this as no board change: a ` +
             `board-only fixer may have written directly to the live board, and without this read that ` +
-            `write can never be told apart from no progress — a retry would take a fresh baseline that ` +
-            `silently absorbs it, and this run's own best-effort final sync could publish it before ` +
-            `anyone reviews it. Inspect and repair the board by hand, then resume.`,
+            `write can never be told apart from no progress.`,
         );
       }
       // Whether the fixer actually wrote to the board, for a board-only run only: `boardEvidence`
@@ -1286,7 +1293,25 @@ async function runGateFixSession(args: {
         // board by hand.
         if (boardOnly && repoPath && boardBefore) {
           const boardOnFailure = await args.readBoardFingerprint(repoPath, target.id);
-          const changedOnFailure = boardOnFailure ? boardEvidence(boardBefore, boardOnFailure) : [];
+          // An unreadable failure-audit read is poisoned, never read as proof the board is
+          // unchanged (PR #284 review, "poison when the failed-fix board audit is unreadable") —
+          // the same fail-closed rule the pre-fix baseline and post-fix "after" reads already
+          // follow above. Folding an exhausted `mustReadBoard` into `[]` here would let a fixer
+          // that mutated the board and THEN failed — e.g. because `syncBoard` itself returned
+          // false — escape with its write untold apart from no progress: the original error would
+          // propagate as an ordinary retryable failure, and a resumed attempt's fresh baseline
+          // would silently absorb the locally-mutated, unreviewed state before any later sync
+          // published it.
+          if (!boardOnFailure) {
+            throw new PoisonError(
+              `the review fix for ${target.id} FAILED and the post-failure board audit could not be read ` +
+                `— \`mustReadBoard\` exhausted its retries. Refusing to treat this as no board change: the ` +
+                `fixer may have written directly to the live board before failing, and without this read ` +
+                `that write can never be told apart from no progress. Inspect and repair the board by ` +
+                `hand, then resume. The fixer itself failed with: ${String(e)}`,
+            );
+          }
+          const changedOnFailure = boardEvidence(boardBefore, boardOnFailure);
           if (changedOnFailure.length > 0) {
             throw new PoisonError(
               `the review fix for ${target.id} FAILED after writing directly to the board — bead(s) ` +

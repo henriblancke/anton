@@ -535,6 +535,16 @@ export async function readBoardEvidence(
  * separate from {@link readBoardEvidence}, which only ever ADDS to the marker: only the ticket's own
  * success path, after `finishTicket` returns without throwing, knows the handoff truly finished.
  *
+ * Also sets {@link beads.setBoardEvidenceConfirmed} — the one write here that is NEVER released
+ * (PR #284 review, "no record that this bead's board-only delivery ever happened"). Once this
+ * function returns, the marker and preserved baseline it clears are gone by design, and without a
+ * permanent trace a resume that finds this ticket closed with no commit on its OWN branch (a crash
+ * before the epic's branch was ever pushed, or a fresh worktree on another machine) cannot tell
+ * "confirmed and cleaned up" from "closed with no evidence at all" — `doneOnBoard`'s dispatch-loop
+ * caller (execute-epic-dispatch.ts) reads this durable flag to take the safe branch instead of
+ * regenerating a ticket whose fresh board baseline already absorbed its own landed change, which
+ * can never produce a further diff to prove and would otherwise fail it as undelivered forever.
+ *
  * Retried through {@link mustPersist} rather than a bare `.catch(() => {})` (PR #284 review round 8):
  * a swallowed failure here is NOT harmless — it leaves the stale marker on an already-closed bead,
  * so a later reopen (a review send-back on this same board-only ticket) reads `pendingBoardEvidence`
@@ -599,7 +609,15 @@ export async function clearBoardEvidencePending(
           beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
         );
   const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
-  const cleared = markerCleared && baselineCleared;
+  // Written in the SAME all-or-nothing gate as the two clears above, never after it (PR #284
+  // review, "no record that this bead's board-only delivery ever happened"): this is the one
+  // thing left once both are gone, so it must land — and be confirmed synced — exactly as
+  // reliably as they do, or a resume on a fresh branch with no baseline to fall back on has no
+  // way to tell "confirmed and cleaned up" from "closed with nothing behind it" and can
+  // regenerate this ticket into a false `NoDeliveryError`. Idempotent (`--set-metadata` on an
+  // already-`true` key), so retrying it on a resumed cleanup costs nothing.
+  const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId));
+  const cleared = markerCleared && baselineCleared && confirmedSet;
   const synced = cleared
     ? await beads
         .push(repo)
@@ -607,7 +625,7 @@ export async function clearBoardEvidencePending(
         .catch(() => false)
     : false;
   if (!cleared || !synced) {
-    // Both writes landed locally — only the confirming push is missing. This obligation marker is
+    // All writes landed locally — only the confirming push is missing. This obligation marker is
     // what a resume's `hasCleanupUnsynced` check relies on (PR #284 review, "require the cleanup
     // obligation write to succeed"): unlike the earlier `.catch(() => {})` here, its result is not
     // discarded — `mustPersist` never throws, so a swallowed result meant a resume whose local db
@@ -620,15 +638,16 @@ export async function clearBoardEvidencePending(
       : true;
     const detail = cleared
       ? obligationPersisted
-        ? "both cleanup writes landed locally, but the confirming push could not verify they reached " +
+        ? "every cleanup write landed locally, but the confirming push could not verify they reached " +
           "the remote"
-        : "both cleanup writes landed locally, but the confirming push could not verify they reached " +
+        : "every cleanup write landed locally, but the confirming push could not verify they reached " +
           "the remote, and bd also refused the local retry-obligation marker (after retries) — a " +
           "resume will NOT automatically retry this cleanup; clear the pending marker and preserved " +
           "baseline for this ticket directly, or retry until the obligation marker persists"
       : `bd would not clear ${[
           !markerCleared && "the pending-evidence marker",
           !baselineCleared && "the preserved baseline",
+          !confirmedSet && "the delivery-confirmed marker",
         ]
           .filter((s): s is string => s !== false)
           .join(" and ")} it left on the board (after retries)`;

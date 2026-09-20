@@ -55,6 +55,7 @@ import { runTargetAbove } from "./gate-targets";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
+import { recordBoardOnlyAttribution } from "./step-registry";
 import type { SatisfiedSettlement, StepContext } from "./step-registry";
 
 /** What the ticket phase leaves for the run phase to speak for. */
@@ -1197,6 +1198,25 @@ async function dispatchTicket(
   const skipping = ledger.skipCause.get(ticket.id);
   if (skipping) {
     await recordSkipped(ticket, skipping, doneOnBoard);
+    return;
+  }
+  // A board-only ticket already CONFIRMED delivered — `clearBoardEvidencePending` set this
+  // durable flag and cleared the pending marker/baseline that would otherwise recover it (PR
+  // #284 review, "no record that this bead's board-only delivery ever happened") — has nothing
+  // left for a regenerated agent to prove: `readBoardBaseline` on this resume takes a FRESH read
+  // that already reflects this ticket's own landed change, so an idempotent retry can only ever
+  // find a zero diff and fail with `NoDeliveryError`, undoing a delivery that already happened.
+  // Checked BEFORE `assertRerunGates`/`reopenForRegeneration` below, neither of which apply here
+  // — no agent runs, so a disabled `agent:` label or a contract gap regressed since this ticket
+  // closed is not this path's business. Only the attribution commit `step:pr` needs (this
+  // branch, unlike the one that confirmed the delivery, carries no commit ahead of base for this
+  // ticket) is missing, so write it directly instead of re-dispatching.
+  if (doneOnBoard && ticket.status === "closed" && beads.isBoardOnly(ticket) && beads.boardEvidenceConfirmed(ticket)) {
+    await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
+    onBranch.add(ticket.id);
+    if (ledger.skipCause.has(ticket.id)) {
+      ledger.skipCause = skippedDependents(timedOut, tickets, all, onBranch);
+    }
     return;
   }
   // Done on the board but the commit is missing from this branch (cross-machine resume): the

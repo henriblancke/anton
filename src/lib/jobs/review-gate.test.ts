@@ -736,6 +736,116 @@ describe("runReviewGate — bounds", () => {
   );
 
   it(
+    "reverts a mixed fixer's git changes before poisoning on an unreadable post-fix board read " +
+      "(PR #284 review, \"restore git state before poisoning on an unreadable board\") — a fixer " +
+      "that also touched the git tree has an UNVERIFIED tree at that point (no gates ran, nothing " +
+      "committed), so the poison must not bypass the same discard a red gate would trigger",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      // dispatch #2 is the fix session — it dirties the tree, mimicking a fixer that wrote both a
+      // file AND a bd update before the confirming board read fails.
+      const worktree = fakeWorktree([2]);
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return reads === 1 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "touched a file and wrote to bd"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      // The whole point: the git dirt the fixer left standing was reverted BEFORE the run parked —
+      // discardSessionWrites only calls restoreState when the post-session state differs from the
+      // pre-round baseline, so a non-empty call here proves the rollback actually ran.
+      expect(worktree.restores.length).toBeGreaterThan(0);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
+    "poisons instead of treating an unreadable failure-audit as no board change (PR #284 review, " +
+      '"poison when the failed-fix board audit is unreadable") — a fixer that mutated the board and ' +
+      "THEN failed (e.g. because its own sync came back false) must not have that write waved through " +
+      "as an ordinary retryable stall just because the audit read itself could not confirm it",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        // The pre-fix baseline succeeds; every read taken AFTER the fixer's own failure is
+        // unreadable — `mustReadBoard` exhausted its retries on a genuinely contended board.
+        return reads === 1 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+      };
+      const { run, calls } = fakeClaude([
+        report(4, [BLOCKING]),
+        new Error("the board write could not be confirmed synced"),
+      ]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/post-failure board audit could not be read/);
+      expect((error as Error).message).toContain(boardOnlyTarget.id);
+      // The original failure survives in the poison, so a human sees WHY the fixer stopped, not
+      // just that the audit read afterward was unreadable.
+      expect((error as Error).message).toContain("could not be confirmed synced");
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
     "parks instead of stalling when a board-only fix's write cannot be confirmed synced " +
       "(PR #284 review round 15) — a local-only Dolt write must not read as a normal no-progress " +
       "round, since a resume or this run's own best-effort final sync could later publish it with no " +

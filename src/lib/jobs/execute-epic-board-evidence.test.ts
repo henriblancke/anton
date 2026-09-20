@@ -22,6 +22,10 @@ const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promi
 // above are.
 const setBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 const clearBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// The durable delivery-confirmed marker (PR #284 review, "no record that this bead's board-only
+// delivery ever happened") shells out to `bd update` too — mocked for the same reason the other
+// board-evidence writes above are.
+const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // `ensureDescription`'s fallback for a bead the LIST read omitted a description for (PR #284
 // review) — mocked so the hydration tests below exercise that fallback, not a live `bd show`
 // against a fake "/repo".
@@ -39,6 +43,7 @@ vi.mock("../beads/bd", async () => {
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
       clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
+      setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
       show: showMock,
     },
   };
@@ -66,6 +71,7 @@ setBoardEvidenceBaselineMock.mockResolvedValue("");
 clearBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
+setBoardEvidenceConfirmedMock.mockResolvedValue("");
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;

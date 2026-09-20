@@ -58,6 +58,14 @@ vi.mock("./execute-epic-board-evidence", async () => {
   };
 });
 
+// The durable-confirmation resume path writes the attribution commit directly rather than through
+// runTicket/the ticket's own worktree (PR #284 review, thread on line 601) — mocked so the test
+// exercises the dispatch decision, not `steps/git.ts`'s real `commitMarker` against a fake worktree.
+const recordBoardOnlyAttributionMock = vi.fn();
+vi.mock("./step-registry", () => ({
+  recordBoardOnlyAttribution: (...args: unknown[]) => recordBoardOnlyAttributionMock(...args),
+}));
+
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -176,6 +184,7 @@ beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   clearBoardEvidencePendingMock.mockReset();
+  recordBoardOnlyAttributionMock.mockReset().mockResolvedValue(undefined);
   hasCommitMock.mockReset().mockResolvedValue(false);
   satisfiedByMock.mockReset().mockResolvedValue(undefined);
   branchAddedMock.mockReset().mockResolvedValue(true);
@@ -1036,4 +1045,50 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
       });
     },
   );
+});
+
+// A board-only ticket closed and cleaned up on ANOTHER machine (its pending marker and preserved
+// baseline both cleared once delivery confirmed) whose branch was never pushed before this run
+// resumes on a fresh worktree here: no commit of its own, no sibling, and no note — `branchDelivery`
+// finds nothing, so the ordinary cross-machine path would regenerate it. Regenerating it is exactly
+// wrong (PR #284 review, "no record that this bead's board-only delivery ever happened"): its own
+// fresh `readBoardBaseline` already reflects the change this ticket made, so an idempotent agent can
+// only ever find a zero diff and fail with `NoDeliveryError`, undoing a delivery that already
+// happened. `beads.boardEvidenceConfirmed` is the durable trace `clearBoardEvidencePending` leaves
+// for exactly this case — it survives the marker/baseline clear precisely so this branch can tell
+// "confirmed and cleaned up" apart from "closed with nothing behind it".
+describe("a board-only ticket durably confirmed delivered with no commit on this branch (PR #284 review)", () => {
+  it("writes the attribution commit directly instead of regenerating the ticket", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly],
+      metadata: { boardEvidenceConfirmed: "true" },
+    });
+    hasCommitMock.mockResolvedValue(false);
+
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
+    expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+  });
+
+  it("still reopens and regenerates a board-only ticket that was never durably confirmed", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly],
+      description: CONTRACT,
+    });
+    hasCommitMock.mockResolvedValue(false);
+    const run = makeRun([child], new AbortController().signal);
+    (run.target as Bead).description = CONTRACT;
+
+    await dispatchRunTickets(run, prep());
+
+    expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    expect(reopenMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a");
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
 });
