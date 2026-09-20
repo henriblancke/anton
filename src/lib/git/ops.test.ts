@@ -4157,7 +4157,9 @@ for (let i = 0; i < 200; i += 1) {
   process.stderr.write("circle session consent backfill failed { message: 'boom' }\\n");
 }
 process.stderr.write(${JSON.stringify(SUMMARY)} + "\\n  expected 402, got 200\\n");
-process.exit(1);
+// exitCode, not exit(): stderr is a pipe here, so its writes are async — exit() can tear the
+// process down before the OS pipe drains, dropping exactly the tail this test asserts on.
+process.exitCode = 1;
 `,
     );
     chmodSync(hookPath, 0o755);
