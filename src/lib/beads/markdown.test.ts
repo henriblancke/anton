@@ -434,6 +434,20 @@ it("drops the delimiters of a fence nested in several containers, empty ones inc
   expect(rendered("> > ```\n> > x\n> > ```")).toEqual(["> > x"]);
 });
 
+it("peels only the opener's own containers from a container-owned fence's closer", () => {
+  // The fence opens inside a list item (one column-step of container). Its final content line
+  // begins with another list-shaped marker at that same continuation column — literal content the
+  // opener never nested inside, not a closer. An unrestricted strip peeled that marker too,
+  // misreading owned content as the closer and dropping the sole authored criterion.
+  expect(rendered("## Acceptance\n- ~~~\n  - ~~~")).toEqual(["## Acceptance", "  - ~~~"]);
+  expect(scanMarkdown("## Acceptance\n- ~~~\n  - ~~~").map((l) => l.delimiter)).toEqual([
+    false,
+    true,
+    false,
+  ]);
+  expect(unterminatedCloser("## Acceptance\n- ~~~\n  - ~~~")).toBe("  ~~~");
+});
+
 it("closes a container-nested fence whose closer reaches the item's column with a tab, not spaces", () => {
   // CommonMark measures a list item's continuation by visual column, not source spelling — a tab
   // and enough spaces that land on the same column both keep a closer inside the item. Comparing

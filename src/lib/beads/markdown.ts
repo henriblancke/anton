@@ -435,15 +435,15 @@ function scanMarkdownParsed(source: string): ScannedLine[] {
       for (let index = start; index <= end; index++) lines[index]!.fenced = true;
       lines[start]!.delimiter = true;
       // The parser includes an unterminated block's final content line in the code node. Its trailing
-      // run can resemble a delimiter, but only a full container-stripped line may close the fence —
-      // and only the containers the OPENER actually carries: a top-level fence's closer must be
-      // judged as-is, or a line that merely looks list/quote-shaped (`- ~~~` as literal content, not
-      // a closer) gets stripped down to a false match and consumed as the delimiter.
+      // run can resemble a delimiter, but only the containers the OPENER actually carries may close
+      // the fence: a top-level fence's closer must be judged as-is, and a container-owned fence's
+      // closer must be judged after peeling exactly the opener's recorded prefix — an unrestricted
+      // strip also peels a nested marker the closer never opened (`- ~~~` as a literal line inside a
+      // list-owned fence), misreading owned content as the closer and dropping it from the render.
       const closingLine = lines[end]?.text ?? "";
       const prefix = fenceContainerPrefix(lines[start]?.text.slice(0, node.position.start.column - 1) ?? "");
-      const directCloser = prefix.length > 0 ? stripContainerMarkers(closingLine) : closingLine;
-      const continuationCloser = prefix.length > 0 ? (peelClosurePrefix(closingLine, prefix) ?? "") : "";
-      if (end !== start && (closingFence(directCloser, opening) || closingFence(continuationCloser, opening))) {
+      const closer = prefix.length > 0 ? peelClosurePrefix(closingLine, prefix) : closingLine;
+      if (end !== start && closer !== undefined && closingFence(closer, opening)) {
         lines[end]!.delimiter = true;
       }
       return;
@@ -612,12 +612,13 @@ function unterminatedCloserParsed(source: string): string | undefined {
         // own container prefix the same way scanMarkdown does before judging the terminal line.
         const lineStart = source.lastIndexOf("\n", Math.max(0, offset - 1)) + 1;
         const prefix = fenceContainerPrefix(source.slice(lineStart, offset));
-        // A top-level fence carries no container, so its closer is judged as-is — stripping here
-        // regardless of `prefix` would treat a literal list/quote-shaped content line (`- ~~~`) as
-        // the closer it merely resembles, closing the fence early on content it never opened inside.
-        const directCloser = prefix.length > 0 ? stripContainerMarkers(last) : last;
-        const continuationCloser = prefix.length > 0 ? (peelClosurePrefix(last, prefix) ?? "") : "";
-        if (!closingFence(directCloser, opener) && !closingFence(continuationCloser, opener)) {
+        // A top-level fence carries no container, so its closer is judged as-is. A container-owned
+        // fence's closer must be judged after peeling exactly the opener's recorded prefix — an
+        // unrestricted strip also peels a nested marker the closer never opened (`- ~~~` as literal
+        // content inside a list-owned fence), misreading owned content as the closer and treating an
+        // actually-unterminated fence as already closed.
+        const closerLine = prefix.length > 0 ? peelClosurePrefix(last, prefix) : last;
+        if (closerLine === undefined || !closingFence(closerLine, opener)) {
           closer = { offset, text: fenceCloser(openerLine) };
         }
       }
