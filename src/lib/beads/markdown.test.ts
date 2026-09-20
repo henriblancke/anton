@@ -260,13 +260,19 @@ describe("scanMarkdown", () => {
 
     it("does not reach across a line that opens a block of its own", () => {
       // Each of these ends the paragraph, so the `===` below closes nothing.
-      for (const between of ["- item", "> quote", "# ATX", "    code", "<div>"]) {
+      for (const between of ["- item", "> quote", "# ATX", "<div>"]) {
         expect(headings(`Acceptance\n${between}\n===`)[0]).toBeUndefined();
       }
       // A type-7 tag may NOT interrupt a paragraph, so that run really is one heading.
       expect(headings('Acceptance\n<widget x="y">\n===')[0]).toEqual({
         depth: 1,
         key: "acceptance",
+      });
+      // Indented code may NOT interrupt a paragraph either — it only starts a code block after a
+      // blank line — so a four-space line here is paragraph continuation, and the run is one heading.
+      expect(headings("Acceptance\n    code\n===")[0]).toEqual({
+        depth: 1,
+        key: "acceptancecode",
       });
     });
 
@@ -283,6 +289,18 @@ describe("scanMarkdown", () => {
         { depth: 2, key: "a" },
         undefined,
         { depth: 1, key: "b" },
+        undefined,
+      ]);
+    });
+
+    it("keeps an indented continuation line in a multiline Setext heading under a real section", () => {
+      // Indented code cannot interrupt the open "Backend" paragraph, so `    API` is heading text
+      // and the h1 closes Acceptance — it must not be miscounted as authored Acceptance content.
+      expect(headings("## Acceptance Criteria\nBackend\n    API\n===\n- [ ] implement it")).toEqual([
+        { depth: 2, key: "acceptancecriteria" },
+        { depth: 1, key: "backendapi" },
+        undefined,
+        undefined,
         undefined,
       ]);
     });

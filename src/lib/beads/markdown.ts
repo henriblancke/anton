@@ -13,6 +13,9 @@ const BLOCKQUOTE = /^ {0,3}>[ \t]?/;
 const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-+)[ \t]*$/;
 const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+/** Block starts that interrupt an open paragraph — everything BLOCK_LINE checks except indented
+ * code, which CommonMark never lets interrupt a paragraph (it only starts one after a blank line). */
+const PARAGRAPH_INTERRUPT = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)/;
 const BLOCK_LINE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)|^ {4}/;
 const HTML_BLOCK_LINE = /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)|^ {0,3}<(?:div|address|article|aside|blockquote|body|section|table|ul|ol|li|p)(?:[ \t>]|\/>|$)/i;
 const HTML_DECLARATION_LINE = /^ {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z])/;
@@ -202,9 +205,27 @@ const paragraphLine = (line: Line): boolean =>
   !HTML_DECLARATION_LINE.test(line.masked);
 
 /**
+ * A line the AST already placed inside an open heading's text. Unlike `paragraphLine`, this allows
+ * an indented-code-looking line through: CommonMark never lets indented code interrupt an open
+ * paragraph, so a four-space line here is a continuation (e.g. a multiline Setext heading), not a
+ * block boundary — only the markers that can actually interrupt a paragraph disqualify it.
+ */
+const headingInteriorLine = (line: Line): boolean =>
+  !line.fenced &&
+  !line.commented &&
+  !line.heading &&
+  !line.headingRest &&
+  !line.html &&
+  line.visible.trim() !== "" &&
+  !THEMATIC_BREAK.test(line.text) &&
+  !PARAGRAPH_INTERRUPT.test(line.text) &&
+  !HTML_BLOCK_LINE.test(line.masked) &&
+  !HTML_DECLARATION_LINE.test(line.masked);
+
+/**
  * An interior heading line stripped of its own container markers, so a continuation nested in the
  * same blockquote or list item as its Setext heading (`> API` under `> Backend`) classifies as
- * plain paragraph text rather than tripping the "starts a new block" rejection in `paragraphLine`.
+ * plain paragraph text rather than tripping the "starts a new block" rejection in `headingInteriorLine`.
  */
 function containerRelative(line: Line): Line {
   const stripped = stripContainerMarkers(line.text);
@@ -332,7 +353,7 @@ export function scanMarkdown(source: string): ScannedLine[] {
       const { start, end } = lineRange(lines, node.position);
       const line = lines[start];
       const uninterrupted = Array.from({ length: Math.max(0, end - start - 1) }, (_, offset) =>
-        paragraphLine(containerRelative(lines[start + offset + 1]!)),
+        headingInteriorLine(containerRelative(lines[start + offset + 1]!)),
       ).every(Boolean);
       if (line && !line.fenced && !line.commented && (end === start || uninterrupted)) {
         line.heading = { depth: node.depth!, key: slug(textOf(node).replace(/<!--.*$/, "")) };
