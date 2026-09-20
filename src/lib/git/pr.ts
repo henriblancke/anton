@@ -364,6 +364,20 @@ export async function commentOnPr(
   await gh(repoPath, ["pr", "comment", String(number), "--body", body], signal);
 }
 
+/**
+ * Existing top-level PR comments (the same surface `commentOnPr` posts to — not inline review
+ * comments), oldest first. Lets a caller dedupe its own status posts before adding another.
+ */
+export async function getPrComments(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const raw = await gh(repoPath, ["pr", "view", String(number), "--json", "comments"], signal);
+  const view = JSON.parse(raw) as { comments?: Array<{ body?: string }> };
+  return (view.comments ?? []).map((c) => c.body ?? "");
+}
+
 /** Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId). */
 export async function replyToReviewComment(
   repoPath: string,
@@ -377,6 +391,31 @@ export async function replyToReviewComment(
   await gh(
     repoPath,
     ["api", "--method", "POST", `repos/${nwo}/pulls/${number}/comments/${commentId}/replies`, "-f", `body=${body}`],
+    signal,
+  );
+}
+
+/** Reaction content the reactions endpoint accepts for a triaged finding's outcome. */
+export type PrReactionContent = "+1" | "-1" | "eyes";
+
+/**
+ * React to an inline review comment (REST reactions endpoint, keyed by the same databaseId the
+ * reply path uses). The free calibration signal reviewers ask for on every finding — `+1` for
+ * fixed, `-1` for declined, `eyes` for needs-human. Best-effort, matching replyToReviewComment: a
+ * failed reaction must never fail the run, since the reply (not the reaction) is what stops
+ * re-triage.
+ */
+export async function reactToReviewComment(
+  repoPath: string,
+  commentId: number,
+  content: PrReactionContent,
+  signal?: AbortSignal,
+): Promise<void> {
+  const nwo = await nameWithOwner(repoPath, signal);
+  if (!nwo) return;
+  await gh(
+    repoPath,
+    ["api", "--method", "POST", `repos/${nwo}/pulls/comments/${commentId}/reactions`, "-f", `content=${content}`],
     signal,
   );
 }

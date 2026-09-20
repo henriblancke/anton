@@ -8,7 +8,7 @@
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { isBoardUnreachableError, RunAlreadyLiveError } from "./errors";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { Clock } from "./queue";
 
 /**

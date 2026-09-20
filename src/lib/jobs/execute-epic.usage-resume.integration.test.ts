@@ -22,6 +22,7 @@ import {
   resetPerCaseState,
   FakeClock,
   writeBin,
+  fakeClaudeReadingStdin,
   createExecuteEpicSandbox,
   createTicket,
   makeEpicRunner,
@@ -192,12 +193,14 @@ process.exit(0);`,
     const argvLog = join(sandbox, "resume-argv.jsonl");
     // Counting claude: invocation 1 dies transiently (mid-stream, no result); invocation 2+ succeed.
     // The counter lives in the worktree, shared across both invocations of the same runTicket loop.
+    // Built through `fakeClaudeReadingStdin` so the run-level `step:describe` dispatch never reaches
+    // this body (see that helper): the describer is a third spawn this case does not script, and
+    // without the short-circuit it would append a third line to `argvLog` and advance `.resume-count`,
+    // moving the transient death off the invocation the case means to kill.
     const resumeClaude = writeBin(
       binDir,
       "claude-resume",
-      `const fs=require('fs');const path=require('path');
-const a=process.argv.slice(2);const get=f=>{const i=a.indexOf(f);return i>=0?a[i+1]:undefined;};
-fs.appendFileSync(${JSON.stringify(argvLog)},JSON.stringify({resume:get('--resume')})+'\\n');
+      fakeClaudeReadingStdin(`fs.appendFileSync(${JSON.stringify(argvLog)},JSON.stringify({resume:get('--resume')})+'\\n');
 const counter=path.join(process.cwd(),'.resume-count');
 let n=0;try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch(e){}
 n+=1;fs.writeFileSync(counter,String(n));
@@ -207,7 +210,7 @@ if(n===1){process.stderr.write('API Error: Connection closed mid-response\\n');p
 fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'work '+n+'\\n');
 e({type:'assistant',message:{content:[{type:'text',text:'done'}]}});
 e({type:'result',subtype:'success',result:'done',session_id:'s4',num_turns:1,is_error:false});
-process.exit(0);`,
+process.exit(0);`),
     );
 
     const runner = makeEpicRunner(ctx);
@@ -231,9 +234,11 @@ process.exit(0);`,
       expect(argv[1].resume).toBe("s4"); // retry resumes the SAME captured session id
 
       // The Claude session id was persisted on the session row (from the init event on failure,
-      // then confirmed by the successful result).
+      // then confirmed by the successful result). Filtered on kind because a standalone target files
+      // its run-level `describe` session under the SAME bead (the target IS the ticket), and that row
+      // is not one of the ticket's claude attempts.
       const sessions = (await tdb.db.select().from(schema.sessions)).filter(
-        (s) => s.beadId === target,
+        (s) => s.beadId === target && s.kind === "execute",
       );
       expect(sessions).toHaveLength(1);
       expect(sessions[0].claudeSessionId).toBe("s4");

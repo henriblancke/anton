@@ -36,6 +36,7 @@ describe("draftFromSettings", () => {
     expect(d.autonomy).toBe(true);
     expect(d.budgetAware).toBe(false);
     expect(d.seedPrompt).toBe("");
+    expect(d.describePrompt).toBe("");
   });
 
   it("seeds an absent allowlist to every bundled agent — the runtime's own reading of absent", () => {
@@ -67,6 +68,7 @@ describe("dirtyFields", () => {
   it("names the SECTION key an edited field belongs to, not the field", () => {
     expect(dirty({ lintCommand: "bun run lint" }).gates).toBe(true);
     expect(dirty({ reviewMinScore: 8 }).review).toBe(true);
+    expect(dirty({ describePrompt: "summarize outcomes" }).describePrompt).toBe(true);
     expect(dirty({ weeklyTargetPct: 50 }).budget).toBe(true);
   });
 
@@ -142,8 +144,15 @@ describe("settingsPatchBody", () => {
   it("clears a blank override to null so the shipped default applies", () => {
     const body = settingsPatchBody(draft(), BUNDLED, []);
     expect(body.seedPrompt).toBeNull();
+    expect(body.describePrompt).toBeNull();
     expect(body.testCommand).toBeNull();
     expect(body.model).toBeNull();
+  });
+
+  it("round-trips the describe prompt through the draft and save body", () => {
+    const d = draft({ describePrompt: "Summarize customer impact." });
+    expect(d.describePrompt).toBe("Summarize customer impact.");
+    expect(settingsPatchBody(d, BUNDLED, []).describePrompt).toBe("Summarize customer impact.");
   });
 
   it("carries the commit timeout through to the save body", () => {

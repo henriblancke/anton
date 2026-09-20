@@ -20,8 +20,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 import { dirname, isAbsolute, join } from "node:path";
 import {
+  classifyPushFailure,
   COMMIT_TIMEOUT_ENV,
   commitAll,
   commitMarker,
@@ -47,6 +49,7 @@ import {
   distanceBehindUpstream,
   readPreservedCommitFor,
   readWorktreeState,
+  SIGNAL_KILL_BACKOFF_ENV,
   resolveFreshBase,
   resolveForkPoint,
   resolveHooksPathOverride,
@@ -67,6 +70,8 @@ import {
   satisfiedMarkerSubject,
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
+  boundedTail,
+  MAX_STDERR_CHARS,
 } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
@@ -106,6 +111,220 @@ if(a.includes('core.hooksPath')&&a.includes('--get')&&a.includes('--show-scope')
 }
 const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
 process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * A git shim that fails the FIRST `push` it sees with a {@link classifyPushFailure}-transient cause
+ * (exit 128, "Could not resolve host") and forwards every other invocation — including the retried
+ * push — to the real git, so `pushBranch`'s retry loop is proven against an actual transient failure
+ * rather than one asserted only against the classifier in isolation (anton-1cjaw round 2).
+ */
+function shimGitFailingPushOnce(sandboxDir: string, counterFile: string): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "push-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counter=${JSON.stringify(counterFile)};
+if(a.includes('push')){
+  let n=0;
+  try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch{}
+  n+=1;
+  fs.writeFileSync(counter,String(n));
+  if(n===1){
+    process.stderr.write("fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid\\n");
+    process.exit(128);
+  }
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * A git shim whose `push` kills ITSELF with SIGKILL — the closest reproduction of the OOM killer
+ * taking a pre-push hook that does not require actually exhausting the host's memory (anton-ttlxp).
+ * `killAfter` pushes that die; every later push, and every non-push invocation, is forwarded to the
+ * real git. It prints to stderr first, so the captured output looks like the real failures did: a
+ * pile of passing-test noise with no assertion failure anywhere in it.
+ */
+function shimGitKillingPushWithSignal(
+  sandboxDir: string,
+  counterFile: string,
+  killAfter: number | "always",
+): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, `kill-shim-${killAfter}`);
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counter=${JSON.stringify(counterFile)};
+const killAfter=${JSON.stringify(killAfter)};
+if(a.includes('push')){
+  let n=0;
+  try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch{}
+  n+=1;
+  fs.writeFileSync(counter,String(n));
+  if(killAfter==='always'||n<=killAfter){
+    process.stderr.write("PASS tests/unit/thing.test.ts\\nPASS tests/unit/other.test.ts\\n");
+    process.kill(process.pid,'SIGKILL');
+    // SIGKILL is immediate and uncatchable; this only keeps the process alive until it lands.
+    require('node:child_process').spawnSync(process.execPath,['-e','setTimeout(()=>{},5000)']);
+  }
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * A git shim mixing causes across attempts (anton-ttlxp review round 2): `push` #1 fails with an
+ * ordinary transient cause (a DNS blip, no `retry` override), `push` #2 is killed by a signal, and
+ * every push after that succeeds for real. Proves the retry cap the signal kill computes is relative
+ * to the attempt IT first fires on, not to attempt 1 — an absolute cap would let the DNS blip's
+ * default 3-attempt budget starve the kill's own guaranteed retry on attempt 2.
+ */
+function shimGitTransientThenSignalKilled(sandboxDir: string, counterFile: string): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "transient-then-kill-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counter=${JSON.stringify(counterFile)};
+if(a.includes('push')){
+  let n=0;
+  try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch{}
+  n+=1;
+  fs.writeFileSync(counter,String(n));
+  if(n===1){
+    process.stderr.write("fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid\\n");
+    process.exit(128);
+  }
+  if(n===2){
+    process.stderr.write("PASS tests/unit/thing.test.ts\\nPASS tests/unit/other.test.ts\\n");
+    process.kill(process.pid,'SIGKILL');
+    // SIGKILL is immediate and uncatchable; this only keeps the process alive until it lands.
+    require('node:child_process').spawnSync(process.execPath,['-e','setTimeout(()=>{},5000)']);
+  }
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * A git shim reproducing the OTHER external-kill shape (anton-ttlxp #305 review): a signal that
+ * kills only the immediate `git` process while a survivor it already spawned — standing in for a
+ * pre-push hook or one of its workers — lives on, unreaped, as a member of the same (detached)
+ * process group. The survivor is spawned with `stdio: 'ignore'`, never `inherit`, so it holds no
+ * reference to the pipe `gitPush` reads: the instant this shim dies, Node sees the pipe as fully
+ * closed and fires `close` immediately even though the survivor is still very much alive — the
+ * exact shape the P1 finding describes. It traps SIGTERM and writes `markerFile` only then, so
+ * seeing that file after `pushBranch` settles proves `reapCommitGroup`'s own group-wide signal
+ * reached it — the shim signals only ITSELF, never the survivor directly.
+ */
+function shimGitOrphaningSurvivorOnSignal(
+  sandboxDir: string,
+  startedFile: string,
+  markerFile: string,
+): string {
+  const binDir = join(sandboxDir, "orphan-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawn}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+if(a.includes('push')){
+  const survivor=spawn(process.execPath,['-e',\`
+    const fs=require('node:fs');
+    process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(markerFile)},'');process.exit(0)});
+    fs.writeFileSync(${JSON.stringify(startedFile)},'');
+    setInterval(()=>{},1000);
+  \`],{stdio:'ignore'});
+  survivor.unref();
+  const started=${JSON.stringify(startedFile)};
+  const deadline=Date.now()+10000;
+  const poll=()=>{
+    if(fs.existsSync(started)){process.kill(process.pid,'SIGTERM');return;}
+    if(Date.now()>deadline){process.exit(1);return;}
+    setTimeout(poll,20);
+  };
+  poll();
+  return;
+}
+process.exit(0);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * The survivor shape {@link shimGitOrphaningSurvivorOnSignal} does NOT cover (P1 finding, #305
+ * review round 2): a real pre-push hook (or a worker it spawns) normally INHERITS the stdout/stderr
+ * pipe `git` was given, rather than opting out with its own `stdio: 'ignore'`. Node's `close` event
+ * waits for every holder of those pipes to let go, so with an inheriting survivor `close` never
+ * fires while it lives — proving the reap must start from `exit` instead.
+ */
+function shimGitOrphaningInheritingSurvivorOnSignal(
+  sandboxDir: string,
+  startedFile: string,
+  markerFile: string,
+): string {
+  const binDir = join(sandboxDir, "inherit-orphan-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawn}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+if(a.includes('push')){
+  const survivor=spawn(process.execPath,['-e',\`
+    const fs=require('node:fs');
+    process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(markerFile)},'');process.exit(0)});
+    fs.writeFileSync(${JSON.stringify(startedFile)},'');
+    setInterval(()=>{},1000);
+  \`],{stdio:'inherit'});
+  survivor.unref();
+  const started=${JSON.stringify(startedFile)};
+  const deadline=Date.now()+10000;
+  const poll=()=>{
+    if(fs.existsSync(started)){process.kill(process.pid,'SIGTERM');return;}
+    if(Date.now()>deadline){process.exit(1);return;}
+    setTimeout(poll,20);
+  };
+  poll();
+  return;
+}
+process.exit(0);
 `,
   );
   chmodSync(join(binDir, "git"), 0o755);
@@ -3776,6 +3995,567 @@ describe("push timeout default", () => {
   });
 });
 
+// anton-1cjaw: the discriminator table measured on git 2.x/macOS via execFile — captured stderr and
+// `--porcelain` stdout fed straight to the classifier, no live push involved. The exit code alone
+// cannot separate transient from permanent, so every case here pins BOTH the code and the porcelain
+// shape that actually produces it.
+describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
+  it("classifies a local pre-push hook decline as permanent — no Done line, transport never ran", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr: "husky - pre-push hook exited with code 1 (error)\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-push hook/);
+    expect(verdict.reason).toMatch(/husky - pre-push hook exited with code 1/);
+  });
+
+  it("classifies a remote pre-receive decline as permanent — Done present, named as remote policy", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: [
+        "To https://example.invalid/acme/repo.git",
+        "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[remote rejected] (pre-receive hook declined)",
+        "Done",
+      ].join("\n"),
+      stderr: "error: failed to push some refs to 'https://example.invalid/acme/repo.git'\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/remote policy/);
+    expect(verdict.reason).toMatch(/pre-receive/);
+  });
+
+  it("classifies a non-fast-forward rejection as permanent — an identical retry cannot fix it", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: [
+        "To https://example.invalid/acme/repo.git",
+        "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[rejected] (fetch first)",
+        "Done",
+      ].join("\n"),
+      stderr:
+        "error: failed to push some refs to 'https://example.invalid/acme/repo.git'\n" +
+        "hint: Updates were rejected because the remote contains work that you do not have locally.\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/non-fast-forward/);
+  });
+
+  it("classifies a non-fast-forward rejection worded as (non-fast-forward) the same way", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: [
+        "To https://example.invalid/acme/repo.git",
+        "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[rejected] (non-fast-forward)",
+        "Done",
+      ].join("\n"),
+      stderr: "error: failed to push some refs\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  it("classifies an exit-1 rejection the porcelain does not name as permanent — unclassified stays permanent", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: ["To https://example.invalid/acme/repo.git", "Done"].join("\n"),
+      stderr: "error: something this classifier has never seen\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  it("classifies a DNS/unreachable-host exit-128 failure as transient", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr:
+        "fatal: unable to access 'https://example.invalid/acme/repo.git/': " +
+        "Could not resolve host: example.invalid\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+  });
+
+  it("classifies a reset connection exit-128 failure as transient", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: unable to access '...': Connection reset by peer\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+  });
+
+  it("classifies a transient 5xx from the remote's HTTP front end as transient", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+  });
+
+  it("classifies a transient 5xx reported without the 'HTTP NNN' token as transient (git 2.43's own wording, anton-280)", () => {
+    // Confirmed against a real reproduction: `git push -h` documents `--porcelain` as
+    // machine-readable, and git 2.43 exits 128 with just this line for a 503 — no "HTTP 502"-style
+    // prefix, which is what the `/HTTP 5\d\d/` pattern above requires.
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: unable to access '...': The requested URL returned error: 503\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+  });
+
+  it("classifies a gpg signing misconfiguration exit-128 failure as permanent — the opposite verdict from DNS at the same exit code", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "error: gpg failed to sign the push certificate\nfatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  it("classifies a missing-credential exit-128 failure as permanent — a retry cannot supply auth", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr:
+        "fatal: could not read Username for 'https://example.invalid': terminal prompts disabled\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  it("classifies a held index.lock exit-128 failure as permanent", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: Unable to create '/repo/.git/index.lock': File exists.\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  it("classifies an unrecognized exit-128 failure as permanent — an unconfident classification never retries", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: something this classifier has never seen before\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  it("classifies an exit code outside the discriminator table as permanent", () => {
+    const verdict = classifyPushFailure({ code: 129, stdout: "", stderr: "some unrelated failure\n" });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  // anton-ttlxp: the 21 recorded `exit null` push failures. Node hands `close` a (code, signal)
+  // pair; the signal used to be dropped, so an OOM-killed pre-push hook was rendered as "exit null"
+  // next to its own passing-test stderr — indistinguishable from the project's tests being broken.
+  describe("a push killed by a signal from outside anton (anton-ttlxp)", () => {
+    it("is reported as a kill naming SIGKILL, not as an unrecognized rejection", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "",
+        stderr: "PASS tests/unit/thing.test.ts\nPASS tests/unit/other.test.ts\n",
+      });
+
+      expect(verdict.reason).toMatch(/SIGKILL/);
+      expect(verdict.reason).toMatch(/killed/i);
+      // The specific string the bug produced must be gone: it named neither the signal nor the kill.
+      expect(verdict.reason).not.toMatch(/exit null/);
+      // Nor the generic fallthrough's wording, which frames every unplaced cause as a rejection.
+      expect(verdict.reason).not.toMatch(/rejected the push/);
+      expect(verdict.reason).not.toMatch(/does not recognize/);
+    });
+
+    it("says the kill came from outside anton without claiming to know whether the ref moved", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/outside anton/);
+      // No porcelain `Done` line was captured, so the ref state is genuinely unknown — the
+      // classifier must say so instead of asserting nothing was rejected (#305 review).
+      expect(verdict.reason).toMatch(/unknown/);
+      expect(verdict.reason).not.toMatch(/no ref moved/);
+    });
+
+    it("says the remote already accepted the update when porcelain's Done line was captured", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "To origin\n*\trefs/heads/main:refs/heads/main\t[new branch]\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.reason).toMatch(/already accepted the update/);
+      expect(verdict.reason).not.toMatch(/unknown/);
+    });
+
+    // #305 review round 2: `Done` only proves the remote answered, not that it accepted — porcelain
+    // writes `Done` once every ref-status line is written, rejections included. A signal landing
+    // right after a `[rejected]` line must not be reported as an accepted update that a backoff
+    // should just retry.
+    it("reports a proven non-fast-forward rejection as permanent, not as an accepted update", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "To origin\n!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.transient).toBe(false);
+      expect(verdict.reason).toMatch(/non-fast-forward/);
+      expect(verdict.reason).not.toMatch(/already accepted the update/);
+    });
+
+    it("reports a proven pre-receive hook decline as permanent, not as an accepted update", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout:
+          "To origin\n!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.transient).toBe(false);
+      expect(verdict.reason).toMatch(/pre-receive hook/);
+      expect(verdict.reason).not.toMatch(/already accepted the update/);
+    });
+
+    // #305 review round 3: a rejection reason this classifier has no specific pattern for (e.g. a
+    // hidden-ref deny) must still be read as a proven rejection via the generic `!` porcelain flag
+    // (git-push(1)) — not fall through to the Done-based "transient" path just because neither of
+    // the two known-wording patterns matched.
+    it("reports a rejection with unrecognized wording as permanent via the generic '!' flag", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout:
+          "To origin\n!\trefs/heads/main:refs/heads/main\t[remote rejected] (deny updating a hidden ref)\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.transient).toBe(false);
+      expect(verdict.reason).toMatch(/deny updating a hidden ref/);
+      expect(verdict.reason).not.toMatch(/already accepted the update/);
+    });
+
+    it("points at the OOM killer for SIGKILL specifically — the measured cause on a loaded host", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/OOM/);
+    });
+
+    it("names any other signal without claiming it was the OOM killer", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGTERM", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/SIGTERM/);
+      expect(verdict.reason).not.toMatch(/OOM/);
+    });
+
+    it("still reports a kill when the signal name itself did not survive", () => {
+      const verdict = classifyPushFailure({ code: null, stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/killed/i);
+      expect(verdict.reason).not.toMatch(/exit null/);
+    });
+
+    it("is transient — an already-applied push is a safe no-op to retry either way", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.transient).toBe(true);
+    });
+
+    it("carries a retry shape chosen for THIS cause, not the transport backoff numbers", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      // Bounded below the transport budget: a pre-push test suite must not be paid for three times.
+      expect(verdict.retry?.maxAttempts).toBe(2);
+      // And gapped far above the 1s transport blip gap — 1s retries into the same memory pressure.
+      expect(verdict.retry?.backoffMs).toBeGreaterThanOrEqual(30_000);
+    });
+
+    it("keeps the captured stderr so the operator still sees what the push printed", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "",
+        stderr: "some hook output\n",
+      });
+
+      expect(verdict.reason).toMatch(/some hook output/);
+    });
+
+    it("says so plainly when the push printed nothing at all", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/printed nothing to stderr/);
+    });
+
+    // anton-ttlxp #305 review: `ANTON_GIT_PUSH_SIGNAL_BACKOFF_MS` is a CAP on the 30s default, same
+    // contract as `ANTON_GIT_PUSH_TIMEOUT_MS` — `raw > 0` there, so this must reject `raw <= 0` too,
+    // not just `raw < 0`. An accepted `0` used to drive the post-kill backoff straight to 0ms,
+    // retrying immediately into the memory pressure the backoff exists to avoid.
+    describe("SIGNAL_KILL_BACKOFF_ENV as a cap, never an override", () => {
+      let prevEnv: string | undefined;
+
+      beforeEach(() => {
+        prevEnv = process.env[SIGNAL_KILL_BACKOFF_ENV];
+      });
+
+      afterEach(() => {
+        if (prevEnv === undefined) delete process.env[SIGNAL_KILL_BACKOFF_ENV];
+        else process.env[SIGNAL_KILL_BACKOFF_ENV] = prevEnv;
+      });
+
+      it("ignores an explicit 0 and keeps the 30s default instead of retrying with no delay", () => {
+        process.env[SIGNAL_KILL_BACKOFF_ENV] = "0";
+
+        const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+        expect(verdict.retry?.backoffMs).toBe(30_000);
+      });
+
+      it("ignores a negative value and keeps the 30s default", () => {
+        process.env[SIGNAL_KILL_BACKOFF_ENV] = "-5";
+
+        const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+        expect(verdict.retry?.backoffMs).toBe(30_000);
+      });
+
+      it("honors a valid positive override, capping the backoff at or below it", () => {
+        process.env[SIGNAL_KILL_BACKOFF_ENV] = "50";
+
+        const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+        expect(verdict.retry?.backoffMs).toBeLessThanOrEqual(50);
+      });
+    });
+  });
+});
+
+// anton-yxlt6: the bound was right, the half it kept was not. A `pre-push` hook that runs a test
+// suite spends its first 4 KiB on banners and deliberate logging from PASSING tests, so a
+// head-keeping buffer recorded exactly that and dropped the failure summary — the only part an
+// operator needs. These pin the tail.
+describe("boundedTail (anton-yxlt6)", () => {
+  /** Drive a collector with `chunks` and read back what it kept, after the stream ends. */
+  async function collect(chunks: (string | Buffer)[]): Promise<string> {
+    const stream = new PassThrough();
+    const read = boundedTail(stream);
+    for (const chunk of chunks) stream.write(chunk);
+    stream.end();
+    await new Promise((resolve) => stream.on("end", resolve));
+    return read();
+  }
+
+  it("keeps the END of a stream that overflows the cap, not the beginning", async () => {
+    const verdict = "FAIL src/auth.test.ts > refuses an expired token\n  expected 401, got 200\n";
+    const kept = await collect([
+      "a".repeat(MAX_STDERR_CHARS),
+      "b".repeat(MAX_STDERR_CHARS),
+      verdict,
+    ]);
+
+    expect(kept).toContain(verdict.trim());
+    expect(kept).not.toContain("a".repeat(64));
+  });
+
+  it("keeps total retained output bounded — the memory bound is the point", async () => {
+    const kept = await collect(Array.from({ length: 50 }, () => "x".repeat(MAX_STDERR_CHARS)));
+
+    // The notice is anton's own prefix; the captured output itself never exceeds the cap.
+    const captured = kept.slice(kept.indexOf("\n") + 1);
+    expect(captured.length).toBeLessThanOrEqual(MAX_STDERR_CHARS);
+  });
+
+  it("makes truncation visible rather than silent, naming how much was dropped", async () => {
+    const kept = await collect(["q".repeat(MAX_STDERR_CHARS + 100), "tail\n"]);
+
+    expect(kept).toMatch(/^\[anton: dropped 105 earlier characters of output/);
+    expect(kept).toContain("tail");
+  });
+
+  it("leaves output that fits under the cap untouched — no notice, no truncation", async () => {
+    const kept = await collect(["husky - pre-push hook exited with code 1 (error)\n"]);
+
+    expect(kept).toBe("husky - pre-push hook exited with code 1 (error)");
+    expect(kept).not.toContain("[anton:");
+  });
+
+  it("counts characters, not bytes, and never mangles a multi-byte sequence split across chunks", async () => {
+    // "é" is two UTF-8 bytes; splitting it across two chunks is what a naive per-chunk
+    // `toString("utf8")` corrupts into U+FFFD.
+    const eacute = Buffer.from("é", "utf8");
+    const kept = await collect(["ok ", eacute.subarray(0, 1), eacute.subarray(1), " done"]);
+
+    expect(kept).toBe("ok é done");
+  });
+
+  it("drains every chunk past the cap so a chatty hook can never block on a full pipe", async () => {
+    const stream = new PassThrough();
+    const read = boundedTail(stream);
+    // Far more than the stream's own highWaterMark: if the collector stopped consuming past the
+    // cap, backpressure would leave these buffered and `write` would report the pipe as full.
+    let everyWriteAccepted = true;
+    for (let i = 0; i < 200; i += 1) {
+      if (!stream.write("z".repeat(1024))) everyWriteAccepted = false;
+    }
+    stream.end();
+    await new Promise((resolve) => stream.on("end", resolve));
+
+    expect(everyWriteAccepted).toBe(true);
+    expect(read()).toContain("[anton: dropped");
+  });
+});
+
+// anton-yxlt6: the porcelain contract is what separates a LOCAL hook decline from a REMOTE
+// rejection, so switching which half of stdout survives has to be proven against the classifier,
+// not assumed. git writes the per-ref status lines and the trailing `Done` at the END of stdout —
+// precisely what a tail-keeping buffer preserves and a head-keeping one would have dropped first.
+describe("classifyPushFailure under truncated porcelain stdout (anton-yxlt6)", () => {
+  /** What `boundedTail` hands the classifier once a chatty hook overflowed the cap. */
+  function truncatedTail(body: string): string {
+    return `[anton: dropped 9000 earlier characters of output — showing the last ${MAX_STDERR_CHARS}]\n${body}`;
+  }
+
+  it("still reads the trailing Done line, so a remote decline is not misread as a local one", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: truncatedTail(
+        [
+          "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[remote rejected] (pre-receive hook declined)",
+          "Done",
+        ].join("\n"),
+      ),
+      stderr: truncatedTail("error: failed to push some refs\n"),
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/remote policy/);
+  });
+
+  it("still reads a per-ref non-fast-forward status under truncation", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: truncatedTail(
+        [
+          "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[rejected] (non-fast-forward)",
+          "Done",
+        ].join("\n"),
+      ),
+      stderr: truncatedTail("error: failed to push some refs\n"),
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/non-fast-forward/);
+  });
+
+  it("still calls a local hook decline local — a truncated stdout with no Done stays a hook decline", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr: truncatedTail("FAIL src/auth.test.ts > refuses an expired token\n"),
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-push hook/);
+    expect(verdict.reason).toMatch(/refuses an expired token/);
+  });
+
+  it("does not let anton's own truncation notice fabricate a Done line", () => {
+    // The notice is anton's text, not git's; it must never look like porcelain structure.
+    const notice = truncatedTail("");
+    expect(/^Done\s*$/m.test(notice)).toBe(false);
+  });
+});
+
+// anton-yxlt6: the reported failure, end to end against real git — a pre-push hook whose failure
+// summary lands AFTER 4 KB of passing-test chatter. Before the fix the captured stderr was entirely
+// that chatter and the summary appeared nowhere in the error an operator reads.
+suite("pushBranch (real git · a hook whose failure summary follows 4 KB of passing-test chatter)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+
+  const g = (args: string[], cwd = repo) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+
+  // The verdict an operator actually needs, written last — exactly where a test runner puts it.
+  const SUMMARY = "FAIL src/billing.test.ts > refunds a cancelled subscription";
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-push-tail-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["remote", "add", "origin", bare]);
+
+    // A hook shaped like the real one: a banner, then deliberate logging from tests that PASS —
+    // well past the cap — and only then the failure summary and a non-zero exit.
+    const hookPath = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(
+      hookPath,
+      `#!/usr/bin/env node
+process.stderr.write("> vitest run\\n\\n RUN  v3.0.0\\n");
+for (let i = 0; i < 200; i += 1) {
+  process.stderr.write("stdout | src/circle.test.ts > backfill refuses a bad payload\\n");
+  process.stderr.write("circle session consent backfill failed { message: 'boom' }\\n");
+}
+process.stderr.write(${JSON.stringify(SUMMARY)} + "\\n  expected 402, got 200\\n");
+// exitCode, not exit(): stderr is a pipe here, so its writes are async — exit() can tear the
+// process down before the OS pipe drains, dropping exactly the tail this test asserts on.
+process.exitCode = 1;
+`,
+    );
+    chmodSync(hookPath, 0o755);
+
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+    writeFileSync(join(repo, "work.md"), "work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("records the hook's failure summary, not just the passing-test chatter that precedes it", async () => {
+    const error = await pushBranch(repo, "anton/epic-1").then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain(SUMMARY);
+    expect(error?.message).toContain("expected 402, got 200");
+    // Truncation is visible rather than silent — the operator can tell output was dropped.
+    expect(error?.message).toContain("[anton: dropped");
+    // And the classifier still places it: no `Done`, so the transport never ran — a LOCAL decline.
+    expect(error?.message).toMatch(/pre-push hook declined/);
+  }, 30_000);
+});
+
 // anton-o74nf: `git push` runs PROJECT code too — a `pre-push` hook — so it gets the same
 // process-group treatment PR #228 gave the commit path. Mirrors "commitAll (real git · a hook that
 // outlives the kill)" above, against `pushBranch`/`gitPush` instead.
@@ -3926,4 +4706,338 @@ suite("pushBranch (real git · a pre-push hook that outlives the kill)", () => {
       );
     },
   );
+
+  // anton-ttlxp: anton's OWN two kills must stay themselves now that a code-null branch exists.
+  // Both set `killing` and return before `gitPush`'s close handler forms a verdict, so neither can
+  // reach the external-kill branch — but nothing pinned that until this bead added the branch.
+  it.runIf(process.platform !== "win32")(
+    "does not reclassify a budget timeout as a kill from outside anton",
+    async () => {
+      delete process.env[PUSH_TIMEOUT_ENV];
+
+      const failure = await pushBranch(repo, "main", undefined, 2_000).catch((e: unknown) => e);
+
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/timed out after/);
+      expect((failure as Error).message).not.toMatch(/outside anton/);
+      expect((failure as Error).message).not.toMatch(/killed by SIG/);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "does not reclassify an abort as a kill from outside anton",
+    async () => {
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = pushBranch(repo, "main", undefined, 30 * 60_000, controller.signal);
+
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true));
+      controller.abort(reason);
+
+      // Still the caller's own abort reason, not wrapped in any classifier verdict.
+      await expect(pending).rejects.toBe(reason);
+      expect(reason.message).toBe("job made no progress");
+    },
+  );
+});
+
+/**
+ * anton-1cjaw: proves the classifier's verdict actually drives `pushBranch`'s retry loop against a
+ * REAL git failure, not just in isolation. A local `pre-push` hook that appends to `attempts` on
+ * every invocation is the probe — `git push` re-fires it on every retry, so the count IS the number
+ * of times a push was actually attempted, immune to anything the classifier might get wrong about
+ * matching stdout/stderr text.
+ */
+suite("pushBranch retries only classified-transient failures (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+  let attempts: string;
+
+  const g = (args: string[], cwd = repo) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-push-retry-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    attempts = join(sandbox, "attempts.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", "-b", "main", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["remote", "add", "origin", bare]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("attempts a local pre-push hook decline exactly once", async () => {
+    const hook = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(hook, `#!/bin/sh\necho attempt >> ${JSON.stringify(attempts)}\nexit 1\n`);
+    chmodSync(hook, 0o755);
+
+    await expect(pushBranch(repo, "main")).rejects.toThrow(/pre-push hook/);
+
+    expect(
+      readFileSync(attempts, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean),
+    ).toHaveLength(1);
+  });
+
+  it("attempts a remote pre-receive decline exactly once", async () => {
+    const localHook = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(localHook, `#!/bin/sh\necho attempt >> ${JSON.stringify(attempts)}\nexit 0\n`);
+    chmodSync(localHook, 0o755);
+
+    const remoteHooksDir = join(bare, "hooks");
+    const remoteHook = join(remoteHooksDir, "pre-receive");
+    writeFileSync(remoteHook, "#!/bin/sh\necho 'rejected by policy' >&2\nexit 1\n");
+    chmodSync(remoteHook, 0o755);
+
+    await expect(pushBranch(repo, "main")).rejects.toThrow(/remote policy/);
+
+    expect(
+      readFileSync(attempts, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean),
+    ).toHaveLength(1);
+  });
+
+  it("attempts a non-fast-forward rejection exactly once", async () => {
+    const localHook = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(localHook, `#!/bin/sh\necho attempt >> ${JSON.stringify(attempts)}\nexit 0\n`);
+    chmodSync(localHook, 0o755);
+
+    // Establish the branch, then diverge the remote out from under `repo` — pushed from a separate
+    // clone, so `repo`'s local `main` is missing a commit the remote already has.
+    await pushBranch(repo, "main");
+    const other = join(sandbox, "other");
+    execFileSync("git", ["clone", "-q", bare, other], { stdio: "ignore" });
+    execFileSync("git", ["-C", other, "config", "user.email", "t@example.com"], { stdio: "ignore" });
+    execFileSync("git", ["-C", other, "config", "user.name", "anton-test"], { stdio: "ignore" });
+    writeFileSync(join(other, "elsewhere.md"), "elsewhere\n");
+    execFileSync("git", ["-C", other, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", other, "commit", "-q", "-m", "elsewhere"], { stdio: "ignore" });
+    execFileSync("git", ["-C", other, "push", "-q", "origin", "main"], { stdio: "ignore" });
+
+    writeFileSync(join(repo, "local-only.md"), "local\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "local-only"]);
+
+    // Reset the counter: the first (successful) push above already fired the hook once, and only the
+    // rejected push's own attempt count is what this test is proving.
+    writeFileSync(attempts, "");
+
+    await expect(pushBranch(repo, "main")).rejects.toThrow(/non-fast-forward/);
+
+    expect(
+      readFileSync(attempts, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean),
+    ).toHaveLength(1);
+  });
+
+  it("retries a classified-transient failure and succeeds on the second attempt", async () => {
+    const counter = join(sandbox, "push-attempts.log");
+    const binDir = shimGitFailingPushOnce(sandbox, counter);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      await pushBranch(repo, "main");
+    } finally {
+      process.env.PATH = prevPath;
+    }
+
+    // Two invocations of the shim's `push` branch — the failed first attempt, and the retry that
+    // actually landed — proves the retry ran for real rather than the classifier alone saying it should.
+    expect(Number(readFileSync(counter, "utf8").trim())).toBe(2);
+    const localHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "main"], { encoding: "utf8" }).trim();
+    expect(remoteHead).toBe(localHead);
+  });
+
+  it("aborts immediately during backoff instead of waiting out the 1s delay", async () => {
+    const counter = join(sandbox, "push-attempts-abort.log");
+    const binDir = shimGitFailingPushOnce(sandbox, counter);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    const controller = new AbortController();
+    const reason = new Error("job made no progress");
+    try {
+      const pending = pushBranch(repo, "main", undefined, undefined, controller.signal);
+
+      // Wait for the first (transient, per the shim) attempt to fail — `pushBranch` is now asleep
+      // in its 1s backoff before the retry.
+      await vi.waitFor(() => expect(readFileSync(counter, "utf8").trim()).toBe("1"), {
+        timeout: 800,
+        interval: 10,
+      });
+      const abortedAt = Date.now();
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+      // Well under the 1s backoff `sleepMs` alone would have waited out — proves the abort raced
+      // the sleep rather than waiting for `gitPush`'s own check at the top of the next attempt.
+      expect(Date.now() - abortedAt).toBeLessThan(500);
+      // No second attempt: the abort landed during backoff, before the retry ever ran.
+      expect(readFileSync(counter, "utf8").trim()).toBe("1");
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  });
+
+  /**
+   * anton-ttlxp: the second half of the bug. `classifyPushError` bailed on any non-numeric `code`,
+   * so all 21 recorded signal kills reached the run boundary having spent NONE of the 3 attempts —
+   * one of them stranding 34 review-approved commits on a branch that never left the machine.
+   */
+  describe("a push killed by a signal from outside anton (anton-ttlxp)", () => {
+    let prevPath: string | undefined;
+
+    beforeEach(() => {
+      prevPath = process.env.PATH;
+      // The real gap is 30s, deliberately — see SIGNAL_KILL_RETRY. Capped here so the retry is
+      // exercised without the test waiting it out; the cap can only shorten, never lengthen.
+      process.env[SIGNAL_KILL_BACKOFF_ENV] = "50";
+    });
+
+    afterEach(() => {
+      process.env.PATH = prevPath;
+      delete process.env[SIGNAL_KILL_BACKOFF_ENV];
+    });
+
+    it.runIf(process.platform !== "win32")(
+      "spends its retries instead of failing the run on attempt 1",
+      async () => {
+        const counter = join(sandbox, "kill-once.log");
+        process.env.PATH = `${shimGitKillingPushWithSignal(sandbox, counter, 1)}:${prevPath}`;
+
+        await pushBranch(repo, "main");
+
+        // Two pushes: the killed first attempt and the retry that landed. Before the fix this was 1.
+        expect(Number(readFileSync(counter, "utf8").trim())).toBe(2);
+        const localHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+        const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "main"], {
+          encoding: "utf8",
+        }).trim();
+        expect(remoteHead).toBe(localHead);
+      },
+    );
+
+    // Review round 2: the kill's guaranteed retry must survive an ordinary transient cause landing
+    // FIRST. `SIGNAL_KILL_RETRY.maxAttempts` is written as "this cause gets 2 tries", relative to
+    // whichever attempt it first fires on — an absolute total-attempts cap silently drops the kill's
+    // own retry whenever something else already spent the earlier attempt.
+    it.runIf(process.platform !== "win32")(
+      "still spends the kill's guaranteed retry when an ordinary transient failure came first",
+      async () => {
+        const counter = join(sandbox, "transient-then-kill.log");
+        process.env.PATH = `${shimGitTransientThenSignalKilled(sandbox, counter)}:${prevPath}`;
+
+        await pushBranch(repo, "main");
+
+        // Three pushes: the DNS-blip attempt, the killed attempt, and the retry the kill is owed.
+        // Before the fix, attempt 2's kill computed an absolute cap of 2 total attempts — already
+        // spent by attempt 1's DNS blip — and threw immediately, stopping at 2.
+        expect(Number(readFileSync(counter, "utf8").trim())).toBe(3);
+      },
+    );
+
+    it.runIf(process.platform !== "win32")(
+      "stops at 2 attempts when killed every time — a pre-push test suite is never paid for 3 times",
+      async () => {
+        const counter = join(sandbox, "kill-always.log");
+        process.env.PATH = `${shimGitKillingPushWithSignal(sandbox, counter, "always")}:${prevPath}`;
+
+        await expect(pushBranch(repo, "main")).rejects.toThrow(/SIGKILL/);
+
+        expect(Number(readFileSync(counter, "utf8").trim())).toBe(2);
+      },
+    );
+
+    it.runIf(process.platform !== "win32")(
+      "ends a permanent kill as a failure that NAMES the signal, never an unexplained one",
+      async () => {
+        const counter = join(sandbox, "kill-always-msg.log");
+        process.env.PATH = `${shimGitKillingPushWithSignal(sandbox, counter, "always")}:${prevPath}`;
+
+        const failure = await pushBranch(repo, "main").catch((e: unknown) => e);
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toMatch(/killed by SIGKILL/);
+        expect(message).toMatch(/outside anton/);
+        // No porcelain `Done` line came back from this shim, so the ref state is unknown — the
+        // message must not assert nothing was rejected (#305 review).
+        expect(message).toMatch(/unknown/);
+        expect(message).not.toMatch(/no ref moved/);
+        // The exact string the bug produced, gone from the message the caller finally sees.
+        expect(message).not.toMatch(/exit null/);
+        // #305 review round 2: the shim writes this stderr an instant before killing itself, with
+        // nothing surviving to hold the pipe open — the dominant real shape this fix targets. If the
+        // signal-kill reap reads stdout/stderr before Node has drained what was already buffered in
+        // the pipe, this is exactly the output that goes missing.
+        expect(message).toMatch(/PASS tests\/unit\/thing\.test\.ts/);
+      },
+    );
+
+    // anton-ttlxp #305 review: a signal from OUTSIDE anton can kill just the `git` process while a
+    // pre-push hook (or a worker it spawned) is still alive in the group. Unlike the timeout and
+    // abort kills `gitPush` triggers itself, nothing reaped that survivor before this fix — this
+    // proves the fix's own reap runs before the caller sees the rejection.
+    it.runIf(process.platform !== "win32")(
+      "reaps a survivor orphaned by a signal that killed only the git process",
+      async () => {
+        const started = join(sandbox, "orphan-started");
+        const marker = join(sandbox, "orphan-marker");
+        process.env.PATH = `${shimGitOrphaningSurvivorOnSignal(sandbox, started, marker)}:${prevPath}`;
+
+        const failure = await pushBranch(repo, "main").catch((e: unknown) => e);
+
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toMatch(/outside anton/);
+        // The shim signals only ITSELF, never the survivor directly — the survivor writes its
+        // marker only upon receiving TERM, so seeing it here proves reapCommitGroup's group-wide
+        // signal (not the shim's own self-kill) is what reached the orphaned survivor.
+        expect(existsSync(marker)).toBe(true);
+      },
+    );
+
+    // P1 finding, #305 review round 2: a survivor that INHERITS the push's stdio (the common real
+    // shape a pre-push hook takes, unlike the opted-out `stdio: 'ignore'` shim above) holds `close`
+    // open indefinitely. Reaping must start from `exit` instead, or this never resolves until the
+    // (much later, and misreported as a timeout) budget expiry.
+    it.runIf(process.platform !== "win32")(
+      "reaps an inheriting survivor promptly instead of waiting out the budget for `close`",
+      async () => {
+        const started = join(sandbox, "inherit-orphan-started");
+        const marker = join(sandbox, "inherit-orphan-marker");
+        process.env.PATH = `${shimGitOrphaningInheritingSurvivorOnSignal(sandbox, started, marker)}:${prevPath}`;
+
+        const budgetMs = 8_000;
+        const start = Date.now();
+        const failure = await pushBranch(repo, "main", undefined, budgetMs).catch((e: unknown) => e);
+        const elapsedMs = Date.now() - start;
+
+        expect(failure).toBeInstanceOf(Error);
+        // Settled from the `exit`-triggered reap, nowhere near the budget: falling back to `close`
+        // (which the inheriting survivor holds open) would only resolve at the budget expiry itself.
+        expect(elapsedMs).toBeLessThan(budgetMs - 2_000);
+        expect((failure as Error).message).toMatch(/outside anton/);
+        expect((failure as Error).message).not.toMatch(/timed out/);
+        expect(existsSync(marker)).toBe(true);
+      },
+    );
+  });
 });

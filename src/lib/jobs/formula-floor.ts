@@ -39,6 +39,7 @@ import {
 const COMMIT_STEP = "commit";
 const PR_STEP = "pr";
 const REVIEW_STEP = "review";
+const DESCRIBE_STEP = "describe";
 
 export type FloorViolationKind =
   | "unresolved-step"
@@ -48,6 +49,8 @@ export type FloorViolationKind =
   | "pr-before-commit"
   | "step-after-pr"
   | "review-before-commit"
+  | "describe-before-commit"
+  | "describe-before-review"
   | "diff-after-commit";
 
 export interface FloorViolation {
@@ -75,6 +78,13 @@ interface Pipeline {
   steps: Classified[];
   /** Execution index of the first step resolving to `name`, or -1 when the formula has none. */
   indexOf(name: string): number;
+  /**
+   * Execution index of the LAST step resolving to `name`, or -1 when the formula has none. A
+   * formula may name a non-required step more than once (`step:review` is the case in practice),
+   * and a rule about what must follow that step means the last occurrence — see
+   * {@link refuseDescribeBeforeLastReview}.
+   */
+  lastIndexOf(name: string): number;
 }
 
 /** One floor condition: given the pipeline, the steps it refuses. Empty when the condition holds. */
@@ -85,7 +95,11 @@ function classify(cooked: CookedFormula, registry: StepRegistry): Pipeline {
     const name = stepName(step);
     return { step, definition: name ? registry[name] : undefined };
   });
-  return { steps, indexOf: (name) => steps.findIndex((c) => c.definition?.name === name) };
+  return {
+    steps,
+    indexOf: (name) => steps.findIndex((c) => c.definition?.name === name),
+    lastIndexOf: (name) => steps.findLastIndex((c) => c.definition?.name === name),
+  };
 }
 
 /**
@@ -238,6 +252,60 @@ const refuseReviewBeforeCommit: FloorCheck = ({ steps, indexOf }) => {
   ];
 };
 
+/**
+ * Refuses a describer placed before the commit. Like self-review, it reads the committed run diff;
+ * before the commit, any narrative it produces cannot describe the work that reaches the PR, and
+ * the ticket-phase result is deliberately not carried into the run-phase PR step.
+ */
+const refuseDescribeBeforeCommit: FloorCheck = ({ steps, indexOf }) => {
+  const commitAt = indexOf(COMMIT_STEP);
+  const describeAt = indexOf(DESCRIBE_STEP);
+  if (describeAt < 0 || commitAt < 0 || describeAt > commitAt) return [];
+
+  return [
+    {
+      kind: "describe-before-commit",
+      step: steps[describeAt].step.id,
+      detail:
+        `step "${steps[describeAt].step.id}" writes the PR narrative before "${steps[commitAt].step.id}" ` +
+        `commits — the describer reads the run's committed diff, and its ticket-phase result cannot ` +
+        `reach the later PR step. The floor requires \`${STEP_LABEL_PREFIX}:${DESCRIBE_STEP}\` to run ` +
+        `after \`${STEP_LABEL_PREFIX}:${COMMIT_STEP}\``,
+    },
+  ];
+};
+
+/**
+ * Refuses a describer placed before a review that still runs after it (PR #303 review). The commit
+ * is not the only thing that moves the branch: the self-review gate COMMITS its own fixes onto it
+ * (that is why `step:review` is legal in this same post-commit slot — see its `producesDiff: false`
+ * note in the registry). So `commit -> describe -> review -> pr` clears
+ * {@link refuseDescribeBeforeCommit} while still opening the PR with a narrative written against
+ * the pre-fix tree, describing code the gate has since changed.
+ *
+ * Keyed on the LAST review, not the first: a formula may name `step:review` more than once
+ * (anton-nyz1v), and each occurrence can commit fixes, so the narrative is only safe once every one
+ * of them has run. A formula with no review at all is unaffected — `refuseDescribeBeforeCommit`
+ * above is then the whole ordering constraint.
+ */
+const refuseDescribeBeforeLastReview: FloorCheck = ({ steps, indexOf, lastIndexOf }) => {
+  const describeAt = indexOf(DESCRIBE_STEP);
+  const lastReviewAt = lastIndexOf(REVIEW_STEP);
+  if (describeAt < 0 || lastReviewAt < 0 || describeAt > lastReviewAt) return [];
+
+  return [
+    {
+      kind: "describe-before-review",
+      step: steps[describeAt].step.id,
+      detail:
+        `step "${steps[describeAt].step.id}" writes the PR narrative before "${steps[lastReviewAt].step.id}" ` +
+        `self-reviews — the gate COMMITS its fixes onto the run's branch, so the PR would carry a ` +
+        `narrative describing the diff as it stood before those fixes. The floor requires \`` +
+        `${STEP_LABEL_PREFIX}:${DESCRIBE_STEP}\` to run after every \`${STEP_LABEL_PREFIX}:${REVIEW_STEP}\``,
+    },
+  ];
+};
+
 /** Refuses a step that writes to the worktree after the commit — its work would never be committed. */
 const refuseDiffAfterCommit: FloorCheck = ({ steps, indexOf }) => {
   const commitAt = indexOf(COMMIT_STEP);
@@ -269,6 +337,8 @@ const FLOOR_CHECKS: readonly FloorCheck[] = [
   refusePrBeforeCommit,
   refuseStepsAfterPr,
   refuseReviewBeforeCommit,
+  refuseDescribeBeforeCommit,
+  refuseDescribeBeforeLastReview,
   refuseDiffAfterCommit,
 ];
 

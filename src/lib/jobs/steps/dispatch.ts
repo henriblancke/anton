@@ -9,7 +9,7 @@ import { metered } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { quotaMeterKey } from "../../quota-meter";
-import { appendSessionLog, endSession, setSessionClaudeId } from "../../sessions";
+import { appendSessionLog, endSession, setSessionClaudeId, type SessionKind } from "../../sessions";
 import { resolveModel } from "../model-routing";
 import { stepName } from "./resolve";
 import { stepSession, type StepContext } from "./context";
@@ -29,6 +29,39 @@ export async function dispatchClaude(
     appendSystemPrompt: string;
     /** The message for a run claude itself reported as failed. */
     failure: (text: string | undefined) => string;
+    /**
+     * The session kind to record this dispatch under. Defaults to `execute` — a delivering step's
+     * kind, which `listDeliveriesByBead` (runs.ts) reads as delivery evidence. A step that dispatches
+     * an agent but delivers nothing passes its own kind (see `step:describe`).
+     */
+    sessionKind?: SessionKind;
+    /**
+     * Route this dispatch against the run's WHOLE label context — the target's labels and every
+     * ticket's — rather than the ticket-phase default below (PR #303 review).
+     *
+     * The default reads one ticket as "this dispatch is about that ticket", which is right for a
+     * per-ticket step and wrong for a step describing the run: an epic with one child would route on
+     * the CHILD's labels, so a route like `{ step: "describe", label: "risk:high" }` on the epic never
+     * fires, and the same run grown a second ticket would suddenly route on the target instead. A
+     * run-level step's model must follow the work it covers, not the run's ticket count — so it
+     * resolves the way the analogous run-level review does (`review-gate.ts`), against the target and
+     * all tickets at once.
+     */
+    runLevelLabels?: boolean;
+    /**
+     * Hard-deny these tools for this dispatch (`--disallowedTools`). Deny rules outrank the
+     * permission mode, so this BINDS an unattended `bypassPermissions` session rather than asking it
+     * — which is what makes it usable as a guard by a step that must not write (`step:describe`).
+     */
+    disallowedTools?: string[];
+    /**
+     * Which settings files this session loads (`--setting-sources`). Omitted → Claude Code's default
+     * of `user,project,local`, which reads `.claude/settings.json` FROM THE WORKTREE — source-
+     * controlled, and able to register hooks that run shell commands. A session that must not write
+     * passes `["user"]`, leaving it configured only by the machine anton runs on (the reviewer does
+     * the same, via `REVIEW_SETTING_SOURCES`).
+     */
+    settingSources?: Array<"user" | "project" | "local">;
   },
 ): Promise<StepResult> {
   // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
@@ -47,7 +80,7 @@ export async function dispatchClaude(
   const claude = ctx.deps?.recordsEachAttempt
     ? (ctx.deps.runClaude ?? runClaude)
     : metered(ctx.db, ctx.clock, dimensions, ctx.deps?.runClaude ?? runClaude);
-  const { session, owned } = await stepSession(ctx, args.beadId);
+  const { session, owned } = await stepSession(ctx, args.beadId, args.sessionKind);
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 
   try {
@@ -60,12 +93,20 @@ export async function dispatchClaude(
       model: resolveModel(ctx.settings, {
         jobType: "execute-epic",
         step: ctx.step ? (stepName(ctx.step) as "implement" | "claude") : undefined,
-        // Ticket-phase steps receive exactly one ticket. Its labels are the routing context even
-        // though this session is filed under the run target by callers that share a session.
-        labels: ctx.tickets.length === 1 ? (ctx.tickets[0]?.labels ?? []) : ctx.target.labels,
+        // A run-level step covers the whole run, so it routes on the whole run (see
+        // `runLevelLabels`). Otherwise: ticket-phase steps receive exactly one ticket, and its labels
+        // are the routing context even though this session is filed under the run target by callers
+        // that share a session.
+        labels: args.runLevelLabels
+          ? [ctx.target, ...ctx.tickets].flatMap((bead) => bead.labels ?? [])
+          : ctx.tickets.length === 1
+            ? (ctx.tickets[0]?.labels ?? [])
+            : ctx.target.labels,
       }),
       routing,
       permissionMode: ctx.settings.permissionMode ?? "bypassPermissions",
+      ...(args.disallowedTools ? { disallowedTools: args.disallowedTools } : {}),
+      ...(args.settingSources ? { settingSources: args.settingSources } : {}),
       signal: ctx.ctx.signal,
       onEvent: session.onEvent,
     });

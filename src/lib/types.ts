@@ -71,6 +71,13 @@ export const STAGES: Stage[] = ["backlog", "implementing", "in-review", "done"];
  */
 export const MAX_ABANDON_REASON_CHARS = 500;
 
+/**
+ * The `agent:` label value for work a PERSON executes, not an agent — mirrors `beads.HUMAN_AGENT` /
+ * `LABELS.agentHuman` (lib/beads/bd.ts). Duplicated here, not imported, so a client surface can gate
+ * the Mark-done action on `detail.agent === HUMAN_AGENT` without pulling lib/beads into the bundle.
+ */
+export const HUMAN_AGENT = "human";
+
 // The self-review's own shapes, re-exported type-only for the same reason as the contract above:
 // the rework dialog renders findings and score rounds, and a value import of lib/jobs would drag
 // the whole job runtime into the browser bundle.
@@ -432,6 +439,23 @@ export interface OperatorQueueItem {
    * held run to resume (PR #214 review).
    */
   holdsRun?: boolean;
+  /**
+   * Whether this bead still has open work under it. bd nesting is type-agnostic, so this is never
+   * assumed false off the bead's own type alone (PR #288 review) — a parentless task/bug/chore can
+   * hold open children too. `closeHumanTicket` (close-human.ts) refuses to close a bead with open
+   * descendants (409), so this withholds Mark done exactly where that route would 409 (mirrors the
+   * `holdsRun` gap fix, PR #214 review).
+   */
+  hasOpenDescendants?: boolean;
+  /**
+   * Whether this bead's own `blocks` dependencies still hold it — the same rule `bd close` (and
+   * `closeHumanTicket`'s pre-check, via `openBlockersOf` in jobs/execute-epic-human-gate.ts) refuses
+   * against: an open BLOCKS dependency, gate or not, not just a run's own hold. Distinct from
+   * `holdsRun` (a live run that has not yet reached this ticket) — an ordinary sibling prerequisite
+   * ("sign the contract, then wire the account") blocks the close even with no run in flight, so
+   * Mark done must withhold on it too (PR #288 review).
+   */
+  hasOpenBlockers?: boolean;
 }
 
 export interface Board {
@@ -583,6 +607,31 @@ export interface TicketDetail extends Ticket {
   /** Contract status over the bead's own run (runContractStatus, same as the standalone chip), so
    * the dialog's Run affordance agrees with the approve gate instead of 422ing on click. */
   contract?: ContractStatus;
+  /**
+   * Whether a run actually reaches this ticket and holds on it — the same predicate
+   * `OperatorQueueItem.holdsRun` derives (PR #214 review), so this dialog's Mark done can withhold
+   * itself exactly where the operator queue's inline control already does. Absent/false for a run
+   * target itself (nothing holds it) and for a ticket whose target is itself `agent:human`
+   * (poisoned before dispatch, so no gate is ever armed under it).
+   */
+  holdsRun?: boolean;
+  /**
+   * Whether this bead still has open work under it. bd nesting is type-agnostic, so this is never
+   * assumed false off the bead's own type alone (PR #288 review) — a parentless task/bug/chore can
+   * hold open children too. `closeHumanTicket` (close-human.ts) refuses to close a bead with open
+   * descendants (409), so this withholds Mark done exactly where that route would 409 (mirrors the
+   * `holdsRun` gap fix, PR #214 review).
+   */
+  hasOpenDescendants?: boolean;
+  /**
+   * Whether this bead's own `blocks` dependencies still hold it — the same rule `bd close` (and
+   * `closeHumanTicket`'s pre-check, via `openBlockersOf` in jobs/execute-epic-human-gate.ts) refuses
+   * against: an open BLOCKS dependency, gate or not, not just a run's own hold. Distinct from
+   * `holdsRun` (a live run that has not yet reached this ticket) — an ordinary sibling prerequisite
+   * ("sign the contract, then wire the account") blocks the close even with no run in flight, so
+   * Mark done must withhold on it too (PR #288 review).
+   */
+  hasOpenBlockers?: boolean;
 }
 
 // ── Board drag-and-drop ──

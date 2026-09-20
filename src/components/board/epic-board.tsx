@@ -135,7 +135,12 @@ export function EpicBoard({
       {/* Below the escalations, never instead of them: a stopped run needs a decision now, while
           this band is standing work that was always the founder's. It reads the UNFILTERED board on
           purpose — a queue narrowed by the column filters would quietly under-report what is owed. */}
-      <OperatorQueue slug={slug} items={state.board.operatorQueue} onOpenTicket={setOpenTicketId} />
+      <OperatorQueue
+        slug={slug}
+        items={state.board.operatorQueue}
+        onOpenTicket={setOpenTicketId}
+        onDone={state.refresh}
+      />
       <BoardCanvas
         slug={slug}
         view={view}

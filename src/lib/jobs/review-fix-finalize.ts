@@ -21,7 +21,8 @@ import {
   type Worktree,
 } from "../git/worktree";
 import { findOpenRunForEpic, updateRun } from "../runs";
-import { IN_REVIEW, safe, tryShow } from "./review-fix-board";
+import { IN_REVIEW, tryShow } from "./review-fix-board";
+import { safe } from "./safe";
 import { safeToRerunAtMerge, undeliveredAtMerge } from "./review-fix-delivery";
 import { preservedNote, type PreservedSetup } from "./review-fix-notes";
 import {

@@ -8,6 +8,7 @@
 import type { ReviewFinding } from "./review-context";
 import type { ResolvedStep } from "./run-formula";
 import type { StepContext } from "./step-registry";
+import type { RunNarrative } from "./steps/result";
 
 /** What one run step leaves for the ones after it — and, at the end, for the run row. */
 export interface RunPhaseCarry {
@@ -16,6 +17,14 @@ export interface RunPhaseCarry {
    * them at the merge gate, which is why the steps that follow are handed them.
    */
   advisories: ReviewFinding[];
+  /**
+   * The run's PR narrative, set by `describe` (anton-fpkk8). Restored at the top of the walk from
+   * whatever a prior attempt on THIS run row already earned, so a resumed describer that fails to
+   * report one (its own contract: a failure costs the narrative and nothing else, `steps/describe.ts`)
+   * doesn't erase a perfectly good earlier one. A describer that DOES report one overwrites it, same
+   * as advisories.
+   */
+  narrative?: RunNarrative;
   /**
    * A stale PR body's advisories, when even the bead note failed — carried out on the run row, the
    * only home left for text that exists nowhere else.

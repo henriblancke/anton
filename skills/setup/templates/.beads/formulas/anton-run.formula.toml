@@ -6,16 +6,16 @@
 #
 # Every step names its handler with a `step:<name>` label rather than a custom TOML key, because
 # `bd cook` silently DROPS step keys it doesn't recognise. anton knows: step:implement, step:verify,
-# step:review, step:commit, step:pr, and step:claude — the extension point, which dispatches a
-# `prompt:<id>` or `skill:<id>` of the project's own with no anton code change. An unmapped step
-# parks the run rather than being skipped.
+# step:review, step:commit, step:describe, step:pr, and step:claude — the extension point, which
+# dispatches a `prompt:<id>` or `skill:<id>` of the project's own with no anton code change. An
+# unmapped step parks the run rather than being skipped.
 #
 # Labels must be LITERAL: bd resolves `{{var}}` in a step's title/description/notes but copies
 # `labels` through verbatim, so a `prompt:{{prompt}}` would never resolve. anton parks on one at run
 # start. To vary the pipeline by the work's own labels, map a label to a formula of its own in
 # Settings → Pipeline variants.
 formula = "anton-run"
-description = "anton's default run pipeline: implement, verify, commit, self-review, open the PR. implement/commit/pr are anton's invariant floor — a run that never implements, never commits, or never reaches a human has no evidence of record. verify and review may be removed; that costs quality, never the run's integrity."
+description = "anton's default run pipeline: implement, verify, commit, self-review, describe, open the PR. implement/commit/pr are anton's invariant floor — a run that never implements, never commits, or never reaches a human has no evidence of record. verify, review, and describe may be removed; that costs quality, never the run's integrity."
 type = "workflow"
 version = 1
 
@@ -57,12 +57,24 @@ needs = ["commit"]
 title = "Self-review {{target}} before the PR opens"
 labels = ["step:review"]
 
+# Describe sits after the commit for the same reason review does: this is the one slot where the
+# committed diff exists and the PR has not opened, so a describer reads the run's real, reviewed
+# diff instead of guessing at intent from the beads. It is legal here (and only here, or later)
+# because it WRITES NOTHING to the worktree — unlike a step that produces a diff (`step:implement`,
+# `step:claude`), whose work this late would never be committed and the floor refuses it.
+[[steps]]
+id = "describe"
+type = "task"
+needs = ["review"]
+title = "Write the PR narrative for {{target}}"
+labels = ["step:describe"]
+
 # The PR is the pipeline's LAST step, and the floor requires that: anton stamps the PR ref when it
 # opens, and a resumed run reads a live ref as proof the run finished — so a step added after the PR
 # would be skipped by the next attempt if it failed. Put extra steps before the PR.
 [[steps]]
 id = "pr"
 type = "task"
-needs = ["review"]
+needs = ["describe"]
 title = "Open the pull request for {{target}}"
 labels = ["step:pr"]

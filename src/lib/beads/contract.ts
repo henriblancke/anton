@@ -158,14 +158,31 @@ interface SectionOccurrence {
 function sectionOccurrences(description: string, keys: ReadonlySet<string>): SectionOccurrence[] {
   const out: SectionOccurrence[] = [];
   let open: OpenSection | undefined;
+  let sectionHeading = false;
   const close = () => {
     if (open) out.push({ key: open.key, body: open.body.join("\n").trim() });
   };
-  for (const { text, heading } of scanMarkdown(description)) {
-    if (heading && opensSection(open, heading, keys)) {
-      close();
-      open = { key: heading.key, depth: heading.depth, body: [] };
-    } else open?.body.push(text);
+  for (const { text, heading, headingRest } of scanMarkdown(description)) {
+    if (heading) {
+      sectionHeading = opensSection(open, heading, keys);
+      if (sectionHeading) {
+        close();
+        open = { key: heading.key, depth: heading.depth, body: [] };
+      } else {
+        open?.body.push(text);
+      }
+    } else if (headingRest) {
+      if (!sectionHeading) open?.body.push(text);
+    } else {
+      sectionHeading = false;
+      open?.body.push(text);
+    }
+    // A Setext heading's later lines — the `===` / `---` underline included — are the heading
+    // itself, not the body under it: they open no section and say nothing in one. Leaving them in
+    // the body read `Acceptance Criteria` / `===` as a WRITTEN rubric (the underline is not
+    // scaffolding to the line-at-a-time judges), passing the gate with no criterion stated. A
+    // nested Setext heading remains in its parent section with its underline, so bodyState can
+    // still recognise the full heading as scaffolding.
   }
   close();
   return out;
@@ -176,11 +193,18 @@ function sectionOccurrences(description: string, keys: ReadonlySet<string>): Sec
  * whole of what a bead says under one name, for every reader that asks WHAT a section holds. A
  * reader that also needs where it sits must go to {@link sectionOccurrences}: the aggregate has one
  * position, and it is the first heading's whether or not that is the copy carrying the content.
+ *
+ * Joined on a BLANK line, not a bare one: {@link contentLines} re-scans the aggregate afresh, and a
+ * paragraph line from one occurrence immediately followed by a bare `===`/`---` line from the next
+ * — neither a heading in its own original context — parses as a Setext heading once adjacent,
+ * dropping authored content as scaffolding. A blank line between them is never itself a heading
+ * underline, and ends the paragraph before one can reach across the join, exactly as CommonMark
+ * ends any paragraph at a blank line.
  */
 function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
   const out = new Map<string, string>();
   for (const { key, body } of sectionOccurrences(description, keys)) {
-    out.set(key, [out.get(key), body].filter(Boolean).join("\n"));
+    out.set(key, [out.get(key), body].filter(Boolean).join("\n\n"));
   }
   return out;
 }
@@ -198,11 +222,12 @@ export function preambleOf(description: string): string {
   return lines.join("\n").trim();
 }
 
-/** A list marker — a bullet or an ordered item (`-`, `*`, `+`, `1.`, `1)`), as CommonMark counts
- * them. Shared by the two scaffolding judges below so an ordered placeholder reads exactly like the
- * bulleted one: {@link EMPTY_LIST_ITEM} already accepted both, and {@link PROMPT_LINE} not doing so
- * let `1. TODO — …` pass the blocking gate that `- TODO — …` was refused by. */
-const LIST_MARKER = /(?:[-*+]|\d{1,9}[.)])/;
+/**
+ * A list marker — CommonMark's bullets and ordered items, plus the `•` founders paste from rich text.
+ * Shared by the contract's scaffolding judges and rework's criterion derivation, so a marker-only
+ * instruction is refused before filing exactly when its generated acceptance would be unwritten.
+ */
+export const LIST_MARKER = /(?:[-*+•]|\d{1,9}[.)])/;
 
 /**
  * Every variable default in `anton-bead.formula.json` is a PROMPT, not content — "- [ ] TODO — a
@@ -277,11 +302,21 @@ const isScaffolding = (text: string) =>
   isHeading(text) || EMPTY_LIST_ITEM.test(text) || THEMATIC_BREAK.test(text);
 
 /** The lines of a body that count as authored text — everything the render hides, the blank lines
- * and the scaffolding dropped. Fenced content is literal, so the scaffolding test skips it. */
+ * and the scaffolding dropped. Fenced content is literal, so the scaffolding test skips it.
+ *
+ * A Setext heading is scaffolding too, and only the scanner can say so: `Backend` is a paragraph
+ * until the `===` under it arrives, so the line-at-a-time {@link isScaffolding} cannot see it and a
+ * section holding nothing but an underlined label read as written — the empty rubric approved and
+ * executed against, which is the one thing this judge exists to refuse. {@link RenderedLine.heading}
+ * carries the scanner's verdict for every line of the run, the underline included. */
 function contentLines(raw: string): RenderedLine[] {
   return renderedLines(raw)
-    .map((l) => ({ text: (l.fenced ? l.text : unquote(l.text)).trim(), fenced: l.fenced }))
-    .filter((l) => l.text !== "" && (l.fenced || !isScaffolding(l.text)));
+    .map((l) => ({
+      text: (l.fenced ? l.text : unquote(l.text)).trim(),
+      fenced: l.fenced,
+      heading: l.heading,
+    }))
+    .filter((l) => l.text !== "" && (l.fenced || (!l.heading && !isScaffolding(l.text))));
 }
 
 /** One body's state. A body is a prompt only when EVERY line of it is one. */
@@ -325,6 +360,9 @@ export const GOAL_KEYS = ["goal"];
  * gate accepts but the reader misses would hand the reviewer a bead with no bounds and no proof. */
 export const OUT_OF_SCOPE_KEYS = ["outofscope"];
 export const VERIFY_KEYS = ["verify", "verification"];
+/** Named for the same reason: the rework reconcile rewrites a follow-up's Context line
+ * (rework-notes.ts `replaceRunsUnder`), and must section by the heading the gate judges. */
+export const CONTEXT_KEYS = ["context"];
 
 /** The four advisory sections every task/bug/chore/feature carries, in the order they read best. */
 const TICKET_RULES: SectionRule[] = [
@@ -338,7 +376,7 @@ const TICKET_RULES: SectionRule[] = [
   {
     section: "Context",
     severity: "advisory",
-    keys: ["context"],
+    keys: CONTEXT_KEYS,
     message:
       "no `## Context` section — the agent has to rediscover which files and patterns apply (rewrite the description: `bd update <id> --body-file -`)",
     promptMessage:
@@ -414,6 +452,16 @@ const CONTRACT_KEYS: ReadonlySet<string> = new Set([...TICKET_KEYS, ...EPIC_KEYS
  * description than the gate calls Context, never more.
  */
 export const isContractHeading = (heading: Heading): boolean => CONTRACT_KEYS.has(heading.key);
+
+/**
+ * Does this heading name a TICKET's contract section? For a reader outside the gate that rewrites
+ * one section of a bead it KNOWS is a ticket and must end it exactly where {@link sectionOccurrences}
+ * does for that tier: rework's follow-up reconciliation (lib/rework-notes.ts) swaps the Acceptance
+ * body, and a `### Success` grouping criteria inside it is Acceptance's own content to the gate.
+ * Bounding on the merged set stopped there and left the grouped criteria in the bead's effective
+ * acceptance beside the new boxes.
+ */
+export const isTicketContractHeading = (heading: Heading): boolean => TICKET_KEYS.has(heading.key);
 
 /** The heading set {@link sectionsOf} sections a bead of this tier by. Exempt reads as ticket — the
  * same non-epic default {@link acceptanceKeysOf} and {@link goalKeysOf} apply. */

@@ -1,6 +1,6 @@
 ---
 name: review
-version: 16ad20660756
+version: 4a2b6ee47d50
 description: >-
   Reasoning contract for anton's pre-PR self-review gate: in a fresh context, review the diff the
   run's implementing agent just produced — correctness, code quality, project principle adherence,
@@ -55,12 +55,69 @@ promising name exists, and not because the implementer said so.
 
 ## 3. Review the diff in depth
 
-Read the whole diff, then judge it on:
+Read the whole diff. Run the interleaving pass below first — it is the class of defect most likely
+to survive pattern-matching the code shape — then judge the rest on the axes that follow.
+
+### 3a. The interleaving pass (mandatory)
+
+This is a forced enumeration, not a mood you bring to "correctness." For **every state mutation
+whose read-to-write window is touched by the diff** — every write to the beads board, the Dolt DB,
+a file, a lock, a claim, a marker, a queue — walk these steps and put the result in your notes
+before you move on. This includes a mutation whose own line is unchanged: if the diff inserts,
+removes, or moves an `await` (or otherwise changes what can run between an existing dependent read
+and an existing write), the write is in scope even though it isn't itself a diff line.
+
+1. **Name the mutation.** File:line, and what it writes.
+2. **Name the read it depends on.** The value(s) the code trusted before deciding to write —
+   often several commits or an `await` earlier than the write itself.
+3. **Name what can change that value, and who could change it**, choosing only from actors that
+   actually exist in this system:
+   - **another process** on the same machine — a second run, a concurrent worker
+   - **another machine holding the shared board** — a `bd`/Dolt sync racing the write (pull, push,
+     or another machine's claim landing mid-read)
+   - **a firing deadline** — a schedule tick, a budget or reap window closing
+   - **a cancellation** — the run or ticket being cancelled between the read and the write
+   - **the event loop itself** — an `await` between the read and the write that hands control to
+     something else before the write lands
+4. **Reach a verdict**, one of four:
+   - **A finding** — blocking if a stale read can corrupt state or let the write proceed on a
+     fact that is no longer true, advisory if the window is real but narrow and benign.
+   - **Safe/fenced** — the mutation has a dependent read, but a transaction, lock, or fencing
+     token correctly protects the read-to-write window. Name the mechanism and where it's
+     enforced; this is not a finding, but it is not silence either.
+   - **Safe/no interleaving** — the mutation has a dependent read, but none of the actors in
+     step 3 can actually land between the read and the write. A synchronous, function-local
+     sequence with no `await` or yield point in between only rules out **the event loop itself**
+     (other JS tasks on this process) — it proves nothing about another process, another machine,
+     or a firing deadline, because the OS can still preempt this process between two separate
+     synchronous filesystem, database, or CLI calls. To rule out those actors, name an atomic
+     primitive (a CAS, an `INSERT ... ON CONFLICT`) whose read-modify-write is indivisible by
+     construction, or otherwise prove the external actor cannot run in that window (e.g. it holds
+     no access to the shared resource) — never the mere absence of `await`. Name which actors you
+     checked and why each is ruled out, and by which of these two mechanisms; this is not a
+     finding, but it is not silence either.
+   - **No dependent read** — the mutation writes unconditionally, or from data it owns outright,
+     with no prior read whose staleness could matter. Name why no read is being trusted; this is
+     not a finding, but it is not silence either.
+
+   Restating this pass without walking every mutation satisfies nothing; it must produce one of
+   these four verdicts for each mutation found. Reserve the summary sentence **"no
+   mutation-with-dependent-read in this diff"** for a diff with no state mutations at all — once
+   any mutation exists, it gets its own verdict from the list above, never the summary sentence.
+
+Calibrate against the shape of defects this catches, drawn from real escapes: "fence the marker
+before accepting the retirement," "recheck cancellation after the final WIP await," "re-read
+before releasing a retired claim," "reassert the claim after the final policy await." Each is a
+decision that trusted a read across a yield point instead of rechecking it at the write.
+
+### 3b. The rest of the diff
+
+Judge everything else on:
 
 **Correctness.** Does it do what it claims on the inputs that actually occur? Hunt the edge cases:
-empty/absent/malformed input, boundary values, concurrency and interleaving, partial failure and
-retry, unhandled rejections, resource cleanup. Trace at least one realistic end-to-end path per
-criterion instead of pattern-matching the code shape.
+empty/absent/malformed input, boundary values, partial failure and retry, unhandled rejections,
+resource cleanup. Trace at least one realistic end-to-end path per criterion instead of
+pattern-matching the code shape.
 
 **Robustness and safety.** Error paths as carefully as happy paths. Untrusted input validated at the
 boundary. No secret, token, or server-only value reaching a client bundle, a log, or a UI surface.

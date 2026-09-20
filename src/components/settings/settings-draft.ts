@@ -51,6 +51,7 @@ export interface SettingsDraft {
   /** Which router connection this project meters on (anton-m5oc); "" clears (no routed meter). */
   routerConnectionId: string;
   seedPrompt: string;
+  describePrompt: string;
   reviewFixPrompt: string;
   reviewFixConcurrency: number;
   productMasterPrompt: string;
@@ -122,6 +123,7 @@ export function draftFromSettings(
     claudeGatewayModelDiscovery: settings.claudeGatewayModelDiscovery ?? false,
     routerConnectionId: settings.routerConnectionId ?? "",
     seedPrompt: settings.seedPrompt ?? "",
+    describePrompt: settings.describePrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
     reviewFixConcurrency: settings.reviewFixConcurrency ?? DEFAULT_REVIEW_FIX_CONCURRENCY,
     productMasterPrompt: settings.productMasterPrompt ?? "",
@@ -189,6 +191,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
     "routerConnectionId",
   ],
   seedPrompt: ["seedPrompt"],
+  describePrompt: ["describePrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
   reviewFixConcurrency: ["reviewFixConcurrency"],
   productMasterPrompt: ["productMasterPrompt"],
@@ -293,6 +296,7 @@ export function settingsPatchBody(
     claudeGatewayModelDiscovery: draft.claudeGatewayModelDiscovery,
     routerConnectionId: orNull(draft.routerConnectionId),
     seedPrompt: orNull(draft.seedPrompt),
+    describePrompt: orNull(draft.describePrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),
     reviewFixConcurrency: draft.reviewFixConcurrency,
     productMasterPrompt: orNull(draft.productMasterPrompt),
