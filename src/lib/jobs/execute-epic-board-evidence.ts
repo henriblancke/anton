@@ -308,8 +308,20 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
  * push lands, this re-reads the board and, if the pull actually changed anything, persists and confirms
  * a REFRESHED baseline taken after it — the caller uses THAT for the rest of this attempt (dispatch
  * hasn't happened yet, so a refreshed read here still describes pre-dispatch state) instead of the one
- * read before the pull. Skipped when the refresh finds no difference from `baseline`, so a healthy pass
- * with nothing to pull costs exactly the one push it always cost.
+ * read before the pull.
+ *
+ * That refreshed persist's OWN confirming push is itself a pull → commit → push pass (chatgpt-codex-
+ * connector, PR #284 review, "Re-read after the refreshed-baseline push"): if yet another machine
+ * publishes a change between the refresh read above and this second push, that push's pull absorbs it
+ * locally, but the fingerprint already taken describes the board BEFORE that pull. Returning it as-is
+ * would repeat exactly the bug this whole refresh exists to close — a pre-dispatch change the baseline
+ * omits reads as the agent's own evidence — just one pull later. So this doesn't stop at one refresh:
+ * after each confirming push lands, it re-reads the board again and loops back through the same
+ * persist-and-push cycle as long as that read still differs from the last baseline it confirmed,
+ * bounded at {@link BASELINE_REFRESH_ROUNDS} rounds so a board under continuous, unrelated churn fails
+ * closed (returns `null`) rather than spinning forever chasing a moving target. A round that finds no
+ * further difference returns the last confirmed baseline immediately — a healthy pass with nothing left
+ * to pull costs exactly the pushes it needed and no more.
  *
  * The refresh is skipped entirely — `baseline` is returned as-is once the confirming push above lands —
  * when `ticket` already carries a RECOVERY baseline (chatgpt-codex-connector, PR #284 review round 17,
@@ -323,14 +335,23 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
  * dispatched against it yet, so anything its confirming pull picks up is genuinely pre-existing state
  * from something else with board access, safe to fold in. See {@link beads.boardEvidenceBaselineLocked}.
  *
- * Never throws: any failure — the initial persist, the confirming push, the post-pull re-read, or the
- * refreshed persist/push — returns `null` so `runTicket` can refuse to dispatch on the same closed-fail
+ * Never throws: any failure — the initial persist, the confirming push, a refresh read, or a refresh
+ * round's persist/push — returns `null` so `runTicket` can refuse to dispatch on the same closed-fail
  * path it already takes for an unreadable baseline, rather than dispatch an agent whose writes this
  * attempt could not durably anchor. Retrying every push here is safe specifically because a caller only
  * ever reaches dispatch once this function returns non-null (`runTicket` refuses to dispatch on `null`)
  * — so a prior attempt that returned unconfirmed never let an agent run, and there is nothing a retry
  * could lose by confirming again.
  */
+/**
+ * How many extra read/persist/push rounds {@link ensureBoardBaselinePersisted} chases a moving
+ * baseline before giving up. Each round is one more machine's concurrent write the function can
+ * still absorb correctly; past that it fails closed (`null`) rather than loop indefinitely against a
+ * board under continuous unrelated churn — the same trade every bounded retry in this codebase makes
+ * (see {@link mustPersist}'s `attempts`).
+ */
+const BASELINE_REFRESH_ROUNDS = 3;
+
 export async function ensureBoardBaselinePersisted(
   repo: string,
   ticket: Bead,
@@ -350,20 +371,28 @@ export async function ensureBoardBaselinePersisted(
     .catch(() => false);
   if (!synced) return null;
   if (recoveryBaseline) return baseline;
-  const board = await mustReadBoard(repo);
-  const hydrated = board && (await hydrateDescriptions(repo, board));
-  if (!hydrated) return null;
-  const refreshed = fingerprintBoard(hydrated, ticket.id);
-  if (boardEvidence(baseline, refreshed).length === 0) return baseline;
-  const refreshedPersisted = await mustPersist(() =>
-    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(refreshed)),
-  );
-  if (!refreshedPersisted) return null;
-  const refreshedSynced = await beads
-    .push(repo)
-    .then((outcome) => outcome === "synced" || outcome === "shared-server")
-    .catch(() => false);
-  return refreshedSynced ? refreshed : null;
+
+  let confirmed = baseline;
+  for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
+    const board = await mustReadBoard(repo);
+    const hydrated = board && (await hydrateDescriptions(repo, board));
+    if (!hydrated) return null;
+    const refreshed = fingerprintBoard(hydrated, ticket.id);
+    if (boardEvidence(confirmed, refreshed).length === 0) return confirmed;
+    const refreshedPersisted = await mustPersist(() =>
+      beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(refreshed)),
+    );
+    if (!refreshedPersisted) return null;
+    const refreshedSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!refreshedSynced) return null;
+    confirmed = refreshed;
+  }
+  // Every round found the board still drifting under its own confirming push — fail closed rather
+  // than dispatch against a baseline that may still omit a change landing right now.
+  return null;
 }
 
 /**

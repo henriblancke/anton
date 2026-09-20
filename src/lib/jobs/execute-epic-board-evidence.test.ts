@@ -1492,6 +1492,8 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the refreshed persist
         pushMock.mockResolvedValueOnce("synced"); // the refreshed confirming push
+        // The stabilizing re-read after THAT push finds nothing further, so the loop stops here.
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
         const pushCallsBefore = pushMock.mock.calls.length;
 
         const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
@@ -1502,7 +1504,60 @@ describe(
           "t-fresh",
           Object.fromEntries(refreshed!.beads),
         );
+        // Only ONE refresh round actually changed anything, so only ONE extra push — the stabilizing
+        // re-read that found no further diff costs a read, not another push.
         expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 2);
+      },
+    );
+
+    it(
+      "keeps refreshing across MULTIPLE confirming pushes when each one's own pull absorbs yet " +
+        "another remote change (chatgpt-codex-connector, PR #284 review, \"Re-read after the " +
+        "refreshed-baseline push\") — a single refresh round would return a baseline that already " +
+        "misses a change its OWN confirming push just pulled in, crediting that pre-dispatch change " +
+        "to a no-op agent as if it were the agent's own delivery",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]); // round 1 read: drifted
+        pushMock.mockResolvedValueOnce("synced"); // round 1's confirming push, which itself pulls v2
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]); // round 2 read: drifted again
+        pushMock.mockResolvedValueOnce("synced"); // round 2's confirming push, which finds nothing further
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]); // round 3 read: stable
+        const pushCallsBefore = pushMock.mock.calls.length;
+
+        const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
+
+        expect(refreshed).toEqual(fingerprintBoard([bead("a", { description: "v2" })]));
+        // Initial confirming push, plus one more push per round that actually found a diff (rounds
+        // 1 and 2) — round 3's read is stable, so it costs a read but no further push.
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 3);
+      },
+    );
+
+    it(
+      "fails closed (returns null) rather than dispatch when the board keeps drifting across every " +
+        "bounded refresh round — a board under continuous unrelated churn must never let this loop " +
+        "run forever chasing a moving target",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        // Every round's read finds a NEW value and every confirming push succeeds — the board never
+        // stabilizes within the bounded number of rounds, queued explicitly (this file shares mocks
+        // across `it` blocks with no `afterEach` reset, so a persistent `mockImplementation`/
+        // `mockResolvedValue` here would leak into every test that runs after it).
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]);
+        pushMock.mockResolvedValueOnce("synced");
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]);
+        pushMock.mockResolvedValueOnce("synced");
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v3" })]);
+        pushMock.mockResolvedValueOnce("synced");
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
       },
     );
 
