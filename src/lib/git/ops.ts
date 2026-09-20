@@ -10,6 +10,7 @@ import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
+import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import { sleepMs } from "../retry-helpers";
@@ -645,21 +646,58 @@ async function showPaths(cwd: string, sha: string): Promise<string[]> {
 }
 
 /**
- * Cap on the stderr kept from a spawned git. A command that fails on every path would otherwise
+ * Cap on the output kept from a spawned git. A command that fails on every path would otherwise
  * trade one unbounded buffer for another, and 4 KiB is plenty for the message a rejection carries.
  */
-const MAX_STDERR_CHARS = 4096;
+export const MAX_STDERR_CHARS = 4096;
+
+/**
+ * The marker {@link boundedTail} prefixes onto a truncated stream, so a reader is never handed a
+ * tail that looks like the whole output. Names anton, not git, because git did not write it.
+ */
+function truncationNotice(dropped: number): string {
+  return `[anton: dropped ${dropped} earlier characters of output — showing the last ${MAX_STDERR_CHARS}]\n`;
+}
+
+/**
+ * Collect a spawned git's output stream, keeping the LAST {@link MAX_STDERR_CHARS} characters rather
+ * than the first (anton-yxlt6). A verdict comes last: a `pre-push` hook that runs a test suite spends
+ * its opening 4 KiB on banners and deliberate chatter from PASSING tests, so a head-keeping buffer
+ * reliably recorded that noise and dropped the failure summary the operator actually needs.
+ * `git push --porcelain` puts its own structure at the end of stdout for the same reason — the per-ref
+ * status lines and the trailing `Done` that {@link classifyPushFailure} reads — so the tail preserves
+ * the porcelain contract at least as well as the head did.
+ *
+ * Every chunk is consumed whatever the buffer already holds: the pipe must keep draining past the cap
+ * or a chatty hook fills it and blocks the push outright. Decoding is incremental so the cap counts
+ * characters, not bytes, and a multi-byte sequence split across two chunks is never mangled.
+ *
+ * Exported for the unit test that feeds it more than the cap across several chunks.
+ */
+export function boundedTail(stream: Readable | null | undefined): () => string {
+  const decoder = new StringDecoder("utf8");
+  let text = "";
+  let dropped = 0;
+  const append = (piece: string) => {
+    if (!piece) return;
+    text += piece;
+    if (text.length <= MAX_STDERR_CHARS) return;
+    dropped += text.length - MAX_STDERR_CHARS;
+    text = text.slice(text.length - MAX_STDERR_CHARS);
+  };
+  stream?.on("data", (chunk: Buffer) => append(decoder.write(chunk)));
+  // Flush whatever trailing bytes the decoder held back, so a stream ending mid-sequence still
+  // contributes its last character rather than silently losing it.
+  stream?.on("end", () => append(decoder.end()));
+  return () => (dropped > 0 ? truncationNotice(dropped) + text.trim() : text.trim());
+}
 
 /**
  * Start collecting a spawned git's stderr, bounded at {@link MAX_STDERR_CHARS}; the returned getter
  * reads back what arrived, trimmed. Shared by every `spawn` here so the bound is stated once.
  */
 function boundedStderr(child: ChildProcess): () => string {
-  let text = "";
-  child.stderr?.on("data", (chunk: Buffer) => {
-    if (text.length < MAX_STDERR_CHARS) text += chunk.toString("utf8");
-  });
-  return () => text.trim();
+  return boundedTail(child.stderr);
 }
 
 /**
@@ -670,11 +708,7 @@ function boundedStderr(child: ChildProcess): () => string {
  * `ignore`, where nothing reads stdout).
  */
 function boundedStdout(child: ChildProcess): () => string {
-  let text = "";
-  child.stdout?.on("data", (chunk: Buffer) => {
-    if (text.length < MAX_STDERR_CHARS) text += chunk.toString("utf8");
-  });
-  return () => text.trim();
+  return boundedTail(child.stdout);
 }
 
 /**
