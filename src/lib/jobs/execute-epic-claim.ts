@@ -12,7 +12,7 @@ import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { latestBlockNoteCommit } from "../beads/block-note";
 import { parseTicketNotes } from "../beads/notes";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
-import { commitParentShas, isAncestor, resolveCommitSha, resolveForkPoint, resolveFreshBase } from "../git/ops";
+import { commitParentShas, git, isAncestor, resolveCommitSha, resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
   branchExists,
@@ -60,7 +60,9 @@ export function claimOwnerFor(runId: string): string {
  * ran, and a later `--onto` refresh derived from it replays commits the rewind meant to drop.
  *
  * Each operation leaves a different, checkable trace:
- * - `fast_forwarded` moves the branch to EXACTLY `pendingRefresh.sha` — nothing else produces that.
+ * - `fast_forwarded` moves the branch to `pendingRefresh.sha`. Usually that is exactly the current
+ *   tip; a post-merge hook may immediately commit on top, in which case the branch reflog records
+ *   the adjacent `fromSha` → `sha` transition before the hook's commit.
  * - `merged` leaves a tip whose parents are exactly the pre-mutation tip and the merged-in base.
  * - `rebased` always replays onto brand-new commit objects: a landed rebase makes the pre-mutation
  *   tip UNREACHABLE from the new one, which the hook side-effect shape above does not (the hook's
@@ -91,7 +93,14 @@ async function confirmPendingRefreshMutation(
   switch (kind) {
     case "fast_forwarded": {
       const tip = await resolveCommitSha(repo, ref);
-      return tip === pendingRefresh.sha;
+      if (tip === pendingRefresh.sha) return true;
+      // `git merge --ff-only` runs post-merge hooks. A hook may commit after the fast-forward but
+      // before this process can persist the final outcome, so its commit becomes the current tip.
+      // Reachability alone remains insufficient — the target was already ahead of `fromSha` before
+      // the operation — but adjacent reflog entries prove this branch itself moved from the recorded
+      // pre-mutation tip to the target. Read machine-oriented object names, not reflog prose.
+      const entries = (await git(repo, ["reflog", "show", "--format=%H", ref])).split("\n");
+      return entries.some((sha, index) => sha === pendingRefresh.sha && entries[index + 1] === pendingRefresh.fromSha);
     }
     case "merged": {
       const tip = await resolveCommitSha(repo, ref);

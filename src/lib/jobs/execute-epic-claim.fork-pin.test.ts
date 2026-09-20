@@ -41,6 +41,7 @@ const resolveForkPointMock = vi.fn();
 const isAncestorMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 const resolveCommitShaMock = vi.fn<(...a: unknown[]) => Promise<string>>();
 const commitParentShasMock = vi.fn<(...a: unknown[]) => Promise<string[]>>();
+const gitMock = vi.fn<(...a: unknown[]) => Promise<string>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
@@ -50,6 +51,7 @@ vi.mock("../git/ops", async () => {
     isAncestor: (...a: unknown[]) => isAncestorMock(...a),
     resolveCommitSha: (...a: unknown[]) => resolveCommitShaMock(...a),
     commitParentShas: (...a: unknown[]) => commitParentShasMock(...a),
+    git: (...a: unknown[]) => gitMock(...a),
   };
 });
 
@@ -122,6 +124,7 @@ beforeEach(async () => {
   isAncestorMock.mockReset().mockResolvedValue(true);
   resolveCommitShaMock.mockReset();
   commitParentShasMock.mockReset();
+  gitMock.mockReset();
   // The branch is present by default; the branch-deleted regression test overrides this itself.
   branchExistsMock.mockReset().mockResolvedValue(true);
 });
@@ -975,10 +978,9 @@ it("does not trust a pending rebase when the branch moved for an unrelated reaso
   );
 });
 
-// anton-s55u (PR #279 review, P1, seventh round): a landed fast-forward's own specific trace — the
-// branch tip is EXACTLY the target base, not merely a descendant of it — is what confirms it, not
-// ancestry (which a fast-forward's own precondition, `fromSha` already behind `sha`, makes trivially
-// true even before anything runs).
+// anton-s55u (PR #279 review): a landed fast-forward reaches the target base exactly unless its
+// post-merge hook commits immediately afterward. In the latter case, the branch reflog's adjacent
+// pre-mutation → target transition is the operation-specific evidence, not generic ancestry.
 it("confirms a pending fast-forward only when the branch tip is EXACTLY the target base", async () => {
   await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseForkSha: "old-fork-commit",
@@ -1026,14 +1028,37 @@ it("does not trust a pending fast-forward when the branch tip is merely a descen
     createdBranch: false,
     repoPath: "/repo",
   });
-  // Some OTHER commit landed on the branch after `ff-target` — the tip descends from it but isn't it.
+  // Some OTHER commit landed on the branch after `ff-target` — without the fast-forward's own reflog
+  // transition, a descendant tip cannot prove the pending operation landed.
   resolveCommitShaMock.mockResolvedValue("some-later-commit");
+  gitMock.mockResolvedValue("some-later-commit\nff-target\nnot-the-recorded-pre-mutation-tip");
 
   await warmRunWorktree(makeRun(RETRY));
 
   expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({ forkSha: "old-fork-commit" }),
   );
+});
+
+it("confirms a pending fast-forward followed by a post-merge hook commit", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "ff-target",
+    pendingRefreshFromSha: "branch-tip-before-ff",
+    pendingRefreshKind: "fast_forwarded",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({ path: WORKTREE, branch: BRANCH, baseBranch: FRESH_BASE, createdBranch: false, repoPath: "/repo" });
+  resolveCommitShaMock.mockResolvedValue("post-merge-hook-commit");
+  gitMock.mockResolvedValue("post-merge-hook-commit\nff-target\nbranch-tip-before-ff");
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ forkSha: "ff-target" }));
 });
 
 // PR #279 review, P2: an operator can delete a crashed attempt's checkout AND branch before the

@@ -599,7 +599,7 @@ export async function resolveHooksPathOverrideForMerge(
   return resolveHooksPathOverride(repoPath, worktreePath);
 }
 
-async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
+export async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
   const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
   const { stdout } = await execFileAsync("git", [...configArgs, "-C", cwd, ...args], {
     timeout: 120_000,
