@@ -176,6 +176,16 @@ export async function warmRunWorktree(
   // branch, not that no attempt ever did, so overwriting a prior success's record with the fresh base
   // it was never brought up to would lose the only base a truthful already-shipped claim naming that
   // success's commits could still be checked against.
+  //
+  // Computed once, outside the try, so the catch below can retry the SAME payload (PR #279 review,
+  // P1): `createWorktree` already mutated the branch (rebased/merged it) by this point — the payload
+  // here is the only durable record of what onto, and losing it would leave a later resume deriving
+  // `forkSha` from the stale, pre-refresh pin instead.
+  const refreshFields =
+    worktree.refreshOutcome &&
+    !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
+      ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }
+      : undefined;
   try {
     // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither
     // must be removed, or a retry could reuse its branch and derive a fork from a moved base.
@@ -223,19 +233,34 @@ export async function warmRunWorktree(
       // following a prior EFFECTIVE refresh is likewise left alone (PR #279 review): the branch still
       // carries that refresh's commits, so overwriting its record with this attempt's non-move would
       // erase the only durable evidence of it.
-      ...(worktree.refreshOutcome &&
-      !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
-        ? {
-            baseRefreshOutcome: worktree.refreshOutcome.outcome,
-            baseRefreshSha: worktree.refreshOutcome.baseSha,
-          }
-        : {}),
+      ...(refreshFields ?? {}),
     });
   } catch (error) {
     // A newly-created checkout without a pinned fork is unsafe to reuse: any setup failure before
     // persistence would otherwise leave a retry free to derive against a base another run has moved.
     // A reused checkout belongs to its prior attempt and is already pinned, so this attempt leaves it
-    // intact.
+    // intact — UNLESS this warm's own refresh just mutated it (PR #279 review, P1): `createWorktree`
+    // already rebased/merged the branch onto `freshBase` before this try block ever ran, so the
+    // failure above (whatever it was) has nothing to do with whether that mutation happened. Losing
+    // `refreshFields` here would leave the branch at its new, mutated state with the row still
+    // pointing at the OLD boundary; a later resume would then derive `--onto`'s upstream from that
+    // stale pin and replay commits the mutation already carried forward — the resurrection this
+    // column exists to prevent (see `refreshFields` above, and `priorEffectiveRefreshSha`'s doc
+    // comment for the replay mechanics). Best-effort retry the boundary alone; if even that write
+    // won't land, fail closed rather than resume against an unrecorded mutation.
+    if (reusedCheckout && refreshFields) {
+      try {
+        await updateRun(db, clock, runId, refreshFields);
+      } catch (persistError) {
+        throw new PoisonEpic(
+          `anton ${refreshFields.baseRefreshOutcome} ${branch} onto ${freshBase} but could not persist ` +
+            `the refresh boundary (${persistError instanceof Error ? persistError.message : String(persistError)}) ` +
+            `— resuming would derive a rebase boundary from the stale, pre-refresh pin and could replay ` +
+            `already-applied commits onto a later base rewrite. Repair the run row for ${runId}, then ` +
+            `resume (original failure: ${error instanceof Error ? error.message : String(error)})`,
+        );
+      }
+    }
     if (!reusedCheckout) {
       await releaseWorktreeClaim(repo, branch, worktreeClaim).catch((cleanupError) => {
         console.error(`[execute-epic] could not release the failed worktree claim for ${branch}`, cleanupError);
