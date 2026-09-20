@@ -474,7 +474,18 @@ export function unterminatedCloser(source: string): string | undefined {
       const opener = openingFence(openerLine);
       if (opener) {
         const last = source.slice(source.lastIndexOf("\n") + 1);
-        if (!closingFence(last, opener)) closer = { offset, text: fenceCloser(openerLine) };
+        // The AST reports "ends at EOF" even for a fence that closed cleanly and simply happens to
+        // be the document's last content — a wide list item's closer still carries the container's
+        // indentation, which the raw final line keeps but a bare `closingFence` check rejects
+        // outright (CommonMark's fence marker allows only 0-3 leading columns). Strip the opener's
+        // own container prefix the same way scanMarkdown does before judging the terminal line.
+        const lineStart = source.lastIndexOf("\n", Math.max(0, offset - 1)) + 1;
+        const directCloser = stripContainerMarkers(last);
+        const prefix = fenceContainerPrefix(source.slice(lineStart, offset));
+        const continuationCloser = prefix && last.startsWith(prefix) ? last.slice(prefix.length) : "";
+        if (!closingFence(directCloser, opener) && !closingFence(continuationCloser, opener)) {
+          closer = { offset, text: fenceCloser(openerLine) };
+        }
       }
     }
     if (node.type === "html" && node.value?.startsWith("<!--") && !node.value.endsWith("-->")) {

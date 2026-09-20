@@ -502,6 +502,11 @@ describe("unterminatedCloser", () => {
     // dropping it left a bare `> ` closer, which leaves the list (already closed by the fence) and
     // opens a new top-level quoted fence that swallows everything appended after it.
     expect(unterminatedCloser("- > ```md\n  > sample")).toBe("  > ```");
+    // A closer at a wide list item's own indentation (5 columns, from a two-digit ordinal marker)
+    // still terminates the fence — the AST reports the code node ending at EOF just because it is
+    // the document's last content, but the raw final line's container-relative spelling already
+    // closes it, so no synthetic closer should be appended.
+    expect(unterminatedCloser("123. ```\n     sample\n     ```")).toBeUndefined();
   });
 
   it("does not let a closed fence's own content reopen it as a synthetic closer", () => {
