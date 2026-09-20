@@ -598,6 +598,71 @@ it("verifies against the pinned dirty-resume base, not a stale recorded refresh,
   expect(runStep.alreadyShippedBase).toBe("this-attempt-dirty-base");
 });
 
+it("prefers the newer resolved base over an older recorded refresh once the branch already carries it (PR #279 review, P1)", async () => {
+  // Attempt 1 refreshed this reused checkout onto `prior-base` (recorded as `merged`). Before this
+  // attempt, a prior resume ALSO landed the branch on the newer `fresh-base` (e.g. its own refresh
+  // succeeded but crashed before the row could record it) — so the branch already carries
+  // `fresh-base`'s commits. This attempt is a dirty resume, so `refreshOntoBase` doesn't move
+  // anything and reports `skipped_dirty` with the same `fresh-base` it independently resolved.
+  // `fresh-base` descends from `prior-base` (they're ancestor-comparable, not diverged), and it is
+  // reachable from the branch tip — so citing the older `prior-base` here would leave base-only
+  // commits in `prior-base..fresh-base` eligible for false attribution to this branch's delivery.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "prior-base",
+    branch: BRANCH,
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "fresh-base" },
+  });
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "prior-base" && descendant === "fresh-base") return true;
+    if (ancestor === "fresh-base" && descendant === `refs/heads/${BRANCH}`) return true;
+    return false;
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun(RUN_ID));
+
+  expect(runStep.alreadyShippedBase).toBe("fresh-base");
+});
+
+it("keeps the older recorded refresh when the newer resolved base was never actually merged onto the branch", async () => {
+  // Same setup as above, but this time the branch does NOT already carry `fresh-base` — this is an
+  // ordinary `skipped_dirty` that never applied it. Citing `fresh-base` here would check an
+  // already-shipped claim against a commit the checkout doesn't actually have, so the older but
+  // confirmed-landed `prior-base` must still win.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "prior-base",
+    branch: BRANCH,
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "fresh-base" },
+  });
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "prior-base" && descendant === "fresh-base") return true;
+    return false;
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun(RUN_ID));
+
+  expect(runStep.alreadyShippedBase).toBe("prior-base");
+});
+
 it("passes the last EFFECTIVE refresh's base as the --onto boundary, in preference to the original fork (PR #279 review)", async () => {
   // Attempt 1 refreshed this reused checkout with `--onto` the original fork, landing on
   // `first-refresh-base`, then failed for an ordinary reason (its row settles `failed`). Attempt 2

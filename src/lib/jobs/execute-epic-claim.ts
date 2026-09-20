@@ -96,6 +96,40 @@ async function confirmPendingRefreshMutation(
   }
 }
 
+/**
+ * Which of `pinnedBase`/`shippedFallback` a dirty-resume checkout's already-shipped claims should be
+ * checked against (PR #279 review, P1: excluding the newest base already present on dirty branches).
+ *
+ * `shippedFallback` is always something the branch is already confirmed to hold — the fork point
+ * itself, or a refresh {@link confirmPendingRefreshMutation} (or a prior clean resume) verified
+ * actually landed — so it is always a safe answer. `pinnedBase` is only what a dirty resume's fresh
+ * base RESOLUTION saw; `refreshOntoBase` skipped applying it, so nothing here guarantees the branch
+ * ever actually merged it.
+ *
+ * Three cases:
+ * - `shippedFallback` is the more advanced side (or the two coincide) — the ordinary case, and also
+ *   the offline lag where a dirty resume's fresh-base resolution fell back to a stale LOCAL ref
+ *   behind a refresh a prior resume already applied. `shippedFallback` wins outright; it costs
+ *   nothing to prefer it here since it is never behind what the branch can truthfully cite.
+ * - Neither is an ancestor of the other — a genuine divergence, the shape a history-rewriting
+ *   force-push leaves. Falls through to `pinnedBase`, the freshest resolved value: `shippedFallback`
+ *   could cite a commit the rewrite already dropped.
+ * - `pinnedBase` is the more advanced side. Newer alone isn't enough to trust it — an ordinary
+ *   `skipped_dirty` never merged it — so it wins only when it is ALSO reachable from the branch tip
+ *   (a prior attempt already landed the same commit this resume's resolution independently sees).
+ *   Otherwise falls back to the always-safe `shippedFallback`.
+ */
+async function resolveComparableBase(
+  worktreePath: string,
+  branch: string,
+  pinnedBase: string,
+  shippedFallback: string,
+): Promise<string> {
+  if (await isAncestor(worktreePath, pinnedBase, shippedFallback)) return shippedFallback;
+  if (!(await isAncestor(worktreePath, shippedFallback, pinnedBase))) return pinnedBase;
+  return (await isAncestor(worktreePath, pinnedBase, `refs/heads/${branch}`)) ? pinnedBase : shippedFallback;
+}
+
 /** Step 2. Warm (or reuse) the run's checkout and build the context every step is narrowed from. */
 export async function warmRunWorktree(
   run: EpicRun,
@@ -515,22 +549,10 @@ export async function warmRunWorktree(
   // could rewind the base — so it, not the mutable ref, is what a fresh creation must pin against.
   const pinnedBase = worktree.refreshOutcome?.baseSha ?? (reusedCheckout ? freshBase : baseForkSha);
   const shippedFallback = reusedCheckout ? (reconciledRefreshSha ?? baseForkSha) : baseForkSha;
-  // Both ancestry directions, not just fallback-descends-from-base (PR #279 review): a dirty resume
-  // whose `resolveFreshBase` fell back to a stale LOCAL base (no network) can leave `pinnedBase`
-  // BEHIND `shippedFallback` — e.g. local `main` sits at A while an earlier, still-recorded refresh
-  // already carried this branch to B. Checking only whether `shippedFallback` descends from
-  // `pinnedBase` answers no in that case and falls through to `pinnedBase`, even though the checkout
-  // still holds B — rejecting a truthful already-shipped claim that cites B's commits. So
-  // `shippedFallback` is kept whenever EITHER side is an ancestor of the other — ordinary forward
-  // motion, or this offline lag — and only a genuine divergence (neither an ancestor of the other,
-  // the shape a history-rewriting force-push leaves) falls through to `pinnedBase`.
   const alreadyShippedBase =
     worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
       ? worktree.refreshOutcome.baseSha
-      : (await isAncestor(worktree.path, shippedFallback, pinnedBase)) ||
-          (await isAncestor(worktree.path, pinnedBase, shippedFallback))
-        ? shippedFallback
-        : pinnedBase;
+      : await resolveComparableBase(worktree.path, worktree.branch, pinnedBase, shippedFallback);
 
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
   // dispatched in the order the project's formula declares. This is what they all operate on; each
