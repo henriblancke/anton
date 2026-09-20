@@ -1319,6 +1319,58 @@ describe(
   },
 );
 
+// chatgpt-codex-connector, PR #284 review, "Reconfirm pending evidence before regenerating the
+// ticket": a process dying AFTER `finishTicket` closes/transitions the ticket but BEFORE
+// `clearBoardEvidencePending` ever runs leaves the pending marker/baseline `readBoardEvidence`
+// already confirmed synced sitting on the board with NO cleanup obligation — that flag is only
+// ever written BY `clearBoardEvidencePending`, which in this scenario never started. A fresh
+// machine with no commit for this ticket must still finish confirming that surviving evidence
+// instead of falling through to full regeneration.
+describe(
+  "a board-only ticket with surviving pending evidence but no cleanup obligation and no commit " +
+    "on this branch (PR #284 review, \"Reconfirm pending evidence before regenerating the ticket\")",
+  () => {
+    it("finishes confirming a surviving pending marker instead of reopening and regenerating", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb1"])],
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        false,
+      );
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+
+    it("finishes confirming a surviving preserved baseline alone, with no pending marker either", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ x: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", child, [], true, false);
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    });
+  },
+);
+
 // PR #284 review ("Preserve confirmed evidence IDs during cleanup retries"): a same-machine resume
 // whose commit IS on this branch retries any leftover cleanup obligation through the `if (delivery)`
 // path. `setBoardEvidenceConfirmed` is not idempotent on its `ids` argument — passing the bare

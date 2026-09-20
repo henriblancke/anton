@@ -341,11 +341,16 @@ export async function runTicket(args: {
  * more failed attempts sit between it and the one that finally delivers, even though the next
  * attempt's fresh `readBoardBaseline` read may already contain it as pre-existing state.
  *
- * Only the marker/baseline write itself failing after every retry is unsafe enough to halt the run
- * outright (mirrors `boardOnlyNoDeliveryMessage`'s own `markerUnpersisted`/`baselineUnpersisted`
- * handling on the success path) — anything else (including evidence the confirming push could not
- * verify synced) leaves the recovery state durably on the ticket for the next attempt to pick up, so
- * this ticket's own failure is left to settle exactly as it would have otherwise.
+ * The marker/baseline write itself failing after every retry is unsafe enough to halt the run
+ * outright, and so is a baseline that landed only LOCALLY without a confirmed sync (mirrors
+ * `boardOnlyNoDeliveryMessage`'s own `markerUnpersisted`/`baselineUnpersisted`/`baselineUnconfirmed`
+ * handling on the success path, chatgpt-codex-connector PR #284 review round 17, "Halt when the
+ * recovery baseline remains unsynced") — the run-lease actor is machine-scoped, not run-scoped, so a
+ * resume that lands on a DIFFERENT machine never sees a baseline that only landed on this one, and its
+ * fresh `readBoardBaseline` may already have absorbed this attempt's writes through an independent
+ * sync, permanently losing attribution. Anything else (evidence found and its confirming push
+ * verified synced) leaves the recovery state durably on the ticket for the next attempt to pick up,
+ * so this ticket's own failure is left to settle exactly as it would have otherwise.
  */
 async function auditBoardOnFailedTicket(
   run: Omit<StepContext, "tickets">,
@@ -361,15 +366,28 @@ async function auditBoardOnFailedTicket(
   // recovery write itself failed" coincide. Returning early on `!found` first would silently drop
   // that failure and let the ticket settle as an ordinary failure, leaving a resumed attempt's fresh
   // `readBoardBaseline` free to absorb this attempt's untracked board writes as pre-existing once a
-  // later sync publishes them.
-  if (result.markerUnpersisted || result.baselineUnpersisted) {
+  // later sync publishes them. `baselineUnconfirmed` is checked the same way and for the same reason
+  // (chatgpt-codex-connector, PR #284 review round 17): it can also come back alongside `found: false`
+  // (see `readBoardEvidence`'s `!hydrated` branch), and a baseline that is safe only on THIS machine
+  // is exactly the state a cross-machine resume must not silently treat as "nothing to attribute".
+  if (result.markerUnpersisted || result.baselineUnpersisted || result.baselineUnconfirmed) {
+    const unsafeWrite = result.markerUnpersisted
+      ? "pending-evidence marker"
+      : result.baselineUnpersisted
+        ? "recovery baseline"
+        : "recovery baseline's confirming sync";
+    const sameMachineNote = result.baselineUnconfirmed
+      ? " The baseline itself landed locally, so resuming on THIS SAME machine is safe — but the " +
+        "run-lease actor is machine-scoped, and a resume on a different machine would never see it, " +
+        "silently absorbing these writes as pre-existing."
+      : "";
     throw new PoisonEpic(
       `${ticket.id} failed and this attempt's board writes${result.ids.length > 0 ? ` on ${result.ids.join(", ")}` : ""} could not be ` +
-        `recorded for a resume — bd refused the ${result.markerUnpersisted ? "pending-evidence marker" : "recovery baseline"} ` +
-        `write after retries. The run stopped rather than let a resumed attempt's fresh board ` +
-        `baseline silently absorb these unreviewed writes as pre-existing, with no way left to ` +
-        `attribute or safely reject them. Check the beads DB, then resume the run. This ticket ` +
-        `failed with: ${String(cause)}`,
+        `recorded for a resume — bd refused the ${unsafeWrite} after retries.${sameMachineNote} The run ` +
+        `stopped rather than let a resumed attempt's fresh board baseline silently absorb these ` +
+        `unreviewed writes as pre-existing, with no way left to attribute or safely reject them. Check ` +
+        `the beads DB, then resume the run${result.baselineUnconfirmed ? " on this same machine" : ""}. ` +
+        `This ticket failed with: ${String(cause)}`,
     );
   }
   if (!result.found) return;

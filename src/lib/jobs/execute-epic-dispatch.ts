@@ -1235,12 +1235,28 @@ async function dispatchTicket(
   // ids, anything still pending, and anything already durably confirmed — since the pending marker
   // and preserved baseline that normally carry them may already be cleared. Guarded on NOT already
   // confirmed so a ticket the fast path below already handles doesn't get retried twice.
+  //
+  // Also entered on a surviving pending marker or preserved baseline alone, not just
+  // `hasBoardEvidenceCleanupUnsynced` (chatgpt-codex-connector, PR #284 review, "Reconfirm pending
+  // evidence before regenerating the ticket"): a process dying AFTER `finishTicket` closes/transitions
+  // this ticket but BEFORE `clearBoardEvidencePending` ever runs leaves the pending marker and
+  // baseline `readBoardEvidence` wrote (and already confirmed synced, per `assertBoardOnlyDelivered`'s
+  // own gate) on the board exactly as they were — with no cleanup obligation, because the cleanup call
+  // that would have written one never started. A fresh machine then sees `doneOnBoard` true,
+  // `boardEvidenceConfirmed` false, and `hasBoardEvidenceCleanupUnsynced` false, which used to fall
+  // through both this guard and the confirmed-shortcut below into full regeneration against a fresh
+  // baseline that already contains the delivered writes — the same undone-delivery shape the
+  // obligation check above exists to prevent, just reached one call earlier.
   if (
     doneOnBoard &&
     isBoardOnlyRun(run, ticket) &&
     !beads.boardEvidenceConfirmed(ticket) &&
-    beads.hasBoardEvidenceCleanupUnsynced(ticket)
+    (beads.hasBoardEvidenceCleanupUnsynced(ticket) ||
+      beads.pendingBoardEvidence(ticket).length > 0 ||
+      beads.boardEvidenceBaseline(ticket) !== undefined)
   ) {
+    const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
     const recoveredIds = [
       ...new Set([
         ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
@@ -1248,13 +1264,7 @@ async function dispatchTicket(
         ...beads.confirmedBoardEvidenceIds(ticket),
       ]),
     ].toSorted();
-    await clearBoardEvidencePending(
-      repo,
-      ticket,
-      recoveredIds,
-      beads.boardEvidenceBaseline(ticket) !== undefined,
-      true,
-    );
+    await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
     if (recoveredIds.length > 0) {
       ledger.boardEvidence.set(ticket.id, recoveredIds);
     }

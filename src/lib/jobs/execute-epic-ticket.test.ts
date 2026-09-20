@@ -442,6 +442,34 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       expect(settleFailedTicketMock).not.toHaveBeenCalled();
     },
   );
+
+  it(
+    "halts instead of settling when the audit's own recovery baseline landed locally but could " +
+      "not be confirmed synced — a resume on a DIFFERENT machine never sees a baseline that only " +
+      "landed on this one (chatgpt-codex-connector, PR #284 review, \"Halt when the recovery " +
+      "baseline remains unsynced\")",
+    async () => {
+      readBoardEvidenceMock.mockResolvedValue({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+        baselineUnconfirmed: true,
+      });
+
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [failingVerifyStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow(/could not be recorded for a resume[\s\S]*resume the run on this same machine/);
+
+      expect(settleFailedTicketMock).not.toHaveBeenCalled();
+    },
+  );
 });
 
 /**
