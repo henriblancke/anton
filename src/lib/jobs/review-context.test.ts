@@ -385,6 +385,48 @@ describe("reviewContext", () => {
     },
   );
 
+  it(
+    "tells the reviewer to read a board-only ticket's beads off the live board, not this " +
+      "worktree's own frozen `bd` (PR #284 review round 12) — the confirmed ids AND the `-C` " +
+      "instruction, since the worktree's beads copy is a separate, unsynced one",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: epic,
+        tickets: [boardOnlyTicket],
+        diff: { files: [], patch: "", truncated: false },
+        boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+        repoPath: "/repos/anton",
+      });
+      expect(out).toContain("- anton-x1.1: anton-y9");
+      expect(out).toContain("bd -C /repos/anton show <id>");
+      expect(out).toContain("frozen, pre-delivery copy");
+    },
+  );
+
+  it(
+    "still gives the live-board instruction with no confirmed ids to name — the legacy shape " +
+      "where only the run target carries `delivery:board`",
+    () => {
+      const boardOnlyEpic: Bead = { ...epic, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: boardOnlyEpic,
+        tickets: [ticket],
+        diff: { files: [], patch: "", truncated: false },
+        repoPath: "/repos/anton",
+      });
+      expect(out).toContain("bd -C /repos/anton show <id>");
+      // No evidence map was given, so there is nothing to list — but the instruction still fires.
+      expect(out).not.toContain("confirmed evidence covers");
+    },
+  );
+
+  it("gives neither board-evidence section when repoPath and boardEvidenceByTicket are both absent", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff });
+    expect(out).not.toContain("bd -C");
+    expect(out).not.toContain("confirmed evidence covers");
+  });
+
   it("repeats a truncated patch's deletions, which the worktree cannot show", () => {
     // "Read the files in the worktree" is impossible for a file the run removed, and the reviewer has
     // no `git` to fetch it from the base — so a removed route past the cut would be reviewed by nobody.
@@ -1054,6 +1096,41 @@ describe("buildFindingsFixPrompt", () => {
 
     expect(prompt).toContain("If a finding is WRONG");
     expect(prompt).toContain("Do not commit, push, or open a PR");
+  });
+
+  it(
+    "tells a board-only fixer that an unchanged tree is expected and how to write to the live " +
+      "board, not the ordinary instructions (PR #284 review round 12)",
+    async () => {
+      const { prompt } = await buildFindingsFixPrompt({
+        target: epic,
+        findings: [{ severity: "blocking", location: "anton-x1", note: "the bead was never closed" }],
+        settings: {},
+        projectDir,
+        round: 1,
+        maxRounds: 2,
+        boardOnly: true,
+        repoPath: "/repos/anton",
+      });
+
+      expect(prompt).toContain("This run is board-only");
+      expect(prompt).toContain("An unchanged git tree when you finish is");
+      expect(prompt).toContain("bd -C /repos/anton update <id>");
+    },
+  );
+
+  it("omits the board-only section entirely for an ordinary (non-board-only) fix", async () => {
+    const { prompt } = await buildFindingsFixPrompt({
+      target: epic,
+      findings: [{ severity: "blocking", location: "src/a.ts:1", note: "drops the error path" }],
+      settings: {},
+      projectDir,
+      round: 1,
+      maxRounds: 2,
+    });
+
+    expect(prompt).not.toContain("This run is board-only");
+    expect(prompt).not.toContain("bd -C");
   });
 });
 

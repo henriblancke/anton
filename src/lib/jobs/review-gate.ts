@@ -34,10 +34,13 @@ import { resolveCommitTimeoutMs, resolveReviewConfig, resolveVerifyGates, type P
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
+import { boardEvidence, fingerprintBoard, type BoardFingerprint } from "./execute-epic-board-evidence";
+import { mustReadBoard } from "./execute-epic-persist";
 import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
+  isBoardOnlyDelivery,
   parseReviewFindings,
   type ReviewFinding,
   type ReviewProtocolViolation,
@@ -139,6 +142,12 @@ export interface ReviewGateDeps {
   gitCommonDir?: (worktreePath: string) => Promise<string>;
   /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
   hashTree?: (worktreePath: string) => Promise<string>;
+  /**
+   * Read the live board's content fingerprint — a board-only fix session's before/after progress
+   * signal (see {@link readBoardFingerprint}). Overridable so a test can fake the board without
+   * shelling out to a real `bd`, exactly like every other side effect in this list.
+   */
+  readBoardFingerprint?: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -160,6 +169,14 @@ export interface ReviewGateArgs {
   tickets: Bead[];
   /** See {@link import("./steps/context").StepContext.boardEvidenceByTicket}. */
   boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /**
+   * See {@link import("./steps/context").StepContext.repoPath} — the live board's repo path, never
+   * the worktree. Handed to the reviewer so a board-only ticket's evidence can be read fresh instead
+   * of off this worktree's own frozen, unsynced beads copy (PR #284 review round 12), and to a
+   * board-only fix session so its `bd` writes land on the board anton's own evidence check actually
+   * reads (round 13) rather than being stranded in the worktree's copy.
+   */
+  repoPath?: string;
   settings: ProjectSettings;
   /** The run's worktree: where the diff is read and the fixes land. */
   worktreePath: string;
@@ -282,6 +299,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const rounds: ReviewRound[] = args.rounds ?? [];
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
+  // Whether EVERY ticket this run had to deliver is board-only (PR #284 review round 12/13): decided
+  // once, off the same bead pair the reviewer's own {@link diffSection} judges — never re-derived per
+  // round, since the tickets' labels don't change mid-gate.
+  const boardOnly = isBoardOnlyDelivery({ target, tickets });
   const driver = args.deps?.runClaude ?? runClaude;
   // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
   // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
@@ -308,6 +329,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
+  const readBoard = args.deps?.readBoardFingerprint ?? defaultReadBoardFingerprint;
 
   // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
   // between rounds, and an unsandboxable host must fail the gate outright rather than after a review
@@ -357,6 +379,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       target,
       tickets,
       boardEvidenceByTicket: args.boardEvidenceByTicket,
+      repoPath: args.repoPath,
       settings,
       worktreePath,
       baseRev,
@@ -442,6 +465,9 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       readState,
       restoreState,
       hashTree,
+      boardOnly,
+      repoPath: args.repoPath,
+      readBoardFingerprint: readBoard,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
@@ -500,6 +526,8 @@ async function runReviewSession(args: {
   tickets: Bead[];
   /** See {@link ReviewGateArgs.boardEvidenceByTicket}. */
   boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /** See {@link ReviewGateArgs.repoPath}. */
+  repoPath?: string;
   settings: ProjectSettings;
   worktreePath: string;
   /** The pinned fork-point commit: the patch AND the reviewer's trusted inputs both come from it. */
@@ -621,6 +649,7 @@ async function runReviewSession(args: {
         tickets,
         diff,
         boardEvidenceByTicket: args.boardEvidenceByTicket,
+        repoPath: args.repoPath,
         settings,
         projectDir: worktreePath,
         // Literally the same commit the diff is taken from — a pinned SHA, not the movable base ref
@@ -897,6 +926,24 @@ function describeTree(tree: string | undefined): string {
 }
 
 /**
+ * The board's content fingerprint, read fresh off `repoPath` — the anti-stall signal a board-only
+ * fix session's round needs (PR #284 review round 13), NOT the authoritative delivery evidence
+ * ({@link import("./execute-epic-board-evidence").readBoardEvidence}, which this deliberately
+ * doesn't call: that check owns a baseline/pending/sync-confirmation protocol scoped to a ticket's
+ * one-time settlement, and reusing it here — inside a converging review loop that can run several
+ * times per ticket — would race its own retry/persist bookkeeping for a question this loop only
+ * needs a best-effort answer to). `ticketId` excludes THAT bead's own assignee from the fingerprint,
+ * the same exclusion {@link fingerprintBoard} applies for the ticket currently being dispatched, so
+ * anton's own claim/heartbeat rewrites never read as this round's fix. Returns `undefined` on a read
+ * failure (after `mustReadBoard`'s own retries) — folded by the caller into "no board signal this
+ * round", same as it would answer before this existed.
+ */
+async function defaultReadBoardFingerprint(repoPath: string, ticketId: string): Promise<BoardFingerprint | undefined> {
+  const board = await mustReadBoard(repoPath);
+  return board && fingerprintBoard(board, ticketId);
+}
+
+/**
  * One fix: a fresh claude session over the round's blocking findings, the operator's verify gates,
  * then a commit onto the run's branch. Advisory findings are deliberately NOT dispatched — they are
  * surfaced to the founder, and letting the fixer roam past the blocking list widens the diff with
@@ -940,9 +987,16 @@ async function runGateFixSession(args: {
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
   /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
   hashTree: (worktreePath: string) => Promise<string>;
+  /** See {@link ReviewGateArgs.repoPath} — computed once by {@link runReviewGate} for the whole run. */
+  boardOnly?: boolean;
+  /** See {@link ReviewGateArgs.repoPath}. Only read when {@link boardOnly} is set. */
+  repoPath?: string;
+  /** See {@link ReviewGateDeps.readBoardFingerprint}. Only called when {@link boardOnly} and {@link repoPath} are both set. */
+  readBoardFingerprint: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
 }): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
+  const { boardOnly, repoPath } = args;
 
   const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
     target,
@@ -951,6 +1005,8 @@ async function runGateFixSession(args: {
     projectDir: worktreePath,
     round,
     maxRounds,
+    boardOnly,
+    repoPath,
   });
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
@@ -967,6 +1023,12 @@ async function runGateFixSession(args: {
       `[review-fix] round ${round}/${maxRounds}: fixing ${findings.length} blocking finding(s)\n`,
     );
     const before = await args.readState(worktreePath);
+    // The board's OWN "before", read alongside the tree's (PR #284 review round 13) — only for a
+    // board-only run, whose fixer's actual deliverable is a bd write this worktree's git state can
+    // never show. Best-effort like every other board read in this codebase: `mustReadBoard`'s own
+    // retries exhausted just means this round falls back to the tree-only signal below, exactly as
+    // it did before this existed.
+    const boardBefore = boardOnly && repoPath ? await args.readBoardFingerprint(repoPath, target.id) : undefined;
     // Flips once the gates have passed AND the work is committed: past that point the round's output
     // is verified, and the rollback below must not touch it however the session ends.
     let verified = false;
@@ -993,6 +1055,17 @@ async function runGateFixSession(args: {
           `claude reported an error fixing review findings for ${target.id}: ${result.text ?? "unknown"}`,
         );
       }
+
+      // The board's "after" (PR #284 review round 13) — read right alongside the tree's, before the
+      // gates run: nothing between here and the gate suite can touch the board, so there is no
+      // reason to delay it, and doing so keeps this read next to the baseline it is diffed against.
+      const boardAfter = boardBefore ? await args.readBoardFingerprint(repoPath!, target.id) : undefined;
+      // Whether the fixer actually wrote to the board, for a board-only run only: `boardEvidence`
+      // is the same pure diff `execute-epic-board-evidence.ts` uses for the run's OWN delivery
+      // check, reused here only as an anti-stall SIGNAL for this loop — never as proof for anton's
+      // authoritative board-evidence gate, which still runs at ticket settlement regardless of what
+      // this round observed.
+      const boardChanged = boardBefore && boardAfter ? boardEvidence(boardBefore, boardAfter).length > 0 : false;
 
       // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
       // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
@@ -1045,7 +1118,10 @@ async function runGateFixSession(args: {
           ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
           : selfCommitted
             ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
-            : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
+            : boardChanged
+              ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed, which is this ` +
+                `run's actual deliverable (delivery:board)\n`
+              : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
       if (!treeProven) {
         await appendSessionLog(
@@ -1059,7 +1135,11 @@ async function runGateFixSession(args: {
       await endSession(db, clock, sessionId, "done");
       return {
         sessionId,
-        committed: committed || selfCommitted,
+        // `boardChanged` is this round's progress signal for a board-only run (PR #284 review round
+        // 13): its fix leaves no git diff by design, so `committed`/`selfCommitted` alone would read
+        // a genuine bd repair as `!committed` and the caller's stall check would park a healthy round
+        // as stalled — exactly the false negative this thread reported.
+        committed: committed || selfCommitted || boardChanged,
         ...(treeProven ? { verified: gates } : {}),
       };
     } catch (e) {

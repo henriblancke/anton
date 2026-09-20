@@ -135,6 +135,19 @@ export interface ReviewRun {
    * the section then falls back to the unspecific note it always gave.
    */
   boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /**
+   * The live board's repo path ({@link import("./steps/context").StepContext.repoPath}) — the same
+   * path a board-only IMPLEMENTER is told to point `bd -C` at (see
+   * {@link import("../claude/system-prompt").SystemPromptLayers.repoPath}), handed to the reviewer
+   * for the identical reason: `projectDir` above is this run's WORKTREE, which on a non-server Dolt
+   * board carries its own separate, unsynced beads copy with no remote to publish from. A reviewer
+   * whose only tool is a bare `bd show <id>` at that cwd reads that frozen, pre-delivery copy — never
+   * the board anton's own evidence check already confirmed the ticket changed and synced — and so can
+   * never confirm a board-only Acceptance criterion either way. Passed through so the reviewer is told
+   * explicitly to run `bd` against THIS path instead of relying on its cwd (see
+   * {@link boardEvidenceSection}). Absent for a caller that never resolved it (a direct test call).
+   */
+  repoPath?: string;
   /** `.product/principles.md` at the base revision, when the project has one. */
   principles?: string;
   /**
@@ -231,6 +244,8 @@ export async function buildReviewPrompt(args: {
   diff: BranchDiff;
   /** See {@link ReviewRun.boardEvidenceByTicket}. */
   boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /** See {@link ReviewRun.repoPath}. */
+  repoPath?: string;
   settings: ProjectSettings;
   /** The worktree under review. Its files are read at `baseRev`, never from the working tree. */
   projectDir: string;
@@ -271,6 +286,7 @@ export async function buildReviewPrompt(args: {
       verified: args.verified,
       gatesDiscarded: args.gatesDiscarded,
       boardEvidenceByTicket: args.boardEvidenceByTicket,
+      repoPath: args.repoPath,
     }),
   ].join("\n");
   return { prompt, reviewer };
@@ -508,7 +524,7 @@ export function reviewContext(run: ReviewRun): string {
   return [
     ...headerSection(run),
     ...beadsSection(run),
-    ...diffSection(run.diff, isBoardOnlyDelivery(run), run.tickets, run.boardEvidenceByTicket),
+    ...diffSection(run.diff, isBoardOnlyDelivery(run), run.tickets, run.boardEvidenceByTicket, run.repoPath),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
     ...previousBlockingClassSection(run.previousBlocking ?? []),
@@ -612,29 +628,63 @@ function truncatedContractNote(cut: boolean): string[] {
  * reaches `step:review` at all — `assertBoardOnlyDelivered` blocks or parks it before the run's
  * `step:commit`/`step:review` — so a labelled ticket that made it into this run's tickets already
  * had its evidence confirmed and synced.
+ *
+ * Takes the bare `target`/`tickets` pair rather than a whole {@link ReviewRun} so the review GATE
+ * (review-gate.ts) can reuse the identical rule to decide whether a fix session it is about to
+ * dispatch is repairing a board-only delivery too (PR #284 review round 12) — that caller has no
+ * diff, principles, or reviewer contract to build a `ReviewRun` from, only the same bead pair this
+ * check actually reads.
  */
-function isBoardOnlyDelivery(run: ReviewRun): boolean {
+export function isBoardOnlyDelivery(run: { target: Bead; tickets: Bead[] }): boolean {
   const units = run.tickets.length > 0 ? run.tickets : [run.target];
   return units.every((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
 }
 
 /**
  * WHICH beads a board-only run's confirmed evidence actually covers, one line per ticket (PR #284
- * review round 11). Falls back to nothing (the caller's surrounding prose still stands alone) when
- * this run predates the plumbing or no ticket's evidence carried ids this round — never a claim that
+ * review round 11), plus — when `repoPath` is given — how to read their CURRENT content (PR #284
+ * review round 12/13).
+ *
+ * The id list falls back to nothing (the caller's surrounding prose still stands alone) when this
+ * run predates the plumbing or no ticket's evidence carried ids this round — never a claim that
  * nothing changed, since the check upstream already refused a run with no evidence at all.
+ *
+ * The live-board instruction is independent of whether ids are known: `projectDir` throughout this
+ * module is this run's WORKTREE, and on a non-server Dolt board that worktree carries its own
+ * separate, unsynced beads copy (see {@link ReviewRun.repoPath}). Without an explicit `-C`, a
+ * reviewer's `bd show <id>` reads that frozen, pre-delivery copy regardless of whether this section
+ * could name the changed ids — so the instruction is worth giving even when the ids themselves are
+ * not, e.g. for the legacy shape where only the run target carries the `delivery:board` label.
  */
 function boardEvidenceSection(
   tickets: Bead[],
   boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
+  repoPath: string | undefined,
 ): string[] {
-  if (!boardEvidenceByTicket || boardEvidenceByTicket.size === 0) return [];
   const lines = tickets
-    .map((t) => ({ ticket: t, ids: boardEvidenceByTicket.get(t.id) }))
+    .map((t) => ({ ticket: t, ids: boardEvidenceByTicket?.get(t.id) }))
     .filter((e): e is { ticket: Bead; ids: string[] } => !!e.ids?.length)
     .map((e) => `- ${e.ticket.id}: ${e.ids.join(", ")}`);
-  if (lines.length === 0) return [];
-  return [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``];
+  if (lines.length === 0 && !repoPath) return [];
+  return [
+    ...(lines.length > 0 ? [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``] : []),
+    ...(repoPath
+      ? [
+          `This worktree's own \`bd\` reads a separate, unsynced copy of the board — the same reason a`,
+          `board-only implementer is told to point every \`bd\` write at the live path explicitly,`,
+          `rather than its cwd. Do the same to READ: check a bead's CURRENT field values against the`,
+          `live board, not this worktree's default \`bd\`, e.g.:`,
+          ``,
+          "```",
+          `bd -C ${repoPath} show <id>`,
+          "```",
+          ``,
+          `A plain \`bd show <id>\` here reports this worktree's frozen, pre-delivery copy — not usable`,
+          `evidence either way for whether Acceptance was met.`,
+          ``,
+        ]
+      : []),
+  ];
 }
 
 function diffSection(
@@ -642,6 +692,7 @@ function diffSection(
   boardOnlyDelivery: boolean,
   tickets: Bead[],
   boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
+  repoPath: string | undefined,
 ): string[] {
   if (diff.files.length === 0) {
     if (boardOnlyDelivery) {
@@ -655,7 +706,7 @@ function diffSection(
         `before this review ran — a zero-diff run is not, by itself, evidence of nothing delivered`,
         `here.`,
         ``,
-        ...boardEvidenceSection(tickets, boardEvidenceByTicket),
+        ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath),
         `Judge the Acceptance criteria above against that confirmed board delivery instead of a code`,
         `diff; there is deliberately none to read. If Acceptance names a specific bead or field, check`,
         `it against the ids and beads named above (or their absence) rather than taking "the gate`,
@@ -689,7 +740,7 @@ function diffSection(
     // CONFIRMED board-only delivery, so surfacing it here is never a false claim, and omitting it
     // just because the diff happens to be nonempty would leave the reviewer with only the unrelated
     // patch and no way to check Acceptance against the bd writes that were the actual deliverable.
-    ...boardEvidenceSection(tickets, boardEvidenceByTicket),
+    ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath),
     ...deletionsBlock(diff),
   ];
 }
@@ -1151,8 +1202,18 @@ export async function buildFindingsFixPrompt(args: {
   projectDir: string;
   round: number;
   maxRounds: number;
+  /**
+   * Set when EVERY ticket in this run is labelled `delivery:board` ({@link isBoardOnlyDelivery}) —
+   * this fix session's findings are then almost certainly about the board delivery itself, since the
+   * run's diff is empty by design. Carried so the fixer is told its outcome-reporting rule differs
+   * from an ordinary fix (PR #284 review round 12): an unchanged tree here is not "no progress", and
+   * the gate's own stall check reads the board, not the diff, for exactly this run.
+   */
+  boardOnly?: boolean;
+  /** See {@link ReviewRun.repoPath} — only meaningful when {@link boardOnly} is set. */
+  repoPath?: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string }> {
-  const { target, findings, settings, projectDir, round, maxRounds } = args;
+  const { target, findings, settings, projectDir, round, maxRounds, boardOnly, repoPath } = args;
 
   const appendSystemPrompt = await buildExecutionSystemPrompt({
     agentPrompt: await loadAgentPrompt(labelValue(target.labels, "agent"), { projectDir }),
@@ -1182,6 +1243,29 @@ export async function buildFindingsFixPrompt(args: {
     `  in your final message, with the reason. Do NOT make a token change to look responsive: unresolved`,
     `  findings are surfaced to a human, which is the correct outcome for a bad finding.`,
     `- Do not commit, push, or open a PR — anton commits what you change.`,
+    ...(boardOnly
+      ? [
+          ``,
+          `### This run is board-only`,
+          ``,
+          `Every ticket in this run is labelled \`delivery:board\`: its deliverable is \`bd\` writes, not`,
+          `a code change, so the finding(s) above are almost certainly about the board delivery itself`,
+          `rather than this (empty) diff. Fix them there. An unchanged git tree when you finish is`,
+          `expected and is NOT evidence you made no progress — anton checks this round's outcome`,
+          `against the board, not the diff.`,
+          ...(repoPath
+            ? [
+                ``,
+                `Run every \`bd\` write against the live board, not this worktree's own separate, unsynced`,
+                `copy — pass \`bd\`'s own directory flag rather than relying on your cwd, e.g.:`,
+                ``,
+                "```",
+                `bd -C ${repoPath} update <id> --status done`,
+                "```",
+              ]
+            : []),
+        ]
+      : []),
   ].join("\n");
 
   return { prompt, appendSystemPrompt };

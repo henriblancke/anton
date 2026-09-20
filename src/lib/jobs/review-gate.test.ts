@@ -546,6 +546,90 @@ describe("runReviewGate — bounds", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it(
+    "treats a board-only fixer's bd write as progress, not a stall (PR #284 review round 13) — " +
+      "the fix leaves no git diff by design, so only the board's own before/after tells them apart",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      // First read is the pre-fix baseline; the second (post-fix) reports the bead changed.
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }), // board-only: nothing ever staged
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      });
+
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
+      expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "still stalls a board-only fix that changed neither the tree nor the board — a genuinely " +
+      "declined or no-op fix must not be read as progress just because the run is board-only",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      // Same fingerprint every read: nothing on the board moved either.
+      const readBoardFingerprint = async () => ({ beads: new Map([[boardOnlyTicket.id, "unchanged"]]) });
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "every finding is wrong; left as-is"]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      });
+
+      expect(out.outcome).toBe("stalled");
+      expect(out.rounds[0].fixCommitted).toBe(false);
+      expect(calls).toHaveLength(2); // no confirming review dispatched on a stall
+    },
+  );
+
   it("never passes a protocol violation as a clean review, and dispatches no fix for it", async () => {
     const { result, calls } = gate(["I read everything and it looks fine."], { reviewMaxRounds: 3 });
     const out = await result;
