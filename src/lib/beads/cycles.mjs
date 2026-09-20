@@ -11,7 +11,8 @@ export function parseDepCycles(raw) {
     if (typeof node === "string") return [node];
     if (Array.isArray(node)) return node.flatMap(idsOf);
     if (!node || typeof node !== "object") return [];
-    const named = node.cycle ?? node.path ?? node.ids ?? node.issue_ids ?? node.issues ?? node.nodes;
+    const named =
+      node.cycle ?? node.path ?? node.ids ?? node.issue_ids ?? node.issues ?? node.nodes ?? node.members;
     if (named !== undefined) return idsOf(named);
     const id = typeof node.id === "string" ? node.id : typeof node.issue_id === "string" ? node.issue_id : undefined;
     return id ? [id] : [];

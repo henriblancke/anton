@@ -120,10 +120,13 @@ export interface OrphanBead {
  * `raw` is carried deliberately. bd REFUSES to create a blocking cycle at every write path there is
  * — `dep add` (with and without `--no-cycle-check`), `link`, `batch`, and `import` (which skips the
  * offending edge) all reject it, measured on 1.1.0 and 1.1.2 — so a populated cycle list can only
- * come from a merge or a corrupted graph, and the EMPTY shape (`[]`) is the only one obtainable to
- * pin a parse against. Rather than guess, {@link parseDepCycles} extracts ids from the encodings bd
- * plausibly uses and hands the untouched element through as `raw`, so a report can always render
- * something truthful even if `ids` comes back empty.
+ * come from a merge or a corrupted graph, and the EMPTY shape (`[]`) is the only one obtainable
+ * from a live `bd` to pin a parse against. The populated shape is confirmed instead against bd's own
+ * source (`issueops.Cycle{Members []CycleMember \`json:"members"\`, Partial bool}`, output bare via
+ * `outputJSON(report.Cycles)`) rather than guessed — {@link parseDepCycles} reads the `members` key
+ * alongside the other encodings bd's CLI help and older exports have used, and hands the untouched
+ * element through as `raw`, so a report can always render something truthful even if `ids` comes
+ * back empty for a shape bd changes to next.
  */
 export interface DepCycle {
   /** The bead ids on the cycle, best-effort — may be empty if bd's element shape is unrecognised. */
