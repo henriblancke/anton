@@ -1101,6 +1101,17 @@ export async function clearBoardEvidencePending(
           .then((outcome) => outcome === "synced" || outcome === "shared-server")
           .catch(() => false)
       : false;
+    if (obligationCleared && !obligationSynced) {
+      // The clear landed locally but the confirming push could not verify it reached the remote
+      // (chatgpt-codex-connector, PR #284 review, "Re-persist the obligation when its clear cannot
+      // sync"). Throwing without restoring it here would leave the LOCAL db with no obligation
+      // while the remote may still carry it: a same-machine resume reads the locally-cleared state
+      // and skips retrying, so only the remote obligation survives for a later machine to
+      // rediscover and union its ids into an unrelated reopened delivery. Re-persisting it locally
+      // (mirrors `clearBoardEvidencePending`'s own `!cleared || !synced` branch above) keeps a
+      // same-machine resume retrying the sync until it actually lands.
+      await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids));
+    }
     if (!obligationCleared || !obligationSynced) {
       throw new PoisonEpic(
         `${ticketId} delivered and closed, but the cleanup-sync retry obligation could not be ` +

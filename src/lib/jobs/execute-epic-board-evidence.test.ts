@@ -1216,6 +1216,27 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "re-persists the obligation locally before throwing when its own clear lands but the " +
+      "confirming push cannot verify it reached the remote (chatgpt-codex-connector, PR #284 " +
+      "review, \"Re-persist the obligation when its clear cannot sync\") — otherwise a " +
+      "same-machine resume reads the locally-cleared state as nothing left to retry, while the " +
+      "remote may still carry the obligation for a later machine to rediscover and union its ids " +
+      "into an unrelated reopened delivery",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(
+        clearBoardEvidencePending("/repo", bead("t-cleanup-resync-obligation"), ["a"], false, true),
+      ).rejects.toThrow(/t-cleanup-resync-obligation/);
+      expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-cleanup-resync-obligation",
+        ["a"],
+      );
+    },
+  );
+
+  it(
     "throws again, without releasing the obligation, when a resumed cleanup-only retry's push " +
       "still cannot confirm (PR #284 review)",
     async () => {
