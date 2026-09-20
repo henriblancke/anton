@@ -193,6 +193,47 @@ process.exit(r.status ?? 1);
 }
 
 /**
+ * A git shim mixing causes across attempts (anton-ttlxp review round 2): `push` #1 fails with an
+ * ordinary transient cause (a DNS blip, no `retry` override), `push` #2 is killed by a signal, and
+ * every push after that succeeds for real. Proves the retry cap the signal kill computes is relative
+ * to the attempt IT first fires on, not to attempt 1 — an absolute cap would let the DNS blip's
+ * default 3-attempt budget starve the kill's own guaranteed retry on attempt 2.
+ */
+function shimGitTransientThenSignalKilled(sandboxDir: string, counterFile: string): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "transient-then-kill-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counter=${JSON.stringify(counterFile)};
+if(a.includes('push')){
+  let n=0;
+  try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch{}
+  n+=1;
+  fs.writeFileSync(counter,String(n));
+  if(n===1){
+    process.stderr.write("fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid\\n");
+    process.exit(128);
+  }
+  if(n===2){
+    process.stderr.write("PASS tests/unit/thing.test.ts\\nPASS tests/unit/other.test.ts\\n");
+    process.kill(process.pid,'SIGKILL');
+    require('node:child_process').spawnSync(process.execPath,['-e','setTimeout(()=>{},5000)']);
+  }
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
  * A git shim reproducing the OTHER external-kill shape (anton-ttlxp #305 review): a signal that
  * kills only the immediate `git` process while a survivor it already spawned — standing in for a
  * pre-push hook or one of its workers — lives on, unreaped, as a member of the same (detached)
@@ -223,6 +264,51 @@ if(a.includes('push')){
     fs.writeFileSync(${JSON.stringify(startedFile)},'');
     setInterval(()=>{},1000);
   \`],{stdio:'ignore'});
+  survivor.unref();
+  const started=${JSON.stringify(startedFile)};
+  const deadline=Date.now()+10000;
+  const poll=()=>{
+    if(fs.existsSync(started)){process.kill(process.pid,'SIGTERM');return;}
+    if(Date.now()>deadline){process.exit(1);return;}
+    setTimeout(poll,20);
+  };
+  poll();
+  return;
+}
+process.exit(0);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * The survivor shape {@link shimGitOrphaningSurvivorOnSignal} does NOT cover (P1 finding, #305
+ * review round 2): a real pre-push hook (or a worker it spawns) normally INHERITS the stdout/stderr
+ * pipe `git` was given, rather than opting out with its own `stdio: 'ignore'`. Node's `close` event
+ * waits for every holder of those pipes to let go, so with an inheriting survivor `close` never
+ * fires while it lives — proving the reap must start from `exit` instead.
+ */
+function shimGitOrphaningInheritingSurvivorOnSignal(
+  sandboxDir: string,
+  startedFile: string,
+  markerFile: string,
+): string {
+  const binDir = join(sandboxDir, "inherit-orphan-shim-bin");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawn}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+if(a.includes('push')){
+  const survivor=spawn(process.execPath,['-e',\`
+    const fs=require('node:fs');
+    process.on('SIGTERM',()=>{fs.writeFileSync(${JSON.stringify(markerFile)},'');process.exit(0)});
+    fs.writeFileSync(${JSON.stringify(startedFile)},'');
+    setInterval(()=>{},1000);
+  \`],{stdio:'inherit'});
   survivor.unref();
   const started=${JSON.stringify(startedFile)};
   const deadline=Date.now()+10000;
@@ -4588,6 +4674,25 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
       },
     );
 
+    // Review round 2: the kill's guaranteed retry must survive an ordinary transient cause landing
+    // FIRST. `SIGNAL_KILL_RETRY.maxAttempts` is written as "this cause gets 2 tries", relative to
+    // whichever attempt it first fires on — an absolute total-attempts cap silently drops the kill's
+    // own retry whenever something else already spent the earlier attempt.
+    it.runIf(process.platform !== "win32")(
+      "still spends the kill's guaranteed retry when an ordinary transient failure came first",
+      async () => {
+        const counter = join(sandbox, "transient-then-kill.log");
+        process.env.PATH = `${shimGitTransientThenSignalKilled(sandbox, counter)}:${prevPath}`;
+
+        await pushBranch(repo, "main");
+
+        // Three pushes: the DNS-blip attempt, the killed attempt, and the retry the kill is owed.
+        // Before the fix, attempt 2's kill computed an absolute cap of 2 total attempts — already
+        // spent by attempt 1's DNS blip — and threw immediately, stopping at 2.
+        expect(Number(readFileSync(counter, "utf8").trim())).toBe(3);
+      },
+    );
+
     it.runIf(process.platform !== "win32")(
       "stops at 2 attempts when killed every time — a pre-push test suite is never paid for 3 times",
       async () => {
@@ -4639,6 +4744,32 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
         // The shim signals only ITSELF, never the survivor directly — the survivor writes its
         // marker only upon receiving TERM, so seeing it here proves reapCommitGroup's group-wide
         // signal (not the shim's own self-kill) is what reached the orphaned survivor.
+        expect(existsSync(marker)).toBe(true);
+      },
+    );
+
+    // P1 finding, #305 review round 2: a survivor that INHERITS the push's stdio (the common real
+    // shape a pre-push hook takes, unlike the opted-out `stdio: 'ignore'` shim above) holds `close`
+    // open indefinitely. Reaping must start from `exit` instead, or this never resolves until the
+    // (much later, and misreported as a timeout) budget expiry.
+    it.runIf(process.platform !== "win32")(
+      "reaps an inheriting survivor promptly instead of waiting out the budget for `close`",
+      async () => {
+        const started = join(sandbox, "inherit-orphan-started");
+        const marker = join(sandbox, "inherit-orphan-marker");
+        process.env.PATH = `${shimGitOrphaningInheritingSurvivorOnSignal(sandbox, started, marker)}:${prevPath}`;
+
+        const budgetMs = 8_000;
+        const start = Date.now();
+        const failure = await pushBranch(repo, "main", undefined, budgetMs).catch((e: unknown) => e);
+        const elapsedMs = Date.now() - start;
+
+        expect(failure).toBeInstanceOf(Error);
+        // Settled from the `exit`-triggered reap, nowhere near the budget: falling back to `close`
+        // (which the inheriting survivor holds open) would only resolve at the budget expiry itself.
+        expect(elapsedMs).toBeLessThan(budgetMs - 2_000);
+        expect((failure as Error).message).toMatch(/outside anton/);
+        expect((failure as Error).message).not.toMatch(/timed out/);
         expect(existsSync(marker)).toBe(true);
       },
     );

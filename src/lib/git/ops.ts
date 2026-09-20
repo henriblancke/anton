@@ -1549,24 +1549,26 @@ function gitPush(
     // `signal` IS bound (anton-ttlxp): on a death by signal `code` is null and the second argument
     // holds the only record of what killed it. Dropped, an OOM-killed pre-push hook reported as
     // "exit null" alongside its passing-test stderr reads as the project's tests being broken.
+    //
+    // The signal-kill reap starts from `exit`, not `close` (P1, #305 review round 2): a surviving
+    // pre-push hook or worker normally INHERITS the pipes `stdio: ["ignore", "pipe", "pipe"]` gave
+    // `git`, so `close` — which waits for every holder of those pipes to let go — never fires while
+    // the survivor is alive. Reaping is what would kill it, so gating the reap on `close` deadlocks:
+    // nothing happens until the (much later) budget timer, and that failure is misreported as a
+    // plain timeout rather than the signal kill it was. `exit` fires the moment `git` itself dies,
+    // independent of who else still holds its stdio.
+    child.on("exit", (code, killedBy) => {
+      if (killing || settled || code !== null) return;
+      killing = true;
+      void reapCommitGroup(child).then(() =>
+        settle(() => reject(pushFailed(args, code, killedBy, stderr(), stdout()))),
+      );
+    });
     child.on("close", (code, killedBy) => {
-      // A kill in flight owns the verdict: its group may still hold live writers. Both anton-owned
-      // kills (budget expiry, abort) return here, which is why the code-null branch downstream can
-      // only ever describe a kill from OUTSIDE anton.
+      // A kill in flight owns the verdict: its group may still hold live writers. Every kill path —
+      // budget expiry, abort, and the signal-kill reap started from `exit` above — sets `killing`
+      // before this fires, so only a clean run (a real exit code) ever reaches here.
       if (killing) return;
-      if (code === null) {
-        // The signal killed `git` alone — a pre-push hook, or a worker it spawned, can still be
-        // alive in the group. Unlike the timeout/abort paths above, nothing has reaped it yet
-        // (#305 review): if the survivor has already closed or redirected the pipes it inherited,
-        // `close` fires immediately, and retrying without reaping first launches a second hook
-        // while the first is still consuming memory or writing files — worsening the exact
-        // OOM pressure a signal kill usually means.
-        killing = true;
-        void reapCommitGroup(child).then(() =>
-          settle(() => reject(pushFailed(args, code, killedBy, stderr(), stdout()))),
-        );
-        return;
-      }
       settle(() =>
         code === 0 ? resolvePromise() : reject(pushFailed(args, code, killedBy, stderr(), stdout())),
       );
@@ -1872,8 +1874,13 @@ export async function pushBranch(
     } catch (error) {
       const verdict = classifyPushError(error);
       if (verdict?.transient) {
-        // A cause-specific shape only ever TIGHTENS the budget, never extends it past the global cap.
-        maxAttempts = Math.min(maxAttempts, verdict.retry?.maxAttempts ?? PUSH_MAX_ATTEMPTS);
+        // A cause-specific shape only ever TIGHTENS the budget, never extends it past the global cap
+        // — but the tightening is relative to the ATTEMPT the cause first surfaces on, not an
+        // absolute total (review round 2): `retry.maxAttempts` is written as "this cause gets N
+        // tries", so computing the cap from attempt 1 shortchanges a cause that first appears on a
+        // later attempt — an ordinary transient failure ahead of a signal kill would otherwise eat
+        // the one retry `SIGNAL_KILL_RETRY` guarantees it.
+        maxAttempts = Math.min(maxAttempts, attempt + (verdict.retry?.maxAttempts ?? PUSH_MAX_ATTEMPTS) - 1);
         backoffMs =
           verdict.retry?.backoffMs ??
           PUSH_RETRY_BACKOFF_MS[Math.min(attempt - 1, PUSH_RETRY_BACKOFF_MS.length - 1)];
