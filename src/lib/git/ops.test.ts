@@ -2507,7 +2507,7 @@ suite("resolveFreshBase (real git)", () => {
     rmSync(sandbox, { recursive: true, force: true });
   });
 
-  it("fetches and returns origin/<base> when origin is ahead", async () => {
+  it("fetches and returns origin/<base>, authoritative, when origin is ahead", async () => {
     // Advance origin/main via a second clone so the local repo's remote-tracking ref is stale.
     const other = join(sandbox, "other");
     execFileSync("git", ["clone", "-q", bare, other], { stdio: "ignore" });
@@ -2520,34 +2520,48 @@ suite("resolveFreshBase (real git)", () => {
 
     const aheadTip = execFileSync("git", ["-C", bare, "rev-parse", "main"]).toString().trim();
 
-    const ref = await resolveFreshBase(repo, "main");
-    expect(ref).toBe("origin/main");
+    const result = await resolveFreshBase(repo, "main");
+    expect(result).toEqual({ ref: "origin/main", baseIsAuthoritative: true });
     // The fetch updated the remote-tracking ref to origin's new tip.
     const tracked = execFileSync("git", ["-C", repo, "rev-parse", "origin/main"]).toString().trim();
     expect(tracked).toBe(aheadTip);
   });
 
-  it("logs a warning and falls back to local <base> when the fetch fails", async () => {
+  it("logs a warning and falls back to a NON-authoritative local <base> when the fetch fails", async () => {
     // Break the remote URL so `git fetch origin` fails, but hasRemote() still reports a remote.
     g(repo, ["remote", "set-url", "origin", join(sandbox, "does-not-exist.git")]);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const ref = await resolveFreshBase(repo, "main");
+    const result = await resolveFreshBase(repo, "main");
 
-    expect(ref).toBe("main");
+    expect(result).toEqual({ ref: "main", baseIsAuthoritative: false });
     expect(warn).toHaveBeenCalledOnce();
     expect(String(warn.mock.calls[0]?.[0])).toContain("origin/main");
   });
 
-  it("returns local <base> without fetching when there is no origin remote", async () => {
+  it("returns an AUTHORITATIVE local <base> without fetching when there is no origin remote", async () => {
     g(repo, ["remote", "remove", "origin"]);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-    const ref = await resolveFreshBase(repo, "main");
+    const result = await resolveFreshBase(repo, "main");
 
-    expect(ref).toBe("main");
+    expect(result).toEqual({ ref: "main", baseIsAuthoritative: true });
     // No remote → no fetch attempt → no warning.
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a NON-authoritative local <base>, without crashing, when even probing for a remote fails operationally (PR #279 review, P1)", async () => {
+    // A confirmed "No such remote" is the ONLY shape that resolves to authoritative-local; anything
+    // else `git remote get-url` throws (a corrupt config here) must be treated as indeterminate, not
+    // folded into the same answer a genuinely remote-less repo gets.
+    writeFileSync(join(repo, ".git", "config"), "this is not valid git config\n[[[", { flag: "a" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await resolveFreshBase(repo, "main");
+
+    expect(result).toEqual({ ref: "main", baseIsAuthoritative: false });
+    // Warns once for the failed probe and again for the (also-failing) fetch attempt.
+    expect(warn.mock.calls.length).toBeGreaterThanOrEqual(1);
   });
 });
 

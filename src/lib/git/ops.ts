@@ -1519,12 +1519,32 @@ export async function branchSatisfiesTicket(
   return claims.find((c) => c.ticketIds.includes(ticketId));
 }
 
+/**
+ * Whether git's rejection of `remote get-url <name>` is its own CONFIRMED answer that no such
+ * remote is configured (exit 2, "No such remote '<name>'" — stable since long before this project
+ * existed) rather than an operational failure that merely prevented the probe from completing.
+ */
+function isNoSuchRemoteError(error: unknown, name: string): boolean {
+  if (!exitedWith(error, 2)) return false;
+  const stderr = (error as { stderr?: unknown } | null)?.stderr;
+  return typeof stderr === "string" && stderr.includes(`No such remote '${name}'`);
+}
+
+/**
+ * Whether `repoPath` has a remote named `name` — confirmed, never guessed. Only git's own
+ * "No such remote" exit is folded into `false`; anything else (permission error, corrupt config,
+ * a git binary that failed to run at all) is rethrown rather than swallowed into the same `false`
+ * (PR #279 review, P1) — a caller that can't tell "confirmed absent" from "the probe itself broke"
+ * risks treating a merely-unlucky check as proof there's no remote to be stale relative to. See
+ * {@link resolveFreshBase}, the caller this distinction protects.
+ */
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
   try {
     await git(repoPath, ["remote", "get-url", name]);
     return true;
-  } catch {
-    return false;
+  } catch (e) {
+    if (isNoSuchRemoteError(e, name)) return false;
+    throw e;
   }
 }
 
@@ -1871,17 +1891,50 @@ export async function fetchOrigin(repoPath: string, refs: string[] = []): Promis
   await serializeFetch(repoPath, () => git(repoPath, ["fetch", "origin", ...refs]));
 }
 
+/** {@link resolveFreshBase}'s result: the ref to branch off, and whether it's authoritative truth. */
+export interface FreshBase {
+  /** `"origin/<base>"` on a confirmed fetch, otherwise the plain local `<base>`. */
+  ref: string;
+  /**
+   * Whether `ref` is authoritative truth rather than a possibly-stale reading — true for a
+   * CONFIRMED fetch of `origin/<base>` and for a repo with no `origin` remote at all (there is
+   * nothing else for the local branch to be stale relative to). False for the remaining fallback
+   * shape: a repo that has (or might have — see below) an origin whose fetch just failed. See
+   * `refreshOntoBase`'s own `baseIsAuthoritative` doc comment for why callers need this distinction
+   * rather than re-deriving it themselves.
+   */
+  baseIsAuthoritative: boolean;
+}
+
 /**
  * Resolve the freshest usable base ref for a new worktree (anton-l0h). Fetches `origin/<base>` and
  * returns `"origin/<base>"` so the job layer can branch off the remote tip. Best-effort: if the
  * repo has no `origin` remote, or the fetch fails (offline, auth, deleted ref), it logs loudly and
  * falls back to the local `<base>` so a run is never blocked on network access. Only updates the
  * remote-tracking ref — no local branch is mutated.
+ *
+ * Returns {@link FreshBase} rather than a bare string so a caller never has to re-probe
+ * {@link hasRemote} itself to learn whether the fallback is authoritative (PR #279 review, P1):
+ * a caller's OWN second call to `hasRemote` can fail for an operational reason unrelated to
+ * whether `origin` exists — a transient error `hasRemote` swallows into the same `false` it
+ * returns for a confirmed-absent remote — and a caller treating that `false` as "no remote"
+ * would wrongly mark a stale local fallback authoritative. Calling `hasRemote` exactly once here
+ * and carrying its answer out removes that second, redundant probe entirely.
  */
-export async function resolveFreshBase(repoPath: string, base: string): Promise<string> {
-  if (!(await hasRemote(repoPath))) {
-    // No origin (e.g. a local-only repo) — nothing to fetch; branch off the local base.
-    return base;
+export async function resolveFreshBase(repoPath: string, base: string): Promise<FreshBase> {
+  let remotePresent: boolean | undefined;
+  try {
+    remotePresent = await hasRemote(repoPath);
+  } catch (e) {
+    // The probe itself failed operationally (not a confirmed "no such remote") — indeterminate,
+    // never "confirmed absent". Fall through to the fetch attempt below, which surfaces the same
+    // underlying problem and lands in the non-authoritative fallback rather than the authoritative
+    // no-remote one.
+    console.warn(`[git] probing ${repoPath} for an "origin" remote failed`, e);
+  }
+  if (remotePresent === false) {
+    // Confirmed no origin (e.g. a local-only repo) — nothing to fetch; branch off the local base.
+    return { ref: base, baseIsAuthoritative: true };
   }
   const trackingRef = `refs/remotes/origin/${base}`;
   try {
@@ -1892,13 +1945,13 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
     await fetchOrigin(repoPath, [`+refs/heads/${base}:${trackingRef}`]);
     // Confirm the ref actually resolves before branching a run off it (throws → fall back).
     await git(repoPath, ["rev-parse", "--verify", "--quiet", trackingRef]);
-    return `origin/${base}`;
+    return { ref: `origin/${base}`, baseIsAuthoritative: true };
   } catch (e) {
     console.warn(
       `[git] fetch of origin/${base} in ${repoPath} failed; falling back to local ${base}`,
       e,
     );
-    return base;
+    return { ref: base, baseIsAuthoritative: false };
   }
 }
 

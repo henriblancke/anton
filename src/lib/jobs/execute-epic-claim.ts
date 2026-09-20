@@ -12,7 +12,7 @@ import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { latestBlockNoteCommit } from "../beads/block-note";
 import { parseTicketNotes } from "../beads/notes";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
-import { commitParentShas, hasRemote, isAncestor, resolveCommitSha, resolveForkPoint, resolveFreshBase } from "../git/ops";
+import { commitParentShas, isAncestor, resolveCommitSha, resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
   createWorktree,
@@ -159,7 +159,6 @@ export async function warmRunWorktree(
   const baseBranch = settings.baseBranch ?? project.defaultBranch;
   // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
   // the remote-tracking ref is the accurate fork point even when the local base has drifted.
-  const freshBase = await resolveFreshBase(repo, baseBranch);
   // `resolveFreshBase` returns `origin/<baseBranch>` only once it has fetched AND verified that ref
   // (anton-nyz1v, PR #279 review, fifth round) — anything else falls back to the plain local
   // `<baseBranch>` name instead, but that fallback covers two shapes `refreshOntoBase` must NOT
@@ -171,7 +170,14 @@ export async function warmRunWorktree(
   // as authoritative as a confirmed fetch reporting the same shape from a remote would be; treating
   // it as a stale fallback would let the branch's eventual diff silently reintroduce whatever the
   // rewind dropped. See `baseIsAuthoritative`'s own doc comment on `refreshOntoBase`.
-  const baseIsAuthoritative = freshBase === `origin/${baseBranch}` || !(await hasRemote(repo));
+  //
+  // `baseIsAuthoritative` comes straight from `resolveFreshBase` rather than a second `hasRemote`
+  // probe here (PR #279 review, P1): a redundant re-probe can fail for an operational reason that
+  // has nothing to do with whether `origin` exists, and `hasRemote` folding that into the same
+  // `false` it returns for a confirmed-absent remote would wrongly mark a stale local fallback
+  // authoritative. `resolveFreshBase` already made this determination once, from its own single
+  // `hasRemote` call; carrying it out here removes the second probe entirely.
+  const { ref: freshBase, baseIsAuthoritative } = await resolveFreshBase(repo, baseBranch);
   // Claim the checkout for the whole run (anton-hrun.1). The claim's `git worktree lock` is the
   // ONLY evidence a second anton process over this repository has that the directory is in use:
   // its teardown and its sweep judge residue from their own run rows and the board, which say

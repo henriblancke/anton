@@ -37,7 +37,6 @@ vi.mock("../git/worktree", async () => {
 const resolveFreshBaseMock = vi.fn();
 const resolveForkPointMock = vi.fn();
 const isAncestorMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
-const hasRemoteMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 const resolveCommitShaMock = vi.fn<(...a: unknown[]) => Promise<string>>();
 const commitParentShasMock = vi.fn<(...a: unknown[]) => Promise<string[]>>();
 vi.mock("../git/ops", async () => {
@@ -47,7 +46,6 @@ vi.mock("../git/ops", async () => {
     resolveFreshBase: (...a: unknown[]) => resolveFreshBaseMock(...a),
     resolveForkPoint: (...a: unknown[]) => resolveForkPointMock(...a),
     isAncestor: (...a: unknown[]) => isAncestorMock(...a),
-    hasRemote: (...a: unknown[]) => hasRemoteMock(...a),
     resolveCommitSha: (...a: unknown[]) => resolveCommitShaMock(...a),
     commitParentShas: (...a: unknown[]) => commitParentShasMock(...a),
   };
@@ -114,13 +112,12 @@ beforeEach(async () => {
   getRunBaseForkShaMock.mockReset().mockImplementation(actualRuns.getRunBaseForkSha);
   findRunBaseForkShaForBranchMock.mockReset().mockImplementation(actualRuns.findRunBaseForkShaForBranch);
   updateRunMock.mockReset().mockImplementation(actualRuns.updateRun);
-  resolveFreshBaseMock.mockReset().mockResolvedValue(FRESH_BASE);
+  resolveFreshBaseMock.mockReset().mockResolvedValue({ ref: FRESH_BASE, baseIsAuthoritative: true });
   resolveForkPointMock.mockReset().mockResolvedValue("f0f0f0forkcommit");
   // Ordinary forward motion by default — the freshly-resolved base still descends from whatever
   // fallback base an already-shipped claim would be checked against (PR #279 review). The one test
   // that means to exercise a rewritten-behind fallback overrides this itself.
   isAncestorMock.mockReset().mockResolvedValue(true);
-  hasRemoteMock.mockReset().mockResolvedValue(true);
   resolveCommitShaMock.mockReset();
   commitParentShasMock.mockReset();
 });
@@ -138,9 +135,10 @@ it("pins the fork commit against the freshly-fetched base on a first creation", 
 it("marks the base authoritative when the repo has no origin remote, even though resolveFreshBase falls back to the local branch name (PR #279 review, sixth round)", async () => {
   // No origin at all — resolveFreshBase's fallback here isn't a possibly-stale fetch failure, it's
   // the ONLY source of truth this repo has, so a rewind behind the branch's fork point must be
-  // treated as authoritative rather than lumped in with the failed-fetch case.
-  resolveFreshBaseMock.mockResolvedValue("main");
-  hasRemoteMock.mockResolvedValue(false);
+  // treated as authoritative rather than lumped in with the failed-fetch case. `resolveFreshBase`
+  // itself is what decides this now (PR #279 review, P1) — the caller no longer re-probes
+  // `hasRemote` on its own to derive it.
+  resolveFreshBaseMock.mockResolvedValue({ ref: "main", baseIsAuthoritative: true });
 
   await warmRunWorktree(makeRun());
 
@@ -150,8 +148,7 @@ it("marks the base authoritative when the repo has no origin remote, even though
 });
 
 it("leaves the base non-authoritative when origin exists but the fetch just failed", async () => {
-  resolveFreshBaseMock.mockResolvedValue("main");
-  hasRemoteMock.mockResolvedValue(true);
+  resolveFreshBaseMock.mockResolvedValue({ ref: "main", baseIsAuthoritative: false });
 
   await warmRunWorktree(makeRun());
 
