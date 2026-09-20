@@ -18,6 +18,7 @@ import {
   createWorktree,
   releaseWorktreeClaim,
   removeWorktree,
+  warmWorktreeBestEffort,
   type Worktree,
 } from "../git/worktree";
 import { resolveOperator } from "../operator";
@@ -132,11 +133,13 @@ export async function warmRunWorktree(
     repoPath: repo,
     branch,
     baseBranch: freshBase,
-    warm: true,
+    // Warmed explicitly below, AFTER the refresh boundary this call may just have rebased/merged
+    // the branch onto is safely persisted (anton-s55u, PR #279 review, P1) — warming can run for
+    // minutes, and a process killed mid-warm must not leave a mutated branch with nothing recording
+    // what it was refreshed onto, or a resume after the crash re-derives a boundary against a base
+    // that may have moved again since, risking the same resurrected-commit bug the pin prevents.
+    warm: false,
     claimedBy: worktreeClaim,
-    // A cold install can run for minutes; without the job's signal an operator's kill would wait
-    // it out, holding the run's concurrency slot the whole time.
-    signal: ctx.signal,
     // anton-s55u: a resumed run must implement against the tree it will merge into, not whatever
     // base a parked or failed prior attempt cut this branch from. Safe here specifically: this
     // branch tracks `baseBranch` by construction (unlike review-fix's PR branches, which diverge
@@ -252,6 +255,11 @@ export async function warmRunWorktree(
     }
     throw error;
   }
+  // Deferred from `createWorktree` itself (`warm: false` above) until now, once the refresh boundary
+  // it may have just rebased/merged the branch onto is safely on the run row (anton-s55u, PR #279
+  // review, P1) — this call is the only thing left that can run for minutes, and its own signal lets
+  // an operator's kill interrupt it without holding the run's concurrency slot for the full timeout.
+  await warmWorktreeBestEffort(worktree, ctx.signal);
   await ctx.heartbeat();
 
   // What an `already-shipped` claim is checked against (PR #279 review). `baseForkSha` above is

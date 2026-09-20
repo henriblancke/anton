@@ -288,7 +288,13 @@ suite("worktree manager (real git)", () => {
 
       const log = vi.spyOn(console, "log").mockImplementation(() => {});
       try {
-        const second = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true });
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          forkSha: first.forkSha,
+        });
 
         expect(second.path).toBe(first.path);
         // The unique commit survived, now sitting on top of the fresh base — not lost, not reset.
@@ -306,6 +312,24 @@ suite("worktree manager (real git)", () => {
       } finally {
         log.mockRestore();
       }
+    });
+
+    // anton-s55u (PR #279 review, P1): a legacy reused checkout with no recorded `baseForkSha`
+    // reaches the rebase fallback with `forkSha` undefined. Without a pin, a plain `git rebase
+    // <base>` can't be told apart from the rewritten-base shape the `--onto` test above guards —
+    // so it must refuse rather than guess and risk resurrecting a dropped base commit.
+    it("refuses to rebase a divergent reused branch that has no trustworthy fork-point pin", async () => {
+      const branch = "anton/refresh-no-pin";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+
+      advanceDefaultBranch("no-pin-base.txt", "advance 3\n", "advance main (no pin)");
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/no trustworthy fork-point pin/);
     });
 
     // anton-s55u (PR #279 review): the plain one-argument `git rebase <base>` above replays
@@ -772,7 +796,13 @@ suite("worktree manager (real git)", () => {
       advanceDefaultBranch("README.md", "main's conflicting edit\n", "advance main (conflict)");
 
       await expect(
-        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+        createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          forkSha: first.forkSha,
+        }),
       ).rejects.toThrow(/diverges from .* could not be rebased/);
 
       // The branch's commit is intact — never reset or discarded — and the rebase left no residue.

@@ -818,21 +818,32 @@ async function refreshOntoBase(opts: {
     }
   }
 
-  // The plain one-argument form below replays `merge-base(baseSha, branch)..branch` — the branch's
-  // own fork point only while `baseBranch` still contains it. Once `baseBranch` has been rewritten
-  // past an older shared ancestor, that merge-base lands before the real fork and the plain form
-  // would replay ORIGINAL base commits alongside the branch's own work, resurrecting them into the
-  // rebased branch (PR #279 review). `--onto <baseSha> <forkSha> <branch>` sidesteps this entirely:
-  // it transplants exactly `forkSha..branch` (branch's own commits since it actually forked, checked
-  // below) onto `baseSha`, with no requirement that `baseSha` still descend from `forkSha` — so it
-  // stays correct even for a `baseBranch` that was force-pushed or recreated past the real fork
-  // point. A fork point that isn't actually on `branch` (a stale or mismatched pin) is ignored —
-  // safer to fall back to the plain form than to `--onto` a boundary that doesn't describe this
-  // branch's history.
-  const rebaseArgs =
-    forkSha && (await branchContainsCommit(repoPath, branch, forkSha))
-      ? ["rebase", "--onto", baseSha, forkSha, branch]
-      : ["rebase", baseSha];
+  // `--onto <baseSha> <forkSha> <branch>` transplants exactly `forkSha..branch` (branch's own
+  // commits since it actually forked) onto `baseSha`, with no requirement that `baseSha` still
+  // descend from `forkSha` — so it stays correct even for a `baseBranch` that was force-pushed or
+  // recreated past the real fork point. A fork point that isn't actually on `branch` (a stale or
+  // mismatched pin) is ignored, same as no pin at all.
+  //
+  // Without a trustworthy pin there is no safe fallback (PR #279 review, P1): the plain one-argument
+  // `git rebase <base>` replays `merge-base(baseSha, branch)..branch` — the branch's own fork point
+  // only while `baseBranch` still contains it. A legacy reused checkout with no recorded
+  // `baseForkSha` reaches here with `forkSha` undefined; once `baseBranch` has been rewritten past
+  // the branch's real fork point, that merge-base lands before it and the plain form would replay
+  // ORIGINAL base commits alongside the branch's own work, silently resurrecting them into the
+  // rebased branch. There is no way to tell that shape apart from an ordinary, unrewritten
+  // divergence without the pin, so a divergent reused branch lacking one fails closed here instead
+  // of guessing.
+  const trustedForkSha =
+    forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
+  if (!trustedForkSha) {
+    throw new Error(
+      `[worktree] ${branch} diverges from ${baseBranch} (${baseSha.slice(0, 12)}) and has no ` +
+        `trustworthy fork-point pin to rebase --onto — a plain rebase could silently resurrect ` +
+        `commits ${baseBranch} dropped if it was force-pushed or recreated past ${branch}'s real ` +
+        `fork point. Resolve manually in ${worktreePath} and retry.`,
+    );
+  }
+  const rebaseArgs = ["rebase", "--onto", baseSha, trustedForkSha, branch];
 
   try {
     await git(worktreePath, rebaseArgs, hooksPath);
@@ -1126,23 +1137,35 @@ export async function createWorktree(opts: {
     ),
   );
 
-  if (warm) {
-    try {
-      await warmWorktree(wt, signal);
-    } catch (err) {
-      // The fork was captured before warming; an unexpected setup failure must not discard it before
-      // the run row can persist it for a later resume.
-      console.warn(
-        `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
-          `${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
+  // The fork was captured before warming; an unexpected setup failure must not discard it before
+  // the run row can persist it for a later resume.
+  if (warm) await warmWorktreeBestEffort(wt, signal);
   // No hooks bridge to materialize here: every git command anton runs against this worktree passes
   // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
   // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
   // dependence on whether warming happened to regenerate anything.
   return wt;
+}
+
+/**
+ * {@link warmWorktree}, logged and swallowed rather than thrown — warming is an accelerator, never
+ * a gate. Exported (not just `createWorktree`'s own inline `warm: true`) for a caller that must
+ * persist a refresh boundary before warming starts (anton-s55u, PR #279 review, P1): warming can
+ * run for minutes, and a process killed during it would otherwise leave a rebased/merged branch
+ * with no persisted record of the boundary it was mutated onto, so a resume after the crash
+ * re-derives one against a base that may have moved again — risking the very resurrected-commit bug
+ * the pin exists to prevent. Such a caller materializes with `warm: false`, persists once the
+ * checkout settles, then calls this directly.
+ */
+export async function warmWorktreeBestEffort(wt: Worktree, signal?: AbortSignal): Promise<void> {
+  try {
+    await warmWorktree(wt, signal);
+  } catch (err) {
+    console.warn(
+      `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**
