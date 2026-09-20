@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "4b449f7d-0036-4469-abbf-390bcc4655b2",
+  "id": "c55d85f9-0468-4758-88b5-1ec1d13e6109",
   "prevId": "b68169ec-a92a-4986-bd44-c5d2db64dc7d",
   "tables": {
     "autopilot_disarms": {
@@ -947,6 +947,30 @@
           "isUnique": true,
           "where": "\"jobs\".\"type\" = 'sync-push' and \"jobs\".\"status\" = 'queued'"
         },
+        "jobs_status_run_at_idx": {
+          "name": "jobs_status_run_at_idx",
+          "columns": [
+            "status",
+            "run_at"
+          ],
+          "isUnique": false
+        },
+        "jobs_status_lease_expires_at_idx": {
+          "name": "jobs_status_lease_expires_at_idx",
+          "columns": [
+            "status",
+            "lease_expires_at"
+          ],
+          "isUnique": false
+        },
+        "jobs_project_updated_idx": {
+          "name": "jobs_project_updated_idx",
+          "columns": [
+            "project_id",
+            "updated_at"
+          ],
+          "isUnique": false
+        },
         "jobs_project_parked_idx": {
           "name": "jobs_project_parked_idx",
           "columns": [
@@ -1492,20 +1516,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "base_refresh_outcome": {
-          "name": "base_refresh_outcome",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "base_refresh_sha": {
-          "name": "base_refresh_sha",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "status": {
           "name": "status",
           "type": "text",
@@ -1613,6 +1623,15 @@
           "name": "runs_write_seq_idx",
           "columns": [
             "write_seq"
+          ],
+          "isUnique": false
+        },
+        "runs_project_epic_updated_idx": {
+          "name": "runs_project_epic_updated_idx",
+          "columns": [
+            "project_id",
+            "epic_bead_id",
+            "updated_at"
           ],
           "isUnique": false
         }
@@ -1963,6 +1982,14 @@
           "name": "sessions_job_idx",
           "columns": [
             "job_id"
+          ],
+          "isUnique": false
+        },
+        "sessions_run_started_idx": {
+          "name": "sessions_run_started_idx",
+          "columns": [
+            "run_id",
+            "started_at"
           ],
           "isUnique": false
         }

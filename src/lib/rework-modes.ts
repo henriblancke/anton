@@ -12,12 +12,15 @@ import { beads, type Bead } from "./beads/bd";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote } from "./beads/notes";
 import { resolveOperator } from "./operator";
-import type { ReworkRequest } from "./rework-contract";
+import { ReworkConflictError, type ReworkRequest } from "./rework-contract";
 import {
+  detachmentNoteBody,
   followUpDescription,
   hasAnyHumanNote,
+  hasDetachmentNote,
   hasHumanNote,
   originNoteBody,
+  reconcileFollowUpDescription,
   reworkNoteBody,
 } from "./rework-notes";
 import { RUN_STAGE_LABELS } from "./rework-pipeline";
@@ -123,13 +126,21 @@ function reopenAlreadyApplied(fresh: Bead, body: string): boolean {
  *
  * A SHIPPED target (its PR merged, {@link resolvePipeline}) is parented nowhere for a second reason:
  * its next run has nothing left to execute, so a child of it would never be dispatched either.
+ *
+ * `lockedFollowUps` is every bead the caller took a write lock on besides the ticket and the target
+ * ({@link followUpCandidateIds}) — the only beads this may WRITE to when it resumes one. A resume
+ * rewrites the match's contract off the read it makes here, and a founder editing that same bead
+ * (ticket-detail's `updateTicket`, serialized on the bead's own lock) must land before or after it,
+ * never under it. A match that is already complete is only read, and is reported as done whether or
+ * not it was locked.
  */
 export async function applyFollowUp(
   project: Project,
   target: Bead,
   ticket: Bead,
   request: ReworkRequest,
-  pipeline?: ReworkPipeline,
+  pipeline: ReworkPipeline | undefined,
+  lockedFollowUps: ReadonlySet<string>,
 ): Promise<AppliedRework> {
   const repo = project.repoPath;
   const context: FollowUpContext = {
@@ -156,7 +167,23 @@ export async function applyFollowUp(
   // and the whole point of the lock is that the loser sees the winner's work.
   const all = await refreshAllIssues(repo);
   const match = await existingFollowUp(repo, all, ticket.id, request.summary, context.body);
-  return match ? resumeFollowUp(context, match) : createFollowUp(context, all);
+  if (!match) return createFollowUp(context, all);
+  const detachment = owedDetachment(context, match.bead);
+  // A match the caller did not lock became a candidate between its snapshot and its locks. The lock
+  // guards WRITES to that bead — finishing a half-made one, or detaching a stranded one — so only a
+  // resume that owes one is refused: writing unserialized is the lost update the lock exists to
+  // prevent, and the answer is the one every other moved-board race gets (409): look again, and the
+  // retry snapshots — and locks — the bead it will resume. A match that is DONE, and owes nothing, is
+  // read and reported without a write, so it needs no lock. That is exactly what the loser of two
+  // identical requests sees: both snapshot an empty candidate set, the winner creates the follow-up
+  // under the ticket lock, and the loser's re-read finds it — the documented no-op, not a conflict.
+  if ((match.partial || detachment) && !lockedFollowUps.has(match.bead.id)) {
+    throw new ReworkConflictError(
+      `${match.bead.id} became ${ticket.id}'s follow-up while this send-back was being decided — ` +
+        `look again and send it back`,
+    );
+  }
+  return resumeFollowUp(context, match, detachment);
 }
 
 /** Everything both follow-up paths need: who is writing, what the note says, and what the PR decided. */
@@ -175,18 +202,43 @@ interface FollowUpContext {
 
 /**
  * A follow-up this request must not duplicate is already on the board. Two things can still be owed
- * on it — a parentage the target's merge has invalidated, and an unfinished creation — and both are
- * settled here rather than reported as "already sent back".
+ * on it — a detachment the target's merge demands ({@link owedDetachment}), and an unfinished
+ * creation — and both are settled here rather than reported as "already sent back".
+ *
+ * The detachment is three writes at most, and every one is re-derivable from the board so a retry
+ * finishes exactly what the attempt before it left: the note is owed until it is on the bead; the
+ * `bd reparent` is owed while the bead is still under the target; the half-created bead's
+ * run-location line is re-said by the reconcile, which always reads the parentage the bead holds
+ * NOW. The note lands FIRST on purpose. It is the one record of the detachment that survives the
+ * reparent — which is what erases the parent edge — and the founder, who may rewrite the Context
+ * line the bead was created with. Written after the reparent, a note that failed to land left a
+ * parentless bead whose reason for standing alone was recorded nowhere, and a retry reading the
+ * Context back to find it saw nothing once that line had been edited. So the note states the
+ * decision being carried out rather than a detachment already done ({@link detachmentNoteBody}),
+ * and a reparent that fails after it leaves the bead under the target with its detachment
+ * recorded, which is exactly what the retry looks for.
  */
 async function resumeFollowUp(
   context: FollowUpContext,
   match: FollowUpMatch,
+  detachment: Detachment | undefined,
 ): Promise<AppliedRework> {
   const { target, ticket, body } = context;
   const existing = match.bead;
-  const stranded = context.shippedPr !== undefined && beads.parentOf(existing) === target.id;
-  if (stranded) await detachStrandedFollowUp(context, existing);
-  if (match.partial) await finishHalfCreatedFollowUp(context, existing);
+  if (detachment) {
+    if (!detachment.recorded) {
+      await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
+    }
+    await beads.reparent(context.repo, existing.id, "");
+  }
+  if (match.partial) {
+    await reconcileHalfCreatedContract(
+      context,
+      existing,
+      detachment ? undefined : beads.parentOf(existing),
+    );
+    await finishHalfCreatedFollowUp(context, existing);
+  }
   return {
     result: {
       mode: "follow-up",
@@ -201,40 +253,103 @@ async function resumeFollowUp(
     // Read off the bead the winner actually created — as reconciled above — so the repeat that
     // finishes a half-applied send-back retires on exactly the condition that holds now.
     runsUnderTarget: context.shippedPr === undefined && beads.parentOf(existing) === target.id,
-    reconciled: stranded,
+    reconciled: detachment !== undefined,
   };
 }
 
 /**
- * A follow-up created UNDER the target before its PR merged is stranded there: the merged target has
- * no run left to dispatch it, and a child task is not a run target of its own, so nothing would ever
- * pick it up. That is exactly the shape the instructed retry lands in — the 409 says "send it back
- * again", and this pass reads the PR as merged. So the parentage is reconciled to what this request
- * would have created had it gone first (parentless, {@link resolvePipeline}), rather than the
- * founder being told a stranded child "carries the next pass as its own run target". The bead keeps
- * its Context section, which a founder may have edited; the note is the record of the move.
+ * The detachment the target's merge demands of this bead, or `undefined` where none is owed. A
+ * follow-up created UNDER the target before its PR merged is stranded there: the merged target has
+ * no run left to dispatch it, and a child task is not a run target of its own, so nothing would
+ * ever pick it up. That is exactly the shape the instructed retry lands in — the 409 says "send it
+ * back again", and this pass reads the PR as merged. So the parentage is reconciled to what this
+ * request would have created had it gone first (parentless, {@link resolvePipeline}), rather than
+ * the founder being told a stranded child "carries the next pass as its own run target".
+ *
+ * Owed while the bead is still under the target, and only then: the reparent is the write that
+ * settles it, and the parent edge is what says it has not landed. Whether the reason has already
+ * been recorded is read off the bead's own notes ({@link hasDetachmentNote}) — the record an earlier
+ * pass wrote before its reparent failed — never off the Context section, which a founder may
+ * rewrite. A parentless bead owes nothing: either its detachment went through (its note landed
+ * first, {@link resumeFollowUp}), it was created standing alone, or someone moved it. A bead the
+ * gardener moved somewhere else entirely is the same case: its parentage is someone's decision,
+ * not a stranding.
  */
-async function detachStrandedFollowUp(context: FollowUpContext, existing: Bead): Promise<void> {
-  await beads.reparent(context.repo, existing.id, "");
+interface Detachment {
+  /** The merged PR that demands it — what the note names. */
+  pr: string;
+  /** The note is already on the bead, so this pass owes only the reparent. */
+  recorded: boolean;
+}
+
+function owedDetachment(context: FollowUpContext, existing: Bead): Detachment | undefined {
+  const { shippedPr: pr, target } = context;
+  if (pr === undefined || beads.parentOf(existing) !== target.id) return undefined;
+  return { pr, recorded: hasDetachmentNote(existing, target.id, pr) };
+}
+
+/**
+ * Record why the follow-up is being detached ({@link owedDetachment}) — written BEFORE the
+ * `bd reparent`, as the one record of it that neither the reparent nor a founder's edit of the
+ * Context can erase ({@link resumeFollowUp}). What it says about the Context section is decided by
+ * whether this pass leaves that section alone ({@link detachmentNoteBody}).
+ */
+async function noteStrandedFollowUp(
+  context: FollowUpContext,
+  existing: Bead,
+  pr: string,
+  contextKept: boolean,
+): Promise<void> {
   await beads.note(
     context.repo,
     existing.id,
-    `anton: rework — ${context.target.id}'s pull request (${context.shippedPr}) merged after this ` +
-      `follow-up was created under it, so it was detached and is its own run target now — approve ` +
-      `it to run. Its Context section still names the parent it was created under.`,
+    detachmentNoteBody({ targetId: context.target.id, pr, contextKept }),
   );
+}
+
+/**
+ * Reconcile a half-created follow-up's contract ({@link existingFollowUp}) to the request finishing
+ * it. `bd create` froze the FIRST attempt's instructions and findings into the acceptance, and the
+ * founder may have edited either before retrying under the same title — the note about to land
+ * carries the edited request, and a bead whose contract says one thing while its note says another
+ * is judged against two different asks. Rewritten before any note so a failure here leaves the bead
+ * still noteless — still partial, still this request's to finish — rather than noted against a
+ * stale rubric. `parentId` is the parentage the bead holds after reconciliation, so the Context
+ * section says where it actually runs.
+ *
+ * Only the acceptance and that run-location line are touched ({@link reconcileFollowUpDescription}).
+ * The match is on title and edge, not on who wrote the bead: a founder may have made it by hand, or
+ * edited the remnant's Context, Out of scope or Verify before retrying, and refreshing the boxes must
+ * not cost them that.
+ */
+async function reconcileHalfCreatedContract(
+  context: FollowUpContext,
+  existing: Bead,
+  parentId: string | undefined,
+): Promise<void> {
+  const { repo, target, ticket, request, pipeline } = context;
+  const description = reconcileFollowUpDescription(existing.description, {
+    summary: request.summary,
+    instructions: request.instructions,
+    findings: request.findings,
+    ticket,
+    targetId: target.id,
+    parentId,
+    pipeline,
+  });
+  if (existing.description !== description) {
+    await beads.update(repo, existing.id, { description });
+  }
 }
 
 /**
  * A bead an earlier attempt created and linked but never got a note onto ({@link existingFollowUp})
  * is this request's own work, half done — so finish it rather than opening a second follow-up beside
  * it. Both remaining writes are made, in the order the create path makes them: the attempt died on
- * the first, so neither can already be on the board.
+ * the first, so neither can already be on the board. The contract has been reconciled by then
+ * ({@link reconcileHalfCreatedContract}).
  */
-async function finishHalfCreatedFollowUp(
-  context: FollowUpContext,
-  existing: Bead,
-): Promise<void> {
+async function finishHalfCreatedFollowUp(context: FollowUpContext, existing: Bead): Promise<void> {
   const { repo, author, body } = context;
   await beads.note(repo, existing.id, formatHumanNote(body, author, new Date()), author || undefined);
   await noteOrigin(context, existing.id);
@@ -250,6 +365,8 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
     type: "task",
     description: followUpDescription({
       summary: request.summary,
+      instructions: request.instructions,
+      findings: request.findings,
       ticket,
       targetId: target.id,
       parentId,
@@ -329,14 +446,26 @@ export async function existingFollowUp(
   for (const candidate of followUpCandidates(all, ticketId, summary)) {
     const fresh = await beads.show(repo, candidate.id);
     // The snapshot's "unsettled" rule, re-applied to the read the decision is actually made on: the
-    // lock covers the ticket and the target, not the follow-up, so a candidate can close between the
-    // two. A closed bead is nobody's follow-up — nothing dispatches it and its parentage no longer
-    // says anything — so matching one would report this send-back as already done and drop it.
+    // locks are in-process only (anton-od4), so a `bd close` from a terminal or another host can land
+    // between the two. A closed bead is nobody's follow-up — nothing dispatches it and its parentage
+    // no longer says anything — so matching one would report this send-back as already done and drop it.
     if (fresh.status === "closed") continue;
     if (hasHumanNote(fresh, body)) return { bead: fresh, partial: false };
     partial ??= unfinishedCreation(fresh);
   }
   return partial ? { bead: partial, partial: true } : undefined;
+}
+
+/**
+ * The beads a follow-up of `ticketId` under this summary could resume ({@link existingFollowUp}),
+ * off the caller's board snapshot — what `reworkTicket` locks alongside the ticket and the target
+ * before it applies, so the resume's rewrite of a match is serialized against that bead's own
+ * writers. Nested acquisition would not do: the ticket and target locks are already held by then,
+ * and a gardener move of the same follow-up takes its set in sorted order (`withBeadWriteLocks`),
+ * which can hold the follow-up while waiting on the target.
+ */
+export function followUpCandidateIds(all: Bead[], ticketId: string, summary: string): string[] {
+  return followUpCandidates(all, ticketId, summary).map((b) => b.id);
 }
 
 /**
