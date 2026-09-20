@@ -2,9 +2,12 @@
  * The run formula (anton-hrql): the pipeline anton walks, owned per project.
  *
  * anton ships `anton-run.formula.toml` as an asset and the installer drops it into the project's
- * `.beads/formulas/` — the same no-clobber shape as the bead skeleton (beads/config.mjs), the verify
- * gates, and the reviewer. A project-local file of that name therefore always wins, and it is
- * git-tracked, so a tuned pipeline travels to every clone.
+ * `.beads/formulas/` — the same shape as the bead skeleton (`ensureFormula` in beads/config.mjs).
+ * The project-local file is what this loader reads, and it is git-tracked, so it travels to every
+ * clone. It is NOT preserved against anton's own: a copy that differs from the shipped asset is
+ * replaced on the next `anton init` (with a `.bak` beside it), because a pipeline anton's code no
+ * longer matches fails in ways that read as anton bugs. To own a pipeline, give it its own name and
+ * point at it through the per-label variant map below — that file is never overwritten.
  *
  * This module is the LOADER, and it exists to make a broken pipeline fail at the START of a run
  * rather than halfway through one. `validateRunFormula` is called before any worktree is created, and

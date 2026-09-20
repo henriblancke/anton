@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 9c732e69d011
+version: f5fca17a3f74
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -67,8 +67,20 @@ Copy both files from `${CLAUDE_SKILL_DIR}/templates/.beads/formulas/` to
 - `anton-bead.formula.json` — the bead SKELETON.
 - `anton-run.formula.toml` — the run PIPELINE.
 
-**No-clobber — if a file already exists, leave it alone and report it as skipped**: a project that
-has tuned its own bead skeleton or pipeline keeps it.
+**Compare, then replace — matching `ensureFormula` in `src/lib/beads/config.mjs`, which is what
+`anton setup` and `anton init` run:**
+
+- The file is absent → copy it, report `installed`.
+- It exists and is byte-identical to the template → leave it, report `already`.
+- It exists and DIFFERS → copy the template over it, report `replaced`, and say so plainly. Save
+  the previous contents beside it as `<filename>.bak` first.
+- It exists and is a SYMLINK (or anything other than a regular file) → do NOT write. Copying would
+  follow the link and overwrite its target somewhere outside the repo. Report it and move on.
+
+Existence alone must not decide this. A project holding a verbatim copy of an OLDER template is
+indistinguishable from one that tuned its pipeline if you only check whether the file is there —
+which is how `step:describe` came to be missing from every project anton had already set up, while
+each re-run reported the formula as present and fine.
 
 The bead formula is the skeleton `/shape` and anton's Add-work UI pour every bead from (one step per
 tier, the contract sections pre-stubbed), so the conformant shape is structural instead of a prompt

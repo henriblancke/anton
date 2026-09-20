@@ -18,7 +18,7 @@
  * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
  * `.beads/metadata.json` (anton-4gd2).
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -466,10 +466,27 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  * repo" (configureBeadsDoltSync does exactly that, then aborts `anton setup` for having no git
  * origin). So an absent `.beads/` is a skip, not a mkdir.
  *
+ * A destination that is not a REGULAR FILE is refused outright ("unsafe-dest"), and that gate only
+ * matters because this function now writes over things. `copyFileSync` follows symlinks: it opens
+ * the link's TARGET and writes there, so a `.beads/formulas/anton-run.formula.toml` that is a
+ * symlink would have this installer write anton's asset to whatever the link points at — anywhere
+ * on disk the anton process can write, outside the repo entirely. `POST /api/projects` takes a
+ * repository path from a caller and runs this installer over it, so the path reaches here from
+ * input. The `.bak` is checked the same way for the same reason: it is a second write to an
+ * attacker-nameable path. Under the OLD no-clobber rule an existing symlink was never written to at
+ * all, so this hazard arrives WITH the replace behavior and is fixed in the same change.
+ *
  * Returns { status, detail? } — "installed" (nothing was there) | "replaced" (a differing copy was
  * overwritten; `detail` names the backup) | "already" (byte-identical) | "missing-asset" (the
- * bundled file isn't in this install — a warning, never fatal: anton's own loaders fall back to
- * their packaged copy) | "no-workspace" | "failed".
+ * bundled file isn't in this install, or could not be read — a warning, never fatal: anton's own
+ * loaders fall back to their packaged copy) | "unsafe-dest" | "no-workspace" | "failed".
+ *
+ * NOTE on "missing-asset" when the project's own copy EXISTS: the old rule returned "already"
+ * without ever looking at `src`, because existence alone decided the outcome. Comparing content
+ * requires reading `src`, so that combination now reports "missing-asset" — a warning naming an
+ * install problem, while the project's file is left untouched. Warning over silence is deliberate:
+ * "already" would claim the local copy had been checked against the shipped one when nothing was
+ * read.
  *
  * A filesystem error (read-only checkout, no write permission, transient I/O) is REPORTED as
  * "failed", never thrown: this is one best-effort step among a dozen in setup/registration, and an
@@ -477,7 +494,10 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  */
 function ensureFormula(beadsDir, filename, src) {
   const dest = join(beadsDir, "formulas", filename);
-  const present = existsSync(dest);
+  // lstat, never existsSync: a symlink pointing at nothing is "absent" to existsSync but is still a
+  // path this function must refuse rather than write through. `present` means "something is here",
+  // not "a file is here" — what KIND it is decides the refusal below.
+  const present = lstatOrUndefined(dest) !== undefined;
   // The workspace gate runs BEFORE the asset gate for an absent dest, matching the original order:
   // a release bundle with no `.beads/` must report "no-workspace" whether or not it ships the asset.
   if (!present && !existsSync(beadsDir)) return { status: "no-workspace" };
@@ -491,6 +511,12 @@ function ensureFormula(beadsDir, filename, src) {
     // packaged copy, and nothing about the project is touched.
     return { status: "missing-asset", detail: err?.message || String(err) };
   }
+
+  // Refused before the comparison, not just before the write: reading through a symlink to decide
+  // "already" would let a link that happens to point at an identical file pass silently, leaving a
+  // link where the installer reports a file.
+  const unsafe = present ? unsafeDestDetail(dest, filename) : undefined;
+  if (unsafe) return { status: "unsafe-dest", detail: unsafe };
 
   if (present) {
     // An existing copy that cannot be READ is not "already": treat unknown as differing and let the
@@ -515,8 +541,14 @@ function ensureFormula(beadsDir, filename, src) {
     let backup;
     if (present) {
       try {
-        copyFileSync(dest, `${dest}.bak`);
-        backup = `${filename}.bak`;
+        // Same refusal as the destination, and for the same reason — this is a WRITE to a path the
+        // repo names. A `.bak` that is a symlink (or anything else not a regular file) is skipped:
+        // the install still proceeds, since git holds the durable copy, and `detail` says the backup
+        // is absent so the operator is not told about one that was never written.
+        if (lstatOrUndefined(`${dest}.bak`) === undefined || !unsafeDestDetail(`${dest}.bak`, `${filename}.bak`)) {
+          copyFileSync(dest, `${dest}.bak`);
+          backup = `${filename}.bak`;
+        }
       } catch {
         backup = undefined;
       }
@@ -532,6 +564,38 @@ function ensureFormula(beadsDir, filename, src) {
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };
   }
+}
+
+/** `lstatSync` without the throw — undefined when nothing is at `path`, never following a symlink. */
+function lstatOrUndefined(path) {
+  try {
+    return lstatSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Why `path` must not be written to, or undefined when it is an ordinary file this installer may
+ * replace. Symlinks are the case that matters ({@link ensureFormula}); directories, sockets and
+ * device nodes are refused by the same rule because none of them is a formula either, and a
+ * `copyFileSync` onto one fails or does something surprising rather than installing an asset.
+ *
+ * A path that cannot be `lstat`ed at all is refused too: the check exists to establish what is
+ * there, and an answer it could not get is not permission to write.
+ */
+function unsafeDestDetail(path, label) {
+  const stat = lstatOrUndefined(path);
+  if (stat === undefined) return `${label} could not be inspected — refusing to write over it`;
+  if (stat.isSymbolicLink()) {
+    return (
+      `${label} is a SYMLINK — refusing to write through it. Installing would follow the link and ` +
+      `overwrite its target, which may be anywhere on disk. Replace it with a regular file (or ` +
+      `delete it) and re-run.`
+    );
+  }
+  if (!stat.isFile()) return `${label} is not a regular file — refusing to write over it`;
+  return undefined;
 }
 
 /**
@@ -2033,7 +2097,17 @@ export function configureBeadsForRepo(dir, opts = {}) {
     const formula = asset.install(beadsDir, asset.src);
     steps.push({ name: asset.label, status: formula.status, detail: formula.detail });
     if (formula.status === "missing-asset") {
-      emit(`${asset.label} asset missing from this install (${asset.src}) — skipping.`);
+      // `detail` is present when the asset EXISTS but could not be read (permission, I/O) — a
+      // different problem from an absent file, and the only thing that tells them apart here.
+      emit(
+        `${asset.label} asset missing from this install (${asset.src})` +
+          `${formula.detail ? `: ${formula.detail}` : ""} — skipping.`,
+      );
+    } else if (formula.status === "unsafe-dest") {
+      // A refusal, not a no-op: the project's formula is NOT what anton ships and was left that
+      // way, so it is collected as an error rather than emitted and forgotten.
+      emit(`refused to install the ${asset.label}: ${formula.detail}`);
+      errors.push(`refused to install the ${asset.label}: ${formula.detail}`);
     } else if (formula.status === "no-workspace") {
       // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
       emit(`no .beads workspace to install the ${asset.label} into — skipping.`);

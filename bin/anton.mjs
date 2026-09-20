@@ -1831,7 +1831,17 @@ async function cmdSetup(args = []) {
   ]) {
     const formula = asset.install(join(APP_ROOT, ".beads"));
     if (formula.status === "missing-asset") {
-      console.log(c.yellow(`\n! ${asset.label.toLowerCase()} missing from this install — skipping ${asset.filename}.`));
+      // `detail` distinguishes an asset that is ABSENT from one that exists and could not be read.
+      console.log(
+        c.yellow(
+          `\n! ${asset.label.toLowerCase()} missing from this install — skipping ${asset.filename}.` +
+            `${formula.detail ? ` (${formula.detail})` : ""}`,
+        ),
+      );
+    } else if (formula.status === "unsafe-dest") {
+      // Not a skip to shrug at: the file anton walks is not the file anton ships, and it stays that
+      // way until a human clears the path.
+      console.log(c.yellow(`\n! refused to install the ${asset.label.toLowerCase()}: ${formula.detail}`));
     } else if (formula.status === "failed") {
       // Best-effort, like the missing asset above: setup carries on and anton falls back to its
       // packaged copy, so an unwritable `.beads/formulas/` is a warning, not a failed setup.

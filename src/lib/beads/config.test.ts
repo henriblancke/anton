@@ -5,7 +5,16 @@
  * init` would read the nested form as unset and re-set every key on every run (anton-qhoz).
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -428,6 +437,83 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(ensureBeadFormula(beadsDir(), join(tmpdir(), "no-such-formula.json")).status).toBe(
       "missing-asset",
     );
+  });
+
+  /**
+   * A behavior change from the no-clobber rule, pinned here rather than left incidental (PR #307
+   * review): the old code returned "already" for this combination because existence alone decided
+   * the outcome and `src` was never opened. Comparing content has to read `src`, so a shipped asset
+   * that is absent or unreadable is now a warning — and the project's own file, which nothing was
+   * ever compared against, is left exactly as it was.
+   */
+  it("warns rather than claiming 'already' when the shipped asset is gone but a local copy exists", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
+
+    expect(ensureBeadFormula(dir, join(tmpdir(), "no-such-formula.json")).status).toBe("missing-asset");
+    // Untouched: a warning about anton's install is never a reason to rewrite the project's file.
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+  });
+
+  it("carries the reason when the shipped asset exists but cannot be read", () => {
+    const dir = beadsDir();
+    // A directory where a file is expected: present to existsSync, an EISDIR to readFileSync.
+    const unreadable = join(dir, "..", "unreadable-asset");
+    mkdirSync(unreadable, { recursive: true });
+
+    const result = ensureBeadFormula(dir, unreadable);
+    expect(result.status).toBe("missing-asset");
+    // Without this the operator is told the asset is "missing from this install" while it is right
+    // there — the detail is the only thing separating an absent asset from an unreadable one.
+    expect(result.detail).toBeTruthy();
+  });
+
+  /**
+   * The hazard that arrives WITH the replace behavior (PR #307 review, P1). `copyFileSync` follows
+   * symlinks — it opens the link's target and writes there — so a symlinked destination would have
+   * this installer write anton's asset to any path the link names, outside the repo entirely. The
+   * path reaches here from input: `POST /api/projects` takes a repository path and runs the
+   * installer over it. Under the old rule an existing symlink was never written to at all.
+   */
+  it("refuses to write through a symlinked destination, leaving the link's target intact", () => {
+    const dir = beadsDir();
+    const outside = join(dir, "..", "outside-the-repo.txt");
+    writeFileSync(outside, "NOT ANTON'S TO OVERWRITE");
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    symlinkSync(outside, dest(dir));
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("SYMLINK");
+    // The file the link pointed at is untouched, and the link itself is still a link.
+    expect(readFileSync(outside, "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
+    expect(lstatSync(dest(dir)).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses a destination that is a directory rather than a formula", () => {
+    const dir = beadsDir();
+    mkdirSync(dest(dir), { recursive: true });
+    expect(ensureBeadFormula(dir).status).toBe("unsafe-dest");
+  });
+
+  /**
+   * The backup is a SECOND write to a path the repo names, so it gets the same refusal. Skipping it
+   * must not block the install — git still holds the durable copy — but `detail` then has to stop
+   * promising a backup that was never written.
+   */
+  it("installs over a differing file even when the .bak path is a symlink, and says the backup is absent", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
+    const outside = join(dir, "..", "bak-target.txt");
+    writeFileSync(outside, "ALSO NOT ANTON'S");
+    symlinkSync(outside, `${dest(dir)}.bak`);
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    expect(result.detail).toContain("NOT backed up");
+    expect(readFileSync(outside, "utf8")).toBe("ALSO NOT ANTON'S");
   });
 
   it("refuses to fabricate a .beads workspace where none exists", () => {
