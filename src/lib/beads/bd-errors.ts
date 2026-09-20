@@ -41,3 +41,19 @@ export function unclaimableStatus(e: unknown): string | undefined {
   const message = typeof err?.message === "string" ? err.message : "";
   return /not claimable:\s*status\s+([a-z_]+)/i.exec(`${stderr}\n${message}`)?.[1];
 }
+
+/**
+ * Did bd refuse a `close` because an open blocker still holds the bead — "blocked by open issues
+ * [...] (use --force to override)"? That answer is a real verdict about the bead's state. Every
+ * other way `close` can fail — bd absent, the process timed out, Dolt is unhealthy — never
+ * establishes that the bead can't be closed, so a caller that maps every `close` rejection to the
+ * same "won't close" verdict turns an infrastructure outage into a permanent-looking refusal.
+ *
+ * Reads stderr first and the message second: {@link bd}'s rejection carries the raw stderr on both.
+ */
+export function isBlockedByOpenIssues(e: unknown): boolean {
+  const err = e as { stderr?: unknown; message?: unknown } | null | undefined;
+  const stderr = typeof err?.stderr === "string" ? err.stderr : "";
+  const message = typeof err?.message === "string" ? err.message : "";
+  return /blocked by open issues/i.test(`${stderr}\n${message}`);
+}

@@ -71,12 +71,13 @@ describe("the shipped default (anton-hrql)", () => {
     const doc = parseRunFormulaSource(shipped(), bundledRunFormulaPath());
     const steps = doc.steps as Array<Record<string, unknown>>;
 
-    expect(steps.map((s) => s.id)).toEqual(["implement", "verify", "commit", "review", "pr"]);
+    expect(steps.map((s) => s.id)).toEqual(["implement", "verify", "commit", "review", "describe", "pr"]);
     expect(steps.map((s) => s.labels)).toEqual([
       ["step:implement"],
       ["step:verify"],
       ["step:commit"],
       ["step:review"],
+      ["step:describe"],
       ["step:pr"],
     ]);
     // Sequential: each step waits on the one before it, so the walk has a single total order.
@@ -86,6 +87,7 @@ describe("the shipped default (anton-hrql)", () => {
       ["verify"],
       ["commit"],
       ["review"],
+      ["describe"],
     ]);
     // `formula`, NOT `name` — a formula keyed `name` parses and then fails cook (anton-upfc).
     expect(doc.formula).toBe("anton-run");
@@ -108,6 +110,7 @@ describe("the shipped default (anton-hrql)", () => {
       "verify",
       "commit",
       "review",
+      "describe",
       "pr",
     ]);
   });

@@ -16,17 +16,6 @@ export const IN_REVIEW = LABELS.stage("in-review");
 /** A `bd show`-shaped reader: the bead, or `undefined` when the board could not answer. */
 export type ReadBead = (id: string) => Promise<Bead | undefined>;
 
-/** Run a best-effort side effect, swallowing failures. Returns true iff `fn` completed. */
-export async function safe(fn: () => Promise<unknown>): Promise<boolean> {
-  try {
-    await fn();
-    return true;
-  } catch {
-    // best-effort
-    return false;
-  }
-}
-
 /** One bead, or `undefined` when bd could not answer — an unreadable bead decides nothing. */
 export function tryShow(repo: string, id: string): Promise<Bead | undefined> {
   return beads.show(repo, id).catch(() => undefined);

@@ -48,17 +48,35 @@ jobs:
       # anthropics/claude-code-action@v1 hardcodes the Claude Code version it installs, so
       # an upstream CLI regression (2.1.265 broke the first API call for every run —
       # claude-code#92964: the Artifact tool's input_schema shipped a `pattern` with Unicode
-      # property escapes and every request 400'd before a turn started) takes the check down
-      # until the action's pin moves. Install a pinned-good version into a temp dir here and
-      # pass it through `path_to_claude_code_executable` to bypass the action-installed binary.
+      # property escapes and every request 400'd before a turn started, fixed in 2.1.268)
+      # takes the check down until the action's pin moves. Install a pinned-good version into
+      # a temp dir here and pass it through `path_to_claude_code_executable` to bypass the
+      # action-installed binary.
+      # Bumped 2.1.263 -> 2.1.274 (2026-09-17): this job started failing every run with the
+      # same signature as claude-code-action#852/#914 — is_error:true, num_turns:1,
+      # total_cost_usd:0, ~500ms — an init-time crash before any model turn. 2.1.274's
+      # changelog fixes exactly this shape of failure ("[Code Review] Fixed rare reviews
+      # ending with 'Code review encountered an error' when GitHub or an internal service
+      # failed transiently at launch; they now wait and retry"). If reviews start failing
+      # this way again, re-check the changelog and bump further before assuming it's this
+      # PR's fault — the log's `Running Claude Code via SDK (full output hidden for
+      # security)` line means the real crash detail never reaches this job's log; add
+      # `show_full_output: true` on the action to see it.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.263'
+          CLAUDE_CODE_VERSION: '2.1.274'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
 
+      # NOTE: claude-code-action always forces `enableAllProjectMcpServers: true` on the settings
+      # it writes (base-action/src/setup-claude-code-settings.ts overwrites the key after merging
+      # any `settings:` input, so it cannot be turned off from here). A project MCP server the CLI
+      # cannot spawn is therefore FATAL in headless `-p` mode, not a soft warning — #299 died in
+      # ~500ms with zero API cost that way, on a `graft` server this job never installed. graft is
+      # gone and the repo now declares no `.mcp.json` at all, so there is nothing to auto-connect
+      # to. If a project MCP server is ever re-added, it must be installed in this job too.
       - name: Run Claude Code Review
         id: claude-review
         env:

@@ -562,7 +562,9 @@ describe("the beads the narrowed fence drops", () => {
     expect(underClosed).toEqual([]);
   });
 
-  it.each(PROBES)("holds the ranking or fires when one of them %s", (_name, mutate) => {
+  // Coverage instruments every decision over the 842-bead corpus; leave the semantic sweep intact
+  // while giving this one intentionally expensive assertion room to run on a contended CI worker.
+  it.each(PROBES)("holds the ranking or fires when one of them %s", { timeout: 180_000 }, (_name, mutate) => {
     const silent: string[] = [];
     for (const bead of SAMPLE) {
       const moved = mutate(bead);

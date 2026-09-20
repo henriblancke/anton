@@ -117,6 +117,163 @@ describe("getTicketDetail contract status", () => {
   });
 });
 
+// Direct coverage for holdsRunOf (unexported, so exercised through getTicketDetail) — the read-path
+// half of the canMarkDone/holdsRun gap two rounds of PR review flagged on ticket-state-bar.tsx. It
+// has to agree with operatorQueue's own `holdsRun` (operator-queue.ts), which operator-queue.test.ts
+// already pins, so these mirror that file's fixtures rather than inventing new ones.
+describe("getTicketDetail holdsRun", () => {
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("holds no run for the run target itself — nothing holds it, it IS the work", async () => {
+    fakeBd([bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"] })]);
+
+    const detail = await getTicketDetail(project, "f1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
+  it("holds a run for a human ticket inside an approved, non-human run target", async () => {
+    fakeBd([
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(true);
+  });
+
+  it("holds no run when the target itself is agent:human — execute-epic poisons it before dispatch", async () => {
+    // Same shape the earlier PR review round flagged: the target was relabelled agent:human out
+    // from under a ticket that already had a gate armed on it. No gate is ever (re-)armed here, so
+    // Mark done must not be withheld as if one were.
+    fakeBd([
+      bead({ id: "f1", title: "Buy the domain", issue_type: "feature", labels: ["agent:human"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
+  it("holds no run once the target has closed — no run is left to resume and reach it", async () => {
+    // Codex review (PR #288): a human child left open under an already-closed, non-human target is
+    // stranded — no run will ever arm a gate on it again — so Mark done must be offered, not withheld
+    // as if a live run still owned it.
+    fakeBd([
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", status: "closed", labels: ["approved"] }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
+  it("holds no run for a task parented directly on a container epic — no ancestor is a run target", async () => {
+    // A container epic (one with a feature child elsewhere) is never a card (boardCards), so a
+    // sibling task parented on it has no run-target ancestor at all. This must read the same as
+    // liveRunTargetOf (ticket-view.ts, shared with close-human.ts): a divergent walk that fell back
+    // to the immediate parent read the container as still holding the ticket (PR #288 review),
+    // which offered Mark done here while closeHumanTicket 409'd pointing at a target that never runs.
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic" }),
+      bead({ id: "f1", issue_type: "feature", parent: "e1", labels: ["approved"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+
+  it("holds no run once the target is deferred — snoozed, so no run reaches it either", async () => {
+    fakeBd([
+      bead({
+        id: "f1",
+        title: "Ship billing",
+        issue_type: "feature",
+        status: "deferred",
+        labels: ["approved"],
+      }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1", labels: ["agent:human"] }),
+    ]);
+
+    const detail = await getTicketDetail(project, "f1.1");
+
+    expect(detail.holdsRun).toBe(false);
+  });
+});
+
+// Direct coverage for hasOpenDescendantsOf (unexported, exercised through getTicketDetail) — the
+// read-path half of the same canMarkDone gap the P288 review flagged on close-human.ts: a human
+// epic/feature with open work still under it must read as such so ticket-state-bar.tsx can withhold
+// Mark done exactly where closeHumanTicket would 409. Has to agree with operatorQueue's own
+// `hasOpenDescendants`, which operator-queue.test.ts already pins, so these mirror that file's shape.
+describe("getTicketDetail hasOpenDescendants", () => {
+  beforeEach(() => resetIssueSnapshots());
+  afterEach(() => vi.restoreAllMocks());
+
+  it("flags a human epic that still has an open child under it", async () => {
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(true);
+  });
+
+  it("does not flag it once the child has closed", async () => {
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1", status: "closed" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+
+  it("never flags a task/bug — it is always a leaf, whatever its own status", async () => {
+    fakeBd([bead({ id: "t-1" })]);
+
+    const detail = await getTicketDetail(project, "t-1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+
+  it("does not flag it for an open molecule/gate under it — pipeline plumbing, not user work", async () => {
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1" }),
+      bead({ id: "e1.2", issue_type: "gate", parent: "e1.1" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+
+  it("does not flag it for a task poured under an open molecule — the whole subtree is pruned", async () => {
+    // Codex review (PR #288): filtering only the molecule/gate NODES still counted a poured `task`
+    // step underneath them as open work, so this withheld Mark done for as long as the run lasted
+    // even though closeHumanTicket's own (now-shared) read would have allowed the close.
+    fakeBd([
+      bead({ id: "e1", issue_type: "epic", labels: ["agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1" }),
+      bead({ id: "e1.2", issue_type: "task", parent: "e1.1" }),
+    ]);
+
+    const detail = await getTicketDetail(project, "e1");
+
+    expect(detail.hasOpenDescendants).toBe(false);
+  });
+});
+
 describe("updateTicket read economy", () => {
   beforeEach(() => resetIssueSnapshots());
   afterEach(() => vi.restoreAllMocks());
@@ -155,6 +312,78 @@ describe("updateTicket read economy", () => {
     expect(detail.epicAssignee).toBe("alice");
     // At most the background refresh the client's next poll shares — never awaited here.
     expect(bd.list.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it("reads the board after saving a parentless epic — hasOpenDescendants needs it even though holdsRun does not", async () => {
+    const bd = fakeBd([
+      bead({ id: "e-1", title: "Epic", issue_type: "epic" }),
+      bead({ id: "e-1.1", issue_type: "task", parent: "e-1" }),
+    ]);
+    await getTicketDetail(project, "e-1"); // warm the board
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "e-1", { title: "New" });
+
+    expect(detail.title).toBe("New");
+    // Unlike a parentless task/bug (a leaf, exempt above), an epic/feature can hold children
+    // regardless of its own parent — the zero-spawn shortcut must not apply to it.
+    expect(detail.hasOpenDescendants).toBe(true);
+    expect(bd.list).toHaveBeenCalled();
+  });
+
+  it("reads the board after saving a parentless agent:human task with an open child", async () => {
+    // Codex review (PR #288): bd nesting is type-agnostic, so a parentless task/bug/chore is NOT
+    // always a leaf — the old shortcut assumed it was and reported this ticket as having no open
+    // descendants, exposing Mark done even though closeHumanTicket would 409 on the open child.
+    const bd = fakeBd([
+      bead({ id: "t-1", title: "Old", labels: ["agent:human"] }),
+      bead({ id: "t-1.1", issue_type: "task", parent: "t-1" }),
+    ]);
+    await getTicketDetail(project, "t-1"); // warm the board
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "t-1", { title: "New" });
+
+    expect(detail.title).toBe("New");
+    expect(detail.hasOpenDescendants).toBe(true);
+    expect(bd.list).toHaveBeenCalled();
+  });
+
+  it("keeps the zero-spawn shortcut for a parentless non-human task, even with an open child", async () => {
+    // hasOpenDescendants is never READ off non-human work (Mark done only renders for agent:human),
+    // so an inaccurate answer here is harmless and the save stays cheap.
+    const bd = fakeBd([
+      bead({ id: "t-1", title: "Old" }),
+      bead({ id: "t-1.1", issue_type: "task", parent: "t-1" }),
+    ]);
+    await getTicketDetail(project, "t-1");
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "t-1", { title: "New" });
+
+    expect(detail.title).toBe("New");
+    expect(bd.list).not.toHaveBeenCalled();
+  });
+
+  it("reads the board for a parentless agent:human task held by an ordinary blocks dependency", async () => {
+    // Same gap, the other predicate: `closeHumanTicket` also 409s on any open `blocks` dependency,
+    // not just an open descendant or a live run — the board read must cover it too.
+    const bd = fakeBd([
+      bead({ id: "b-1" }),
+      bead({
+        id: "t-1",
+        title: "Old",
+        labels: ["agent:human"],
+        dependencies: [{ issue_id: "t-1", depends_on_id: "b-1", type: "blocks" }],
+      }),
+    ]);
+    await getTicketDetail(project, "t-1");
+    bd.list.mockClear();
+
+    const detail = await updateTicket(project, "t-1", { title: "New" });
+
+    expect(detail.hasOpenBlockers).toBe(true);
+    expect(bd.list).toHaveBeenCalled();
   });
 });
 

@@ -94,6 +94,12 @@ export type ReviewGateOutcome =
 
 export interface ReviewGateResult {
   outcome: ReviewGateOutcome;
+  /**
+   * The fork-point commit every round was judged against — pinned once, up front (see the comment
+   * at its resolution below), so a caller persisting a resume key off a `clean` verdict reuses this
+   * SHA rather than re-resolving the movable branch ref after the gate returns.
+   */
+  baseRev: string;
   /** Every round that ran, in order — each with its validated score for the call-site to persist. */
   rounds: ReviewRound[];
   /**
@@ -329,6 +335,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
    * exactly the content it commits — so a converging review never runs the suite twice per round.
    */
   let verified: VerifyGateOutcome[] | undefined;
+  /**
+   * The blocking findings the immediately preceding round reported — undefined on round 1. Handed to
+   * the next round's reviewer so it can tell a finding it raised itself apart from one this fix
+   * session was actually dispatched to close (see {@link ReviewRun.previousBlocking}).
+   */
+  let previousBlocking: ReviewFinding[] | undefined;
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -354,6 +366,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       readState,
       restoreState,
       verified,
+      previousBlocking,
       ...(args.assertLeaseHeld ? { assertLeaseHeld: args.assertLeaseHeld } : {}),
     });
     reviewer = review.reviewer;
@@ -380,7 +393,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
     // A reviewer that never reported, or reported an unusable score, has told us nothing about the
     // work — the run is handed back with whatever findings were salvaged, never as a clean review.
-    if (!review.report.ok) return { outcome: "protocol-violation", rounds, unresolved, reviewer };
+    if (!review.report.ok) return { outcome: "protocol-violation", baseRev, rounds, unresolved, reviewer };
 
     // The score-regression alarm (anton-i98r), read across every round so far. Checked BEFORE the
     // clean and cap exits, and so ahead of both: a run the reviewer has scored low K times running
@@ -390,19 +403,23 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // score that isn't moving) is the more useful thing to say about why the run stopped.
     const regression = detectScoreRegression(rounds, config.scoreAlarm);
     if (regression) {
-      return { outcome: "score-regression", rounds, unresolved, reviewer, score: review.report.score, regression };
+      return { outcome: "score-regression", baseRev, rounds, unresolved, reviewer, score: review.report.score, regression };
     }
 
     if (blocking.length === 0) {
-      return { outcome: "clean", rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "clean", baseRev, rounds, unresolved, reviewer, score: review.report.score };
     }
     if (round === config.maxRounds) {
-      return { outcome: "unresolved", rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: review.report.score };
     }
 
     // Replaces, never accumulates: this round was shown the previous carry and restated whatever
     // still applied, so its advisories are the whole open set going into the next round.
     carried = findings.filter((f) => f.severity === "advisory");
+    // This round's blocking findings become the NEXT round's `previousBlocking` — the fix session
+    // below is dispatched against exactly this set, so the reviewer that reads its result next is
+    // told which class it was asked to close.
+    previousBlocking = blocking;
     args.assertLeaseHeld?.(); // don't write a fix under a lease that lapsed while reviewing
     const fix = await runGateFixSession({
       db,
@@ -432,7 +449,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
     if (!fix.committed) {
-      return { outcome: "stalled", rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "stalled", baseRev, rounds, unresolved, reviewer, score: review.report.score };
     }
   }
 
@@ -485,6 +502,8 @@ async function runReviewSession(args: {
   readDiff: (worktreePath: string, base: string) => Promise<BranchDiff>;
   /** Advisories still open from earlier rounds — this review restates or settles each. */
   carried: ReviewFinding[];
+  /** The BLOCKING findings the immediately preceding round reported. See {@link ReviewRun.previousBlocking}. */
+  previousBlocking?: ReviewFinding[];
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
@@ -603,6 +622,7 @@ async function runReviewSession(args: {
         // own diff could not have written, and that no commit landing on the base mid-review moves.
         baseRev: args.baseRev,
         carriedAdvisories: args.carried,
+        previousBlocking: args.previousBlocking,
         verified,
         gatesDiscarded,
       });

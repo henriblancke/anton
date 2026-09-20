@@ -70,14 +70,17 @@ import {
   ANTON_MARK,
   classifyReview,
   commentOnPr,
+  getPrComments,
   getPrReview,
   prNumberFromRef,
+  reactToReviewComment,
   reRequestReview,
   replyToReviewComment,
   resolveReviewThread,
   reviewersRequestingChanges,
   threadsNeedingAttention,
   type Actionable,
+  type PrReactionContent,
   type PrReview,
   type ReviewThread,
 } from "../git/pr";
@@ -95,7 +98,8 @@ import {
   resolveVerifyGates,
   type ProjectSettings,
 } from "../projects";
-import { runVerifyGates } from "./shell";
+import { captureVerifyGates } from "./shell";
+import { tailLines } from "./review-context";
 import { findOpenRunForEpic } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
@@ -104,9 +108,10 @@ import {
   parseThreadReport,
   type ThreadOutcome,
 } from "./review-fix-context";
-import { IN_REVIEW, safe } from "./review-fix-board";
+import { IN_REVIEW } from "./review-fix-board";
+import { safe } from "./safe";
 import { finalizeMergedEpic } from "./review-fix-finalize";
-import { PoisonError } from "./errors";
+import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
@@ -425,7 +430,7 @@ async function handleEpic(args: {
   return withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts } = await prepareFixWorktree({
+    const { worktree, conflicts, alreadyAhead } = await prepareFixWorktree({
       ctx,
       repo,
       branch,
@@ -448,6 +453,7 @@ async function handleEpic(args: {
       pr,
       verdict,
       conflicts,
+      alreadyAhead,
       branch,
       number,
     });
@@ -472,7 +478,7 @@ async function prepareFixWorktree(args: {
   number: number;
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
-}): Promise<{ worktree: Worktree; conflicts: string[] }> {
+}): Promise<{ worktree: Worktree; conflicts: string[]; alreadyAhead: boolean }> {
   const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } =
     args;
 
@@ -515,6 +521,13 @@ async function prepareFixWorktree(args: {
     mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
+  // Snapshot "ahead of origin" right after the fast-forward sync above and BEFORE the premerge
+  // below — the premerge's own auto-merge commit (see its "clean auto-merge" comment) would
+  // otherwise put the branch ahead for a reason that has nothing to do with a prior session's or
+  // operator's own commits, and the caller uses this specifically to recognize THAT: a resume whose
+  // branch already carries committed work (anton-2wklm).
+  const alreadyAhead = await branchAheadOfRemote(repo, branch);
+
   // This premerge brings in a DIFFERENT ref than the sync above (`origin/${baseBranch}`, the PR's
   // base, not `origin/${branch}`), so it needs the identical incoming-ref-aware resolution — the
   // sync's own comment explains why resolveHooksPathOverride (answering "what does the CURRENT
@@ -531,7 +544,7 @@ async function prepareFixWorktree(args: {
   // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
   const conflicts = await premergeBase(repo, worktree.path, pr, baseBranch, number);
   await ctx.heartbeat();
-  return { worktree, conflicts };
+  return { worktree, conflicts, alreadyAhead };
 }
 
 /** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
@@ -574,6 +587,8 @@ async function runFixSession(args: {
   pr: PrReview;
   verdict: Actionable;
   conflicts: string[];
+  /** Ahead of origin before this run touched anything — see {@link prepareFixWorktree}. */
+  alreadyAhead: boolean;
   branch: string;
   number: number;
 }): Promise<boolean> {
@@ -589,6 +604,7 @@ async function runFixSession(args: {
     pr,
     verdict,
     conflicts,
+    alreadyAhead,
     branch,
     number,
   } = args;
@@ -607,6 +623,43 @@ async function runFixSession(args: {
   ctx.report({ sessionId, cwd: worktree.path, routing: claudeRouting(settings) });
 
   try {
+    // A resume can land here with the fix already committed on the branch — an operator resolving
+    // what a red gate named (a migration re-stamp, say) and hitting resume rather than a fresh
+    // claude session re-diagnosing feedback that's already handled. Detecting that BEFORE the claude
+    // dispatch is what makes the human loop cheap: the gates still gate (a red one parks exactly as
+    // it would after a claude run), but a green one pushes the operator's own commits straight
+    // through instead of paying for a session that would just re-produce them. `alreadyAhead` is
+    // snapshotted before `prepareFixWorktree`'s own premerge step, which can itself land an unpushed
+    // auto-merge commit — that must still go through claude + gates normally, not take this shortcut.
+    //
+    // `alreadyAhead` only says the branch carries prior commits — it says nothing about that same
+    // premerge step, which runs unconditionally and can hand back a FRESH, unresolved conflict
+    // (literal markers + MERGE_HEAD) alongside it. Nothing in this fast path can resolve those
+    // markers — only claude does that, via the prompt built below — so a fresh conflict must fall
+    // through to the normal dispatch path even when the branch is already ahead. Skipping claude
+    // here would otherwise let the gate run against literal conflict text and, on a red result,
+    // have the next worktree reap silently discard the unresolved merge while notifyGateParked
+    // claims it was "resolved and committed locally".
+    if (alreadyAhead && conflicts.length === 0) {
+      await appendSessionLog(
+        logPath,
+        `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
+      );
+      await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+      const pushed = await commitAndPushFix(
+        repo,
+        worktree.path,
+        epic.id,
+        branch,
+        number,
+        settings,
+        ctx.signal,
+      );
+      await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
+      await endSession(db, clock, sessionId, "done");
+      return pushed;
+    }
+
     await appendSessionLog(
       logPath,
       `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
@@ -645,6 +698,16 @@ async function runFixSession(args: {
       throw new Error(
         `claude reported an error resolving PR #${number}: ${result.text ?? "unknown"}`,
       );
+    }
+
+    // premergeBase left any base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for
+    // this same session to resolve alongside the review feedback. Commit that resolution NOW, before
+    // the gates run: a red gate below still throws and parks the branch, but the merge itself is
+    // already landed rather than sitting as an uncommitted resolution the next re-run's fresh
+    // worktree would simply discard (anton-vtex7). Nothing is pushed here — publication stays behind
+    // the gates. No conflicts to resolve → nothing to commit yet → this run is unchanged.
+    if (conflicts.length > 0) {
+      await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal);
     }
 
     await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
@@ -689,8 +752,40 @@ async function runFixSession(args: {
     return true;
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
+    // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say
+    // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
+    // only a stale badge, not why anton stopped (anton-gvqk3).
+    if (isPoisonError(e)) {
+      await notifyGateParked({ repo, number, error: e, conflicts, signal: ctx.signal });
+    }
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
+}
+
+/**
+ * Tell the PR why anton stopped: the gate/blocker a poison park named, plus whether a base-branch
+ * merge is already resolved and committed locally (unpushed) so the reader isn't left guessing what
+ * state the branch is in. Carries {@link ANTON_MARK} like every other anton comment, so the review
+ * sweep's own `threadsNeedingAttention` never mistakes it for a human's. Idempotent against the PR's
+ * comment history rather than any local state — a resumed job parking on the SAME gate is a fresh
+ * process with nothing of its own to remember, but the PR remembers what was already said on it.
+ */
+export async function notifyGateParked(args: {
+  repo: string;
+  number: number;
+  error: Error;
+  conflicts: string[];
+  signal: AbortSignal;
+}): Promise<void> {
+  const { repo, number, error, conflicts, signal } = args;
+  const mergeNote =
+    conflicts.length > 0
+      ? " The base branch merge was resolved and committed locally (not yet pushed)."
+      : "";
+  const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}`;
+  const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
+  if (existing.includes(body)) return;
+  await safe(() => commentOnPr(repo, number, body, signal));
 }
 
 /** The per-PR worker has no pipeline step; its target labels are its routing context. */
@@ -698,34 +793,49 @@ export function resolveReviewFixModel(settings: ProjectSettings, epic: Pick<Bead
   return resolveModel(settings, { jobType: "review-fix-pr", labels: epic.labels });
 }
 
+/** Cap on the gate output a poison park carries — enough to act on, not the whole log. */
+const GATE_FAILURE_OUTPUT_CHARS = 3000;
+
 /**
  * Optional verify gates before pushing (same mechanism as execution, anton-3oh8): tests +
- * operator-pinned lint/typecheck/build. Absent → no gates run. Throws on the first non-zero exit.
+ * operator-pinned lint/typecheck/build. Absent → no gates run.
+ *
+ * A red gate here poisons on the spot instead of throwing a plain (retryable) error. Unlike a
+ * ticket attempt, this fix session already ran and already committed everything it has authority
+ * over — a retry re-dispatches claude against the exact same tree and base, which can only
+ * reproduce the exact same failure (fati-87h burned three identical attempts on a deterministic
+ * gate this way). `captureVerifyGates` (not `runVerifyGates`) is called directly so the failure
+ * carries the gate's output, not just its label and exit code.
+ *
+ * Genuinely transient failures — an aborted signal, a killed process — never reach the check
+ * below: `captureVerifyGates` REJECTS for those (it never returns a red outcome for them), so they
+ * propagate as an ordinary error the runner still retries.
  */
-async function runTestGate(
+export async function runTestGate(
   settings: ProjectSettings,
   cwd: string,
   signal: AbortSignal,
   logPath: string,
   number: number,
 ): Promise<void> {
-  await runVerifyGates(
-    resolveVerifyGates(settings),
-    cwd,
-    signal,
-    logPath,
-    (gate, code) =>
-      `${gate.label} gate failed after review-fix for PR #${number} (exit ${code})`,
+  const outcomes = await captureVerifyGates(resolveVerifyGates(settings), cwd, signal, logPath);
+  const red = outcomes.find((o) => !o.ok);
+  if (!red) return;
+  // Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
+  throw new PoisonError(
+    `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
+      tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
   );
 }
 
 /**
- * Commit claude's fix and push the branch. Pushes if this run committed OR a prior attempt left
- * commits unpushed (e.g. a push failed after committing, then the retry's claude produced no new
- * diff). Otherwise there is genuinely nothing to send — a clean no-op, not a silent skip of
- * pending work. Returns whether anything was pushed.
+ * Stage whatever is in the worktree and commit it, with the recovery a commit timeout needs. Split
+ * out of `commitAndPushFix` (anton-vtex7) so `runFixSession` can land a resolved base merge BEFORE
+ * the verify gates run, while the push itself still waits behind them. Returns whether a commit
+ * exists to push (this call made one, or the tree had nothing new to add) and the hooksPath
+ * resolved for it, which `commitAndPushFix` reuses for the push.
  */
-async function commitAndPushFix(
+async function commitFix(
   repo: string,
   worktreePath: string,
   epicId: string,
@@ -733,7 +843,7 @@ async function commitAndPushFix(
   number: number,
   settings: ProjectSettings,
   signal: AbortSignal,
-): Promise<boolean> {
+): Promise<{ committed: boolean; hooksPath: string | undefined }> {
   // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
   // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
   // INDEX, and claude's fix session may have checked a hooks-path submodule out at a new commit
@@ -775,6 +885,34 @@ async function commitAndPushFix(
     }
     committed = true;
   }
+  return { committed, hooksPath };
+}
+
+/**
+ * Commit claude's fix and push the branch. Pushes if this run committed (here, or already via the
+ * pre-gate `commitFix` call in `runFixSession` for a conflicted PR) OR a prior attempt left commits
+ * unpushed (e.g. a push failed after committing, then the retry's claude produced no new diff).
+ * Otherwise there is genuinely nothing to send — a clean no-op, not a silent skip of pending work.
+ * Returns whether anything was pushed.
+ */
+async function commitAndPushFix(
+  repo: string,
+  worktreePath: string,
+  epicId: string,
+  branch: string,
+  number: number,
+  settings: ProjectSettings,
+  signal: AbortSignal,
+): Promise<boolean> {
+  const { committed, hooksPath } = await commitFix(
+    repo,
+    worktreePath,
+    epicId,
+    branch,
+    number,
+    settings,
+    signal,
+  );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
   // pre-push hook that inspects the working tree must see the branch actually being pushed. The
@@ -797,12 +935,14 @@ interface ThreadReplyArgs {
 }
 
 /**
- * Reply to each reported inline thread, resolving the fixed ones. Replying to declined threads
- * (even when nothing was pushed) is what stops them being re-triaged every sweep — an unresolved
- * thread whose last comment is anton's is no longer actionable (see threadsNeedingAttention). A
- * "fixed" claim without a push is a fabrication — leave that thread untouched.
+ * Reply to each reported inline thread, react on it, and resolve the fixed ones. Replying to
+ * declined threads (even when nothing was pushed) is what stops them being re-triaged every sweep
+ * — an unresolved thread whose last comment is anton's is no longer actionable (see
+ * threadsNeedingAttention); the reaction is the free calibration signal on top, not a substitute
+ * for the reply. A "fixed" claim without a push is a fabrication — leave that thread untouched,
+ * reply and reaction both.
  */
-async function applyThreadOutcomes(args: {
+export async function applyThreadOutcomes(args: {
   repo: string;
   number: number;
   pr: PrReview;
@@ -837,6 +977,7 @@ async function recordThreadOutcome(
   await safe(() =>
     replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
   );
+  await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
   if (item.outcome === "fixed")
     await safe(() => resolveReviewThread(repo, thread.id, signal));
   await appendSessionLog(
@@ -848,6 +989,18 @@ async function recordThreadOutcome(
 /** What anton says on a thread claude reported without a reply of its own. */
 const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
   outcome === "fixed" ? "addressed in the latest push" : "left as-is";
+
+/** The reaction that turns a triaged outcome into the reviewer's free calibration signal. */
+const reactionForOutcome = (outcome: ThreadOutcome["outcome"]): PrReactionContent => {
+  switch (outcome) {
+    case "fixed":
+      return "+1";
+    case "left":
+      return "-1";
+    case "needs-human":
+      return "eyes";
+  }
+};
 
 /** Post the PR-level "pushed a fix, please re-review" comment and re-request the change reviewers. */
 async function notifyReReview(args: {

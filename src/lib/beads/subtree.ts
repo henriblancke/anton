@@ -13,11 +13,20 @@ import { beads, type Bead } from "./bd";
  * destroys.
  *
  * `keep` filters what is COLLECTED, never what is descended through — a settled bead is walked past
- * so open work beneath it is still found. Guards against a malformed parent cycle.
+ * so open work beneath it is still found. `prune`, when given, stops the walk from descending past a
+ * matching bead's own children — for a pipeline artifact (a poured `molecule`, its `gate` children)
+ * that means the whole subtree it coordinates is excluded, not just the artifact node itself; without
+ * it a `keep` that merely filters out the artifact still surfaces the `task` steps poured under it.
+ * Guards against a malformed parent cycle.
  *
  * Pure over a bead list, so a caller costs one bd read and is testable from a fixture board.
  */
-export function descendantsOf(board: Bead[], rootId: string, keep?: (bead: Bead) => boolean): Bead[] {
+export function descendantsOf(
+  board: Bead[],
+  rootId: string,
+  keep?: (bead: Bead) => boolean,
+  prune?: (bead: Bead) => boolean,
+): Bead[] {
   const childrenByParent = new Map<string, Bead[]>();
   for (const bead of board) {
     const parent = beads.parentOf(bead);
@@ -35,6 +44,7 @@ export function descendantsOf(board: Bead[], rootId: string, keep?: (bead: Bead)
     if (seen.has(bead.id)) continue;
     seen.add(bead.id);
     if (!keep || keep(bead)) found.push(bead);
+    if (prune?.(bead)) continue;
     const children = childrenByParent.get(bead.id) ?? [];
     for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
   }

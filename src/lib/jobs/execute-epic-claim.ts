@@ -20,7 +20,7 @@ import {
 import { resolveOperator } from "../operator";
 import { findRunBaseForkShaForBranch, getRunBaseForkSha, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { EpicRun } from "./execute-epic-run";
 import type { StepContext } from "./step-registry";
 

@@ -478,9 +478,10 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   }
 
   // The operator's own queue (anton-qfso.1): the approved `agent:human` beads anton refuses to
-  // dispatch. Derived from the SAME snapshot as the cards — excluding this work from the agent queue
-  // must not cost a read to find it again.
-  const humanWork = operatorQueue(workBeads);
+  // dispatch. Passed `allBeads`, not the pipeline-stripped `workBeads`: operatorQueue needs closed
+  // gate beads on hand to resolve `blocks` edges correctly (PR #288 review) — a gate missing from
+  // its lookup reads as an open blocker forever, even after it's closed.
+  const humanWork = operatorQueue(allBeads);
 
   // Every run target the board holds — cards and standalone chips alike — rolled up into the
   // project's score trend (anton-tprv). Off the labels already in this snapshot: no per-card read.

@@ -67,6 +67,29 @@ export const runs = sqliteTable("runs", {
   // freeze — a project on reviews that happened before those runs, or before the operator's last
   // re-arm. Recorded per attempt so the join cannot lie.
   reviewScore: integer("review_score"),
+  // What a CLEAN verdict passed on (anton-qmuyt): `<merge-base>:<HEAD>:<contract-fingerprint>`, so a
+  // resume can recompute the same tuple and skip a re-review that would judge byte-identical work.
+  // Written only on a clean verdict, never inferred or backfilled — a row with no key (every row
+  // written before this column existed, and every row whose review parked) always re-reviews. See
+  // review-key.ts.
+  reviewKey: text("review_key"),
+  // The advisory findings the clean verdict above left open, serialized — restored into the
+  // run-phase carry on a skip so `prBody` still shows them at the merge gate, exactly as a review
+  // that actually ran would have left them.
+  reviewKeyAdvisories: text("review_key_advisories"),
+  // The score THIS clean verdict earned, bound to `reviewKey` at the same write (anton-nyz1v #280
+  // review): `reviewScore` above is the row's mutable LATEST score, rewritten by every later
+  // `step:review` occurrence in the same formula — a resume that restores `reviewScore` off the row
+  // instead of off this column would hand an earlier gate's skip the score of a later, unrelated
+  // gate. Written only alongside `reviewKey`, on a clean verdict; never inferred or backfilled.
+  reviewKeyScore: integer("review_key_score"),
+  // The run's PR narrative, serialized (anton-fpkk8) — written whenever `step:describe` actually
+  // produces one, independent of `reviewKey` above (a describer that fails costs only itself, never
+  // the review verdict it rides alongside). Restored into the run-phase carry on the row a resume
+  // reuses in place, so a describer that fails on retry doesn't erase a narrative an earlier attempt
+  // already earned. Null on rows written before this column existed, and on every run whose
+  // describer never reported one — both resume with no narrative and no error.
+  narrative: text("narrative"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),
@@ -94,6 +117,9 @@ export const runs = sqliteTable("runs", {
   // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
   // write an index lookup instead of a table scan.
   index("runs_write_seq_idx").on(table.writeSeq),
+  // The run-resume query receives its lifecycle states as bound parameters. SQLite cannot prove
+  // those parameters imply a partial-index predicate, so keep status out of this ordered lookup.
+  index("runs_project_epic_updated_idx").on(table.projectId, table.epicBeadId, table.updatedAt),
 ]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
@@ -155,6 +181,15 @@ export const jobs = sqliteTable(
     uniqueIndex("jobs_active_sync_push_unique")
       .on(table.projectId)
       .where(sql`${table.type} = 'sync-push' and ${table.status} = 'queued'`),
+    // The runner binds lifecycle states as parameters. A normal composite index remains usable for
+    // those parameters, unlike a partial index whose state predicate SQLite cannot prove at plan time.
+    index("jobs_status_run_at_idx").on(table.status, table.runAt),
+    // The expired-lease arm of `leaseDue` has the same bound status predicate and participates in
+    // SQLite's multi-index OR plan, so give it a separate planner-compatible composite index.
+    index("jobs_status_lease_expires_at_idx").on(table.status, table.leaseExpiresAt),
+    // The Jobs UI paginates and counts a project's complete durable history newest first. Finished
+    // rows dominate this table, so the project prefix avoids scanning unrelated project histories.
+    index("jobs_project_updated_idx").on(table.projectId, table.updatedAt),
     // Serves the unwatched-park read (anton-kh98), which runs on every board render of a project
     // whose stall watcher is disarmed — the shipped default. Partial on 'parked' so it stays tiny
     // next to a jobs table that keeps every finished job for the life of the project, and carries
@@ -742,6 +777,9 @@ export const sessions = sqliteTable(
   (table) => [
     // Serves the jobs page's "which session did each of these rows open" read (one IN per page).
     index("sessions_job_idx").on(table.jobId),
+    // Run detail reads a run's sessions newest-first. `run_id` is globally unique, so including
+    // project_id would only widen the index without narrowing this predicate.
+    index("sessions_run_started_idx").on(table.runId, table.startedAt),
   ],
 );
 

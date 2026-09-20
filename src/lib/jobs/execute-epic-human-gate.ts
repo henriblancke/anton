@@ -18,7 +18,7 @@ import {
   ParkedAskError,
   StrandedHumanGateError,
 } from "./execute-epic-errors";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { RunPatch } from "../runs";
 
 // ── human wait (anton-287p) ──

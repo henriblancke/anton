@@ -15,7 +15,15 @@
 export type RunStatus = "queued" | "running" | "parked" | "done" | "failed";
 export type SessionStatus = "running" | "done" | "failed";
 /** Mirrors the `SessionKind` union in `src/lib/sessions.ts` for the kinds a run can surface. */
-export type SessionKind = "shape" | "execute" | "review" | "review-fix" | "interactive";
+export type SessionKind =
+  | "shape"
+  | "execute"
+  | "review"
+  | "review-fix"
+  | "review-skip"
+  /** The PR describer (anton-aucch) — a run-level dispatch, so a run surfaces it. */
+  | "describe"
+  | "interactive";
 
 export interface SessionSummary {
   id: string;

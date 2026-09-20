@@ -83,8 +83,10 @@ describeBd("execute-epic e2e — recovery & readiness (real handler · real bd/g
     const job1 = await driveEpicRun(runner, { projectId, epicBeadId: bugId });
     await expectJobStatus(tdb.db, job1, "done");
     expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-42");
+    // Scoped to `execute` — a standalone target files its run-level `describe` session under the SAME
+    // bead (the target IS the ticket), and that row is not one of the ticket's claude attempts.
     const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
-      (s) => s.beadId === bugId,
+      (s) => s.beadId === bugId && s.kind === "execute",
     );
     expect(sessionsAfter1).toHaveLength(1);
 
@@ -110,9 +112,11 @@ process.exit(0);`,
       await expectJobStatus(tdb.db, job2, "done");
       expect(beads.getPrRef(await beads.show(repo, bugId))).toBe("gh-99");
       // The standalone target is stage:in-review from attempt 1, so its ticket is resume-skipped —
-      // claude is not re-run; only the (agent-free) PR step executes on recovery.
+      // claude is not re-run for the WORK. Scoped to `execute` because the recovery re-walks the run
+      // phase, whose `step:describe` does dispatch (and records a `describe` session under this same
+      // bead) — it is not an attempt at the ticket.
       const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
-        (s) => s.beadId === bugId,
+        (s) => s.beadId === bugId && s.kind === "execute",
       );
       expect(sessionsAfter2).toHaveLength(1);
     } finally {
@@ -345,8 +349,14 @@ process.exit(0);`,
       childIds.includes(s.beadId!),
     );
     expect(sessions).toHaveLength(2);
+    // The feature bead was never IMPLEMENTED — the children were the unit of work. Scoped to
+    // `execute`, the kind a claude attempt at the work records under: the run-level `step:describe`
+    // files its own `describe` session under the run target, which is the feature, and that row says
+    // nothing about the feature having been implemented.
     expect(
-      (await tdb.db.select().from(schema.sessions)).some((s) => s.beadId === featureId),
+      (await tdb.db.select().from(schema.sessions)).some(
+        (s) => s.beadId === featureId && s.kind === "execute",
+      ),
     ).toBe(false);
     const feature = await beads.show(repo, featureId);
     expect(feature.status).not.toBe("closed");
@@ -442,7 +452,9 @@ process.exit(0);`,
       expect((await beads.show(repo, lateTaskId)).status).toBe("closed");
       const sessions = await tdb.db.select().from(schema.sessions);
       expect(sessions.some((s) => s.beadId === lateTaskId)).toBe(true);
-      expect(sessions.some((s) => s.beadId === featureId)).toBe(false);
+      // Never implemented itself — scoped to `execute` for the same reason as above: the run-level
+      // describer's session is filed under the feature and is not an attempt at its work.
+      expect(sessions.some((s) => s.beadId === featureId && s.kind === "execute")).toBe(false);
       const feature = await beads.show(repo, featureId);
       expect(feature.status).not.toBe("closed");
       expect(feature.labels ?? []).toContain("stage:in-review");

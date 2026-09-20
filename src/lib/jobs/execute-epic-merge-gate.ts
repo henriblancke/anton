@@ -5,7 +5,7 @@
  */
 import { beads, type Bead, type Gate } from "../beads/bd";
 import { prNumberFromRef } from "../git/pr";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 
 // ── merge wait (anton-k0kj) ──
 

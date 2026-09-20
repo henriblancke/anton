@@ -6,8 +6,17 @@ import { TicketStateBar } from "@/components/ticket/ticket-state-bar";
 import type { Stage, TicketDetail } from "@/lib/types";
 
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
+const { toast } = await import("sonner");
 
-const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean }) =>
+const detail = (over: {
+  stage?: Stage;
+  deferred?: boolean;
+  abandoned?: boolean;
+  agent?: string;
+  holdsRun?: boolean;
+  hasOpenDescendants?: boolean;
+  hasOpenBlockers?: boolean;
+}) =>
   ({
     id: "t-1",
     title: "Do the thing",
@@ -16,6 +25,10 @@ const detail = (over: { stage?: Stage; deferred?: boolean; abandoned?: boolean }
     type: "task",
     deferred: over.deferred ?? false,
     abandoned: over.abandoned ?? false,
+    agent: over.agent,
+    holdsRun: over.holdsRun,
+    hasOpenDescendants: over.hasOpenDescendants,
+    hasOpenBlockers: over.hasOpenBlockers,
   }) as TicketDetail;
 
 afterEach(() => {
@@ -115,5 +128,168 @@ describe("TicketStateBar", () => {
     );
     expect((screen.getByRole("button", { name: /Active/ }) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByRole("button", { name: /Snoozed/ }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("offers Mark done on an open agent:human bead — no run ever closes it", () => {
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={vi.fn()} />,
+    );
+    expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
+  });
+
+  it("withholds Mark done from agent work — a run is expected to close that", () => {
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "nextjs" })} onChanged={vi.fn()} />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a human bead that already settled — abandoned or done", () => {
+    const { rerender } = render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", abandoned: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+
+    rerender(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", stage: "done" })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a held ticket, and from a bead with open work under it", () => {
+    const { rerender } = render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", holdsRun: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+
+    rerender(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", hasOpenDescendants: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("withholds Mark done from a bead still held by an ordinary open blocks dependency", () => {
+    // PR #288 review: `closeHumanTicket` 409s on any open `blocks` dependency, not just a live run
+    // or open descendants, so this control must withhold on it too.
+    render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human", hasOpenBlockers: true })}
+        onChanged={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "Mark done" })).toBeNull();
+  });
+
+  it("arms a confirm before POSTing the close route, distinct from Abandon's reason form", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(JSON.stringify({ detail: detail({ agent: "human", stage: "done" }) }), {
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const onChanged = vi.fn();
+
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={onChanged} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(fetchMock).not.toHaveBeenCalled();
+    // No reason field, unlike Abandon — a delivery needs no justification.
+    expect(screen.queryByLabelText(/Reason/)).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm mark done" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/projects/anton/tickets/t-1/close");
+    expect(init.method).toBe("POST");
+  });
+
+  it("clears the Abandon confirmation when Mark done is armed instead", () => {
+    // Regression: arming Abandon then Mark done used to leave both confirmations mounted, so
+    // whichever finished first left the other stale-but-enabled to fire a second, 409ing POST.
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Abandoned/ }));
+    expect(screen.getByRole("button", { name: /Confirm abandon/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(screen.queryByRole("button", { name: /Confirm abandon/ })).toBeNull();
+    expect(screen.getByRole("button", { name: "Confirm mark done" })).toBeTruthy();
+  });
+
+  it("settles Mark done from a re-fetch when the close response body can't be decoded", async () => {
+    // Codex review (PR #288): res.ok is already true once the close commits server-side, so a
+    // truncated/undecodable body must not read as a failed close and strand the stale open detail
+    // on screen, inviting a retry that 409s on the bead this call already closed.
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("not json", { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: detail({ agent: "human", stage: "done" }) }), {
+          status: 200,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const onChanged = vi.fn();
+
+    render(
+      <TicketStateBar
+        slug="anton"
+        ticketId="t-1"
+        detail={detail({ agent: "human" })}
+        onChanged={onChanged}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm mark done" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1]![0]).toBe("/api/projects/anton/tickets/t-1");
+    expect(onChanged.mock.calls[0]![0].stage).toBe("done");
+    expect(toast.success).toHaveBeenCalledWith("Marked done");
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("clears the Mark done confirmation when Abandon is armed instead", () => {
+    render(
+      <TicketStateBar slug="anton" ticketId="t-1" detail={detail({ agent: "human" })} onChanged={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    expect(screen.getByRole("button", { name: "Confirm mark done" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Abandoned/ }));
+    expect(screen.queryByRole("button", { name: "Confirm mark done" })).toBeNull();
+    expect(screen.getByRole("button", { name: /Confirm abandon/ })).toBeTruthy();
   });
 });

@@ -12,14 +12,9 @@
  */
 import { beads, ownerOf, type Bead } from "../beads/bd";
 import { withBeadWriteLocks } from "../beads/claim-lock";
-import {
-  memoisedShow,
-  ridesOn,
-  safe,
-  stateOf,
-  type ReadBead,
-} from "./review-fix-board";
+import { memoisedShow, ridesOn, stateOf, type ReadBead } from "./review-fix-board";
 import { safeToRerunAtMerge } from "./review-fix-delivery";
+import { safe } from "./safe";
 import {
   disposeFollowUp,
   resolveFollowUp,

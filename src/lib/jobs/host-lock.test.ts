@@ -3,8 +3,8 @@
  * mutual exclusion, advisory (never-wedging) behavior under contention, and reclaim of a lock whose
  * owner died. Lock names are unique per test because the lock root is a real shared /tmp directory.
  */
-import { describe, expect, it } from "vitest";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { describe, expect, it, vi } from "vitest";
+import { mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -13,6 +13,270 @@ import { withHostLock } from "./host-lock";
 const LOCK_ROOT = join(tmpdir(), "anton-host-locks");
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Markers used to scope the node:fs/promises interception below to exactly one test each, so the
+// injected races never leak into the rest of the suite's real filesystem timing.
+const {
+  RESUME_MARKER,
+  GATE_MARKER,
+  FIRST_STAT_MARKER,
+  WRITE_VANISH_MARKER,
+  RECREATE_MARKER,
+  RETIRE_RACE_MARKER,
+  RETIRE_SWAP_MARKER,
+  RETIRE_SWAP_OCCUPIED_MARKER,
+  WRITE_FAIL_MARKER,
+  REPUBLISH_MARKER,
+  LATE_PUBLISH_MARKER,
+  MKDIR_GATE_RACE_MARKER,
+  SUCCESSOR_TOKEN,
+  D2_TOKEN,
+  CREATOR_TOKEN,
+} = vi.hoisted(() => ({
+  RESUME_MARKER: "test-resume-corrupt",
+  GATE_MARKER: "test-gate-ownership",
+  FIRST_STAT_MARKER: "test-first-snapshot-corrupt",
+  WRITE_VANISH_MARKER: "test-write-vanish",
+  RECREATE_MARKER: "test-recreate-before-publish",
+  RETIRE_RACE_MARKER: "test-retire-race",
+  RETIRE_SWAP_MARKER: "test-retire-swap",
+  RETIRE_SWAP_OCCUPIED_MARKER: "test-retire-swap-occupied",
+  WRITE_FAIL_MARKER: "test-write-fail",
+  REPUBLISH_MARKER: "test-republish-race",
+  LATE_PUBLISH_MARKER: "test-late-publish-race",
+  MKDIR_GATE_RACE_MARKER: "test-mkdir-gate-race",
+  SUCCESSOR_TOKEN: "11111111-1111-4111-8111-111111111111",
+  D2_TOKEN: "22222222-2222-4222-8222-222222222222",
+  CREATOR_TOKEN: "33333333-3333-4333-8333-333333333333",
+}));
+
+// All races below hinge on a pause between two specific awaits inside host-lock.ts that real
+// timing can't force deterministically (they'd need an actual 60s+ stall). Intercepting the fs
+// call that sits at the seam lets the peer's race action run at exactly the right moment instead.
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  const statCalls = new Map<string, number>();
+  const readFileCalls = new Map<string, number>();
+  const renameCalls = new Map<string, number>();
+  const mkdirCalls = new Map<string, number>();
+
+  const installSuccessor = async (dir: string) => {
+    await actual.rename(dir, `${dir}.retired-${SUCCESSOR_TOKEN}`);
+    await actual.mkdir(dir);
+    await actual.writeFile(
+      `${dir}/owner.json`,
+      JSON.stringify({ token: SUCCESSOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "successor" }),
+      "utf8",
+    );
+  };
+
+  return {
+    ...actual,
+    // Fires on the 2nd stat(dir) for the resume-corrupt test — the identity re-check inside
+    // write(), right after the first stat captured our own acquisition's mtime. Simulates a peer
+    // fully reclaiming and re-acquiring `dir` in the gap.
+    //
+    // Fires on the 1st stat(dir) for the first-snapshot-corrupt test — the very capture of
+    // `ourDirStat` right after our own mkdir(dir) resolved. Simulates a peer reclaiming `dir` and
+    // re-acquiring it before this creator ever gets to observe its own, correct identity.
+    //
+    stat: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && (path.includes(RESUME_MARKER) || path.includes(FIRST_STAT_MARKER))) {
+        const n = (statCalls.get(path) ?? 0) + 1;
+        statCalls.set(path, n);
+        const fireAt = path.includes(FIRST_STAT_MARKER) ? 1 : 2;
+        if (n === fireAt) {
+          await installSuccessor(path);
+        }
+      }
+      // Fires on the 3rd stat(dir) (bare path, no suffix) for the late-publish-race test —
+      // reclaim()'s own snapshot of `dir` passed to retire() as `expected`, taken right after the
+      // metadata recheck already found no holder published. Simulates the suspended creator
+      // resuming and publishing owner.json into `dir` in exactly that gap — the race the finding
+      // describes: publication doesn't change `dir`'s device+inode, so the snapshot alone can't
+      // reveal it; only retire()'s post-rename check of the content it actually moved can.
+      if (
+        typeof path === "string" &&
+        path.includes(LATE_PUBLISH_MARKER) &&
+        !path.includes(".reclaiming") &&
+        !path.includes(".retired-") &&
+        !path.endsWith("owner.json") &&
+        !path.endsWith(".tmp")
+      ) {
+        const n = (statCalls.get(path) ?? 0) + 1;
+        statCalls.set(path, n);
+        if (n === 3) {
+          await actual.writeFile(
+            `${path}/owner.json`,
+            JSON.stringify({ token: CREATOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "late-resumed-creator" }),
+            "utf8",
+          );
+        }
+      }
+      // Fires on retire()'s post-rename safeStat(dest) for the retire-swap-occupied test — right
+      // after this call's rename already grabbed the successor and moved it to `dest`, but before
+      // the mismatch is detected. Simulates a third process racing `mkdir(dir)` into the now-vacant
+      // path in that exact gap, before the restore rename has a chance to run.
+      if (typeof path === "string" && path.includes(RETIRE_SWAP_OCCUPIED_MARKER) && path.includes(".retired-")) {
+        const n = (statCalls.get(path) ?? 0) + 1;
+        statCalls.set(path, n);
+        if (n === 1) {
+          const dir = path.slice(0, path.indexOf(".retired-"));
+          await actual.mkdir(dir).catch(() => {});
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.stat(path, ...rest);
+    },
+    // Fires on the 1st rename(dir, ...) for the retire-swap test — retire()'s own rename of `dir`
+    // to its tombstone, right after reclaim() captured the orphan's real identity as `expected` but
+    // before this call's rename acts on it. Simulates a peer that fully retired the same orphan and
+    // re-acquired `dir` as a live successor in exactly that gap, so this call's rename grabs the
+    // successor instead of the orphan it was meant to retire.
+    rename: async (oldPath: unknown, newPath: unknown, ...rest: unknown[]) => {
+      // RETIRE_SWAP_OCCUPIED_MARKER embeds RETIRE_SWAP_MARKER as a substring, so this branch also
+      // covers the retire-swap-occupied test below.
+      if (
+        typeof oldPath === "string" &&
+        oldPath.includes(RETIRE_SWAP_MARKER) &&
+        !oldPath.includes(".retired-") &&
+        !oldPath.includes(".reclaiming")
+      ) {
+        const n = (renameCalls.get(oldPath) ?? 0) + 1;
+        renameCalls.set(oldPath, n);
+        if (n === 1) {
+          await installSuccessor(oldPath);
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.rename(oldPath, newPath, ...rest);
+    },
+    // Fires on the 2nd readFile(metaPath) for the gate-ownership test — reclaim()'s own
+    // readHolder(), right after it captured its own gate's mtime. Simulates a peer reaping that
+    // (apparently stale) gate and creating its own replacement in the gap.
+    readFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && path.includes(GATE_MARKER) && path.endsWith("owner.json")) {
+        const n = (readFileCalls.get(path) ?? 0) + 1;
+        readFileCalls.set(path, n);
+        if (n === 2) {
+          const dir = path.slice(0, -"/owner.json".length);
+          const gate = `${dir}.reclaiming`;
+          await actual.rm(gate, { recursive: true, force: true }).catch(() => {});
+          await actual.mkdir(gate);
+        }
+      }
+      // Fires on the 1st readFile of a gate's token file for the retire-race test — reclaim()'s own
+      // pre-retire re-verification that it still owns the gate (now bound to the generation token,
+      // not gate identity, per anton-nd2n: an inode-recycling filesystem could otherwise make a
+      // successor's gate identity-match ours). Simulates a peer reaping this decider's gate as
+      // stale, a fresh decider (D2) fully reclaiming the same orphan under its own token, and D2
+      // re-acquiring `dir` live — all inside the window between this decider's abandonment check
+      // and its retire call.
+      if (
+        typeof path === "string" &&
+        path.includes(RETIRE_RACE_MARKER) &&
+        path.includes(".reclaiming") &&
+        path.endsWith("/token")
+      ) {
+        const n = (readFileCalls.get(path) ?? 0) + 1;
+        readFileCalls.set(path, n);
+        if (n === 1) {
+          const gate = path.slice(0, -"/token".length);
+          const dir = gate.slice(0, -".reclaiming".length);
+          // Peer reaps this decider's gate as stale...
+          await actual.rm(gate, { recursive: true, force: true }).catch(() => {});
+          // ...a fresh decider (D2) wins the gate, decides the same orphan is abandoned, and retires
+          // it under its own token...
+          await actual.mkdir(gate);
+          await actual.rename(dir, `${dir}.retired-d2-reclaim`);
+          await actual.rm(gate, { recursive: true, force: true }).catch(() => {}); // D2's own cleanup
+          // ...and re-acquires `dir` as a live successor before this decider resumes.
+          await actual.mkdir(dir);
+          await actual.writeFile(
+            `${dir}/owner.json`,
+            JSON.stringify({ token: D2_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "d2" }),
+            "utf8",
+          );
+        }
+      }
+      // Fires on the 1st readFile of a gate's token file for the republish-race test —
+      // reclaim()'s own re-verification that it still owns the gate, immediately before its final
+      // metadata re-check. Simulates the suspended creator resuming and publishing owner.json into
+      // `dir` in that exact gap: `dir`'s own device+inode never changes when its contents do, so
+      // this must be caught by re-reading the metadata, not by the gate ownership check alone.
+      if (
+        typeof path === "string" &&
+        path.includes(REPUBLISH_MARKER) &&
+        path.includes(".reclaiming") &&
+        path.endsWith("/token")
+      ) {
+        const n = (readFileCalls.get(path) ?? 0) + 1;
+        readFileCalls.set(path, n);
+        if (n === 1) {
+          const gate = path.slice(0, -"/token".length);
+          const dir = gate.slice(0, -".reclaiming".length);
+          await actual.writeFile(
+            `${dir}/owner.json`,
+            JSON.stringify({ token: CREATOR_TOKEN, pid: process.pid, heartbeatAt: Date.now(), label: "resumed-creator" }),
+            "utf8",
+          );
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.readFile(path, ...rest);
+    },
+    // Fires on the metadata write for the write-vanish test — simulates `dir` being reclaimed out
+    // from under a live acquisition in the gap write() itself introduces (after its own ownership
+    // checks pass, before the write that publishes/refreshes metadata actually lands).
+    //
+    // Fires on the metadata write for the recreate-before-publish test — simulates a peer fully
+    // reclaiming and recreating `dir` in that same gap, but before the peer's own first write has
+    // published any metadata. write()'s tmp file lands inside the (empty) successor directory by
+    // pathname; the second identity check right after this must catch the swap and back off before
+    // the rename that would otherwise publish into the successor's directory.
+    writeFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === "string" && path.includes(WRITE_VANISH_MARKER) && path.endsWith(".tmp")) {
+        const dir = path.slice(0, path.indexOf("/owner.json."));
+        await actual.rm(dir, { recursive: true, force: true }).catch(() => {});
+      }
+      if (typeof path === "string" && path.includes(RECREATE_MARKER) && path.endsWith(".tmp")) {
+        const dir = path.slice(0, path.indexOf("/owner.json."));
+        await actual.rename(dir, `${dir}.retired-recreate-race`);
+        await actual.mkdir(dir);
+      }
+      // Fires on every metadata write for the write-fail test — simulates a transient I/O error
+      // (e.g. a full disk or an EIO) on the write itself, unlike the vanish/recreate cases above:
+      // `dir` is left standing, untouched, still owned by this acquisition.
+      if (typeof path === "string" && path.includes(WRITE_FAIL_MARKER) && path.endsWith(".tmp")) {
+        throw new Error("simulated transient write failure");
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.writeFile(path, ...rest);
+    },
+    // Fires on the 1st mkdir(dir) for the mkdir-gate-race test — the acquire primitive itself,
+    // right after the loop's own gate check found nothing live. Simulates a reclaimer creating its
+    // gate in the gap between that check and this mkdir: by the time this acquisition's mkdir
+    // resolves, a decision is already in flight for the same `dir`.
+    mkdir: async (path: unknown, ...rest: unknown[]) => {
+      if (
+        typeof path === "string" &&
+        path.includes(MKDIR_GATE_RACE_MARKER) &&
+        !path.endsWith(".reclaiming")
+      ) {
+        const n = (mkdirCalls.get(path) ?? 0) + 1;
+        mkdirCalls.set(path, n);
+        if (n === 1) {
+          // @ts-expect-error -- forwarding whatever arguments the caller passed
+          const result = await actual.mkdir(path, ...rest);
+          await actual.mkdir(`${path}.reclaiming`);
+          return result;
+        }
+      }
+      // @ts-expect-error -- forwarding whatever arguments the caller passed
+      return actual.mkdir(path, ...rest);
+    },
+  };
+});
 
 describe("withHostLock", () => {
   it("serializes concurrent holders of the same lock", async () => {
@@ -109,6 +373,55 @@ describe("withHostLock", () => {
     expect(ran).toBe(true);
   });
 
+  it("reclaims an orphaned lock dir that never got its owner.json written", async () => {
+    const name = `test-orphan-stale-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    // Models a process killed between `mkdir` and the metadata write: the dir exists, empty, with
+    // no owner.json. Backdate its mtime past the stale window so it reads as an old orphan rather
+    // than a peer that just started.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    const start = Date.now();
+    // Large budget: a genuine reclaim finishes almost instantly. A regression to the old
+    // `holder?.token && retire(...)` short-circuit (which can never fire for a metadata-less
+    // holder) would instead fall through to the advisory wait-out-the-budget path, which a small
+    // maxWaitMs can't distinguish from success — so use a budget big enough that only a real
+    // reclaim finishes inside it.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+    const elapsedMs = Date.now() - start;
+
+    expect(ran).toBe(true);
+    expect(elapsedMs).toBeLessThan(1000);
+
+    // The reclaim path retires the orphan to a token-specific tombstone before re-acquiring the
+    // live path — a fingerprint the advisory fallback never produces, since it never touches `dir`.
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
+  });
+
+  it("does not steal a metadata-less lock dir still inside the stale window", async () => {
+    const name = `test-orphan-fresh-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    // Same empty, metadata-less dir, but freshly created — a peer could be mid-write right now, so
+    // it must be waited on rather than reclaimed.
+    await mkdir(dir, { recursive: true });
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 100 });
+
+    // Advisory fallback still lets it run unlocked once the budget elapses, but the original dir
+    // must still be standing at its live path — reclaimed dirs get renamed away by `retire`.
+    expect(ran).toBe(true);
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
   it("does not let a second stale reclaimer remove the live path", async () => {
     const name = `test-reclaim-race-${process.pid}`;
     const dir = join(LOCK_ROOT, name);
@@ -131,6 +444,65 @@ describe("withHostLock", () => {
     expect(stillLive.token).toBe(oldToken);
   });
 
+  it("reaps an orphaned reclaiming gate left by a killed reclaimer", async () => {
+    const name = `test-reclaim-gate-orphan-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // An orphaned holder dir, old enough to be reclaimable...
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+    // ...but a `.reclaiming` gate left behind by an earlier reclaimer that was killed between its
+    // own `mkdir(gate)` and the `finally`'s `rm(gate)`. Backdated past STALE_AFTER_MS so it reads
+    // as abandoned too, rather than a live decision in progress.
+    await mkdir(gate, { recursive: true });
+    await utimes(gate, old, old);
+
+    let ran = false;
+    const start = Date.now();
+    // Without reaping, `mkdir(gate)` keeps hitting EEXIST forever and reclaim() always returns
+    // false, so this can only pass by waiting out the full advisory budget — use a budget large
+    // enough that only an actual reclaim (one poll cycle to reap the gate, then a second to retire
+    // the dir) finishes inside it.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+    const elapsedMs = Date.now() - start;
+
+    expect(ran).toBe(true);
+    expect(elapsedMs).toBeLessThan(4000);
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
+  });
+
+  it("does not let two concurrent reclaimers of the same orphan both enter the section", async () => {
+    const name = `test-reclaim-concurrent-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    // Same metadata-less orphan as the "never got its owner.json written" case, but this time two
+    // peers race to reclaim it at once. Each used to mint its own random token and retire
+    // independently — this reproduces that race directly rather than relying on real OS timing.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let active = 0;
+    let maxActive = 0;
+    const section = async () => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await sleep(30);
+      active--;
+    };
+
+    await Promise.all([
+      withHostLock(name, section, { maxWaitMs: 5000 }),
+      withHostLock(name, section, { maxWaitMs: 5000 }),
+      withHostLock(name, section, { maxWaitMs: 5000 }),
+    ]);
+
+    expect(maxActive).toBe(1);
+  });
+
   it("reports the holder to onWait only when contended", async () => {
     const name = `test-onwait-${process.pid}`;
     const uncontended: unknown[] = [];
@@ -147,5 +519,357 @@ describe("withHostLock", () => {
     await holder;
 
     expect(seen).toEqual([process.pid]);
+  });
+
+  it("does not let a resumed creator corrupt a successor's lock", async () => {
+    const name = `${RESUME_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected stat() above fires between our own mkdir(dir) and our first metadata write,
+    // simulating a peer fully reclaiming `dir` and re-acquiring it in that gap — the exact window
+    // the finding describes as unprotected. This call must detect the swap and back off rather
+    // than writing into (or later retiring) the successor's directory.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(successor.token).toBe(SUCCESSOR_TOKEN);
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("does not let a creator whose very first identity snapshot was already wrong corrupt a successor's lock", async () => {
+    const name = `${FIRST_STAT_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected stat() above fires on the FIRST stat(dir) call — the capture of `ourDirStat`
+    // itself, right after our own mkdir(dir) resolved — simulating a peer fully reclaiming and
+    // re-acquiring `dir` before this creator ever observes its own correct identity. Unlike the
+    // "resumed creator" case above, inode comparison can never catch this: `ourDirStat` itself is
+    // now the successor's inode, so every isOurDir() check would wrongly agree. Only the token
+    // cross-check in write()/release can save the successor here.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(successor.token).toBe(SUCCESSOR_TOKEN);
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("falls back to running unlocked when dir vanishes between the ownership checks and the metadata write", async () => {
+    const name = `${WRITE_VANISH_MARKER}-${process.pid}`;
+
+    // The injected writeFile() above fires on the initial metadata write and removes `dir` right
+    // before the real write lands, simulating a reclaim in the narrow gap between write()'s
+    // ownership checks (which both still pass, since nothing has raced yet at that point) and the
+    // write syscall itself. write() must swallow the resulting ENOENT and fall back to running `fn`
+    // unlocked rather than letting it escape withHostLock as a rejection.
+    let ran = false;
+    await expect(
+      withHostLock(name, async () => {
+        ran = true;
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(ran).toBe(true);
+  });
+
+  it("retires the lock dir when the initial publish fails outright with dir still ours", async () => {
+    const name = `${WRITE_FAIL_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected writeFile() above throws on the initial metadata write without touching `dir`,
+    // simulating a transient I/O error rather than a reclaim race. Unlike the write-vanish case,
+    // `dir` is still standing and still ours when write() gives up — if it were left behind
+    // metadata-less and un-heartbeated, every peer would misjudge it as "maybe mid-write" and wait
+    // out the full stale window before anyone could reclaim it.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The live path must be gone — retired to a token-specific tombstone — rather than left standing
+    // metadata-less for peers to wait out.
+    await expect(stat(dir)).rejects.toThrow();
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
+  });
+
+  it("does not let a resumed writer publish into a successor's dir recreated before its first write", async () => {
+    const name = `${RECREATE_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // The injected writeFile() above fires on the initial metadata write and swaps `dir` for a fresh
+    // (still metadata-less) directory right before the tmp file lands, simulating a peer fully
+    // reclaiming and re-acquiring `dir` in that gap — but before the peer's own first write has
+    // published anything. Unlike the write-vanish case, `dir` still exists, so the tmp write itself
+    // succeeds — silently landing inside the successor's directory instead of ours. The identity
+    // recheck right after must catch that swap and back off before the rename that would otherwise
+    // publish this write's stale token into the successor's directory.
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The successor's directory must still be standing, untouched by our write — no owner.json was
+    // ever published into it by the resumed creator.
+    expect((await stat(dir)).isDirectory()).toBe(true);
+    await expect(readFile(join(dir, "owner.json"), "utf8")).rejects.toThrow();
+  });
+
+  it("does not let a resumed reclaimer's cleanup remove a successor's reclaiming gate", async () => {
+    const name = `${GATE_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected readFile() above fires on reclaim()'s own readHolder() call — right
+    // after it captured its own gate's mtime — and simulates a peer reaping that gate as stale and
+    // creating its own replacement in the gap.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+
+    expect(ran).toBe(true);
+    // The reclaimer's own finally must not have deleted the successor's replacement gate by
+    // pathname alone — it must still be standing.
+    expect((await stat(gate)).isDirectory()).toBe(true);
+  });
+
+  it("does not let a suspended decider retire a successor's already-reacquired lock", async () => {
+    const name = `${RETIRE_RACE_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected readFile() above fires on reclaim()'s own re-verification of its gate
+    // (a generation-token comparison, not identity), right after this decider has already decided
+    // the orphan is abandoned — simulating a peer reaping this decider's gate, a fresh decider (D2)
+    // fully reclaiming the same orphan under its own token, and D2 re-acquiring `dir` live, all
+    // before this decider reaches its own retire call. Without re-checking gate ownership
+    // immediately before retire, this decider would rename D2's live directory away by pathname
+    // alone.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    // Short budget: D2's directory is never released in this test, so a correct run always falls
+    // through to the advisory timeout rather than ever reclaiming.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // D2's live acquisition must survive completely untouched.
+    const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(holder.token).toBe(D2_TOKEN);
+  });
+
+  it("does not retire a metadata-less orphan whose creator republished its lease before the retire", async () => {
+    const name = `${REPUBLISH_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected readFile() above fires on reclaim()'s own gate re-verification, right
+    // after this decider has already judged the directory abandoned, and simulates the suspended
+    // creator resuming and publishing owner.json in that exact gap — the race the finding
+    // describes: `dir`'s own state doesn't reveal the gate is still ours, so without a fresh
+    // metadata re-check immediately before retire(), this decider would still evict the creator
+    // that just legitimately claimed the lease.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    // Short budget: the creator's republished lease is never released in this test, so a correct
+    // run always falls through to the advisory timeout rather than ever reclaiming.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The republished lease must survive completely untouched — not retired out from under it.
+    const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(holder.token).toBe(CREATOR_TOKEN);
+  });
+
+  it("does not retire a metadata-less orphan whose creator publishes between the recheck and the retire snapshot", async () => {
+    const name = `${LATE_PUBLISH_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected stat() above fires on reclaim()'s snapshot of `dir` passed to retire()
+    // as `expected` — right after the metadata recheck already found nothing published — and
+    // simulates the suspended creator resuming and publishing owner.json in exactly that gap: the
+    // finding's race. `dir`'s device+inode never changes when its contents do, so the snapshot alone
+    // can't reveal the publish; retire() must bind the authorization check to the content its own
+    // rename actually moved, not to the earlier recheck, or it would still evict the creator that
+    // just legitimately claimed the lease.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    // Short budget: the creator's published lease is never released in this test, so a correct run
+    // always falls through to the advisory timeout rather than ever reclaiming.
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The published lease must survive completely untouched, still live at the original path — not
+    // retired to a tombstone out from under it.
+    const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(holder.token).toBe(CREATOR_TOKEN);
+  });
+
+  it("restores a successor's directory when retire()'s own rename grabs it instead of the orphan", async () => {
+    const name = `${RETIRE_SWAP_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // A metadata-less orphan old enough to be reclaimed, so the acquire loop drives straight into
+    // reclaim(). The injected rename() above fires on retire()'s own rename of `dir` to its
+    // tombstone — after retire() has already been handed the orphan's real, pre-swap identity as
+    // `expected`, but before the rename itself runs. It simulates a peer that fully retired this
+    // same orphan and re-acquired `dir` as a live successor in that exact gap, so this call's
+    // rename mechanically succeeds but grabs the successor's directory instead of the orphan.
+    // retire() must detect that mismatch against `expected` and restore the successor rather than
+    // leaving it stranded under this call's tombstone.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The successor's live acquisition must survive completely untouched, restored to `dir` rather
+    // than left sitting under a tombstone no peer will ever look for it under.
+    const successor = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(successor.token).toBe(SUCCESSOR_TOKEN);
+    expect((await stat(dir)).isDirectory()).toBe(true);
+  });
+
+  it("restores the displaced live successor even when a third acquisition fills the vacated dir first", async () => {
+    const name = `${RETIRE_SWAP_OCCUPIED_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+
+    // Same swap as above — retire()'s own rename grabs a live successor instead of the orphan it was
+    // meant to retire — but a third process also races an empty `mkdir(dir)` into the gap between
+    // that rename and the mismatch check, before the restore has a chance to run. The third process
+    // has published nothing yet, so it must not be allowed to strand the displaced successor (which
+    // is still running its own protected section under the identity that just got renamed away) —
+    // the restore must evict the empty newcomer and put the live successor back.
+    await mkdir(dir, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(dir, old, old);
+
+    let ran = false;
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 200 });
+
+    expect(ran).toBe(true); // advisory: still runs, just unlocked
+    // The live successor must end up back at `dir`, not the empty newcomer that raced in.
+    const holder = JSON.parse(await readFile(join(dir, "owner.json"), "utf8")) as { token: string };
+    expect(holder.token).toBe(SUCCESSOR_TOKEN);
+  });
+
+  it("waits for a live reclaim decision's gate instead of racing mkdir into its restore vacancy", async () => {
+    const name = `test-reclaim-gate-fence-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // A fresh reclaiming gate with no `dir` standing at all models the exact vacancy this fix
+    // closes: retire() has renamed `dir` away to a restore tombstone (e.g. on a verify failure) and
+    // hasn't put it back yet. Racing mkdir(dir) into that gap, as the old code did, would grab the
+    // path out from under the pending restore and leave the legitimate holder stranded while a
+    // second acquirer also believes it holds the lock.
+    await mkdir(gate, { recursive: true });
+
+    let started = false;
+    const run = withHostLock(name, async () => {
+      started = true;
+    }, { maxWaitMs: 2000 });
+
+    await sleep(150);
+    // Must be waiting on the fresh gate, not racing an empty mkdir(dir) into the vacancy.
+    expect(started).toBe(false);
+
+    // The decision completes and releases the gate; the path is free for a fresh acquisition.
+    await rm(gate, { recursive: true, force: true });
+    await run;
+    expect(started).toBe(true);
+  });
+
+  it("backs off a fresh mkdir(dir) when a reclaim gate appears right after it, instead of publishing into it", async () => {
+    const name = `${MKDIR_GATE_RACE_MARKER}-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+
+    // The injected mkdir() above fires right after this acquisition's own mkdir(dir) succeeds and
+    // plants a fresh reclaiming gate for the same `dir` — modeling a reclaimer whose gate creation
+    // raced in during the gap between the loop's gate check and this mkdir. Without a recheck right
+    // after mkdir, this acquisition would go on to publish owner.json while that decision is still
+    // live, and a restore it later triggers would find `dir` non-empty and fail, stranding the
+    // legitimate holder while this acquisition keeps running unaware — two holders at once. The fix
+    // must instead abandon this still-empty directory and wait out the gate like any other fresh one.
+    let started = false;
+    const run = withHostLock(name, async () => {
+      started = true;
+    }, { maxWaitMs: 2000 });
+
+    await sleep(150);
+    // Must have backed off rather than entered the section while the gate is live.
+    expect(started).toBe(false);
+    await expect(readFile(join(dir, "owner.json"), "utf8")).rejects.toThrow();
+
+    // The decision completes and releases the gate; the retry now succeeds normally.
+    await rm(gate, { recursive: true, force: true });
+    await run;
+    expect(started).toBe(true);
+    // A real acquire-then-release retires `dir` to a token-specific tombstone on the way out — a
+    // fingerprint the advisory-unlocked fallback never produces, since it never touches `dir` at all.
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
+  });
+
+  it("does not let a stale reclaiming gate block acquisition forever", async () => {
+    const name = `test-reclaim-gate-fence-stale-${process.pid}`;
+    const dir = join(LOCK_ROOT, name);
+    const gate = `${dir}.reclaiming`;
+    // An orphaned gate old enough that no live decision could still be behind it (a live decision
+    // never outlives STALE_AFTER_MS) must not be treated as a reason to wait — otherwise every
+    // future acquirer would poll out its full budget and fall back to advisory-unlocked forever,
+    // instead of falling through to the normal path that reaps it.
+    await mkdir(gate, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(gate, old, old);
+
+    let ran = false;
+    const start = Date.now();
+    await withHostLock(name, async () => {
+      ran = true;
+    }, { maxWaitMs: 5000 });
+    const elapsedMs = Date.now() - start;
+
+    expect(ran).toBe(true);
+    expect(elapsedMs).toBeLessThan(1000);
+    // Acquired and released normally (not just an advisory unlocked fallback that never touches
+    // `dir` at all) — the release retires it to a token-specific tombstone.
+    const siblings = await readdir(LOCK_ROOT);
+    expect(siblings.some((entry) => entry.startsWith(`${name}.retired-`))).toBe(true);
   });
 });
