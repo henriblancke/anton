@@ -1085,24 +1085,21 @@ async function refreshOntoBase(opts: {
   // divergence (the ONLY shape `remotelyPublished`/`preservedSha`/`hasMergeCommit` exist to protect
   // in the common case, e.g. a branch's own pushed commit alongside a base that separately advanced)
   // merges its real content and is exactly what this path is for, pin or no pin. What a missing pin
-  // CANNOT rule out is the one shape reported in review (PR #279 review, P1, third re-review): an
-  // AUTHORITATIVE rewind of `baseBranch` from `A-B` back to `A` leaves `A` already an ancestor of a
-  // branch cut at `A-B-W` — `git merge --no-edit A` on that branch reports "Already up to date" and
-  // silently RETAINS `B` rather than merging anything, so the eventual PR against `A` restores
-  // exactly what the rewind dropped. That shape is checkable without a pin at all: it's `baseSha`
-  // already reachable from `branch` (not the reverse), same as the dirty-tree escape's own unpinned
-  // guard above. A stale LOCAL fallback reading the same shape is left alone — nothing was rewound.
-  const baseAlreadyOnBranch =
+  // CANNOT rule out is an AUTHORITATIVE base rewrite. A one-way rewind from `A-B` to `A` leaves `A`
+  // already reachable from a branch cut at `A-B-W`; a two-way rewrite to `A-E` makes the two refs
+  // diverge. Both leave the new base NOT descended from the branch, and `git merge` preserves `B`
+  // through the branch side of its result. Without a pin, ordinary independent divergence has the
+  // same shape, so fail closed rather than silently reintroduce what the rewrite dropped. A stale
+  // LOCAL fallback reading the same shape is left alone — nothing was authoritatively rewritten.
+  const unpinnedAuthoritativeBaseRewrite =
     !trustedForkSha &&
     baseIsAuthoritative &&
-    (await isAncestor(worktreePath, baseSha, branchSha)) &&
     !(await isAncestor(worktreePath, branchSha, baseSha));
-  if ((remotelyPublished || preservedSha || hasMergeCommit) && baseAlreadyOnBranch) {
+  if ((remotelyPublished || preservedSha || hasMergeCommit) && unpinnedAuthoritativeBaseRewrite) {
     throw new Error(
-      `[worktree] ${branch} already contains ${baseBranch} (${baseSha.slice(0, 12)}) and has no ` +
-        `trustworthy fork-point pin to check whether that's genuine or the result of an authoritative ` +
-        `rewind — merging would report "Already up to date" and silently retain whatever commits ` +
-        `${baseBranch} dropped if it was rewound past ${branch}'s real fork point. Resolve manually ` +
+      `[worktree] ${branch} has no trustworthy fork-point pin and ${baseBranch} ` +
+        `(${baseSha.slice(0, 12)}) does not descend from it — an authoritative rewind or rewrite ` +
+        `could make merging silently retain whatever commits ${baseBranch} dropped. Resolve manually ` +
         `in ${worktreePath} and retry.`,
     );
   }

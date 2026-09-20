@@ -732,6 +732,50 @@ suite("worktree manager (real git)", () => {
       expect(headOf(first.path)).toBe(uniqueSha);
     });
 
+    it("refuses an authoritatively confirmed two-way rewrite on an unpinned published branch", async () => {
+      const rewriteRepo = mkdtempSync(join(tmpdir(), "anton-wt-unpinned-rewrite-repo-"));
+      try {
+        execFileSync("git", ["init", "-q", "-b", "main"], { cwd: rewriteRepo });
+        execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: rewriteRepo });
+        execFileSync("git", ["config", "user.name", "anton-test"], { cwd: rewriteRepo });
+        writeFileSync(join(rewriteRepo, "README.md"), "# tmp\n");
+        execFileSync("git", ["-C", rewriteRepo, "add", "."]);
+        execFileSync("git", ["-C", rewriteRepo, "commit", "-q", "-m", "init"]);
+
+        writeFileSync(join(rewriteRepo, "dropped-by-rewrite.txt"), "old base\n");
+        execFileSync("git", ["-C", rewriteRepo, "add", "."]);
+        execFileSync("git", ["-C", rewriteRepo, "commit", "-q", "-m", "old base"]);
+        const oldBase = headOf(rewriteRepo);
+
+        const branch = "anton/refresh-unpinned-two-way-rewrite";
+        const first = await createWorktree({ repoPath: rewriteRepo, branch, baseBranch: "main" });
+        writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+        execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+        execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "published ticket work"]);
+        const branchTip = headOf(first.path);
+        execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, branchTip], { cwd: rewriteRepo });
+
+        execFileSync("git", ["-C", rewriteRepo, "reset", "--hard", `${oldBase}~1`]);
+        writeFileSync(join(rewriteRepo, "rewritten-base.txt"), "new base\n");
+        execFileSync("git", ["-C", rewriteRepo, "add", "."]);
+        execFileSync("git", ["-C", rewriteRepo, "commit", "-q", "-m", "rewritten base"]);
+
+        await expect(
+          createWorktree({
+            repoPath: rewriteRepo,
+            branch,
+            baseBranch: "main",
+            refresh: true,
+            baseIsAuthoritative: true,
+          }),
+        ).rejects.toThrow(/no trustworthy fork-point pin/);
+        expect(headOf(first.path)).toBe(branchTip);
+        expect(existsSync(join(first.path, "dropped-by-rewrite.txt"))).toBe(true);
+      } finally {
+        rmSync(rewriteRepo, { recursive: true, force: true });
+      }
+    });
+
     it("refuses to leave a dirty checkout's uncommitted work untouched over an authoritatively confirmed rewind behind its fork point", async () => {
       const branch = "anton/refresh-authoritative-rewind-dirty";
       const rewoundBase = branchTip(defaultBranch());
