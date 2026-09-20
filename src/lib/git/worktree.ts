@@ -906,7 +906,22 @@ async function refreshOntoBase(opts: {
       );
       return { outcome: "merged", baseSha };
     } catch (err) {
-      await git(worktreePath, ["merge", "--abort"]).catch(() => undefined);
+      // Marker removed only once the abort actually succeeds — same discipline as the
+      // unfinished-operation recovery above: a failed `--abort` (e.g. a transient index lock)
+      // leaves the merge genuinely in progress, and deleting the marker anyway would make the
+      // NEXT resume misread it as an agent's own deliberate conflict rather than this one's (PR
+      // #279 review, P2).
+      try {
+        await git(worktreePath, ["merge", "--abort"]);
+      } catch (abortErr) {
+        throw new Error(
+          `[worktree] ${branch} diverges from ${baseBranch} and could not be merged onto it cleanly ` +
+            `(${gitError(err)}), and the recovery \`git merge --abort\` also failed ` +
+            `(${gitError(abortErr)}) — leaving the ownership marker in place so a later resume still ` +
+            `treats this as its own interrupted merge. Inspect ${worktreePath} and resolve the merge ` +
+            `manually, then resume the run.`,
+        );
+      }
       await rm(markerPath, { force: true }).catch(() => undefined);
       const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
         () => "(could not list them)",
@@ -946,7 +961,17 @@ async function refreshOntoBase(opts: {
         `fork point. Resolve manually in ${worktreePath} and retry.`,
     );
   }
-  const rebaseArgs = ["rebase", "--onto", baseSha, trustedForkSha, branch];
+  // Plain `--onto` linearizes: it drops any merge commit in `forkSha..branch` and replays only its
+  // first-parent line, silently discarding whatever a conflict-resolution-only merge recorded in its
+  // tree even though the rebase itself reports success (PR #279 review, P1). `--rebase-merges`
+  // recreates the merge topology instead — required whenever the range actually contains one.
+  const hasMergeCommit =
+    (
+      await git(worktreePath, ["log", "--merges", "--oneline", `${trustedForkSha}..${branch}`])
+    ).length > 0;
+  const rebaseArgs = hasMergeCommit
+    ? ["rebase", "--rebase-merges", "--onto", baseSha, trustedForkSha, branch]
+    : ["rebase", "--onto", baseSha, trustedForkSha, branch];
 
   // Same marker discipline as the merge above: written right before the call that can leave a
   // conflicted rebase in progress, so a later resume can tell this rebase apart from an agent's own.
@@ -957,7 +982,20 @@ async function refreshOntoBase(opts: {
     console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
     return { outcome: "rebased", baseSha };
   } catch (err) {
-    await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
+    // Same abort-failure discipline as the merge path above: only clear the marker once `--abort`
+    // actually succeeds, so a failed abort (e.g. a transient index lock) still leaves the rebase
+    // recognizable as this function's own on the next resume (PR #279 review, P2).
+    try {
+      await git(worktreePath, ["rebase", "--abort"]);
+    } catch (abortErr) {
+      throw new Error(
+        `[worktree] ${branch} diverges from ${baseBranch} and could not be rebased onto it cleanly ` +
+          `(${gitError(err)}), and the recovery \`git rebase --abort\` also failed ` +
+          `(${gitError(abortErr)}) — leaving the ownership marker in place so a later resume still ` +
+          `treats this as its own interrupted rebase. Inspect ${worktreePath} and resolve the rebase ` +
+          `manually, then resume the run.`,
+      );
+    }
     await rm(markerPath, { force: true }).catch(() => undefined);
     const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
       () => "(could not list them)",
