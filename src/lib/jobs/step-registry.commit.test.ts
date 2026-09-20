@@ -84,6 +84,7 @@ suite("commitStep (real git)", () => {
       baseBranch: "main",
       baseRef: "origin/main",
       baseForkSha: "f0f0f0forkcommit",
+      alreadyShippedBase: "f0f0f0forkcommit",
       target: ticket,
       tickets: [ticket],
       settings: {} satisfies ProjectSettings,

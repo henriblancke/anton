@@ -330,6 +330,13 @@
       "when": 1789934046292,
       "tag": "0046_lush_magma",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "6",
+      "when": 1789938463113,
+      "tag": "0047_spotty_tarot",
+      "breakpoints": true
     }
   ]
 }

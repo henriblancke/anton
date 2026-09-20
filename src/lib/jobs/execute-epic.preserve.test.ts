@@ -113,6 +113,7 @@ suite("preserveTimedOutWork (real git)", () => {
       baseBranch: "main",
       baseRef: "origin/main",
       baseForkSha: "f0f0f0forkcommit",
+      alreadyShippedBase: "f0f0f0forkcommit",
       target: ticket,
       settings,
     };
@@ -840,6 +841,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -945,6 +947,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -1075,6 +1078,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: {} satisfies ProjectSettings,
   });
@@ -1166,7 +1170,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
     expect(note).toMatch(/Nothing was rolled back/);
     expect(note).not.toMatch(/partial work/);
     // The evidence clause cites the commit it settled on, so the park gate reads "review and close".
-    expect(note).toContain(`committed on ${BRANCH} @ ${earlier.slice(0, 7)}`);
+    expect(note).toContain(`committed on ${BRANCH} @ ${earlier}`);
     // And the branch is exactly where it was: nothing reset, the earlier commit still the tip.
     expect(head()).toBe(earlier);
     expect(existsSync(join(repo, "EARLIER.md"))).toBe(true);
@@ -1200,6 +1204,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target: ticket,
     settings: { testCommand: "true" } satisfies ProjectSettings,
   });

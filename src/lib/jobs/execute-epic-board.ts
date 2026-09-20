@@ -130,7 +130,7 @@ export interface HumanHeldTicket {
   /** anton's newest note on the bead — why it blocked the ticket — when it left one. */
   note?: string;
   /**
-   * The branch + short sha of the work this ticket's block left behind, when its note records a
+   * The branch + full sha of the work this ticket's block left behind, when its note records a
    * commit. Both halves matter: the remedy this ticket is owed ({@link humanHeldClause}) turns on
    * whether that branch is the one THIS run ships. The sha is absent when the run that wrote the
    * note could not read it — a commit that cannot be located is still a commit.
