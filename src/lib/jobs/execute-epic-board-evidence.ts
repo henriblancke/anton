@@ -378,7 +378,7 @@ export async function ensureBoardBaselinePersisted(
     const hydrated = board && (await hydrateDescriptions(repo, board));
     if (!hydrated) return null;
     const refreshed = fingerprintBoard(hydrated, ticket.id);
-    if (boardEvidence(confirmed, refreshed).length === 0) return confirmed;
+    if (boardEvidence(confirmed, refreshed).length === 0) return lockDispatchBaseline(repo, ticket, confirmed);
     const refreshedPersisted = await mustPersist(() =>
       beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(refreshed)),
     );
@@ -393,6 +393,36 @@ export async function ensureBoardBaselinePersisted(
   // Every round found the board still drifting under its own confirming push — fail closed rather
   // than dispatch against a baseline that may still omit a change landing right now.
   return null;
+}
+
+/**
+ * Lock the settled pre-dispatch baseline onto `ticket` before this function ever hands it back for
+ * dispatch (chatgpt-codex-connector, PR #284 review, "Lock the baseline before starting dispatch").
+ * Without this, the lock was only ever set by {@link readBoardEvidence} AFTER the agent session ran —
+ * so a host death during that session (agent writes land, evidence check never runs) left the
+ * baseline unlocked. A resumed attempt's `ensureBoardBaselinePersisted` then found `recoveryBaseline`
+ * false, treated the baseline as still freely refreshable, and its confirming pull folded the
+ * previous attempt's already-landed writes into a "refreshed" baseline — erasing the only snapshot an
+ * idempotent retry's evidence check needs to diff against, and permanently rejecting it as no
+ * delivery. Locking here, the instant the pre-dispatch baseline stops moving, closes that window:
+ * every later resume finds `recoveryBaseline` true and returns this exact baseline untouched, exactly
+ * as `readBoardEvidence`'s own recovery locks already do for the post-dispatch case.
+ *
+ * Fails closed like every other write in this function: an unconfirmed lock refuses dispatch (`null`)
+ * rather than risk repeating the exact loss it exists to prevent.
+ */
+async function lockDispatchBaseline(
+  repo: string,
+  ticket: Bead,
+  baseline: BoardFingerprint,
+): Promise<BoardFingerprint | null> {
+  const locked = await preserveRecoveryBaseline(repo, ticket, baseline);
+  if (!locked) return null;
+  const synced = await beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+  return synced ? baseline : null;
 }
 
 /**

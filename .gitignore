@@ -61,9 +61,6 @@ server-build.*.json
 *.db
 .beads-credential-key
 
-# local tool cache/telemetry (not part of the repo)
-/graft/
-
 # Prebuilt release bundles (anton-1xp) — built in CI, never committed
 dist/
 
@@ -75,5 +72,5 @@ dist/
 # at: a second full copy of the tree that must never be committable.
 .worktrees/
 
-# graft's local graph cache — regenerable, not committed (run `graft build`).
+# graft's local graph cache/telemetry — regenerable, not committed (run `graft build`).
 /graft/

@@ -711,6 +711,55 @@ describe("runReviewGate — bounds", () => {
   );
 
   it(
+    "still refuses to dispatch on an unreadable board baseline in a MIXED run even when the round's " +
+      "blocking finding is against the NON-board-only ticket (@claude, PR #284 review) — `boardOnly` " +
+      "is deliberately the any-ticket predicate (see runReviewGate's own comment on `hasBoardOnlyTicket` " +
+      "vs `isBoardOnlyDelivery`): a fix session has no way to tell, from a finding's `file:line` alone, " +
+      "which ticket it concerns, so a transient board-read failure fails the WHOLE round closed rather " +
+      "than risk dispatching a fixer this run could not durably anchor if it turned out to touch the " +
+      "board-only ticket after all",
+    async () => {
+      const codeTarget: Bead = { ...target, labels: [] };
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-gate1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-gate1.2", labels: [] };
+      const worktree = fakeWorktree();
+      // The blocking finding names only a file that belongs to the plain, non-board-only ticket —
+      // nothing here implicates the board-only one.
+      const { run, calls } = fakeClaude([report(4, [{ severity: "blocking", location: "src/plain.ts:1", note: "plain bug" }]), "fixed it"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: codeTarget,
+        tickets: [boardOnlyTicket, plainTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint: async () => undefined, // mustReadBoard exhausted its retries (network blip)
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not read a board-only baseline/);
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it(
     "parks instead of treating an unreadable post-fix board read as no change (PR #284 review round " +
       "16) — a board-capable fixer's real write must never fold into a false no-progress signal just " +
       "because the confirming read failed",
