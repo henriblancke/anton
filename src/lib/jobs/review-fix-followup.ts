@@ -8,12 +8,8 @@
  * operators share. Nothing here decides WHICH tickets move; see review-fix-rehome.ts for that.
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
-import {
-  olderOf,
-  safe,
-  tryList,
-  type ReadBead,
-} from "./review-fix-board";
+import { olderOf, tryList, type ReadBead } from "./review-fix-board";
+import { safe } from "./safe";
 
 /**
  * Metadata key stamping a follow-up run target with the merged target it was created for — the

@@ -94,6 +94,13 @@ export const runs = sqliteTable("runs", {
   // instead of off this column would hand an earlier gate's skip the score of a later, unrelated
   // gate. Written only alongside `reviewKey`, on a clean verdict; never inferred or backfilled.
   reviewKeyScore: integer("review_key_score"),
+  // The run's PR narrative, serialized (anton-fpkk8) — written whenever `step:describe` actually
+  // produces one, independent of `reviewKey` above (a describer that fails costs only itself, never
+  // the review verdict it rides alongside). Restored into the run-phase carry on the row a resume
+  // reuses in place, so a describer that fails on retry doesn't erase a narrative an earlier attempt
+  // already earned. Null on rows written before this column existed, and on every run whose
+  // describer never reported one — both resume with no narrative and no error.
+  narrative: text("narrative"),
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),

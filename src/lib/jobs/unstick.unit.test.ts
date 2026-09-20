@@ -54,6 +54,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     reviewKey: null,
     reviewKeyAdvisories: null,
     reviewKeyScore: null,
+    narrative: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",

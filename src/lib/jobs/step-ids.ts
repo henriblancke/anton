@@ -15,6 +15,7 @@ export const BUILTIN_STEP_IDS = [
   "verify",
   "review",
   "commit",
+  "describe",
   "pr",
   "claude",
 ] as const;
@@ -22,7 +23,7 @@ export const BUILTIN_STEP_IDS = [
 export type BuiltinStepId = (typeof BUILTIN_STEP_IDS)[number];
 
 /** The pipeline steps that invoke Claude and can therefore be selected by a model route. */
-export const MODEL_ROUTABLE_STEP_IDS = ["implement", "review", "claude"] as const;
+export const MODEL_ROUTABLE_STEP_IDS = ["implement", "review", "describe", "claude"] as const;
 
 const MODEL_ROUTABLE_STEP_ID_SET = new Set<string>(MODEL_ROUTABLE_STEP_IDS);
 

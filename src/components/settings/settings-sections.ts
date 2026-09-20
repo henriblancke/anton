@@ -95,6 +95,12 @@ export const SECTIONS = [
     dirtyKeys: ["review"],
   },
   {
+    id: "describe",
+    label: "PR narrative",
+    group: "Before the PR opens",
+    dirtyKeys: ["describePrompt"],
+  },
+  {
     id: "review-fix",
     label: "Review-fix",
     group: "Before the PR opens",

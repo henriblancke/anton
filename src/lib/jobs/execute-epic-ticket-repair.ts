@@ -24,7 +24,7 @@ import {
 import { refusalNote, repairRefStale, type RefStaleOutcome } from "../gardener/repair-ref-stale";
 import { resolveRepairAutonomy } from "../projects";
 import { appendSessionLog } from "../sessions";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { StepContext } from "./step-registry";
 
 /** What the repair pass answers, whichever class it ran for. */

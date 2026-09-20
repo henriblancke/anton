@@ -23,7 +23,7 @@ import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import { collectorOf, type ScanSignal } from "./scan-severity";
 
 /** The collector these rules are about; every other signal rides through untouched. */
-const DUPLICATION_COLLECTOR = "duplication";
+export const DUPLICATION_COLLECTOR = "duplication";
 
 /**
  * How many files one filter pass will read. A scan can carry a hundred duplication signals across
@@ -264,7 +264,7 @@ const DECLARATIVE: ReadonlySet<LineClass> = new Set<LineClass>([
 ]);
 
 /** A location stringer reported the block at. */
-interface Location {
+export interface Location {
   /** Repo-relative path, as stringer spelled it. */
   path: string;
   /** 1-based first line of the block. */
@@ -1773,7 +1773,7 @@ function classifyLines(
 }
 
 /** The locations stringer listed in its description, falling back to the signal's own file:line. */
-function parseLocations(signal: ScanSignal): Location[] {
+export function parseLocations(signal: ScanSignal): Location[] {
   const description = signal.Description ?? signal.description ?? "";
   const found: Location[] = [];
   const seen = new Set<string>();
@@ -1814,8 +1814,14 @@ function kindOf(signal: ScanSignal): string {
   return typeof raw === "string" && raw ? raw : DUPLICATION_COLLECTOR;
 }
 
-/** A repo-relative path that stays inside the repo; undefined for anything that escapes it. */
-function insideRepo(repoPath: string, raw: string): string | undefined {
+// normalize, not a `./` strip: it also collapses mid-path traversals, so a path spelled
+// `src/../app.ts` matches the same repo-relative form a plain `src/app.ts` would.
+/**
+ * A repo-relative path that stays inside the repo; undefined for anything that escapes it (no
+ * path, the repo root itself, or a path outside it). Exported so stringer.ts's own worktree/tracked
+ * filters share this containment check instead of maintaining a second copy that could drift.
+ */
+export function insideRepo(repoPath: string, raw: string): string | undefined {
   const rel = isAbsolute(raw) ? relative(repoPath, raw) : normalize(raw);
   return rel && rel !== "." && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel : undefined;
 }

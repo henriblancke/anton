@@ -215,6 +215,8 @@ export type RunPatch = Partial<{
   reviewKeyAdvisories: string | null;
   /** The score bound to `reviewKey` above — see the column's own note. */
   reviewKeyScore: number | null;
+  /** The run's PR narrative, serialized — see the column's own note. */
+  narrative: string | null;
   /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
   attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
@@ -295,6 +297,8 @@ export interface RecordedReviewKey {
   reviewKeyAdvisories: string | null;
   /** The score that verdict earned — restored onto the skipping row so it reads as reviewed, not a gap. */
   reviewScore: number | null;
+  /** The narrative `describe` wrote for that same attempt (anton-fpkk8) — see the column's own note. */
+  narrative: string | null;
 }
 
 /**
@@ -341,6 +345,7 @@ export async function findRunReviewKeyForBranch(
       reviewKey: schema.runs.reviewKey,
       reviewKeyAdvisories: schema.runs.reviewKeyAdvisories,
       reviewKeyScore: schema.runs.reviewKeyScore,
+      narrative: schema.runs.narrative,
     })
     .from(schema.runs)
     .where(
@@ -362,6 +367,7 @@ export async function findRunReviewKeyForBranch(
     reviewKey: row.reviewKey,
     reviewKeyAdvisories: row.reviewKeyAdvisories,
     reviewScore: row.reviewKeyScore,
+    narrative: row.narrative,
   };
 }
 
