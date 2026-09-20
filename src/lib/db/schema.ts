@@ -117,6 +117,11 @@ export const runs = sqliteTable("runs", {
   // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
   // write an index lookup instead of a table scan.
   index("runs_write_seq_idx").on(table.writeSeq),
+  // Resuming an epic only considers the still-open lifecycle states. A partial index keeps the
+  // hot lookup small even as the durable run history grows.
+  index("runs_open_epic_updated_idx")
+    .on(table.projectId, table.epicBeadId, table.updatedAt)
+    .where(sql`${table.status} in ('queued', 'running', 'parked')`),
 ]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
@@ -178,6 +183,15 @@ export const jobs = sqliteTable(
     uniqueIndex("jobs_active_sync_push_unique")
       .on(table.projectId)
       .where(sql`${table.type} = 'sync-push' and ${table.status} = 'queued'`),
+    // The runner polls this hot path continuously. Terminal rows stay in the durable audit log, so
+    // index only the queued slice that can actually become runnable rather than scanning history.
+    index("jobs_queued_due_idx").on(table.runAt).where(sql`${table.status} = 'queued'`),
+    // A running row is reclaimable only after its lease expires. Keep that similarly-small state
+    // slice separate so `leaseDue` can use SQLite's multi-index OR for its runnable predicate.
+    index("jobs_running_lease_idx").on(table.leaseExpiresAt).where(sql`${table.status} = 'running'`),
+    // The Jobs UI paginates and counts a project's complete durable history newest first. Finished
+    // rows dominate this table, so the project prefix avoids scanning unrelated project histories.
+    index("jobs_project_updated_idx").on(table.projectId, table.updatedAt),
     // Serves the unwatched-park read (anton-kh98), which runs on every board render of a project
     // whose stall watcher is disarmed — the shipped default. Partial on 'parked' so it stays tiny
     // next to a jobs table that keeps every finished job for the life of the project, and carries
@@ -765,6 +779,9 @@ export const sessions = sqliteTable(
   (table) => [
     // Serves the jobs page's "which session did each of these rows open" read (one IN per page).
     index("sessions_job_idx").on(table.jobId),
+    // Run detail reads a run's sessions newest-first. `run_id` is globally unique, so including
+    // project_id would only widen the index without narrowing this predicate.
+    index("sessions_run_started_idx").on(table.runId, table.startedAt),
   ],
 );
 
