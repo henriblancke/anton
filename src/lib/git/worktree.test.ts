@@ -829,6 +829,52 @@ suite("worktree manager (real git)", () => {
       expect(branchTip(branch)).toBe(beforeSha);
     });
 
+    // PR #279 re-review (P2): a transient failure of the recovery `--abort` itself (e.g. a stale
+    // `index.lock`) must not be swallowed — the operation is still genuinely in progress, so the
+    // ownership marker has to survive for the next resume to still recognize it as its own.
+    it("keeps the ownership marker and propagates the error when the recovery abort itself fails", async () => {
+      const branch = "anton/refresh-abort-fails";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch("abort-fails-base.txt", "advance 11\n", "advance main (abort fails)");
+
+      const mergeHeadPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(mergeHeadPath, `${beforeSha}\n`);
+      writeRefreshMarker(first.path);
+      const markerPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "ANTON_REFRESH_IN_PROGRESS"],
+        { encoding: "utf8" },
+      ).trim();
+
+      // A stale `index.lock` makes `git merge --abort` fail exactly like a transient lock contention
+      // would — it needs to write the index to unwind the merge.
+      const indexLockPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "index.lock"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(indexLockPath, "");
+
+      try {
+        await expect(
+          createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+        ).rejects.toThrow(/recovery abort failed/);
+
+        // Still genuinely mid-merge, and the marker survives so a later resume still treats this as
+        // its own interrupted operation rather than an agent's deliberate one.
+        expect(existsSync(mergeHeadPath)).toBe(true);
+        expect(existsSync(markerPath)).toBe(true);
+        expect(branchTip(branch)).toBe(beforeSha);
+      } finally {
+        rmSync(indexLockPath, { force: true });
+      }
+    });
+
     it("fails loud on a conflicting divergence and never discards the branch's commits", async () => {
       const branch = "anton/refresh-conflict";
       const first = await createWorktree({ repoPath: repo, branch });
@@ -936,6 +982,71 @@ suite("worktree manager (real git)", () => {
             forkSha: first.forkSha,
           }),
         ).rejects.toThrow(/no longer descends from .* fork point/);
+
+        // Never touched — the uncommitted edit is still there, HEAD hasn't moved.
+        expect(readFileSync(join(first.path, "README.md"), "utf8")).toBe("parked uncommitted edit\n");
+        expect(
+          execFileSync("git", ["-C", first.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+        ).toBe(beforeSha);
+      } finally {
+        rmSync(ontoRepo, { recursive: true, force: true });
+      }
+    });
+
+    // PR #279 re-review (P1): a legacy reused checkout carries no recorded `forkSha` at all — the
+    // guard above only fires when a pin is passed, so without one this scenario reached the plain
+    // `skipped_dirty` return and dispatched straight onto a base rewritten behind the branch's real
+    // (unknown) fork point. A null pin can't be told apart from a stale one, so it must fail closed
+    // the same way, not fall back to assuming the divergence is safe.
+    it("refuses to skip-dispatch a dirty checkout diverged from its base with no recorded fork pin", async () => {
+      const ontoRepo = mkdtempSync(join(tmpdir(), "anton-wt-dirty-no-pin-repo-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.name", "anton-test"], { cwd: ontoRepo });
+        writeFileSync(join(ontoRepo, "README.md"), "# tmp\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "."]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "init"]);
+        const ontoDefaultBranch = execFileSync(
+          "git",
+          ["-C", ontoRepo, "symbolic-ref", "--short", "HEAD"],
+          { encoding: "utf8" },
+        ).trim();
+
+        // Main advances to `sharedBase` — the commit the ticket branch forks from.
+        writeFileSync(join(ontoRepo, "shared-base.txt"), "shared\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "shared-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (later dropped)"]);
+        const sharedBase = execFileSync("git", ["-C", ontoRepo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        const branch = "anton/refresh-dirty-no-pin";
+        const first = await createWorktree({ repoPath: ontoRepo, branch, baseBranch: ontoDefaultBranch });
+        expect(first.forkSha).toBe(sharedBase);
+
+        // Parked, uncommitted work — exactly what a run left mid-resolution leaves behind.
+        writeFileSync(join(first.path, "README.md"), "parked uncommitted edit\n");
+        const beforeSha = execFileSync("git", ["-C", first.path, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        // Force-push/recreate main: drop `sharedBase` back to the ORIGINAL root, then commit a new,
+        // unrelated tip — main and the ticket branch now only share that root commit, not `sharedBase`.
+        execFileSync("git", ["-C", ontoRepo, "reset", "--hard", `${sharedBase}~1`]);
+        writeFileSync(join(ontoRepo, "rewritten-base.txt"), "rewritten\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "rewritten-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (rewritten)"]);
+
+        // No `forkSha` passed — a legacy reused checkout, or a caller with no pin on record.
+        await expect(
+          createWorktree({
+            repoPath: ontoRepo,
+            branch,
+            baseBranch: ontoDefaultBranch,
+            refresh: true,
+          }),
+        ).rejects.toThrow(/no trustworthy fork-point pin/);
 
         // Never touched — the uncommitted edit is still there, HEAD hasn't moved.
         expect(readFileSync(join(first.path, "README.md"), "utf8")).toBe("parked uncommitted edit\n");

@@ -664,6 +664,9 @@ async function refreshOntoBase(opts: {
       `[worktree] could not resolve base ${baseBranch} to refresh ${branch}: ${gitError(err)}`,
     );
   }
+  // Resolved up front (not just in the clean path below) so the dirty-tree escape can run the same
+  // divergence check on it (PR #279 review, P1).
+  const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
 
   const markerPath = await refreshMarkerPath(worktreePath);
 
@@ -687,7 +690,20 @@ async function refreshOntoBase(opts: {
           `run once it is confirmed clean, or the conflict is resolved.`,
       );
     }
-    await git(worktreePath, [unfinished, "--abort"]).catch(() => undefined);
+    // The marker is removed only once the abort actually succeeds (PR #279 re-review, P2): a failed
+    // `--abort` (e.g. a transient index lock) leaves the operation genuinely in progress, and
+    // deleting the marker anyway would make the NEXT resume misread it as an agent's own deliberate
+    // conflict — refusing to touch it — while this attempt falsely reports having cleared it.
+    try {
+      await git(worktreePath, [unfinished, "--abort"]);
+    } catch (err) {
+      throw new Error(
+        `[worktree] ${worktreePath} had an unfinished git ${unfinished} in progress on ${branch} and ` +
+          `the recovery abort failed (${gitError(err)}) — leaving the ownership marker in place so a ` +
+          `later resume still treats this as its own interrupted operation rather than an agent's. ` +
+          `Inspect ${worktreePath} and resolve the ${unfinished} manually, then resume the run.`,
+      );
+    }
     await rm(markerPath, { force: true }).catch(() => undefined);
     throw new Error(
       `[worktree] ${worktreePath} had an unfinished git ${unfinished} in progress on ${branch} — a ` +
@@ -703,28 +719,46 @@ async function refreshOntoBase(opts: {
   const dirty = await dirtyPaths(worktreePath);
   if (dirty.length > 0) {
     // Preserve the edits, but don't dispatch against them blind (PR #279 review, P1): this escape
-    // sits BEFORE the fork-descendancy checks the clean path runs below, so without this guard it
-    // would skip straight past a base that was force-pushed behind the checkout's own pinned fork
-    // point — the parked edits get committed atop stale history, and the eventual PR against the
-    // rewritten base silently reintroduces whatever commit(s) that rewrite dropped. Checked only when
-    // `forkSha` is both known and still reachable on `branch` (an unknown or stale pin can't
-    // distinguish this from an ordinary, unrewritten divergence, so it's left to the same reasoning
-    // the clean path already applies); and only when `baseSha` is neither a descendant of `forkSha`
-    // (the base moved forward normally, nothing dropped) nor an ancestor of it (the base is merely
-    // stale — e.g. a failed fetch fell back to a lagging local ref — safe to leave alone either way).
-    if (
-      forkSha &&
-      (await branchContainsCommit(repoPath, branch, forkSha)) &&
-      !(await isAncestor(worktreePath, forkSha, baseSha)) &&
-      !(await isAncestor(worktreePath, baseSha, forkSha))
+    // sits BEFORE the fork-descendancy checks the clean path runs below, so without a guard here it
+    // would skip straight past a base that was force-pushed or recreated behind the checkout's real
+    // fork point — the parked edits get committed atop stale history, and the eventual PR against
+    // the rewritten base silently reintroduces whatever commit(s) that rewrite dropped. With a pin
+    // that's still reachable on `branch`, the check is precise (only trips when `baseSha` is neither
+    // a descendant of `forkSha`, the ordinary safe case, nor an ancestor of it, the merely-stale-base
+    // case); without one, a two-way divergence fails closed on the coarser check below instead of
+    // guessing (PR #279 review, P1 re-review).
+    const trustedForkSha =
+      forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
+    if (trustedForkSha) {
+      if (
+        !(await isAncestor(worktreePath, trustedForkSha, baseSha)) &&
+        !(await isAncestor(worktreePath, baseSha, trustedForkSha))
+      ) {
+        throw new Error(
+          `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${baseBranch} ` +
+            `(${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork point ${trustedForkSha.slice(0, 12)} — ` +
+            `${baseBranch} looks like it was force-pushed or recreated behind that commit. Committing and ` +
+            `dispatching against the checkout's stale history would silently reintroduce whatever ` +
+            `${baseBranch} dropped once those commits are pushed. Leaving the uncommitted changes in ` +
+            `${worktreePath} untouched — resolve manually and retry.`,
+        );
+      }
+    } else if (
+      // No trustworthy pin at all (a legacy reused checkout, or a stale one) — PR #279 review (P1,
+      // re-review). That can't be told apart from the force-push-behind-fork shape above without the
+      // pin, so a genuine two-way divergence (neither ref is an ancestor of the other) must fail
+      // closed here too, the same way the clean path's `trustedForkSha` guard below refuses a plain
+      // rebase without one. An ordinary one-way advance (`branchSha` still an ancestor of `baseSha`,
+      // or vice versa) is unaffected — nothing could have been dropped either way.
+      !(await isAncestor(worktreePath, branchSha, baseSha)) &&
+      !(await isAncestor(worktreePath, baseSha, branchSha))
     ) {
       throw new Error(
-        `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${baseBranch} ` +
-          `(${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork point ${forkSha.slice(0, 12)} — ` +
-          `${baseBranch} looks like it was force-pushed or recreated behind that commit. Committing and ` +
-          `dispatching against the checkout's stale history would silently reintroduce whatever ` +
-          `${baseBranch} dropped once those commits are pushed. Leaving the uncommitted changes in ` +
-          `${worktreePath} untouched — resolve manually and retry.`,
+        `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${branch} ` +
+          `diverges from ${baseBranch} (${baseSha.slice(0, 12)}) with no trustworthy fork-point pin — ` +
+          `committing and dispatching against the checkout's stale history could silently reintroduce ` +
+          `commits ${baseBranch} dropped if it was force-pushed or recreated past ${branch}'s real fork ` +
+          `point. Leaving the uncommitted changes in ${worktreePath} untouched — resolve manually and retry.`,
       );
     }
     console.log(
@@ -734,7 +768,6 @@ async function refreshOntoBase(opts: {
     return { outcome: "skipped_dirty", baseSha };
   }
 
-  const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
   if (baseSha === branchSha) return { outcome: "noop", baseSha }; // already current
 
   // Resolved once against the pinned `baseSha` (not `baseBranch`) so the reset/rebase/merge below
