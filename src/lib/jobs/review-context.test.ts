@@ -1128,7 +1128,7 @@ describe("buildFindingsFixPrompt", () => {
     "tells a board-only fixer that an unchanged tree is expected and how to write to the live " +
       "board, not the ordinary instructions (PR #284 review round 12)",
     async () => {
-      const { prompt } = await buildFindingsFixPrompt({
+      const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
         target: epic,
         findings: [{ severity: "blocking", location: "anton-x1", note: "the bead was never closed" }],
         settings: {},
@@ -1142,6 +1142,11 @@ describe("buildFindingsFixPrompt", () => {
       expect(prompt).toContain("This run may deliver via the board");
       expect(prompt).toContain("is NOT evidence you made no progress");
       expect(prompt).toContain("bd -C '/repos/anton' update <id>");
+      // The system prompt must carry the same carve-out (PR #284 review round 16): without it, the
+      // fixer's base contract still forbids reporting `delivered` on an unchanged tree, contradicting
+      // the human-turn prompt above.
+      expect(appendSystemPrompt).toContain("## This ticket is board-only");
+      expect(appendSystemPrompt).toContain("bd -C '/repos/anton' update <id>");
     },
   );
 

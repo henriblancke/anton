@@ -1162,13 +1162,7 @@ async function dispatchTicket(
       ledger.boardEvidence.set(ticket.id, idsToConfirm);
     }
     if (idsToConfirm.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
-      await clearBoardEvidencePending(
-        repo,
-        ticket.id,
-        idsToConfirm,
-        hasPreservedBaseline,
-        hasCleanupUnsynced,
-      );
+      await clearBoardEvidencePending(repo, ticket, idsToConfirm, hasPreservedBaseline, hasCleanupUnsynced);
     }
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review
@@ -1256,7 +1250,7 @@ async function dispatchTicket(
     ].toSorted();
     await clearBoardEvidencePending(
       repo,
-      ticket.id,
+      ticket,
       recoveredIds,
       beads.boardEvidenceBaseline(ticket) !== undefined,
       true,
@@ -1305,13 +1299,7 @@ async function dispatchTicket(
       const recoveredIds = [
         ...new Set([...stalePending, ...confirmedIds, ...beads.cleanupUnsyncedBoardEvidenceIds(ticket)]),
       ].toSorted();
-      await clearBoardEvidencePending(
-        repo,
-        ticket.id,
-        recoveredIds,
-        hasPreservedBaseline,
-        hasCleanupUnsynced,
-      );
+      await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
       if (recoveredIds.length > 0) {
         ledger.boardEvidence.set(ticket.id, recoveredIds);
       }

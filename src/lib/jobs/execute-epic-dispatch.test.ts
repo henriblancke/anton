@@ -972,7 +972,7 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
     expect(runTicketMock).not.toHaveBeenCalled();
     expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
       "/tmp/anton-repo",
-      "anton-a",
+      child,
       ["anton-eb1"],
       false,
       false,
@@ -1008,13 +1008,7 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
 
       return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
         expect(runTicketMock).not.toHaveBeenCalled();
-        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
-          "/tmp/anton-repo",
-          "anton-a",
-          [],
-          true,
-          false,
-        );
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", child, [], true, false);
       });
     },
   );
@@ -1035,13 +1029,7 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
 
       return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
         expect(runTicketMock).not.toHaveBeenCalled();
-        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
-          "/tmp/anton-repo",
-          "anton-a",
-          [],
-          false,
-          true,
-        );
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", child, [], false, true);
       });
     },
   );
@@ -1162,7 +1150,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
 
     expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
       "/tmp/anton-repo",
-      "anton-a",
+      child,
       ["anton-eb1", "anton-eb2"],
       false,
       false,
@@ -1186,7 +1174,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
 
     expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
       "/tmp/anton-repo",
-      "anton-a",
+      child,
       ["anton-eb1"],
       true,
       false,
@@ -1263,7 +1251,7 @@ describe(
       expect(runTicketMock).not.toHaveBeenCalled();
       expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
         "/tmp/anton-repo",
-        "anton-a",
+        child,
         ["anton-eb1"],
         false,
         true,
@@ -1289,7 +1277,7 @@ describe(
 
       expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
         "/tmp/anton-repo",
-        "anton-a",
+        child,
         ["anton-eb1"],
         true,
         true,
@@ -1320,7 +1308,7 @@ describe(
 
       expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
         "/tmp/anton-repo",
-        "anton-a",
+        child,
         ["anton-eb1"],
         false,
         true,
@@ -1358,7 +1346,7 @@ describe(
       expect(runTicketMock).not.toHaveBeenCalled();
       expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
         "/tmp/anton-repo",
-        "anton-a",
+        child,
         ["anton-eb1"],
         false,
         true,

@@ -248,7 +248,7 @@ export async function runTicket(args: {
   // delivery that genuinely landed. The thrown error propagates straight out of `runTicket` instead.
   if (progress.boardEvidenceIds) {
     if (finished.transitioned) {
-      await clearBoardEvidencePending(run.repoPath, ticket.id, progress.boardEvidenceIds);
+      await clearBoardEvidencePending(run.repoPath, ticket, progress.boardEvidenceIds);
     } else {
       // `finishTicket`'s close/in-review write is best-effort — right for a normal ticket, where an
       // unclosed bead is a survivable, PR-visible state (PR #253 review). It is wrong for a

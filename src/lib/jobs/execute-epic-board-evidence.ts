@@ -42,6 +42,7 @@
  * never be fooled by the agent's OWN unsubstantiated self-report, which is the false-success shape
  * anton-j5i8 exists to catch and the reason this check exists at all.
  */
+import { createHash } from "node:crypto";
 import {
   ANTON_METADATA_KEYS,
   BOARD_EVIDENCE_PENDING_PREFIX,
@@ -133,7 +134,7 @@ function normalizedDependencies(b: Bead): string[] {
  * as its own evidence, while every OTHER bead's assignee — where a board-only reassignment would
  * actually land — does. */
 function fingerprintOf(b: Bead, dispatchedTicketId: string): string {
-  return JSON.stringify([
+  const content = JSON.stringify([
     b.status,
     b.title,
     b.description ?? "",
@@ -147,6 +148,12 @@ function fingerprintOf(b: Bead, dispatchedTicketId: string): string {
     contentMetadata(b),
     b.id === dispatchedTicketId ? "" : (b.assignee ?? ""),
   ]);
+  // Hashed, not stored raw (PR #284 review round 16): the baseline this fingerprints into
+  // (setBoardEvidenceBaseline) is persisted as ONE `bd update --set-metadata` argv argument, and a
+  // mature board's full titles/descriptions serialized per bead can exceed Linux's ~128KiB
+  // single-argument ceiling, failing that write outright. A fixed-size digest bounds each bead's
+  // contribution regardless of description length while still changing whenever the content does.
+  return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
 /** Fingerprint every bead in a board read, keyed by id. `dispatchedTicketId` (default none, i.e. no
@@ -647,23 +654,34 @@ export async function readBoardEvidence(
  * retry that passes fewer ids than a prior successful call overwrites real confirmed evidence with
  * less, and a retry whose only prior trace is this obligation (the marker/baseline confirmation
  * itself never landed) has NO OTHER source for those ids once they are gone. `ids` stays a plain
- * parameter rather than being resolved from the bead in here so this function stays stateless; the
- * recovery is the caller's job precisely because both existing call sites already hold the ticket.
+ * parameter (rather than being derived from `ticket` in here) for that confirmed-evidence write
+ * specifically, since the recovery union above is the caller's job — every call site already holds
+ * the ticket. The `--remove-label` value is a different matter: it is read straight off `ticket`'s
+ * own current label (see `stale` below), never off `ids`, since the recovery call sites deliberately
+ * pass a WIDER union into `ids` than the bead's live pending label actually holds.
  */
 export async function clearBoardEvidencePending(
   repo: string,
-  ticketId: string,
+  ticket: Bead,
   ids: readonly string[],
   hasBaseline = false,
   hasCleanupObligation = false,
 ): Promise<void> {
-  if (ids.length === 0 && !hasBaseline && !hasCleanupObligation) return;
+  const ticketId = ticket.id;
+  // The label removed below is read off the bead's OWN current `board-evidence-pending:*` label
+  // (PR #284 review round 16), never synthesized from `ids` via `LABELS.boardEvidencePending(ids)`
+  // as it used to be — every other place that removes a prefixed label reads the bead's real value
+  // first (e.g. this same function's `setBoardEvidenceConfirmed` neighbor, or `readBoardEvidence`'s
+  // own `stale` above) for exactly this reason. The three cleanup-retry call sites in
+  // execute-epic-dispatch.ts deliberately pass `ids` as a UNION of pending + cleanup-unsynced +
+  // confirmed ids — wider than the bead's live pending label, and correct for `ids`' OTHER use below
+  // (`setBoardEvidenceConfirmed`, which needs that full set). Building `--remove-label` from that
+  // union instead constructs a value the bead's actual label may not match, so the write either
+  // errors or silently no-ops, stranding the real stale marker.
+  const stale = beads.boardEvidencePendingLabels(ticket);
+  if (ids.length === 0 && !hasBaseline && !hasCleanupObligation && stale.length === 0) return;
   const markerCleared =
-    ids.length === 0
-      ? true
-      : await mustPersist(() =>
-          beads.setBoardEvidencePending(repo, ticketId, [], [LABELS.boardEvidencePending(ids)]),
-        );
+    stale.length === 0 ? true : await mustPersist(() => beads.setBoardEvidencePending(repo, ticketId, [], stale));
   const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
   // Written in the SAME all-or-nothing gate as the two clears above, never after it (PR #284
   // review, "no record that this bead's board-only delivery ever happened"): this is the one

@@ -1247,6 +1247,8 @@ export async function buildFindingsFixPrompt(args: {
   const appendSystemPrompt = await buildExecutionSystemPrompt({
     agentPrompt: await loadAgentPrompt(labelValue(target.labels, "agent"), { projectDir }),
     seedPrompt: settings.seedPrompt,
+    boardOnly,
+    repoPath,
   });
 
   const prompt = [

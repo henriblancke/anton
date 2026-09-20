@@ -257,7 +257,7 @@ describe("runTicket — releases the board-evidence marker only once the handoff
       timeoutMs: 5_000,
     });
 
-    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", boardTicket.id, ["anton-x1"]);
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", boardTicket, ["anton-x1"]);
   });
 
   it("fails loud instead of returning success when bd refused the requested transition — a " +
