@@ -549,9 +549,10 @@ function ensureFormula(beadsDir, filename, src) {
   // in `dest`, not in the `.bak`. Backing up what was actually compared cannot lose it that way.
   let current;
   if (present) {
-    // An existing copy that cannot be READ is not "already": treat unknown as differing and let the
-    // copy below overwrite it, the same way the describer's read-only guard treats an unreadable
-    // worktree state as dirty rather than clean.
+    // An existing copy that cannot be READ is not "already": unknown is treated as differing, the
+    // same way the describer's read-only guard treats an unreadable worktree state as dirty rather
+    // than clean. That decides only that this is not a no-op — the replacement itself then refuses,
+    // because contents nobody could read are contents no backup can hold.
     try {
       current = readFileSync(dest);
     } catch {
@@ -584,22 +585,29 @@ function ensureFormula(beadsDir, filename, src) {
           detail: `${unsafeBak} — leaving ${filename} untouched, since replacing it without a backup could destroy uncommitted changes`,
         };
       }
+      // An UNREADABLE original is refused, not replaced-without-a-backup (PR #307 review, P1). It
+      // reaches here by being treated as "differing" — the right call for deciding whether to
+      // replace — but "anton could not read it" says nothing about whether it mattered. A mode-000
+      // formula in a writable directory is still somebody's file, and replacing it destroys bytes
+      // no backup holds and git may never have seen. An earlier version reasoned the guarantee was
+      // "never destroy contents anton could read"; that is the wrong guarantee, and it was written
+      // to fit the code rather than the other way round.
+      if (current === undefined) {
+        return {
+          status: "failed",
+          detail: `${filename} exists but could not be read, so it cannot be backed up — leaving it untouched rather than replacing contents nothing has a copy of`,
+        };
+      }
       // `current`, NOT a fresh read of `dest` — the bytes the comparison saw are the ones worth
-      // keeping; see where it is captured. An unreadable original (current === undefined) reached
-      // here by being treated as "differing", and there is nothing to back up, so the replacement
-      // proceeds: the guarantee is "never destroy contents anton could read", and these are not
-      // contents anton could read.
+      // keeping; see where it is captured.
       // Any throw here propagates to the outer catch as "failed"; nothing has been overwritten yet.
-      if (current !== undefined) writeNewFile(`${dest}.bak`, current);
+      writeNewFile(`${dest}.bak`, current);
     }
     writeNewFile(dest, shipped);
     if (!present) return { status: "installed" };
     return {
       status: "replaced",
-      detail:
-        current !== undefined
-          ? `differed from the shipped pipeline — previous contents saved as ${filename}.bak`
-          : `differed from the shipped pipeline — the previous file could not be read, so no backup was made`,
+      detail: `differed from the shipped pipeline — previous contents saved as ${filename}.bak`,
     };
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };

@@ -566,6 +566,47 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(readFileSync(dest(dir), "utf8")).toBe(shipped);
   });
 
+  /**
+   * An UNREADABLE original is refused, not replaced (PR #307 review, P1). It reaches the
+   * replacement by being treated as "differing" — right for deciding this is not a no-op — but
+   * "anton could not read it" says nothing about whether it mattered. A mode-000 formula in a
+   * writable directory is still somebody's file, and replacing it destroys bytes no backup holds
+   * and git may never have seen. An earlier version replaced it and reported no backup was made,
+   * which announced the loss instead of preventing it.
+   */
+  it("refuses to replace a formula it cannot read, rather than destroying contents nothing has a copy of", () => {
+    const dir = beadsDir();
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    writeFileSync(dest(dir), '{"formula":"anton-bead","IRREPLACEABLE":true}');
+    chmodSync(dest(dir), 0o000);
+
+    // Root reads a mode-000 file regardless, so the precondition only holds unprivileged.
+    let readable: boolean;
+    try {
+      readFileSync(dest(dir));
+      readable = true;
+    } catch {
+      readable = false;
+    }
+
+    try {
+      const result = ensureBeadFormula(dir);
+      if (readable) {
+        // Running as root: the file IS readable, so the normal replace-with-backup path applies.
+        expect(result.status).toBe("replaced");
+        return;
+      }
+      expect(result.status).toBe("failed");
+      expect(result.detail).toContain("could not be read");
+      // The bytes are still there, and no `.bak` pretends otherwise.
+      chmodSync(dest(dir), 0o600);
+      expect(readFileSync(dest(dir), "utf8")).toContain("IRREPLACEABLE");
+      expect(existsSync(`${dest(dir)}.bak`)).toBe(false);
+    } finally {
+      chmodSync(dest(dir), 0o600); // so afterEach can clean up
+    }
+  });
+
   it("leaves no temp file behind after a successful install", () => {
     const dir = beadsDir();
     ensureBeadFormula(dir);
@@ -585,11 +626,6 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(existsSync(join(real, "formulas", BEAD_FORMULA_FILENAME))).toBe(false);
   });
 
-  /**
-   * The backup is a SECOND write to a path the repo names, so it gets the same refusal. Skipping it
-   * must not block the install — git still holds the durable copy — but `detail` then has to stop
-   * promising a backup that was never written.
-   */
   /**
    * The backup is a PRECONDITION of the replacement (PR #307 review, P1). An earlier version wrote
    * the formula anyway and reported "NOT backed up", reasoning that git holds the durable copy —
