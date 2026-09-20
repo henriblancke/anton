@@ -1830,7 +1830,21 @@ async function cmdSetup(args = []) {
   // own step; this path never called it, so a backup made here would be staged by the next
   // `git add -A` and a stale pipeline committed. Idempotent and additive — it only appends entries
   // the file lacks.
-  if (existsSync(join(APP_ROOT, ".beads"))) ensureBeadsGitignore(join(APP_ROOT, ".beads"));
+  // Wrapped, like every other step in this command: `ensureBeadsGitignore` writes a file and can
+  // throw on a read-only checkout or a `.gitignore` that is a directory, and an uncaught throw here
+  // would abort `anton setup` before the installers below ever run their own best-effort reporting
+  // (PR #307 review). A missing ignore entry is a warning — the `.bak` might get committed — not a
+  // reason to fail setup.
+  if (existsSync(join(APP_ROOT, ".beads"))) {
+    try {
+      ensureBeadsGitignore(join(APP_ROOT, ".beads"));
+    } catch (e) {
+      console.log(
+        c.yellow(`\n! could not update .beads/.gitignore: ${e?.message ?? e}`) +
+          c.dim("\n  A formula backup (.bak) written below would not be ignored — do not commit it."),
+      );
+    }
+  }
   for (const asset of [
     { label: "Bead formula", filename: BEAD_FORMULA_FILENAME, install: ensureBeadFormula },
     { label: "Run formula", filename: RUN_FORMULA_FILENAME, install: ensureRunFormula },

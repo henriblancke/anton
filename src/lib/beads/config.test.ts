@@ -540,6 +540,32 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(readFileSync(outside, "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
   });
 
+  /**
+   * PR #307 review, P1. The backup must hold the bytes the COMPARISON saw, not a fresh read of the
+   * destination: two installers on one repo (concurrent `anton init`s) both compare the customized
+   * file, the first replaces it, and a second that re-read `dest` at backup time would save the
+   * shipped formula it just found — leaving the operator's customization in neither the file nor
+   * the `.bak`.
+   *
+   * This pins the INVARIANT that makes the race harmless (the backup holds what was compared), not
+   * the interleaving itself: `ensureFormula` is synchronous with no seam between its compare and
+   * its backup, so a true concurrent run cannot be staged from here. What the invariant rules out
+   * is the only way the race could lose data.
+   */
+  it("backs up the bytes it compared, so a concurrent replacement cannot erase them", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    const shipped = readFileSync(dest(dir), "utf8");
+    const customized = '{"formula":"anton-bead","MY-CUSTOMIZATION":true}';
+    writeFileSync(dest(dir), customized);
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    // The backup holds the customization that was compared — never the shipped bytes just written.
+    expect(readFileSync(`${dest(dir)}.bak`, "utf8")).toBe(customized);
+    expect(readFileSync(dest(dir), "utf8")).toBe(shipped);
+  });
+
   it("leaves no temp file behind after a successful install", () => {
     const dir = beadsDir();
     ensureBeadFormula(dir);

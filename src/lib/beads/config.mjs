@@ -542,11 +542,16 @@ function ensureFormula(beadsDir, filename, src) {
   const unsafe = unsafeDirDetail(beadsDir) ?? (present ? unsafeDestDetail(dest, filename) : undefined);
   if (unsafe) return { status: "unsafe-dest", detail: unsafe };
 
+  // The bytes the comparison below saw, kept for the backup to write (PR #307 review). Re-reading
+  // `dest` at backup time instead would open a window where a CONCURRENT installer — two `anton
+  // init`s on one repo — has already replaced the file, so the second process would back up the
+  // shipped formula it just found and the operator's real customization would exist nowhere: not
+  // in `dest`, not in the `.bak`. Backing up what was actually compared cannot lose it that way.
+  let current;
   if (present) {
     // An existing copy that cannot be READ is not "already": treat unknown as differing and let the
     // copy below overwrite it, the same way the describer's read-only guard treats an unreadable
     // worktree state as dirty rather than clean.
-    let current;
     try {
       current = readFileSync(dest);
     } catch {
@@ -579,14 +584,22 @@ function ensureFormula(beadsDir, filename, src) {
           detail: `${unsafeBak} — leaving ${filename} untouched, since replacing it without a backup could destroy uncommitted changes`,
         };
       }
+      // `current`, NOT a fresh read of `dest` — the bytes the comparison saw are the ones worth
+      // keeping; see where it is captured. An unreadable original (current === undefined) reached
+      // here by being treated as "differing", and there is nothing to back up, so the replacement
+      // proceeds: the guarantee is "never destroy contents anton could read", and these are not
+      // contents anton could read.
       // Any throw here propagates to the outer catch as "failed"; nothing has been overwritten yet.
-      writeNewFile(`${dest}.bak`, readFileSync(dest));
+      if (current !== undefined) writeNewFile(`${dest}.bak`, current);
     }
     writeNewFile(dest, shipped);
     if (!present) return { status: "installed" };
     return {
       status: "replaced",
-      detail: `differed from the shipped pipeline — previous contents saved as ${filename}.bak`,
+      detail:
+        current !== undefined
+          ? `differed from the shipped pipeline — previous contents saved as ${filename}.bak`
+          : `differed from the shipped pipeline — the previous file could not be read, so no backup was made`,
     };
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };
