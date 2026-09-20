@@ -93,19 +93,39 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     expect(boardEvidence(before, after)).toEqual(["a"]);
   });
 
-  it("ignores bookkeeping-label, assignee and note churn — anton's own writes, not the agent's work", () => {
+  it("ignores bookkeeping-label and note churn — anton's own writes, not the agent's work", () => {
     const before = fingerprintBoard([
-      bead("a", { labels: ["stage:implementing"], assignee: "op-1", notes: "old" }),
+      bead("a", { labels: ["stage:implementing"], notes: "old" }),
     ]);
     const after = fingerprintBoard([
       bead("a", {
         labels: ["run-lease:123", "review-score:8"],
-        assignee: "op-2",
         notes: "anton: something",
       }),
     ]);
     expect(boardEvidence(before, after)).toEqual([]);
   });
+
+  it(
+    "ignores the DISPATCHED ticket's own assignee churn — anton's claim/heartbeat rewrites it " +
+      "regardless of what the agent did",
+    () => {
+      const before = fingerprintBoard([bead("a", { assignee: "op-1" })], "a");
+      const after = fingerprintBoard([bead("a", { assignee: "op-2" })], "a");
+      expect(boardEvidence(before, after)).toEqual([]);
+    },
+  );
+
+  it(
+    "catches an assignee change on any OTHER bead — reserving/reassigning another bead via `bd " +
+      "assign` is a supported board-only deliverable that touches no other field (anton-fc5x " +
+      "follow-up review)",
+    () => {
+      const before = fingerprintBoard([bead("a", { assignee: "" })], "dispatched-ticket");
+      const after = fingerprintBoard([bead("a", { assignee: "some-other-owner" })], "dispatched-ticket");
+      expect(boardEvidence(before, after)).toEqual(["a"]);
+    },
+  );
 
   it("catches a priority change — a board-only ticket may exist to reprioritize a batch (anton-fc5x review round 1)", () => {
     const before = fingerprintBoard([bead("a", { priority: 2 })]);
@@ -407,8 +427,10 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
-    "reports baselineUnconfirmed when the recovery baseline write itself fails every retry — the " +
-      "push is never reached, so persistence alone still fails closed (PR #284 review round 9)",
+    "reports baselineUnpersisted, never baselineUnconfirmed, when the recovery baseline write " +
+      "itself fails every retry — the push is never reached, and with nothing persisted anywhere " +
+      "(not even locally) a same-machine resume is not specially safe the way baselineUnconfirmed's " +
+      "is (anton-fc5x review round 7)",
     async () => {
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       const baseline = (await readBoardBaseline("/repo"))!;
@@ -423,7 +445,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         ids: [],
         synced: false,
         evidenceUnavailable: true,
-        baselineUnconfirmed: true,
+        baselineUnpersisted: true,
       });
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
     },

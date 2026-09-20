@@ -94,8 +94,9 @@ function contentMetadata(b: Bead): [string, unknown][] {
 
 /** A point-in-time fingerprint of the whole board's CONTENT — status, title, description,
  * acceptance criteria, priority, every non-bookkeeping label, every non-bookkeeping metadata key,
- * parentage and dependency edges. Deliberately not assignee or notes, which anton itself rewrites
- * on a claim, a heartbeat lease refresh or a note, regardless of what the agent did. Parent and
+ * parentage, dependency edges, and (on every bead except the one this run is dispatching) assignee.
+ * Notes stay excluded on every bead — anton's heartbeat appends to them regardless of what the agent
+ * did, and no supported board-only write uses notes as its sole deliverable. Parent and
  * dependencies are included (anton-fc5x review round 2) because a reparent or a `bd dep
  * add`/`bd supersede` — both canonical board-only deliverables per this module's own docstring —
  * touch only those edges, never status/title/description/labels, and would otherwise fingerprint
@@ -112,7 +113,13 @@ function contentMetadata(b: Bead): [string, unknown][] {
  * `metadata` (minus `ANTON_METADATA_KEYS`) is included (anton-fc5x review round 6) for the same
  * reason again: it is the field `bd update --set-metadata` writes to, and anton's own metadata
  * writes (the PR pointer, its retired counterpart, the board-evidence baseline) are excluded the
- * same way its own labels already are. */
+ * same way its own labels already are. Assignee is included on every OTHER bead too (anton-fc5x
+ * follow-up review) for the same reason once more: reserving or reassigning another bead via `bd
+ * assign`/`beads.assign` is a supported board-only deliverable (skills/bd/SKILL.md) that touches no
+ * other field — `bd assign` deliberately leaves status untouched — so excluding assignee everywhere
+ * would fingerprint that delivery as no change at all. Only the CURRENTLY DISPATCHED ticket's own
+ * assignee stays excluded, because anton itself rewrites it on a claim or a heartbeat lease refresh
+ * regardless of what the agent did — that exclusion is what `dispatchedTicketId` below narrows to. */
 export interface BoardFingerprint {
   readonly beads: ReadonlyMap<string, string>;
 }
@@ -123,7 +130,10 @@ function normalizedDependencies(b: Bead): string[] {
   return (b.dependencies ?? []).map((d) => `${d.type}:${d.depends_on_id}`).toSorted();
 }
 
-function fingerprintOf(b: Bead): string {
+/** `dispatchedTicketId`, so this ticket's own claim/heartbeat-rewritten assignee never fingerprints
+ * as its own evidence, while every OTHER bead's assignee — where a board-only reassignment would
+ * actually land — does. */
+function fingerprintOf(b: Bead, dispatchedTicketId: string): string {
   return JSON.stringify([
     b.status,
     b.title,
@@ -136,12 +146,16 @@ function fingerprintOf(b: Bead): string {
     normalizedDependencies(b),
     b.external_ref ?? "",
     contentMetadata(b),
+    b.id === dispatchedTicketId ? "" : (b.assignee ?? ""),
   ]);
 }
 
-/** Fingerprint every bead in a board read, keyed by id. */
-export function fingerprintBoard(board: readonly Bead[]): BoardFingerprint {
-  return { beads: new Map(board.map((b) => [b.id, fingerprintOf(b)])) };
+/** Fingerprint every bead in a board read, keyed by id. `dispatchedTicketId` (default none, i.e. no
+ * exclusion) names the ticket this run is currently dispatching, so its own assignee — rewritten by
+ * anton's claim/heartbeat regardless of what the agent did — never fingerprints as this ticket's own
+ * evidence, while every other bead's assignee does. */
+export function fingerprintBoard(board: readonly Bead[], dispatchedTicketId = ""): BoardFingerprint {
+  return { beads: new Map(board.map((b) => [b.id, fingerprintOf(b, dispatchedTicketId)])) };
 }
 
 /**
@@ -230,7 +244,7 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
   if (preserved) return deserializeFingerprint(preserved);
   const board = await mustReadBoard(repo);
   const hydrated = board && (await hydrateDescriptions(repo, board));
-  return hydrated ? fingerprintBoard(hydrated) : null;
+  return hydrated ? fingerprintBoard(hydrated, ticket?.id) : null;
 }
 
 /** What the post-run board read found, relative to the baseline. */
@@ -265,18 +279,31 @@ export interface BoardEvidenceResult {
    */
   markerUnpersisted?: boolean;
   /**
-   * The FIRST attempt's recovery baseline (see {@link readBoardEvidence}'s `!hydrated` branch) could
-   * not be made durable — persisted AND confirmed synced — before this attempt gave up (PR #284
-   * review round 9). Always paired with `evidenceUnavailable: true`. Named separately because it is
-   * a sharper warning than a merely unreadable post-run board: if this ticket resumes on ANOTHER
+   * The FIRST attempt's recovery baseline (see {@link readBoardEvidence}'s `!hydrated` branch)
+   * PERSISTED LOCALLY but could not be confirmed synced before this attempt gave up (PR #284 review
+   * round 9). Always paired with `evidenceUnavailable: true`. Named separately because it is a
+   * sharper warning than a merely unreadable post-run board: if this ticket resumes on ANOTHER
    * machine (the run-lease actor is machine-scoped, not run-scoped), that machine never sees this
    * preserved baseline either, so `readBoardBaseline` takes a FRESH read there too — one that may
    * already have absorbed this ticket's own writes through an independent sync pass — and an
    * idempotent retry that correctly makes no further writes then reads as no evidence at all,
    * permanently. Resuming on the SAME machine is still safe (the baseline sits in this process's
-   * local Dolt state regardless of whether it pushed), so the operator note has to say which.
+   * local Dolt state regardless of whether it pushed), so the operator note has to say which. Only
+   * ever set when the local persist itself succeeded — see {@link baselineUnpersisted} for the case
+   * where it did not.
    */
   baselineUnconfirmed?: boolean;
+  /**
+   * The FIRST attempt's recovery baseline could not be written even LOCALLY, after every retry
+   * (anton-fc5x review round 7) — the sibling case to {@link baselineUnconfirmed}, which requires the
+   * local write to have actually landed. With nothing persisted anywhere, resuming on THIS machine is
+   * NOT specially safe: a same-machine resume finds no preserved baseline either and falls back to
+   * the same fresh read a different machine would, one that may already have absorbed this ticket's
+   * own writes through an independent sync pass. Named separately so `boardOnlyNoDeliveryMessage`
+   * never repeats `baselineUnconfirmed`'s same-machine safety claim for a write that never landed at
+   * all.
+   */
+  baselineUnpersisted?: boolean;
 }
 
 /**
@@ -378,7 +405,11 @@ export async function readBoardEvidence(
       // through some other channel — writes, permanently rejecting an idempotent retry as unchanged.
       // `baselineUnconfirmed` is reported (never silently folded into a plain `evidenceUnavailable`)
       // so the operator note can say precisely that resuming on THIS machine is safe but resuming
-      // elsewhere is not.
+      // elsewhere is not — but only when the write actually landed locally and merely failed to
+      // confirm as synced. A write that failed outright (`!persisted`) leaves NO baseline anywhere,
+      // not even on this machine, so that same-machine safety claim would be false; that case is
+      // reported as `baselineUnpersisted` instead (anton-fc5x review round 7), which carries no such
+      // claim.
       const persisted = await mustPersist(() =>
         beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
       );
@@ -394,13 +425,13 @@ export async function readBoardEvidence(
           ids: pending,
           synced: false,
           evidenceUnavailable: true,
-          baselineUnconfirmed: true,
+          ...(persisted ? { baselineUnconfirmed: true } : { baselineUnpersisted: true }),
         };
       }
     }
     return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
   }
-  const freshIds = boardEvidence(baseline, fingerprintBoard(hydrated));
+  const freshIds = boardEvidence(baseline, fingerprintBoard(hydrated, ticket.id));
   const pending = beads.pendingBoardEvidence(ticket);
   const ids = [...new Set([...pending, ...freshIds])].toSorted();
   if (ids.length === 0) return { found: false, ids: [], synced: false };
@@ -432,14 +463,21 @@ export async function readBoardEvidence(
       // Confirmed (persisted AND synced) exactly like the `!hydrated` branch's recovery baseline (PR
       // #284 review round 10) — both marker and baseline are unrecoverable state once this attempt's
       // baseline is superseded, so a baseline write that landed only locally, or never landed at all,
-      // is reported the same way that branch reports it: `baselineUnconfirmed`, not silently folded
-      // into `markerUnpersisted`/`synced`, which describe the marker and content edits only.
+      // is reported the same way that branch reports it: `baselineUnconfirmed`/`baselineUnpersisted`,
+      // not silently folded into `markerUnpersisted`/`synced`, which describe the marker and content
+      // edits only. The two are kept distinct (anton-fc5x review round 7) for the same reason as the
+      // `!hydrated` branch above: only a baseline that actually landed locally makes a same-machine
+      // resume specially safe.
       return {
         found: true,
         ids,
         synced,
         markerUnpersisted: true,
-        ...(!baselinePersisted || !synced ? { baselineUnconfirmed: true } : {}),
+        ...(!baselinePersisted
+          ? { baselineUnpersisted: true }
+          : !synced
+            ? { baselineUnconfirmed: true }
+            : {}),
       };
     }
   }

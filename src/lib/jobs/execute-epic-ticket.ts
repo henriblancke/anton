@@ -595,13 +595,25 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `settle on.`
     );
   }
+  if (evidence.baselineUnpersisted) {
+    return (
+      `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
+      `is bd writes to the board, not the git tree — the post-run board read failed (after retries), ` +
+      `and the recovery baseline this attempt tried to preserve for a resume could not be written even ` +
+      `LOCALLY (after retries). Blocking the ticket for operator review — resuming on this machine is ` +
+      `NOT specially safe here: with no baseline persisted anywhere, a same-machine resume falls back ` +
+      `to the same fresh board read a different machine would, one that may already have absorbed this ` +
+      `ticket's own already-synced writes as pre-existing, permanently rejecting an idempotent retry as ` +
+      `unchanged. Check the beads DB and the sync channel, then resume the run.`
+    );
+  }
   if (evidence.baselineUnconfirmed) {
     return (
       `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
       `is bd writes to the board, not the git tree — the post-run board read failed (after retries), ` +
-      `and the recovery baseline this attempt tried to preserve for a resume could not be made ` +
-      `durable either (persisted and confirmed synced). Blocking the ticket for operator review — ` +
-      `RESUMING ON THIS SAME MACHINE is safe, but resuming on a different one will not see this ` +
+      `and the recovery baseline this attempt preserved locally could not be confirmed synced. ` +
+      `Blocking the ticket for operator review — RESUMING ON THIS SAME MACHINE is safe (the baseline ` +
+      `landed locally regardless of the push), but resuming on a different one will not see this ` +
       `attempt's baseline and may silently absorb this ticket's own already-synced writes as ` +
       `pre-existing, permanently rejecting an idempotent retry as unchanged. Check the beads DB and ` +
       `the sync channel, then resume the run on this machine.`
