@@ -367,4 +367,31 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       expect(settleFailedTicketMock).not.toHaveBeenCalled();
     },
   );
+
+  it(
+    "halts instead of settling when a total read failure ALSO could not persist a recovery " +
+      "baseline — `found: false` here means nothing to attribute, not that the recovery write " +
+      "itself succeeded (chatgpt-codex-connector, PR #284 review)",
+    async () => {
+      readBoardEvidenceMock.mockResolvedValue({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+        baselineUnpersisted: true,
+      });
+
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [failingVerifyStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow(/could not be recorded for a resume/);
+
+      expect(settleFailedTicketMock).not.toHaveBeenCalled();
+    },
+  );
 });

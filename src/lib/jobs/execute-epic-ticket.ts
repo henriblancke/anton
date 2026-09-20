@@ -282,15 +282,16 @@ async function auditBoardOnFailedTicket(
   cause: unknown,
 ): Promise<void> {
   const result = await readBoardEvidence(run.repoPath, boardBaseline, ticket);
-  if (!result.found) return;
-  await appendSessionLog(
-    logPath,
-    `[board-audit] ${ticket.id} failed after board evidence was found on ${result.ids.join(", ")} — ` +
-      `preserved on the ticket for a resumed attempt to attribute.\n`,
-  ).catch(() => {});
+  // Checked BEFORE the `!found` return (chatgpt-codex-connector, PR #284 review): a total read
+  // failure with no prior pending ids reports `found: false` alongside `baselineUnpersisted: true`
+  // (see `readBoardEvidence`'s own docstring) — the one shape where "nothing to attribute" and "the
+  // recovery write itself failed" coincide. Returning early on `!found` first would silently drop
+  // that failure and let the ticket settle as an ordinary failure, leaving a resumed attempt's fresh
+  // `readBoardBaseline` free to absorb this attempt's untracked board writes as pre-existing once a
+  // later sync publishes them.
   if (result.markerUnpersisted || result.baselineUnpersisted) {
     throw new PoisonEpic(
-      `${ticket.id} failed and this attempt's board writes on ${result.ids.join(", ")} could not be ` +
+      `${ticket.id} failed and this attempt's board writes${result.ids.length > 0 ? ` on ${result.ids.join(", ")}` : ""} could not be ` +
         `recorded for a resume — bd refused the ${result.markerUnpersisted ? "pending-evidence marker" : "recovery baseline"} ` +
         `write after retries. The run stopped rather than let a resumed attempt's fresh board ` +
         `baseline silently absorb these unreviewed writes as pre-existing, with no way left to ` +
@@ -298,6 +299,12 @@ async function auditBoardOnFailedTicket(
         `failed with: ${String(cause)}`,
     );
   }
+  if (!result.found) return;
+  await appendSessionLog(
+    logPath,
+    `[board-audit] ${ticket.id} failed after board evidence was found on ${result.ids.join(", ")} — ` +
+      `preserved on the ticket for a resumed attempt to attribute.\n`,
+  ).catch(() => {});
 }
 
 /**

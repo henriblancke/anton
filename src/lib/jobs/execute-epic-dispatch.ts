@@ -1290,7 +1290,26 @@ async function dispatchTicket(
     // section still names them instead of falling back to a generic "some board write happened"
     // note for a ticket whose evidence genuinely was confirmed.
     const confirmedIds = beads.confirmedBoardEvidenceIds(ticket);
-    if (confirmedIds.length > 0) {
+    // `boardEvidenceConfirmed` is not proof the marker/baseline clear it's normally paired with
+    // ever landed (chatgpt-codex-connector, PR #284 review, "Finish surviving cleanup before
+    // accepting confirmation"): `clearBoardEvidencePending` can persist the confirmed flag and
+    // still fail one of its PRECEDING clears, and a later best-effort sync can publish that
+    // partial state on its own. A fresh-machine resume with no attribution commit of its own must
+    // finish that survivor cleanup before trusting `confirmed` as fully settled — otherwise a
+    // stale preserved baseline anchors a future, unrelated reopen of this ticket to a board
+    // snapshot from before this delivery, or a stale pending marker is read as current evidence
+    // for a ticket that got no new work. Checked independently of `hasBoardEvidenceCleanupUnsynced`
+    // (the block above), which already retries the confirming-push-only failure shape on its own —
+    // this only covers the marker/baseline survivors that shape doesn't leave behind.
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    if (stalePending.length > 0 || hasPreservedBaseline) {
+      const recoveredIds = [...new Set([...stalePending, ...confirmedIds])].toSorted();
+      await clearBoardEvidencePending(repo, ticket.id, recoveredIds, hasPreservedBaseline, false);
+      if (recoveredIds.length > 0) {
+        ledger.boardEvidence.set(ticket.id, recoveredIds);
+      }
+    } else if (confirmedIds.length > 0) {
       ledger.boardEvidence.set(ticket.id, confirmedIds);
     }
     await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });

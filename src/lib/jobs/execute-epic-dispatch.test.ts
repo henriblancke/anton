@@ -1144,6 +1144,54 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
     expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([target]);
     expect(outcome.delivered.map((b) => b.id)).toContain(EPIC);
   });
+
+  // chatgpt-codex-connector, PR #284 review, "Finish surviving cleanup before accepting
+  // confirmation": `clearBoardEvidencePending` can persist the confirmed flag and still fail one of
+  // its PRECEDING clears (the marker or the baseline), and a later best-effort sync can publish that
+  // partial state on its own. A resume that only checks `boardEvidenceConfirmed` would accept this
+  // ticket as fully settled and leave the survivor behind for a future, unrelated reopen to misread.
+  it("finishes a surviving pending marker instead of trusting confirmed as fully settled", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb2"])],
+      metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+    });
+    hasCommitMock.mockResolvedValue(false);
+
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      "anton-a",
+      ["anton-eb1", "anton-eb2"],
+      false,
+      false,
+    );
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1", "anton-eb2"]);
+  });
+
+  it("finishes a surviving preserved baseline instead of trusting confirmed as fully settled", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly],
+      metadata: {
+        boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+        boardEvidenceBaseline: JSON.stringify({ x: "hash" }),
+      },
+    });
+    hasCommitMock.mockResolvedValue(false);
+
+    await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      "anton-a",
+      ["anton-eb1"],
+      true,
+      false,
+    );
+  });
 });
 
 // PR #284 review ("Recover cleanup-only resumes before regeneration"): a prior attempt can clear
