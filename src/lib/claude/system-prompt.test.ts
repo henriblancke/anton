@@ -80,6 +80,21 @@ describe("composeSystemPrompt", () => {
     const out = composeSystemPrompt({ base });
     expect(out).not.toContain("This ticket is board-only");
   });
+
+  // PR #284 review (P1): the worktree's embedded Dolt copy is not what anton's board-evidence check
+  // reads — a `bd` write left at the worktree's own cwd can be stranded there forever on a
+  // non-server board. The carve-out must tell the agent to point writes at the live board explicitly.
+  it("tells a board-only agent to redirect bd writes at the live repo path via -C", () => {
+    const out = composeSystemPrompt({ base, boardOnly: true, repoPath: "/live/repo" });
+    expect(out).toContain("bd -C /live/repo update <id> --status done");
+    expect(out.toLowerCase()).toContain("separate, unsynced copy");
+  });
+
+  it("omits the -C redirect instruction when boardOnly is set without a repoPath", () => {
+    const out = composeSystemPrompt({ base, boardOnly: true });
+    expect(out).toContain("This ticket is board-only");
+    expect(out).not.toContain("-C");
+  });
 });
 
 describe("loadBaseSystemPrompt (real file)", () => {

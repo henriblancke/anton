@@ -35,6 +35,7 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
       agentPrompt: await loadAgentPrompt(agentTag, { projectDir: ctx.worktreePath }),
       seedPrompt: ctx.settings.seedPrompt,
       boardOnly: ctx.boardOnly,
+      repoPath: ctx.repoPath,
     });
     const dispatched = await readForDispatch(ctx.repoPath, ticket);
     // Asked per ticket, not once per run: the answer is about THIS bead's own preserved commit, and
@@ -91,6 +92,7 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
     appendSystemPrompt: await buildExecutionSystemPrompt({
       seedPrompt: ctx.settings.seedPrompt,
       boardOnly: ctx.boardOnly,
+      repoPath: ctx.repoPath,
     }),
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });

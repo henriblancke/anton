@@ -61,12 +61,26 @@ export interface SystemPromptLayers {
    * the agent/seed layers, rather than as a customization that could be mistaken for one.
    */
   boardOnly?: boolean;
+  /**
+   * The live board's repo path ({@link import("../jobs/steps/context").StepContext.repoPath}) — only
+   * read when {@link boardOnly} is set. anton's board-evidence check ({@link
+   * import("../jobs/execute-epic-board-evidence").readBoardEvidence}) always reads/writes THIS path,
+   * never the ticket's own worktree: on an embedded (non-server) Dolt board, the worktree carries its
+   * own separate, unsynced copy with no remote wired to publish from (see `MAX_TICKET_FIELD_CHARS`'s
+   * docstring in `steps/prompts.ts`), so a `bd` write left at the worktree's default cwd can land in a
+   * copy the evidence check never reads and never converges into — stranding a compliant board-only
+   * agent's own writes forever, not just delaying them. Passing this lets {@link boardOnlySection}
+   * tell the agent to point every `bd` write at the live board explicitly, via `bd`'s own `-C` flag,
+   * rather than relying on its cwd.
+   */
+  repoPath?: string;
 }
 
 /** The carve-out from the base's unchanged-tree rule for a ticket anton classified as board-only —
  * a fact about THIS run, so it rides with the contract rather than the customizable layers below
- * it (see {@link SystemPromptLayers.boardOnly}). */
-function boardOnlySection(): string {
+ * it (see {@link SystemPromptLayers.boardOnly}). `repoPath`, when given, adds the explicit `-C`
+ * instruction described on {@link SystemPromptLayers.repoPath}. */
+function boardOnlySection(repoPath?: string): string {
   return [
     "## This ticket is board-only",
     "",
@@ -87,6 +101,21 @@ function boardOnlySection(): string {
     "the branch, so this is not the false-success shape the base rule exists to catch. If you could",
     "not make the required writes, report `blocked` or `needs-human` exactly as you would for any",
     "other ticket.",
+    ...(repoPath
+      ? [
+          "",
+          `Run every \`bd\` write against the live board at \`${repoPath}\`, not this worktree's own ` +
+            "copy — pass `bd`'s own directory flag rather than relying on where you happen to be, e.g.:",
+          "",
+          "```",
+          `bd -C ${repoPath} update <id> --status done`,
+          "```",
+          "",
+          "This worktree's embedded beads database is a separate, unsynced copy on a non-server board: " +
+            "anton's board-evidence check reads and writes only the path above, and a write left at " +
+            "this worktree's own cwd can be stranded there permanently rather than merely delayed.",
+        ]
+      : []),
   ].join("\n");
 }
 
@@ -103,7 +132,7 @@ export function composeSystemPrompt(layers: SystemPromptLayers): string {
 
   // The board-only carve-out rides with the contract, ahead of the agent/seed layers, since it is
   // part of what the base itself means for THIS ticket rather than a customization of it.
-  if (layers.boardOnly) sections.push(boardOnlySection());
+  if (layers.boardOnly) sections.push(boardOnlySection(layers.repoPath));
 
   const agent = layers.agentPrompt?.trim();
   if (agent) {
@@ -138,6 +167,7 @@ export async function buildExecutionSystemPrompt(opts: {
   agentPrompt?: string;
   seedPrompt?: string;
   boardOnly?: boolean;
+  repoPath?: string;
 }): Promise<string> {
   const base = await loadBaseSystemPrompt();
   return composeSystemPrompt({
@@ -145,5 +175,6 @@ export async function buildExecutionSystemPrompt(opts: {
     agentPrompt: opts.agentPrompt,
     seedPrompt: opts.seedPrompt,
     boardOnly: opts.boardOnly,
+    repoPath: opts.repoPath,
   });
 }

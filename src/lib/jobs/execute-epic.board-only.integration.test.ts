@@ -93,11 +93,18 @@ describeBd("execute-epic e2e — a board-only ticket settles on board evidence, 
       description: "## Goal\nold wording",
     });
 
+    // The write deliberately does NOT set `cwd` on the child process — it inherits the REAL dispatch
+    // cwd (the worktree, per dispatch.ts), and instead points `bd` at the live board the same way the
+    // board-only system-prompt carve-out instructs a compliant agent to (`-C <repoPath>`, PR #284
+    // review). Hardcoding `cwd: repo` here would mask exactly the gap that instruction exists to
+    // close: on an embedded (non-server) Dolt board the worktree carries its own separate, unsynced
+    // copy, so a write left at the worktree's own cwd would never reach the board this ticket's
+    // evidence check reads.
     const boardOnlyClaude = writeBin(
       binDir,
       "claude-boardonly",
       fakeClaudeReadingStdin(`const cp=require('child_process');
-cp.execFileSync('bd',['update',${JSON.stringify(decoyId)},'--description','## Goal\\nswept wording'],{cwd:${JSON.stringify(repo)}});
+cp.execFileSync('bd',['-C',${JSON.stringify(repo)},'update',${JSON.stringify(decoyId)},'--description','## Goal\\nswept wording']);
 const text='Swept the vocabulary on the board.\\n\\nANTON-RESULT: delivered';
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 e({type:'system',subtype:'init',session_id:'bo'});

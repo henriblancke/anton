@@ -17,7 +17,6 @@
  * {@link import("./steps/git").recordBoardOnlyAttribution} before settling the ticket delivered — so
  * this module only ever answers "did the board change", never touches git itself.
  *
-
  * The agent runs `bd` directly in its own worktree process, never through this app's `bd.ts`
  * wrapper — so the in-process issue snapshot (snapshot.ts) never sees the agent's writes land and
  * cannot be trusted for either read here. Both reads below go through {@link mustReadBoard} (never a
