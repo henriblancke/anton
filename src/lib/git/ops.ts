@@ -1560,6 +1560,33 @@ function pushTimedOut(args: string[], timeoutMs: number, stderr: string): Error 
 }
 
 /**
+ * SSH keepalives for the push, because git opens the connection BEFORE `pre-push` runs.
+ *
+ * A project whose pre-push gate is slow (fati's runs the full app + voice suites, ~9-11 minutes)
+ * leaves that connection idle with nothing transferred for the whole gate, and the server hangs it
+ * up: `Connection to github.com closed by remote host.` The tests PASSED — the push is simply lost,
+ * and because nothing was sent there is no `Done` line, so {@link classifyPushFailure} reads the
+ * exit-1 as a declined local hook and never retries. Seven consecutive fati runs died this way on
+ * 2026-09-19/20 (fati-uhya), each after paying the full gate.
+ *
+ * `ServerAliveInterval=30` with `ServerAliveCountMax=30` holds the channel open through a ~15-minute
+ * gate while still giving up on a genuinely dead link. Pushing with these set landed fati-uhya on
+ * the first try after those seven failures.
+ *
+ * Only ever ADDS to the operator's own setting: an existing `GIT_SSH_COMMAND` is left exactly as it
+ * is, since it may carry an identity or a jump host we must not drop. Harmless for an HTTPS remote,
+ * which never reads it.
+ */
+export function pushEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): NodeJS.ProcessEnv {
+  const next = { ...env } as NodeJS.ProcessEnv;
+  if (next.GIT_SSH_COMMAND) return next;
+  next.GIT_SSH_COMMAND = "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=30";
+  return next;
+}
+
+/**
  * Run a `git push` and return only once it — and any `pre-push` hook it spawned — is GONE, the push
  * counterpart to {@link gitCommit} (PR #228 review, extended by anton-o74nf). `pre-push` is project
  * code exactly like `pre-commit`: free to outlive a plain `execFile` timeout, and a caller told the
@@ -1590,6 +1617,7 @@ function gitPush(
     const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
+      env: pushEnv(),
     });
     const stderr = boundedStderr(child);
     const stdout = boundedStdout(child);
@@ -1753,6 +1781,19 @@ const PORCELAIN_HOOK_REJECTED = /\[remote rejected\]\s*\(.*hook declined.*\)/;
 const PORCELAIN_ANY_REJECTED = /^!\t.*$/m;
 
 /**
+ * The remote hung up the transport before anything was transferred — the shape a slow `pre-push`
+ * gate produces when it outlasts the server's idle timeout (see {@link pushEnv}). Matched on stderr
+ * for a `code === 1` push, where it would otherwise be read as a declined local hook.
+ *
+ * Deliberately narrow: every alternative is a TRANSPORT diagnostic that only ssh or git itself
+ * writes, so a project hook printing the word "connection" in its own failure cannot mimic one.
+ * `Connection reset` is absent on purpose — the exit-128 branch already owns it, and a hook's stderr
+ * is quoted into this branch's text.
+ */
+const SSH_CONNECTION_DROPPED =
+  /(?:Connection (?:to .* )?closed by remote host|banner exchange: Connection to .* closed|kex_exchange_identification|client_loop: send disconnect|The remote end hung up unexpectedly)/i;
+
+/**
  * Caps {@link SIGNAL_KILL_RETRY}'s gap, same CAP-never-an-override contract as {@link PUSH_TIMEOUT_ENV}
  * and read per call for the same reason. Exists so the retry can be exercised without waiting out a
  * real 30 seconds; a lower value can only shorten the wait, never lengthen it.
@@ -1857,6 +1898,22 @@ export function classifyPushFailure(result: {
   }
 
   if (code === 1) {
+    // Checked BEFORE the declined-hook branch below, which is the default for "exit 1, no `Done`".
+    // A connection the server hung up on produces exactly that shape — git opens the SSH channel
+    // before `pre-push` runs, so a slow gate leaves it idle until the server drops it, and nothing
+    // was ever transferred — but the hook had nothing to do with it and usually PASSED. Read as a
+    // declined hook it is permanent, so the run dies having paid the full gate; read as what it is,
+    // the retry costs another gate but can actually succeed. {@link pushEnv} makes this rare rather
+    // than routine; this makes it survivable when it still happens.
+    if (SSH_CONNECTION_DROPPED.test(stderr)) {
+      return {
+        transient: true,
+        reason:
+          `the connection to the remote was closed before the push transferred anything — git opens ` +
+          `it before pre-push runs, so a slow gate can outlast the server's idle timeout. The hook's ` +
+          `own verdict is not what failed here: ${stderr}`,
+      };
+    }
     if (!/^Done\s*$/m.test(stdout)) {
       return {
         transient: false,

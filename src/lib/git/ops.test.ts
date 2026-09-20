@@ -72,6 +72,7 @@ import {
   SATISFIES_TRAILER,
   boundedTail,
   MAX_STDERR_CHARS,
+  pushEnv,
 } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
@@ -3995,6 +3996,23 @@ describe("push timeout default", () => {
   });
 });
 
+describe("pushEnv — keepalives so a slow pre-push gate cannot outlast the server's idle timeout", () => {
+  it("sets keepalives when the operator has no GIT_SSH_COMMAND of their own", () => {
+    const env = pushEnv({ PATH: "/usr/bin" });
+
+    expect(env.GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+    expect(env.GIT_SSH_COMMAND).toMatch(/ServerAliveCountMax=30/);
+    // Carries the rest of the environment through — git still needs PATH, HOME, SSH_AUTH_SOCK.
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("never overwrites an operator's own GIT_SSH_COMMAND — it may carry an identity or a jump host", () => {
+    const mine = "ssh -i ~/.ssh/deploy_key -J bastion.example.com";
+
+    expect(pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND).toBe(mine);
+  });
+});
+
 // anton-1cjaw: the discriminator table measured on git 2.x/macOS via execFile — captured stderr and
 // `--porcelain` stdout fed straight to the classifier, no live push involved. The exit code alone
 // cannot separate transient from permanent, so every case here pins BOTH the code and the porcelain
@@ -4010,6 +4028,41 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
     expect(verdict.transient).toBe(false);
     expect(verdict.reason).toMatch(/pre-push hook/);
     expect(verdict.reason).toMatch(/husky - pre-push hook exited with code 1/);
+  });
+
+  // The real fati-uhya stderr, verbatim: the gate PASSED and printed so, then the push was lost
+  // because git had opened the SSH channel before pre-push ran and the server dropped it as idle.
+  // Read as a hook decline this is permanent, so seven consecutive runs died having paid the full
+  // ~11-minute gate. It is a transport fault, and the retry can actually succeed.
+  it("classifies a connection the remote hung up on as transient, not as the hook declining", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr:
+        "pre-push: ✅ tests passed for the changed side(s).\n" +
+        "Connection to github.com closed by remote host.\n" +
+        "fatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+    // Must not be blamed on the hook, whose own PASSING output sits in that same stderr.
+    expect(verdict.reason).not.toMatch(/hook declined/);
+    expect(verdict.reason).toMatch(/closed before the push transferred anything/);
+  });
+
+  // The narrowness of SSH_CONNECTION_DROPPED is the point: a hook is free to print the word
+  // "connection" in a failure of its own, and that must stay permanent.
+  it("still calls a hook decline permanent when the hook's own output mentions a connection", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr:
+        "pre-push: ❌ tests failed — a test could not reach the database connection\n" +
+        "husky - pre-push hook exited with code 1 (error)\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-push hook/);
   });
 
   it("classifies a remote pre-receive decline as permanent — Done present, named as remote policy", () => {
