@@ -432,7 +432,15 @@ export async function warmRunWorktree(
   // `skipped_dirty`, which still returns the sha it reasoned about (`refreshOntoBase`'s own
   // `return { outcome: "skipped_dirty", baseSha }`) — so reusing that pin here keeps this check
   // evaluated against the same commit the refresh itself saw, rather than one a race moved on to.
-  const pinnedBase = worktree.refreshOutcome?.baseSha ?? freshBase;
+  //
+  // A freshly CREATED checkout never runs a refresh (see `materializeFreshWorktree`), so
+  // `refreshOutcome` is always undefined there — falling back to the bare `freshBase` local would
+  // reintroduce the very race the comment above guards against for a reused checkout: nothing stops
+  // `warmWorktreeBestEffort` (which runs for minutes) from racing a sibling run's force-fetch that
+  // rewrites `origin/<base>` before this line re-reads it (PR #279 review, P1). `baseForkSha` is
+  // already the immutable commit this checkout was cut from — frozen at creation, before any warm
+  // could rewind the base — so it, not the mutable ref, is what a fresh creation must pin against.
+  const pinnedBase = worktree.refreshOutcome?.baseSha ?? (reusedCheckout ? freshBase : baseForkSha);
   const shippedFallback = reusedCheckout ? (priorEffectiveRefreshSha ?? baseForkSha) : baseForkSha;
   // Both ancestry directions, not just fallback-descends-from-base (PR #279 review): a dirty resume
   // whose `resolveFreshBase` fell back to a stale LOCAL base (no network) can leave `pinnedBase`

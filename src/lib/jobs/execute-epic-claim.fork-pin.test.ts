@@ -320,6 +320,31 @@ it("pins alreadyShippedBase to baseForkSha on a fresh creation — nothing to re
   expect(runStep.alreadyShippedBase).toBe(runStep.baseForkSha);
 });
 
+it("falls back to the frozen baseForkSha, not the mutable freshBase ref, on a fresh creation once ancestry genuinely diverges (PR #279 review)", async () => {
+  // A fresh creation never runs a refresh, so `refreshOutcome` is undefined and `pinnedBase` must
+  // fall back to something. `freshBase` here is `origin/main` — a REF NAME, not a resolved commit —
+  // so passing it straight through re-resolves against whatever `origin/main` points to at the
+  // instant `isAncestor` runs, not what it pointed to when this attempt started. A sibling run's
+  // force-fetch during `warmWorktreeBestEffort` (which runs for minutes) can rewrite that ref in
+  // between, letting a stale re-resolution stand in for the checkout's actual, frozen fork. Forcing
+  // the ancestor check to fail both ways (the shape a genuine divergence — or a rewritten ref caught
+  // mid-flight — leaves) proves the fallback is the frozen `baseForkSha`, never the bare ref.
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: true,
+    repoPath: "/repo",
+    forkSha: "creation-fork-sha",
+  });
+  isAncestorMock.mockResolvedValue(false);
+
+  const { runStep } = await warmRunWorktree(makeRun());
+
+  expect(runStep.baseForkSha).toBe("creation-fork-sha");
+  expect(runStep.alreadyShippedBase).toBe("creation-fork-sha");
+});
+
 it("ignores a stale branch-scoped refresh record on a freshly RECREATED checkout, using its own fork instead (PR #279 review)", async () => {
   // An earlier attempt refreshed this branch onto `stale-recorded-base` and recorded it on its row
   // (now dead — an operator deleted the checkout and branch after it parked). This attempt's
