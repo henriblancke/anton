@@ -312,8 +312,20 @@ export function beadsPrereqs(dir, opts = {}) {
   return tooling.ok ? beadsBoardPrereqs(dir, opts) : tooling;
 }
 
-/** The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime state. */
-export const BEADS_GITIGNORE_ENTRIES = ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"];
+/**
+ * The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime
+ * state, plus the `.bak` a replaced formula leaves behind ({@link ensureFormula}). The backup is a
+ * local recovery aid for ONE machine's uncommitted tuning, and it lands in a directory git tracks —
+ * so without this line the next `git add -A` (an agent's, typically) would commit a stale pipeline
+ * copy into the repo and ship it to every clone.
+ */
+export const BEADS_GITIGNORE_ENTRIES = [
+  "issues.jsonl",
+  "interactions.jsonl",
+  "dolt/",
+  "embeddeddolt/",
+  "formulas/*.bak",
+];
 
 /**
  * Idempotently ensure `.beads/.gitignore` untracks the JSONL exports + Dolt runtime state. Appends
@@ -384,8 +396,8 @@ export const BEAD_FORMULA_FILENAME = "anton-bead.formula.json";
 
 /**
  * The run-formula asset's filename (anton-hrql) — the PIPELINE anton walks, as opposed to the bead
- * SKELETON above. Same install shape, same no-clobber rule, same `.beads/formulas/` home, so a
- * project owns its pipeline the way it already owns its bead shape.
+ * SKELETON above. Same install shape, same replace-on-drift rule ({@link ensureFormula}), same
+ * `.beads/formulas/` home.
  */
 export const RUN_FORMULA_FILENAME = "anton-run.formula.toml";
 
@@ -425,19 +437,39 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
 }
 
 /**
- * Install a bundled formula into `<repo>/.beads/formulas/`, NO-CLOBBER (anton-8mnr). A project-local
- * copy always wins: once a team has tuned its own bead shape or pipeline, re-running setup must never
- * overwrite it. Living under `.beads/` (which git tracks — only the JSONL exports and the Dolt runtime
- * are ignored) is what carries it to every clone and teammate.
+ * Install a bundled formula into `<repo>/.beads/formulas/`, OVERWRITING a project-local copy that
+ * differs from the shipped one (anton-8mnr, revised).
+ *
+ * The original rule was no-clobber on mere existence, and that silently stranded every shipped
+ * pipeline change: `step:describe` (anton-gzyjd) reached zero registered projects, because each had
+ * a byte-identical copy of an older template and `existsSync` cannot tell a TUNED pipeline from a
+ * STALE default. Every re-run printed "already present" and changed nothing, so the one signal an
+ * operator had said the opposite of the truth.
+ *
+ * So the comparison is now on CONTENT, not existence:
+ *   - byte-identical to the shipped asset  → "already", silent, the common case.
+ *   - differs in any way                   → "replaced", and the caller REPORTS it, naming the
+ *                                            backup that holds what was there.
+ *
+ * A differing file is overwritten rather than preserved, by explicit instruction: anton's shipped
+ * pipeline is the one its code is written against, and a project running a stale copy fails in ways
+ * that look like anton bugs. The cost is real and is mitigated, not denied — a project that TUNED
+ * its formula loses that tuning here. Two things make it recoverable: the file lives under `.beads/`
+ * which git tracks, so `git diff` shows the change and `git checkout` undoes it; and the prior
+ * contents are written beside it as `<filename>.bak` before the copy, so a repo with uncommitted
+ * tuning still has them. A project that wants a pipeline of its own should name it something else
+ * and point at it through the per-label variant map (anton-aa3m), which is the supported way to own
+ * a pipeline and is never touched by this installer.
  *
  * Never CREATES the workspace: a formula under a `.beads/` that no `bd init` made is a half-
  * workspace, and every downstream probe reads the directory's mere existence as "this is a beads
  * repo" (configureBeadsDoltSync does exactly that, then aborts `anton setup` for having no git
  * origin). So an absent `.beads/` is a skip, not a mkdir.
  *
- * Returns { status, detail? } — "installed" | "already" | "missing-asset" (the bundled file isn't in
- * this install — a warning, never fatal: anton's own loaders fall back to their packaged copy) |
- * "no-workspace" | "failed".
+ * Returns { status, detail? } — "installed" (nothing was there) | "replaced" (a differing copy was
+ * overwritten; `detail` names the backup) | "already" (byte-identical) | "missing-asset" (the
+ * bundled file isn't in this install — a warning, never fatal: anton's own loaders fall back to
+ * their packaged copy) | "no-workspace" | "failed".
  *
  * A filesystem error (read-only checkout, no write permission, transient I/O) is REPORTED as
  * "failed", never thrown: this is one best-effort step among a dozen in setup/registration, and an
@@ -445,24 +477,77 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  */
 function ensureFormula(beadsDir, filename, src) {
   const dest = join(beadsDir, "formulas", filename);
-  if (existsSync(dest)) return { status: "already" };
-  if (!existsSync(beadsDir)) return { status: "no-workspace" };
+  const present = existsSync(dest);
+  // The workspace gate runs BEFORE the asset gate for an absent dest, matching the original order:
+  // a release bundle with no `.beads/` must report "no-workspace" whether or not it ships the asset.
+  if (!present && !existsSync(beadsDir)) return { status: "no-workspace" };
   if (!existsSync(src)) return { status: "missing-asset" };
+
+  let shipped;
+  try {
+    shipped = readFileSync(src);
+  } catch (err) {
+    // An unreadable ASSET is the same class of problem as an absent one: anton falls back to its
+    // packaged copy, and nothing about the project is touched.
+    return { status: "missing-asset", detail: err?.message || String(err) };
+  }
+
+  if (present) {
+    // An existing copy that cannot be READ is not "already": treat unknown as differing and let the
+    // copy below overwrite it, the same way the describer's read-only guard treats an unreadable
+    // worktree state as dirty rather than clean.
+    let current;
+    try {
+      current = readFileSync(dest);
+    } catch {
+      current = undefined;
+    }
+    if (current !== undefined && current.equals(shipped)) return { status: "already" };
+  }
+
   try {
     mkdirSync(dirname(dest), { recursive: true });
+    // The backup is written BEFORE the copy and only when something is being replaced, so a fresh
+    // install leaves no stray `.bak` and a re-run that replaces twice keeps the copy from just
+    // before the current one. A backup that FAILS does not stop the install — the tracked file in
+    // git is the durable record, and the `.bak` is the convenience for uncommitted tuning — but it
+    // is reported, so the operator knows which of the two recovery paths they actually have.
+    let backup;
+    if (present) {
+      try {
+        copyFileSync(dest, `${dest}.bak`);
+        backup = `${filename}.bak`;
+      } catch {
+        backup = undefined;
+      }
+    }
     copyFileSync(src, dest);
+    if (!present) return { status: "installed" };
+    return {
+      status: "replaced",
+      detail: backup
+        ? `differed from the shipped pipeline — previous contents saved as ${backup}`
+        : "differed from the shipped pipeline — previous contents NOT backed up (see git)",
+    };
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };
   }
-  return { status: "installed" };
 }
 
-/** Install the bead skeleton every bead anton creates is rendered from (anton-8mnr). */
+/**
+ * Install the bead skeleton every bead anton creates is rendered from (anton-8mnr). Replaces a copy
+ * that differs from the shipped one — see {@link ensureFormula} for why, and for what a project that
+ * wants a skeleton of its own should do instead.
+ */
 export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
   return ensureFormula(beadsDir, BEAD_FORMULA_FILENAME, src);
 }
 
-/** Install the run pipeline anton walks (anton-hrql). */
+/**
+ * Install the run pipeline anton walks (anton-hrql). Replaces a copy that differs from the shipped
+ * one: this is the asset a shipped step (`step:describe`, anton-gzyjd) has to reach, and the one
+ * whose staleness reads as an anton bug. See {@link ensureFormula}.
+ */
 export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
   return ensureFormula(beadsDir, RUN_FORMULA_FILENAME, src);
 }
@@ -1938,8 +2023,9 @@ export function configureBeadsForRepo(dir, opts = {}) {
   }
 
   // 3c. Install anton's formulas: the bead skeleton, so every bead this project creates starts
-  //     contract-shaped (anton-8mnr), and the run pipeline anton walks (anton-hrql). No-clobber —
-  //     a project that tuned either one keeps it.
+  //     contract-shaped (anton-8mnr), and the run pipeline anton walks (anton-hrql). A copy that
+  //     DIFFERS from the shipped asset is replaced, not kept — this is the path a registered project
+  //     actually installs through, so it is the one that has to carry a new shipped step.
   for (const asset of [
     { label: "bead formula", filename: BEAD_FORMULA_FILENAME, src: bundledBeadFormulaPath(appRoot), install: ensureBeadFormula },
     { label: "run formula", filename: RUN_FORMULA_FILENAME, src: bundledRunFormulaPath(appRoot), install: ensureRunFormula },
@@ -1954,6 +2040,9 @@ export function configureBeadsForRepo(dir, opts = {}) {
     } else if (formula.status === "failed") {
       emit(`could not install the ${asset.label}: ${formula.detail}`);
       errors.push(`could not install the ${asset.label}: ${formula.detail}`);
+    } else if (formula.status === "replaced") {
+      // Loud, and never silent: this is the one status that DESTROYED something the project had.
+      emit(`.beads/formulas/${asset.filename} (replaced) — ${formula.detail}`);
     } else {
       emit(`.beads/formulas/${asset.filename} (${formula.status})`);
     }

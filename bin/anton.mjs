@@ -1816,13 +1816,15 @@ async function cmdSetup(args = []) {
   await provisionAgentsSkills(args);
 
   // anton's formulas: the bead skeleton every bead anton creates is rendered from (anton-8mnr) and
-  // the run pipeline anton walks (anton-hrql). Both live in the repo's `.beads/`, so a project-local
-  // copy always wins and a re-run never clobbers it.
+  // the run pipeline anton walks (anton-hrql). Both live in the repo's `.beads/`; a copy that
+  // differs from the shipped asset is REPLACED (see ensureFormula), and the replacement is reported
+  // rather than passed off as "already present".
   // Only lands when the package root already IS a beads workspace (anton's own dev checkout) — a
   // release bundle has none, and the installers refuse to fabricate one there (the Dolt-sync step
   // below reads a bare `.beads/` as a workspace and would abort setup for having no git origin).
   // Registered projects get their formulas from configureBeadsForRepo (`anton init` / addProject),
-  // which is the path shaping and the run pipeline actually read.
+  // which is the path shaping and the run pipeline actually read — so `anton setup` alone never
+  // refreshes a registered project's pipeline, and `anton init <repo>` is what does.
   for (const asset of [
     { label: "Bead formula", filename: BEAD_FORMULA_FILENAME, install: ensureBeadFormula },
     { label: "Run formula", filename: RUN_FORMULA_FILENAME, install: ensureRunFormula },
@@ -1834,11 +1836,20 @@ async function cmdSetup(args = []) {
       // Best-effort, like the missing asset above: setup carries on and anton falls back to its
       // packaged copy, so an unwritable `.beads/formulas/` is a warning, not a failed setup.
       console.log(c.yellow(`\n! could not install the ${asset.label.toLowerCase()}: ${formula.detail}`));
+    } else if (formula.status === "replaced") {
+      // The only status that overwrote something. Yellow and detailed — it names the backup, so an
+      // operator who had tuned this file learns where its contents went at the moment it happened.
+      console.log(
+        c.bold(`\n${asset.label}:`) +
+          ` .beads/formulas/${asset.filename} ` +
+          c.yellow("replaced") +
+          c.dim(` — ${formula.detail}`),
+      );
     } else if (formula.status !== "no-workspace") {
       console.log(
         c.bold(`\n${asset.label}:`) +
           ` .beads/formulas/${asset.filename} ` +
-          (formula.status === "installed" ? c.green("installed") : c.dim("already present")),
+          (formula.status === "installed" ? c.green("installed") : c.dim("already current")),
       );
     }
   }

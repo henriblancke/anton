@@ -369,9 +369,10 @@ describe("bd version gate (anton-qwsq)", () => {
 });
 
 /**
- * The setup half of anton-8mnr: the bead formula must LAND in a fresh `.beads/`, and must never
- * overwrite a project-local copy — a team that tuned its own bead skeleton keeps it across every
- * `anton setup` / `anton init` / addProject re-run.
+ * The setup half of anton-8mnr: the bead formula must LAND in a fresh `.beads/`, and a project-local
+ * copy that DIFFERS from the shipped asset must be replaced across every `anton setup` /
+ * `anton init` / addProject re-run. The original no-clobber-on-existence rule is what stranded
+ * `step:describe` in every registered project; see `ensureFormula`.
  */
 describe("ensureBeadFormula (anton-8mnr)", () => {
   const dirs: string[] = [];
@@ -401,13 +402,26 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(JSON.parse(readFileSync(dest(dir), "utf8")).formula).toBe("anton-bead");
   });
 
-  it("never clobbers an existing project-local copy", () => {
+  it("leaves a byte-identical copy alone, and says so", () => {
+    const dir = beadsDir();
+    expect(ensureBeadFormula(dir).status).toBe("installed");
+    // The common case: a second run over an up-to-date project writes nothing and reports nothing.
+    expect(ensureBeadFormula(dir).status).toBe("already");
+    expect(existsSync(`${dest(dir)}.bak`)).toBe(false);
+  });
+
+  it("replaces a project-local copy that differs, backing up what was there", () => {
     const dir = beadsDir();
     ensureBeadFormula(dir);
     writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
 
-    expect(ensureBeadFormula(dir).status).toBe("already");
-    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    expect(result.detail).toContain(`${BEAD_FORMULA_FILENAME}.bak`);
+    // The shipped asset won…
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBeUndefined();
+    // …and the previous contents are recoverable without reaching for git.
+    expect(JSON.parse(readFileSync(`${dest(dir)}.bak`, "utf8")).mine).toBe(true);
   });
 
   it("reports a missing asset instead of throwing", () => {
@@ -445,9 +459,9 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
 
 /**
  * The setup half of anton-hrql: the RUN pipeline installs on the same terms as the bead skeleton
- * above — a fresh project gets anton's default, and a project that wrote its own keeps it across
- * every `anton setup` / `anton init` / addProject re-run. Both assets share one installer, so only
- * the run-formula-specific behavior is asserted here.
+ * above — a fresh project gets anton's default, and a stale or edited copy is replaced. Both assets
+ * share one installer, so only the run-formula-specific behavior is asserted here: this is the asset
+ * a newly shipped step has to reach, which is the whole reason the rule changed.
  */
 describe("ensureRunFormula (anton-hrql)", () => {
   const dirs: string[] = [];
@@ -471,13 +485,37 @@ describe("ensureRunFormula (anton-hrql)", () => {
     expect(readFileSync(dest(dir), "utf8")).toContain('formula = "anton-run"');
   });
 
-  it("never clobbers a project's own pipeline", () => {
+  it("replaces a pipeline that differs from the shipped one", () => {
     const dir = beadsDir();
     ensureRunFormula(dir);
     writeFileSync(dest(dir), 'formula = "anton-run"\n# ours\n');
 
-    expect(ensureRunFormula(dir).status).toBe("already");
-    expect(readFileSync(dest(dir), "utf8")).toContain("# ours");
+    expect(ensureRunFormula(dir).status).toBe("replaced");
+    expect(readFileSync(dest(dir), "utf8")).not.toContain("# ours");
+    expect(readFileSync(`${dest(dir)}.bak`, "utf8")).toContain("# ours");
+  });
+
+  /**
+   * The regression this whole change exists for. A project whose pipeline is a verbatim copy of an
+   * OLDER shipped template — not tuned, just stale — is exactly what `existsSync` could not tell
+   * apart from a deliberate edit, so a step anton had started shipping reached no registered
+   * project and every re-run reported "already present". Pinned with `step:describe` because that
+   * is the step it actually happened to (anton-gzyjd).
+   */
+  it("carries a newly shipped step into a project holding a stale default", () => {
+    const dir = beadsDir();
+    // The step block itself, not the word: the file's header comment lists every step anton knows,
+    // so a bare "step:describe" search matches prose in a formula that does not run the step.
+    const stepBlock = /\n\[\[steps\]\]\nid = "describe"[\s\S]*?labels = \["step:describe"\]\n/;
+    const shipped = readFileSync(bundledRunFormulaPath(), "utf8");
+    expect(shipped).toMatch(stepBlock);
+    // The pre-describe template: same file, that one step cut out of it.
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    writeFileSync(dest(dir), shipped.replace(stepBlock, "\n"));
+    expect(readFileSync(dest(dir), "utf8")).not.toMatch(stepBlock);
+
+    expect(ensureRunFormula(dir).status).toBe("replaced");
+    expect(readFileSync(dest(dir), "utf8")).toMatch(stepBlock);
   });
 
   it("lands beside the bead formula rather than replacing it", () => {
