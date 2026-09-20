@@ -205,6 +205,8 @@ export type RunPatch = Partial<{
   /** What refreshOntoBase did to a reused checkout at warm, and the base it settled on (anton-s55u) — see schema. */
   baseRefreshOutcome: string | null;
   baseRefreshSha: string | null;
+  /** The branch's tip just before a still-pending refresh above was attempted (anton-s55u) — see schema. */
+  pendingRefreshFromSha: string | null;
   attempts: number;
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
@@ -379,12 +381,26 @@ export async function findRunBaseRefreshShaForBranch(
  */
 export const PENDING_REFRESH_OUTCOME = "pending";
 
+/** A still-pending refresh's write-ahead record, as {@link findPendingRefreshShaForBranch} recovers it. */
+export interface PendingRefresh {
+  /** The base commit the dead attempt was mutating the branch onto. */
+  sha: string;
+  /**
+   * The branch's own tip the instant before that mutation was attempted — the only evidence that
+   * can tell "the mutation actually landed" apart from "`sha` was already reachable from the branch
+   * before the mutation ever ran" (see the column's own note on schema.ts). Undefined for a pending
+   * row written before this field existed; the caller must then refuse to trust the pending sha
+   * rather than reconcile it against nothing.
+   */
+  fromSha: string | undefined;
+}
+
 /**
- * The sha a still-PENDING refresh (see {@link PENDING_REFRESH_OUTCOME}) recorded for this branch —
- * some attempt began a merge/rebase onto this sha and never lived to finalize its row with a real
- * outcome. Undefined once a NEWER row on this branch recorded a real outcome (an attempt that
- * finished its own refresh cleanly, whether or not it's the same one that went pending) or the
- * recreation tombstone (the branch the pending sha describes is gone).
+ * The write-ahead record a still-PENDING refresh (see {@link PENDING_REFRESH_OUTCOME}) left for this
+ * branch — some attempt began a merge/rebase/fast-forward onto `sha` and never lived to finalize its
+ * row with a real outcome. Undefined once a NEWER row on this branch recorded a real outcome (an
+ * attempt that finished its own refresh cleanly, whether or not it's the same one that went pending)
+ * or the recreation tombstone (the branch the pending sha describes is gone).
  *
  * Walked exactly like {@link findRunBaseRefreshShaForBranch} and for the same reason: attempts don't
  * all share a row, and a `skipped_dirty` row in between must be skipped rather than mistaken for the
@@ -392,18 +408,23 @@ export const PENDING_REFRESH_OUTCOME = "pending";
  * row that actually settled something settled it for real, so whatever this function would have
  * found is already superseded.
  *
- * A sha this returns is not yet trustworthy on its own: it describes what a dead attempt INTENDED,
- * not what it necessarily achieved. The caller (execute-epic-claim.ts) is the one with git access to
- * check whether it actually landed on the branch before treating it as a boundary.
+ * Neither field this returns is trustworthy on its own: `sha` describes what a dead attempt
+ * INTENDED, not what it necessarily achieved. The caller (execute-epic-claim.ts) is the one with git
+ * access to check whether it actually landed on the branch, reconciled against `fromSha`, before
+ * treating it as a boundary.
  */
 export async function findPendingRefreshShaForBranch(
   db: AntonDb,
   projectId: string,
   epicBeadId: string,
   branch: string,
-): Promise<string | undefined> {
+): Promise<PendingRefresh | undefined> {
   const rows = await db
-    .select({ baseRefreshOutcome: schema.runs.baseRefreshOutcome, baseRefreshSha: schema.runs.baseRefreshSha })
+    .select({
+      baseRefreshOutcome: schema.runs.baseRefreshOutcome,
+      baseRefreshSha: schema.runs.baseRefreshSha,
+      pendingRefreshFromSha: schema.runs.pendingRefreshFromSha,
+    })
     .from(schema.runs)
     .where(
       and(
@@ -417,7 +438,10 @@ export async function findPendingRefreshShaForBranch(
   for (const row of rows) {
     if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
     if (row.baseRefreshOutcome === "skipped_dirty") continue;
-    return row.baseRefreshOutcome === PENDING_REFRESH_OUTCOME ? (row.baseRefreshSha ?? undefined) : undefined;
+    if (row.baseRefreshOutcome !== PENDING_REFRESH_OUTCOME) return undefined;
+    return row.baseRefreshSha
+      ? { sha: row.baseRefreshSha, fromSha: row.pendingRefreshFromSha ?? undefined }
+      : undefined;
   }
   return undefined;
 }

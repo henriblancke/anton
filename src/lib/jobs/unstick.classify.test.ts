@@ -65,6 +65,7 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     baseForkSha: null,
     baseRefreshOutcome: null,
     baseRefreshSha: null,
+    pendingRefreshFromSha: null,
     status: "parked",
     reviewScore: null,
     reviewKey: null,

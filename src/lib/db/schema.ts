@@ -60,9 +60,12 @@ export const runs = sqliteTable("runs", {
   baseForkSha: text("base_fork_sha"),
   // What refreshOntoBase (worktree.ts) did to a REUSED checkout at this attempt's warm, before the
   // agent was dispatched (anton-s55u) — noop | fast_forwarded | rebased | merged | skipped_dirty |
-  // branch_recreated (the last is warmRunWorktree's own tombstone, BRANCH_RECREATED_REFRESH_TOMBSTONE
-  // in runs.ts, written when createWorktree recreated the branch rather than reusing it — never
-  // refreshOntoBase's own return value). skipped_dirty is a parked run's uncommitted work left in
+  // pending | branch_recreated. pending is PENDING_REFRESH_OUTCOME (runs.ts) — a write-ahead marker
+  // execute-epic-claim.ts's `beforeMutate` writes immediately before the mutating merge/rebase/
+  // fast-forward call, so a process killed mid-mutation still leaves a crash-recovery trace.
+  // branch_recreated is warmRunWorktree's own tombstone, BRANCH_RECREATED_REFRESH_TOMBSTONE in
+  // runs.ts, written when createWorktree recreated the branch rather than reusing it — never
+  // refreshOntoBase's own return value. skipped_dirty is a parked run's uncommitted work left in
   // place, not a failure. Without this, a stale-tree resume left no evidence anywhere queryable: the
   // outcome only ever reached a console.log the job runner doesn't persist. Null when the checkout
   // was freshly created (nothing to refresh) or the caller didn't opt into refresh (e.g. review-fix's
@@ -72,6 +75,16 @@ export const runs = sqliteTable("runs", {
   // human confirm which base a resumed run actually implemented against, hours later, without
   // re-deriving it from a diff.
   baseRefreshSha: text("base_refresh_sha"),
+  // The branch's own tip the instant BEFORE the pending mutation above was attempted (anton-s55u, PR
+  // #279 review, P1) — written alongside baseRefreshOutcome=pending, read back only to reconcile a
+  // still-pending row into a trustworthy `--onto` boundary. Ancestry alone can't tell "the mutation
+  // landed" from "baseRefreshSha was already an ancestor of this branch before the mutation ever ran"
+  // (e.g. a rewound base whose new, older target already sits behind the branch's existing history) —
+  // that reachability is identical either way. Comparing against the branch's PRE-mutation tip breaks
+  // the tie: if baseRefreshSha was already an ancestor of THIS sha, the current-branch check is
+  // inconclusive and the pending sha is not trusted; only when it wasn't, and is now, has the branch
+  // actually moved. See findPendingRefreshShaForBranch's reconciliation caller in execute-epic-claim.ts.
+  pendingRefreshFromSha: text("pending_refresh_from_sha"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports

@@ -1,0 +1,19 @@
+-- The branch's own tip the instant BEFORE a still-pending refresh (base_refresh_outcome = 'pending',
+-- PENDING_REFRESH_OUTCOME in runs.ts) was attempted (anton-s55u, PR #279 review, P1) — written by
+-- execute-epic-claim.ts's `beforeMutate` write-ahead hook alongside the pending marker, before the
+-- mutating fast-forward/merge/rebase call runs.
+--
+-- Reachability of `base_refresh_sha` against the branch's CURRENT history alone can't tell a landed
+-- mutation apart from a base that was already reachable from the branch's PRE-mutation history (e.g.
+-- an authoritative base rewind whose new, older target already sits behind the branch's existing
+-- commits) — both leave the same ancestry. Comparing against this column breaks the tie: only when
+-- `base_refresh_sha` was NOT already an ancestor of this sha, but is now an ancestor of the branch's
+-- current tip, has the branch actually moved. A pending row with this column null (written before it
+-- existed) can't run that comparison and fails closed instead.
+--
+-- Nullable and NOT backfilled: only meaningful while base_refresh_outcome = 'pending'; ignored once a
+-- real outcome overwrites it.
+--
+-- Reverse:
+--   ALTER TABLE `runs` DROP COLUMN `pending_refresh_from_sha`;
+ALTER TABLE `runs` ADD `pending_refresh_from_sha` text;

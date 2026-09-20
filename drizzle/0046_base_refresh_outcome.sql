@@ -1,6 +1,8 @@
 -- Record what refreshOntoBase (worktree.ts) did to a REUSED checkout before the agent was
--- dispatched (anton-s55u): noop | fast_forwarded | rebased | merged | skipped_dirty |
--- branch_recreated, plus the base commit it settled on. branch_recreated is
+-- dispatched (anton-s55u): noop | fast_forwarded | rebased | merged | skipped_dirty | pending |
+-- branch_recreated, plus the base commit it settled on. pending is PENDING_REFRESH_OUTCOME
+-- (runs.ts) — a write-ahead crash-recovery marker execute-epic-claim.ts's `beforeMutate` writes
+-- immediately before the mutating merge/rebase/fast-forward call. branch_recreated is
 -- BRANCH_RECREATED_REFRESH_TOMBSTONE (runs.ts) — warmRunWorktree's own tombstone written when
 -- createWorktree recreated the branch rather than reusing it, never refreshOntoBase's own return
 -- value.

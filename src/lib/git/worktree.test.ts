@@ -344,11 +344,11 @@ suite("worktree manager (real git)", () => {
       advanceDefaultBranch("before-mutate-rebase.txt", "advance\n", "advance main (before-mutate rebase)");
       const freshMain = branchTip(defaultBranch());
 
-      const seenAtCallTime: { headOfBranch: string; arg: string }[] = [];
-      const beforeMutate = vi.fn(async (baseSha: string) => {
+      const seenAtCallTime: { headOfBranch: string; baseArg: string; branchArg: string }[] = [];
+      const beforeMutate = vi.fn(async (baseSha: string, branchSha: string) => {
         // The branch must still be exactly where it was before this refresh touched it — proves the
         // hook fires BEFORE the mutation, not after.
-        seenAtCallTime.push({ headOfBranch: headOf(first.path), arg: baseSha });
+        seenAtCallTime.push({ headOfBranch: headOf(first.path), baseArg: baseSha, branchArg: branchSha });
       });
 
       const second = await createWorktree({
@@ -361,9 +361,35 @@ suite("worktree manager (real git)", () => {
       });
 
       expect(beforeMutate).toHaveBeenCalledTimes(1);
-      expect(beforeMutate).toHaveBeenCalledWith(freshMain);
-      expect(seenAtCallTime).toEqual([{ headOfBranch: preRebaseHead, arg: freshMain }]);
+      expect(beforeMutate).toHaveBeenCalledWith(freshMain, preRebaseHead);
+      expect(seenAtCallTime).toEqual([{ headOfBranch: preRebaseHead, baseArg: freshMain, branchArg: preRebaseHead }]);
       expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
+    });
+
+    // anton-s55u (PR #279 review, P1): a fast-forward moves the branch just as much as a merge or
+    // rebase does — without this, a process killed right after `git merge --ff-only` returns left
+    // execute-epic-claim.ts's row with no pending-boundary trace at all, since only the merge/rebase
+    // paths invoked `beforeMutate`.
+    it("invokes beforeMutate with the resolved base sha and the branch's pre-mutation tip before a fast-forward runs", async () => {
+      const branch = "anton/refresh-before-mutate-ff";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const preFfHead = headOf(first.path);
+      advanceDefaultBranch("before-mutate-ff.txt", "advance\n", "advance main (before-mutate ff)");
+      const freshMain = branchTip(defaultBranch());
+
+      const beforeMutate = vi.fn(async () => undefined);
+
+      const second = await createWorktree({
+        repoPath: repo,
+        branch,
+        baseBranch: defaultBranch(),
+        refresh: true,
+        beforeMutate,
+      });
+
+      expect(beforeMutate).toHaveBeenCalledTimes(1);
+      expect(beforeMutate).toHaveBeenCalledWith(freshMain, preFfHead);
+      expect(second.refreshOutcome).toEqual({ outcome: "fast_forwarded", baseSha: freshMain });
     });
 
     // PR #279 review, sixth round: `git rebase --rebase-merges` reconstructs a merge commit by
