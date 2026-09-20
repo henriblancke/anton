@@ -456,8 +456,9 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  * that look like anton bugs. The cost is real and is mitigated, not denied — a project that TUNED
  * its formula loses that tuning here. Two things make it recoverable: the file lives under `.beads/`
  * which git tracks, so `git diff` shows the change and `git checkout` undoes it; and the prior
- * contents are written beside it as `<filename>.bak` before the copy, so a repo with uncommitted
- * tuning still has them. A project that wants a pipeline of its own should name it something else
+ * contents are written beside it as `<filename>.bak` FIRST, the replacement being abandoned if that
+ * write cannot happen — git is no help for tuning that was never committed, which is the case the
+ * backup exists for. A project that wants a pipeline of its own should name it something else
  * and point at it through the per-label variant map (anton-aa3m), which is the supported way to own
  * a pipeline and is never touched by this installer.
  *
@@ -556,34 +557,36 @@ function ensureFormula(beadsDir, filename, src) {
 
   try {
     mkdirSync(dirname(dest), { recursive: true });
-    // The backup is written BEFORE the copy and only when something is being replaced, so a fresh
-    // install leaves no stray `.bak` and a re-run that replaces twice keeps the copy from just
-    // before the current one. A backup that FAILS does not stop the install — the tracked file in
-    // git is the durable record, and the `.bak` is the convenience for uncommitted tuning — but it
-    // is reported, so the operator knows which of the two recovery paths they actually have.
-    let backup;
+    // The backup is written BEFORE the replacement and only when something is being replaced, so a
+    // fresh install leaves no stray `.bak` and a re-run that replaces twice keeps the copy from
+    // just before the current one.
+    //
+    // The backup is a PRECONDITION of the replacement, not a courtesy attempted alongside it (PR
+    // #307 review, P1). An earlier version let it fail and overwrote anyway, reasoning that git
+    // holds the durable copy — which is false for exactly the case the backup exists to protect:
+    // uncommitted tuning. Git cannot recover bytes that were never committed, so "NOT backed up"
+    // reported AFTER the overwrite announces an irreversible loss instead of preventing one.
+    //
+    // So a backup that cannot be written — an unsafe `.bak` path, a full disk, an unreadable
+    // source — abandons the replacement and leaves the project's file exactly as it was. That
+    // trades a stale formula (recoverable: fix the path, re-run) for destroyed local work
+    // (not recoverable at all), which is the right way round.
     if (present) {
-      try {
-        // Same refusal as the destination, and for the same reason — this is a WRITE to a path the
-        // repo names. A `.bak` that is a symlink (or anything else not a regular file) is skipped:
-        // the install still proceeds, since git holds the durable copy, and `detail` says the backup
-        // is absent so the operator is not told about one that was never written. `missingIsSafe`
-        // because no prior `.bak` is the common case, not a suspicious one.
-        if (!unsafeDestDetail(`${dest}.bak`, `${filename}.bak`, { missingIsSafe: true })) {
-          writeNewFile(`${dest}.bak`, readFileSync(dest));
-          backup = `${filename}.bak`;
-        }
-      } catch {
-        backup = undefined;
+      const unsafeBak = unsafeDestDetail(`${dest}.bak`, `${filename}.bak`, { missingIsSafe: true });
+      if (unsafeBak) {
+        return {
+          status: "unsafe-dest",
+          detail: `${unsafeBak} — leaving ${filename} untouched, since replacing it without a backup could destroy uncommitted changes`,
+        };
       }
+      // Any throw here propagates to the outer catch as "failed"; nothing has been overwritten yet.
+      writeNewFile(`${dest}.bak`, readFileSync(dest));
     }
     writeNewFile(dest, shipped);
     if (!present) return { status: "installed" };
     return {
       status: "replaced",
-      detail: backup
-        ? `differed from the shipped pipeline — previous contents saved as ${backup}`
-        : "differed from the shipped pipeline — previous contents NOT backed up (see git)",
+      detail: `differed from the shipped pipeline — previous contents saved as ${filename}.bak`,
     };
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };

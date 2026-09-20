@@ -564,7 +564,13 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
    * must not block the install — git still holds the durable copy — but `detail` then has to stop
    * promising a backup that was never written.
    */
-  it("installs over a differing file even when the .bak path is a symlink, and says the backup is absent", () => {
+  /**
+   * The backup is a PRECONDITION of the replacement (PR #307 review, P1). An earlier version wrote
+   * the formula anyway and reported "NOT backed up", reasoning that git holds the durable copy —
+   * false for exactly the case the backup protects, uncommitted tuning. Announcing an irreversible
+   * loss is not a substitute for preventing one, so an unwritable `.bak` abandons the replacement.
+   */
+  it("leaves a differing file alone when its .bak path is unsafe, rather than replacing it unbacked", () => {
     const dir = beadsDir();
     ensureBeadFormula(dir);
     writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
@@ -573,8 +579,11 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     symlinkSync(outside, `${dest(dir)}.bak`);
 
     const result = ensureBeadFormula(dir);
-    expect(result.status).toBe("replaced");
-    expect(result.detail).toContain("NOT backed up");
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("uncommitted");
+    // The project's own file survives — that is the whole point.
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+    // And the symlink's target was never written through.
     expect(readFileSync(outside, "utf8")).toBe("ALSO NOT ANTON'S");
   });
 

@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 30c656a67224
+version: e14c7c0f8fa5
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -80,8 +80,14 @@ Then, per file:
 
 - The file is absent → copy it, report `installed`.
 - It exists and is byte-identical to the template → leave it, report `already`.
-- It exists and DIFFERS → copy the template over it, report `replaced`, and say so plainly. Save
-  the previous contents beside it as `<filename>.bak` first.
+- It exists and DIFFERS → save the previous contents beside it as `<filename>.bak` **first**, then
+  write the template over it, report `replaced`, and say so plainly. The backup is a precondition,
+  not a courtesy: **if it cannot be written, leave the formula alone and report that instead.** Git
+  cannot recover tuning that was never committed, which is exactly what the backup is protecting —
+  a stale formula is fixable on the next run, destroyed local work is not.
+  Apply the SAME checks to the `.bak` path that you applied to the formula: if it is already a
+  symlink or a hard link, `cp` writes through it into whatever it points at, which may be outside
+  the repo. Check it with `ls -l` before writing, and write-then-`mv` rather than `cp` over it.
 - It exists and is a SYMLINK (`ls -l` shows an arrow) → do NOT write. Copying follows the link and
   overwrites its target somewhere outside the repo. Report it and move on.
 - It exists and has a LINK COUNT above 1 (`ls -l` column 2, or `stat -f %l` on macOS / `stat -c %h`
