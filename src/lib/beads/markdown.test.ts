@@ -569,6 +569,15 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("```\nfirst\n~~~\nsecond\n```\n- item\n  ~~~\nopen")).toBe("  ~~~");
   });
 
+  it("does not strip a list/quote-shaped final line the opener carries no container for", () => {
+    // A top-level fence opens with no container, so CommonMark allows its closer only 0-3 leading
+    // spaces — `- ~~~` is literal content, not a closer. Stripping it as if it were container-owned
+    // (the way an opener like `- ```` legitimately would be) turned it into a false-positive closer,
+    // dropping the line and reporting the fence as already terminated.
+    expect(unterminatedCloser("~~~md\nfirst\n- ~~~")).toBe("~~~");
+    expect(rendered("~~~md\nfirst\n- ~~~")).toEqual(["first", "- ~~~"]);
+  });
+
   it("opens no HTML block from a tag the render never shows or reads as text", () => {
     // Inside a fence or a comment the tag is content, not markup.
     expect(unterminatedCloser("```\n<script>\n```")).toBeUndefined();

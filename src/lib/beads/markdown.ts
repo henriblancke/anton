@@ -330,6 +330,14 @@ function markSetextHeadings(lines: Line[]): void {
  * an inline code span is literal text — CommonMark parses no HTML there — so it never opens a
  * comment here either.
  */
+/**
+ * Known simplification: this tracks a comment's open/close purely by scanning raw line text, not
+ * by the container it opened in. Per CommonMark, an open HTML block does not get lazy continuation
+ * — so a comment opened inside a blockquote/list item that does not survive to the next line
+ * actually closes there, while this keeps it open until a literal `-->` is seen. Pre-existing
+ * (the prior flat scanner had the same gap); it only biases toward over-hiding content, never
+ * toward leaking a genuinely hidden comment into `visible`.
+ */
 function stripComments(lines: Line[], codeSpans: { start: number; end: number }[]) {
   const inCode = (offset: number) => codeSpans.some((span) => offset >= span.start && offset < span.end);
   let open = false;
@@ -420,10 +428,13 @@ function scanMarkdownParsed(source: string): ScannedLine[] {
       for (let index = start; index <= end; index++) lines[index]!.fenced = true;
       lines[start]!.delimiter = true;
       // The parser includes an unterminated block's final content line in the code node. Its trailing
-      // run can resemble a delimiter, but only a full container-stripped line may close the fence.
+      // run can resemble a delimiter, but only a full container-stripped line may close the fence —
+      // and only the containers the OPENER actually carries: a top-level fence's closer must be
+      // judged as-is, or a line that merely looks list/quote-shaped (`- ~~~` as literal content, not
+      // a closer) gets stripped down to a false match and consumed as the delimiter.
       const closingLine = lines[end]?.text ?? "";
-      const directCloser = stripContainerMarkers(closingLine);
       const prefix = fenceContainerPrefix(lines[start]?.text.slice(0, node.position.start.column - 1) ?? "");
+      const directCloser = prefix.length > 0 ? stripContainerMarkers(closingLine) : closingLine;
       const continuationCloser = prefix.length > 0 ? (peelClosurePrefix(closingLine, prefix) ?? "") : "";
       if (end !== start && (closingFence(directCloser, opening) || closingFence(continuationCloser, opening))) {
         lines[end]!.delimiter = true;
@@ -489,17 +500,27 @@ const isHtmlBlock = (node: MarkdownNode, parent?: MarkdownNode): boolean =>
   !/^<![a-z]/.test(node.value ?? "") &&
   ["root", "listItem", "blockquote"].includes(parent?.type ?? "");
 
-/** The Markdown AST identifies raw HTML blocks; inline tags and comments do not hide a section. */
+/**
+ * The Markdown AST identifies raw HTML blocks; inline tags and comments do not hide a section.
+ *
+ * Both the recursive-descent parser and {@link visit} recurse once per nesting level with no depth
+ * cap, same as {@link scanMarkdown} — a pathologically nested description can overflow the stack.
+ * Fall back to "no HTML block" rather than crash the process on that one description's structure.
+ */
 export function htmlBlockLines(source: string): boolean[] {
   const lines = lineRecords(source);
-  const root = fromMarkdown(source) as unknown as MarkdownNode;
-  const inHtml = lines.map(() => false);
-  visit(root, (node, parent) => {
-    if (!isHtmlBlock(node, parent)) return;
-    const { start, end } = lineRange(lines, node.position!);
-    for (let index = start; index <= end; index++) inHtml[index] = true;
-  });
-  return inHtml;
+  try {
+    const root = fromMarkdown(source) as unknown as MarkdownNode;
+    const inHtml = lines.map(() => false);
+    visit(root, (node, parent) => {
+      if (!isHtmlBlock(node, parent)) return;
+      const { start, end } = lineRange(lines, node.position!);
+      for (let index = start; index <= end; index++) inHtml[index] = true;
+    });
+    return inHtml;
+  } catch {
+    return lines.map(() => false);
+  }
 }
 
 /** The source prefix a closer needs to remain inside a list item or blockquote. */
@@ -552,8 +573,20 @@ const persistentHtmlCloser = (value: string): string | undefined => {
 /**
  * A closer for the terminal fenced block, comment, or persistent HTML block. This is deliberately
  * a small editing policy layered on top of the parser's structural result.
+ *
+ * Same unbounded-recursion exposure as {@link scanMarkdown} — the parser and {@link visit} both
+ * recurse per nesting level with no depth cap. Falling back to "no closer needed" leaves the
+ * pathological description's writer unedited rather than crashing the process that reads it.
  */
 export function unterminatedCloser(source: string): string | undefined {
+  try {
+    return unterminatedCloserParsed(source);
+  } catch {
+    return undefined;
+  }
+}
+
+function unterminatedCloserParsed(source: string): string | undefined {
   const root = fromMarkdown(source) as unknown as MarkdownNode;
   let closer: { offset: number; text: string } | undefined;
   visit(root, (node) => {
@@ -571,8 +604,11 @@ export function unterminatedCloser(source: string): string | undefined {
         // outright (CommonMark's fence marker allows only 0-3 leading columns). Strip the opener's
         // own container prefix the same way scanMarkdown does before judging the terminal line.
         const lineStart = source.lastIndexOf("\n", Math.max(0, offset - 1)) + 1;
-        const directCloser = stripContainerMarkers(last);
         const prefix = fenceContainerPrefix(source.slice(lineStart, offset));
+        // A top-level fence carries no container, so its closer is judged as-is — stripping here
+        // regardless of `prefix` would treat a literal list/quote-shaped content line (`- ~~~`) as
+        // the closer it merely resembles, closing the fence early on content it never opened inside.
+        const directCloser = prefix.length > 0 ? stripContainerMarkers(last) : last;
         const continuationCloser = prefix.length > 0 ? (peelClosurePrefix(last, prefix) ?? "") : "";
         if (!closingFence(directCloser, opener) && !closingFence(continuationCloser, opener)) {
           closer = { offset, text: fenceCloser(openerLine) };
