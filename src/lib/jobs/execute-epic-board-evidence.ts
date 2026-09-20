@@ -424,6 +424,34 @@ export async function ensureBoardBaselinePersisted(
 const LOCK_STABILITY_ROUNDS = 3;
 
 /**
+ * Best-effort: drop the (possibly stray) locked baseline {@link lockDispatchBaseline} itself just
+ * wrote, so a round that fails AFTER claiming the lock never leaves it behind for a LATER attempt to
+ * trust blindly (chatgpt-codex-connector, PR #284 review, "Refresh locks left by failed pre-dispatch
+ * attempts"). Every persist in that function's loop writes `locked: true` BEFORE that round's own
+ * push and re-read have confirmed the value is actually stable — that ordering is what survives a
+ * crash mid-round, but it also means a round that then fails (an unconfirmed push, an unreadable
+ * re-read, or a comparison that found drift on the very last round) can leave a candidate locked that
+ * the caller's own next statement was about to disprove. Left in place, `ensureBoardBaselinePersisted`'s
+ * `recoveryBaseline` fast path on the NEXT attempt would skip its own refresh loop entirely and hand
+ * that stale value back for dispatch untouched — even though THIS attempt's own confirming push
+ * already pulled in the change that invalidated it, crediting a no-op agent with someone else's write
+ * the same way this whole locking scheme exists to prevent, just relocated to the round that gives up
+ * rather than the one that never tried. Clearing restores the ticket to "no baseline persisted", so
+ * the next attempt recomputes and re-verifies a fresh one from scratch instead of trusting a value
+ * this call could not itself confirm.
+ *
+ * Local-only and never throws: this runs on a path that is already refusing to dispatch (`null`), so
+ * there is no delivery to protect by insisting the clear also reaches the remote — a same-machine
+ * resume (the common case; the run-lease actor that will retry this ticket) sees it immediately
+ * either way. An unconfirmed or refused clear still leaves the caller returning `null`, the same
+ * closed-fail path a healthy round would have taken anyway.
+ */
+async function abandonDispatchBaseline(repo: string, ticket: Bead): Promise<null> {
+  await beads.clearBoardEvidenceBaseline(repo, ticket.id).catch(() => {});
+  return null;
+}
+
+/**
  * Lock the settled pre-dispatch baseline onto `ticket` before this function ever hands it back for
  * dispatch (chatgpt-codex-connector, PR #284 review, "Lock the baseline before starting dispatch").
  * Without this, the lock was only ever set by {@link readBoardEvidence} AFTER the agent session ran —
@@ -447,7 +475,11 @@ const LOCK_STABILITY_ROUNDS = 3;
  *
  * Fails closed like every other write in this function: an unconfirmed lock, an unreadable re-read,
  * or a baseline that never stops drifting all refuse dispatch (`null`) rather than risk repeating the
- * exact loss this locking exists to prevent.
+ * exact loss this locking exists to prevent — and, in every one of those failure shapes, clears the
+ * stray locked baseline this call itself just wrote (see {@link abandonDispatchBaseline}) rather than
+ * leave it for a later attempt's `ensureBoardBaselinePersisted` to trust without ever re-reading the
+ * board (chatgpt-codex-connector, PR #284 review, "Refresh locks left by failed pre-dispatch
+ * attempts").
  */
 async function lockDispatchBaseline(
   repo: string,
@@ -462,23 +494,24 @@ async function lockDispatchBaseline(
           beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(candidate), true),
         )
       : await preserveRecoveryBaseline(repo, ticket, candidate);
-    if (!persisted) return null;
+    if (!persisted) return locked ? abandonDispatchBaseline(repo, ticket) : null;
     locked = true;
     const synced = await beads
       .push(repo)
       .then((outcome) => outcome === "synced" || outcome === "shared-server")
       .catch(() => false);
-    if (!synced) return null;
+    if (!synced) return abandonDispatchBaseline(repo, ticket);
     const board = await mustReadBoard(repo);
     const hydrated = board && (await hydrateDescriptions(repo, board));
-    if (!hydrated) return null;
+    if (!hydrated) return abandonDispatchBaseline(repo, ticket);
     const refreshed = fingerprintBoard(hydrated, ticket.id);
     if (boardEvidence(candidate, refreshed).length === 0) return candidate;
     candidate = refreshed;
   }
   // The lock-confirming push kept pulling in further drift every round — fail closed rather than
-  // hand back a locked baseline that may still omit a change landing right now.
-  return null;
+  // hand back a locked baseline that may still omit a change landing right now, and clear the stray
+  // locked value this loop itself left behind rather than leave it for the next attempt to trust.
+  return abandonDispatchBaseline(repo, ticket);
 }
 
 /**

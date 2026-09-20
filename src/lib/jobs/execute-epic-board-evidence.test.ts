@@ -1795,6 +1795,75 @@ describe(
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
         ).resolves.toBeNull();
+        // The exhausted loop locked a candidate every round (each round persists BEFORE its own
+        // stability re-read confirms it) — the last of those never-confirmed values must not survive
+        // this refusal to dispatch, or the next attempt's `recoveryBaseline` fast path would trust it
+        // without ever re-reading the board (chatgpt-codex-connector, PR #284 review, "Refresh locks
+        // left by failed pre-dispatch attempts").
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+      },
+    );
+
+    it(
+      "clears the locked baseline it just wrote when the lock's OWN confirming push never syncs " +
+        "(chatgpt-codex-connector, PR #284 review, \"Refresh locks left by failed pre-dispatch " +
+        "attempts\") — otherwise a NEXT attempt's `recoveryBaseline` fast path would hand back this " +
+        "unconfirmed value for dispatch without ever re-verifying it against the board",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
+        pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+      },
+    );
+
+    it(
+      "clears the locked baseline it just wrote when the lock's OWN post-push stability re-read " +
+        "cannot be trusted (after retries), rather than leave a locked-but-never-verified value for " +
+        "a later attempt to trust without re-reading the board",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
+        pushMock.mockResolvedValueOnce("synced"); // lock round 0's confirming push
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable"));
+        }
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+      },
+    );
+
+    it(
+      "does NOT attempt to clear a baseline it never actually locked, when the very first lock " +
+        "round's own persist fails every retry before `locked` is ever set — nothing was written, " +
+        "so there is nothing this call could have left stray",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused")); // lock round 0's persist
+        setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+        setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+        const clearCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
+        expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(clearCallsBefore);
       },
     );
   },
