@@ -73,6 +73,7 @@ import {
   boundedTail,
   MAX_STDERR_CHARS,
   pushEnv,
+  readSshCommand,
 } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
@@ -3993,6 +3994,56 @@ describe("commit timeout default", () => {
 describe("push timeout default", () => {
   it("agrees with the project setting's default (anton-i5wkg) — the two must never drift apart", () => {
     expect(DEFAULT_PUSH_TIMEOUT_MINUTES * 60_000).toBe(DEFAULT_PUSH_TIMEOUT_MS);
+  });
+});
+
+/**
+ * Direct coverage for the probe (PR #306 review round 5) — it had only end-to-end coverage through
+ * `pushBranch` against a real, healthy repo, so neither the unset/unknown distinction nor the
+ * variant read was exercised anywhere. These run real `git config` against real repositories, which
+ * is what makes them worth having: the three-state logic rests on a claim about git's EXIT CODES
+ * (1 for "no such key", 128 for a non-repo), and only a real git can confirm that claim holds.
+ */
+describe("readSshCommand — what could actually be established about core.sshCommand", () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  const plainDir = () => {
+    const d = mkdtempSync(join(tmpdir(), "anton-sshprobe-"));
+    dirs.push(d);
+    return d;
+  };
+
+  const repo = () => {
+    const d = plainDir();
+    execFileSync("git", ["-C", d, "init", "-q"]);
+    return d;
+  };
+
+  it("reports 'unset' for a repo that configures nothing — git's exit 1 is a definite answer", async () => {
+    await expect(readSshCommand(repo())).resolves.toEqual({ state: "unset", variant: undefined });
+  });
+
+  it("reports the configured command", async () => {
+    const d = repo();
+    execFileSync("git", ["-C", d, "config", "core.sshCommand", "ssh -i /etc/deploy/key"]);
+
+    await expect(readSshCommand(d)).resolves.toMatchObject({ state: "set", command: "ssh -i /etc/deploy/key" });
+  });
+
+  it("reports 'unknown' where git cannot answer at all, rather than 'unset'", async () => {
+    // A path that is not a repository: git exits 128, not 1. Treating that as "unset" is what let a
+    // failed probe install an overriding GIT_SSH_COMMAND.
+    await expect(readSshCommand(join(plainDir(), "no-such-dir"))).resolves.toMatchObject({ state: "unknown" });
+  });
+
+  it("carries ssh.variant alongside the command", async () => {
+    const d = repo();
+    execFileSync("git", ["-C", d, "config", "ssh.variant", "plink"]);
+
+    await expect(readSshCommand(d)).resolves.toMatchObject({ state: "unset", variant: "plink" });
   });
 });
 
