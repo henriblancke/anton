@@ -37,8 +37,8 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-function plan(sql: string): string {
-  return (sqlite.prepare(`explain query plan ${sql}`).all() as { detail: string }[])
+function plan(sql: string, ...params: unknown[]): string {
+  return (sqlite.prepare(`explain query plan ${sql}`).all(...params) as { detail: string }[])
     .map((row) => row.detail)
     .join(" ");
 }
@@ -53,8 +53,16 @@ describe("drizzle/0046 — SQLite hot-path indexes", () => {
       .toContain("jobs_running_lease_idx");
     expect(plan("select id from jobs where project_id = 'project' order by updated_at desc limit 1"))
       .toContain("jobs_project_updated_idx");
-    expect(plan("select id from runs where project_id = 'project' and epic_bead_id = 'epic' and status in ('queued', 'running', 'parked') order by updated_at desc limit 1"))
-      .toContain("runs_open_epic_updated_idx");
+    expect(
+      plan(
+        "select id from runs where project_id = ? and epic_bead_id = ? and status in (?, ?, ?) order by updated_at desc limit 1",
+        "project",
+        "epic",
+        "queued",
+        "running",
+        "parked",
+      ),
+    ).toContain("runs_project_epic_updated_idx");
     expect(plan("select id from sessions where run_id = 'run' order by started_at desc"))
       .toContain("sessions_run_started_idx");
   });

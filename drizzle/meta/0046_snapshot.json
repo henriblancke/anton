@@ -1626,15 +1626,14 @@
           ],
           "isUnique": false
         },
-        "runs_open_epic_updated_idx": {
-          "name": "runs_open_epic_updated_idx",
+        "runs_project_epic_updated_idx": {
+          "name": "runs_project_epic_updated_idx",
           "columns": [
             "project_id",
             "epic_bead_id",
             "updated_at"
           ],
-          "isUnique": false,
-          "where": "\"runs\".\"status\" in ('queued', 'running', 'parked')"
+          "isUnique": false
         }
       },
       "foreignKeys": {

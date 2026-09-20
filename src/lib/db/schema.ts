@@ -117,11 +117,9 @@ export const runs = sqliteTable("runs", {
   // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
   // write an index lookup instead of a table scan.
   index("runs_write_seq_idx").on(table.writeSeq),
-  // Resuming an epic only considers the still-open lifecycle states. A partial index keeps the
-  // hot lookup small even as the durable run history grows.
-  index("runs_open_epic_updated_idx")
-    .on(table.projectId, table.epicBeadId, table.updatedAt)
-    .where(sql`${table.status} in ('queued', 'running', 'parked')`),
+  // The run-resume query receives its lifecycle states as bound parameters. SQLite cannot prove
+  // those parameters imply a partial-index predicate, so keep status out of this ordered lookup.
+  index("runs_project_epic_updated_idx").on(table.projectId, table.epicBeadId, table.updatedAt),
 ]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
