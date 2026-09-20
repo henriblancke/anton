@@ -1556,3 +1556,33 @@ describe("beads.link validates --type at the seam (anton-igkb)", () => {
     }
   });
 });
+
+describe(
+  "beads.cleanupUnsyncedBoardEvidenceIds / hasBoardEvidenceCleanupUnsynced (PR #284 review, " +
+    "\"Recover cleanup-only resumes before regeneration\")",
+  () => {
+    it("recovers the ids a prior cleanup obligation carried", () => {
+      const b = bead({ metadata: { boardEvidenceCleanupUnsynced: JSON.stringify(["a", "b"]) } });
+      expect(beads.cleanupUnsyncedBoardEvidenceIds(b)).toEqual(["a", "b"]);
+      expect(beads.hasBoardEvidenceCleanupUnsynced(b)).toBe(true);
+    });
+
+    it("still reports the obligation present for the legacy bare-boolean value, reading no ids " +
+      "back rather than crashing (a bead written before this field carried ids)", () => {
+      const b = bead({ metadata: { boardEvidenceCleanupUnsynced: "true" } });
+      expect(beads.hasBoardEvidenceCleanupUnsynced(b)).toBe(true);
+      expect(beads.cleanupUnsyncedBoardEvidenceIds(b)).toEqual([]);
+    });
+
+    it("reports no obligation and no ids when the key was never set", () => {
+      const b = bead({});
+      expect(beads.hasBoardEvidenceCleanupUnsynced(b)).toBe(false);
+      expect(beads.cleanupUnsyncedBoardEvidenceIds(b)).toEqual([]);
+    });
+
+    it("reads unparseable metadata as no ids rather than throwing", () => {
+      const b = bead({ metadata: { boardEvidenceCleanupUnsynced: "{not json" } });
+      expect(beads.cleanupUnsyncedBoardEvidenceIds(b)).toEqual([]);
+    });
+  },
+);

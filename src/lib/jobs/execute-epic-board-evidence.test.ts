@@ -871,7 +871,11 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       await expect(
         clearBoardEvidencePending("/repo", "t-cleanup-obligation", ["a"]),
       ).rejects.toThrow(/t-cleanup-obligation/);
-      expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith("/repo", "t-cleanup-obligation");
+      expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-cleanup-obligation",
+        ["a"],
+      );
     },
   );
 
@@ -923,6 +927,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith(
         "/repo",
         "t-cleanup-confirm-failed",
+        ["a"],
       );
       // Nothing was pushed — the failure is purely local, so there is no sync channel to report yet.
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);

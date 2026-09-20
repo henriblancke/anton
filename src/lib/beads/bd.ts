@@ -212,10 +212,18 @@ const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
  * DB but its confirming push failed (PR #284 review, "retain a retry obligation after cleanup
  * push failure") — the one case the pending-ids marker and the preserved baseline cannot cover,
  * because both are already cleared locally by the time the push fails, so neither survives to
- * tell a same-machine resume there is still an unconfirmed remote write. Set right before
+ * tell a resume there is still an unconfirmed remote write. Set right before
  * `clearBoardEvidencePending` throws in exactly that case, and released only once a later push
  * actually confirms — see {@link beads.setBoardEvidenceCleanupUnsynced} /
  * {@link beads.clearBoardEvidenceCleanupUnsynced} / {@link beads.hasBoardEvidenceCleanupUnsynced}.
+ *
+ * Carries the ids still owed confirmation (JSON array), not just a boolean (PR #284 review,
+ * "Recover cleanup-only resumes before regeneration") — the pending-marker label and
+ * preserved-baseline metadata that would otherwise carry those ids are already cleared by the time
+ * this obligation is set, so a resume with no attribution commit on its own branch (a fresh
+ * cross-machine worktree) has no other way to recover which ids still need confirming before it can
+ * safely retry, rather than falling through to regenerate a ticket whose delivery already landed.
+ * See {@link beads.cleanupUnsyncedBoardEvidenceIds}.
  */
 const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
 
@@ -1095,14 +1103,40 @@ export const beads = {
     bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_KEY]),
 
   /** Whether a prior attempt's board-evidence cleanup wrote locally but never confirmed reaching
-   * the remote — parsed off the bead's own metadata. See {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}. */
+   * the remote — parsed off the bead's own metadata. See {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}.
+   * `!== undefined` rather than a value check (PR #284 review, "Recover cleanup-only resumes
+   * before regeneration"): the key now carries a JSON ids array (possibly empty) rather than the
+   * literal string `"true"`, so presence alone is what marks the obligation. */
   hasBoardEvidenceCleanupUnsynced: (b: Bead): boolean =>
-    b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY] === "true",
+    b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY] !== undefined,
+
+  /** The evidence ids an unsynced cleanup still owes confirmation, parsed back off the same
+   * metadata {@link beads.hasBoardEvidenceCleanupUnsynced} checks — empty when the stored value
+   * predates this field, carries no ids, or is unreadable, matching
+   * {@link beads.confirmedBoardEvidenceIds}'s tolerance for a malformed value. See
+   * {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}. */
+  cleanupUnsyncedBoardEvidenceIds: (b: Bead): string[] => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY];
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  },
 
   /** Record that this ticket's board-evidence cleanup landed locally but its confirming push
-   * failed, so a same-machine resume knows to retry the push even with nothing else pending. */
-  setBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>
-    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}=true`]),
+   * failed, carrying the ids still owed confirmation so a resume — same machine or, once this
+   * state syncs, a fresh cross-machine worktree — can finish confirming them even after the
+   * pending marker and preserved baseline that otherwise carry them are already cleared. */
+  setBoardEvidenceCleanupUnsynced: (cwd: string, id: string, ids: readonly string[] = []) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--set-metadata",
+      `${BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}=${JSON.stringify(ids)}`,
+    ]),
 
   /** Release the retry obligation once a later push actually confirms the cleanup reached the remote. */
   clearBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>

@@ -1137,19 +1137,35 @@ async function dispatchTicket(
     const stalePending = beads.pendingBoardEvidence(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
     const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    // The ids to (re)confirm are the UNION of the still-pending marker, whatever a prior cleanup
+    // obligation already carried, and whatever is already durably confirmed (PR #284 review,
+    // "Preserve confirmed evidence IDs during cleanup retries") — never bare `stalePending` alone.
+    // A prior halt can clear the pending marker (and write the real confirmed ids) before failing
+    // only on the confirming push or on releasing the obligation itself, so `stalePending` reads
+    // empty on exactly the resume this retry exists for. Passing it alone into
+    // `clearBoardEvidencePending` would overwrite the durable confirmation with an empty array
+    // instead of retrying it with the real ids — `setBoardEvidenceConfirmed` is not idempotent on
+    // its `ids` argument (see that function's own docstring).
+    const idsToConfirm = [
+      ...new Set([
+        ...stalePending,
+        ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
+        ...beads.confirmedBoardEvidenceIds(ticket),
+      ]),
+    ].toSorted();
     // Recorded into the ledger BEFORE the clear, mirroring the fresh-run path below (PR #284
     // review): these ids are exactly the confirmed evidence the reviewer's board-only section
     // cross-checks, and `deliveredTickets` carries this ticket into `ReviewRun.tickets`
     // regardless of this fast path — so without this, the ticket lands in the board-only run
     // with no per-ticket evidence line, silently undercutting that cross-check.
-    if (stalePending.length > 0) {
-      ledger.boardEvidence.set(ticket.id, stalePending);
+    if (idsToConfirm.length > 0) {
+      ledger.boardEvidence.set(ticket.id, idsToConfirm);
     }
-    if (stalePending.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
+    if (idsToConfirm.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
       await clearBoardEvidencePending(
         repo,
         ticket.id,
-        stalePending,
+        idsToConfirm,
         hasPreservedBaseline,
         hasCleanupUnsynced,
       );
@@ -1220,6 +1236,52 @@ async function dispatchTicket(
   // OPEN at `stage:in-review` by design — `doneOnBoard` (via `resumeSkipped`) already accounts for
   // both the closed and the standalone-in-review case, so re-checking `closed` here only excluded
   // the second one.
+  // A ticket whose earlier board-evidence cleanup landed locally but never confirmed reaching the
+  // remote survives that fact independently of whether THIS machine's branch carries its
+  // attribution commit (PR #284 review, "Recover cleanup-only resumes before regeneration"):
+  // `hasBoardEvidenceCleanupUnsynced` is board state that syncs across machines, while `delivery`
+  // above only answers "is the commit on THIS branch". A resume that reaches here with the
+  // obligation still set never took the `if (delivery)` retry above — this machine has no
+  // attribution commit for this ticket at all (a fresh cross-machine worktree, or one where
+  // `concludeRunAttempt`'s best-effort final sync is the only thing that ever published the
+  // obligation) — so without finishing the retry here it falls straight through the
+  // confirmed-evidence fast path below (confirmation never landed) into full regeneration against
+  // a fresh baseline that already contains the delivered writes; an idempotent agent then finds
+  // nothing to do and fails with `NoDeliveryError`, undoing a delivery that already happened.
+  // Finished here instead, using every id this machine can recover — the obligation's own carried
+  // ids, anything still pending, and anything already durably confirmed — since the pending marker
+  // and preserved baseline that normally carry them may already be cleared. Guarded on NOT already
+  // confirmed so a ticket the fast path below already handles doesn't get retried twice.
+  if (
+    doneOnBoard &&
+    isBoardOnlyRun(run, ticket) &&
+    !beads.boardEvidenceConfirmed(ticket) &&
+    beads.hasBoardEvidenceCleanupUnsynced(ticket)
+  ) {
+    const recoveredIds = [
+      ...new Set([
+        ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
+        ...beads.pendingBoardEvidence(ticket),
+        ...beads.confirmedBoardEvidenceIds(ticket),
+      ]),
+    ].toSorted();
+    await clearBoardEvidencePending(
+      repo,
+      ticket.id,
+      recoveredIds,
+      beads.boardEvidenceBaseline(ticket) !== undefined,
+      true,
+    );
+    if (recoveredIds.length > 0) {
+      ledger.boardEvidence.set(ticket.id, recoveredIds);
+    }
+    await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
+    onBranch.add(ticket.id);
+    if (ledger.skipCause.has(ticket.id)) {
+      ledger.skipCause = skippedDependents(timedOut, tickets, all, onBranch);
+    }
+    return;
+  }
   if (doneOnBoard && isBoardOnlyRun(run, ticket) && beads.boardEvidenceConfirmed(ticket)) {
     // The pending marker and preserved baseline that would normally carry these ids are the very
     // things `clearBoardEvidencePending` cleared when it set the confirmed flag — `bd.ts` persists

@@ -603,6 +603,18 @@ export async function readBoardEvidence(
  * only when all three (`cleared`) did, so a caller can pass it back on resume even with `ids` empty
  * and `hasBaseline` false; once a later attempt clears and confirms and syncs successfully, it is
  * released the same way the other two survivors are.
+ *
+ * A resumed `hasCleanupObligation` retry should still pass the REAL ids (PR #284 review, "Recover
+ * cleanup-only resumes before regeneration"/"Preserve confirmed evidence IDs during cleanup
+ * retries"), not a bare `[]`, whenever any are known — recovered from
+ * {@link beads.cleanupUnsyncedBoardEvidenceIds} (what THIS obligation itself carried) and
+ * {@link beads.confirmedBoardEvidenceIds} (already durably confirmed by an earlier call), unioned
+ * with whatever is still in `ids`. `setBoardEvidenceConfirmed` below is not idempotent on `ids` — a
+ * retry that passes fewer ids than a prior successful call overwrites real confirmed evidence with
+ * less, and a retry whose only prior trace is this obligation (the marker/baseline confirmation
+ * itself never landed) has NO OTHER source for those ids once they are gone. `ids` stays a plain
+ * parameter rather than being resolved from the bead in here so this function stays stateless; the
+ * recovery is the caller's job precisely because both existing call sites already hold the ticket.
  */
 export async function clearBoardEvidencePending(
   repo: string,
@@ -624,8 +636,13 @@ export async function clearBoardEvidencePending(
   // thing left once both are gone, so it must land — and be confirmed synced — exactly as
   // reliably as they do, or a resume on a fresh branch with no baseline to fall back on has no
   // way to tell "confirmed and cleaned up" from "closed with nothing behind it" and can
-  // regenerate this ticket into a false `NoDeliveryError`. Idempotent (`--set-metadata` on an
-  // already-`true` key), so retrying it on a resumed cleanup costs nothing.
+  // regenerate this ticket into a false `NoDeliveryError`. NOT idempotent on `ids` (PR #284
+  // review, "Preserve confirmed evidence IDs during cleanup retries") — the field carries the
+  // confirmed ids themselves, not a boolean, so retrying this write with a narrower `ids` than a
+  // prior successful call overwrites real confirmed evidence with less. Every caller is therefore
+  // responsible for passing the full known id set on a retry (pending ids UNIONED with whatever
+  // `beads.confirmedBoardEvidenceIds`/`beads.cleanupUnsyncedBoardEvidenceIds` already know), never
+  // just the ids freshly found this attempt.
   const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids));
   const cleared = markerCleared && baselineCleared && confirmedSet;
   const synced = cleared
@@ -658,9 +675,14 @@ export async function clearBoardEvidencePending(
     // state on the board (still-pending ids, or a still-present baseline) is exactly the signal a
     // resume already checks — an extra obligation there would be redundant, not protective.
     const survivorsGone = markerCleared && baselineCleared;
+    // Carries `ids` along with the obligation (PR #284 review, "Recover cleanup-only resumes
+    // before regeneration") — the pending marker and preserved baseline that would otherwise
+    // carry them are exactly what `markerCleared`/`baselineCleared` just cleared, so this
+    // obligation is the only place left for a resume, on this machine or a fresh cross-machine
+    // worktree with no attribution commit of its own, to recover which ids still need confirming.
     const obligationPersisted =
       cleared || survivorsGone
-        ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId))
+        ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids))
         : true;
     const detail = cleared
       ? obligationPersisted

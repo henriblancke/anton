@@ -1145,3 +1145,125 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
     expect(outcome.delivered.map((b) => b.id)).toContain(EPIC);
   });
 });
+
+// PR #284 review ("Recover cleanup-only resumes before regeneration"): a prior attempt can clear
+// the pending marker and preserved baseline locally but exhaust its retries on
+// `setBoardEvidenceConfirmed` itself — leaving `boardEvidenceCleanupUnsynced` as the only trace,
+// carrying the ids still owed confirmation. That obligation is board state, so it can reach a
+// machine with no attribution commit of its own for this ticket at all (a fresh cross-machine
+// worktree). Without retrying it here, independently of `delivery`, this ticket would fall through
+// the confirmed-evidence fast path (never confirmed) into full regeneration against a fresh
+// baseline that already contains its delivered writes.
+describe(
+  "a board-only ticket with an unsynced cleanup obligation and no commit on this branch " +
+    "(PR #284 review, \"Recover cleanup-only resumes before regeneration\")",
+  () => {
+    it("finishes confirming the recovered ids instead of reopening and regenerating", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceCleanupUnsynced: JSON.stringify(["anton-eb1"]) },
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      const outcome = await dispatchRunTickets(
+        makeRun([child], new AbortController().signal),
+        prep(),
+      );
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        "anton-a",
+        ["anton-eb1"],
+        false,
+        true,
+      );
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+
+    it("unions the obligation's ids with a surviving pending marker and preserved baseline", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceCleanupUnsynced: JSON.stringify(["anton-eb1"]),
+          boardEvidenceBaseline: JSON.stringify({ x: "hash" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        "anton-a",
+        ["anton-eb1"],
+        true,
+        true,
+      );
+    });
+
+    it("leaves an already-confirmed ticket to the ordinary fast path instead of retrying twice", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+          boardEvidenceCleanupUnsynced: JSON.stringify(["anton-eb1"]),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      const outcome = await dispatchRunTickets(
+        makeRun([child], new AbortController().signal),
+        prep(),
+      );
+
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+  },
+);
+
+// PR #284 review ("Preserve confirmed evidence IDs during cleanup retries"): a same-machine resume
+// whose commit IS on this branch retries any leftover cleanup obligation through the `if (delivery)`
+// path. `setBoardEvidenceConfirmed` is not idempotent on its `ids` argument — passing the bare
+// (already-cleared) pending marker would overwrite real confirmed evidence with an empty array.
+describe(
+  "a resume-skipped ticket's cleanup retry preserves already-known evidence ids (PR #284 review, " +
+    "\"Preserve confirmed evidence IDs during cleanup retries\")",
+  () => {
+    it("unions already-confirmed ids into the retry instead of passing the empty stale-pending set", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+          boardEvidenceCleanupUnsynced: JSON.stringify([]),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true);
+
+      const outcome = await dispatchRunTickets(
+        makeRun([child], new AbortController().signal),
+        prep(),
+      );
+
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        "anton-a",
+        ["anton-eb1"],
+        false,
+        true,
+      );
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+  },
+);
