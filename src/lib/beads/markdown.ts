@@ -14,8 +14,10 @@ const FENCE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
 const SETEXT_UNDERLINE = /^ {0,3}(?:=+|-+)[ \t]*$/;
 const THEMATIC_BREAK = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
 /** Block starts that interrupt an open paragraph — everything BLOCK_LINE checks except indented
- * code, which CommonMark never lets interrupt a paragraph (it only starts one after a blank line). */
-const PARAGRAPH_INTERRUPT = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)/;
+ * code, which CommonMark never lets interrupt a paragraph (it only starts one after a blank line),
+ * and a list marker that CommonMark also refuses to let interrupt: an empty item, or an ordered
+ * item that doesn't start at 1. Those stay paragraph (here, Setext heading) text. */
+const PARAGRAPH_INTERRUPT = /^ {0,3}(?:[-*+]|1[.)])[ \t]+\S|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)/;
 const BLOCK_LINE = /^ {0,3}(?:[-*+]|\d{1,9}[.)])(?:[ \t]|$)|^ {0,3}>|^ {0,3}#{1,6}(?:[ \t]|$)|^ {4}/;
 const HTML_BLOCK_LINE = /^ {0,3}<(?:pre|script|style|textarea)(?:[ \t>]|$)|^ {0,3}<(?:div|address|article|aside|blockquote|body|section|table|ul|ol|li|p)(?:[ \t>]|\/>|$)/i;
 const HTML_DECLARATION_LINE = /^ {0,3}(?:<!--|<\?|<!\[CDATA\[|<![A-Z])/;

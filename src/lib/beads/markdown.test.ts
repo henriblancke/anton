@@ -276,6 +276,25 @@ describe("scanMarkdown", () => {
       });
     });
 
+    it("does not let a non-interrupting list marker end a multiline Setext heading", () => {
+      // CommonMark: an empty bullet item cannot interrupt an open paragraph, so `*` stays heading
+      // text and the h1 closes Acceptance without exposing "Backend" as an authored criterion.
+      expect(headings("## Acceptance\nBackend\n*\n===\n- [ ] implement it")[1]).toEqual({
+        depth: 1,
+        key: "backend",
+      });
+      // An ordered item that doesn't start at 1 cannot interrupt either, so it also stays heading
+      // text rather than closing the run early.
+      expect(headings("## Acceptance\nBackend\n2. API\n===\n- [ ] implement it")[1]).toEqual({
+        depth: 1,
+        key: "backend2api",
+      });
+      // A nonempty bullet, and an ordered item starting at 1, still interrupt — the heading run
+      // never reaches them.
+      expect(headings("Acceptance\n- item\n===")[0]).toBeUndefined();
+      expect(headings("Acceptance\n1. item\n===")[0]).toBeUndefined();
+    });
+
     it("stops at a thematic break, which ends the paragraph before any underline reaches it", () => {
       // `***` is a rule, not paragraph text: it closes `Acceptance` and opens nothing, so the
       // `===` under it underlines no paragraph at all.
