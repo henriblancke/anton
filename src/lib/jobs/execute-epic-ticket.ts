@@ -151,6 +151,11 @@ export async function runTicket(args: {
   // through `settleFailedTicket`, which exists to fail an UNSETTLED ticket and would reopen/reblock
   // this one on a cleanup write that has nothing to do with whether its work landed.
   let finished: { settlement: TicketSettlement; closed: boolean; transitioned: boolean } | undefined;
+  // Whether `walkTicketSteps` was ever reached this attempt (PR #284 review, "Skip the failure audit
+  // when dispatch never started") — the two `NoDeliveryError` throws below fire BEFORE any step runs,
+  // so a catch reached from one of them has no dispatch to audit. Read only in the catch block, never
+  // reassigned there, so a throw from `walkTicketSteps` itself still reports `true`.
+  let dispatchStarted = false;
 
   try {
     // A board-only ticket with no baseline is refused BEFORE dispatch, not just at the commit
@@ -176,6 +181,7 @@ export async function runTicket(args: {
     if (boardBaselinePersistFailed) {
       throw new NoDeliveryError(boardOnlyBaselineNotPersistedMessage(ticket));
     }
+    dispatchStarted = true;
     await walkTicketSteps({
       run,
       steps: args.steps,
@@ -218,7 +224,16 @@ export async function runTicket(args: {
     // it as pre-existing (via an independent sync pass, or this run's own best-effort final sync in
     // `concludeRunAttempt`) — the exact loss of attribution the whole board-evidence check exists to
     // prevent.
-    if (boardOnly && boardBaseline) {
+    //
+    // Gated on `dispatchStarted` too (chatgpt-codex-connector, PR #284 review, "Skip the failure
+    // audit when dispatch never started"): the two pre-dispatch `NoDeliveryError`s above reach this
+    // catch with `boardBaseline` still set but no agent ever run. Auditing there anyway diffs
+    // `boardBaseline` against whatever the confirming pull inside `ensureBoardBaselinePersisted` just
+    // read — which can be an unrelated writer's board update, not this ticket's own work — and
+    // persists it as this ticket's pending evidence. A later attempt that actually dispatches could
+    // then have its own honest `satisfied`/`delivered` self-report accepted on THOSE stale ids,
+    // defeating the delivery gate for work nobody did.
+    if (boardOnly && boardBaseline && dispatchStarted) {
       await auditBoardOnFailedTicket(run, ticket, boardBaseline, session.logPath, e);
     }
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.

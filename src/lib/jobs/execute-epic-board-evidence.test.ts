@@ -460,6 +460,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-baseline",
         Object.fromEntries(baseline.beads),
+        true,
       );
     },
   );
@@ -591,7 +592,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         evidenceUnavailable: true,
       });
       const preserved = Object.fromEntries(firstBaseline.beads);
-      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-recover", preserved);
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-recover", preserved, true);
 
       // Resume: a heartbeat/backstop sync (outside this check) already pushed the write, so a
       // FRESH board read alone would show no diff at all. But the ticket now carries the baseline
@@ -698,6 +699,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-fast-path-baseline",
         Object.fromEntries(baseline.beads),
+        true,
       );
     },
   );
@@ -787,6 +789,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-marker-unpersisted-baseline",
         Object.fromEntries(baseline.beads),
+        true,
       );
     },
   );
@@ -1426,6 +1429,41 @@ describe(
 
       await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBeNull();
     });
+
+    it(
+      "never refreshes a RECOVERY baseline past a prior dispatched attempt's own writes " +
+        "(chatgpt-codex-connector, PR #284 review round 17, \"Preserve recovery baselines when " +
+        "resuming dispatched tickets\") — the confirming pull can legitimately surface that SAME " +
+        "prior attempt's own not-yet-confirmed delivery, and folding it into a refreshed baseline " +
+        "would erase the only pre-delivery snapshot a resumed idempotent agent's evidence check " +
+        "needs to diff against",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "before dispatch" })]);
+        const recoveryTicket = bead("t-recovery-locked", {
+          metadata: {
+            boardEvidenceBaseline: JSON.stringify(Object.fromEntries(baseline.beads)),
+            boardEvidenceBaselineLocked: "1",
+          },
+        });
+        pushMock.mockResolvedValueOnce("synced");
+        const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
+        const loadCallsBefore = loadAllIssuesMock.mock.calls.length;
+
+        // Deliberately no `loadAllIssuesMock` stub queued: were this baseline NOT locked, the
+        // confirming pull's post-push refresh read would consume one here (reflecting the prior
+        // dispatched attempt's own delivery, still landing) and fold it into a "refreshed"
+        // baseline, erasing this recovery snapshot. Locked, that read must never happen at all.
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", recoveryTicket, baseline),
+        ).resolves.toEqual(baseline);
+
+        // No refresh read or re-persist — the baseline is returned untouched.
+        expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore);
+        expect(loadAllIssuesMock.mock.calls.length).toBe(loadCallsBefore);
+        expect(pushMock).toHaveBeenCalledWith("/repo");
+      },
+    );
   },
 );
 

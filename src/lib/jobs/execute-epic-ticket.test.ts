@@ -493,36 +493,45 @@ describe(
       vi.resetAllMocks();
       dispatchMock.mockReset();
       readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
-      // The catch-side audit (`auditBoardOnFailedTicket`) still reads the board on ANY failure once
-      // `boardBaseline` came back non-null, including this pre-dispatch refusal — a benign "nothing
-      // changed" read is the right default here since nothing has run yet.
+      // A benign "nothing changed" default for tests below that DO reach dispatch and exercise the
+      // catch-side audit (`auditBoardOnFailedTicket`) after a real step failure.
       readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
       settleFailedTicketMock.mockImplementation(async () => {
         throw new Error("settled as a failure");
       });
     });
 
-    it("fails closed before the agent ever dispatches, without claiming the baseline read failed", async () => {
-      ensureBoardBaselinePersistedMock.mockResolvedValue(null);
+    it(
+      "fails closed before the agent ever dispatches, without claiming the baseline read failed, " +
+        "and never runs the catch-side audit (chatgpt-codex-connector, PR #284 review, \"Skip the " +
+        "failure audit when dispatch never started\") — no step ever ran, so there is nothing this " +
+        "ticket's own agent could have written for the audit to attribute",
+      async () => {
+        ensureBoardBaselinePersistedMock.mockResolvedValue(null);
 
-      await expect(
-        runTicket({
-          run: run(),
-          steps: [neverDispatchedStep()],
-          ticket: boardTicket,
-          runTicketIds: [boardTicket.id],
-          timeoutMs: 5_000,
-        }),
-      ).rejects.toThrow("settled as a failure");
+        await expect(
+          runTicket({
+            run: run(),
+            steps: [neverDispatchedStep()],
+            ticket: boardTicket,
+            runTicketIds: [boardTicket.id],
+            timeoutMs: 5_000,
+          }),
+        ).rejects.toThrow("settled as a failure");
 
-      // The step handler never runs — dispatch is refused before `walkTicketSteps` is ever called.
-      expect(dispatchMock).not.toHaveBeenCalled();
-      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
-      const settled = settleFailedTicketMock.mock.calls[0]![0] as { e: Error };
-      expect(settled.e.message).toMatch(/was not dispatched/);
-      expect(settled.e.message).toMatch(/could not be durably persisted/);
-      expect(settled.e.message).not.toMatch(/could not be read/);
-    });
+        // The step handler never runs — dispatch is refused before `walkTicketSteps` is ever called.
+        expect(dispatchMock).not.toHaveBeenCalled();
+        // Nor does the catch-side audit: diffing `boardBaseline` against a fresh read here could
+        // credit an unrelated writer's board update — pulled in by `ensureBoardBaselinePersisted`'s
+        // own confirming push — as this ticket's evidence, even though no agent ever ran.
+        expect(readBoardEvidenceMock).not.toHaveBeenCalled();
+        expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+        const settled = settleFailedTicketMock.mock.calls[0]![0] as { e: Error };
+        expect(settled.e.message).toMatch(/was not dispatched/);
+        expect(settled.e.message).toMatch(/could not be durably persisted/);
+        expect(settled.e.message).not.toMatch(/could not be read/);
+      },
+    );
 
     it("dispatches normally once the baseline is durably persisted", async () => {
       ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });

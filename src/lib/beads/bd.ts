@@ -207,6 +207,21 @@ const RETIRED_PR_KEY = "retiredPr";
 const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
 
 /**
+ * Metadata key marking {@link BOARD_EVIDENCE_BASELINE_KEY} as a RECOVERY baseline — one preserved
+ * by {@link execute-epic-board-evidence.ts!readBoardEvidence} AFTER a dispatch attempt already ran,
+ * as opposed to the never-dispatched pre-dispatch baseline {@link
+ * execute-epic-board-evidence.ts!ensureBoardBaselinePersisted} persists and freely refreshes across
+ * its own confirming pull (PR #284 review round 17, "Preserve recovery baselines when resuming
+ * dispatched tickets"). Both baselines share the same key and shape, so this is the only signal
+ * that tells them apart: a confirming pull `ensureBoardBaselinePersisted` runs before a RETRY can
+ * legitimately pick up that prior attempt's own not-yet-confirmed delivery, and folding that into a
+ * "refreshed" baseline would erase the only pre-delivery snapshot an idempotent resumed agent's
+ * evidence check needs to diff against. Never set on the never-dispatched baseline, so it stays
+ * absent until the first `readBoardEvidence` call after a dispatch actually ran.
+ */
+const BOARD_EVIDENCE_BASELINE_LOCKED_KEY = "boardEvidenceBaselineLocked";
+
+/**
  * Metadata key marking that a board-evidence cleanup ({@link beads.setBoardEvidencePending} /
  * {@link beads.clearBoardEvidenceBaseline} clearing to empty) wrote successfully to the LOCAL bd
  * DB but its confirming push failed (PR #284 review, "retain a retry obligation after cleanup
@@ -260,6 +275,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   "pr",
   RETIRED_PR_KEY,
   BOARD_EVIDENCE_BASELINE_KEY,
+  BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
   BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
   BOARD_EVIDENCE_CONFIRMED_KEY,
 ];
@@ -1088,9 +1104,18 @@ export const beads = {
     }
   },
 
+  /** Whether the preserved baseline above is a RECOVERY baseline — one `readBoardEvidence` wrote
+   * AFTER a dispatch attempt already ran, as opposed to the never-dispatched pre-dispatch baseline
+   * `ensureBoardBaselinePersisted` freely refreshes. See {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY}. */
+  boardEvidenceBaselineLocked: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_BASELINE_LOCKED_KEY] !== undefined,
+
   /**
    * Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
-   * pre-dispatch baseline.
+   * pre-dispatch baseline. `locked` (default false) marks it a RECOVERY baseline — set by callers
+   * preserving it AFTER a dispatch attempt already ran (see {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY})
+   * — so `ensureBoardBaselinePersisted`'s own confirming-pull refresh never overwrites it with a
+   * "refreshed" value that folds in that same prior attempt's own not-yet-confirmed delivery.
    *
    * Written through `--metadata @file` (a temp file, cleaned up in `finally` like {@link
    * beads.createGraph}'s plan file), never `--set-metadata key=value` (chatgpt-codex-connector,
@@ -1105,20 +1130,39 @@ export const beads = {
    * written) — the same replace-one-key semantics `--set-metadata` had, just off a bounded file
    * instead of an unbounded argv string.
    */
-  setBoardEvidenceBaseline: async (cwd: string, id: string, fingerprint: Record<string, string>) => {
+  setBoardEvidenceBaseline: async (
+    cwd: string,
+    id: string,
+    fingerprint: Record<string, string>,
+    locked = false,
+  ) => {
     const dir = mkdtempSync(join(tmpdir(), "anton-bd-baseline-"));
     try {
       const file = join(dir, "metadata.json");
-      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_BASELINE_KEY]: JSON.stringify(fingerprint) }));
+      writeFileSync(
+        file,
+        JSON.stringify({
+          [BOARD_EVIDENCE_BASELINE_KEY]: JSON.stringify(fingerprint),
+          ...(locked ? { [BOARD_EVIDENCE_BASELINE_LOCKED_KEY]: "1" } : {}),
+        }),
+      );
       return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   },
 
-  /** Release a preserved baseline once the handoff it backed has completed. */
+  /** Release a preserved baseline (and its recovery lock, if any) once the handoff it backed has
+   * completed. */
   clearBoardEvidenceBaseline: (cwd: string, id: string) =>
-    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_KEY]),
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--unset-metadata",
+      BOARD_EVIDENCE_BASELINE_KEY,
+      "--unset-metadata",
+      BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
+    ]),
 
   /** Whether a prior attempt's board-evidence cleanup wrote locally but never confirmed reaching
    * the remote — parsed off the bead's own metadata. See {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}.

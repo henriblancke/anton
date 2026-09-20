@@ -304,6 +304,18 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
  * read before the pull. Skipped when the refresh finds no difference from `baseline`, so a healthy pass
  * with nothing to pull costs exactly the one push it always cost.
  *
+ * The refresh is skipped entirely — `baseline` is returned as-is once the confirming push above lands —
+ * when `ticket` already carries a RECOVERY baseline (chatgpt-codex-connector, PR #284 review round 17,
+ * "Preserve recovery baselines when resuming dispatched tickets"): one {@link readBoardEvidence}
+ * preserved AFTER a dispatch attempt already ran, as opposed to the never-dispatched baseline this
+ * function itself persists and freely refreshes above. On a RESUMED (redispatching) attempt, the
+ * confirming pull just above can legitimately pull in that SAME prior attempt's own not-yet-confirmed
+ * delivery — folding it into a "refreshed" baseline would erase the only pre-delivery snapshot an
+ * idempotent resumed agent's evidence check needs to diff against, permanently rejecting its next
+ * confirmation as unchanged. A never-dispatched baseline carries no such risk: nothing has been
+ * dispatched against it yet, so anything its confirming pull picks up is genuinely pre-existing state
+ * from something else with board access, safe to fold in. See {@link beads.boardEvidenceBaselineLocked}.
+ *
  * Never throws: any failure — the initial persist, the confirming push, the post-pull re-read, or the
  * refreshed persist/push — returns `null` so `runTicket` can refuse to dispatch on the same closed-fail
  * path it already takes for an unreadable baseline, rather than dispatch an agent whose writes this
@@ -317,7 +329,9 @@ export async function ensureBoardBaselinePersisted(
   ticket: Bead,
   baseline: BoardFingerprint,
 ): Promise<BoardFingerprint | null> {
-  if (!beads.boardEvidenceBaseline(ticket)) {
+  const hadBaseline = Boolean(beads.boardEvidenceBaseline(ticket));
+  const recoveryBaseline = hadBaseline && beads.boardEvidenceBaselineLocked(ticket);
+  if (!hadBaseline) {
     const persisted = await mustPersist(() =>
       beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
     );
@@ -328,6 +342,7 @@ export async function ensureBoardBaselinePersisted(
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
   if (!synced) return null;
+  if (recoveryBaseline) return baseline;
   const board = await mustReadBoard(repo);
   const hydrated = board && (await hydrateDescriptions(repo, board));
   if (!hydrated) return null;
@@ -504,7 +519,9 @@ export async function readBoardEvidence(
     const alreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
     const persisted =
       alreadyPreserved ||
-      (await mustPersist(() => beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline))));
+      (await mustPersist(() =>
+        beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
+      ));
     if (!persisted) {
       // A write that failed outright leaves NO baseline anywhere, not even on this machine, so a
       // same-machine-safe claim would be false — reported as `baselineUnpersisted` instead
@@ -556,7 +573,7 @@ export async function readBoardEvidence(
       const baselinePersisted =
         baselineAlreadyPreserved ||
         (await mustPersist(() =>
-          beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+          beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
         ));
       const outcome = await beads.push(repo).catch(() => "not-wired" as const);
       const synced = outcome === "synced" || outcome === "shared-server";
@@ -606,7 +623,7 @@ export async function readBoardEvidence(
   // promises for a baseline that survived from an earlier attempt.
   if (baselineAlreadyPreserved) return { found: true, ids, synced, baselineUnconfirmed: true };
   const baselinePersisted = await mustPersist(() =>
-    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
   );
   return {
     found: true,
