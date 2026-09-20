@@ -23,6 +23,7 @@ const removeWorktreeMock = vi.fn();
 const updateRunMock = vi.fn();
 const getRunBaseForkShaMock = vi.fn();
 const findRunBaseForkShaForBranchMock = vi.fn();
+const branchExistsMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 vi.mock("../git/worktree", async () => {
   const actual = await vi.importActual<typeof import("../git/worktree")>("../git/worktree");
   return {
@@ -31,6 +32,7 @@ vi.mock("../git/worktree", async () => {
     releaseWorktreeClaim: (...a: unknown[]) => releaseClaimMock(...a),
     removeWorktree: (...a: unknown[]) => removeWorktreeMock(...a),
     createWorktree: (...a: unknown[]) => createWorktreeMock(...a),
+    branchExists: (...a: unknown[]) => branchExistsMock(...a),
   };
 });
 
@@ -120,6 +122,8 @@ beforeEach(async () => {
   isAncestorMock.mockReset().mockResolvedValue(true);
   resolveCommitShaMock.mockReset();
   commitParentShasMock.mockReset();
+  // The branch is present by default; the branch-deleted regression test overrides this itself.
+  branchExistsMock.mockReset().mockResolvedValue(true);
 });
 afterEach(() => t.close());
 
@@ -1027,6 +1031,44 @@ it("does not trust a pending fast-forward when the branch tip is merely a descen
 
   await warmRunWorktree(makeRun(RETRY));
 
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
+// PR #279 review, P2: an operator can delete a crashed attempt's checkout AND branch before the
+// next resume. Reconciliation must fail closed on the missing ref rather than throw — the operation-
+// specific probes below (`rev-parse --verify`, `merge-base --is-ancestor`) all read `refs/heads/
+// <branch>` directly and throw on a ref that doesn't exist, which would otherwise abort the resume
+// before `createWorktree` ever gets a chance to recreate the branch.
+it("treats a pending refresh as unconfirmed, without probing it, when the branch itself no longer exists", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "ff-target",
+    pendingRefreshFromSha: "branch-tip-before-ff",
+    pendingRefreshKind: "fast_forwarded",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  // The operator deleted the branch along with the old checkout — `createWorktree` recreates it fresh.
+  branchExistsMock.mockResolvedValue(false);
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: true,
+    repoPath: "/repo",
+  });
+
+  await expect(warmRunWorktree(makeRun(RETRY))).resolves.toBeDefined();
+
+  expect(branchExistsMock).toHaveBeenCalledWith("/repo", BRANCH);
+  // Never reaches the fast-forward-specific probe — the branch is gone, so there's nothing to check
+  // (unrelated `isAncestor` calls still fire further down, for the always-on fork-pin reconciliation).
+  expect(resolveCommitShaMock).not.toHaveBeenCalled();
   expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({ forkSha: "old-fork-commit" }),
   );

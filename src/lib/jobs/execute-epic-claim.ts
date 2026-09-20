@@ -15,6 +15,7 @@ import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { commitParentShas, isAncestor, resolveCommitSha, resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
+  branchExists,
   createWorktree,
   releaseWorktreeClaim,
   removeWorktree,
@@ -68,12 +69,23 @@ export function claimOwnerFor(runId: string): string {
  * Undefined `kind` (a pending row written before this field existed, or one whose `beforeMutate` call
  * predates it) fails closed, same as an undefined `fromSha` already does: there is no confirmation
  * shape to check, so the pending sha is never trusted.
+ *
+ * A MISSING branch also fails closed, checked before any operation-specific probe runs (PR #279
+ * review, P2): an operator can delete a crashed attempt's checkout and branch between the crash and
+ * this resume, and every probe below reads `refs/heads/<branch>` directly — `rev-parse --verify` and
+ * `merge-base --is-ancestor` both throw on a ref that doesn't exist, rather than the clean exit-1
+ * `isAncestor` already knows how to read as "no". Left unchecked, that throw would propagate out of
+ * `warmRunWorktree` before `createWorktree` ever runs, so the branch's recreation path — the one
+ * this exact situation is supposed to reach — is never given the chance to fire. Treating "branch
+ * gone" as "mutation not confirmed" is correct, not just safe: a deleted branch belongs to a
+ * generation `createWorktree` is about to replace, so nothing here needs confirming against it.
  */
 async function confirmPendingRefreshMutation(
   repo: string,
   branch: string,
   pendingRefresh: Pick<PendingRefresh, "sha" | "kind"> & { fromSha: string },
 ): Promise<boolean> {
+  if (!(await branchExists(repo, branch))) return false;
   const ref = `refs/heads/${branch}`;
   const kind = pendingRefresh.kind as MutatingRefreshOutcome | undefined;
   switch (kind) {
