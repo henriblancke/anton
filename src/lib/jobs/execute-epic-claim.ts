@@ -222,16 +222,18 @@ export async function warmRunWorktree(
     // `priorBaseRefreshSha` alongside the pending marker (PR #279 review, P1): this write is about to
     // overwrite THIS row's own `baseRefreshOutcome`/`baseRefreshSha` — which, on a resumed run calling
     // this a second time, can already hold a genuinely confirmed boundary from an earlier, successful
-    // refresh on this same row. `priorEffectiveRefreshSha`, resolved above before any of this call's
-    // own writes ran, is exactly that boundary (or an older row's, or undefined) — snapshotting it here
-    // is what lets findRunBaseRefreshShaForBranch recover it later if a crash leaves this write as the
-    // last one this row ever makes.
+    // refresh on this same row. `reconciledRefreshSha`, not the pre-reconciliation `priorEffectiveRefreshSha`
+    // (PR #279 review, P1, second re-review): when THIS call's own reconciliation above just promoted a
+    // crashed-but-landed pending refresh into `reconciledRefreshSha`, that promoted value is the row's
+    // true last-confirmed boundary — snapshotting the older `priorEffectiveRefreshSha` instead would
+    // lose it the moment this new pending write lands, and a later crash recovery would fall back to
+    // the stale pre-reconciliation boundary, replaying history the confirmed refresh already dropped.
     beforeMutate: (baseSha, branchSha) =>
       updateRun(db, clock, runId, {
         baseRefreshOutcome: PENDING_REFRESH_OUTCOME,
         baseRefreshSha: baseSha,
         pendingRefreshFromSha: branchSha,
-        priorBaseRefreshSha: priorEffectiveRefreshSha ?? null,
+        priorBaseRefreshSha: reconciledRefreshSha ?? null,
       }),
   });
   run.worktree = worktree;

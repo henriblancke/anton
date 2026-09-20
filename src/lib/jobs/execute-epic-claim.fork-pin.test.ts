@@ -667,6 +667,55 @@ it("snapshots this row's own prior confirmed boundary onto priorBaseRefreshSha b
   expect(rowDuringMutation?.priorBaseRefreshSha).toBe("earlier-confirmed-base");
 });
 
+// anton-s55u (PR #279 review, P1, second re-review): this row's own reconciliation above can ALREADY
+// have promoted a crashed-but-landed pending refresh into `reconciledRefreshSha` before this same call
+// starts a SECOND mutation of its own — snapshotting the pre-reconciliation `priorEffectiveRefreshSha`
+// instead would lose that just-recovered boundary the moment this new pending write lands, and a later
+// crash would fall back to the stale value reconciliation already proved outdated.
+it("snapshots the reconciled boundary, not the pre-reconciliation one, when this call both recovers a crashed refresh and starts a new one", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "landed-base-b",
+    pendingRefreshFromSha: "branch-tip-before-first-mutation",
+    // This row's own earlier confirmed boundary, from before the crashed attempt's pending write
+    // overwrote it — what `priorEffectiveRefreshSha` resolves to BEFORE reconciliation runs.
+    priorBaseRefreshSha: "very-old-base-a",
+    branch: BRANCH,
+  });
+  let rowDuringSecondMutation:
+    | { baseRefreshOutcome: string | null; priorBaseRefreshSha: string | null }
+    | undefined;
+  createWorktreeMock.mockImplementation(
+    async (opts: { beforeMutate?: (baseSha: string, branchSha: string) => Promise<void> }) => {
+      await opts.beforeMutate?.("new-mutation-target-c", "branch-tip-before-second-mutation");
+      rowDuringSecondMutation = await actualRuns.getRunById(t.db, RUN_ID);
+      return {
+        path: WORKTREE,
+        branch: BRANCH,
+        baseBranch: FRESH_BASE,
+        createdBranch: false,
+        repoPath: "/repo",
+        refreshOutcome: { outcome: "rebased", baseSha: "new-mutation-target-c" },
+      };
+    },
+  );
+  // The crashed attempt's mutation onto `landed-base-b` actually landed: the branch moved off its
+  // recorded pre-mutation tip, and `landed-base-b` is now reachable from its current tip.
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "branch-tip-before-first-mutation" || descendant === "branch-tip-before-first-mutation") {
+      return false;
+    }
+    return ancestor === "landed-base-b" && descendant === `refs/heads/${BRANCH}`;
+  });
+
+  await warmRunWorktree(makeRun(RUN_ID));
+
+  expect(rowDuringSecondMutation?.baseRefreshOutcome).toBe(actualRuns.PENDING_REFRESH_OUTCOME);
+  expect(rowDuringSecondMutation?.priorBaseRefreshSha).toBe("landed-base-b");
+});
+
 // anton-s55u (PR #279 review, P2): swallowing this write's failure used to let refreshOntoBase's
 // mutating call proceed with no write-ahead record at all — the exact unrecorded-mutation gap
 // `beforeMutate` exists to close. The rejection must propagate instead, so the mutation never runs.
