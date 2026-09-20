@@ -167,6 +167,41 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledWith(REPO);
   });
 
+  it("retries rather than attach empty cycle evidence to a board whose own edges are pre-repair (P2 review on PR #274)", async () => {
+    // `work`'s own read still carries a `blocks` edge — the cycle's other half sits on some other
+    // bead this test doesn't need — that a concurrent repair removes in the gap before `bd dep
+    // cycles` runs. Without the recheck, the empty cycles result would land on this stale, still-
+    // cyclic-looking `board` as if it described the same revision.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock
+      .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
+      .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
+      .mockImplementationOnce(async () => [repaired, other]) // retry's work read
+      .mockImplementationOnce(async () => [repaired, other]); // retry's recheck — now consistent
+    cyclesMock.mockResolvedValue([]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([repaired, other]);
+    expect(cycleEvidenceFor(board)).toEqual([]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("skips the recheck entirely when cycles come back non-empty — already the fail-safe answer", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await loadAllIssues(REPO, { withCycles: true });
+
+    expect(listMock).toHaveBeenCalledTimes(1);
+  });
+
   it("bumps the version when a concurrent non-cycled refresh wins the shared loader race", async () => {
     // Warm the snapshot first so the race below reloads IDENTICAL content — isolating the assertion
     // from the ordinary "first load ever" version bump every cold snapshot gets regardless of cycles.

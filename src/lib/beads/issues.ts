@@ -131,7 +131,33 @@ export async function loadAllIssues(
   // Starting this read only once `board` is in hand guarantees (under the store's monotonic-read
   // guarantee) it observes a graph at least as current as `board`'s own — evidence can be newer than
   // the board it's attached to, never older.
-  return opts.withCycles ? attachCycleEvidence(board, await beads.depCycles(cwd)) : board;
+  if (!opts.withCycles) return board;
+  const cycles = await beads.depCycles(cwd);
+  // "Never older" is not "consistent": an empty `cycles` result only proves the graph is clean AS OF
+  // this call, not that `work`'s own edges (snapshotted before it) still describe that same graph.
+  // A repair landing in the gap between the two reads can remove one edge of a cycle `work` already
+  // captured, so `cycles` comes back empty while `board`'s edges still encode the now-resolved
+  // cycle. `structureGaps` would wave that through on the empty evidence, but `orderTickets`
+  // (execute-epic-board.ts) sorts `board`'s raw edges directly, hits the still-cyclic pair, and
+  // falls back to input order for tickets the stale cycle touches — dispatching by an ordering
+  // nobody validated. Only worth checking when `cycles` is empty: a non-empty result is already the
+  // fail-safe (blocking) answer this file leans on elsewhere, so this particular mismatch cannot
+  // make it MORE wrong. Re-listing and comparing edges catches the empty case: if the graph moved
+  // between the two reads, retry against whatever is current instead of pairing evidence with a
+  // board it no longer describes.
+  if (cycles.length === 0 && !sameBlocksEdges(work, await loadWorkIssues(cwd))) {
+    return loadAllIssues(cwd, opts);
+  }
+  return attachCycleEvidence(board, cycles);
+}
+
+/** Whether two bead lists agree on every `blocks` edge — the only edge type `bd dep cycles` walks. */
+function sameBlocksEdges(a: Bead[], b: Bead[]): boolean {
+  const key = (e: { from: string; to: string; type: string }) => `${e.from}>${e.to}:${e.type}`;
+  const toSet = (list: Bead[]) =>
+    new Set(beads.edgesOf(list).filter((e) => e.type === "blocks").map(key));
+  const [setA, setB] = [toSet(a), toSet(b)];
+  return setA.size === setB.size && [...setA].every((k) => setB.has(k));
 }
 
 
