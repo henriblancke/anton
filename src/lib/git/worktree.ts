@@ -566,6 +566,22 @@ async function unfinishedGitOperation(worktreePath: string): Promise<"rebase" | 
 }
 
 /**
+ * Where {@link refreshOntoBase} records that IT — not an agent working in this checkout — started
+ * the rebase/merge currently in progress (PR #279 review, P1). A parked agent can leave its own
+ * conflicted merge or rebase mid-resolution on purpose (it resolves some conflicts, then hits a
+ * usage limit); on disk that is indistinguishable from a refresh interrupted mid-operation, since
+ * both leave the same `rebase-merge`/`rebase-apply`/`MERGE_HEAD` state. Written immediately before
+ * the merge/rebase call that can leave conflicts, and removed once that call resolves (cleanly or
+ * via its own `--abort`) — present only for the window where it would actually be this function's
+ * operation left unfinished. `--path-format=absolute --git-path` for the same reason
+ * {@link unfinishedGitOperation} needs it: scoped to THIS worktree's private git-dir, not the
+ * caller's cwd.
+ */
+async function refreshMarkerPath(worktreePath: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-path", "ANTON_REFRESH_IN_PROGRESS"]);
+}
+
+/**
  * Bring a REUSED checkout's branch up to `baseBranch` before anything is dispatched against it
  * (anton-s55u). Without this, a worktree/branch picked back up from a parked or failed run keeps
  * whatever base it was cut from — a resumed run can silently implement, test, and self-review
@@ -646,13 +662,30 @@ async function refreshOntoBase(opts: {
     );
   }
 
+  const markerPath = await refreshMarkerPath(worktreePath);
+
   // Checked BEFORE the dirty-tree escape below: an interrupted rebase/merge reports its conflict
   // paths through `status --porcelain` exactly like ordinary parked edits, so without this check
   // that escape would read it as "leave it alone" and dispatch straight into a checkout with HEAD
   // detached mid-operation and `branch` still at its stale pre-refresh tip.
   const unfinished = await unfinishedGitOperation(worktreePath);
   if (unfinished) {
+    // Only abort an operation THIS function started (the marker, written right before its own
+    // merge/rebase call below) — never one an agent left mid-resolution on purpose (PR #279 review,
+    // P1). `git merge -h`/`git rebase -h` name `--abort` as the recovery for an interrupted refresh,
+    // but the same on-disk state is exactly what a parked agent's own conflicted merge or rebase
+    // leaves behind deliberately, and aborting THAT would discard partial resolution work parking
+    // exists to preserve.
+    if (!existsSync(markerPath)) {
+      throw new Error(
+        `[worktree] ${worktreePath} has an unfinished git ${unfinished} in progress on ${branch} that ` +
+          `this refresh did not start — it may be an agent's own conflict resolution left mid-flight on ` +
+          `purpose. Refusing to abort it and discard that work. Inspect ${worktreePath} and resume the ` +
+          `run once it is confirmed clean, or the conflict is resolved.`,
+      );
+    }
     await git(worktreePath, [unfinished, "--abort"]).catch(() => undefined);
+    await rm(markerPath, { force: true }).catch(() => undefined);
     throw new Error(
       `[worktree] ${worktreePath} had an unfinished git ${unfinished} in progress on ${branch} — a ` +
         `prior process likely died before it could abort its own ${unfinished === "rebase" ? "rebase" : "merge"} ` +
@@ -660,6 +693,9 @@ async function refreshOntoBase(opts: {
         `state. Inspect ${worktreePath} and resume the run once it is confirmed clean.`,
     );
   }
+  // No unfinished operation — any marker left here is stale (an operation the marker recorded that
+  // has since concluded some other way, e.g. a resume that found the checkout already clean).
+  await rm(markerPath, { force: true }).catch(() => undefined);
 
   const dirty = await dirtyPaths(worktreePath);
   if (dirty.length > 0) {
@@ -793,8 +829,13 @@ async function refreshOntoBase(opts: {
   }
 
   if (remotelyPublished || preservedSha) {
+    // Written just before the call that can leave a conflicted merge in progress, so a later
+    // resume's `unfinishedGitOperation` check can tell THIS merge apart from an agent's own
+    // (see `refreshMarkerPath`'s doc comment).
+    await writeFile(markerPath, "", "utf8").catch(() => undefined);
     try {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
+      await rm(markerPath, { force: true }).catch(() => undefined);
       console.log(
         `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ` +
           (remotelyPublished
@@ -805,6 +846,7 @@ async function refreshOntoBase(opts: {
       return { outcome: "merged", baseSha };
     } catch (err) {
       await git(worktreePath, ["merge", "--abort"]).catch(() => undefined);
+      await rm(markerPath, { force: true }).catch(() => undefined);
       const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
         () => "(could not list them)",
       );
@@ -845,12 +887,17 @@ async function refreshOntoBase(opts: {
   }
   const rebaseArgs = ["rebase", "--onto", baseSha, trustedForkSha, branch];
 
+  // Same marker discipline as the merge above: written right before the call that can leave a
+  // conflicted rebase in progress, so a later resume can tell this rebase apart from an agent's own.
+  await writeFile(markerPath, "", "utf8").catch(() => undefined);
   try {
     await git(worktreePath, rebaseArgs, hooksPath);
+    await rm(markerPath, { force: true }).catch(() => undefined);
     console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
     return { outcome: "rebased", baseSha };
   } catch (err) {
     await git(worktreePath, ["rebase", "--abort"]).catch(() => undefined);
+    await rm(markerPath, { force: true }).catch(() => undefined);
     const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
       () => "(could not list them)",
     );

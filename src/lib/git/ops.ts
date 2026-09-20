@@ -1437,10 +1437,15 @@ export interface SatisfiedClaim {
  * operator investigating a skip is owed. Fails closed to none, exactly as {@link branchCommits}
  * does and for the same reason — a `git log` that failed is not proof a ticket was satisfied, and
  * the safe error here is re-running work rather than skipping it.
+ *
+ * `excludeBase`, threaded straight through to {@link branchCommits}, matters here exactly as it does
+ * for {@link worktreeHasCommitFor} (PR #279 review): unbounded, this walks a refreshed checkout's
+ * WHOLE history, so a base commit carrying a sibling's `Anton-Satisfies` trailer for an already-closed
+ * ticket reads as this branch's own delivery of it rather than inherited base history.
  */
 export async function readSatisfiedClaims(
   worktreePath: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; excludeBase?: string } = {},
 ): Promise<SatisfiedClaim[]> {
   const commits = await branchCommits(worktreePath, options);
   return commits.flatMap((c) =>
@@ -1457,11 +1462,14 @@ export async function readSatisfiedClaims(
  * to say which commit it skipped on. Match is EXACT, never by prefix — `anton-jz1.2` satisfying
  * something says nothing about `anton-jz1`, the same collision {@link worktreeHasCommitFor} guards
  * against in its subject scan. Fails closed to `undefined` with {@link readSatisfiedClaims}.
+ *
+ * `excludeBase` — see {@link readSatisfiedClaims}'s own doc comment on why an unbounded scan
+ * misattributes inherited base history to this branch.
  */
 export async function branchSatisfiesTicket(
   worktreePath: string,
   ticketId: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; excludeBase?: string } = {},
 ): Promise<SatisfiedClaim | undefined> {
   const claims = await readSatisfiedClaims(worktreePath, options);
   return claims.find((c) => c.ticketIds.includes(ticketId));

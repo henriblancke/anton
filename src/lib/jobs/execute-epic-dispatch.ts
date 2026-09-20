@@ -131,19 +131,26 @@ export async function dispatchRunTickets(
   // READS NOW: review-fix can merge a newer base into this branch, placing its commits beyond the
   // pinned fork even though the PR does not contain them. Both bounds are required to answer what
   // THIS branch delivers, not what a later base merge introduced.
+  //
+  // `alreadyShippedBase`, not the raw `baseRef` (PR #279 review): `baseRef` is a movable ref name
+  // that a failed fetch falls back to resolving LOCALLY, which can read behind the base a REUSED
+  // checkout's refresh already committed the branch onto. `alreadyShippedBase` is the effective base
+  // that refresh actually left the checkout sitting on (`worktree.refreshOntoBase`'s own doc comment),
+  // so excluding against it — not a ref name that can resolve to something staler — is what keeps this
+  // scan from reading a commit the checkout inherited from its own refreshed base as this run's delta.
   const forkPoint = prep.runStep.baseForkSha;
-  const baseRef = prep.runStep.baseRef;
+  const excludeBase = prep.runStep.alreadyShippedBase;
   const { live, held, dispatchable } = await partitionTickets(run, prep, prep.gated, async (id) => {
     try {
       return await worktreeHasCommitFor(prep.worktree.path, id, {
         base: forkPoint,
-        excludeBase: baseRef,
+        excludeBase,
         strict: true,
       });
     } catch (e) {
       throw new PoisonEpic(
         `${id} is superseded on the board, and anton could not read the commits ` +
-          `\`${prep.worktree.branch}\` carries beyond ${prep.runStep.baseRef} in ${prep.worktree.path} ` +
+          `\`${prep.worktree.branch}\` carries beyond ${excludeBase} in ${prep.worktree.path} ` +
           `to tell whether this branch holds its work (${e instanceof Error ? e.message : String(e)}). ` +
           `Refusing to retire it on an unreadable branch — if its commit IS here, the pull request ` +
           `would ship it unlisted. Repair the worktree, then resume the run`,
@@ -327,9 +334,10 @@ async function partitionTickets(
     const delivery = await branchDelivery(
       {
         hasCommitFor,
-        satisfiedBy: (id) => branchSatisfiesTicket(prep.worktree.path, id),
+        satisfiedBy: (id) =>
+          branchSatisfiesTicket(prep.worktree.path, id, { excludeBase: prep.runStep.alreadyShippedBase }),
         notedSatisfiedBy: (candidate) => notedSatisfaction(prep.runStep, candidate),
-        branchAdded: (sha) => branchAddedCommit(run.repo, run.branch, prep.runStep.baseRef, sha),
+        branchAdded: (sha) => branchAddedCommit(run.repo, run.branch, prep.runStep.alreadyShippedBase, sha),
       },
       ticket,
     );
@@ -964,17 +972,24 @@ export interface BranchDeliveryReads {
  */
 function worktreeReads(
   worktreePath: string,
-  run: Pick<StepContext, "repoPath" | "branch" | "baseRef">,
+  run: Pick<StepContext, "repoPath" | "branch" | "alreadyShippedBase">,
 ): BranchDeliveryReads {
   return {
     // Exclude commits reachable from the base AS IT READS NOW (PR #279 review): a refresh can bring
     // in a commit for a child already closed on the board, and an unbounded scan would then read
     // that INHERITED base commit as this branch's own delivery of the ticket rather than base
     // history — the same widening `excludeBase` closes for the dispatch partition above.
-    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id, { excludeBase: run.baseRef }),
-    satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
+    //
+    // `alreadyShippedBase`, not `baseRef` (PR #279 review): `baseRef` is a movable ref name that a
+    // failed fetch resolves LOCALLY, which can read behind the base a reused checkout's refresh
+    // already committed the branch onto — undercounting the exclusion and letting an inherited base
+    // commit (a sibling's `<id>:` subject or `Anton-Satisfies` trailer for an already-closed ticket)
+    // read as this branch's own delivery. `alreadyShippedBase` is the base the checkout actually sits
+    // on right now, on every refresh outcome (`StepContext.alreadyShippedBase`'s own doc comment).
+    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id, { excludeBase: run.alreadyShippedBase }),
+    satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id, { excludeBase: run.alreadyShippedBase }),
     notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket),
-    branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, sha),
+    branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, sha),
   };
 }
 
@@ -1347,15 +1362,18 @@ async function deliveredOrPark(
   const retired = new Set(run.retired.map((r) => r.id));
   //     A human ticket a SIBLING's commit satisfied stays too (PR #258 review): the ledger proved
   //     the work is on this branch under another name, so the branch question above cannot see it.
-  //     `excludeBase: runStep.baseRef` (PR #279 review): a refresh can bring in a commit for a
-  //     ticket already closed on the board, and an unbounded scan would then count that INHERITED
-  //     base commit as work THIS branch delivered — a nonempty ledger built entirely from base
-  //     history would bypass the empty-delivery park below and open a PR with an empty diff, or
-  //     (with other branch work) falsely attribute the inherited ticket to it.
+  //     `excludeBase: runStep.alreadyShippedBase` (PR #279 review): a refresh can bring in a commit
+  //     for a ticket already closed on the board, and an unbounded scan would then count that
+  //     INHERITED base commit as work THIS branch delivered — a nonempty ledger built entirely from
+  //     base history would bypass the empty-delivery park below and open a PR with an empty diff, or
+  //     (with other branch work) falsely attribute the inherited ticket to it. `alreadyShippedBase`,
+  //     not the movable `baseRef`: a failed fetch resolves `baseRef` LOCALLY, which can read behind
+  //     the base a reused checkout's own refresh already committed the branch onto, undercounting the
+  //     exclusion and letting exactly that inherited commit through as this run's own delivery.
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id) && !retired.has(t.id)),
     stoppedShort,
-    (id) => worktreeHasCommitFor(worktree.path, id, { excludeBase: runStep.baseRef }),
+    (id) => worktreeHasCommitFor(worktree.path, id, { excludeBase: runStep.alreadyShippedBase }),
     new Set(ledger.satisfied.keys()),
   );
 

@@ -144,7 +144,9 @@ const prep = (): Extract<RunPreparation, { done: false }> =>
     done: false,
     ticketSteps: [],
     runSteps: [],
-    runStep: { baseRef: BASE_REF, baseForkSha: FORK_POINT },
+    // `alreadyShippedBase` is what dispatch's exclusion scans actually read (PR #279 review) — equal
+    // to `baseRef` here since these fixtures never exercise a refreshed checkout.
+    runStep: { baseRef: BASE_REF, baseForkSha: FORK_POINT, alreadyShippedBase: BASE_REF },
     worktree: { path: WORKTREE, branch: "anton/anton-epic" },
     readiness: { blockers: [] },
     gated: new Set<string>(),

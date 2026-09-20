@@ -739,6 +739,16 @@ suite("worktree manager (real git)", () => {
     // while `branch` still points at its pre-rebase tip. `status --porcelain` alone can't tell that
     // apart from ordinary parked edits, so this must be caught and aborted before the dirty-tree
     // escape ever sees it — never dispatched into.
+    /** The private git-path marker recording that a refresh — not an agent — started an operation. */
+    function writeRefreshMarker(worktreePath: string): void {
+      const markerPath = execFileSync(
+        "git",
+        ["-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-path", "ANTON_REFRESH_IN_PROGRESS"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(markerPath, "");
+    }
+
     it("aborts and fails loud when a reused checkout has an unfinished rebase left by a killed process", async () => {
       const branch = "anton/refresh-unfinished-rebase";
       const first = await createWorktree({ repoPath: repo, branch });
@@ -754,6 +764,9 @@ suite("worktree manager (real git)", () => {
         { encoding: "utf8" },
       ).trim();
       mkdirSync(rebaseMergePath, { recursive: true });
+      // Marks this as a refresh's own interrupted rebase (PR #279 review, P1) — without it the guard
+      // below refuses to abort at all, on the (correct, in general) assumption it may be an agent's own.
+      writeRefreshMarker(first.path);
 
       await expect(
         createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
@@ -775,12 +788,44 @@ suite("worktree manager (real git)", () => {
         { encoding: "utf8" },
       ).trim();
       writeFileSync(mergeHeadPath, `${beforeSha}\n`);
+      writeRefreshMarker(first.path);
 
       await expect(
         createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
       ).rejects.toThrow(/had an unfinished git merge in progress/);
 
       // Never dispatched into — the branch itself is untouched.
+      expect(branchTip(branch)).toBe(beforeSha);
+    });
+
+    // anton-s55u (PR #279 review, P1): a parked agent can leave its OWN conflicted merge or rebase
+    // mid-resolution on purpose (it resolves some conflicts, then hits a usage limit) — on disk that
+    // is the identical shape to a refresh interrupted mid-operation. Without the marker distinguishing
+    // the two, the guard above would abort it and discard the agent's partial resolution work.
+    it("refuses to abort an unfinished merge it did not start, and never touches it", async () => {
+      const branch = "anton/refresh-agent-owned-merge";
+      const first = await createWorktree({ repoPath: repo, branch });
+      const beforeSha = headOf(first.path);
+      advanceDefaultBranch(
+        "agent-owned-merge-base.txt",
+        "advance 10\n",
+        "advance main (agent-owned merge)",
+      );
+
+      const mergeHeadPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "MERGE_HEAD"],
+        { encoding: "utf8" },
+      ).trim();
+      writeFileSync(mergeHeadPath, `${beforeSha}\n`);
+      // No marker written — this merge is not refreshOntoBase's, so it must be left exactly alone.
+
+      await expect(
+        createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+      ).rejects.toThrow(/did not start/);
+
+      // Never touched — the merge is still in progress, HEAD still detached mid-merge.
+      expect(existsSync(mergeHeadPath)).toBe(true);
       expect(branchTip(branch)).toBe(beforeSha);
     });
 

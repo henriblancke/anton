@@ -117,6 +117,11 @@ export interface StepContext {
    * while still failing a check against the older, frozen fork. This is that refreshed base when a
    * clean refresh actually applied one (`worktree.refreshOntoBase`'s `baseSha`, on every outcome but
    * `skipped_dirty`, where the branch never moved) — {@link baseForkSha} otherwise.
+   *
+   * Also what dispatch's delivery-exclusion scans bound themselves against, not {@link baseRef}
+   * (PR #279 review): `baseRef` is a movable ref name a failed fetch resolves LOCALLY, which can read
+   * behind the base this field already correctly accounts for — undercounting the exclusion and
+   * letting a commit the checkout inherited from its own refreshed base read as this run's delivery.
    */
   alreadyShippedBase: string;
   /** The run target — the epic, or the single bead of a standalone run. */
