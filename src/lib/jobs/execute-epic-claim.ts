@@ -161,13 +161,19 @@ export async function warmRunWorktree(
   // pending target `A` is already an ancestor of a branch cut at `A-B-W` before any rebase ever runs,
   // exactly as it would be once one actually lands. A resume trusting reachability alone here would
   // derive `--onto`'s boundary from `A` regardless, and `git rebase --onto <newbase> A` replays `B` —
-  // history the rewind dropped — back onto the branch as if it were the branch's own work. The tie is
-  // broken by also comparing `pendingRefresh.sha` against the branch's tip AT THE INSTANT the dead
-  // attempt recorded it (`pendingRefresh.fromSha`, written by the same `beforeMutate` write-ahead
-  // hook): only when `pendingRefresh.sha` was NOT already an ancestor of that pre-mutation tip, but
-  // IS one of the branch's CURRENT tip, has the branch actually moved past where it already sat —
-  // the same reachability check the dead attempt itself would have needed to pass before its mutating
-  // call could ever run. A row written before `fromSha` existed has nothing to reconcile against and
+  // history the rewind dropped — back onto the branch as if it were the branch's own work.
+  //
+  // The tie is broken by asking whether the branch's CURRENT tip is still its recorded pre-mutation
+  // tip at all (PR #279 review, P2 re-review), not by re-testing `pendingRefresh.sha`'s reachability
+  // from that stale pre-mutation snapshot: a merge/rebase/fast-forward that actually lands always
+  // moves the branch off `pendingRefresh.fromSha` — a rebase replays onto entirely new commits, a
+  // fast-forward moves the ref straight to `pendingRefresh.sha`, and even a merge (whose tip still has
+  // `fromSha` as one parent) is never EQUAL to it — so mutual ancestry between `fromSha` and the
+  // branch's current tip (i.e. the two being the same commit) holds if and only if the mutation never
+  // ran. That still correctly rejects the rewound-but-never-mutated case the ancestry-alone check
+  // exists to catch (the branch is unchanged, so it stays equal to `fromSha`), while also recovering
+  // the case that check wrongly treated as unconfirmed: an authoritative rewind whose merge/rebase
+  // genuinely landed. A row written before `fromSha` existed has nothing to reconcile against and
   // fails closed: its pending sha is never trusted.
   const pendingRefresh = await findPendingRefreshShaForBranch(db, projectId, run.targetId, branch);
   let reconciledRefreshSha = priorEffectiveRefreshSha;
@@ -176,11 +182,11 @@ export async function warmRunWorktree(
     pendingRefresh.fromSha !== undefined &&
     pendingRefresh.sha !== priorEffectiveRefreshSha
   ) {
-    const alreadyAncestorBeforeMutation = await isAncestor(repo, pendingRefresh.sha, pendingRefresh.fromSha).catch(
-      () => true,
-    );
+    const branchStillAtPreMutationTip =
+      (await isAncestor(repo, pendingRefresh.fromSha, `refs/heads/${branch}`).catch(() => true)) &&
+      (await isAncestor(repo, `refs/heads/${branch}`, pendingRefresh.fromSha).catch(() => true));
     const mutationConfirmed =
-      !alreadyAncestorBeforeMutation &&
+      !branchStillAtPreMutationTip &&
       (await isAncestor(repo, pendingRefresh.sha, `refs/heads/${branch}`).catch(() => false));
     if (mutationConfirmed) reconciledRefreshSha = pendingRefresh.sha;
   }

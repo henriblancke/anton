@@ -734,7 +734,7 @@ it("ignores a pending refresh that never actually landed on the branch, falling 
 // to `A` leaves `A` (the pending target) already an ancestor of a branch cut at `A-B-W`, before any
 // rebase ever ran. Reachability against the branch's CURRENT history alone can't tell that apart from
 // a mutation that actually landed; only comparing against the branch's recorded PRE-mutation tip can.
-it("does not trust a pending refresh whose target base was already an ancestor of the branch BEFORE the mutation ran (a rewound base)", async () => {
+it("does not trust a pending refresh whose target base was already an ancestor of the branch BEFORE the mutation ran (a rewound base) when the branch never actually moved", async () => {
   await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseForkSha: "old-fork-commit",
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
@@ -753,8 +753,54 @@ it("does not trust a pending refresh whose target base was already an ancestor o
     repoPath: "/repo",
   });
   // `rewound-base` was ALREADY an ancestor of the branch's pre-mutation tip (the rewind's whole
-  // premise), and — since the dead attempt never actually mutated anything — still is now. Trusting
-  // reachability against the current branch alone (the old check) would wrongly treat this as landed.
+  // premise) — and the dead attempt never actually mutated anything, so the branch's CURRENT tip is
+  // still exactly `branch-tip-before-mutation`. Trusting reachability against the current branch
+  // alone (the old check) would wrongly treat this as landed.
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "rewound-base") return true;
+    // The branch is unchanged: its current tip and the recorded pre-mutation tip are the same
+    // commit, so each is trivially an ancestor of the other.
+    return (
+      (ancestor === "branch-tip-before-mutation" && descendant === `refs/heads/${BRANCH}`) ||
+      (ancestor === `refs/heads/${BRANCH}` && descendant === "branch-tip-before-mutation")
+    );
+  });
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
+// anton-s55u (PR #279 review, P2 re-review): the false NEGATIVE the ancestry-alone check left behind
+// — when the rewind target was already reachable from the pre-mutation tip, the old check always
+// treated the pending refresh as unconfirmed, even once the rebase/merge/fast-forward it recorded
+// actually landed. A landed mutation always moves the branch off its recorded pre-mutation tip, so
+// that's what must be checked instead of re-testing reachability from a now-stale snapshot.
+it("trusts a pending refresh onto a rewound base once the branch's tip has moved off its recorded pre-mutation state", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "rewound-base",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  // `rewound-base` was already reachable from the pre-mutation tip (the rewind's premise), but this
+  // time the mutation actually completed: the branch's CURRENT tip is no longer
+  // `branch-tip-before-mutation` in either direction, while `rewound-base` remains reachable from
+  // wherever the branch landed.
   isAncestorMock.mockImplementation(async (...args: unknown[]) => {
     const [, ancestor] = args as [string, string, string];
     return ancestor === "rewound-base";
@@ -763,7 +809,7 @@ it("does not trust a pending refresh whose target base was already an ancestor o
   await warmRunWorktree(makeRun(RETRY));
 
   expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ forkSha: "old-fork-commit" }),
+    expect.objectContaining({ forkSha: "rewound-base" }),
   );
 });
 

@@ -845,23 +845,36 @@ async function refreshOntoBase(opts: {
             `${worktreePath} untouched — resolve manually and retry.`,
         );
       }
-    } else if (
+    } else {
       // No trustworthy pin at all (a legacy reused checkout, or a stale one) — PR #279 review (P1,
       // re-review). That can't be told apart from the force-push-behind-fork shape above without the
       // pin, so a genuine two-way divergence (neither ref is an ancestor of the other) must fail
       // closed here too, the same way the clean path's `trustedForkSha` guard below refuses a plain
-      // rebase without one. An ordinary one-way advance (`branchSha` still an ancestor of `baseSha`,
-      // or vice versa) is unaffected — nothing could have been dropped either way.
-      !(await isAncestor(worktreePath, branchSha, baseSha)) &&
-      !(await isAncestor(worktreePath, baseSha, branchSha))
-    ) {
-      throw new Error(
-        `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${branch} ` +
-          `diverges from ${baseBranch} (${baseSha.slice(0, 12)}) with no trustworthy fork-point pin — ` +
-          `committing and dispatching against the checkout's stale history could silently reintroduce ` +
-          `commits ${baseBranch} dropped if it was force-pushed or recreated past ${branch}'s real fork ` +
-          `point. Leaving the uncommitted changes in ${worktreePath} untouched — resolve manually and retry.`,
-      );
+      // rebase without one. An ordinary one-way advance with `branchSha` still an ancestor of
+      // `baseSha` (base is at/ahead of branch) is unaffected — nothing could have been dropped there.
+      //
+      // The OTHER one-way direction — `baseSha` an ancestor of `branchSha` (branch is at/ahead of
+      // base) — is NOT unconditionally safe (PR #279 review, P1, third re-review): once
+      // `baseIsAuthoritative` is true, that shape is exactly what an authoritative rewind from `A-B`
+      // back to `A` looks like (`A` stays an ancestor of a branch cut at `A-B-W`), and without a pin
+      // there is no way to tell it apart from the ordinary, harmless case of a branch that's simply
+      // advanced past a base that never moved — so it fails closed too. A stale LOCAL fallback
+      // reading the same shape is left alone, same as the pinned case above (see
+      // `baseIsAuthoritative`'s own doc comment) — there, nothing could have been rewound.
+      const baseAtOrAheadOfBranch = await isAncestor(worktreePath, branchSha, baseSha);
+      const branchAtOrAheadOfBase = await isAncestor(worktreePath, baseSha, branchSha);
+      const divergent = !baseAtOrAheadOfBranch && !branchAtOrAheadOfBase;
+      const unpinnedAuthoritativeRewind =
+        baseIsAuthoritative && branchAtOrAheadOfBase && !baseAtOrAheadOfBranch;
+      if (divergent || unpinnedAuthoritativeRewind) {
+        throw new Error(
+          `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${branch} ` +
+            `diverges from ${baseBranch} (${baseSha.slice(0, 12)}) with no trustworthy fork-point pin — ` +
+            `committing and dispatching against the checkout's stale history could silently reintroduce ` +
+            `commits ${baseBranch} dropped if it was force-pushed or recreated past ${branch}'s real fork ` +
+            `point. Leaving the uncommitted changes in ${worktreePath} untouched — resolve manually and retry.`,
+        );
+      }
     }
     console.log(
       `[worktree] skipping refresh of ${branch} onto ${baseBranch}: ${worktreePath} has uncommitted ` +
@@ -1019,20 +1032,45 @@ async function refreshOntoBase(opts: {
   // sidestep this by construction (see the `forkSha` doc above), so this guard covers every path
   // below that merges instead of rebasing — published, preserved, and (PR #279 review, sixth round)
   // a branch carrying a merge commit, which now merges too rather than risk `--rebase-merges`
-  // silently dropping its content. Checked only when `forkSha` is both known and still reachable on
-  // `branch`: an unknown or already-stale pin can't distinguish this case from an ordinary
-  // divergence, so it's left to the merge/rebase paths' own conflict handling below. The stale-base
-  // shape is already ruled out by the no-op above, so a `!isAncestor(forkSha, baseSha)` reaching
-  // here is always the genuine force-push-past-fork case.
+  // silently dropping its content.
+  //
+  // A branch with NO trustworthy pin at all is not universally unsafe to merge — an ordinary
+  // divergence (the ONLY shape `remotelyPublished`/`preservedSha`/`hasMergeCommit` exist to protect
+  // in the common case, e.g. a branch's own pushed commit alongside a base that separately advanced)
+  // merges its real content and is exactly what this path is for, pin or no pin. What a missing pin
+  // CANNOT rule out is the one shape reported in review (PR #279 review, P1, third re-review): an
+  // AUTHORITATIVE rewind of `baseBranch` from `A-B` back to `A` leaves `A` already an ancestor of a
+  // branch cut at `A-B-W` — `git merge --no-edit A` on that branch reports "Already up to date" and
+  // silently RETAINS `B` rather than merging anything, so the eventual PR against `A` restores
+  // exactly what the rewind dropped. That shape is checkable without a pin at all: it's `baseSha`
+  // already reachable from `branch` (not the reverse), same as the dirty-tree escape's own unpinned
+  // guard above. A stale LOCAL fallback reading the same shape is left alone — nothing was rewound.
+  const baseAlreadyOnBranch =
+    !trustedForkSha &&
+    baseIsAuthoritative &&
+    (await isAncestor(worktreePath, baseSha, branchSha)) &&
+    !(await isAncestor(worktreePath, branchSha, baseSha));
+  if ((remotelyPublished || preservedSha || hasMergeCommit) && baseAlreadyOnBranch) {
+    throw new Error(
+      `[worktree] ${branch} already contains ${baseBranch} (${baseSha.slice(0, 12)}) and has no ` +
+        `trustworthy fork-point pin to check whether that's genuine or the result of an authoritative ` +
+        `rewind — merging would report "Already up to date" and silently retain whatever commits ` +
+        `${baseBranch} dropped if it was rewound past ${branch}'s real fork point. Resolve manually ` +
+        `in ${worktreePath} and retry.`,
+    );
+  }
+
+  // With a trusted pin, the check is precise: only trips when `baseSha` no longer descends from it
+  // (the stale-base shape is already ruled out by the no-op above, so a `!isAncestor(trustedForkSha,
+  // baseSha)` reaching here is always the genuine force-push-past-fork case).
   if (
     (remotelyPublished || preservedSha || hasMergeCommit) &&
-    forkSha &&
-    (await branchContainsCommit(repoPath, branch, forkSha)) &&
-    !(await isAncestor(worktreePath, forkSha, baseSha))
+    trustedForkSha &&
+    !(await isAncestor(worktreePath, trustedForkSha, baseSha))
   ) {
     throw new Error(
       `[worktree] ${baseBranch} (${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork ` +
-        `point ${forkSha.slice(0, 12)} — ${baseBranch} looks like it was force-pushed or recreated ` +
+        `point ${trustedForkSha.slice(0, 12)} — ${baseBranch} looks like it was force-pushed or recreated ` +
         `behind that commit. Merging would still reach ${branch}'s own copy of whatever ${baseBranch} ` +
         `dropped, silently reintroducing it. Resolve manually in ${worktreePath} and retry.`,
     );
