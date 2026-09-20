@@ -1009,7 +1009,7 @@ it("confirms a pending fast-forward only when the branch tip is EXACTLY the targ
   );
 });
 
-it("does not trust a pending fast-forward when the branch tip is merely a descendant of the target, not exactly it", async () => {
+it("confirms a pending fast-forward when a post-merge commit leaves the target reachable", async () => {
   await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseForkSha: "old-fork-commit",
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
@@ -1028,15 +1028,18 @@ it("does not trust a pending fast-forward when the branch tip is merely a descen
     createdBranch: false,
     repoPath: "/repo",
   });
-  // Some OTHER commit landed on the branch after `ff-target` — without the fast-forward's own reflog
-  // transition, a descendant tip cannot prove the pending operation landed.
+  // A post-merge hook committed after the fast-forward. `ff-target` cannot have been reachable from
+  // the recorded pre-mutation tip, so its reachability now proves the branch contains the landed FF.
   resolveCommitShaMock.mockResolvedValue("some-later-commit");
-  gitMock.mockResolvedValue("some-later-commit\nff-target\nnot-the-recorded-pre-mutation-tip");
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    return ancestor === "ff-target" && descendant === `refs/heads/${BRANCH}`;
+  });
 
   await warmRunWorktree(makeRun(RETRY));
 
   expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
-    expect.objectContaining({ forkSha: "old-fork-commit" }),
+    expect.objectContaining({ forkSha: "ff-target" }),
   );
 });
 
