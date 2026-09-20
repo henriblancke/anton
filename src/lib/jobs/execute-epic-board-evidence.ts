@@ -262,6 +262,40 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
   return hydrated ? fingerprintBoard(hydrated, ticket?.id) : null;
 }
 
+/**
+ * Durably persist `baseline` onto `ticket` BEFORE the agent is ever dispatched (PR #284 review,
+ * "Persist the board baseline before dispatch") — closes the crash window `readBoardBaseline` alone
+ * leaves open. On a shared-server board the agent's `bd -C <repo>` writes are globally visible the
+ * instant they land, but between `runTicket` computing `boardBaseline` and `readBoardEvidence` first
+ * persisting a pending marker, that baseline lived only in this process's memory. A process/host death
+ * inside that window — after the agent wrote, before this ticket ever reached the evidence check —
+ * left a resumed attempt with nothing preserved to reuse: `readBoardBaseline` would take a FRESH read
+ * that already absorbed the delivered state, and an idempotent retry then diffs as no evidence at all,
+ * permanently.
+ *
+ * A no-op (returns `true` without writing) when `baseline` was already reused from a preserved value —
+ * a resumed attempt whose baseline `readBoardBaseline` pulled off the ticket's own metadata is already
+ * durable; re-persisting it would cost a write for nothing. Never throws: a persist or confirming-push
+ * failure (after {@link mustPersist}'s own retries) returns `false` so `runTicket` can refuse to
+ * dispatch on the same closed-fail path it already takes for an unreadable baseline, rather than
+ * dispatch an agent whose writes this attempt could not durably anchor.
+ */
+export async function ensureBoardBaselinePersisted(
+  repo: string,
+  ticket: Bead,
+  baseline: BoardFingerprint,
+): Promise<boolean> {
+  if (beads.boardEvidenceBaseline(ticket)) return true;
+  const persisted = await mustPersist(() =>
+    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+  );
+  if (!persisted) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
 /** What the post-run board read found, relative to the baseline. */
 export interface BoardEvidenceResult {
   /** At least one bead's content differs from the baseline. */

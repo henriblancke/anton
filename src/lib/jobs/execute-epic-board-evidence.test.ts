@@ -57,6 +57,7 @@ vi.mock("../beads/issues", async () => {
 const {
   boardEvidence,
   clearBoardEvidencePending,
+  ensureBoardBaselinePersisted,
   fingerprintBoard,
   isBoardOnlyRun,
   readBoardBaseline,
@@ -1188,6 +1189,62 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     },
   );
 });
+
+describe(
+  "ensureBoardBaselinePersisted — durably anchors a fresh baseline before dispatch (PR #284 review, " +
+    "\"Persist the board baseline before dispatch\")",
+  () => {
+    it("persists and confirms synced when the ticket carries no preserved baseline yet", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBe(true);
+
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-fresh",
+        Object.fromEntries(baseline.beads),
+      );
+      expect(pushMock).toHaveBeenCalledWith("/repo");
+    });
+
+    it("is a no-op when the ticket already carries a preserved baseline — nothing new to anchor", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const ticketWithBaseline = bead("t-preserved", {
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "preserved-hash" }) },
+      });
+      const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(
+        ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
+      ).resolves.toBe(true);
+
+      expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore);
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+
+    it("returns false, never throws, when the persist itself exhausts every retry", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBe(false);
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+
+    it("returns false when the persist lands locally but the confirming push never syncs", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired");
+
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBe(false);
+    });
+  },
+);
 
 describe("isBoardOnlyRun — reads the label from the ticket OR its run target (anton-fc5x review round 2)", () => {
   const child = bead("anton-child", { labels: [] });

@@ -9,7 +9,7 @@
  * bottom, which pins a trivial `echo` gate — the gate evidence the reviewer is handed is loop
  * behavior (which session runs the gates, and how often), so it is asserted where the loop is.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -19,6 +19,28 @@ import { asc } from "drizzle-orm";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
+
+// `runReviewGate`'s durable persist of board-fix evidence (PR #284 review, "Persist board-fix
+// evidence IDs across review retries") shells out to real `bd` via `beads.setBoardEvidenceConfirmed`
+// / `beads.push` — mocked here so the many board-only fix tests below, which pass a fake `repoPath`
+// ("/repos/anton"), don't pay `mustPersist`'s real retry backoff against a `bd` that can never
+// succeed there. `beads.isBoardOnly` and everything else stays real: only these two writes shell out.
+const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string, ids: readonly string[]) => Promise<string>>();
+const boardPushMock = vi.fn<(repo: string) => Promise<string>>();
+vi.mock("../beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      setBoardEvidenceConfirmed: (...args: [string, string, readonly string[]]) =>
+        setBoardEvidenceConfirmedMock(...args),
+      push: (...args: [string]) => boardPushMock(...args),
+    },
+  };
+});
+setBoardEvidenceConfirmedMock.mockResolvedValue("");
+boardPushMock.mockResolvedValue("synced");
 import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";

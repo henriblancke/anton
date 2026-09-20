@@ -19,6 +19,7 @@ const settleFailedTicketMock = vi.fn();
 const readBoardBaselineMock = vi.fn();
 const readBoardEvidenceMock = vi.fn();
 const clearBoardEvidencePendingMock = vi.fn();
+const ensureBoardBaselinePersistedMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
@@ -54,6 +55,7 @@ vi.mock("./execute-epic-board-evidence", async () => {
     readBoardBaseline: (...args: unknown[]) => readBoardBaselineMock(...args),
     readBoardEvidence: (...args: unknown[]) => readBoardEvidenceMock(...args),
     clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
+    ensureBoardBaselinePersisted: (...args: unknown[]) => ensureBoardBaselinePersistedMock(...args),
   };
 });
 
@@ -238,6 +240,7 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     vi.resetAllMocks();
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x1"], synced: true });
+    ensureBoardBaselinePersistedMock.mockResolvedValue(true);
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -304,6 +307,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
   beforeEach(() => {
     vi.resetAllMocks();
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
+    ensureBoardBaselinePersistedMock.mockResolvedValue(true);
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -395,3 +399,102 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
     },
   );
 });
+
+/**
+ * PR #284 review, "Persist the board baseline before dispatch": a baseline that read fine but could
+ * not be durably anchored to the ticket must refuse dispatch just like an unreadable one — otherwise
+ * a crash between the agent's writes and the first pending-marker write would leave a resumed attempt
+ * with nothing to anchor against.
+ */
+describe(
+  "runTicket — refuses to dispatch a board-only ticket whose baseline could not be persisted (PR #284 review)",
+  () => {
+    const boardTicket = { ...ticket, labels: ["delivery:board"] } as Bead;
+    const dispatchMock = vi.fn();
+
+    function neverDispatchedStep(): ResolvedStep {
+      return {
+        step: { id: "implement" },
+        definition: {
+          name: "claude",
+          class: "dispatch",
+          summary: "should never run — dispatch is refused before any step walks",
+          producesDiff: true,
+          handler: async () => {
+            dispatchMock();
+            return { ok: true, facts: {} };
+          },
+        },
+      } as unknown as ResolvedStep;
+    }
+
+    /** A `commit` step reporting a board-only delivery, mirroring the marker-release describe above. */
+    function deliveredCommitStep(): ResolvedStep {
+      return {
+        step: { id: "commit" },
+        definition: {
+          name: "commit",
+          class: "git",
+          summary: "fake board-only commit",
+          producesDiff: false,
+          handler: async () => {
+            dispatchMock();
+            return { ok: true, facts: { committed: true, selfReport: { outcome: "delivered" } } };
+          },
+        },
+      } as unknown as ResolvedStep;
+    }
+
+    beforeEach(() => {
+      vi.resetAllMocks();
+      dispatchMock.mockReset();
+      readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
+      // The catch-side audit (`auditBoardOnFailedTicket`) still reads the board on ANY failure once
+      // `boardBaseline` came back non-null, including this pre-dispatch refusal — a benign "nothing
+      // changed" read is the right default here since nothing has run yet.
+      readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+      settleFailedTicketMock.mockImplementation(async () => {
+        throw new Error("settled as a failure");
+      });
+    });
+
+    it("fails closed before the agent ever dispatches, without claiming the baseline read failed", async () => {
+      ensureBoardBaselinePersistedMock.mockResolvedValue(false);
+
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [neverDispatchedStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow("settled as a failure");
+
+      // The step handler never runs — dispatch is refused before `walkTicketSteps` is ever called.
+      expect(dispatchMock).not.toHaveBeenCalled();
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+      const settled = settleFailedTicketMock.mock.calls[0]![0] as { e: Error };
+      expect(settled.e.message).toMatch(/was not dispatched/);
+      expect(settled.e.message).toMatch(/could not be durably persisted/);
+      expect(settled.e.message).not.toMatch(/could not be read/);
+    });
+
+    it("dispatches normally once the baseline is durably persisted", async () => {
+      ensureBoardBaselinePersistedMock.mockResolvedValue(true);
+      readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x2"], synced: true });
+      finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
+
+      await runTicket({
+        run: run(),
+        steps: [deliveredCommitStep()],
+        ticket: boardTicket,
+        runTicketIds: [boardTicket.id],
+        timeoutMs: 5_000,
+      });
+
+      expect(dispatchMock).toHaveBeenCalledTimes(1);
+      expect(readBoardEvidenceMock).toHaveBeenCalledWith("/tmp/anton", { beads: new Map() }, boardTicket);
+    });
+  },
+);

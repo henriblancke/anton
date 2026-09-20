@@ -40,7 +40,7 @@ import {
   hydrateDescriptions,
   type BoardFingerprint,
 } from "./execute-epic-board-evidence";
-import { mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustReadBoard } from "./execute-epic-persist";
 import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
@@ -522,6 +522,33 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
         merged.set(t.id, [...new Set([...(merged.get(t.id) ?? []), ...fix.boardEvidenceIds])].toSorted());
       }
       boardEvidenceByTicket = merged;
+      // Durably persisted onto every board-only ticket (PR #284 review, "Persist board-fix evidence
+      // IDs across review retries") — `merged` otherwise lives only in this loop's local variable,
+      // and a process death after this round's board sync but before a later round (or the PR step)
+      // finishes would leave a resumed attempt reconstructing `boardEvidenceByTicket` from scratch
+      // off each ticket's `boardEvidenceConfirmed` metadata (see `execute-epic-dispatch.ts`'s ledger
+      // build) — which never learned about a bead this FIX round created or first touched, recreating
+      // the blind-review problem this merge exists to close. Writing it into the SAME durable field
+      // every other board-evidence path already reads on resume, rather than a parallel mechanism,
+      // means a resumed run's dispatch ledger picks this up for free the moment it re-reads each
+      // ticket. `repo` is always set here in practice — `fix.boardEvidenceIds` is only ever populated
+      // when `runGateFixSession` was itself given a `repoPath` (see its own `boardBefore` gate) — but
+      // checked rather than asserted so a future caller without one degrades to the in-memory-only
+      // behavior this replaces instead of throwing. `merged.get(t.id) ?? []` always passes the FULL
+      // known set, never just `fix.boardEvidenceIds` alone: `setBoardEvidenceConfirmed` is not
+      // idempotent on its `ids` argument (see that function's own docstring), so a narrower write
+      // here would overwrite already-durable evidence with less. Best-effort like every other
+      // opportunistic sync in this loop — a failure here leaves exactly the pre-existing behavior
+      // (in-memory only, lost on crash) rather than a new hard failure this round must halt on.
+      const repo = args.repoPath;
+      if (repo) {
+        await Promise.all(
+          boardOnlyUnits.map((t) =>
+            mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [])),
+          ),
+        );
+        await beads.push(repo).catch(() => false);
+      }
     }
 
     // Nothing changed: the next review would read the identical diff and report the identical

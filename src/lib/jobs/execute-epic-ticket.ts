@@ -17,6 +17,7 @@ import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
 import {
   clearBoardEvidencePending,
+  ensureBoardBaselinePersisted,
   isBoardOnlyRun,
   readBoardBaseline,
   readBoardEvidence,
@@ -121,6 +122,19 @@ export async function runTicket(args: {
   // `ticket` is passed so a resumed attempt reuses a PRIOR attempt's preserved baseline instead of
   // taking a fresh one (PR #284 review round 8) — see readBoardBaseline's own docstring.
   const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
+  // Durably persisted BEFORE the agent is ever dispatched (PR #284 review, "Persist the board
+  // baseline before dispatch") — a freshly-read baseline otherwise lives only in this process's
+  // memory until `readBoardEvidence` first writes a pending marker, and on a shared-server board the
+  // agent's own bd writes are globally visible the moment they land. A process/host death inside that
+  // window would leave a resumed attempt with nothing preserved to anchor to: `readBoardBaseline`
+  // would take a fresh read that already absorbed the delivered state, and an idempotent retry then
+  // diffs as no evidence at all, permanently. Kept SEPARATE from `!boardBaseline` below (never folded
+  // into it) so the operator note can say precisely which of "unreadable" or "read fine but could not
+  // be anchored" happened, instead of a persist failure claiming a read never occurred.
+  const boardBaselinePersistFailed =
+    boardOnly && boardBaseline
+      ? !(await ensureBoardBaselinePersisted(run.repoPath, ticket, boardBaseline))
+      : false;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
   // Set only once the ticket itself has genuinely finished (PR #284 review round 9) — kept outside
@@ -146,6 +160,12 @@ export async function runTicket(args: {
           baselineUnavailable: true,
         }),
       );
+    }
+    // The baseline itself read fine but could not be durably anchored to the ticket before dispatch
+    // (PR #284 review, "Persist the board baseline before dispatch") — checked separately from the
+    // unreadable case above so the message never claims a read failure that did not happen.
+    if (boardBaselinePersistFailed) {
+      throw new NoDeliveryError(boardOnlyBaselineNotPersistedMessage(ticket));
     }
     await walkTicketSteps({
       run,
@@ -641,6 +661,26 @@ async function assertBoardOnlyDelivered(
       `the epic for operator review — nothing verified landed, so closing it would be a false ` +
       `success. The ticket is left open (not blocked) so a resumed run can reclaim and retry it ` +
       `without a manual status edit.${selfReportSuffix(selfReport)}`,
+  );
+}
+
+/**
+ * Why a board-only ticket was never dispatched at all (PR #284 review, "Persist the board baseline
+ * before dispatch") — the pre-dispatch read succeeded, but this attempt could not durably anchor it
+ * to the ticket before letting the agent run. Kept as its own message, never folded into {@link
+ * boardOnlyNoDeliveryMessage}'s `baselineUnavailable` case, because that one specifically claims the
+ * READ failed — untrue here, and misleading for an operator diagnosing a persist/sync outage instead.
+ */
+function boardOnlyBaselineNotPersistedMessage(ticket: Bead): string {
+  return (
+    `${ticket.id} was not dispatched: this ticket is marked \`delivery:board\`, whose deliverable is bd ` +
+    `writes to the board, not the git tree — the pre-dispatch board baseline was read but could not be ` +
+    `durably persisted to the ticket (after retries). Dispatching anyway risks the agent's own bd ` +
+    `writes landing before a process/host death, with no anchored baseline for a resumed attempt to ` +
+    `compare against — a fresh read there would absorb those writes as pre-existing, and an idempotent ` +
+    `retry would then diff as no evidence at all, permanently. Halting before dispatch instead: check ` +
+    `the beads DB and the sync channel, then resume the run — the ticket is left open (not blocked) so ` +
+    `that resume can reclaim it directly.`
   );
 }
 
