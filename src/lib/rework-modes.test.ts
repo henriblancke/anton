@@ -16,7 +16,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./beads/bd";
 import { formatHumanNote } from "./beads/notes";
 import type { ReviewFinding } from "./jobs/review-context";
-import type { ReworkRequest } from "./rework-contract";
+import { ReworkConflictError, type ReworkRequest } from "./rework-contract";
 import type { Project, ReworkMode, ReworkPipeline } from "./types";
 
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
@@ -33,6 +33,7 @@ type CreateOpts = {
 const createMock = vi.fn<(cwd: string, opts: CreateOpts) => Promise<string>>();
 const linkMock = vi.fn();
 const reparentMock = vi.fn();
+const updateMock = vi.fn();
 const refreshMock = vi.fn<() => Promise<Bead[]>>();
 const operatorMock = vi.fn<() => Promise<string | undefined>>();
 
@@ -49,6 +50,7 @@ vi.mock("./beads/bd", async () => {
       create: (...args: unknown[]) => createMock(...(args as [string, CreateOpts])),
       link: (...args: unknown[]) => linkMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
+      update: (...args: unknown[]) => updateMock(...args),
     },
   };
 });
@@ -57,10 +59,31 @@ vi.mock("./beads/issues", () => ({ refreshAllIssues: () => refreshMock() }));
 
 vi.mock("./operator", () => ({ resolveOperator: () => operatorMock() }));
 
-const { applyFollowUp, applyReopen, existingFollowUp, inheritedLabels } = await import(
-  "./rework-modes"
+const {
+  applyFollowUp: applyFollowUpHolding,
+  applyReopen,
+  existingFollowUp,
+  followUpCandidateIds,
+  inheritedLabels,
+} = await import("./rework-modes");
+
+/**
+ * `applyFollowUp` as `reworkTicket` calls it — holding the lock of every bead on the board it could
+ * resume. What the guard on that set refuses when a match is NOT held is pinned in its own case.
+ */
+async function applyFollowUp(
+  project: Project,
+  target: Bead,
+  ticket: Bead,
+  request: ReworkRequest,
+  pipeline?: ReworkPipeline,
+): ReturnType<typeof applyFollowUpHolding> {
+  const held = new Set((await refreshMock()).map((b) => b.id));
+  return applyFollowUpHolding(project, target, ticket, request, pipeline, held);
+}
+const { detachmentNoteBody, followUpDescription, hasHumanNote, reworkNoteBody } = await import(
+  "./rework-notes",
 );
-const { hasHumanNote, reworkNoteBody } = await import("./rework-notes");
 const { RUN_STAGE_LABELS } = await import("./rework-pipeline");
 
 const project: Project = { id: "p1", slug: "p", name: "p", repoPath: "/repo" } as Project;
@@ -124,6 +147,21 @@ const followUpBody = (over: Partial<NoteArgs> = {}) =>
 /** A merged PR on the target — the one pipeline state that forces a follow-up to stand alone. */
 const SHIPPED: ReworkPipeline = { outcome: "shipped", pr: "gh-42", redirected: false };
 
+/** The contract a first attempt froze when it created the follow-up as a ticket of `feat`. */
+const createdUnderFeat = () =>
+  followUpDescription({
+    summary: SUMMARY,
+    instructions: INSTRUCTIONS,
+    findings: [],
+    ticket: finishedTicket(),
+    targetId: "feat",
+    parentId: "feat",
+  });
+
+/** The record a detachment from `feat` leaves, as the pass that kept or rewrote the Context writes it. */
+const detachedNote = (contextKept: boolean) =>
+  detachmentNoteBody({ targetId: "feat", pr: "gh-42", contextKept });
+
 function board(...onBoard: Bead[]): void {
   refreshMock.mockResolvedValue(onBoard);
 }
@@ -159,7 +197,7 @@ function candidate(id: string, over: Partial<Bead> = {}): Bead {
 }
 
 /** Every bd write these modes can make — asserted absent wherever a request must write nothing. */
-const allWrites = [noteMock, reopenMock, untagMock, createMock, linkMock, reparentMock];
+const allWrites = [noteMock, reopenMock, untagMock, createMock, linkMock, reparentMock, updateMock];
 
 /** The bead a bd call was made on, and when it happened — the seam for asserting write order. */
 function orderOn(mock: ReturnType<typeof vi.fn>, id: string, nth = 0): number {
@@ -380,6 +418,45 @@ describe("applyFollowUp", () => {
     for (const write of allWrites) expect(write).not.toHaveBeenCalled();
   });
 
+  it("refuses to resume a match whose lock this request does not hold, writing nothing", async () => {
+    // The candidate was not on the snapshot `reworkTicket` locked from — a founder linked it by hand
+    // in that window. Rewriting its contract unserialized is the lost update the lock prevents, so
+    // the answer is the moved-board 409: look again, and the retry locks what it finds.
+    board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
+
+    await expect(
+      applyFollowUpHolding(project, feature(), finishedTicket(), followUp(), undefined, new Set()),
+    ).rejects.toThrow(ReworkConflictError);
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("reports an unlocked match that is already complete as sent back — the loser of two identical requests", async () => {
+    // Both requests snapshotted an empty candidate set; the winner created the follow-up under the
+    // ticket lock, and this one's re-read finds it. Nothing is owed on it, so nothing is written and
+    // no lock is needed: this is the documented no-op, not a conflict to retry.
+    board(feature(), finishedTicket(), candidate("dup"));
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUpHolding(project, feature(), finishedTicket(), followUp(), undefined, new Set()),
+    ).resolves.toMatchObject({
+      result: { reworkedId: "dup", applied: false },
+      runsUnderTarget: true,
+      reconciled: false,
+    });
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("refuses an unlocked match that is complete but owes a detachment — that resume writes", async () => {
+    board(feature(), finishedTicket(), candidate("dup", { description: createdUnderFeat() }));
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUpHolding(project, feature(), finishedTicket(), followUp(), SHIPPED, new Set()),
+    ).rejects.toThrow(ReworkConflictError);
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
   it("finishes a half-created follow-up rather than opening a second one beside it", async () => {
     // `bd create` and `bd link` landed, the note after them didn't — the bead speaks for no request.
     board(feature(), finishedTicket(), candidate("half"));
@@ -397,6 +474,220 @@ describe("applyFollowUp", () => {
     expect(noteOn("t1")).toContain("Follow-up half was opened from this ticket's review");
   });
 
+  it("reconciles a half-created follow-up's acceptance to the request that finishes it", async () => {
+    // `bd create` froze the first attempt's instructions; the founder edited them before retrying
+    // under the same title. The note carries the edit — the contract must judge against it too.
+    const stale = followUpDescription({
+      summary: SUMMARY,
+      instructions: "Guard the null branch.",
+      findings: [],
+      ticket: finishedTicket(),
+      targetId: "feat",
+      parentId: "feat",
+    });
+    board(feature(), finishedTicket(), candidate("half", { description: stale }));
+    const edited = followUp({ instructions: INSTRUCTIONS, findings: FINDINGS });
+
+    await applyFollowUp(project, feature(), finishedTicket(), edited);
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    const [, id, patch] = updateMock.mock.calls[0]!;
+    expect(id).toBe("half");
+    expect(patch).toEqual({
+      description: followUpDescription({
+        summary: SUMMARY,
+        instructions: INSTRUCTIONS,
+        findings: FINDINGS,
+        ticket: finishedTicket(),
+        targetId: "feat",
+        parentId: "feat",
+      }),
+    });
+    expect((patch as { description: string }).description).not.toContain("Guard the null branch.");
+    // Rewritten BEFORE the note lands, so a failure leaves the bead still noteless — still partial.
+    expect(updateMock.mock.invocationCallOrder[0]!).toBeLessThan(orderOn(noteMock, "half"));
+  });
+
+  it("keeps a founder's edits to the rest of a half-created contract while refreshing its acceptance", async () => {
+    // The match is on title and edge, not authorship: this remnant's Out of scope and Verify were
+    // rewritten by hand before the retry, and refreshing the boxes must not cost the founder that.
+    const authored = createdUnderFeat()
+      .replace(
+        /## Out of scope\n[^\n]+/,
+        "## Out of scope\nLeave the timeout alone — the founder decided that by hand.",
+      )
+      .replace(/## Verify\n[^\n]+/, "## Verify\nRun the retry suite twice.");
+    board(feature(), finishedTicket(), candidate("half", { description: authored }));
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp({ findings: FINDINGS }));
+
+    expect(updateMock).toHaveBeenCalledTimes(1);
+    const description = (updateMock.mock.calls[0]![2] as { description: string }).description;
+    expect(description).toContain("Leave the timeout alone — the founder decided that by hand.");
+    expect(description).toContain("## Verify\nRun the retry suite twice.");
+    expect(description).toContain(`- [ ] src/lib/retry.ts:12 — the null guard is untested`);
+  });
+
+  it("leaves a half-created follow-up's description alone when it already matches the request", async () => {
+    const current = followUpDescription({
+      summary: SUMMARY,
+      instructions: INSTRUCTIONS,
+      findings: [],
+      ticket: finishedTicket(),
+      targetId: "feat",
+      parentId: "feat",
+    });
+    board(feature(), finishedTicket(), candidate("half", { description: current }));
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp());
+
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("describes a half-created follow-up as its own run target once a merged PR detaches it", async () => {
+    board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "half", "");
+    const [, , patch] = updateMock.mock.calls[0]!;
+    expect((patch as { description: string }).description).toContain(
+      "It is its own run target — approve it to run.",
+    );
+    // The Context is rewritten by this very pass, so the note claims nothing about it either way.
+    expect(noteOn("half")).toBe(detachedNote(false));
+    expect(noteOn("half")).not.toContain("Context section");
+    // Recorded BEFORE the reparent — the note is the record a retry finds the detachment by once
+    // the parent edge is gone — and before the rewrite, which needs the parentage settled.
+    expect(orderOn(noteMock, "half")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(updateMock.mock.invocationCallOrder[0]!);
+  });
+
+  it("keeps the detachment recorded when the half-created Context rewrite fails after it", async () => {
+    board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
+    updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).rejects.toThrow("bd update: connection reset");
+
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "half", "");
+    expect(noteMock).toHaveBeenCalledTimes(1);
+    expect(noteOn("half")).toBe(detachedNote(false));
+    // No human note landed — still partial, still this request's to finish on the next retry.
+    expect(noteMock).not.toHaveBeenCalledWith("/repo", "half", expect.stringContaining("[human-note"), expect.anything());
+  });
+
+  it("applies a detachment an earlier attempt recorded but never got through, then finishes the follow-up", async () => {
+    // The earlier pass wrote its note and died on `bd reparent`: the re-read is still under the
+    // target, carrying the record. The retry owes the reparent and the rest, not a second note.
+    board(
+      feature(),
+      finishedTicket(),
+      candidate("half", { description: createdUnderFeat(), notes: detachedNote(false) }),
+    );
+
+    const applied = await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(applied).toMatchObject({
+      result: { reworkedId: "half", applied: true },
+      runsUnderTarget: false,
+      reconciled: true,
+    });
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "half", "");
+    expect(noteMock.mock.calls.filter((c) => c[1] === "half")).toHaveLength(1);
+    const [, , patch] = updateMock.mock.calls[0]!;
+    expect((patch as { description: string }).description).toContain(
+      "It is its own run target — approve it to run.",
+    );
+    expect(hasHumanNote(makeBead({ id: "half", notes: noteOn("half") }), followUpBody())).toBe(true);
+  });
+
+  it("finishes a half-created follow-up whose detachment is recorded but whose rewrite failed", async () => {
+    // The earlier pass got the reparent and the note through and died on `bd update`: the retry
+    // owes the Context rewrite and the instructions, and must not record the detachment twice.
+    board(
+      feature(),
+      finishedTicket(),
+      candidate("half", {
+        parent: undefined,
+        description: createdUnderFeat(),
+        notes: detachedNote(false),
+      }),
+    );
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).resolves.toMatchObject({ result: { applied: true }, runsUnderTarget: false, reconciled: false });
+    expect(reparentMock).not.toHaveBeenCalled();
+    const [, , patch] = updateMock.mock.calls[0]!;
+    expect((patch as { description: string }).description).toContain(
+      "It is its own run target — approve it to run.",
+    );
+    expect(noteMock.mock.calls.filter((c) => c[1] === "half")).toHaveLength(1);
+    expect(hasHumanNote(makeBead({ id: "half", notes: noteOn("half") }), followUpBody())).toBe(true);
+  });
+
+  it("recovers a FINISHED follow-up's detachment when the reparent fails after its note — Context edited or not", async () => {
+    // The founder rewrote the generated run-location line before the target shipped. The record of
+    // the detachment must not depend on that line: the note lands first, and a retry finds the
+    // detachment by the note and the parent edge alone.
+    const edited = createdUnderFeat().replace(
+      "It runs as a ticket of feat, in that target's next run.",
+      "Runs wherever the founder says.",
+    );
+    board(feature(), finishedTicket(), candidate("dup", { description: edited }));
+    showsWithNote("dup", followUpBody());
+    reparentMock.mockRejectedValueOnce(new Error("bd reparent: connection reset"));
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).rejects.toThrow("bd reparent: connection reset");
+    expect(noteOn("dup")).toBe(detachedNote(true));
+    expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+
+    // The retry: still under the target, the record already on the bead.
+    showsWithNote("dup", followUpBody(), {
+      notes: [detachedNote(true), formatHumanNote(followUpBody(), "founder", new Date())].join("\n"),
+    });
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).resolves.toMatchObject({ result: { applied: false }, runsUnderTarget: false, reconciled: true });
+    expect(reparentMock).toHaveBeenCalledTimes(2);
+    expect(noteMock.mock.calls.filter((c) => c[1] === "dup")).toHaveLength(1);
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a detachment alone once it has gone through — the third retry writes nothing", async () => {
+    board(feature(), finishedTicket(), candidate("dup", { parent: undefined }));
+    showsWithNote("dup", followUpBody(), {
+      notes: [detachedNote(true), formatHumanNote(followUpBody(), "founder", new Date())].join("\n"),
+    });
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).resolves.toMatchObject({ reconciled: false });
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
+  it("never records a detachment on a follow-up that was created standing alone", async () => {
+    // Created after the target had already shipped: its Context never named a parent.
+    const alone = followUpDescription({
+      summary: SUMMARY,
+      instructions: INSTRUCTIONS,
+      findings: [],
+      ticket: finishedTicket(),
+      targetId: "feat",
+    });
+    board(feature(), finishedTicket(), candidate("dup", { parent: undefined, description: alone }));
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).resolves.toMatchObject({ reconciled: false });
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
   it("detaches a follow-up stranded under a target whose PR merged under it, and reports the write", async () => {
     board(feature(), finishedTicket(), candidate("dup"));
     showsWithNote("dup", followUpBody());
@@ -411,7 +702,14 @@ describe("applyFollowUp", () => {
     });
     expect(reparentMock).toHaveBeenCalledWith("/repo", "dup", "");
     expect(noteOn("dup")).toContain("gh-42");
-    expect(noteOn("dup")).toContain("its own run target now");
+    expect(noteOn("dup")).toContain("its own run target");
+    // A finished bead keeps its Context, so the note points at the stale parent it still names.
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(noteOn("dup")).toBe(detachedNote(true));
+    expect(noteOn("dup")).toContain("Its Context section still names the parent it was created under.");
+    // Recorded before the reparent — the record a retry finds the detachment by once the parent
+    // edge is gone, and worded so it holds whether or not the reparent lands.
+    expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
   });
 
   it("leaves an already-parentless match alone when the target has shipped — nothing to reconcile", async () => {
@@ -460,6 +758,20 @@ describe("applyFollowUp", () => {
       mode: "follow-up",
     });
     expect(followed.result.note).toBe(followUpBody({ findings: FINDINGS }));
+  });
+});
+
+describe("followUpCandidateIds", () => {
+  it("names the beads a resume could write to — what reworkTicket locks besides ticket and target", () => {
+    const all = [
+      feature(),
+      finishedTicket(),
+      candidate("half"),
+      candidate("closed", { status: "closed" }),
+      candidate("other-title", { title: "Something else" }),
+      makeBead({ id: "unlinked", title: SUMMARY }),
+    ];
+    expect(followUpCandidateIds(all, "t1", SUMMARY)).toEqual(["half"]);
   });
 });
 
