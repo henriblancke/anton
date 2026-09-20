@@ -213,11 +213,17 @@ function dedentColumns(text: string, columns: number): string {
   return " ".repeat(Math.max(0, column - columns)) + text.slice(at);
 }
 
-/** `text` is a heading precisely when the CommonMark parser produces one complete heading node. */
+/** `text` is a heading precisely when the CommonMark parser produces one complete heading node.
+ * Bead descriptions are external input; a pathological line degrades to "not a heading" rather
+ * than throwing through whichever board read/write path is judging it. */
 export function isHeading(text: string): boolean {
-  const root = fromMarkdown(text) as unknown as MarkdownNode;
-  const [node] = root.children ?? [];
-  return node?.type === "heading" && node.position?.end.offset === text.length;
+  try {
+    const root = fromMarkdown(text) as unknown as MarkdownNode;
+    const [node] = root.children ?? [];
+    return node?.type === "heading" && node.position?.end.offset === text.length;
+  } catch {
+    return false;
+  }
 }
 
 const lineRecords = (source: string): Line[] => {
