@@ -1546,23 +1546,48 @@ function gitPush(
     signal?.addEventListener("abort", abort, { once: true });
 
     child.on("error", (err) => settle(() => reject(err)));
-    child.on("close", (code) => {
-      // A kill in flight owns the verdict: its group may still hold live writers.
+    // `signal` IS bound (anton-ttlxp): on a death by signal `code` is null and the second argument
+    // holds the only record of what killed it. Dropped, an OOM-killed pre-push hook reported as
+    // "exit null" alongside its passing-test stderr reads as the project's tests being broken.
+    child.on("close", (code, killedBy) => {
+      // A kill in flight owns the verdict: its group may still hold live writers. Both anton-owned
+      // kills (budget expiry, abort) return here, which is why the code-null branch downstream can
+      // only ever describe a kill from OUTSIDE anton.
       if (killing) return;
-      settle(() => (code === 0 ? resolvePromise() : reject(pushFailed(args, code, stderr(), stdout()))));
+      settle(() =>
+        code === 0 ? resolvePromise() : reject(pushFailed(args, code, killedBy, stderr(), stdout())),
+      );
     });
   });
 }
 
 /**
- * The rejection git's own non-zero push exit carries — {@link commitFailed} extended with the
- * `--porcelain` stdout {@link classifyPushFailure} reads. `stdout`/`stderr` ride on the error object
- * (not just folded into its message) so {@link pushBranch}'s retry loop can classify the failure
- * without re-parsing a formatted string.
+ * Marks an error as one {@link pushFailed} built, and therefore the only kind {@link classifyPushError}
+ * will classify. A symbol, so it cannot collide with a field any other rejection carries.
  */
-function pushFailed(args: string[], code: number | null, stderr: string, stdout: string): Error {
-  return Object.assign(new Error(`git ${args[0]} failed (exit ${code}): ${stderr}`), {
+const PUSH_VERDICT_BRAND = Symbol.for("anton.git.pushVerdict");
+
+/**
+ * The rejection git's own non-zero push exit carries — {@link commitFailed} extended with the
+ * `--porcelain` stdout {@link classifyPushFailure} reads. `stdout`/`stderr`/`signal` ride on the
+ * error object (not just folded into its message) so {@link pushBranch}'s retry loop can classify
+ * the failure without re-parsing a formatted string.
+ *
+ * A signal death leads the message with the signal's name rather than `exit null` (anton-ttlxp):
+ * the exit code is the LESS informative half of the pair whenever a signal is present.
+ */
+function pushFailed(
+  args: string[],
+  code: number | null,
+  signal: NodeJS.Signals | null,
+  stderr: string,
+  stdout: string,
+): Error {
+  const outcome = signal ? `killed by ${signal}` : `exit ${code}`;
+  return Object.assign(new Error(`git ${args[0]} failed (${outcome}): ${stderr}`), {
+    [PUSH_VERDICT_BRAND]: true as const,
     code,
+    signal,
     stderr,
     stdout,
   });
@@ -1572,11 +1597,53 @@ function pushFailed(args: string[], code: number | null, stderr: string, stdout:
 export interface PushFailureVerdict {
   /**
    * True only for a cause an identical retry can plausibly clear — a DNS blip, a reset connection, a
-   * transient 5xx from the remote's HTTP front end.
+   * transient 5xx from the remote's HTTP front end, or an external kill (see {@link SIGNAL_KILL_RETRY}).
    */
   transient: boolean;
   /** Human-readable cause, folded into the error {@link pushBranch} throws once it stops retrying. */
   reason: string;
+  /**
+   * Retry shape this cause needs INSTEAD of the transport defaults ({@link PUSH_MAX_ATTEMPTS} /
+   * {@link PUSH_RETRY_BACKOFF_MS}). Present only where the transport numbers are wrong for the
+   * cause; absent means "retry the normal way". Read only when {@link transient} is true.
+   */
+  retry?: PushRetryShape;
+}
+
+/** How many attempts a cause gets, and how long to wait before each retry. */
+export interface PushRetryShape {
+  /** Total attempts INCLUDING the first, capping {@link PUSH_MAX_ATTEMPTS} downward. */
+  maxAttempts: number;
+  /** Gap before every retry of this cause, replacing {@link PUSH_RETRY_BACKOFF_MS}'s ramp. */
+  backoffMs: number;
+}
+
+/**
+ * The retry an EXTERNAL kill gets (anton-ttlxp), deliberately not the transport shape:
+ *
+ * - **Two attempts, not three.** A push carries the project's whole `pre-push` hook, which on at
+ *   least one registered project is a full test suite. The dominant cause of an external kill is the
+ *   host OOM-killing exactly that suite, so every extra attempt re-runs it under the pressure that
+ *   did the killing. One retry buys the genuinely one-off kill; a third would mostly buy a third
+ *   suite. A kill that recurs still ends as a failure NAMING the signal, never an unexplained one.
+ * - **30 seconds, not 1.** `PUSH_RETRY_BACKOFF_MS`'s 1s gap is sized for a DNS blip. Memory pressure
+ *   lifts on the timescale of a sibling process exiting, so retrying a second later retries straight
+ *   back into the pressure that caused the kill. 30s is short enough to stay inside any sane push
+ *   budget and long enough for a concurrent run's test suite to finish and hand its memory back.
+ */
+const SIGNAL_KILL_RETRY: PushRetryShape = { maxAttempts: 2, backoffMs: 30_000 };
+
+/**
+ * Caps {@link SIGNAL_KILL_RETRY}'s gap, same CAP-never-an-override contract as {@link PUSH_TIMEOUT_ENV}
+ * and read per call for the same reason. Exists so the retry can be exercised without waiting out a
+ * real 30 seconds; a lower value can only shorten the wait, never lengthen it.
+ */
+export const SIGNAL_KILL_BACKOFF_ENV = "ANTON_GIT_PUSH_SIGNAL_BACKOFF_MS";
+
+function signalKillRetry(): PushRetryShape {
+  const raw = Number(process.env[SIGNAL_KILL_BACKOFF_ENV]);
+  if (!Number.isFinite(raw) || raw < 0) return SIGNAL_KILL_RETRY;
+  return { ...SIGNAL_KILL_RETRY, backoffMs: Math.min(SIGNAL_KILL_RETRY.backoffMs, raw) };
 }
 
 /**
@@ -1597,10 +1664,32 @@ export interface PushFailureVerdict {
  */
 export function classifyPushFailure(result: {
   code: number | null;
+  signal?: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
 }): PushFailureVerdict {
-  const { code, stdout, stderr } = result;
+  const { code, signal, stdout, stderr } = result;
+
+  // Something OUTSIDE anton killed the push (anton-ttlxp). Retried, not because the CAUSE is
+  // self-clearing, but because of the STATE it leaves: a kill before exit means git never reached
+  // the transport, so nothing was rejected and no ref moved — strictly safer to retry than the
+  // exit-128 transport faults retried below, which at least talked to a remote. anton's own two
+  // kills (budget expiry, abort) never reach here: both set `killing` and return before `gitPush`'s
+  // close handler forms a verdict at all.
+  if (code === null) {
+    const named = signal ?? "an unidentified signal";
+    const oom =
+      signal === "SIGKILL"
+        ? " — on a host under memory pressure this is most often the OOM killer taking the pre-push hook"
+        : "";
+    return {
+      transient: true,
+      retry: signalKillRetry(),
+      reason:
+        `the push was killed by ${named} from outside anton before git could exit${oom}. ` +
+        `Nothing was rejected and no ref moved: ${stderr || "(the push printed nothing to stderr)"}`,
+    };
+  }
 
   if (code === 1) {
     if (!/^Done\s*$/m.test(stdout)) {
@@ -1657,15 +1746,23 @@ export function classifyPushFailure(result: {
 }
 
 /**
- * Whether a rejected {@link gitPush} carries a cause {@link classifyPushFailure} can place at all — a
- * budget kill (`killed: true`) or a rejection with no numeric exit code (an abort, a spawn error) is
- * never one, because there is no porcelain/stderr pair to classify.
+ * Whether a rejected {@link gitPush} carries a cause {@link classifyPushFailure} can place at all.
+ *
+ * Gated on {@link PUSH_VERDICT_BRAND} rather than on the shape of `code`, because `code` no longer
+ * discriminates (anton-ttlxp): the classifier now HAS a `code === null` branch, so "has a numeric
+ * code" would both reject the external kill it is meant to admit and admit anything else carrying a
+ * numeric `code` — a `DOMException` abort reason arrives with `code: 20` and would be rewritten as a
+ * push rejection. Only errors {@link pushFailed} built have a porcelain/stderr pair to classify, so
+ * only those are classified; a budget kill, an abort, and a spawn error each stay themselves.
  */
 function classifyPushError(error: unknown): PushFailureVerdict | undefined {
-  const err = error as { killed?: boolean; code?: unknown; stdout?: unknown; stderr?: unknown } | null;
-  if (!err || err.killed === true || typeof err.code !== "number") return undefined;
+  const err = error as
+    | { [PUSH_VERDICT_BRAND]?: true; code?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown }
+    | null;
+  if (!err || err[PUSH_VERDICT_BRAND] !== true) return undefined;
   return classifyPushFailure({
-    code: err.code,
+    code: typeof err.code === "number" ? err.code : null,
+    signal: typeof err.signal === "string" ? (err.signal as NodeJS.Signals) : null,
     stdout: typeof err.stdout === "string" ? err.stdout : "",
     stderr: typeof err.stderr === "string" ? err.stderr : "",
   });
@@ -1735,14 +1832,27 @@ export async function pushBranch(
   timeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
-  for (let attempt = 1; attempt <= PUSH_MAX_ATTEMPTS; attempt += 1) {
-    if (attempt > 1) await sleepOrAbort(PUSH_RETRY_BACKOFF_MS[attempt - 2], signal);
+  // The attempt budget and the gap before the next try, both defaulting to the transport shape and
+  // both narrowed by the previous failure's own verdict (anton-ttlxp) — an external kill needs
+  // fewer attempts and a far longer gap than a DNS blip does.
+  let maxAttempts = PUSH_MAX_ATTEMPTS;
+  let backoffMs = PUSH_RETRY_BACKOFF_MS[0];
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (attempt > 1) await sleepOrAbort(backoffMs, signal);
     try {
       await gitPush(cwd, ["push", "--porcelain", "-u", "origin", branch], hooksPath, timeoutMs, signal);
       return;
     } catch (error) {
       const verdict = classifyPushError(error);
-      if (attempt < PUSH_MAX_ATTEMPTS && verdict?.transient) continue;
+      if (verdict?.transient) {
+        // A cause-specific shape only ever TIGHTENS the budget, never extends it past the global cap.
+        maxAttempts = Math.min(maxAttempts, verdict.retry?.maxAttempts ?? PUSH_MAX_ATTEMPTS);
+        backoffMs =
+          verdict.retry?.backoffMs ??
+          PUSH_RETRY_BACKOFF_MS[Math.min(attempt - 1, PUSH_RETRY_BACKOFF_MS.length - 1)];
+        if (attempt < maxAttempts) continue;
+      }
       if (verdict && error instanceof Error) {
         throw new Error(`${error.message} — ${verdict.reason}`, { cause: error });
       }

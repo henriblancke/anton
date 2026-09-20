@@ -48,6 +48,7 @@ import {
   distanceBehindUpstream,
   readPreservedCommitFor,
   readWorktreeState,
+  SIGNAL_KILL_BACKOFF_ENV,
   resolveFreshBase,
   resolveForkPoint,
   resolveHooksPathOverride,
@@ -138,6 +139,49 @@ if(a.includes('push')){
   if(n===1){
     process.stderr.write("fatal: unable to access 'https://example.invalid/': Could not resolve host: example.invalid\\n");
     process.exit(128);
+  }
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+/**
+ * A git shim whose `push` kills ITSELF with SIGKILL — the closest reproduction of the OOM killer
+ * taking a pre-push hook that does not require actually exhausting the host's memory (anton-ttlxp).
+ * `killAfter` pushes that die; every later push, and every non-push invocation, is forwarded to the
+ * real git. It prints to stderr first, so the captured output looks like the real failures did: a
+ * pile of passing-test noise with no assertion failure anywhere in it.
+ */
+function shimGitKillingPushWithSignal(
+  sandboxDir: string,
+  counterFile: string,
+  killAfter: number | "always",
+): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, `kill-shim-${killAfter}`);
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counter=${JSON.stringify(counterFile)};
+const killAfter=${JSON.stringify(killAfter)};
+if(a.includes('push')){
+  let n=0;
+  try{n=parseInt(fs.readFileSync(counter,'utf8'),10)||0;}catch{}
+  n+=1;
+  fs.writeFileSync(counter,String(n));
+  if(killAfter==='always'||n<=killAfter){
+    process.stderr.write("PASS tests/unit/thing.test.ts\\nPASS tests/unit/other.test.ts\\n");
+    process.kill(process.pid,'SIGKILL');
+    // SIGKILL is immediate and uncatchable; this only keeps the process alive until it lands.
+    require('node:child_process').spawnSync(process.execPath,['-e','setTimeout(()=>{},5000)']);
   }
 }
 const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
@@ -3977,6 +4021,87 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
 
     expect(verdict.transient).toBe(false);
   });
+
+  // anton-ttlxp: the 21 recorded `exit null` push failures. Node hands `close` a (code, signal)
+  // pair; the signal used to be dropped, so an OOM-killed pre-push hook was rendered as "exit null"
+  // next to its own passing-test stderr — indistinguishable from the project's tests being broken.
+  describe("a push killed by a signal from outside anton (anton-ttlxp)", () => {
+    it("is reported as a kill naming SIGKILL, not as an unrecognized rejection", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "",
+        stderr: "PASS tests/unit/thing.test.ts\nPASS tests/unit/other.test.ts\n",
+      });
+
+      expect(verdict.reason).toMatch(/SIGKILL/);
+      expect(verdict.reason).toMatch(/killed/i);
+      // The specific string the bug produced must be gone: it named neither the signal nor the kill.
+      expect(verdict.reason).not.toMatch(/exit null/);
+      // Nor the generic fallthrough's wording, which frames every unplaced cause as a rejection.
+      expect(verdict.reason).not.toMatch(/rejected the push/);
+      expect(verdict.reason).not.toMatch(/does not recognize/);
+    });
+
+    it("says the kill came from outside anton and that no ref moved", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/outside anton/);
+      expect(verdict.reason).toMatch(/no ref moved/);
+    });
+
+    it("points at the OOM killer for SIGKILL specifically — the measured cause on a loaded host", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/OOM/);
+    });
+
+    it("names any other signal without claiming it was the OOM killer", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGTERM", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/SIGTERM/);
+      expect(verdict.reason).not.toMatch(/OOM/);
+    });
+
+    it("still reports a kill when the signal name itself did not survive", () => {
+      const verdict = classifyPushFailure({ code: null, stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/killed/i);
+      expect(verdict.reason).not.toMatch(/exit null/);
+    });
+
+    it("is transient — git never reached the transport, so no ref moved and a retry is safe", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.transient).toBe(true);
+    });
+
+    it("carries a retry shape chosen for THIS cause, not the transport backoff numbers", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      // Bounded below the transport budget: a pre-push test suite must not be paid for three times.
+      expect(verdict.retry?.maxAttempts).toBe(2);
+      // And gapped far above the 1s transport blip gap — 1s retries into the same memory pressure.
+      expect(verdict.retry?.backoffMs).toBeGreaterThanOrEqual(30_000);
+    });
+
+    it("keeps the captured stderr so the operator still sees what the push printed", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "",
+        stderr: "some hook output\n",
+      });
+
+      expect(verdict.reason).toMatch(/some hook output/);
+    });
+
+    it("says so plainly when the push printed nothing at all", () => {
+      const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
+
+      expect(verdict.reason).toMatch(/printed nothing to stderr/);
+    });
+  });
 });
 
 // anton-o74nf: `git push` runs PROJECT code too — a `pre-push` hook — so it gets the same
@@ -4127,6 +4252,39 @@ suite("pushBranch (real git · a pre-push hook that outlives the kill)", () => {
       await expect(pushBranch(repo, "main", undefined, 2_000)).rejects.toThrow(
         /timed out after 2,000 ms \(0\.033 minute\(s\)\).*Push timeout/,
       );
+    },
+  );
+
+  // anton-ttlxp: anton's OWN two kills must stay themselves now that a code-null branch exists.
+  // Both set `killing` and return before `gitPush`'s close handler forms a verdict, so neither can
+  // reach the external-kill branch — but nothing pinned that until this bead added the branch.
+  it.runIf(process.platform !== "win32")(
+    "does not reclassify a budget timeout as a kill from outside anton",
+    async () => {
+      delete process.env[PUSH_TIMEOUT_ENV];
+
+      const failure = await pushBranch(repo, "main", undefined, 2_000).catch((e: unknown) => e);
+
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/timed out after/);
+      expect((failure as Error).message).not.toMatch(/outside anton/);
+      expect((failure as Error).message).not.toMatch(/killed by SIG/);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "does not reclassify an abort as a kill from outside anton",
+    async () => {
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = pushBranch(repo, "main", undefined, 30 * 60_000, controller.signal);
+
+      await vi.waitFor(() => expect(existsSync(started)).toBe(true));
+      controller.abort(reason);
+
+      // Still the caller's own abort reason, not wrapped in any classifier verdict.
+      await expect(pending).rejects.toBe(reason);
+      expect(reason.message).toBe("job made no progress");
     },
   );
 });
@@ -4283,5 +4441,76 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
     } finally {
       process.env.PATH = prevPath;
     }
+  });
+
+  /**
+   * anton-ttlxp: the second half of the bug. `classifyPushError` bailed on any non-numeric `code`,
+   * so all 21 recorded signal kills reached the run boundary having spent NONE of the 3 attempts —
+   * one of them stranding 34 review-approved commits on a branch that never left the machine.
+   */
+  describe("a push killed by a signal from outside anton (anton-ttlxp)", () => {
+    let prevPath: string | undefined;
+
+    beforeEach(() => {
+      prevPath = process.env.PATH;
+      // The real gap is 30s, deliberately — see SIGNAL_KILL_RETRY. Capped here so the retry is
+      // exercised without the test waiting it out; the cap can only shorten, never lengthen.
+      process.env[SIGNAL_KILL_BACKOFF_ENV] = "50";
+    });
+
+    afterEach(() => {
+      process.env.PATH = prevPath;
+      delete process.env[SIGNAL_KILL_BACKOFF_ENV];
+    });
+
+    it.runIf(process.platform !== "win32")(
+      "spends its retries instead of failing the run on attempt 1",
+      async () => {
+        const counter = join(sandbox, "kill-once.log");
+        process.env.PATH = `${shimGitKillingPushWithSignal(sandbox, counter, 1)}:${prevPath}`;
+
+        await pushBranch(repo, "main");
+
+        // Two pushes: the killed first attempt and the retry that landed. Before the fix this was 1.
+        expect(Number(readFileSync(counter, "utf8").trim())).toBe(2);
+        const localHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+        const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "main"], {
+          encoding: "utf8",
+        }).trim();
+        expect(remoteHead).toBe(localHead);
+      },
+    );
+
+    it.runIf(process.platform !== "win32")(
+      "stops at 2 attempts when killed every time — a pre-push test suite is never paid for 3 times",
+      async () => {
+        const counter = join(sandbox, "kill-always.log");
+        process.env.PATH = `${shimGitKillingPushWithSignal(sandbox, counter, "always")}:${prevPath}`;
+
+        await expect(pushBranch(repo, "main")).rejects.toThrow(/SIGKILL/);
+
+        expect(Number(readFileSync(counter, "utf8").trim())).toBe(2);
+      },
+    );
+
+    it.runIf(process.platform !== "win32")(
+      "ends a permanent kill as a failure that NAMES the signal, never an unexplained one",
+      async () => {
+        const counter = join(sandbox, "kill-always-msg.log");
+        process.env.PATH = `${shimGitKillingPushWithSignal(sandbox, counter, "always")}:${prevPath}`;
+
+        const failure = await pushBranch(repo, "main").catch((e: unknown) => e);
+
+        expect(failure).toBeInstanceOf(Error);
+        const message = (failure as Error).message;
+        expect(message).toMatch(/killed by SIGKILL/);
+        expect(message).toMatch(/outside anton/);
+        expect(message).toMatch(/no ref moved/);
+        // The exact string the bug produced, gone from the message the caller finally sees.
+        expect(message).not.toMatch(/exit null/);
+      },
+    );
   });
 });
