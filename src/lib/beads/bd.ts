@@ -1269,7 +1269,15 @@ export const beads = {
           ...(locked && verified ? { [BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]: "1" } : {}),
         }),
       );
-      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+      const args = ["update", id, "--metadata", `@${file}`];
+      // `--metadata` MERGES into existing custom metadata rather than replacing it (see this
+      // function's own docstring), so a write that isn't itself marking verified must explicitly
+      // unset a stale VERIFIED_KEY left by an earlier round — otherwise a candidate that changed
+      // after being verified would keep reading as verified.
+      if (!(locked && verified)) {
+        args.push("--unset-metadata", BOARD_EVIDENCE_BASELINE_VERIFIED_KEY);
+      }
+      return await bdWrite(cwd, args);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

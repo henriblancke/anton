@@ -483,6 +483,13 @@ async function abandonDispatchBaseline(repo: string, ticket: Bead): Promise<null
  * already set, and a round that found drift needs the LOCKED value overwritten with the drifted one,
  * not skipped.
  *
+ * Once a round's comparison finds the candidate stable, marking it VERIFIED (see {@link
+ * BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}) and pushing that marker is itself another write that can
+ * pull in a concurrent change (chatgpt-codex-connector, PR #284 review, "Re-read after syncing the
+ * verified baseline marker") — so that confirming push is re-read and compared too, folded back into
+ * the same stability loop rather than trusted blind. A round that finds drift there loops with the
+ * newly-observed content as the next candidate, same as any other round.
+ *
  * Fails closed like every other write in this function: an unconfirmed lock, an unreadable re-read,
  * or a baseline that never stops drifting all refuse dispatch (`null`) rather than risk repeating the
  * exact loss this locking exists to prevent — and, in every one of those failure shapes, clears the
@@ -515,30 +522,47 @@ async function lockDispatchBaseline(
     const hydrated = board && (await hydrateDescriptions(repo, board));
     if (!hydrated) return abandonDispatchBaseline(repo, ticket);
     const refreshed = fingerprintBoard(hydrated, ticket.id);
-    if (boardEvidence(candidate, refreshed).length === 0) {
-      // Every write above locked `candidate` as a TENTATIVE value, before this very comparison had
-      // a chance to prove it stable (chatgpt-codex-connector, PR #284 review, "Distinguish tentative
-      // locks before trusting them on resume") — a process death between that write and here left a
-      // resume's `recoveryBaseline` fast path with nothing to tell it apart from a value this loop
-      // actually finished proving. Only now, once the comparison itself has passed, is `candidate`
-      // safe to mark verified — see {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}.
-      const verified = await preserveRecoveryBaseline(repo, ticket, candidate, true);
-      if (!verified) return abandonDispatchBaseline(repo, ticket);
-      // Confirmed through the sync channel, not left for the dispatch that follows to carry it
-      // (chatgpt-codex-connector, PR #284 review, "Sync the verified baseline marker before
-      // dispatch"): this write only proves the local db, and the dispatched agent session can die
-      // before ever pushing on its own. A fresh-machine resume would then pull a board that still
-      // shows this baseline locked but NOT verified, re-verify it against the board the dispatched
-      // agent already changed, and fold that delivery into the "baseline" — rejecting the later
-      // idempotent retry as a no-op. Confirming here closes that window the same way every other
-      // verified write in this file already does.
-      const verifiedSynced = await beads
-        .push(repo)
-        .then((outcome) => outcome === "synced" || outcome === "shared-server")
-        .catch(() => false);
-      return verifiedSynced ? candidate : abandonDispatchBaseline(repo, ticket);
+    if (boardEvidence(candidate, refreshed).length !== 0) {
+      candidate = refreshed;
+      continue;
     }
-    candidate = refreshed;
+    // Every write above locked `candidate` as a TENTATIVE value, before this very comparison had
+    // a chance to prove it stable (chatgpt-codex-connector, PR #284 review, "Distinguish tentative
+    // locks before trusting them on resume") — a process death between that write and here left a
+    // resume's `recoveryBaseline` fast path with nothing to tell it apart from a value this loop
+    // actually finished proving. Only now, once the comparison itself has passed, is `candidate`
+    // safe to mark verified — see {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}.
+    const verified = await preserveRecoveryBaseline(repo, ticket, candidate, true);
+    if (!verified) return abandonDispatchBaseline(repo, ticket);
+    // Confirmed through the sync channel, not left for the dispatch that follows to carry it
+    // (chatgpt-codex-connector, PR #284 review, "Sync the verified baseline marker before
+    // dispatch"): this write only proves the local db, and the dispatched agent session can die
+    // before ever pushing on its own. A fresh-machine resume would then pull a board that still
+    // shows this baseline locked but NOT verified, re-verify it against the board the dispatched
+    // agent already changed, and fold that delivery into the "baseline" — rejecting the later
+    // idempotent retry as a no-op. Confirming here closes that window the same way every other
+    // verified write in this file already does.
+    const verifiedSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!verifiedSynced) return abandonDispatchBaseline(repo, ticket);
+    // This confirming push can ITSELF pull in a concurrent write, the same as the round's own push
+    // above (chatgpt-codex-connector, PR #284 review, "Re-read after syncing the verified baseline
+    // marker") — without a re-read here, a change landing between the stability comparison and this
+    // push lands locally while the function still returns the older `candidate`, crediting a no-op
+    // agent with that pre-dispatch change. Fold it back into the same stability loop rather than
+    // trusting it blind: `setBoardEvidenceBaseline` unsets a stale VERIFIED_KEY on any write that
+    // isn't itself marking verified, so a round that finds drift here correctly un-verifies the lock
+    // before looping.
+    const postVerifyBoard = await mustReadBoard(repo);
+    const postVerifyHydrated = postVerifyBoard && (await hydrateDescriptions(repo, postVerifyBoard));
+    if (!postVerifyHydrated) return abandonDispatchBaseline(repo, ticket);
+    const postVerifyRefreshed = fingerprintBoard(postVerifyHydrated, ticket.id);
+    if (boardEvidence(candidate, postVerifyRefreshed).length === 0) {
+      return candidate;
+    }
+    candidate = postVerifyRefreshed;
   }
   // The lock-confirming push kept pulling in further drift every round — fail closed rather than
   // hand back a locked baseline that may still omit a change landing right now, and clear the stray
