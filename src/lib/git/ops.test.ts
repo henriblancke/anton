@@ -222,6 +222,7 @@ if(a.includes('push')){
   if(n===2){
     process.stderr.write("PASS tests/unit/thing.test.ts\\nPASS tests/unit/other.test.ts\\n");
     process.kill(process.pid,'SIGKILL');
+    // SIGKILL is immediate and uncatchable; this only keeps the process alive until it lands.
     require('node:child_process').spawnSync(process.execPath,['-e','setTimeout(()=>{},5000)']);
   }
 }
