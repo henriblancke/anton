@@ -833,6 +833,41 @@ describe("prepareEpicRun — the structure/cycle gate re-runs on the board the r
     expect(prep.done).toBe(false);
     expect(publishRunClaimMock).toHaveBeenCalled();
   });
+
+  // chatgpt-codex-connector (PR #274 review): the publish-time re-read recomputes `readiness` from
+  // scratch and, before this fix, only re-folded a still-held `answeredButBlocked` ticket's id back
+  // into `gated` — not its recorded blocker id into `readiness.blockers`, the same union
+  // `armHumanTicketWaits` itself applies when it first arms the wait. Left unfolded, a later
+  // `settleHeldTail` park would call `blockedTailReason` with an empty blocker list for this ticket,
+  // rendering "is blocked by  —" — unparseable by `poisonBlockerIds`, so run-health and unstick would
+  // read the park as an unexplained exhausted job instead of the gate's own wait.
+  it("keeps a still-held answered-but-blocked ticket's blocker ids in readiness.blockers, not just gated", async () => {
+    const humanT2 = {
+      ...ticket("t-2"),
+      labels: [LABELS.agentHuman],
+      dependencies: [{ issue_id: "t-2", depends_on_id: "t-1", type: "blocks" }],
+    } as Bead;
+    const clean = board(ticket("t-1"), humanT2);
+    attachCycleEvidence(clean, []);
+    preflightHumanTicketsMock.mockResolvedValue({
+      board: clean,
+      target: clean.find((b) => b.id === TARGET)!,
+      children: [ticket("t-1"), humanT2],
+      tickets: [ticket("t-1"), humanT2],
+      // t-2's human gate is answered, but t-1 — its ordinary prerequisite — is still open: held,
+      // not closed and not re-armed.
+      answeredButBlocked: new Map([["t-2", ["t-1"]]]),
+      armed: true,
+      handled: new Set(["t-2"]),
+    });
+    loadAllIssuesMock.mockResolvedValue(clean);
+
+    const prep = await prepareEpicRun(run(clean));
+
+    if (prep.done) throw new Error("expected the run to prepare, not finish");
+    expect(prep.gated.has("t-2")).toBe(true);
+    expect(prep.readiness.blockers).toContain("t-1");
+  });
 });
 
 describe("prepareEpicRun — a stale checkout refuses a new start (anton-mh3c)", () => {

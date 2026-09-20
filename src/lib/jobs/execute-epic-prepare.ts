@@ -776,15 +776,29 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
   gates.children = freshChildren;
   const freshReadiness = run.readiness(run.all);
   if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, run.all);
-  gates.readiness = freshReadiness;
-  // Re-fold the still-held `answeredButBlocked` ids back into `gated` (PR #274 review): ordinary
-  // readiness treats their internal `blocks` edge as ordering, not a hold, so this fresh recompute
-  // drops them even though `stillHeldByRecordedBlockers` above just confirmed their recorded blocker
-  // is still open — the same union `armHumanTicketWaits` itself applies when it first arms the wait.
-  // Left dropped, the dispatcher runs the prerequisite, reaches the still-open human ticket, and
-  // poison-parks the whole run instead of leaving it in the held tail for the next preflight to close.
+  // Re-fold the still-held `answeredButBlocked` ids back into `gated` AND `blockers` (PR #274
+  // review): ordinary readiness treats their internal `blocks` edge as ordering, not a hold, so this
+  // fresh recompute drops both even though `stillHeldByRecordedBlockers` above just confirmed their
+  // recorded blocker is still open — the same union `armHumanTicketWaits` itself applies when it
+  // first arms the wait. Left dropped from `gated`, the dispatcher runs the prerequisite, reaches
+  // the still-open human ticket, and poison-parks the whole run instead of leaving it in the held
+  // tail for the next preflight to close. Left dropped from `blockers`, `settleHeldTail`'s park names
+  // no one (`is blocked by  —`), which `poisonBlockerIds` cannot parse back into the gate's own wait.
   const stillHeld = [...gates.answeredButBlocked.keys()].filter(stillHeldByRecordedBlockers);
-  gates.gated = new Set([...freshReadiness.gated, ...stillHeld]);
+  gates.readiness =
+    stillHeld.length > 0
+      ? {
+          blockers: [
+            ...new Set([
+              ...freshReadiness.blockers,
+              ...stillHeld.flatMap((id) => gates.answeredButBlocked.get(id) ?? []),
+            ]),
+          ],
+          gated: [...new Set([...freshReadiness.gated, ...stillHeld])],
+          runnable: freshReadiness.runnable,
+        }
+      : freshReadiness;
+  gates.gated = new Set(gates.readiness.gated);
   // Re-run the read-only allowlist/contract/claimable gates over the board just adopted (PR #274
   // review round 9) — see the doc comment above for why `ticketSetDrift`'s id-only diff cannot
   // catch a changed OBJECT behind an unchanged id.
