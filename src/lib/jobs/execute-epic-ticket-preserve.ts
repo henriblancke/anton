@@ -22,7 +22,7 @@ import {
 } from "../git/ops";
 import { resolveCommitTimeoutMs, resolveVerifyGates, type ProjectSettings } from "../projects";
 import { appendSessionLog } from "../sessions";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import { startTicketBudget } from "./execute-epic-ticket-bookends";
 import { runVerifyGates } from "./shell";
 import type { StepContext } from "./step-registry";

@@ -115,6 +115,51 @@ describe("dispatchClaude", () => {
     expect(claude.calls[0].model).toBe("fallback");
   });
 
+  it("routes a run-level step on the target AND every ticket, whatever the ticket count", async () => {
+    // The ticket-phase default reads a lone ticket as "this dispatch is about that ticket". A
+    // run-level step (`step:describe`) is about the whole run, so an epic with one child must still
+    // route on the epic's own labels — otherwise the route fires or not by ticket count.
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    await dispatchClaude(
+      {
+        ...ctx,
+        step: { id: "describe", labels: ["step:describe"] },
+        target: { ...ctx.target, labels: ["risk:high"] },
+        tickets: [{ ...ctx.target, id: "anton-8d0f.1", labels: ["risk:low"] }],
+        settings: {
+          ...ctx.settings,
+          model: "fallback",
+          modelRoutes: [{ label: "risk:high", model: "safe" }],
+        },
+      },
+      { ...args(ctx.target.id), runLevelLabels: true },
+    );
+
+    expect(claude.calls[0].model).toBe("safe");
+  });
+
+  it("passes a step's denied tools through to the driver", async () => {
+    // Deny rules outrank the permission mode, which is what lets a read-only step guard an
+    // unattended `bypassPermissions` session rather than merely asking it to behave.
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    await dispatchClaude(ctx, { ...args(), disallowedTools: ["Write", "Bash"] });
+
+    expect(claude.calls[0].disallowedTools).toEqual(["Write", "Bash"]);
+  });
+
+  it("leaves the driver's tool policy alone when a step names none", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    await dispatchClaude(ctx, args());
+
+    expect(claude.calls[0].disallowedTools).toBeUndefined();
+  });
+
   it("tells the runner Claude was reached before the spawn, so a crashed spawn still counts (PR #248)", async () => {
     // The runner prices the attempt on this signal alone — an attempt that never says so is refunded
     // from the project's spend meter and its burn window discarded. It has to fire BEFORE the

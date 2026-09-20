@@ -151,7 +151,7 @@ function plainInt(field: string, min: number, max: number): number | null {
 /**
  * Recognise the cadence a cron spells out, or null when it is outside the named set. Matches on the
  * raw field text rather than the parsed value sets: the point is to recover the operator's *choice*,
- * and `0,15,30,45` is a hand-written expression even though it fires like `*​/15`.
+ * and `0,15,30,45` is a hand-written expression even though it fires like `*\/15`.
  */
 function classify(expr: string): Cadence | null {
   if (!isValidCron(expr)) return null;
@@ -298,7 +298,7 @@ export const FAST_CADENCE_MINUTES = 5;
 /**
  * Does this cadence fire more often than every {@link FAST_CADENCE_MINUTES} minutes? Measured as the
  * smallest gap between consecutive fires, so a hand-written `0,1,2 * * * *` is caught as well as
- * `*​/1`. An unparseable expression is not flagged — validation owns that error.
+ * `*\/1`. An unparseable expression is not flagged — validation owns that error.
  */
 export function isFastCadence(expr: string, thresholdMinutes = FAST_CADENCE_MINUTES): boolean {
   let cron;

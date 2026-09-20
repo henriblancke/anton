@@ -1,7 +1,7 @@
 /**
  * Load an anton skill body from anton's own `skills/` asset dir. These are anton's vendored,
  * self-contained required skills (`shape`, `bd`, `scan-triage`, `review-fix`, `review`,
- * `product-master`) — the machinery
+ * `product-master`, `describe`) — the machinery
  * anton owns so it runs standalone (no external plugin or session-start injection). anton's
  * runtime loads the body as its `-p` instruction for a background job; the setup wizard
  * (anton-3n5) installs the same assets into a target project's `.claude/skills/`.
@@ -29,6 +29,7 @@ export const REQUIRED_SKILLS = [
   "review-fix",
   "review",
   "product-master",
+  "describe",
 ] as const;
 
 /**

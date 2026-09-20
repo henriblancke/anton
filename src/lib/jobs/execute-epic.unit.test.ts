@@ -1634,6 +1634,25 @@ describe("stalePrBodyNote — the satisfied attribution rides the salvage too (P
     expect(withEmptyLedger).toContain("reported no advisory findings.");
     expect(withEmptyLedger).not.toContain("Satisfied by");
   });
+
+  // anton-7x273: a `gh` refresh failure must not silently lose the run's narrative — it has no
+  // other home once the PR body is stuck on an earlier attempt's text.
+  it("carries the narrative too, so a refresh gh refuses does not silently lose it", () => {
+    const note = stalePrBodyNote(pr, [], [], new Map(), {
+      summary: "Rewired the body.",
+      risks: "None found.",
+    });
+
+    expect(note).toContain("Rewired the body.");
+    expect(note).toContain("### Risks\n\nNone found.");
+    expect(note.indexOf("Rewired the body.")).toBeLessThan(note.indexOf("reported no advisory findings."));
+  });
+
+  it("is unchanged when no narrative was reported", () => {
+    expect(stalePrBodyNote(pr, [], [first, second], new Map())).toBe(
+      stalePrBodyNote(pr, [], [first, second], new Map(), undefined),
+    );
+  });
 });
 
 /**

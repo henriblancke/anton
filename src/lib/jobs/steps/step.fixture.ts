@@ -64,10 +64,16 @@ export interface StepSandbox {
  * Stand up the sandbox. The caller owns teardown via {@link closeSandbox} — sessions write under
  * `ANTON_SESSIONS_ROOT`, which is redirected into the temp dir so no suite touches the real one.
  */
-export async function openSandbox(name: string): Promise<StepSandbox & { priorSessionsRoot?: string }> {
+export async function openSandbox(
+  name: string,
+): Promise<StepSandbox & { priorSessionsRoot?: string; sessionsRoot: string }> {
   const dir = mkdtempSync(join(tmpdir(), `anton-${name}-`));
   const priorSessionsRoot = process.env.ANTON_SESSIONS_ROOT;
-  process.env.ANTON_SESSIONS_ROOT = join(dir, "sessions");
+  // BESIDE the sandbox, never inside it. In production the sessions root is the anton server's own
+  // `.anton/` — gitignored, and not under any run worktree — so a step that fingerprints its
+  // worktree (`step:describe`) must not see session logs as the tree changing under it.
+  const sessionsRoot = mkdtempSync(join(tmpdir(), "anton-steps-sessions-"));
+  process.env.ANTON_SESSIONS_ROOT = sessionsRoot;
   const tdb = makeProjectDb({ repoPath: dir });
   const projectId = tdb.projectId;
   const runId = randomUUID();
@@ -104,12 +110,18 @@ export async function openSandbox(name: string): Promise<StepSandbox & { priorSe
     ...overrides,
   });
 
-  return { dir, tdb, projectId, runId, context, priorSessionsRoot };
+  return { dir, tdb, projectId, runId, context, priorSessionsRoot, sessionsRoot };
 }
 
-export function closeSandbox(sandbox: { dir: string; tdb: TestDb; priorSessionsRoot?: string }): void {
+export function closeSandbox(sandbox: {
+  dir: string;
+  tdb: TestDb;
+  priorSessionsRoot?: string;
+  sessionsRoot?: string;
+}): void {
   sandbox.tdb.close();
   if (sandbox.priorSessionsRoot === undefined) delete process.env.ANTON_SESSIONS_ROOT;
   else process.env.ANTON_SESSIONS_ROOT = sandbox.priorSessionsRoot;
   rmSync(sandbox.dir, { recursive: true, force: true });
+  if (sandbox.sessionsRoot) rmSync(sandbox.sessionsRoot, { recursive: true, force: true });
 }

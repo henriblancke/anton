@@ -76,8 +76,11 @@ function assertOpen(bead: Bead, what: string): void {
  * task — an id no job is keyed by — and the feature's agent ran on through the abandoned ticket.
  * Guards against a malformed parent cycle; falls back to the immediate parent when the chain reaches
  * no run target at all (a cancel that matches no job, rather than a wrong one).
+ *
+ * Exported for close-human.ts: mark-done needs the identical target to stop a live run before
+ * closing, for the same reason abandon does.
  */
-function runTargetOf(bead: Bead, board: Bead[]): string {
+export function runTargetOf(bead: Bead, board: Bead[]): string {
   if (beads.isRunTarget(bead, board)) return bead.id;
   const byId = new Map(board.map((b) => [b.id, b]));
   const seen = new Set<string>([bead.id]);

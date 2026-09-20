@@ -243,9 +243,11 @@ describeBd("execute-epic e2e — lifecycle (real handler · real bd/git · fake 
     });
     expect(log).toContain(`${bugId}:`);
 
-    // Exactly one execute session for the single ticket.
+    // Exactly one execute session for the single ticket. Filtered on kind because an epic-of-one
+    // files its run-level `describe` session under the SAME bead (the target IS the ticket), and the
+    // describer is not an attempt at the work — see `attemptsOfRun` in the human-gate-loop suite.
     const sessions = (await tdb.db.select().from(schema.sessions)).filter(
-      (s) => s.beadId === bugId,
+      (s) => s.beadId === bugId && s.kind === "execute",
     );
     expect(sessions).toHaveLength(1);
   });
@@ -341,7 +343,7 @@ process.exit(0);`),
       expect(deriveStage(bug1)).toBe("in-review");
       expect(bug1.labels ?? []).not.toContain("stage:implementing");
       const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
-        (s) => s.beadId === bugId,
+        (s) => s.beadId === bugId && s.kind === "execute",
       );
       expect(sessionsAfter1).toHaveLength(1);
 
@@ -379,9 +381,11 @@ process.exit(0);`),
       expect(beads.getPrRef(bug2)).toBe("gh-42");
       expect(deriveStage(bug2)).toBe("in-review");
 
-      // Claude was NOT re-run: still exactly one execute session for the bug.
+      // Claude was NOT re-run: still exactly one execute session for the bug. Scoped to that kind
+      // because the resume re-walks the run phase, whose `step:describe` records its own `describe`
+      // session under this same bead — not a second attempt at the ticket's work.
       const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
-        (s) => s.beadId === bugId,
+        (s) => s.beadId === bugId && s.kind === "execute",
       );
       expect(sessionsAfter2).toHaveLength(1);
     } finally {
@@ -416,7 +420,7 @@ process.exit(0);`),
     const covered = await beads.show(repo, bugId);
     expect(beads.getPrRef(covered)).toBe("gh-42");
     const sessionsAfter1 = (await tdb.db.select().from(schema.sessions)).filter(
-      (s) => s.beadId === bugId,
+      (s) => s.beadId === bugId && s.kind === "execute",
     );
     expect(sessionsAfter1).toHaveLength(1);
 
@@ -447,7 +451,7 @@ process.exit(0);`,
       const after2 = await beads.show(repo, bugId);
       expect(beads.getPrRef(after2)).toBe("gh-42"); // not overwritten / re-opened
       const sessionsAfter2 = (await tdb.db.select().from(schema.sessions)).filter(
-        (s) => s.beadId === bugId,
+        (s) => s.beadId === bugId && s.kind === "execute",
       );
       expect(sessionsAfter2).toHaveLength(1); // claude was NOT re-run
     } finally {

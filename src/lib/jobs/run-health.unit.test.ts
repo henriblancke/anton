@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import type { Bead, Gate } from "../beads/bd";
 import { LABELS } from "../beads/bd";
 import {
+  boardUnreachableFinding,
   detectDeadLeases,
   detectExhaustedJobs,
   detectOpenHumanGates,
@@ -52,6 +53,10 @@ function run(id: string, o: Partial<RunRow> = {}): RunRow {
     baseForkSha: null,
     status: "parked",
     reviewScore: null,
+    reviewKey: null,
+    reviewKeyAdvisories: null,
+    reviewKeyScore: null,
+    narrative: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: null,
@@ -349,6 +354,113 @@ describe("detectExhaustedJobs", () => {
     );
     expect(finding).toMatchObject({ kind: "exhausted-job", jobId: "j-1", beadId: undefined });
     expect(finding.reason).toContain("sync-push");
+  });
+
+  describe("board-wide outages (anton-ifz2)", () => {
+    /** The 2026-08-28 shape: an hour-long outage parks every job type that touched the board. */
+    const OUTAGE_ERROR =
+      "bd dolt pull failed in /repo: Dolt server unreachable at 127.0.0.1:5432 (connection refused)";
+
+    function outageJob(id: string, type: string, minutesAgo: number): JobRow {
+      return job(id, {
+        type,
+        payloadJson: JSON.stringify({ projectId: "p1", epicBeadId: `e-${id}` }),
+        lastError: `failed 3×: ${OUTAGE_ERROR}`,
+        updatedAt: secDate(NOW - minutesAgo * MINUTE),
+      });
+    }
+
+    it("collapses concurrent board-unreachable parks in one project onto a single finding", () => {
+      // 4 job types, parked minutes apart as the outage spread through the queue.
+      const jobs = [
+        outageJob("j-1", "execute-epic", 60),
+        outageJob("j-2", "sync-push", 45),
+        outageJob("j-3", "review-fix-pr", 30),
+        outageJob("j-4", "gate-check", 15),
+      ];
+      const findings = detectExhaustedJobs(jobs, 3, NOW);
+      expect(findings).toHaveLength(1);
+      const [finding] = findings;
+      // Names the target and the remedy (acceptance: it names the unreachable target and the remedy).
+      expect(finding.reason).toContain("the shared Dolt server is unreachable");
+      expect(finding.reason).toContain("check the server is up and reachable");
+      expect(finding.reason).toContain("4 jobs parked on the same outage");
+      // Ages from the OLDEST park in the group — the outage's own start, not the newest job's.
+      expect(finding.since).toBe(NOW - 60 * MINUTE);
+      expect(finding.jobId).toBe("j-1");
+    });
+
+    it("keeps a differently-caused park as its own row, never folded into the outage's", () => {
+      const jobs = [
+        outageJob("j-1", "execute-epic", 60),
+        outageJob("j-2", "sync-push", 45),
+        job("j-3", { lastError: "failed 3×: tests failed" }), // an unrelated ordinary bug
+      ];
+      const findings = detectExhaustedJobs(jobs, 3, NOW);
+      expect(findings).toHaveLength(2);
+      expect(findings.find((f) => f.key === "exhausted-job:j-3")).toBeDefined();
+      expect(findings.find((f) => f.key.startsWith("exhausted-job:board-unreachable:"))).toBeDefined();
+    });
+
+    it("keeps an identity mismatch separate from a generic outage — different remedy, own row", () => {
+      const jobs = [
+        outageJob("j-1", "execute-epic", 60),
+        job("j-2", {
+          type: "sync-push",
+          lastError: "failed 3×: PROJECT IDENTITY MISMATCH — refusing to connect",
+          updatedAt: secDate(NOW - 20 * MINUTE),
+        }),
+      ];
+      const findings = detectExhaustedJobs(jobs, 3, NOW);
+      expect(findings).toHaveLength(2);
+      const mismatch = findings.find((f) => f.reason.includes(".beads/metadata.json"));
+      expect(mismatch).toBeDefined();
+      expect(mismatch?.reason).toContain("this project's Dolt database");
+      const outage = findings.find((f) => f.reason.includes("the shared Dolt server"));
+      expect(outage).toBeDefined();
+      expect(outage?.key).not.toBe(mismatch?.key);
+    });
+
+    it("raises one escalation PER PROJECT, not one for the whole board", () => {
+      const jobs = [
+        outageJob("j-1", "execute-epic", 60),
+        job("j-2", {
+          type: "execute-epic",
+          projectId: "p2",
+          payloadJson: JSON.stringify({ projectId: "p2", epicBeadId: "e-2" }),
+          lastError: `failed 3×: ${OUTAGE_ERROR}`,
+          updatedAt: secDate(NOW - 60 * MINUTE),
+        }),
+      ];
+      const findings = detectExhaustedJobs(jobs, 3, NOW);
+      expect(findings).toHaveLength(2);
+      expect(new Set(findings.map((f) => f.key)).size).toBe(2);
+    });
+
+    it("keeps reappearing on the same key while any job in the group is still parked", () => {
+      // Simulates two sweeps: the second sees one fewer job (an operator resumed it) but the outage
+      // isn't over, so the SAME key must come back rather than a fresh one.
+      const first = detectExhaustedJobs(
+        [outageJob("j-1", "execute-epic", 60), outageJob("j-2", "sync-push", 45)],
+        3,
+        NOW,
+      );
+      const second = detectExhaustedJobs([outageJob("j-2", "sync-push", 45)], 3, NOW);
+      expect(first[0]?.key).toBe(second[0]?.key);
+    });
+
+    it("never collides with a live outage's key for the same project and cause (PR #277 review)", () => {
+      // A release starting mid-outage first raises boardUnreachableFinding's jobless live alert;
+      // once the board recovers, detectExhaustedJobs' legacy branch reports the still-parked
+      // pre-upgrade job under the same project/cause. Sharing one key would make raiseEscalation
+      // return the live row untouched — jobless, no Resume/Abandon — forever.
+      const live = boardUnreachableFinding("p1", "server-unreachable", NOW);
+      const [legacy] = detectExhaustedJobs([outageJob("j-1", "execute-epic", 60)], 3, NOW);
+      expect(legacy.key).not.toBe(live.key);
+      expect(legacy.key.startsWith(live.key)).toBe(true);
+      expect(legacy.jobId).toBe("j-1");
+      expect(live.jobId).toBeUndefined();
+    });
   });
 });
 

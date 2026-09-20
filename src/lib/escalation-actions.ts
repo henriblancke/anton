@@ -149,12 +149,12 @@ async function restoreStall(
  * Dismiss settles the row and nothing else, so it needs no target and can't fail half-way.
  *
  * `byHuman` is the whole point of the call: the stamp it writes is what stops the next sweep raising
- * this stall again (see escalations.ts). Two kinds are refused — see {@link isDismissable} and the
- * module note. The rule is enforced HERE and not only in the panel, since a direct POST never passes
- * through a button.
+ * this stall again (see escalations.ts). Two kinds, plus a live board outage keyed off its finding
+ * key, are refused — see {@link isDismissable} and the module note. The rule is enforced HERE and not
+ * only in the panel, since a direct POST never passes through a button.
  */
 async function dismissStall(db: AntonDb, view: EscalationView): Promise<EscalationActionResult> {
-  if (!isDismissable(view.kind)) return { ok: false, reason: "not-dismissable" };
+  if (!isDismissable(view.kind, view.findingKey)) return { ok: false, reason: "not-dismissable" };
   if (!(await settleEscalation(db, systemClock, view.id, "dismissed", true))) {
     return { ok: false, reason: "not-open" };
   }

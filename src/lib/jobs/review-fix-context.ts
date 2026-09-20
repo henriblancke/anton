@@ -76,12 +76,42 @@ export function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], co
     ...headerSection(epic, pr, reasons),
     ...reviewerSummarySection(pr),
     ...threadsSection(threads),
+    ...clusterSection(threads),
     ...failingChecksSection(pr),
     ...conflictsSection(conflicts),
     ...reportingFormatSection(threads),
   ]
     .join("\n")
     .trimEnd();
+}
+
+/**
+ * Below this many unresolved threads on one path, treat each as its own independent fix. At or
+ * above it, an audit of the last 40 anton PRs (703 external findings) found the fixer answering a
+ * structurally broken file with N one-line patches instead of the root cause — e.g. identity.mjs
+ * took 54 findings on PR #217, rework-contract.ts 48 on #252. 3 is the floor that catches those
+ * cases without flagging a file that just happens to have two unrelated nits.
+ */
+export const CLUSTERED_FINDINGS_THRESHOLD = 3;
+
+function clusterSection(threads: ReviewThread[]): string[] {
+  const counts = new Map<string, number>();
+  for (const t of threads) {
+    if (!t.path) continue;
+    counts.set(t.path, (counts.get(t.path) ?? 0) + 1);
+  }
+  const clustered = [...counts.entries()].filter(([, n]) => n >= CLUSTERED_FINDINGS_THRESHOLD);
+  if (clustered.length === 0) return [];
+  return [
+    `## Clustered findings`,
+    ``,
+    `These paths carry ${CLUSTERED_FINDINGS_THRESHOLD}+ findings each — that many hits on one file`,
+    `is a sign the file is structurally broken, not that it has that many independent bugs. Find`,
+    `the root cause on these paths before writing per-site patches:`,
+    ``,
+    ...clustered.map(([path, n]) => `- ${path} (${n} findings)`),
+    ``,
+  ];
 }
 
 function headerSection(epic: Bead, pr: PrReview, reasons: string[]): string[] {

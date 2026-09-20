@@ -23,6 +23,7 @@ import {
   runDoltSync,
 } from "./bd";
 import { BD_BIN_ENV, resetBdBinCache } from "./bd-bin";
+import { isBoardUnreachableError } from "../jobs/errors";
 
 /** Budget for the hang tests: long enough to clear process startup, short enough to stay a unit test. */
 const BUDGET_MS = 1_500;
@@ -199,15 +200,34 @@ describe("bd timeout reaps the whole process group (anton-jfjw.1)", () => {
     expect(err.message).toContain(`${BUDGET_MS}ms budget`); // and the budget it blew
   });
 
+  it("classifies a budget timeout as a board outage (PR #277 review)", async () => {
+    // A wedged bd is exactly the field failure this module exists to reap: a `git fetch` holding the
+    // exclusive Dolt lock, which then fails every later bd call in this repo. Left as a plain Error,
+    // run-health never sees it and every job it stalls parks individually instead of collapsing onto
+    // one outage finding.
+    fakeBd("bd-hangs-classified", ["#!/bin/sh", "sleep 30"]);
+    const err = (await runBd(dir, ["dolt", "pull"]).catch((e: Error) => e)) as Error & {
+      boardCause?: string;
+    };
+    expect(isBoardUnreachableError(err)).toBe(true);
+    expect(err.boardCause).toBe("board-timeout");
+  });
+
   it("surfaces the wedge through runDoltSync instead of burying it under partial output", async () => {
-    // A wedged step's captured stderr is startup noise; runDoltSync prefers attached output over the
-    // message, so attaching it would hide the real cause (the anton-be1s failure mode). It must not.
+    // A wedged step's captured stderr is startup noise; runDoltSync must not let it bury the real
+    // cause (the anton-be1s failure mode) — and must preserve the typed BoardUnreachableError bd()
+    // already raised rather than reclassifying it from output text (PR #277 review), so the message
+    // is the timeout's own, not a re-wrapped "bd dolt pull failed in ...: bd dolt pull in ..." echo.
     fakeBd("bd-noisy-hang", [
       "#!/bin/sh",
       'echo "warning: whatever" >&2',
       "sleep 30",
     ]);
-    await expect(runDoltSync(dir)).rejects.toThrow(/bd dolt pull failed[\s\S]*exceeded its \d+ms budget/);
+    const err = (await runDoltSync(dir).catch((e: Error) => e)) as Error & { boardCause?: string };
+    expect(err.message).toMatch(/exceeded its \d+ms budget/);
+    expect(err.message).not.toContain("warning: whatever");
+    expect(isBoardUnreachableError(err)).toBe(true);
+    expect(err.boardCause).toBe("board-timeout");
   });
 });
 
@@ -311,13 +331,33 @@ describe("bd normal calls are unchanged (anton-jfjw.1)", () => {
     );
   });
 
-  it("rejects a non-zero exit with the captured streams attached (runDoltSync reads them)", async () => {
+  it("classifies a raw board outage while preserving its process diagnostics", async () => {
+    fakeBd("bd-board-down", [
+      "#!/bin/sh",
+      'echo "partial board response"',
+      'echo "Dolt server unreachable at 127.0.0.1:5432" >&2',
+      "exit 3",
+    ]);
+    const err = (await runBd(dir, ["list", "--json"]).catch((e: Error) => e)) as Error & {
+      code?: number;
+      stdout?: string;
+      stderr?: string;
+    };
+    expect(isBoardUnreachableError(err)).toBe(true);
+    expect(err.code).toBe(3);
+    expect(err.stdout).toContain("partial board response");
+    expect(err.stderr).toContain("Dolt server unreachable");
+    expect(err.message).toContain("Command failed");
+  });
+
+  it("leaves an ordinary non-zero bd error ordinary", async () => {
     fakeBd("bd-fails", ["#!/bin/sh", 'echo "partial" ', 'echo "Error: boom" >&2', "exit 3"]);
     const err = (await runBd(dir, ["dolt", "push"]).catch((e: Error) => e)) as Error & {
       code?: number;
       stdout?: string;
       stderr?: string;
     };
+    expect(isBoardUnreachableError(err)).toBe(false);
     expect(err.code).toBe(3);
     expect(err.stdout).toContain("partial");
     expect(err.stderr).toContain("Error: boom");

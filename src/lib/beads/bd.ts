@@ -239,15 +239,21 @@ function parseRunLease(label: string): { expiry: number | undefined; owner: stri
 // here so every existing `from ".../beads/bd"` import keeps working.
 export { BD_KILL_GRACE_ENV, BD_MAX_BUFFER_ENV, BD_STEP_TIMEOUT_ENV, BD_STEP_TIMEOUT_MS } from "./dolt-exec";
 export { runBdForTest, type BdExec } from "./dolt-exec";
-export { isBenignSyncOutput, isFirstPublishPullOutput, isNotWiredOutput } from "./dolt-sync";
+export {
+  boardUnreachableCause,
+  isBenignSyncOutput,
+  isBoardUnreachableOutput,
+  isFirstPublishPullOutput,
+  isNotWiredOutput,
+} from "./dolt-sync";
 export { PREFLIGHT_TTL_MS, preflightSharedServer, resetServerPreflight, runDoltSync } from "./dolt-sync";
-export type { SyncMode, SyncOutcome } from "./dolt-sync";
+export type { BoardUnreachableCause, SyncMode, SyncOutcome } from "./dolt-sync";
 export { getSyncStatus, getSyncStatusToken, SYNC_STALL_MS } from "./sync-coalescer";
 export type { SyncRequest, SyncState, SyncStatus } from "./sync-coalescer";
 export { BD_BATCH_ENV, batchEnabled, batchOpArgs, encodeBatchOps, quoteBatchValue } from "./bd-args";
 export { buildPruneArgs, buildUpdateArgs, isMissingBatchCommand, LABEL_PREFIXES, labelValueOf } from "./bd-args";
 export type { BatchOp, BatchUpdateFields, BeadPatch, LabelPrefix, PruneAge } from "./bd-args";
-export { isMissingBeadError, unclaimableStatus } from "./bd-errors";
+export { isBlockedByOpenIssues, isMissingBeadError, unclaimableStatus } from "./bd-errors";
 export { buildGateCheckArgs, buildGateCreateArgs, buildGateDiscoverArgs, gateReason, parseGateCheck } from "./gate";
 export type { Gate, GateCheckOpts, GateCheckResult, GateCheckScope, GateCreateOpts } from "./gate";
 export type { GatedMolecule, GateDiscoverOpts, GateType } from "./gate";

@@ -110,12 +110,29 @@ describe("operatorQueue — the set", () => {
     expect(operatorQueue(board)).toEqual([]);
   });
 
-  it("drops a human ticket under a closed run target — that work shipped", () => {
+  it("keeps a human ticket stranded under an already-closed run target — the run shipped, the ticket didn't", () => {
+    // PR #288 review: this used to drop the row entirely once the target settled, hiding exactly the
+    // ticket the ticket dialog's own Mark-done gate (ticket-detail.ts) now treats as real, actionable
+    // work via the same `liveRunTargetOf` predicate — the operator queue is the primary place to find
+    // it, and silently omitting the row left it undiscoverable there.
     const board = [
-      bead({ id: "f1", issue_type: "feature", labels: ["approved"], status: "closed" }),
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"], status: "closed" }),
       bead({ id: "f1.1", issue_type: "task", parent: "f1" }),
     ];
-    expect(operatorQueue(board)).toEqual([]);
+    const [item] = operatorQueue(board);
+    expect(item.id).toBe("f1.1");
+    expect(item.runTarget).toEqual({ id: "f1", title: "Ship billing" });
+    expect(item.holdsRun).toBe(false);
+  });
+
+  it("keeps a human ticket stranded under a deferred run target the same way", () => {
+    const board = [
+      bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"], status: "deferred" }),
+      bead({ id: "f1.1", issue_type: "task", parent: "f1" }),
+    ];
+    const [item] = operatorQueue(board);
+    expect(item.id).toBe("f1.1");
+    expect(item.holdsRun).toBe(false);
   });
 
   it("names no run target for a target of its own", () => {
@@ -134,6 +151,88 @@ describe("operatorQueue — the set", () => {
   it("drops pipeline plumbing — a gate coordinates work without being any", () => {
     const board = [bead({ id: "g1", issue_type: "gate" })];
     expect(operatorQueue(board)).toEqual([]);
+  });
+
+  it("flags a human epic that still has open work under it — Mark done would 409 there", () => {
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1" }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBe(true);
+  });
+
+  it("does not flag a human epic once its child has closed", () => {
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "task", parent: "e1", status: "closed" }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBeUndefined();
+  });
+
+  it("does not flag a leaf human ticket — a task/bug never has children", () => {
+    const board = [bead({ id: "t1" })];
+    expect(operatorQueue(board)[0].hasOpenDescendants).toBeUndefined();
+  });
+
+  it("does not flag a human epic for an open molecule/gate hung under it — pipeline plumbing, not open work", () => {
+    // PR #288 review: this predicate used to filter no pipeline artifacts at all, disagreeing with
+    // the identical read on the ticket dialog (ticket-detail.ts) and closeHumanTicket, which both
+    // already excluded a bare molecule/gate — hiding a working Mark done here for a bead the close
+    // route would actually accept.
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1", labels: [] }),
+      bead({ id: "e1.2", issue_type: "gate", parent: "e1.1", labels: [] }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBeUndefined();
+  });
+
+  it("does not flag a human epic for a task poured under an open molecule — the whole subtree is pruned", () => {
+    // Codex review (PR #288): filtering only the molecule/gate NODES still left a poured `task` step
+    // underneath them counted as open work, 409ing the close for as long as the run lasted.
+    const board = [
+      bead({ id: "e1", issue_type: "epic", labels: ["approved", "agent:human"] }),
+      bead({ id: "e1.1", issue_type: "molecule", parent: "e1", labels: [] }),
+      bead({ id: "e1.2", issue_type: "task", parent: "e1.1", labels: [] }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("e1");
+    expect(target.hasOpenDescendants).toBeUndefined();
+  });
+
+  it("flags a human ticket still held by an ordinary open blocks dependency", () => {
+    // PR #288 review: neither `holdsRun` nor `hasOpenDescendants` represents a plain sibling
+    // prerequisite ("sign the contract, then wire the account"), so this row offered Mark done for
+    // work `closeHumanTicket` would still 409 — it 409s on ANY open `blocks` dependency, not just a
+    // run's own hold.
+    const board = [
+      bead({ id: "b1", labels: ["approved"] }),
+      bead({
+        id: "t1",
+        dependencies: [{ issue_id: "t1", depends_on_id: "b1", type: "blocks" }],
+      }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.id).toBe("t1");
+    expect(target.hasOpenBlockers).toBe(true);
+  });
+
+  it("does not flag it once the blocker closes", () => {
+    const board = [
+      bead({ id: "b1", status: "closed" }),
+      bead({
+        id: "t1",
+        dependencies: [{ issue_id: "t1", depends_on_id: "b1", type: "blocks" }],
+      }),
+    ];
+    const [target] = operatorQueue(board);
+    expect(target.hasOpenBlockers).toBeUndefined();
   });
 
   it("carries what the row acts on: the goal, the chips, and when it was asked", () => {

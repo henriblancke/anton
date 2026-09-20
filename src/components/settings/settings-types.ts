@@ -74,6 +74,8 @@ export interface EditableSettings {
    */
   routerConnectionId?: string;
   seedPrompt?: string;
+  /** PR narrative reasoning contract; absent = the shipped describe skill. */
+  describePrompt?: string;
   reviewFixPrompt?: string;
   productMasterPrompt?: string;
   /** Pre-PR self-review gate (anton-3apm); absent = ON. The knobs below only apply when on. */

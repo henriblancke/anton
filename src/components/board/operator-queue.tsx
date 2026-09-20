@@ -1,10 +1,13 @@
 "use client";
 
-import { UserRoundIcon } from "lucide-react";
+import { useState } from "react";
+import { toast } from "sonner";
+import { CheckIcon, UserRoundIcon } from "lucide-react";
 import Link from "next/link";
 
 import { MetaChip, RelativeTime, RiskChip } from "@/components/atoms";
 import { STAGE_ACCENT_DOT } from "@/components/board/board-utils";
+import { Button } from "@/components/ui/button";
 import type { OperatorQueueItem, Stage } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -33,11 +36,14 @@ export function OperatorQueue({
   slug,
   items,
   onOpenTicket,
+  onDone,
 }: {
   slug: string;
   items: OperatorQueueItem[];
   /** Opens a parented ticket in the board's shared TicketDialog — see {@link QueueRow}. */
   onOpenTicket: (ticketId: string) => void;
+  /** A row's Mark done landed — re-read the board so the closed bead drops off this list. */
+  onDone?: () => void;
 }) {
   if (items.length === 0) return null;
 
@@ -67,7 +73,7 @@ export function OperatorQueue({
               className="mt-0.5 w-0.5 shrink-0 self-stretch rounded-full bg-border"
               aria-hidden="true"
             />
-            <QueueRow slug={slug} item={item} onOpenTicket={onOpenTicket} />
+            <QueueRow slug={slug} item={item} onOpenTicket={onOpenTicket} onDone={onDone} />
           </li>
         ))}
       </ul>
@@ -97,12 +103,22 @@ function QueueRow({
   slug,
   item,
   onOpenTicket,
+  onDone,
 }: {
   slug: string;
   item: OperatorQueueItem;
   onOpenTicket: (ticketId: string) => void;
+  onDone?: () => void;
 }) {
   const started = startedLabel(item.stage);
+  // Nothing else ever closes this row: a run target's work is never dispatched, and a ticket under
+  // one is never reached either — both are refused before dispatch. Three cases are excluded because
+  // `bd close` would refuse them the same way: a ticket that HOLDS a run (an armed human gate) —
+  // the resumed run closes that ticket itself (PR #214 review — that row points at "Resolve &
+  // resume" instead) — a bead that still has open work under it (`closeHumanTicket`, close-human.ts,
+  // refuses with a 409 rather than orphaning or silently claiming it as done), and a bead still held
+  // by an ordinary open `blocks` dependency (same route, same 409, no run involved — PR #288 review).
+  const canMarkDone = !item.holdsRun && !item.hasOpenDescendants && !item.hasOpenBlockers;
 
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-1">
@@ -168,12 +184,9 @@ function QueueRow({
       {/* A target row is the whole ask, and no surface in anton finishes it: beads close when a run
           does the work, and this one refuses to run at all. Naming what closes it is the honest
           version of that — the alternative is an operator doing the work and then hunting the board
-          for a button that does not exist (PR #214 review). */}
+          for a button that does not exist. A control now, not just words (PR #214 review). */}
       {!item.runTarget ? (
-        <p className="text-[11px] text-subtle">
-          No run starts on it, so nothing closes it for you — do the work, then{" "}
-          <span className="font-mono text-muted-foreground">bd close {item.id}</span>.
-        </p>
+        <p className="text-[11px] text-subtle">No run starts on it, so nothing closes it for you.</p>
       ) : null}
       {/* The target is a person's work too, so anton refuses the run at the target and never reaches
           this ticket. Pointing at a "Waiting on you" row here would send the operator after an
@@ -184,7 +197,98 @@ function QueueRow({
           refuses that run at the target, so no run is held behind this one.
         </p>
       ) : null}
+      {/* Do the work, then settle it here: the one close route this shape of work has (anton-fgqr).
+          Excluded on a held row — see `canMarkDone` above. */}
+      {canMarkDone ? <MarkDoneButton slug={slug} id={item.id} onDone={onDone} /> : null}
     </div>
+  );
+}
+
+/**
+ * Settles the one row shape nothing else ever closes (anton-fgqr): a run either never starts (a
+ * human-labelled target) or never reaches this ticket, so without this a person did the work and
+ * still had to reach for the `bd close` CLI (PR #214). Arms a lightweight confirm — no reason field,
+ * unlike Abandon, since a delivery needs no justification — but it is just as irreversible (no
+ * un-close route), so a bare click is one misfire away from a wrong outcome.
+ */
+function MarkDoneButton({
+  slug,
+  id,
+  onDone,
+}: {
+  slug: string;
+  id: string;
+  onDone?: () => void;
+}) {
+  const [armed, setArmed] = useState(false);
+  const [pending, setPending] = useState(false);
+  // `onDone` (useBoardPoll.refresh) only schedules an async fetch — it does not update this
+  // render. Without this flag the button re-enables until that fetch lands (or stays enabled
+  // forever if it fails), so a second click 409s on an already-closed ticket (PR #288 review).
+  const [settled, setSettled] = useState(false);
+
+  async function confirm() {
+    setPending(true);
+    try {
+      const res = await fetch(`/api/projects/${slug}/tickets/${id}/close`, { method: "POST" });
+      if (!res.ok) {
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `Mark done failed (${res.status})`);
+      }
+      toast.success("Marked done");
+      setArmed(false);
+      setSettled(true);
+      onDone?.();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Mark done failed");
+    } finally {
+      setPending(false);
+    }
+  }
+
+  if (settled) {
+    return (
+      <span className="inline-flex w-fit items-center gap-1 text-[11px] text-stage-done">
+        <CheckIcon className="size-3" aria-hidden="true" />
+        Marked done
+      </span>
+    );
+  }
+
+  if (armed) {
+    return (
+      <span className="inline-flex items-center gap-1.5">
+        <span className="text-[11px] text-subtle">Can&apos;t be reopened.</span>
+        <Button
+          type="button"
+          size="xs"
+          variant="outline"
+          className="border-stage-done/40 bg-stage-done/10 text-stage-done hover:bg-stage-done/20"
+          onClick={() => void confirm()}
+          disabled={pending}
+        >
+          <CheckIcon aria-hidden="true" />
+          {pending ? "Marking done…" : "Confirm"}
+        </Button>
+        <Button type="button" size="xs" variant="ghost" onClick={() => setArmed(false)} disabled={pending}>
+          Cancel
+        </Button>
+      </span>
+    );
+  }
+
+  return (
+    <Button
+      type="button"
+      size="xs"
+      variant="outline"
+      className="w-fit border-stage-done/40 text-stage-done hover:bg-stage-done/10"
+      onClick={() => setArmed(true)}
+      title="Mark done — closes this bead as delivered; no agent run ever will"
+    >
+      <CheckIcon aria-hidden="true" />
+      Mark done
+    </Button>
   );
 }
 

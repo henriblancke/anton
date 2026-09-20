@@ -70,3 +70,10 @@ dist/
 # Claude Code isolation worktrees (anton-bqge) — a second checkout of the whole tree lands here;
 # committing one would re-walk it on every scan and duplicate-flag the entire codebase.
 .claude/worktrees/
+
+# Any other in-repo git worktree (anton-fj1q) — same failure, whatever directory it's checked out
+# at: a second full copy of the tree that must never be committable.
+.worktrees/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

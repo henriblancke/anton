@@ -37,7 +37,6 @@ export function DismissedSection({
   /** How many are dismissed in all. Defaults to the page's own length for callers with one page. */
   total?: number;
 }) {
-  const router = useRouter();
   const [older, setOlder] = useState<EscalationView[]>([]);
   const [loading, setLoading] = useState(false);
   const [cursor, setCursor] = useState<DismissedCursor | null | undefined>(undefined);

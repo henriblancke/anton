@@ -481,6 +481,34 @@ describe("reviewContext", () => {
     expect(reviewContext({ target: epic, tickets: [ticket], diff })).not.toContain("still open from an earlier review");
   });
 
+  it("carries the previous round's blocking findings forward as classes and counts only", () => {
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff,
+      previousBlocking: [
+        { severity: "blocking", location: "src/widget.tsx:12", note: "classic time-of-check to time-of-use race" },
+        { severity: "blocking", location: "src/other.tsx:4", note: "a second check-then-act race on the same map" },
+        { severity: "blocking", location: "src/queue.ts:9", note: "fails open when the queue is unreachable" },
+      ],
+    });
+
+    expect(out).toContain("## Blocking classes from the previous round");
+    expect(out).toContain("- fencing-toctou: 2");
+    expect(out).toContain("- fail-open: 1");
+    expect(out).toContain("check whether the same");
+    // Class and count only — none of the finding notes or locations ride along.
+    expect(out).not.toContain("time-of-check to time-of-use");
+    expect(out).not.toContain("check-then-act race on the same map");
+    expect(out).not.toContain("fails open when the queue is unreachable");
+    expect(out).not.toContain("src/widget.tsx:12");
+    expect(out).not.toContain("src/other.tsx:4");
+    expect(out).not.toContain("src/queue.ts:9");
+
+    // A first round has no previous blocking findings, and an empty list must not print a section.
+    expect(reviewContext({ target: epic, tickets: [ticket], diff })).not.toContain("Blocking classes from the previous round");
+  });
+
   it("forbids writing to the worktree in the appended context, so a swapped reviewer is told too", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
     expect(out).toContain("## This review is READ-ONLY");

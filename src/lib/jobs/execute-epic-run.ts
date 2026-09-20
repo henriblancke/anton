@@ -19,7 +19,7 @@ import { updateRun, type RunPatch, type RunRow } from "../runs";
 import type { RetiredTicketOutcome, RunReadiness, TicketTimeoutOutcome } from "./execute-epic-board";
 import type { LiveArmedAsk } from "./execute-epic-human-gate";
 import type { RunLease } from "./execute-epic-lease";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import type { AntonDb, Clock } from "./queue";
 import type { JobContext } from "./runner";
 

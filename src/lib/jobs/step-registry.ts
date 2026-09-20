@@ -37,6 +37,7 @@
  * See `.product/decisions/2026-08-01-no-step-shell.md`.
  */
 import { claudeStep, implementStep } from "./steps/agent";
+import { describeStep } from "./steps/describe";
 import { reviewStep, verifyStep } from "./steps/gates";
 import { commitStep, prStep } from "./steps/git";
 import { resolveStepIn } from "./steps/resolve";
@@ -52,6 +53,7 @@ export {
   type StepDeps,
 } from "./steps/context";
 export {
+  type RunNarrative,
   type StepClass,
   type StepDefinition,
   type StepFacts,
@@ -60,9 +62,10 @@ export {
   type StepResultWith,
 } from "./steps/result";
 export { claudeStep, implementStep, readForDispatch } from "./steps/agent";
+export { describeStep, parseNarrativeReport } from "./steps/describe";
 export { reviewStep, verifyStep } from "./steps/gates";
 export { commitStep, prStep, recordBoardOnlyAttribution } from "./steps/git";
-export { prBody, ticketPrompt, truncateField } from "./steps/prompts";
+export { describeContext, prBody, ticketPrompt, truncateField } from "./steps/prompts";
 export { stepName, STEP_LABEL_PREFIX, type StepRegistry } from "./steps/resolve";
 
 /**
@@ -104,6 +107,17 @@ export const BUILTIN_STEPS: Readonly<Record<BuiltinStepId, StepDefinition>> = Ob
     summary: "commit the run's work — git is the evidence of record",
     producesDiff: false,
     handler: commitStep,
+  },
+  describe: {
+    name: "describe",
+    class: "default-on",
+    summary: "write the run's PR narrative from its committed diff",
+    // The describer writes nothing to the worktree at all — no commit of its own to make, unlike
+    // the review gate, which sits in this same post-commit slot because IT commits its own fixes.
+    // ENFORCED, not just declared: the step denies every write-shaped tool and reverts a tree it
+    // finds changed (`DESCRIBE_DENIED_TOOLS` / `enforceDescriberReadOnly` in steps/describe.ts).
+    producesDiff: false,
+    handler: describeStep,
   },
   pr: {
     name: "pr",

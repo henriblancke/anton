@@ -49,6 +49,10 @@ function run(o: Partial<RunRow> = {}): RunRow {
     baseForkSha: null,
     status: "parked",
     reviewScore: null,
+    reviewKey: null,
+    reviewKeyAdvisories: null,
+    reviewKeyScore: null,
+    narrative: null,
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",
@@ -87,6 +91,7 @@ function ctx(o: Partial<UnstickContext> = {}): UnstickContext {
     // empty one would mean "e-1 was deleted" — the default has to carry the bead the findings name.
     board: new Map<string, Bead>([["e-1", bead("e-1")]]),
     boardFresh: true,
+    boardReadable: true,
     deadLeaseGraceMs: GRACE,
     usageWindowEndsAt: () => undefined,
     epicCancelled: () => false,
