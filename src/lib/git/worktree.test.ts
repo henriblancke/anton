@@ -1259,6 +1259,57 @@ suite("worktree manager (real git)", () => {
       expect(status).not.toContain("rebase in progress");
     });
 
+    // PR #279 re-review (P2): a `pre-rebase` hook (or anything else that rejects the rebase before
+    // git writes any rebase state) leaves nothing for `git rebase --abort` to abort — it fails with
+    // "No rebase in progress", which is not a recovery failure and must not be reported as one, nor
+    // leave the ownership marker behind for a rebase that never began.
+    it("clears the marker and reports the underlying failure when the rebase never starts", async () => {
+      const branch = "anton/refresh-rebase-never-starts";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "never-starts.txt"), "run's own edit\n");
+      execFileSync("git", ["-C", first.path, "add", "never-starts.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "run's own commit"]);
+      const uniqueSha = headOf(first.path);
+
+      advanceDefaultBranch(
+        "rebase-never-starts-base.txt",
+        "advance 12\n",
+        "advance main (rebase never starts)",
+      );
+
+      // Simulates a `pre-rebase` hook rejecting the operation: the real `rebase --onto` never runs,
+      // so it never creates `rebase-merge`/`rebase-apply` state, exactly like a real hook rejection.
+      const shim = gitShim([
+        'if [ "$3" = "rebase" ] && [ "$4" = "--onto" ]; then',
+        '  echo "hint: pre-rebase hook declined rebasing" >&2',
+        "  exit 1",
+        "fi",
+      ]);
+
+      try {
+        await expect(
+          createWorktree({
+            repoPath: repo,
+            branch,
+            baseBranch: defaultBranch(),
+            refresh: true,
+            forkSha: first.forkSha,
+          }),
+        ).rejects.toThrow(/never started/);
+      } finally {
+        shim.restore();
+      }
+
+      // The branch's commit is untouched, and no ownership marker survives a rebase that never began.
+      expect(branchTip(branch)).toBe(uniqueSha);
+      const markerPath = execFileSync(
+        "git",
+        ["-C", first.path, "rev-parse", "--path-format=absolute", "--git-path", "ANTON_REFRESH_IN_PROGRESS"],
+        { encoding: "utf8" },
+      ).trim();
+      expect(existsSync(markerPath)).toBe(false);
+    });
+
     it("skips refreshing a dirty reused worktree instead of discarding its uncommitted work", async () => {
       // A dirty reused checkout is what a run parked on a usage limit or a `needs-human` ask leaves
       // behind on purpose (PR #279 review) — refusing the whole resume here would strand it forever,

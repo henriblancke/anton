@@ -1170,6 +1170,17 @@ async function refreshOntoBase(opts: {
   try {
     await git(worktreePath, rebaseArgs, hooksPath);
   } catch (err) {
+    // A `pre-rebase` hook (or any other failure before git writes rebase state) leaves nothing for
+    // `--abort` to abort — it would fail with "No rebase in progress", which is not a recovery
+    // failure and must not be reported as one (PR #279 review, P2). Check what's actually on disk
+    // first: only run `--abort` when a rebase genuinely started.
+    if ((await unfinishedGitOperation(worktreePath)) !== "rebase") {
+      await rm(markerPath, { force: true }).catch(() => undefined);
+      throw new Error(
+        `[worktree] ${branch} could not be rebased onto ${baseBranch} — the rebase never started ` +
+          `(${gitError(err)}). Resolve in ${worktreePath} and retry.`,
+      );
+    }
     // Same abort-failure discipline as the merge path above: only clear the marker once `--abort`
     // actually succeeds, so a failed abort (e.g. a transient index lock) still leaves the rebase
     // recognizable as this function's own on the next resume (PR #279 review, P2).
