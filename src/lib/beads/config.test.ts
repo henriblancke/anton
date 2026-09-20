@@ -6,6 +6,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -498,6 +499,37 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
   });
 
   /**
+   * The same escape one level UP (PR #307 review, second P1). Checking only the final component is
+   * not enough: `lstat` on it resolves every ancestor, so a symlinked `formulas/` reports its
+   * target's contents as ordinary files and the check passes — and `mkdirSync(recursive)` is
+   * satisfied by a symlink to a directory, creating nothing. The copy then lands outside the repo.
+   */
+  it("refuses a symlinked formulas/ directory, so the copy cannot land outside the repo", () => {
+    const dir = beadsDir();
+    const outside = join(dir, "..", "outside-dir");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, BEAD_FORMULA_FILENAME), "NOT ANTON'S TO OVERWRITE");
+    symlinkSync(outside, join(dir, "formulas"));
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("SYMLINK");
+    expect(readFileSync(join(outside, BEAD_FORMULA_FILENAME), "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
+  });
+
+  it("refuses a symlinked .beads workspace directory for the same reason", () => {
+    const parent = mkdtempSync(join(tmpdir(), "anton-formula-link-"));
+    dirs.push(parent);
+    const real = join(parent, "real-beads");
+    mkdirSync(join(real, "formulas"), { recursive: true });
+    const linked = join(parent, ".beads");
+    symlinkSync(real, linked);
+
+    expect(ensureBeadFormula(linked).status).toBe("unsafe-dest");
+    expect(existsSync(join(real, "formulas", BEAD_FORMULA_FILENAME))).toBe(false);
+  });
+
+  /**
    * The backup is a SECOND write to a path the repo names, so it gets the same refusal. Skipping it
    * must not block the install — git still holds the durable copy — but `detail` then has to stop
    * promising a backup that was never written.
@@ -525,17 +557,34 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
-  it("reports a write failure instead of aborting the setup around it", () => {
-    // An unwritable `.beads/` (read-only checkout, no permission, a `formulas` path that isn't a
-    // directory) must not take down project registration — the formula is one best-effort step
-    // among a dozen and anton's renderer falls back to its packaged copy. A throw here aborted
-    // `anton setup` / addProject outright.
+  it("reports a non-directory formulas/ path instead of aborting the setup around it", () => {
+    // An unusable `.beads/formulas` (here: a plain file where the directory belongs) must not take
+    // down project registration — the formula is one best-effort step among a dozen and anton's
+    // renderer falls back to its packaged copy. A throw here aborted `anton setup` / addProject
+    // outright. It reports "unsafe-dest" rather than the "failed" it used to: the directory check
+    // now names the problem up front instead of letting `mkdirSync` throw an ENOTDIR at it.
     const dir = beadsDir();
     writeFileSync(join(dir, "formulas"), "not a directory");
 
     const result = ensureBeadFormula(dir);
-    expect(result.status).toBe("failed");
-    expect(result.detail).toBeTruthy();
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("not a directory");
+  });
+
+  it("reports a genuine write failure rather than throwing", () => {
+    // The other half of the above, still reachable: `formulas/` is a real directory and the path
+    // passes every safety check, but the write itself fails — a read-only checkout, no permission.
+    const dir = beadsDir();
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    chmodSync(join(dir, "formulas"), 0o500); // r-x: the copy cannot create a file here
+
+    try {
+      const result = ensureBeadFormula(dir);
+      expect(result.status).toBe("failed");
+      expect(result.detail).toBeTruthy();
+    } finally {
+      chmodSync(join(dir, "formulas"), 0o700); // so afterEach can clean up
+    }
   });
 
   it("resolves the bundled asset from the package, not the cwd", () => {

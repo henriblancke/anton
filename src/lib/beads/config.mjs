@@ -515,7 +515,11 @@ function ensureFormula(beadsDir, filename, src) {
   // Refused before the comparison, not just before the write: reading through a symlink to decide
   // "already" would let a link that happens to point at an identical file pass silently, leaving a
   // link where the installer reports a file.
-  const unsafe = present ? unsafeDestDetail(dest, filename) : undefined;
+  //
+  // The DIRECTORY is checked whether or not a file is there, because an absent `dest` is reached
+  // through it too — `mkdirSync(..., {recursive: true})` is satisfied by a symlink to a directory
+  // and creates nothing, so the copy lands wherever the link points.
+  const unsafe = unsafeDirDetail(beadsDir) ?? (present ? unsafeDestDetail(dest, filename) : undefined);
   if (unsafe) return { status: "unsafe-dest", detail: unsafe };
 
   if (present) {
@@ -573,6 +577,43 @@ function lstatOrUndefined(path) {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Why the `formulas/` directory under `beadsDir` must not be written INTO, or undefined when the
+ * path from the workspace down to it is real directories all the way.
+ *
+ * Checking the destination file alone is not enough (PR #307 review, second P1): `lstat` on the
+ * final component resolves every ANCESTOR, so a `.beads/formulas` that is a symlink to a directory
+ * outside the repo reports its target's contents as ordinary files and the check passes. Nor does
+ * the `mkdirSync(..., {recursive: true})` below catch it — a symlink to an existing directory
+ * satisfies it and it creates nothing. The copy then lands outside the repo, which is the same
+ * escape the final-component check closed, one level up. Reproduced before fixing: a symlinked
+ * `formulas/` had `ensureBeadFormula` return "replaced" over an external file.
+ *
+ * Each segment is walked and `lstat`ed itself, so no link anywhere on the path is followed. A
+ * segment that does not exist yet is fine — that is the fresh-install case, and `mkdirSync` will
+ * create a real directory there.
+ */
+function unsafeDirDetail(beadsDir) {
+  // `.beads` itself is an ancestor of the write too, and a symlinked workspace directory is the
+  // same escape one level further up.
+  for (const [dir, label] of [
+    [beadsDir, ".beads"],
+    [join(beadsDir, "formulas"), ".beads/formulas"],
+  ]) {
+    const stat = lstatOrUndefined(dir);
+    if (stat === undefined) return undefined; // not there yet — mkdirSync makes a real one
+    if (stat.isSymbolicLink()) {
+      return (
+        `${label} is a SYMLINK — refusing to install through it. The formula would be written to ` +
+        `the link's target, which may be outside the repository. Replace it with a real directory ` +
+        `and re-run.`
+      );
+    }
+    if (!stat.isDirectory()) return `${label} exists but is not a directory — refusing to install into it`;
+  }
+  return undefined;
 }
 
 /**
