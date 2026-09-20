@@ -18,6 +18,21 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+/** Deterministically fails the refresh marker's own removal — see the "fails closed" test below. */
+const markerRemovalFailure = vi.hoisted(() => ({ enabled: false }));
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    rm(path: Parameters<typeof actual.rm>[0], opts?: Parameters<typeof actual.rm>[1]) {
+      if (markerRemovalFailure.enabled && String(path).endsWith("ANTON_REFRESH_IN_PROGRESS")) {
+        return Promise.reject(new Error("simulated marker removal failure"));
+      }
+      return actual.rm(path, opts);
+    },
+  };
+});
+
 import { execFileSync } from "node:child_process";
 import {
   existsSync,
@@ -312,6 +327,43 @@ suite("worktree manager (real git)", () => {
       } finally {
         log.mockRestore();
       }
+    });
+
+    // anton-s55u (PR #279 review, P1): a caller with its own durable record (execute-epic-claim.ts's
+    // run row) needs to persist the boundary a refresh is ABOUT to apply before the mutating git call
+    // runs — a process killed between the mutation landing and that caller's own finalize write would
+    // otherwise leave nothing behind for a resume to recover. `beforeMutate` is the hook that lets it.
+    it("invokes beforeMutate with the resolved base sha before the mutating rebase runs, and awaits it", async () => {
+      const branch = "anton/refresh-before-mutate-rebase";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+      const preRebaseHead = headOf(first.path);
+
+      advanceDefaultBranch("before-mutate-rebase.txt", "advance\n", "advance main (before-mutate rebase)");
+      const freshMain = branchTip(defaultBranch());
+
+      const seenAtCallTime: { headOfBranch: string; arg: string }[] = [];
+      const beforeMutate = vi.fn(async (baseSha: string) => {
+        // The branch must still be exactly where it was before this refresh touched it — proves the
+        // hook fires BEFORE the mutation, not after.
+        seenAtCallTime.push({ headOfBranch: headOf(first.path), arg: baseSha });
+      });
+
+      const second = await createWorktree({
+        repoPath: repo,
+        branch,
+        baseBranch: defaultBranch(),
+        refresh: true,
+        forkSha: first.forkSha,
+        beforeMutate,
+      });
+
+      expect(beforeMutate).toHaveBeenCalledTimes(1);
+      expect(beforeMutate).toHaveBeenCalledWith(freshMain);
+      expect(seenAtCallTime).toEqual([{ headOfBranch: preRebaseHead, arg: freshMain }]);
+      expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
     });
 
     // PR #279 review, sixth round: `git rebase --rebase-merges` reconstructs a merge commit by
@@ -700,6 +752,40 @@ suite("worktree manager (real git)", () => {
       } finally {
         log.mockRestore();
       }
+    });
+
+    // anton-s55u (PR #279 review, P2): if the marker's own removal fails right after a SUCCESSFUL
+    // merge, silently swallowing that failure would leave the marker in place with nothing left
+    // "in progress" to justify it. A later resume's `unfinishedGitOperation` check only asks whether
+    // the marker exists — so if an agent later parks its own conflicted merge/rebase on this same
+    // checkout, that stale marker would make the next refresh misread it as ITS OWN interrupted
+    // operation and abort it, discarding the agent's partial conflict resolution. Must fail loud
+    // instead, leaving the marker as a visible signal for a human rather than a silent trap.
+    it("fails closed when clearing the refresh marker fails after a successful merge", async () => {
+      const branch = "anton/refresh-marker-cleanup-failure-merge";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const uniqueSha = headOf(first.path);
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, uniqueSha], { cwd: repo });
+      advanceDefaultBranch("marker-cleanup-merge.txt", "advance\n", "advance main (marker cleanup, merge)");
+
+      markerRemovalFailure.enabled = true;
+      try {
+        await expect(
+          createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch(), refresh: true }),
+        ).rejects.toThrow(/could not clear the refresh ownership marker/);
+      } finally {
+        markerRemovalFailure.enabled = false;
+      }
+
+      // The merge itself DID land — this fails closed on cleanup, not on the merge.
+      const mergeBase = execFileSync("git", ["-C", first.path, "merge-base", uniqueSha, branch], {
+        encoding: "utf8",
+      }).trim();
+      expect(mergeBase).toBe(uniqueSha);
+      expect(existsSync(join(first.path, "marker-cleanup-merge.txt"))).toBe(true);
     });
 
     // anton-s55u (PR #279 review, second round): a retry can merge a newer base into an already-

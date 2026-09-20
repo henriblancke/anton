@@ -24,9 +24,11 @@ import {
 import { resolveOperator } from "../operator";
 import {
   BRANCH_RECREATED_REFRESH_TOMBSTONE,
+  findPendingRefreshShaForBranch,
   findRunBaseForkShaForBranch,
   findRunBaseRefreshShaForBranch,
   getRunBaseForkSha,
+  PENDING_REFRESH_OUTCOME,
   updateRun,
 } from "../runs";
 import { PoisonEpic } from "./errors";
@@ -147,6 +149,25 @@ export async function warmRunWorktree(
   // The most recently applied base IS still on the branch — it's what everything got rebased onto —
   // and describes exactly the boundary a second `--onto` needs.
   const priorEffectiveRefreshSha = await findRunBaseRefreshShaForBranch(db, projectId, run.targetId, branch);
+  // A PRIOR attempt on this branch may have started a merge/rebase and never lived to finalize its
+  // row with the real outcome (PR #279 review, P1) — `beforeMutate` below is what leaves that
+  // "pending" trace, for exactly the process-killed-mid-mutation gap the finalize write in the try
+  // block can't cover on its own (a hard kill runs no catch). Not trusted blindly: a kill BEFORE the
+  // mutating git call ever ran leaves this pending but never applied, and preferring it regardless
+  // would derive `--onto` from a boundary the branch was never actually moved onto. Reconciled
+  // against the branch's own history instead — the one thing a completed-but-unrecorded mutation and
+  // nothing else leaves behind. `pendingRefreshSha` was itself resolved, by the dead attempt, through
+  // the same safety checks `refreshOntoBase` always runs before its mutating call, so trusting it
+  // once it's actually reachable on the branch carries none of the risk a raw merge-base
+  // reconstruction against a possibly-rewritten base would (see `refreshOntoBase`'s own extensive
+  // reasoning on why a plain merge-base isn't safe here).
+  const pendingRefreshSha = await findPendingRefreshShaForBranch(db, projectId, run.targetId, branch);
+  const reconciledRefreshSha =
+    pendingRefreshSha !== undefined &&
+    pendingRefreshSha !== priorEffectiveRefreshSha &&
+    (await isAncestor(repo, pendingRefreshSha, `refs/heads/${branch}`).catch(() => false))
+      ? pendingRefreshSha
+      : priorEffectiveRefreshSha;
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -164,8 +185,25 @@ export async function warmRunWorktree(
     // from base by design and must never be rebased underneath an already-pushed PR).
     refresh: true,
     preserveShas,
-    forkSha: priorEffectiveRefreshSha ?? knownForkSha,
+    forkSha: reconciledRefreshSha ?? knownForkSha,
     baseIsAuthoritative,
+    // The write-ahead half of the pending-refresh recovery above (PR #279 review, P1): persisted
+    // BEFORE refreshOntoBase's mutating merge/rebase call, under the same branch lock, so a process
+    // killed anywhere after this point — mid-mutation, or after it lands but before this call
+    // returns and the normal finalize write below runs — leaves a durable trace of the boundary the
+    // mutation targeted instead of nothing at all. Best-effort: a failure to persist intent doesn't
+    // block the refresh itself, it just leaves this attempt exactly as exposed to a hard kill as
+    // before this mechanism existed.
+    beforeMutate: (baseSha) =>
+      updateRun(db, clock, runId, {
+        baseRefreshOutcome: PENDING_REFRESH_OUTCOME,
+        baseRefreshSha: baseSha,
+      }).catch((persistError) => {
+        console.error(
+          `[execute-epic] could not persist the pending refresh boundary for ${branch} before mutating it`,
+          persistError,
+        );
+      }),
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
@@ -212,7 +250,17 @@ export async function warmRunWorktree(
   // (every row starts that way), so a later walk over this branch's rows can't tell "nothing
   // recorded" from "deliberately cleared" without a value only a genuine recreation ever writes —
   // see the constant's own doc comment for how `findRunBaseRefreshShaForBranch` reads it back.
-  const refreshFields = worktree.createdBranch
+  //
+  // Gated on actual evidence of an OLDER row for this branch (`knownForkSha`, `priorEffectiveRefreshSha`,
+  // or `pendingRefreshSha`, all resolved above, before this checkout existed) — `createdBranch` alone
+  // doesn't distinguish a genuine deletion-and-recreation from this branch's very first-ever creation,
+  // which is exactly as fresh as a brand-new row and has no older, potentially-stale pair to guard
+  // against. Writing the tombstone unconditionally there left a first attempt's row reading as though
+  // something had been recreated when nothing ever existed to recreate.
+  const isRecreatedBranch =
+    worktree.createdBranch &&
+    (knownForkSha !== undefined || priorEffectiveRefreshSha !== undefined || pendingRefreshSha !== undefined);
+  const refreshFields = isRecreatedBranch
     ? { baseRefreshOutcome: BRANCH_RECREATED_REFRESH_TOMBSTONE, baseRefreshSha: null }
     : worktree.refreshOutcome &&
         !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)

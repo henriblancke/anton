@@ -598,6 +598,100 @@ it("passes the last EFFECTIVE refresh's base as the --onto boundary, in preferen
   );
 });
 
+// anton-s55u (PR #279 review, P1): a process killed between `createWorktree`'s refresh actually
+// mutating the branch and this function's own finalize write leaves nothing behind for a plain
+// exception-catch to recover, since a hard kill runs no catch at all. `beforeMutate` closes that
+// gap by persisting a "pending" marker naming the boundary the mutation is ABOUT to apply, before
+// the mutating git call ever runs — see PENDING_REFRESH_OUTCOME's own doc comment.
+it("persists a pending refresh boundary via beforeMutate before the mutating git call resolves, recoverable if the process dies before finalize", async () => {
+  let baseRefreshOutcomeDuringMutation: string | null | undefined;
+  createWorktreeMock.mockImplementation(
+    async (opts: { beforeMutate?: (sha: string) => Promise<void> }) => {
+      await opts.beforeMutate?.("about-to-refresh-onto-this");
+      baseRefreshOutcomeDuringMutation = (await actualRuns.getRunById(t.db, RUN_ID))?.baseRefreshOutcome;
+      return {
+        path: WORKTREE,
+        branch: BRANCH,
+        baseBranch: FRESH_BASE,
+        createdBranch: false,
+        repoPath: "/repo",
+        refreshOutcome: { outcome: "rebased", baseSha: "about-to-refresh-onto-this" },
+      };
+    },
+  );
+
+  await warmRunWorktree(makeRun());
+
+  // The pending marker was durably on the row DURING the (simulated) mutation window — a kill right
+  // there would leave this behind for a resume to recover, instead of nothing at all.
+  expect(baseRefreshOutcomeDuringMutation).toBe(actualRuns.PENDING_REFRESH_OUTCOME);
+  // The normal finalize write still overwrites it with the real outcome once createWorktree returns.
+  const row = await actualRuns.getRunById(t.db, RUN_ID);
+  expect(row?.baseRefreshOutcome).toBe("rebased");
+  expect(row?.baseRefreshSha).toBe("about-to-refresh-onto-this");
+});
+
+it("reconciles a pending refresh onto the boundary a crashed attempt actually applied, once the branch's own history confirms it landed", async () => {
+  // Attempt 1 started (but never lived to finalize) a refresh onto `pending-base` — its row is
+  // still stuck on PENDING_REFRESH_OUTCOME. The branch's own history now confirms it actually
+  // landed (the mutation succeeded; only the finalize write never ran).
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    return ancestor === "pending-base" && descendant === `refs/heads/${BRANCH}`;
+  });
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "pending-base" }),
+  );
+});
+
+it("ignores a pending refresh that never actually landed on the branch, falling back to the last confirmed boundary", async () => {
+  // Same shape as above, but the crashed attempt's mutation never actually reached the branch (it
+  // died before the git call ran, or the operation was aborted) — the pending sha must NOT be
+  // trusted as an `--onto` boundary the branch was never really moved onto.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base-never-applied",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  isAncestorMock.mockResolvedValue(false);
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
 it("falls back to the original fork as the --onto boundary when no branch row ever recorded an effective refresh", async () => {
   await actualRuns.updateRun(t.db, clock, RUN_ID, { baseForkSha: "trueforkcommit", branch: BRANCH });
   createWorktreeMock.mockResolvedValue({

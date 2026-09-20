@@ -582,6 +582,30 @@ async function refreshMarkerPath(worktreePath: string): Promise<string> {
 }
 
 /**
+ * Clears the ownership marker once its merge/rebase actually SUCCEEDED — fails loud instead of
+ * swallowing the removal error (PR #279 review, P2). A marker left behind after a SUCCESSFUL
+ * operation is stale in a way nothing else ever checks for: the next resume's `unfinishedGitOperation`
+ * guard above only asks whether the marker exists, not whether it's current, so a stale marker would
+ * make it misread an agent's own later, deliberately parked conflict on this same checkout as this
+ * refresh's own interrupted operation — and abort it, discarding partial resolution work parking
+ * exists to preserve. Deliberately NOT reused for the abort-recovery paths elsewhere in this function:
+ * those already clear the marker only once `--abort` itself succeeds, and swallow a stale-marker
+ * removal on the "nothing to abort" branch — both by design (see their own comments).
+ */
+async function clearRefreshMarkerOrThrow(markerPath: string, describeSuccess: string): Promise<void> {
+  try {
+    await rm(markerPath, { force: true });
+  } catch (err) {
+    throw new Error(
+      `[worktree] ${describeSuccess}, but could not clear the refresh ownership marker at ${markerPath} ` +
+        `(${gitError(err)}) — leaving it in place would make a later resume misread an agent's own ` +
+        `parked conflict on this checkout as this refresh's interrupted operation and discard it. Remove ` +
+        `the marker manually, then resume the run.`,
+    );
+  }
+}
+
+/**
  * Bring a REUSED checkout's branch up to `baseBranch` before anything is dispatched against it
  * (anton-s55u). Without this, a worktree/branch picked back up from a parked or failed run keeps
  * whatever base it was cut from — a resumed run can silently implement, test, and self-review
@@ -671,8 +695,21 @@ async function refreshOntoBase(opts: {
    * exactly as safe as before this parameter existed.
    */
   baseIsAuthoritative?: boolean;
+  /**
+   * Invoked exactly once, immediately before the merge or rebase call that actually mutates
+   * `branch` — never for the noop/fast-forward/skipped-dirty outcomes above, which return before
+   * ever reaching here and need no crash-recovery story of their own (a fast-forward is safe to
+   * blindly redo). This function has no DB of its own to persist intent to (anton-s55u, PR #279
+   * review, P1) — that lives in the run row execute-epic-claim.ts owns, and only ITS caller can
+   * write there before handing off to a call that can leave the branch mutated with nothing durable
+   * recording it, should the process die before this call returns and its caller's own finalize
+   * write runs. Awaited before the mutation proceeds, so a caller that means this as a durable
+   * write-ahead record has it on disk (or knows it failed) before anything moves.
+   */
+  beforeMutate?: (baseSha: string) => Promise<void>;
 }): Promise<RefreshOutcome> {
-  const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha, baseIsAuthoritative } = opts;
+  const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha, baseIsAuthoritative, beforeMutate } =
+    opts;
 
   let baseSha: string;
   try {
@@ -971,13 +1008,11 @@ async function refreshOntoBase(opts: {
     // resume's `unfinishedGitOperation` check can tell THIS merge apart from an agent's own
     // (see `refreshMarkerPath`'s doc comment).
     await writeFile(markerPath, "", "utf8").catch(() => undefined);
+    // The caller's own write-ahead record, if any — awaited so it lands before the mutation it
+    // describes (see `beforeMutate`'s own doc comment).
+    await beforeMutate?.(baseSha);
     try {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
-      await rm(markerPath, { force: true }).catch(() => undefined);
-      console.log(
-        `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ${mergeReason}`,
-      );
-      return { outcome: "merged", baseSha };
     } catch (err) {
       // Marker removed only once the abort actually succeeds — same discipline as the
       // unfinished-operation recovery above: a failed `--abort` (e.g. a transient index lock)
@@ -1006,6 +1041,16 @@ async function refreshOntoBase(opts: {
           `(${gitError(err)})`,
       );
     }
+    // Cleared OUTSIDE the merge's own try/catch above (PR #279 review, P2): a removal failure here
+    // has nothing to do with the merge itself, which already succeeded — reporting it through the
+    // merge-conflict catch above would wrongly attempt `git merge --abort` on a merge that isn't
+    // in progress anymore, and misreport a marker-cleanup failure as a merge conflict.
+    await clearRefreshMarkerOrThrow(
+      markerPath,
+      `merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch}`,
+    );
+    console.log(`[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ${mergeReason}`);
+    return { outcome: "merged", baseSha };
   }
 
   // Without a trustworthy pin there is no safe fallback (PR #279 review, P1): the plain one-argument
@@ -1032,11 +1077,10 @@ async function refreshOntoBase(opts: {
   // Same marker discipline as the merge above: written right before the call that can leave a
   // conflicted rebase in progress, so a later resume can tell this rebase apart from an agent's own.
   await writeFile(markerPath, "", "utf8").catch(() => undefined);
+  // Same write-ahead record as the merge path above.
+  await beforeMutate?.(baseSha);
   try {
     await git(worktreePath, rebaseArgs, hooksPath);
-    await rm(markerPath, { force: true }).catch(() => undefined);
-    console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
-    return { outcome: "rebased", baseSha };
   } catch (err) {
     // Same abort-failure discipline as the merge path above: only clear the marker once `--abort`
     // actually succeeds, so a failed abort (e.g. a transient index lock) still leaves the rebase
@@ -1062,6 +1106,12 @@ async function refreshOntoBase(opts: {
         `${worktreePath} and retry (${gitError(err)})`,
     );
   }
+  // Cleared OUTSIDE the rebase's own try/catch above, for the same reason as the merge path (PR #279
+  // review, P2): a removal failure here has nothing to do with the rebase itself, which already
+  // succeeded.
+  await clearRefreshMarkerOrThrow(markerPath, `rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
+  console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
+  return { outcome: "rebased", baseSha };
 }
 
 /**
@@ -1224,6 +1274,7 @@ async function reuseIfPresent(
   preserveShas: string[] | undefined,
   forkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
+  beforeMutate: ((baseSha: string) => Promise<void>) | undefined,
 ): Promise<Worktree | undefined> {
   if (!existing || !existsSync(existing.path)) return undefined;
   if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
@@ -1236,6 +1287,7 @@ async function reuseIfPresent(
     preserveShas,
     forkSha,
     baseIsAuthoritative,
+    beforeMutate,
   });
   return { ...existing, refreshOutcome };
 }
@@ -1250,6 +1302,7 @@ async function materializeFreshWorktree(
   preserveShas: string[] | undefined,
   knownForkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
+  beforeMutate: ((baseSha: string) => Promise<void>) | undefined,
 ): Promise<Worktree> {
   const path = worktreePathFor(repoPath, branch);
   await mkdir(dirname(path), { recursive: true });
@@ -1274,6 +1327,7 @@ async function materializeFreshWorktree(
       preserveShas,
       forkSha: knownForkSha,
       baseIsAuthoritative,
+      beforeMutate,
     });
     const refreshedForkSha = await readForkAtCreation(path);
     return { path: resolved, branch, baseBranch, forkSha: refreshedForkSha, createdBranch, repoPath, refreshOutcome };
@@ -1292,6 +1346,7 @@ async function materializeClaimedWorktree(
   preserveShas: string[] | undefined,
   forkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
+  beforeMutate: ((baseSha: string) => Promise<void>) | undefined,
 ): Promise<Worktree> {
   const { claimed, existing, baseBranch } = await resolveClaimForCreate(repoPath, branch, baseBranchOpt, claimedBy);
   const reused = await reuseIfPresent(
@@ -1304,11 +1359,22 @@ async function materializeClaimedWorktree(
     preserveShas,
     forkSha,
     baseIsAuthoritative,
+    beforeMutate,
   );
   if (reused) return reused;
   // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
   if (existing) await forgetStaleWorktree(repoPath, existing.path);
-  return materializeFreshWorktree(repoPath, branch, baseBranch, claimed, refresh, preserveShas, forkSha, baseIsAuthoritative);
+  return materializeFreshWorktree(
+    repoPath,
+    branch,
+    baseBranch,
+    claimed,
+    refresh,
+    preserveShas,
+    forkSha,
+    baseIsAuthoritative,
+    beforeMutate,
+  );
 }
 
 export async function createWorktree(opts: {
@@ -1342,6 +1408,8 @@ export async function createWorktree(opts: {
    * came from a confirmed fetch (e.g. `resolveFreshBase`'s success path) or a best-effort fallback.
    */
   baseIsAuthoritative?: boolean;
+  /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
+  beforeMutate?: (baseSha: string) => Promise<void>;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -1358,6 +1426,7 @@ export async function createWorktree(opts: {
       opts.preserveShas,
       opts.forkSha,
       opts.baseIsAuthoritative,
+      opts.beforeMutate,
     ),
   );
 

@@ -352,7 +352,72 @@ export async function findRunBaseRefreshShaForBranch(
   for (const row of rows) {
     if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
     if (row.baseRefreshOutcome === "skipped_dirty") continue;
+    // A still-PENDING row (see PENDING_REFRESH_OUTCOME below) records what a dead attempt INTENDED,
+    // not a confirmed outcome — trusting its sha here as if it were a settled boundary would recreate
+    // exactly the unsafe blind trust this whole mechanism exists to avoid, just via a new sentinel
+    // instead of stale data. Skipped like `skipped_dirty`, not treated as a wall like the tombstone:
+    // an OLDER row's genuinely confirmed boundary is still the right answer until something
+    // reconciles the pending one. See `findPendingRefreshShaForBranch` for how a caller with git
+    // access resolves it.
+    if (row.baseRefreshOutcome === PENDING_REFRESH_OUTCOME) continue;
     if (row.baseRefreshSha) return row.baseRefreshSha;
+  }
+  return undefined;
+}
+
+/**
+ * Written onto a row's `baseRefreshOutcome`, in place of a real outcome, the instant
+ * execute-epic-claim.ts is about to hand a reused checkout's branch to a mutating merge/rebase
+ * (anton-s55u, PR #279 review, P1) — BEFORE that git call runs, not after. Without it, a process
+ * killed between the mutation actually landing and the normal finalize write (`refreshFields`)
+ * leaves nothing durable behind: the catch-based best-effort retry that recovers from a thrown
+ * exception never runs for a hard kill, so a later resume would derive its `--onto` boundary from
+ * the older, now-stale `findRunBaseRefreshShaForBranch` result and could replay commits the
+ * unrecorded mutation already folded into the branch as if they were still-unapplied base history.
+ * This sentinel is what that resume finds instead — see {@link findPendingRefreshShaForBranch} for
+ * how it turns this into a trustworthy boundary.
+ */
+export const PENDING_REFRESH_OUTCOME = "pending";
+
+/**
+ * The sha a still-PENDING refresh (see {@link PENDING_REFRESH_OUTCOME}) recorded for this branch —
+ * some attempt began a merge/rebase onto this sha and never lived to finalize its row with a real
+ * outcome. Undefined once a NEWER row on this branch recorded a real outcome (an attempt that
+ * finished its own refresh cleanly, whether or not it's the same one that went pending) or the
+ * recreation tombstone (the branch the pending sha describes is gone).
+ *
+ * Walked exactly like {@link findRunBaseRefreshShaForBranch} and for the same reason: attempts don't
+ * all share a row, and a `skipped_dirty` row in between must be skipped rather than mistaken for the
+ * answer. Returning undefined here is not itself proof nothing is pending — it means the newest
+ * row that actually settled something settled it for real, so whatever this function would have
+ * found is already superseded.
+ *
+ * A sha this returns is not yet trustworthy on its own: it describes what a dead attempt INTENDED,
+ * not what it necessarily achieved. The caller (execute-epic-claim.ts) is the one with git access to
+ * check whether it actually landed on the branch before treating it as a boundary.
+ */
+export async function findPendingRefreshShaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ baseRefreshOutcome: schema.runs.baseRefreshOutcome, baseRefreshSha: schema.runs.baseRefreshSha })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.baseRefreshOutcome),
+      ),
+    )
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt));
+  for (const row of rows) {
+    if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
+    if (row.baseRefreshOutcome === "skipped_dirty") continue;
+    return row.baseRefreshOutcome === PENDING_REFRESH_OUTCOME ? (row.baseRefreshSha ?? undefined) : undefined;
   }
   return undefined;
 }
