@@ -654,18 +654,21 @@ async function refreshOntoBase(opts: {
    */
   forkSha?: string;
   /**
-   * Whether `baseBranch` resolved from a CONFIRMED fetch of `origin/<baseBranch>` (anton-nyz1v, PR
-   * #279 review, fifth round) — `resolveFreshBase`'s success path, as opposed to its best-effort
-   * fallback to the plain local branch name when the fetch failed or there was no remote. The two
-   * shapes below that leave a checkout untouched when `baseSha` sits BEHIND `branch`'s own fork point
-   * are safe ONLY for that fallback: there, `baseSha` being behind the fork just means this repo's
-   * last successful fetch predates a NEWER commit `branch` already forked from, and origin genuinely
-   * still has both — nothing to reconcile. A CONFIRMED fetch landing behind the fork means the
-   * opposite: origin's tip was force-pushed or recreated BACKWARD past that commit, so it's the fork
-   * point that's now stale, not this reading of origin — `baseSha` is the authoritative truth, and
-   * leaving `branch` untouched would let its eventual PR silently reintroduce whatever origin's
-   * rewind just dropped. Defaults to `false` (the conservative, no-op-preferring reading) so a caller
-   * that never resolves this stays exactly as safe as before this parameter existed.
+   * Whether `baseSha` is authoritative truth rather than a possibly-stale reading (anton-nyz1v, PR
+   * #279 review, fifth and sixth rounds) — true for a CONFIRMED fetch of `origin/<baseBranch>`
+   * (`resolveFreshBase`'s success path) AND for a repo with no `origin` remote at all (there is
+   * nothing else for the local branch to be stale relative to). False only for `resolveFreshBase`'s
+   * remaining fallback shape: a repo that HAS an origin but whose fetch just failed. The two shapes
+   * below that leave a checkout untouched when `baseSha` sits BEHIND `branch`'s own fork point are
+   * safe ONLY for that failed-fetch case: there, `baseSha` being behind the fork just means this
+   * repo's last successful fetch predates a NEWER commit `branch` already forked from, and origin
+   * genuinely still has both — nothing to reconcile. An authoritative `baseSha` landing behind the
+   * fork means the opposite: the true base's tip was force-pushed or recreated BACKWARD past that
+   * commit (on origin, or — with no remote — locally), so it's the fork point that's now stale, not
+   * this reading of the base — `baseSha` is the authoritative truth, and leaving `branch` untouched
+   * would let its eventual PR silently reintroduce whatever the rewind just dropped. Defaults to
+   * `false` (the conservative, no-op-preferring reading) so a caller that never resolves this stays
+   * exactly as safe as before this parameter existed.
    */
   baseIsAuthoritative?: boolean;
 }): Promise<RefreshOutcome> {
@@ -894,6 +897,34 @@ async function refreshOntoBase(opts: {
     return { outcome: "noop", baseSha: forkSha };
   }
 
+  // `--onto <baseSha> <forkSha> <branch>` transplants exactly `forkSha..branch` (branch's own
+  // commits since it actually forked) onto `baseSha`, with no requirement that `baseSha` still
+  // descend from `forkSha` — so it stays correct even for a `baseBranch` that was force-pushed or
+  // recreated past the real fork point. A fork point that isn't actually on `branch` (a stale or
+  // mismatched pin) is ignored, same as no pin at all. Resolved here, ahead of the published/
+  // preserved/merge-commit checks below, because the merge-commit one needs it too.
+  const trustedForkSha =
+    forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
+
+  // `git rebase --rebase-merges` does not replay a merge commit's recorded TREE — it reconstructs
+  // the merge by re-merging its parents from scratch. Anything that tree recorded beyond a clean
+  // auto-merge of those parents (a conflict resolved differently than the auto-merge would, or a
+  // file added while resolving) is silently dropped: the reconstructed merge has no conflicts of its
+  // own, so the rebase reports success even though it isn't the same tree the original merge commit
+  // recorded (P1, PR #279 review, sixth round — reproduced against git 2.43; `git rebase -h` only
+  // promises to "try to rebase merges instead of skipping them", never to preserve their content).
+  // There is no git flag that replays the ORIGINAL tree instead, so a range containing a merge
+  // commit is never rewritten by rebase here: it takes the same non-rewriting merge path below
+  // already used for published/preserved branches, which leaves every existing commit's tree — merge
+  // commits included — untouched. Scoped to `trustedForkSha..branch`, the same range `--onto` would
+  // otherwise replay; left `false` without a trusted pin to scope it, since that shape already fails
+  // closed at the "no trustworthy fork-point pin" throw below regardless of merge commits.
+  const hasMergeCommit =
+    trustedForkSha !== undefined &&
+    (
+      await git(worktreePath, ["log", "--merges", "--oneline", `${trustedForkSha}..${branch}`])
+    ).length > 0;
+
   // `hasCommonHistory` above only demands SOME shared ancestor, not that `baseSha` still descends
   // from the branch's own pinned fork point — a base that was force-pushed BEHIND that fork but still
   // shares an OLDER ancestor with it passes that check regardless. The merge below is unsafe in
@@ -901,14 +932,16 @@ async function refreshOntoBase(opts: {
   // forked from them), so merging a base that dropped them in a rewrite reaches right back through
   // `branch`'s side of the merge and reintroduces them into the result — e.g. a branch cut at `A-B`
   // merged into a base rewritten to `A-E` leaves `B` in `E..HEAD` (PR #279 review). `--onto` rebases
-  // sidestep this by construction (see the `forkSha` doc above), so this guard only needs to cover the
-  // merge path. Checked only when `forkSha` is both known and still reachable on `branch`: an unknown
-  // or already-stale pin can't distinguish this case from an ordinary divergence, so it's left to the
-  // merge/rebase paths' own conflict handling below. The stale-base shape is already ruled out by the
-  // no-op above, so a `!isAncestor(forkSha, baseSha)` reaching here is always the genuine force-push-
-  // past-fork case.
+  // sidestep this by construction (see the `forkSha` doc above), so this guard covers every path
+  // below that merges instead of rebasing — published, preserved, and (PR #279 review, sixth round)
+  // a branch carrying a merge commit, which now merges too rather than risk `--rebase-merges`
+  // silently dropping its content. Checked only when `forkSha` is both known and still reachable on
+  // `branch`: an unknown or already-stale pin can't distinguish this case from an ordinary
+  // divergence, so it's left to the merge/rebase paths' own conflict handling below. The stale-base
+  // shape is already ruled out by the no-op above, so a `!isAncestor(forkSha, baseSha)` reaching
+  // here is always the genuine force-push-past-fork case.
   if (
-    (remotelyPublished || preservedSha) &&
+    (remotelyPublished || preservedSha || hasMergeCommit) &&
     forkSha &&
     (await branchContainsCommit(repoPath, branch, forkSha)) &&
     !(await isAncestor(worktreePath, forkSha, baseSha))
@@ -921,7 +954,19 @@ async function refreshOntoBase(opts: {
     );
   }
 
-  if (remotelyPublished || preservedSha) {
+  if (remotelyPublished || preservedSha || hasMergeCommit) {
+    const mergeReason = remotelyPublished
+      ? `its commits are already on origin, so rebasing would have rewritten published history`
+      : preservedSha
+        ? `commit ${preservedSha.slice(0, 12)} is already cited on a bead, so rebasing would have ` +
+            `made that reference unreachable`
+        : `it carries a merge commit, and --rebase-merges can silently drop content its tree ` +
+            `recorded beyond a clean re-merge of its parents`;
+    const rebaseRefusalReason = remotelyPublished
+      ? "its commits are already published"
+      : preservedSha
+        ? "its commits are already cited on a bead"
+        : "it carries a merge commit --rebase-merges could silently corrupt";
     // Written just before the call that can leave a conflicted merge in progress, so a later
     // resume's `unfinishedGitOperation` check can tell THIS merge apart from an agent's own
     // (see `refreshMarkerPath`'s doc comment).
@@ -930,11 +975,7 @@ async function refreshOntoBase(opts: {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
       await rm(markerPath, { force: true }).catch(() => undefined);
       console.log(
-        `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ` +
-          (remotelyPublished
-            ? `its commits are already on origin, so rebasing would have rewritten published history`
-            : `commit ${preservedSha!.slice(0, 12)} is already cited on a bead, so rebasing would ` +
-                `have made that reference unreachable`),
+        `[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ${mergeReason}`,
       );
       return { outcome: "merged", baseSha };
     } catch (err) {
@@ -960,20 +1001,13 @@ async function refreshOntoBase(opts: {
       );
       throw new Error(
         `[worktree] ${branch} diverges from ${baseBranch} and could not be merged onto it cleanly ` +
-          `(refusing to rebase since its commits are already ` +
-          `${remotelyPublished ? "published" : "cited on a bead"}) — refusing to discard or rewrite ` +
-          `its commits. Unique commits:\n${unique}\nResolve the conflict in ${worktreePath} and ` +
-          `retry (${gitError(err)})`,
+          `(refusing to rebase since ${rebaseRefusalReason}) — refusing to discard or rewrite its ` +
+          `commits. Unique commits:\n${unique}\nResolve the conflict in ${worktreePath} and retry ` +
+          `(${gitError(err)})`,
       );
     }
   }
 
-  // `--onto <baseSha> <forkSha> <branch>` transplants exactly `forkSha..branch` (branch's own
-  // commits since it actually forked) onto `baseSha`, with no requirement that `baseSha` still
-  // descend from `forkSha` — so it stays correct even for a `baseBranch` that was force-pushed or
-  // recreated past the real fork point. A fork point that isn't actually on `branch` (a stale or
-  // mismatched pin) is ignored, same as no pin at all.
-  //
   // Without a trustworthy pin there is no safe fallback (PR #279 review, P1): the plain one-argument
   // `git rebase <base>` replays `merge-base(baseSha, branch)..branch` — the branch's own fork point
   // only while `baseBranch` still contains it. A legacy reused checkout with no recorded
@@ -983,8 +1017,6 @@ async function refreshOntoBase(opts: {
   // rebased branch. There is no way to tell that shape apart from an ordinary, unrewritten
   // divergence without the pin, so a divergent reused branch lacking one fails closed here instead
   // of guessing.
-  const trustedForkSha =
-    forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
   if (!trustedForkSha) {
     throw new Error(
       `[worktree] ${branch} diverges from ${baseBranch} (${baseSha.slice(0, 12)}) and has no ` +
@@ -993,17 +1025,9 @@ async function refreshOntoBase(opts: {
         `fork point. Resolve manually in ${worktreePath} and retry.`,
     );
   }
-  // Plain `--onto` linearizes: it drops any merge commit in `forkSha..branch` and replays only its
-  // first-parent line, silently discarding whatever a conflict-resolution-only merge recorded in its
-  // tree even though the rebase itself reports success (PR #279 review, P1). `--rebase-merges`
-  // recreates the merge topology instead — required whenever the range actually contains one.
-  const hasMergeCommit =
-    (
-      await git(worktreePath, ["log", "--merges", "--oneline", `${trustedForkSha}..${branch}`])
-    ).length > 0;
-  const rebaseArgs = hasMergeCommit
-    ? ["rebase", "--rebase-merges", "--onto", baseSha, trustedForkSha, branch]
-    : ["rebase", "--onto", baseSha, trustedForkSha, branch];
+  // Merge commits in `trustedForkSha..branch` are diverted to the merge path above, so a plain
+  // `--onto` (which linearizes by replaying only the first-parent line) is always safe to reach here.
+  const rebaseArgs = ["rebase", "--onto", baseSha, trustedForkSha, branch];
 
   // Same marker discipline as the merge above: written right before the call that can leave a
   // conflicted rebase in progress, so a later resume can tell this rebase apart from an agent's own.

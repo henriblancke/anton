@@ -37,6 +37,7 @@ vi.mock("../git/worktree", async () => {
 const resolveFreshBaseMock = vi.fn();
 const resolveForkPointMock = vi.fn();
 const isAncestorMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
+const hasRemoteMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
@@ -44,6 +45,7 @@ vi.mock("../git/ops", async () => {
     resolveFreshBase: (...a: unknown[]) => resolveFreshBaseMock(...a),
     resolveForkPoint: (...a: unknown[]) => resolveForkPointMock(...a),
     isAncestor: (...a: unknown[]) => isAncestorMock(...a),
+    hasRemote: (...a: unknown[]) => hasRemoteMock(...a),
   };
 });
 
@@ -114,6 +116,7 @@ beforeEach(async () => {
   // fallback base an already-shipped claim would be checked against (PR #279 review). The one test
   // that means to exercise a rewritten-behind fallback overrides this itself.
   isAncestorMock.mockReset().mockResolvedValue(true);
+  hasRemoteMock.mockReset().mockResolvedValue(true);
 });
 afterEach(() => t.close());
 
@@ -124,6 +127,31 @@ it("pins the fork commit against the freshly-fetched base on a first creation", 
   expect(runStep.baseForkSha).toBe("f0f0f0forkcommit");
   // Persisted, so the resume below can read it back.
   expect(await getRunBaseForkSha(t.db, RUN_ID)).toBe("f0f0f0forkcommit");
+});
+
+it("marks the base authoritative when the repo has no origin remote, even though resolveFreshBase falls back to the local branch name (PR #279 review, sixth round)", async () => {
+  // No origin at all — resolveFreshBase's fallback here isn't a possibly-stale fetch failure, it's
+  // the ONLY source of truth this repo has, so a rewind behind the branch's fork point must be
+  // treated as authoritative rather than lumped in with the failed-fetch case.
+  resolveFreshBaseMock.mockResolvedValue("main");
+  hasRemoteMock.mockResolvedValue(false);
+
+  await warmRunWorktree(makeRun());
+
+  expect(createWorktreeMock).toHaveBeenLastCalledWith(
+    expect.objectContaining({ baseIsAuthoritative: true }),
+  );
+});
+
+it("leaves the base non-authoritative when origin exists but the fetch just failed", async () => {
+  resolveFreshBaseMock.mockResolvedValue("main");
+  hasRemoteMock.mockResolvedValue(true);
+
+  await warmRunWorktree(makeRun());
+
+  expect(createWorktreeMock).toHaveBeenLastCalledWith(
+    expect.objectContaining({ baseIsAuthoritative: false }),
+  );
 });
 
 it("propagates a creation failure when the locked reuse detection cannot inspect refs", async () => {

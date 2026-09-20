@@ -314,6 +314,56 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // PR #279 review, sixth round: `git rebase --rebase-merges` reconstructs a merge commit by
+    // RE-MERGING its parents, not by replaying the tree the original merge commit recorded — a file
+    // added (or a conflict resolved differently) while resolving that merge is silently dropped, even
+    // though the rebase itself reports success. A branch carrying a merge commit must therefore be
+    // merged onto the fresh base instead of rebased, the same non-rewriting path already used for
+    // published/preserved branches, so the merge commit's own tree is never rewritten.
+    it("merges instead of rebasing when the branch's unique history contains a merge commit, so a resolution-only change is never dropped", async () => {
+      const branch = "anton/refresh-merge-commit";
+      const first = await createWorktree({ repoPath: repo, branch });
+
+      execFileSync("git", ["-C", first.path, "checkout", "-q", "-b", "side-of-refresh-merge-commit"]);
+      writeFileSync(join(first.path, "side-work.txt"), "side branch work\n");
+      execFileSync("git", ["-C", first.path, "add", "side-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "side branch commit"]);
+      execFileSync("git", ["-C", first.path, "checkout", "-q", branch]);
+
+      // A real merge commit whose tree carries something a clean re-merge of its parents would NOT
+      // reproduce — the exact shape `--rebase-merges` cannot replay.
+      execFileSync("git", ["-C", first.path, "merge", "-q", "--no-ff", "--no-commit", "side-of-refresh-merge-commit"]);
+      writeFileSync(join(first.path, "resolution-only.txt"), "added while resolving the merge\n");
+      execFileSync("git", ["-C", first.path, "add", "resolution-only.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "merge side branch (resolution-only file)"]);
+
+      advanceDefaultBranch("merge-commit-base.txt", "advance 5i\n", "advance main (merge commit refresh)");
+      const freshMain = branchTip(defaultBranch());
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          forkSha: first.forkSha,
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(second.refreshOutcome).toEqual({ outcome: "merged", baseSha: freshMain });
+        // The merge commit's own tree — the resolution-only file a `--rebase-merges` reconstruction
+        // would never recreate — survives untouched, since the merge commit itself was never rewritten.
+        expect(existsSync(join(second.path, "resolution-only.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "side-work.txt"))).toBe(true);
+        expect(existsSync(join(second.path, "merge-commit-base.txt"))).toBe(true);
+        expect(log.mock.calls.flat().join(" ")).toContain("merged");
+        expect(log.mock.calls.flat().join(" ")).toContain("merge commit");
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     // anton-s55u (PR #279 review, P1): a legacy reused checkout with no recorded `baseForkSha`
     // reaches the rebase fallback with `forkSha` undefined. Without a pin, a plain `git rebase
     // <base>` can't be told apart from the rewritten-base shape the `--onto` test above guards —

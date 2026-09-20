@@ -12,7 +12,7 @@ import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { latestBlockNoteCommit } from "../beads/block-note";
 import { parseTicketNotes } from "../beads/notes";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
-import { isAncestor, resolveForkPoint, resolveFreshBase } from "../git/ops";
+import { hasRemote, isAncestor, resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
   createWorktree,
@@ -74,12 +74,17 @@ export async function warmRunWorktree(
   // the remote-tracking ref is the accurate fork point even when the local base has drifted.
   const freshBase = await resolveFreshBase(repo, baseBranch);
   // `resolveFreshBase` returns `origin/<baseBranch>` only once it has fetched AND verified that ref
-  // (anton-nyz1v, PR #279 review, fifth round) — anything else (no remote, a failed fetch) falls back
-  // to the plain local `<baseBranch>` name instead. `refreshOntoBase` needs to tell those apart: a
-  // fallback that reads behind this branch's own fork point is merely stale and safe to leave alone,
-  // but a CONFIRMED fetch reading the same way means origin was genuinely force-pushed or recreated
-  // behind that commit — see `baseIsAuthoritative`'s own doc comment on `refreshOntoBase`.
-  const baseIsAuthoritative = freshBase === `origin/${baseBranch}`;
+  // (anton-nyz1v, PR #279 review, fifth round) — anything else falls back to the plain local
+  // `<baseBranch>` name instead, but that fallback covers two shapes `refreshOntoBase` must NOT
+  // treat alike (P1, PR #279 review, sixth round). A FAILED fetch (this repo HAS an origin, just
+  // couldn't reach it) is merely stale: a base reading behind the branch's own fork point there
+  // just means the last successful fetch predates a commit the branch already forked from — safe
+  // to leave alone. A repo with NO origin at all has nothing to be stale relative to — the local
+  // branch IS the only source of truth, so an intentional rewind behind that fork point is exactly
+  // as authoritative as a confirmed fetch reporting the same shape from a remote would be; treating
+  // it as a stale fallback would let the branch's eventual diff silently reintroduce whatever the
+  // rewind dropped. See `baseIsAuthoritative`'s own doc comment on `refreshOntoBase`.
+  const baseIsAuthoritative = freshBase === `origin/${baseBranch}` || !(await hasRemote(repo));
   // Claim the checkout for the whole run (anton-hrun.1). The claim's `git worktree lock` is the
   // ONLY evidence a second anton process over this repository has that the directory is in use:
   // its teardown and its sweep judge residue from their own run rows and the board, which say
