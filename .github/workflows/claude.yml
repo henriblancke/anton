@@ -32,9 +32,11 @@ jobs:
 
       # Same pin as claude-code-review.yml: the action hardcodes CLI 2.1.267, which crashes
       # ~500ms after init (anthropics/claude-code-action#1759). Remove once fixed upstream.
-      - name: Install Claude Code 2.1.263
+      # Bumped 2.1.263 -> 2.1.274 (see claude-code-review.yml): 2.1.263 itself started
+      # crashing every run at init (is_error:true, num_turns:1, ~500ms) before any model turn.
+      - name: Install Claude Code 2.1.274
         run: |
-          npm install --global @anthropic-ai/claude-code@2.1.263
+          npm install --global @anthropic-ai/claude-code@2.1.274
           echo "CLAUDE_BIN=$(command -v claude)" >> "$GITHUB_ENV"
           claude --version
 
