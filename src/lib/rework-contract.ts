@@ -1033,8 +1033,12 @@ function heldFence(
   while (items.length > 0 && indent < items[items.length - 1]!) items.pop();
   const base = items[items.length - 1] ?? 0;
   const peeled = peelContainers(dedent(text, indent), indent);
-  // A fence at the top level is the ordinary `fence` path, not a nested one.
-  if (peeled.text === text && peeled.prefix.length === 1) return undefined;
+  // A fence at the top level is the ordinary `fence` path, not a nested one — held only when this
+  // line opens a container of its own (`peeled.opened`/`peeled.prefix`) or continues one already
+  // open (`base`, from `items` popped above). Comparing `peeled.text` (dedented) against the
+  // original, still-indented `text` never matched for a fence carrying only 1-3 columns of plain
+  // leading whitespace and no marker, so such a fence was wrongly treated as container-bound.
+  if (base === 0 && peeled.opened.length === 0 && peeled.prefix.length === 1) return undefined;
   const opener = peeled.text;
   const fence = openingFence(opener);
   if (!fence) return undefined;

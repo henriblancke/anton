@@ -434,6 +434,17 @@ it("drops the delimiters of a fence nested in several containers, empty ones inc
   expect(rendered("> > ```\n> > x\n> > ```")).toEqual(["> > x"]);
 });
 
+it("closes a container-nested fence whose closer reaches the item's column with a tab, not spaces", () => {
+  // CommonMark measures a list item's continuation by visual column, not source spelling — a tab
+  // and enough spaces that land on the same column both keep a closer inside the item. Comparing
+  // the closer against a fixed run of spaces (the opener's own spelling, expanded) missed a tab
+  // closer at that column: the fence stayed unterminated, and its closing delimiter rendered as
+  // authored content instead of dropping.
+  expect(rendered("-\t```\n\tx\n\t```")).toEqual(["\tx"]);
+  expect(rendered("-\t```\n\tx\n   ```")).toEqual(["\tx"]);
+  expect(rendered("- ```\n\tx\n\t```")).toEqual(["\tx"]);
+});
+
 describe("renderedLines", () => {
   it("drops fence delimiters, strips comments, and keeps fenced content flagged as literal", () => {
     expect(renderedLines("# A\n<!-- c -->\n```\nx\n```\n\nend")).toEqual([

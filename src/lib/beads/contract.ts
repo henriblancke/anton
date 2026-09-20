@@ -193,11 +193,18 @@ function sectionOccurrences(description: string, keys: ReadonlySet<string>): Sec
  * whole of what a bead says under one name, for every reader that asks WHAT a section holds. A
  * reader that also needs where it sits must go to {@link sectionOccurrences}: the aggregate has one
  * position, and it is the first heading's whether or not that is the copy carrying the content.
+ *
+ * Joined on a BLANK line, not a bare one: {@link contentLines} re-scans the aggregate afresh, and a
+ * paragraph line from one occurrence immediately followed by a bare `===`/`---` line from the next
+ * — neither a heading in its own original context — parses as a Setext heading once adjacent,
+ * dropping authored content as scaffolding. A blank line between them is never itself a heading
+ * underline, and ends the paragraph before one can reach across the join, exactly as CommonMark
+ * ends any paragraph at a blank line.
  */
 function sectionsOf(description: string, keys: ReadonlySet<string>): Map<string, string> {
   const out = new Map<string, string>();
   for (const { key, body } of sectionOccurrences(description, keys)) {
-    out.set(key, [out.get(key), body].filter(Boolean).join("\n"));
+    out.set(key, [out.get(key), body].filter(Boolean).join("\n\n"));
   }
   return out;
 }

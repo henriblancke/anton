@@ -679,6 +679,17 @@ describe("instructionCriteria", () => {
     expect(texts("* ```\n  ## h\n  ```\n\n    prose")).toEqual(["```\n## h\n```", "prose"]);
   });
 
+  it("reads a fence indented 1-3 columns with no container marker as top-level, not held", () => {
+    // `heldFence`'s guard used to compare its de-dented `peeled.text` against the still-indented
+    // original `text`, which never match for a plain space-indented fence — so it was wrongly
+    // treated as container-bound, its content dropped, and the next line rescanned as a fresh
+    // top-level document rather than filed as its own criterion.
+    expect(instructionCriteria("  ```js\nconsole.log(1)\n  ```\n- next real instruction")).toEqual([
+      { text: "  ```js\nconsole.log(1)\n  ```", fenced: true },
+      { text: "next real instruction", fenced: false },
+    ]);
+  });
+
   it("ends a fence opened on its own line inside an item where the item ends", () => {
     // The scanner reads fences flat, with no notion of the item holding one: it reported the
     // opener and EVERY line after it as fenced, so the blank line and the bullet that dedents out

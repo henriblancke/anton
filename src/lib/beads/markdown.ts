@@ -133,14 +133,19 @@ function stripContainerMarkers(text: string): string {
   return rest;
 }
 
-/** The source spelling required before a fence closer nested in containers. */
-function fenceContainerPrefix(text: string): string {
+/** A fence closer's required container prefix, one step per marker in source order: a blockquote
+ * marker must repeat literally, but a list item's continuation only needs to reach the same visual
+ * column — CommonMark measures it by column, not by source spelling, so `-\t` and `- ` (both column
+ * 2) admit the same closers and a closer may reach that column with either spaces or a tab. */
+type ClosureStep = { literal: string } | { columns: number };
+
+function fenceContainerPrefix(text: string): ClosureStep[] {
+  const steps: ClosureStep[] = [];
   let rest = text;
-  let prefix = "";
   for (;;) {
     const quote = /^ {0,3}>[ \t]?/.exec(rest);
     if (quote) {
-      prefix += quote[0];
+      steps.push({ literal: quote[0] });
       rest = rest.slice(quote[0].length);
       continue;
     }
@@ -148,12 +153,57 @@ function fenceContainerPrefix(text: string): string {
     if (item) {
       let column = 0;
       for (const char of item[0]) column = char === "\t" ? column + (4 - (column % 4)) : column + 1;
-      prefix += blanks(column);
+      steps.push({ columns: column });
       rest = rest.slice(item[0].length);
       continue;
     }
-    return prefix;
+    return steps;
   }
+}
+
+/** `line` past every `steps` requirement, in order, or undefined once one is not met. A literal
+ * step must match verbatim; a column step only needs `line` indented that far — by any mix of
+ * spaces and tabs — and is then dedented by exactly that many columns, splitting a tab that
+ * overshoots into the leftover spaces {@link dedentColumns} does. */
+function peelClosurePrefix(line: string, steps: readonly ClosureStep[]): string | undefined {
+  let rest = line;
+  for (const step of steps) {
+    if ("literal" in step) {
+      if (!rest.startsWith(step.literal)) return undefined;
+      rest = rest.slice(step.literal.length);
+    } else {
+      if (indentColumns(rest) < step.columns) return undefined;
+      rest = dedentColumns(rest, step.columns);
+    }
+  }
+  return rest;
+}
+
+/** Visual columns of `text`'s leading run of spaces and tabs, a tab reaching the next multiple of
+ * four as CommonMark expands it. */
+function indentColumns(text: string): number {
+  let column = 0;
+  for (const char of text) {
+    if (char === " ") column += 1;
+    else if (char === "\t") column += 4 - (column % 4);
+    else break;
+  }
+  return column;
+}
+
+/** `text` with up to `columns` of its leading indentation removed, counted visually — a tab that
+ * reaches past `columns` comes back as the leftover spaces, as CommonMark splits it. */
+function dedentColumns(text: string, columns: number): string {
+  let column = 0;
+  let at = 0;
+  while (at < text.length && column < columns) {
+    const char = text[at]!;
+    if (char === " ") column += 1;
+    else if (char === "\t") column += 4 - (column % 4);
+    else break;
+    at += 1;
+  }
+  return " ".repeat(Math.max(0, column - columns)) + text.slice(at);
 }
 
 /** `text` is a heading precisely when the CommonMark parser produces one complete heading node. */
@@ -327,8 +377,30 @@ const textOf = (node: MarkdownNode): string =>
 /**
  * Every line classified from the CommonMark AST. The source projection intentionally keeps the
  * original lines: callers rewrite citations in place and must not reformat a bead description.
+ *
+ * Bead descriptions are external input, and both the recursive-descent parser and this module's
+ * own AST walk recurse once per nesting level with no depth cap — a pathologically nested
+ * description (thousands of nested blockquotes or list items) can overflow the stack. Falling back
+ * to the flat, unstructured projection keeps every board read/write path this feeds from crashing
+ * the process on such input, at the cost of not recognizing that one description's structure.
  */
 export function scanMarkdown(source: string): ScannedLine[] {
+  try {
+    return scanMarkdownParsed(source);
+  } catch {
+    return lineRecords(source).map(({ text }) => ({
+      text,
+      fenced: false,
+      delimiter: false,
+      commented: false,
+      visible: text,
+      masked: text,
+      headingRest: false,
+    }));
+  }
+}
+
+function scanMarkdownParsed(source: string): ScannedLine[] {
   const lines = lineRecords(source);
   const root = fromMarkdown(source) as unknown as MarkdownNode;
 
@@ -352,7 +424,7 @@ export function scanMarkdown(source: string): ScannedLine[] {
       const closingLine = lines[end]?.text ?? "";
       const directCloser = stripContainerMarkers(closingLine);
       const prefix = fenceContainerPrefix(lines[start]?.text.slice(0, node.position.start.column - 1) ?? "");
-      const continuationCloser = prefix && closingLine.startsWith(prefix) ? closingLine.slice(prefix.length) : "";
+      const continuationCloser = prefix.length > 0 ? (peelClosurePrefix(closingLine, prefix) ?? "") : "";
       if (end !== start && (closingFence(directCloser, opening) || closingFence(continuationCloser, opening))) {
         lines[end]!.delimiter = true;
       }
@@ -501,7 +573,7 @@ export function unterminatedCloser(source: string): string | undefined {
         const lineStart = source.lastIndexOf("\n", Math.max(0, offset - 1)) + 1;
         const directCloser = stripContainerMarkers(last);
         const prefix = fenceContainerPrefix(source.slice(lineStart, offset));
-        const continuationCloser = prefix && last.startsWith(prefix) ? last.slice(prefix.length) : "";
+        const continuationCloser = prefix.length > 0 ? (peelClosurePrefix(last, prefix) ?? "") : "";
         if (!closingFence(directCloser, opener) && !closingFence(continuationCloser, opener)) {
           closer = { offset, text: fenceCloser(openerLine) };
         }

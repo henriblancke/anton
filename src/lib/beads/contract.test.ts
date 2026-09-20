@@ -219,6 +219,22 @@ describe("validateBeadContract — ticket tier (task / bug / chore / feature)", 
     expect(summarize(bead)).toEqual([["Acceptance", "blocking"]]);
   });
 
+  it("does not let a repeated heading's join form an accidental Setext heading", () => {
+    // Neither occurrence is a heading in its own original context: the first has no underline
+    // under it, and the second has no preceding paragraph in ITS OWN section (it opens right after
+    // its own heading). Joined on a bare newline, "Backend" / "===" reads as one Setext H1 once
+    // re-scanned as a single body, and `contentLines` drops both lines as scaffolding — a fully
+    // authored criterion then reads as unwritten and blocks approval on a bead that stated one.
+    const bead = ticket({
+      acceptance_criteria: undefined,
+      description: [DESCRIPTION, "", "## Acceptance", "Backend", "", "## Other", "irrelevant", "", "## Acceptance", "==="].join(
+        "\n",
+      ),
+    });
+    expect(acceptanceBody(bead)).toContain("Backend");
+    expect(validateBeadContract(bead)).toEqual([]);
+  });
+
   it("treats a section holding only a thematic break as unwritten", () => {
     // `---` renders as a rule, not text — counting it as content let approval and execution
     // proceed with no definition of done.
