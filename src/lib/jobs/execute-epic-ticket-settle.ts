@@ -43,7 +43,8 @@ import {
   TicketTimeoutError,
   WorktreeDirtyError,
 } from "./execute-epic-errors";
-import { mustPersist, mustRead, safe } from "./execute-epic-persist";
+import { mustPersist, mustRead } from "./execute-epic-persist";
+import { safe } from "./safe";
 import { preserveTimedOutWork } from "./execute-epic-ticket-preserve";
 import { repairBlockedTicket, type TicketRepair } from "./execute-epic-ticket-repair";
 import type { StepContext } from "./step-registry";

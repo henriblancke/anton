@@ -9,6 +9,7 @@
  */
 import { beads, LABELS } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { readWorktreeState } from "../git/ops";
 import { updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import { releaseRunResources } from "./worktree-reaper";
@@ -17,7 +18,7 @@ import type { DispatchOutcome } from "./execute-epic-dispatch";
 import { armMergeGate } from "./execute-epic-merge-gate";
 import { runReviewStep } from "./execute-epic-review-step";
 import type { RunPhaseCarry, RunStepDispatch } from "./execute-epic-run-step";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import {
   readVerifiedStandaloneRetirement,
   verifiedStandaloneRetirementStillHeld,
@@ -25,6 +26,7 @@ import {
 import type { RunPreparation } from "./execute-epic-prepare";
 import { stalePrBodyNote, stalePrBodyRunError } from "./execute-epic-review";
 import type { EpicRun } from "./execute-epic-run";
+import { recordNarrative, restorableNarrative } from "./review-key";
 
 
 /** Walk the formula's post-commit steps, then finalize the run and release its checkout. */
@@ -33,7 +35,21 @@ export async function walkRunPhase(
   prep: Extract<RunPreparation, { done: false }>,
   dispatched: DispatchOutcome,
 ): Promise<void> {
-  const carry: RunPhaseCarry = { advisories: [], staleBodyFallback: null };
+  const carry: RunPhaseCarry = {
+    advisories: [],
+    // Restored from THIS row, not branch-scoped like the review key's own advisories (anton-fpkk8):
+    // a resumed-in-place row (a park a human cleared) is the case this covers; a retry that opened a
+    // fresh row after an ordinary failure re-describes, exactly as it re-reviews without a branch
+    // lookup of its own key.
+    //
+    // Conditional on the branch still standing where that describer left it (PR #303 review): the
+    // very resume this covers is one a human may have cleared by amending or adding commits, and
+    // `runDescribeStep` deliberately KEEPS this restored value when the next describer fails or
+    // reports nothing — so an unbound restore would open the PR describing the previous tree. See
+    // `restorableNarrative`.
+    narrative: await restorableNarrative(prep.worktree.path, run.existing?.narrative),
+    staleBodyFallback: null,
+  };
   // A standalone target THIS attempt verified and retired as already shipped has nothing for these
   // steps to speak for (PR #238 review): the bead is closed as superseded with anton's evidence on
   // it, and no commit is on the branch — so there is no diff to review and no pull request to open
@@ -52,10 +68,15 @@ export async function walkRunPhase(
         satisfied: dispatched.satisfied,
         step: cooked,
         advisories: carry.advisories,
+        narrative: carry.narrative,
       },
     };
     if (definition.name === "review") {
       await runReviewStep(run, prep, dispatch, carry);
+      continue;
+    }
+    if (definition.name === "describe") {
+      await runDescribeStep(run, dispatch, carry);
       continue;
     }
     if (definition.name === "pr") {
@@ -92,7 +113,7 @@ async function runPrStep(
   if (pr.bodyStale) {
     // The satisfied attribution rides the same salvage as the findings (PR #253 review): the stale
     // body says nothing about which tickets an earlier commit covered, and no commit does either.
-    const note = stalePrBodyNote(pr, advisoryFindings, stepCtx.tickets, stepCtx.satisfied);
+    const note = stalePrBodyNote(pr, advisoryFindings, stepCtx.tickets, stepCtx.satisfied, stepCtx.narrative);
     // If that write ALSO fails (a locked or unavailable beads DB) the findings have no home
     // left, and the run would still finish `done` — the advisory detail silently dropped
     // between this review and the merge gate. Carry the whole note out on the run row
@@ -113,6 +134,46 @@ async function runPrStep(
   if (!standaloneRun) {
     await safe(() => beads.tag(repo, epicBeadId, [LABELS.stage("in-review")]));
     await safe(() => beads.untag(repo, epicBeadId, [LABELS.stage("implementing")]));
+  }
+}
+
+/**
+ * Write the run's PR narrative (anton-fpkk8): dispatch the describer, then carry and persist
+ * whatever it reports.
+ *
+ * A describer that fails reports `ok: true` with no narrative — its own contract (`steps/describe.ts`
+ * header): a thrown git error, a quota exhaustion, an unparseable report all cost the narrative and
+ * nothing else, never the run. That failure must not overwrite a narrative an earlier attempt on
+ * this same row already earned, so ONLY a reported narrative replaces the carry — unlike advisories,
+ * whose review verdict always speaks for the whole open set even when it resolves to none. A
+ * describer that DOES report one overwrites whatever was carried in, same as advisories: a second
+ * `step:describe` in one formula speaks for the run same as a second `step:review` does.
+ */
+async function runDescribeStep(run: EpicRun, dispatch: RunStepDispatch, carry: RunPhaseCarry): Promise<void> {
+  const { db, clock, runId, targetId: epicBeadId } = run;
+  const { cooked, definition, stepCtx } = dispatch;
+  const result = await definition.handler(stepCtx);
+  if (!result.ok) {
+    throw new Error(
+      result.detail ?? `formula step "${cooked.id}" (step:describe) failed for ${epicBeadId}`,
+    );
+  }
+  const reported = result.facts?.narrative;
+  if (reported) {
+    carry.narrative = reported;
+    // Bound to the tip the describer just read (PR #303 review), so a later resume can tell whether
+    // this narrative still describes the branch. Read here rather than reported by the step: the
+    // describer is a reader, and every other step in this walk leaves the tree where it found it —
+    // an unreadable HEAD just records the narrative unbound, which a resume then declines to restore.
+    const head = await readWorktreeState(stepCtx.worktreePath)
+      .then((state) => state.head)
+      .catch(() => undefined);
+    // Best-effort, like every other resume bookkeeping write: a failed write just means the next
+    // resume that doesn't re-describe finds nothing to restore, the same safe default as a run
+    // whose describer never reported one at all.
+    await safe(() =>
+      updateRun(db, clock, runId, { narrative: recordNarrative(reported, head) }),
+    );
   }
 }
 

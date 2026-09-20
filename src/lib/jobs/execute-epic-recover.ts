@@ -15,7 +15,7 @@ import { updateRun } from "../runs";
 import { releaseRunResources } from "./worktree-reaper";
 import { PoisonEpic } from "./errors";
 import { armMergeGate } from "./execute-epic-merge-gate";
-import { safe } from "./execute-epic-persist";
+import { safe } from "./safe";
 import {
   readVerifiedStandaloneRetirement,
   verifiedStandaloneRetirementStillHeld,

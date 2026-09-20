@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   contractGatedBoard,
+  hasOpenBlockers,
   parseAcceptance,
   parseGoal,
   resumeSkipped,
@@ -306,6 +307,56 @@ describe("runContractStatus (a card's contract covers the whole run)", () => {
     // A projection carrying no bd stamps was never read — "not judged" must not render as a gap.
     const bare = makeBead({ id: "feat-bare", issue_type: "feature" });
     expect(runContractStatus(bare, [makeBead({ id: "task-bare", parent: "feat-bare" })])).toBeUndefined();
+  });
+});
+
+describe("hasOpenBlockers (the same rule bd close refuses against)", () => {
+  it("is true for an open `blocks` dependency", () => {
+    const blocker = makeBead({ id: "b-1" });
+    const held = makeBead({
+      id: "t-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "b-1", type: "blocks" }],
+    });
+    expect(hasOpenBlockers(held, [blocker, held])).toBe(true);
+  });
+
+  it("is false once the blocker closes", () => {
+    const blocker = makeBead({ id: "b-1", status: "closed" });
+    const held = makeBead({
+      id: "t-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "b-1", type: "blocks" }],
+    });
+    expect(hasOpenBlockers(held, [blocker, held])).toBe(false);
+  });
+
+  it("ignores non-blocks edges (parent-child, related)", () => {
+    const parent = makeBead({ id: "e-1", issue_type: "epic" });
+    const child = makeBead({
+      id: "t-1",
+      parent: "e-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "e-1", type: "parent-child" }],
+    });
+    expect(hasOpenBlockers(child, [parent, child])).toBe(false);
+  });
+
+  it("reads dependencies off the bead's own entry in `all`, not the argument passed in", () => {
+    // A `bd show`-sourced bead carries no `dependencies` at all — only `bd list --json` inlines
+    // them — so a caller holding one must still get the right answer via its `all` entry.
+    const blocker = makeBead({ id: "b-1" });
+    const listEntry = makeBead({
+      id: "t-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "b-1", type: "blocks" }],
+    });
+    const shown = makeBead({ id: "t-1" }); // no `dependencies` field, like a real `bd show` result
+    expect(hasOpenBlockers(shown, [blocker, listEntry])).toBe(true);
+  });
+
+  it("fails safe on an unknown dependency — bd would hold the close either way", () => {
+    const held = makeBead({
+      id: "t-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "ghost", type: "blocks" }],
+    });
+    expect(hasOpenBlockers(held, [held])).toBe(true);
   });
 });
 

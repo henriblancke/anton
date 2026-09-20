@@ -15,6 +15,7 @@ import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
 import type { JobContext, JobEffect, JobHandler } from "./runner";
+import { safe } from "./safe";
 
 export interface OrphanGroomingPayload {
   projectId: string;
@@ -164,12 +165,4 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
       : `bucketed ${linked} loose ticket(s)`;
     return { changed: linked > 0 || createdEpic, note };
   };
-}
-
-async function safe(fn: () => Promise<unknown>): Promise<void> {
-  try {
-    await fn();
-  } catch {
-    // best-effort
-  }
 }
