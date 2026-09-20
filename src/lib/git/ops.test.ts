@@ -4006,8 +4006,26 @@ describe("push timeout default", () => {
  */
 describe("readSshCommand — what could actually be established about core.sshCommand", () => {
   const dirs: string[] = [];
+  const savedGitConfig = {
+    global: process.env.GIT_CONFIG_GLOBAL,
+    noSystem: process.env.GIT_CONFIG_NOSYSTEM,
+  };
+
+  beforeEach(() => {
+    // The probe deliberately reads Git's effective configuration, so keep these real-git tests
+    // independent of any SSH command or variant configured on the developer/CI machine.
+    const configDir = mkdtempSync(join(tmpdir(), "anton-sshprobe-global-"));
+    dirs.push(configDir);
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    process.env.GIT_CONFIG_GLOBAL = join(configDir, "config");
+  });
+
   afterEach(() => {
     for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+    if (savedGitConfig.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = savedGitConfig.global;
+    if (savedGitConfig.noSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = savedGitConfig.noSystem;
   });
 
   const plainDir = () => {
