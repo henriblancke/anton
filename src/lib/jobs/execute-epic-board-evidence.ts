@@ -523,7 +523,20 @@ async function lockDispatchBaseline(
       // actually finished proving. Only now, once the comparison itself has passed, is `candidate`
       // safe to mark verified — see {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}.
       const verified = await preserveRecoveryBaseline(repo, ticket, candidate, true);
-      return verified ? candidate : abandonDispatchBaseline(repo, ticket);
+      if (!verified) return abandonDispatchBaseline(repo, ticket);
+      // Confirmed through the sync channel, not left for the dispatch that follows to carry it
+      // (chatgpt-codex-connector, PR #284 review, "Sync the verified baseline marker before
+      // dispatch"): this write only proves the local db, and the dispatched agent session can die
+      // before ever pushing on its own. A fresh-machine resume would then pull a board that still
+      // shows this baseline locked but NOT verified, re-verify it against the board the dispatched
+      // agent already changed, and fold that delivery into the "baseline" — rejecting the later
+      // idempotent retry as a no-op. Confirming here closes that window the same way every other
+      // verified write in this file already does.
+      const verifiedSynced = await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false);
+      return verifiedSynced ? candidate : abandonDispatchBaseline(repo, ticket);
     }
     candidate = refreshed;
   }

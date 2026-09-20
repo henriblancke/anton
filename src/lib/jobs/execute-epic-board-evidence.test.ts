@@ -1497,6 +1497,7 @@ describe(
       // PR #284 review, "Distinguish tentative locks before trusting them on resume") — a second
       // write, distinct from the tentative lock write above.
       setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
       const pushCallsBefore = pushMock.mock.calls.length;
 
       await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toEqual(
@@ -1519,9 +1520,11 @@ describe(
         true,
       );
       expect(pushMock).toHaveBeenCalledWith("/repo");
-      // The initial confirming push, plus the lock's own confirming push — the verified-marking
-      // write itself triggers no additional push (same-machine dispatch is about to follow anyway).
-      expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 2);
+      // The initial confirming push, the lock's own confirming push, and the verified-marking
+      // write's own confirming push (chatgpt-codex-connector, PR #284 review, "Sync the verified
+      // baseline marker before dispatch") — that last one confirms the marker reaches the remote
+      // BEFORE dispatch, not left for whatever push happens to follow.
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 3);
     });
 
     it("skips re-persisting the ORIGINAL baseline when the ticket already carries a preserved one, " +
@@ -1539,6 +1542,7 @@ describe(
       pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
       setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+      pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
 
       await expect(
         ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
@@ -1577,6 +1581,7 @@ describe(
         // The lock's own post-push stability re-read finds nothing further either.
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+        pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
         const pushCallsBefore = pushMock.mock.calls.length;
 
         const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
@@ -1591,8 +1596,8 @@ describe(
           true,
         );
         // Only ONE refresh round actually changed anything (one extra persist/push), plus the lock's
-        // own confirming push.
-        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 3);
+        // own confirming push, plus the verified-marking write's own confirming push.
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 4);
       },
     );
 
@@ -1614,14 +1619,18 @@ describe(
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
         pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]); // lock's own stability re-read: stable
+        // (setBoardEvidenceBaselineMock falls back to its global default for the verified-marking
+        // write, which this test doesn't otherwise assert on.)
+        pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
         const pushCallsBefore = pushMock.mock.calls.length;
 
         const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
 
         expect(refreshed).toEqual(fingerprintBoard([bead("a", { description: "v2" })]));
         // Initial confirming push, plus one more push per round that actually found a diff (rounds
-        // 1 and 2), plus the lock's own confirming push once round 3's read comes back stable.
-        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 4);
+        // 1 and 2), plus the lock's own confirming push once round 3's read comes back stable, plus
+        // the verified-marking write's own confirming push.
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 5);
       },
     );
 
@@ -1765,6 +1774,7 @@ describe(
         // Attempt 1's lock's own post-push stability re-read finds nothing further.
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "before dispatch" })]);
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // attempt 1's verified-marking write
+        pushMock.mockResolvedValueOnce("synced"); // attempt 1's verified-marking write's own confirming push
 
         const attempt1 = await ensureBoardBaselinePersisted("/repo", bead("t-crash"), baseline);
         expect(attempt1).toEqual(baseline);
@@ -1821,6 +1831,7 @@ describe(
         pushMock.mockResolvedValueOnce("synced"); // round 1's lock-confirming push
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1 — landed during the crash window" })]); // stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 1's verified-marking write
+        pushMock.mockResolvedValueOnce("synced"); // round 1's verified-marking write's own confirming push
 
         const result = await ensureBoardBaselinePersisted("/repo", tentativelyLockedTicket, staleCandidate);
 
@@ -1855,6 +1866,7 @@ describe(
         pushMock.mockResolvedValueOnce("synced"); // round 2's lock-confirming push
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]); // round 2's stability re-read: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 2's verified-marking write
+        pushMock.mockResolvedValueOnce("synced"); // round 2's verified-marking write's own confirming push
 
         const locked = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
 
@@ -1917,6 +1929,32 @@ describe(
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
         ).resolves.toBeNull();
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+      },
+    );
+
+    it(
+      "clears the locked baseline it just wrote when the VERIFIED-marking write's own confirming " +
+        "push never syncs (chatgpt-codex-connector, PR #284 review, \"Sync the verified baseline " +
+        "marker before dispatch\") — a locked-but-unverified value left on the remote would let a " +
+        "fresh-machine resume re-verify it against a board the about-to-be-dispatched agent already " +
+        "changed, folding that delivery into the baseline and rejecting an idempotent retry as unchanged",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's tentative persist
+        pushMock.mockResolvedValueOnce("synced"); // lock round 0's confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // lock's own stability re-read: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write, lands locally
+        pushMock.mockResolvedValueOnce("not-wired"); // but its own confirming push never syncs
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
+        // Never handed back for dispatch on an unconfirmed verified marker — and the stray locked
+        // value this call itself just wrote is cleared rather than left for a later attempt to trust.
         expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
       },
     );
