@@ -134,18 +134,23 @@ function stripContainerMarkers(text: string): string {
 }
 
 /** A fence closer's required container prefix, one step per marker in source order: a blockquote
- * marker must repeat literally, but a list item's continuation only needs to reach the same visual
- * column — CommonMark measures it by column, not by source spelling, so `-\t` and `- ` (both column
- * 2) admit the same closers and a closer may reach that column with either spaces or a tab. */
-type ClosureStep = { literal: string } | { columns: number };
+ * marker only needs to match the same SHAPE (0-3 spaces, `>`, an optional single space or tab), not
+ * the opener's exact spelling — CommonMark re-reads each continuation line against the marker rule,
+ * so `>\t` and `> ` open the same callout and either may close a fence the other opened. A list
+ * item's continuation only needs to reach the same visual column for the same reason — CommonMark
+ * measures it by column, not by source spelling, so `-\t` and `- ` (both column 2) admit the same
+ * closers and a closer may reach that column with either spaces or a tab. */
+type ClosureStep = { quote: true } | { columns: number };
+
+const QUOTE_STEP = /^ {0,3}>[ \t]?/;
 
 function fenceContainerPrefix(text: string): ClosureStep[] {
   const steps: ClosureStep[] = [];
   let rest = text;
   for (;;) {
-    const quote = /^ {0,3}>[ \t]?/.exec(rest);
+    const quote = QUOTE_STEP.exec(rest);
     if (quote) {
-      steps.push({ literal: quote[0] });
+      steps.push({ quote: true });
       rest = rest.slice(quote[0].length);
       continue;
     }
@@ -161,16 +166,18 @@ function fenceContainerPrefix(text: string): ClosureStep[] {
   }
 }
 
-/** `line` past every `steps` requirement, in order, or undefined once one is not met. A literal
- * step must match verbatim; a column step only needs `line` indented that far — by any mix of
- * spaces and tabs — and is then dedented by exactly that many columns, splitting a tab that
- * overshoots into the leftover spaces {@link dedentColumns} does. */
+/** `line` past every `steps` requirement, in order, or undefined once one is not met. A quote step
+ * only needs `line` to carry a blockquote marker of the same shape, re-matched rather than compared
+ * byte-for-byte — a column step only needs `line` indented that far — by any mix of spaces and tabs
+ * — and is then dedented by exactly that many columns, splitting a tab that overshoots into the
+ * leftover spaces {@link dedentColumns} does. */
 function peelClosurePrefix(line: string, steps: readonly ClosureStep[]): string | undefined {
   let rest = line;
   for (const step of steps) {
-    if ("literal" in step) {
-      if (!rest.startsWith(step.literal)) return undefined;
-      rest = rest.slice(step.literal.length);
+    if ("quote" in step) {
+      const quote = QUOTE_STEP.exec(rest);
+      if (!quote) return undefined;
+      rest = rest.slice(quote[0].length);
     } else {
       if (indentColumns(rest) < step.columns) return undefined;
       rest = dedentColumns(rest, step.columns);

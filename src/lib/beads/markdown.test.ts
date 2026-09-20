@@ -445,6 +445,16 @@ it("closes a container-nested fence whose closer reaches the item's column with 
   expect(rendered("- ```\n\tx\n\t```")).toEqual(["\tx"]);
 });
 
+it("closes a fence nested in a list and blockquote whose closer spells the `>` marker differently", () => {
+  // CommonMark reads a blockquote continuation by shape (0-3 spaces, `>`, an optional single
+  // space or tab), not by matching the opener's exact spelling — comparing the closer's quote
+  // marker byte-for-byte against the opener's rejected a closer that used a tab where the opener
+  // used a space (or vice versa), leaving the fence open and its closing delimiter rendered as
+  // authored content instead of dropping.
+  expect(rendered("123. > ```\n     > x\n     >\t```")).toEqual(["     > x"]);
+  expect(rendered("- >\t```\n  > x\n  > ```")).toEqual(["  > x"]);
+});
+
 describe("renderedLines", () => {
   it("drops fence delimiters, strips comments, and keeps fenced content flagged as literal", () => {
     expect(renderedLines("# A\n<!-- c -->\n```\nx\n```\n\nend")).toEqual([
