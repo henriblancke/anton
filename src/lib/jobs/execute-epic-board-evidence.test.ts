@@ -160,6 +160,17 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "catches a design change — `bd update <id> --design` is a supported board-only write that " +
+      "touches neither status, description nor acceptance criteria (PR #284 review, \"Include the " +
+      "design field in board fingerprints\")",
+    () => {
+      const before = fingerprintBoard([bead("a", { design: "old approach" })]);
+      const after = fingerprintBoard([bead("a", { design: "revised approach" })]);
+      expect(boardEvidence(before, after)).toEqual(["a"]);
+    },
+  );
+
+  it(
     "catches an external_ref change — attaching/changing a tracker reference is a supported " +
       "board-only write that touches neither status, description nor labels (anton-fc5x review round 4)",
     () => {
@@ -968,6 +979,35 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         ["a"],
       );
       expect(pushMock).toHaveBeenCalledWith("/repo");
+    },
+  );
+
+  it(
+    "clearBoardEvidencePending persists the confirmation BEFORE clearing either recovery signal " +
+      "(chatgpt-codex-connector, PR #284 review, \"Persist confirmation before clearing recovery " +
+      "evidence\") — a death between the two clears must never be able to strand a ticket with " +
+      "neither the pending marker, the preserved baseline, nor a confirmation behind it",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      const order: string[] = [];
+      setBoardEvidenceConfirmedMock.mockImplementationOnce(() => {
+        order.push("confirmed");
+        return Promise.resolve("");
+      });
+      setBoardEvidencePendingMock.mockImplementationOnce(() => {
+        order.push("marker");
+        return Promise.resolve("");
+      });
+      clearBoardEvidenceBaselineMock.mockImplementationOnce(() => {
+        order.push("baseline");
+        return Promise.resolve("");
+      });
+      await clearBoardEvidencePending(
+        "/repo",
+        bead("t-1", { labels: [LABELS.boardEvidencePending(["a"])] }),
+        ["a"],
+      );
+      expect(order).toEqual(["confirmed", "marker", "baseline"]);
     },
   );
 

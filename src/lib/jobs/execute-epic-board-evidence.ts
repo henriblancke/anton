@@ -92,8 +92,9 @@ function contentMetadata(b: Bead): [string, unknown][] {
 }
 
 /** A point-in-time fingerprint of the whole board's CONTENT — status, title, description,
- * acceptance criteria, priority, every non-bookkeeping label, every non-bookkeeping metadata key,
- * parentage, dependency edges, and (on every bead except the one this run is dispatching) assignee.
+ * acceptance criteria, design, priority, every non-bookkeeping label, every non-bookkeeping
+ * metadata key, parentage, dependency edges, and (on every bead except the one this run is
+ * dispatching) assignee.
  * Notes stay excluded on every bead — anton's heartbeat appends to them regardless of what the agent
  * did, and no supported board-only write uses notes as its sole deliverable. Parent and
  * dependencies are included (anton-fc5x review round 2) because a reparent or a `bd dep
@@ -109,9 +110,15 @@ function contentMetadata(b: Bead): [string, unknown][] {
  * (anton-fc5x review round 5) for the same reason once more: `bd update <id> --type task` is a
  * supported board-only repair (tiers.mjs) that retypes a bead without touching status, title,
  * description or labels, so leaving it out would fingerprint that repair as no change at all.
- * `metadata` (minus `ANTON_METADATA_KEYS`) is included (anton-fc5x review round 6) for the same
- * reason again: it is the field `bd update --set-metadata` writes to, and anton's own metadata
- * writes (the PR pointer, its retired counterpart, the board-evidence baseline) are excluded the
+ * `design` is included (chatgpt-codex-connector, PR #284 review, "Include the design field in
+ * board fingerprints") for the same reason once more: `bd update <id> --design` is a supported
+ * board-only write (`.beads/PRIME.md:125-126`) that this module's own contract-field list
+ * (`CONTRACT_FIELDS` in gardener/repair-already-shipped.ts) already treats as real ticket content
+ * alongside description/acceptance/context — unlike notes, it is not anton's own bookkeeping, so a
+ * board-only ticket whose sole deliverable is `bd update <id> --design ...` must not fingerprint
+ * as unchanged. `metadata` (minus `ANTON_METADATA_KEYS`) is included (anton-fc5x review round 6)
+ * for the same reason again: it is the field `bd update --set-metadata` writes to, and anton's own
+ * metadata writes (the PR pointer, its retired counterpart, the board-evidence baseline) are excluded the
  * same way its own labels already are. Assignee is included on every OTHER bead too (anton-fc5x
  * follow-up review) for the same reason once more: reserving or reassigning another bead via `bd
  * assign`/`beads.assign` is a supported board-only deliverable (skills/bd/SKILL.md) that touches no
@@ -138,6 +145,7 @@ function fingerprintOf(b: Bead, dispatchedTicketId: string): string {
     b.title,
     b.description ?? "",
     b.acceptance_criteria ?? "",
+    b.design ?? "",
     b.priority ?? null,
     b.issue_type ?? "",
     contentLabels(b),
@@ -754,22 +762,35 @@ export async function clearBoardEvidencePending(
   // errors or silently no-ops, stranding the real stale marker.
   const stale = beads.boardEvidencePendingLabels(ticket);
   if (ids.length === 0 && !hasBaseline && !hasCleanupObligation && stale.length === 0) return;
-  const markerCleared =
-    stale.length === 0 ? true : await mustPersist(() => beads.setBoardEvidencePending(repo, ticketId, [], stale));
-  const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
-  // Written in the SAME all-or-nothing gate as the two clears above, never after it (PR #284
-  // review, "no record that this bead's board-only delivery ever happened"): this is the one
-  // thing left once both are gone, so it must land — and be confirmed synced — exactly as
-  // reliably as they do, or a resume on a fresh branch with no baseline to fall back on has no
-  // way to tell "confirmed and cleaned up" from "closed with nothing behind it" and can
-  // regenerate this ticket into a false `NoDeliveryError`. NOT idempotent on `ids` (PR #284
-  // review, "Preserve confirmed evidence IDs during cleanup retries") — the field carries the
-  // confirmed ids themselves, not a boolean, so retrying this write with a narrower `ids` than a
-  // prior successful call overwrites real confirmed evidence with less. Every caller is therefore
-  // responsible for passing the full known id set on a retry (pending ids UNIONED with whatever
+  // Written FIRST, before either recovery signal below is cleared (chatgpt-codex-connector, PR
+  // #284 review, "Persist confirmation before clearing recovery evidence") — `mustPersist`'s
+  // retries only cover a WRITE that bd refuses; they cannot cover the process (or host) dying
+  // between two already-`await`ed statements, which never reaches the later statement at all. On
+  // the old order (marker clear, then baseline clear, then this write) a death right after both
+  // clears landed — globally visible immediately on a shared Dolt server, no push required — left
+  // the ticket with no pending marker, no preserved baseline, no confirmation and no cleanup
+  // obligation: every recovery signal this module and `execute-epic-dispatch.ts`'s resume checks
+  // rely on gone at once. A resume then finds `doneOnBoard` true, `boardEvidenceConfirmed` false,
+  // and nothing pending or preserved, so it falls through to regeneration — against a fresh
+  // baseline that already contains this ticket's own confirmed writes, which an idempotent agent
+  // can only ever diff as unchanged and fail with `NoDeliveryError`, undoing a delivery that
+  // already landed. Writing this first closes the gap: a death immediately after leaves
+  // `boardEvidenceConfirmed` true with the marker/baseline still present, which is exactly the
+  // shape `execute-epic-dispatch.ts` already finishes as a "confirmed, finish survivor cleanup"
+  // resume rather than a delivery to regenerate. `--metadata @file` merges into existing custom
+  // metadata rather than replacing it (see {@link beads.setBoardEvidenceConfirmed}), so writing
+  // this key before the marker/baseline clear does not disturb them — the three writes are
+  // independent regardless of order. NOT idempotent on `ids` (PR #284 review, "Preserve confirmed
+  // evidence IDs during cleanup retries") — the field carries the confirmed ids themselves, not a
+  // boolean, so retrying this write with a narrower `ids` than a prior successful call overwrites
+  // real confirmed evidence with less. Every caller is therefore responsible for passing the full
+  // known id set on a retry (pending ids UNIONED with whatever
   // `beads.confirmedBoardEvidenceIds`/`beads.cleanupUnsyncedBoardEvidenceIds` already know), never
   // just the ids freshly found this attempt.
   const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids));
+  const markerCleared =
+    stale.length === 0 ? true : await mustPersist(() => beads.setBoardEvidencePending(repo, ticketId, [], stale));
+  const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
   const cleared = markerCleared && baselineCleared && confirmedSet;
   const synced = cleared
     ? await beads
