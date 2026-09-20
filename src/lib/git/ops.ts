@@ -4,7 +4,7 @@
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
 import type { ChildProcess } from "node:child_process";
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1573,17 +1573,83 @@ function pushTimedOut(args: string[], timeoutMs: number, stderr: string): Error 
  * gate while still giving up on a genuinely dead link. Pushing with these set landed fati-uhya on
  * the first try after those seven failures.
  *
- * Only ever ADDS to the operator's own setting: an existing `GIT_SSH_COMMAND` is left exactly as it
- * is, since it may carry an identity or a jump host we must not drop. Harmless for an HTTPS remote,
- * which never reads it.
+ * NEVER silently replaces an operator's SSH command (PR #306 review). `GIT_SSH_COMMAND` outranks
+ * `core.sshCommand` — git's own documentation says the config "is overridden when the environment
+ * variable is set" — so setting this variable on a repo configured with a deploy key or a jump host
+ * would drop that configuration and fail every push it was there to make work. `core.sshCommand` is
+ * read from the repo (`configuredSshCommand`) and the keepalives are APPENDED to it, so the
+ * identity survives and the channel still stays open. An existing `GIT_SSH_COMMAND` is extended the
+ * same way.
+ *
+ * Three cases are left strictly alone:
+ *   - `GIT_SSH` with no `GIT_SSH_COMMAND`/`core.sshCommand`. That variable names a helper BINARY,
+ *     and git documents it for programs that do not accept extra command-line arguments (plink and
+ *     friends) — which is why `GIT_SSH_COMMAND` exists at all. Appending `-o` to one would break it,
+ *     and setting `GIT_SSH_COMMAND` at all would override it. No keepalives there.
+ *   - A command whose program is not `ssh`. Git applies the same basename test before assuming
+ *     OpenSSH options are understood; a wrapper script may reject `-o` outright.
+ *   - A command that already sets `ServerAliveInterval`. The operator has an opinion; it wins.
+ *
+ * Harmless for an HTTPS remote, which never reads any of this.
  */
 export function pushEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
+  configuredSshCommand?: string,
 ): NodeJS.ProcessEnv {
   const next = { ...env } as NodeJS.ProcessEnv;
-  if (next.GIT_SSH_COMMAND) return next;
-  next.GIT_SSH_COMMAND = "ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=30";
+  // The command git would actually run, in the precedence git itself applies.
+  const effective = next.GIT_SSH_COMMAND?.trim() || configuredSshCommand?.trim() || "";
+  if (!effective) {
+    // A bare GIT_SSH helper is the one case with nothing safe to add — see above.
+    if (next.GIT_SSH) return next;
+    next.GIT_SSH_COMMAND = `ssh ${SSH_KEEPALIVE_OPTS}`;
+    return next;
+  }
+  if (/ServerAliveInterval/i.test(effective)) return next;
+  if (!isOpenSshCommand(effective)) return next;
+  // Appending rather than replacing is what preserves an identity or jump host. When `effective`
+  // came from `core.sshCommand`, the value written here CONTAINS that command, so the env var
+  // outranking the config no longer loses it.
+  next.GIT_SSH_COMMAND = `${effective} ${SSH_KEEPALIVE_OPTS}`;
   return next;
+}
+
+/** The keepalives themselves: a probe every 30s, up to 30 unanswered — about 15 minutes of gate. */
+const SSH_KEEPALIVE_OPTS = "-o ServerAliveInterval=30 -o ServerAliveCountMax=30";
+
+/**
+ * `core.sshCommand` as it resolves for `cwd` (repo config, then global, then system), or undefined
+ * when unset — what {@link pushEnv} must preserve rather than override.
+ *
+ * Synchronous and best-effort: it runs once per push, immediately before a spawn that may take
+ * minutes, so the few milliseconds are irrelevant next to being correct about the operator's
+ * identity. Every failure — no git, not a repo, the key simply unset (exit 1) — yields undefined,
+ * which is exactly the common case, so nothing here can fail a push. A short timeout keeps a wedged
+ * git from holding the push open.
+ */
+function readSshCommand(cwd: string): string | undefined {
+  try {
+    const r = spawnSync("git", ["-C", cwd, "config", "--get", "core.sshCommand"], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    if (r.status !== 0) return undefined;
+    return r.stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether `command`'s program is OpenSSH's `ssh`, so `-o` options are understood. Mirrors git's own
+ * basename test (git-config, `core.sshCommand`: an unrecognized basename makes git probe with `-G`
+ * before assuming OpenSSH options). Anything else — plink, a wrapper script — is left untouched
+ * rather than handed flags it may not accept.
+ */
+function isOpenSshCommand(command: string): boolean {
+  const program = command.trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, "") ?? "";
+  const base = program.split(/[/\\]/).pop() ?? "";
+  return base === "ssh" || base === "ssh.exe";
 }
 
 /**
@@ -1617,7 +1683,9 @@ function gitPush(
     const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
-      env: pushEnv(),
+      // The repo's own `core.sshCommand` is read and passed in, so the keepalives extend it instead
+      // of overriding it — setting GIT_SSH_COMMAND outranks that config (PR #306 review).
+      env: pushEnv(process.env, readSshCommand(cwd)),
     });
     const stderr = boundedStderr(child);
     const stdout = boundedStdout(child);
@@ -1785,6 +1853,16 @@ const PORCELAIN_ANY_REJECTED = /^!\t.*$/m;
  * gate produces when it outlasts the server's idle timeout (see {@link pushEnv}). Matched on stderr
  * for a `code === 1` push, where it would otherwise be read as a declined local hook.
  *
+ * Tested ONLY when porcelain has no `Done` line, never ahead of a per-ref verdict (PR #306 review).
+ * The incident this exists for never had one — nothing was transferred, so the remote never answered
+ * — which means scoping it there costs the fix nothing. Testing it earlier would let stderr text
+ * override porcelain's structural answer: a push the remote genuinely REJECTED, whose stderr happens
+ * to also carry a transport diagnostic (a server that hangs up right after answering, a verbose or
+ * jump-host ssh printing `client_loop: send disconnect` during teardown), would be called transient
+ * and retried three times — each retry paying the full slow gate this change exists to protect, on a
+ * push that can never succeed. That inverts the rule the whole classifier is built on: read
+ * porcelain's structure first, fall back to stderr text only where porcelain is silent.
+ *
  * Deliberately narrow: every alternative is a TRANSPORT diagnostic that only ssh or git itself
  * writes, so a project hook printing the word "connection" in its own failure cannot mimic one.
  * `Connection reset` is absent on purpose — the exit-128 branch already owns it, and a hook's stderr
@@ -1898,23 +1976,27 @@ export function classifyPushFailure(result: {
   }
 
   if (code === 1) {
-    // Checked BEFORE the declined-hook branch below, which is the default for "exit 1, no `Done`".
-    // A connection the server hung up on produces exactly that shape — git opens the SSH channel
-    // before `pre-push` runs, so a slow gate leaves it idle until the server drops it, and nothing
-    // was ever transferred — but the hook had nothing to do with it and usually PASSED. Read as a
-    // declined hook it is permanent, so the run dies having paid the full gate; read as what it is,
-    // the retry costs another gate but can actually succeed. {@link pushEnv} makes this rare rather
-    // than routine; this makes it survivable when it still happens.
-    if (SSH_CONNECTION_DROPPED.test(stderr)) {
-      return {
-        transient: true,
-        reason:
-          `the connection to the remote was closed before the push transferred anything — git opens ` +
-          `it before pre-push runs, so a slow gate can outlast the server's idle timeout. The hook's ` +
-          `own verdict is not what failed here: ${stderr}`,
-      };
-    }
+    // NO `Done` — git never got far enough for the remote to answer per-ref, so porcelain has
+    // nothing structural to say and stderr text is all there is. Both readings of that shape live
+    // here, INSIDE the no-`Done` case, so neither can outrank a porcelain verdict below (PR #306
+    // review): a remote that answered and rejected is decided by its own answer, whatever else
+    // happens to appear in stderr.
     if (!/^Done\s*$/m.test(stdout)) {
+      // A connection the server hung up on produces exactly this shape — git opens the SSH channel
+      // before `pre-push` runs, so a slow gate leaves it idle until the server drops it, and nothing
+      // is ever transferred — but the hook had nothing to do with it and usually PASSED. Read as a
+      // declined hook it is permanent, so the run dies having paid the full gate; read as what it
+      // is, the retry costs another gate but can actually succeed. {@link pushEnv} makes this rare
+      // rather than routine; this makes it survivable when it still happens.
+      if (SSH_CONNECTION_DROPPED.test(stderr)) {
+        return {
+          transient: true,
+          reason:
+            `the connection to the remote was closed before the push transferred anything — git opens ` +
+            `it before pre-push runs, so a slow gate can outlast the server's idle timeout. The hook's ` +
+            `own verdict is not what failed here: ${stderr}`,
+        };
+      }
       return {
         transient: false,
         reason: `a local pre-push hook declined the push: ${stderr || "(hook printed nothing to stderr)"}`,

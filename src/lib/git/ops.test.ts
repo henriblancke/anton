@@ -4006,8 +4006,54 @@ describe("pushEnv — keepalives so a slow pre-push gate cannot outlast the serv
     expect(env.PATH).toBe("/usr/bin");
   });
 
-  it("never overwrites an operator's own GIT_SSH_COMMAND — it may carry an identity or a jump host", () => {
+  it("extends an operator's own GIT_SSH_COMMAND instead of discarding it", () => {
     const mine = "ssh -i ~/.ssh/deploy_key -J bastion.example.com";
+
+    const got = pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND;
+    // The identity and the jump host BOTH survive — dropping either fails every push.
+    expect(got).toContain("-i ~/.ssh/deploy_key");
+    expect(got).toContain("-J bastion.example.com");
+    expect(got).toMatch(/ServerAliveInterval=30/);
+  });
+
+  /**
+   * PR #306 review (Codex P1). `GIT_SSH_COMMAND` OVERRIDES `core.sshCommand` — git's own docs say
+   * the config "is overridden when the environment variable is set" — so setting the variable on a
+   * repo that selects a deploy key or a jump host through config would silently drop it and fail
+   * every SSH push. The config is read at the call site and appended to here.
+   */
+  it("preserves a core.sshCommand by appending to it, never replacing it", () => {
+    const configured = "ssh -i /etc/deploy/id_ed25519 -o IdentitiesOnly=yes";
+
+    const got = pushEnv({ PATH: "/usr/bin" }, configured).GIT_SSH_COMMAND;
+    expect(got).toContain(configured);
+    expect(got).toMatch(/ServerAliveInterval=30/);
+  });
+
+  it("prefers GIT_SSH_COMMAND over core.sshCommand, matching git's own precedence", () => {
+    const got = pushEnv({ GIT_SSH_COMMAND: "ssh -i /from/env" }, "ssh -i /from/config").GIT_SSH_COMMAND;
+
+    expect(got).toContain("/from/env");
+    expect(got).not.toContain("/from/config");
+  });
+
+  it("leaves a bare GIT_SSH helper alone — it takes no extra arguments, and the variable would override it", () => {
+    // GIT_SSH names a BINARY, which is the whole reason GIT_SSH_COMMAND exists; plink and friends
+    // reject `-o` outright, and setting GIT_SSH_COMMAND at all would override the helper.
+    const env = pushEnv({ GIT_SSH: "/usr/bin/plink" });
+
+    expect(env.GIT_SSH_COMMAND).toBeUndefined();
+    expect(env.GIT_SSH).toBe("/usr/bin/plink");
+  });
+
+  it("leaves a non-ssh wrapper command alone rather than handing it OpenSSH flags", () => {
+    const wrapper = "/opt/corp/git-ssh-wrapper --profile ci";
+
+    expect(pushEnv({ GIT_SSH_COMMAND: wrapper }).GIT_SSH_COMMAND).toBe(wrapper);
+  });
+
+  it("defers to an operator who already set a keepalive interval of their own", () => {
+    const mine = "ssh -o ServerAliveInterval=5";
 
     expect(pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND).toBe(mine);
   });
@@ -4048,6 +4094,35 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
     // Must not be blamed on the hook, whose own PASSING output sits in that same stderr.
     expect(verdict.reason).not.toMatch(/hook declined/);
     expect(verdict.reason).toMatch(/closed before the push transferred anything/);
+  });
+
+  /**
+   * PR #306 review, both reviewers. The transport check is scoped to the no-`Done` case, so a
+   * remote that ANSWERED and rejected is decided by its own per-ref verdict no matter what else
+   * lands in stderr — a server hanging up right after answering, or a verbose/jump-host ssh
+   * printing `client_loop: send disconnect` during teardown. Classified transient, these would burn
+   * three retries, each paying the full slow gate, on a push that can never succeed.
+   */
+  it("keeps a non-fast-forward rejection permanent even when stderr also shows the connection dropping", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\nDone\n",
+      stderr: "client_loop: send disconnect: Broken pipe\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/non-fast-forward/);
+  });
+
+  it("keeps a remote hook rejection permanent even when stderr also shows the connection dropping", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\nDone\n",
+      stderr: "Connection to github.com closed by remote host.\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-receive hook/);
   });
 
   // The narrowness of SSH_CONNECTION_DROPPED is the point: a hook is free to print the word
