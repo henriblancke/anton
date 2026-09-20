@@ -275,3 +275,96 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * PR #284 review, "Audit live-board mutations when ticket execution fails": a board-only ticket's
+ * deliverable is bd writes the agent makes directly against the live board, so a write it made
+ * before a LATER step failed (a verify gate here) is already live on the board by the time
+ * `walkTicketSteps` throws — well before the commit step's own `assertBoardOnlyDelivered` ever gets
+ * a chance to compare against the baseline. Without this audit, `settleFailedTicket` would settle the
+ * ticket with no record of that write at all, and a resumed attempt's fresh `readBoardBaseline` read
+ * would silently absorb it as pre-existing.
+ */
+describe("runTicket — audits the board on a failed post-dispatch path (PR #284 review)", () => {
+  const boardTicket = { ...ticket, labels: ["delivery:board"] } as Bead;
+
+  function failingVerifyStep(): ResolvedStep {
+    return {
+      step: { id: "verify" },
+      definition: {
+        name: "verify",
+        class: "verify",
+        summary: "fake verify gate",
+        producesDiff: false,
+        handler: async () => ({ ok: false, detail: "tests failed" }),
+      },
+    } as unknown as ResolvedStep;
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
+    settleFailedTicketMock.mockImplementation(async () => {
+      throw new Error("settled as a failure");
+    });
+  });
+
+  it("audits the board against the pre-dispatch baseline before settling the ticket", async () => {
+    readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x9"], synced: true });
+
+    await expect(
+      runTicket({
+        run: run(),
+        steps: [failingVerifyStep()],
+        ticket: boardTicket,
+        runTicketIds: [boardTicket.id],
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow("settled as a failure");
+
+    expect(readBoardEvidenceMock).toHaveBeenCalledWith("/tmp/anton", { beads: new Map() }, boardTicket);
+    expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not audit (or alter settlement) when nothing on the board changed", async () => {
+    readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+
+    await expect(
+      runTicket({
+        run: run(),
+        steps: [failingVerifyStep()],
+        ticket: boardTicket,
+        runTicketIds: [boardTicket.id],
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow("settled as a failure");
+
+    expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+  });
+
+  it(
+    "halts instead of settling when the audit's own pending-evidence marker could not be persisted " +
+      "— losing that record would let a resumed attempt's fresh baseline silently absorb the write " +
+      "with no way left to attribute or reject it",
+    async () => {
+      readBoardEvidenceMock.mockResolvedValue({
+        found: true,
+        ids: ["anton-x9"],
+        synced: false,
+        markerUnpersisted: true,
+      });
+
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [failingVerifyStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow(/could not be recorded for a resume/);
+
+      expect(settleFailedTicketMock).not.toHaveBeenCalled();
+    },
+  );
+});

@@ -43,6 +43,7 @@ import {
   type TicketSettlement,
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
+import { appendSessionLog } from "../sessions";
 import { recordBoardOnlyAttribution } from "./step-registry";
 import type { StepContext, StepFacts } from "./step-registry";
 
@@ -178,6 +179,19 @@ export async function runTicket(args: {
     );
     finished = { settlement, closed, transitioned };
   } catch (e) {
+    // A board-only ticket's deliverable is bd writes the agent makes directly against the live
+    // board (PR #284 review, "Audit live-board mutations when ticket execution fails") — so a write
+    // it made before a LATER step failed (a verify gate, a timeout) is already live on the board by
+    // the time this catch runs, and nothing else on this failure path ever looks: `walkTicketSteps`
+    // threw before the commit step's own `assertBoardOnlyDelivered` ever got a chance to compare
+    // against `boardBaseline`. Audited here, before the ticket settles, so a resumed attempt still
+    // attributes that write instead of `readBoardBaseline` taking a fresh read that already absorbed
+    // it as pre-existing (via an independent sync pass, or this run's own best-effort final sync in
+    // `concludeRunAttempt`) — the exact loss of attribution the whole board-evidence check exists to
+    // prevent.
+    if (boardOnly && boardBaseline) {
+      await auditBoardOnFailedTicket(run, ticket, boardBaseline, session.logPath, e);
+    }
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
     return settleFailedTicket({
       run,
@@ -238,6 +252,52 @@ export async function runTicket(args: {
     closed: finished.closed,
     ...(progress.boardEvidenceIds ? { boardEvidenceIds: progress.boardEvidenceIds } : {}),
   };
+}
+
+/**
+ * Audit the board against the pre-dispatch baseline when a board-only ticket fails AFTER dispatch
+ * started (PR #284 review, "Audit live-board mutations when ticket execution fails") — every path
+ * that reaches `runTicket`'s catch without ever calling `assertBoardOnlyDelivered` (a verify step
+ * that threw, a ticket that ran out of its budget, `ticketSettlement`'s own deadline recheck), so no
+ * comparison against `boardBaseline` has been made at all.
+ *
+ * Reuses {@link readBoardEvidence} rather than a bespoke diff, on purpose: finding real evidence here
+ * persists the SAME `board-evidence-pending:*` marker the success path writes, and that marker is
+ * what a LATER attempt's own `readBoardEvidence` unions into its fresh diff (see that function's own
+ * docstring) — so a write this failed attempt made stays attributable to this ticket however many
+ * more failed attempts sit between it and the one that finally delivers, even though the next
+ * attempt's fresh `readBoardBaseline` read may already contain it as pre-existing state.
+ *
+ * Only the marker/baseline write itself failing after every retry is unsafe enough to halt the run
+ * outright (mirrors `boardOnlyNoDeliveryMessage`'s own `markerUnpersisted`/`baselineUnpersisted`
+ * handling on the success path) — anything else (including evidence the confirming push could not
+ * verify synced) leaves the recovery state durably on the ticket for the next attempt to pick up, so
+ * this ticket's own failure is left to settle exactly as it would have otherwise.
+ */
+async function auditBoardOnFailedTicket(
+  run: Omit<StepContext, "tickets">,
+  ticket: Bead,
+  boardBaseline: BoardFingerprint,
+  logPath: string,
+  cause: unknown,
+): Promise<void> {
+  const result = await readBoardEvidence(run.repoPath, boardBaseline, ticket);
+  if (!result.found) return;
+  await appendSessionLog(
+    logPath,
+    `[board-audit] ${ticket.id} failed after board evidence was found on ${result.ids.join(", ")} — ` +
+      `preserved on the ticket for a resumed attempt to attribute.\n`,
+  ).catch(() => {});
+  if (result.markerUnpersisted || result.baselineUnpersisted) {
+    throw new PoisonEpic(
+      `${ticket.id} failed and this attempt's board writes on ${result.ids.join(", ")} could not be ` +
+        `recorded for a resume — bd refused the ${result.markerUnpersisted ? "pending-evidence marker" : "recovery baseline"} ` +
+        `write after retries. The run stopped rather than let a resumed attempt's fresh board ` +
+        `baseline silently absorb these unreviewed writes as pre-existing, with no way left to ` +
+        `attribute or safely reject them. Check the beads DB, then resume the run. This ticket ` +
+        `failed with: ${String(cause)}`,
+    );
+  }
 }
 
 /**

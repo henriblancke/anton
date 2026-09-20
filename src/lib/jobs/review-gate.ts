@@ -1214,7 +1214,19 @@ async function runGateFixSession(args: {
           `the review fix for ${target.id} left ${worktreePath} on a branch of its own: ${describeRef(afterFix)}, ` +
             `not the run's ${describeRef(before)}. Parked instead of retried — anton pushes the run's branch by ` +
             `name, so the fix (and every later commit) would never reach the PR, while the confirming review ` +
-            `would read it and pass. Move the commits back onto the run's branch by hand, then resume.`,
+            `would read it and pass. Move the commits back onto the run's branch by hand, then resume.` +
+            // `boardChanged` (PR #284 review, "Audit board changes even when the fixer switches
+            // branches") is already computed above, and reaching here means it is also `boardSynced`
+            // — the unsynced case throws before this branch check ever runs. The fixer's commits stay
+            // exactly where they are (parked, not reverted), but a board-capable fixer's bd writes
+            // already escaped to the shared board regardless of the stray branch, and this poison must
+            // say so — the outer catch's `!(e instanceof PoisonError)` skips the board-failure audit
+            // below entirely for a `PoisonError` like this one.
+            (boardChanged
+              ? ` This round also wrote directly to the live board before switching branches — bead(s) ` +
+                `${changedBoardIds.join(", ")} changed and are already confirmed synced, so review ` +
+                `those writes by hand too before resuming.`
+              : ""),
         );
       }
 

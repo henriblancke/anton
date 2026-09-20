@@ -848,6 +848,58 @@ describe("runReviewGate — bounds", () => {
   );
 
   it(
+    "includes the changed beads in the stray-branch poison when a board-capable fixer also " +
+      'switches branches (PR #284 review, "Audit board changes even when the fixer switches ' +
+      'branches") — the outer catch skips the failed-fix board audit entirely for a PoisonError ' +
+      "like the stray-branch one, so that poison itself has to say a live board write already " +
+      "escaped before anyone reviewed it",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      // Dispatch 2 is the fix session — it writes to the board AND checks out a branch of its own.
+      const worktree = fakeWorktree([], "", [], [2]);
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "fixed it on a branch of my own, via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true, // the fixer's board write is confirmed synced
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/on a branch of its own/);
+      expect((error as Error).message).toContain(boardOnlyTicket.id);
+      expect(calls).toHaveLength(2); // no confirming review on work the PR would never carry
+    },
+  );
+
+  it(
     "parks instead of stalling when a board-only fix's write cannot be confirmed synced " +
       "(PR #284 review round 15) — a local-only Dolt write must not read as a normal no-progress " +
       "round, since a resume or this run's own best-effort final sync could later publish it with no " +
