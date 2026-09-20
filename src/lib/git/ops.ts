@@ -678,6 +678,46 @@ function boundedStdout(child: ChildProcess): () => string {
 }
 
 /**
+ * Ceiling on waiting for a dying child's own stdout/stderr to drain (see {@link drainStdio}). Short:
+ * this only covers the gap between the kernel handing `git` its death blow and Node's poll phase
+ * delivering the last bytes already sitting in the pipe — microtasks, not I/O.
+ */
+const STDIO_DRAIN_TIMEOUT_MS = 200;
+
+/**
+ * Wait for a dying child's own stdout/stderr pipes to finish delivering whatever they already
+ * buffered, independent of whether anything ELSE still holds those pipes open.
+ *
+ * `exit` fires the instant `git` itself dies, but says nothing about output it wrote a moment
+ * before dying — that data can still be sitting unread in the pipe's kernel buffer when `exit`'s
+ * listener runs, so reading {@link boundedStdout}/{@link boundedStderr} synchronously there can miss
+ * it. `close` is the event that guarantees the drain, but gating the signal-kill reap on `close`
+ * deadlocks when a surviving hook inherits the pipes (the reason that reap starts from `exit` at
+ * all — see the handler below). Waiting on each stream's own `end` gets the drain guarantee back for
+ * the dominant case — nothing survived to keep the pipe open — without reintroducing that deadlock:
+ * a stream still held open by a survivor never reaches `end`, so this is bounded by
+ * {@link STDIO_DRAIN_TIMEOUT_MS} rather than awaited indefinitely.
+ */
+function drainStdio(child: ChildProcess): Promise<void> {
+  const pending = [child.stdout, child.stderr].filter(
+    (s): s is NonNullable<typeof s> => !!s && !s.readableEnded,
+  );
+  if (pending.length === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let remaining = pending.length;
+    const timer = setTimeout(resolve, STDIO_DRAIN_TIMEOUT_MS);
+    const done = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearTimeout(timer);
+        resolve();
+      }
+    };
+    for (const s of pending) s.once("end", done);
+  });
+}
+
+/**
  * Run git and keep at most `maxChars` of its stdout, killing it the moment output overflows.
  *
  * For commands whose output has no useful upper bound. `git()` collects stdout through execFile's
@@ -1557,10 +1597,17 @@ function gitPush(
     // nothing happens until the (much later) budget timer, and that failure is misreported as a
     // plain timeout rather than the signal kill it was. `exit` fires the moment `git` itself dies,
     // independent of who else still holds its stdio.
+    //
+    // {@link drainStdio} runs alongside the reap, not after it (P1, #305 review round 2): `exit`
+    // firing says nothing about output `git` wrote an instant before dying — that can still be
+    // sitting unread in the pipe when `stderr()`/`stdout()` are called, so reading them right after
+    // `reapCommitGroup` resolves (which, with nothing surviving, can resolve on the very next
+    // microtask) can miss the pre-push hook's own output, the exact thing this signal-kill path
+    // exists to surface.
     child.on("exit", (code, killedBy) => {
       if (killing || settled || code !== null) return;
       killing = true;
-      void reapCommitGroup(child).then(() =>
+      void Promise.all([reapCommitGroup(child), drainStdio(child)]).then(() =>
         settle(() => reject(pushFailed(args, code, killedBy, stderr(), stdout()))),
       );
     });
@@ -1652,6 +1699,16 @@ export interface PushRetryShape {
 const SIGNAL_KILL_RETRY: PushRetryShape = { maxAttempts: 2, backoffMs: 30_000 };
 
 /**
+ * A porcelain non-fast-forward rejection's ref-status line, shared by {@link classifyPushFailure}'s
+ * `code === 1` and `code === null` branches: a proven rejection reads the same way regardless of
+ * whether `git` went on to exit cleanly or was killed right after writing it.
+ */
+const PORCELAIN_NON_FF_REJECTED = /\[rejected\]\s*\((?:fetch first|non-fast-forward)\)/;
+
+/** A porcelain `pre-receive` hook decline's ref-status line, the `code === null` counterpart above. */
+const PORCELAIN_HOOK_REJECTED = /\[remote rejected\]\s*\(.*hook declined.*\)/;
+
+/**
  * Caps {@link SIGNAL_KILL_RETRY}'s gap, same CAP-never-an-override contract as {@link PUSH_TIMEOUT_ENV}
  * and read per call for the same reason. Exists so the retry can be exercised without waiting out a
  * real 30 seconds; a lower value can only shorten the wait, never lengthen it.
@@ -1703,10 +1760,33 @@ export function classifyPushFailure(result: {
       signal === "SIGKILL"
         ? " — on a host under memory pressure this is most often the OOM killer taking the pre-push hook"
         : "";
+    // `Done` proves the remote answered for every ref, but not what it answered (#305 review round
+    // 2): porcelain writes `Done` once every ref-status line is written, REJECTIONS included, so a
+    // signal landing right after `Done` can still be racing a proven-permanent rejection rather than
+    // an accepted update. Check the ref-status lines themselves before ever reading `Done` as
+    // acceptance — the same rejection patterns the `code === 1` branch below already recognizes.
+    if (PORCELAIN_NON_FF_REJECTED.test(stdout)) {
+      return {
+        transient: false,
+        reason:
+          `the push was killed by ${named} from outside anton${oom}, but the remote had already ` +
+          `rejected the update as a non-fast-forward before the signal arrived — a retry of the same ` +
+          `push cannot fix that: ${stdout}`,
+      };
+    }
+    if (PORCELAIN_HOOK_REJECTED.test(stdout)) {
+      return {
+        transient: false,
+        reason:
+          `the push was killed by ${named} from outside anton${oom}, but the remote's pre-receive hook ` +
+          `had already declined the update before the signal arrived — remote policy, not a transport ` +
+          `fault: ${stdout}`,
+      };
+    }
     // A `Done` line only appears once `--porcelain` heard back from the remote for every ref, so
-    // its presence is the one thing this can assert about ref state; its absence proves nothing —
-    // the signal could still have landed after the remote accepted the update but before the line
-    // was written back.
+    // its presence (absent either rejection pattern above) is the one thing this can assert about
+    // ref state; its absence proves nothing — the signal could still have landed after the remote
+    // accepted the update but before the line was written back.
     const refState = /^Done\s*$/m.test(stdout)
       ? "the remote had already accepted the update when the signal arrived"
       : "whether the remote accepted the update before the signal arrived is unknown";
@@ -1726,14 +1806,14 @@ export function classifyPushFailure(result: {
         reason: `a local pre-push hook declined the push: ${stderr || "(hook printed nothing to stderr)"}`,
       };
     }
-    if (/\[rejected\]\s*\((?:fetch first|non-fast-forward)\)/.test(stdout)) {
+    if (PORCELAIN_NON_FF_REJECTED.test(stdout)) {
       return {
         transient: false,
         reason:
           "the remote has commits this branch does not — a non-fast-forward rejection an identical retry cannot fix",
       };
     }
-    if (/\[remote rejected\]\s*\(.*hook declined.*\)/.test(stdout)) {
+    if (PORCELAIN_HOOK_REJECTED.test(stdout)) {
       return {
         transient: false,
         reason: "the remote's pre-receive hook declined the push — remote policy, not a transport fault",

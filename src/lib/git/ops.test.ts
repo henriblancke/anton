@@ -4201,6 +4201,37 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
       expect(verdict.reason).not.toMatch(/unknown/);
     });
 
+    // #305 review round 2: `Done` only proves the remote answered, not that it accepted — porcelain
+    // writes `Done` once every ref-status line is written, rejections included. A signal landing
+    // right after a `[rejected]` line must not be reported as an accepted update that a backoff
+    // should just retry.
+    it("reports a proven non-fast-forward rejection as permanent, not as an accepted update", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout: "To origin\n!\trefs/heads/main:refs/heads/main\t[rejected] (fetch first)\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.transient).toBe(false);
+      expect(verdict.reason).toMatch(/non-fast-forward/);
+      expect(verdict.reason).not.toMatch(/already accepted the update/);
+    });
+
+    it("reports a proven pre-receive hook decline as permanent, not as an accepted update", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout:
+          "To origin\n!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.transient).toBe(false);
+      expect(verdict.reason).toMatch(/pre-receive hook/);
+      expect(verdict.reason).not.toMatch(/already accepted the update/);
+    });
+
     it("points at the OOM killer for SIGKILL specifically — the measured cause on a loaded host", () => {
       const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
 
@@ -4724,6 +4755,11 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
         expect(message).not.toMatch(/no ref moved/);
         // The exact string the bug produced, gone from the message the caller finally sees.
         expect(message).not.toMatch(/exit null/);
+        // #305 review round 2: the shim writes this stderr an instant before killing itself, with
+        // nothing surviving to hold the pipe open — the dominant real shape this fix targets. If the
+        // signal-kill reap reads stdout/stderr before Node has drained what was already buffered in
+        // the pipe, this is exactly the output that goes missing.
+        expect(message).toMatch(/PASS tests\/unit\/thing\.test\.ts/);
       },
     );
 
