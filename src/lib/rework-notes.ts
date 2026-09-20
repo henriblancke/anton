@@ -409,12 +409,15 @@ function replaceRunsUnder(description: string, targetId: string, parentId?: stri
   // A raw HTML block renders its content as literal source, as a fence does its own: a run-location
   // sentence moved into a `<pre>`/`<script>` sample is founder-authored text, not the active
   // generated line, and rewriting it there would change what the founder wrote under Context.
+  // The same holds for a sentence tucked into an HTML comment — `commented` marks it inert, so it
+  // is a founder's sample, not the live line the reconcile is meant to update.
   const inHtml = new Set<number>();
   htmlBlockLines(description).forEach((html, at) => html && inHtml.add(at));
   return lines
     .map((line, at) =>
       inContext.has(at) &&
       !line.fenced &&
+      !line.commented &&
       !inHtml.has(at) &&
       generated.has(line.text)
         ? wanted

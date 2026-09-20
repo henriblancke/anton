@@ -783,6 +783,27 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toContain("It is its own run target");
   });
 
+  it("keeps a run-location line moved into a multiline HTML comment under Context as inert sample text", () => {
+    // A comment renders nothing, so a sentence moved inside one is a founder's sample, not the
+    // active generated line. `scanMarkdown` marks it `commented`, and the exact-text match must
+    // skip commented lines alongside fenced and raw-HTML ones, or it mutates the founder's sample.
+    const sentence = "It runs as a ticket of feat, in that target's next run.";
+    const moved = [
+      "## Goal",
+      "harden the retry",
+      "",
+      "## Context",
+      "Here is the original line:",
+      "",
+      "<!--",
+      sentence,
+      "-->",
+    ].join("\n");
+    const reconciled = reconcileFollowUpDescription(moved, { ...edited, parentId: undefined });
+    expect(reconciled).toContain(`<!--\n${sentence}\n-->`);
+    expect(reconciled).not.toContain("It is its own run target");
+  });
+
   it("appends an Acceptance section to a hand-made bead that has none, keeping what it says", () => {
     const handMade = "## Goal\nharden the retry\n\n## Context\nMade by hand.\n";
     const reconciled = reconcileFollowUpDescription(handMade, edited);
