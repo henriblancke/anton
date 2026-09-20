@@ -324,6 +324,35 @@ it("ignores a stale branch-scoped refresh record on a freshly RECREATED checkout
   expect(runStep.alreadyShippedBase).toBe("recreated-branch-fork");
 });
 
+it("clears a stale refresh record on its own row when its branch is recreated (PR #279 review)", async () => {
+  // This run's row already recorded an effective refresh from an earlier attempt (a reused checkout
+  // brought onto `stale-recorded-base`). Before this attempt, that checkout and branch were deleted
+  // and this call's `createWorktree` cuts a brand-new branch straight off the fresh base — nothing
+  // ran a refresh this time, so `refreshOutcome` is undefined and there is nothing fresh to record.
+  // Leaving the row's old pair in place would let a later `findRunBaseRefreshShaForBranch` on this
+  // branch prefer that stale boundary over the recreated branch's own fork as the next refresh's
+  // `--onto` boundary, replaying whatever the deletion/recreation dropped.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "stale-recorded-base",
+    branch: BRANCH,
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: true,
+    repoPath: "/repo",
+    forkSha: "recreated-branch-fork",
+  });
+
+  await warmRunWorktree(makeRun(RUN_ID));
+
+  const row = await actualRuns.getRunById(t.db, RUN_ID);
+  expect(row?.baseRefreshOutcome).toBeNull();
+  expect(row?.baseRefreshSha).toBeNull();
+});
+
 it("advances alreadyShippedBase to the refreshed base when a stale reused checkout was brought forward (PR #279 review)", async () => {
   // A resume reuses a branch pinned to an OLD fork — baseForkSha stays frozen at it, by design, so
   // dispatch keeps partitioning against the checkout's true fork. But the refresh that just merged

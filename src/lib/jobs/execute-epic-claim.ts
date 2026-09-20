@@ -181,9 +181,18 @@ export async function warmRunWorktree(
   // P1): `createWorktree` already mutated the branch (rebased/merged it) by this point — the payload
   // here is the only durable record of what onto, and losing it would leave a later resume deriving
   // `forkSha` from the stale, pre-refresh pin instead.
-  const refreshFields =
-    worktree.refreshOutcome &&
-    !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
+  //
+  // A freshly CREATED branch (`worktree.createdBranch`) forks straight off `freshBase` and never runs
+  // a refresh (see `materializeFreshWorktree`), so it has nothing of its own to record here — but THIS
+  // row can still carry a refresh an EARLIER attempt recorded before its checkout and branch were
+  // deleted and recreated (PR #279 review). Leaving that stale pair in place (by writing neither key)
+  // would let a later `findRunBaseRefreshShaForBranch` on this same branch prefer it over the
+  // recreated branch's fresh `baseForkSha` as the `--onto` rebase boundary, replaying whatever the
+  // deletion/recreation dropped. Explicit nulls clear it — a harmless no-op when the row never had one.
+  const refreshFields = worktree.createdBranch
+    ? { baseRefreshOutcome: null, baseRefreshSha: null }
+    : worktree.refreshOutcome &&
+        !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
       ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }
       : undefined;
   try {
