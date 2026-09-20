@@ -358,6 +358,15 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
       // by `boardGeneration`, captured above alongside `board` itself rather than re-read here — see
       // that capture site for why a fresh read at this point would be too late.
       const hydrated = dedupeById([...board, ...await loadGateIssues(cwd, true, dangling)]);
+      // A write can invalidate the entry while the strict `loadGateIssues` await above is in
+      // flight — `hydrateIssueSnapshot`'s own generation guard then correctly refuses to stamp
+      // `hydrated` onto the (now different) entry. Without this check we'd still return that
+      // retired array here, handing an approval-path caller beads read before the write (PR #274
+      // review, thread on this line). Retry against the current board instead of serving stale
+      // gate evidence.
+      if (issueSnapshotGeneration(cwd) !== boardGeneration) {
+        return refreshAllIssues(cwd, opts);
+      }
       // `dedupeById` allocates a new array, and the cycle sidecar is WeakMap-keyed on array identity
       // (cycle-evidence.ts) — so a caller combining `withCycles` and `strictGates` would otherwise
       // lose the evidence just attached to `board` above the moment this branch rebuilds it (PR #274

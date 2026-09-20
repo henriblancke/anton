@@ -51,7 +51,8 @@ const {
   resetCycleProbes,
 } = await import("./issues");
 const { cycleEvidenceFor } = await import("./cycle-evidence");
-const { issueSnapshotVersion, refreshIssueSnapshot, resetIssueSnapshots } = await import("./snapshot");
+const { invalidateIssueSnapshot, issueSnapshotVersion, refreshIssueSnapshot, resetIssueSnapshots } =
+  await import("./snapshot");
 
 const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -435,6 +436,42 @@ describe("loadAllIssues", () => {
 
     await expect(approval).rejects.toThrow("database is locked");
     await expect(ordinary).resolves.toEqual([{ ...target }]);
+  });
+
+  it("retries instead of returning a stale hydration when a write lands during the strict re-fetch (PR #274 review)", async () => {
+    // Same shared-loader race as above (ordinary wins with a non-strict, gate-less board), but this
+    // time a write (`invalidateIssueSnapshot`) lands while the strict caller's own gate re-fetch is
+    // still in flight. `hydrateIssueSnapshot`'s generation guard correctly refuses to stamp that
+    // re-fetch's result onto the now-different entry — this call must notice the same mismatch and
+    // retry against the current board, not hand back the array it built from beads read before the
+    // write.
+    listMock.mockImplementationOnce(async () => [target]); // shared work read
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // shared loader's own (non-strict) gate read — degrades, swallowed
+
+    let resolveStrictRefetch!: (beads: Bead[]) => void;
+    listMock.mockImplementationOnce(
+      () => new Promise<Bead[]>((resolve) => { resolveStrictRefetch = resolve; }),
+    ); // this call's own strict re-fetch — held open to land the write mid-flight
+
+    // The post-retry read: a fresh board that already carries the gate (and the write's content
+    // change), so no further gate re-fetch is needed.
+    const updated: Bead = { ...target, title: "Ship it (updated)" };
+    listMock.mockImplementationOnce(async () => [updated, gate]);
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { strictGates: true });
+
+    await ordinary;
+    invalidateIssueSnapshot(REPO, true);
+    resolveStrictRefetch([gate]);
+
+    const approvalBoard = await approval;
+
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(approvalBoard.find((b) => b.id === "t-1")?.title).toEqual("Ship it (updated)");
+    expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
   });
 });
 
