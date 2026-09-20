@@ -4205,6 +4205,40 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
     expect(verdict.reason).toMatch(/non-fast-forward/);
   });
 
+  /**
+   * The gap the `Done`-only gate left (PR #306 review round 4). Porcelain writes each ref's status
+   * as it learns it and `Done` only as a footer, so a transport dying in between leaves a PROVEN
+   * `!` rejection with no `Done` — which the earlier gate handed to the stderr heuristic and
+   * retried, spending another full pre-push gate on a rejection no retry can fix. The earlier
+   * regression tests all included `Done`, so none of them covered this.
+   */
+  it.each([
+    ["non-fast-forward", "[rejected] (non-fast-forward)", /non-fast-forward/],
+    ["remote hook", "[remote rejected] (pre-receive hook declined)", /pre-receive hook/],
+  ])("keeps a %s rejection permanent when the transport died before the Done footer", (_l, status, reason) => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      // The ref-status line landed; the connection dropped before `Done` could follow.
+      stdout: `!\trefs/heads/main:refs/heads/main\t${status}\n`,
+      stderr: "Connection to github.com closed by remote host.\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(reason);
+  });
+
+  it("keeps an unrecognized rejection permanent without a Done footer, rather than reading stderr", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      // `!` is "rejected or failed to push" whatever the reason text — the generic backstop.
+      stdout: "!\trefs/heads/main:refs/heads/main\t[remote rejected] (refusing to update hidden ref)\n",
+      stderr: "client_loop: send disconnect: Broken pipe\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/rejected the push/);
+  });
+
   it("keeps a remote hook rejection permanent even when stderr also shows the connection dropping", () => {
     const verdict = classifyPushFailure({
       code: 1,

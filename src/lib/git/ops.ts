@@ -1639,10 +1639,16 @@ const SSH_KEEPALIVE_OPTS = "-o ServerAliveInterval=30 -o ServerAliveCountMax=30"
  * Best-effort: every failure — no git, not a repo, the key simply unset (exit 1) — yields undefined,
  * which is also the common case, so nothing here can fail a push. The timeout bounds a wedged git.
  */
-async function readSshCommand(cwd: string): Promise<string | undefined> {
+async function readSshCommand(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
   try {
     const { stdout } = await execFileAsync("git", ["-C", cwd, "config", "--get", "core.sshCommand"], {
       timeout: 5_000,
+      // The push's own signal, so a cancellation landing DURING the probe kills it instead of
+      // waiting out a wedged git (PR #306 review round 4). The abort surfaces as a rejection here
+      // and is swallowed like any other failure — `gitPush` re-checks `signal.aborted` immediately
+      // after this returns and rejects with the caller's reason, so cancellation is reported by
+      // that check rather than by whatever error the killed subprocess produced.
+      signal,
     });
     return stdout.trim() || undefined;
   } catch {
@@ -1690,7 +1696,7 @@ async function gitPush(
   // Awaited OUTSIDE the executor, so nothing blocks the event loop: this runs inside the in-process
   // job runner, which drives up to ANTON_MAX_CONCURRENT jobs and the Next.js HTTP handlers on one
   // loop (PR #306 review). See {@link readSshCommand}.
-  const sshCommand = await readSshCommand(cwd);
+  const sshCommand = await readSshCommand(cwd, signal);
   return new Promise((resolvePromise, reject) => {
     // Re-checked: the await above is a real window, and the signal may have fired during it.
     if (signal?.aborted) {
@@ -2020,12 +2026,18 @@ export function classifyPushFailure(result: {
   }
 
   if (code === 1) {
-    // NO `Done` — git never got far enough for the remote to answer per-ref, so porcelain has
-    // nothing structural to say and stderr text is all there is. Both readings of that shape live
-    // here, INSIDE the no-`Done` case, so neither can outrank a porcelain verdict below (PR #306
-    // review): a remote that answered and rejected is decided by its own answer, whatever else
-    // happens to appear in stderr.
-    if (!/^Done\s*$/m.test(stdout)) {
+    // NO `Done` and NO ref-status line — git never got far enough for the remote to answer, so
+    // porcelain has nothing structural to say and stderr text is all there is. Both readings of
+    // that shape live here, so neither can outrank a porcelain verdict (PR #306 review): a remote
+    // that answered is decided by its own answer, whatever else appears in stderr.
+    //
+    // `Done` alone is NOT the right gate for that (review round 4). Porcelain writes each ref's
+    // status as it learns it and `Done` only as a footer, so a transport that dies in between
+    // leaves a proven `!` rejection with no `Done` — which the `Done`-only gate sent straight into
+    // the stderr heuristic below and retried, on a rejection no retry can fix. `PORCELAIN_ANY_REJECTED`
+    // is the generic backstop for exactly this (`!` is "rejected or failed to push", whatever the
+    // reason text), and the `code === null` branch above already pairs the two the same way.
+    if (!/^Done\s*$/m.test(stdout) && !PORCELAIN_ANY_REJECTED.test(stdout)) {
       // A connection the server hung up on produces exactly this shape — git opens the SSH channel
       // before `pre-push` runs, so a slow gate leaves it idle until the server drops it, and nothing
       // is ever transferred — but the hook had nothing to do with it and usually PASSED. Read as a
