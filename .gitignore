@@ -71,3 +71,11 @@ dist/
 # Any other in-repo git worktree (anton-fj1q) — same failure, whatever directory it's checked out
 # at: a second full copy of the tree that must never be committable.
 .worktrees/
+
+# TOMBSTONE — graft is removed (see the removal commit), but git does NOT delete an ignored,
+# untracked directory when you pull. Any checkout or worktree that ever ran `graft build` still
+# holds its generated cache (in fati's main checkout that was 147MB across ~2.6k files). Drop this
+# rule and that tree appears in `git status` on the next pull, one `git add -A` away from being
+# committed, and ripgrep starts serving its stale cards as if they were source. Keeping it costs
+# nothing where no cache exists; delete it only once none do.
+/graft/
