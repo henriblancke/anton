@@ -280,11 +280,15 @@ describe("issue snapshots", () => {
     invalidateIssueSnapshot("/repo", true);
     resolveCold([bead("loaded")]);
 
-    // Version 1: the write bumped it, the discarded load did not. Generation 1 for the same reason.
+    // Version 1: the write bumped it, and this fallback always reads the entry's current version.
+    // Generation 0 (the ORIGINAL, pre-write generation this load actually ran against), not 1 (PR
+    // #274 review): stamping discarded, pre-write beads with the post-write generation would tell a
+    // caller comparing against `issueSnapshotGeneration` that they match the current board, when they
+    // describe the one the write replaced.
     await expect(read).resolves.toEqual({
       beads: [bead("loaded")],
       version: 1,
-      generation: 1,
+      generation: 0,
     });
 
     // …and the guard still holds: the raced load did not repopulate the cache, so the next

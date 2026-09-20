@@ -777,7 +777,14 @@ async function assertPublishedBoardCycleFree(run: EpicRun, gates: RunGates): Pro
   const freshReadiness = run.readiness(run.all);
   if (!freshReadiness.runnable) throw blockedRunPoison(epicBeadId, freshReadiness, run.all);
   gates.readiness = freshReadiness;
-  gates.gated = new Set(freshReadiness.gated);
+  // Re-fold the still-held `answeredButBlocked` ids back into `gated` (PR #274 review): ordinary
+  // readiness treats their internal `blocks` edge as ordering, not a hold, so this fresh recompute
+  // drops them even though `stillHeldByRecordedBlockers` above just confirmed their recorded blocker
+  // is still open — the same union `armHumanTicketWaits` itself applies when it first arms the wait.
+  // Left dropped, the dispatcher runs the prerequisite, reaches the still-open human ticket, and
+  // poison-parks the whole run instead of leaving it in the held tail for the next preflight to close.
+  const stillHeld = [...gates.answeredButBlocked.keys()].filter(stillHeldByRecordedBlockers);
+  gates.gated = new Set([...freshReadiness.gated, ...stillHeld]);
   // Re-run the read-only allowlist/contract/claimable gates over the board just adopted (PR #274
   // review round 9) — see the doc comment above for why `ticketSetDrift`'s id-only diff cannot
   // catch a changed OBJECT behind an unchanged id.

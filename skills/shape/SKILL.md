@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 5dbfa7066555
+version: 11db9bdf0f93
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -304,8 +304,17 @@ for (const bead of all) for (const edge of bead.dependencies ?? []) {
 // that whole feature is done, mirroring `computeChildReadiness`'s `runTargetOf` mapping.
 const heldIds = (feature, tickets) => {
   const ids = new Set(tickets.map((t) => t.id));
+  // A `gh:pr` gate is the feature's OWN merge wait, not a prerequisite — mirrors
+  // computeChildReadiness's `isOwnMergeWait` (epic-graph.ts). Without this exemption a feature that
+  // already has an open merge-wait gate reads as held on itself, and this audit would wrongly claim
+  // the executor dispatches nothing for a recovery/reshaping run it will actually still run.
+  const isOwnMergeWait = (id) => {
+    const b = byId.get(id);
+    return b !== undefined && b.issue_type === "gate" && b.await_type === "gh:pr";
+  };
   const isHeld = (blockerId) => {
     if (ids.has(blockerId)) return false; // inside this feature — ordering, not a gate
+    if (isOwnMergeWait(blockerId)) return false; // this feature's own PR, not a prerequisite
     const gate = runTargetOf(blockerId);
     if (gate === feature.id) return false; // this feature's own subtree — ordering, not a gate
     const target = byId.get(gate);

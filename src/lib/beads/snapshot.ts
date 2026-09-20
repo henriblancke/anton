@@ -250,7 +250,16 @@ export function refreshIssueSnapshotRead(
       // A write or sync invalidated this loader while it was running. Its result predates that
       // boundary and must never repopulate the current snapshot.
       if (entry.generation !== generation) {
-        return { beads: entry.beads ?? beads, version: entry.version, generation: entry.generation };
+        // No retained board to fall back on: `beads` (this load's own result) is the only data we
+        // have, but it predates the invalidation that just bumped `entry.generation` — stamping it
+        // with that CURRENT generation would tell a caller comparing against
+        // `issueSnapshotGeneration` that it matches the post-write board, when it actually describes
+        // the one the write replaced (PR #274 review). Keep the ORIGINAL generation this load
+        // actually ran against so that comparison correctly flags it stale and retries instead.
+        if (!entry.beads) {
+          return { beads, version: entry.version, generation };
+        }
+        return { beads: entry.beads, version: entry.version, generation: entry.generation };
       }
       const serialized = JSON.stringify(beads);
       // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
@@ -402,9 +411,14 @@ export async function readIssueSnapshot(
   }
   // Take the loader's own result, not just the cache: when a write invalidates mid-flight the
   // generation guard refuses to repopulate the cache but still hands the loaded board back here —
-  // reading `entry.beads` alone would serve a successful load as an empty board.
-  const loaded = await refreshIssueSnapshot(cwd, loader, now);
-  return { beads: entry.beads ?? loaded, version: entry.version, generation: entry.generation };
+  // reading `entry.beads` alone would serve a successful load as an empty board. Read via
+  // `refreshIssueSnapshotRead`, not `refreshIssueSnapshot` + a separate `entry.generation` read
+  // (PR #274 review, `snapshot.ts:253`): that wrapper discards the generation the loaded board was
+  // actually retained (or, on a cold discard, ORIGINALLY loaded) under, and a fresh `entry.generation`
+  // read here would instead pick up whatever an invalidation bumped it to in the meantime — pairing
+  // pre-write beads with a post-write generation a caller like `readAllIssues` trusts as current.
+  const read = await refreshIssueSnapshotRead(cwd, loader, now);
+  return { beads: read.beads, version: entry.version, generation: read.generation };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */
