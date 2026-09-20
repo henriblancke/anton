@@ -47,6 +47,7 @@ import {
   ANTON_METADATA_KEYS,
   BOARD_EVIDENCE_PENDING_PREFIX,
   beads,
+  LABELS,
   REVIEW_SCORE_PREFIX,
   RUN_LEASE_PREFIX,
   STAGE_PREFIX,
@@ -72,11 +73,24 @@ const BOOKKEEPING_LABEL_PREFIXES = [
   BOARD_EVIDENCE_PENDING_PREFIX,
 ];
 
-/** `b`'s labels, minus anton's own bookkeeping prefixes, in a stable order so re-fetching the same
- * content twice (labels can come back in a different order) never reads as a change. */
+/**
+ * Exact-match labels anton rewrites the same way the prefixes above do, on ANY bead on the board —
+ * not just the one currently dispatched — but that aren't prefix-shaped so the filter above never
+ * catches them (PR #284 review). `LABELS.notDelivered` ("not-delivered") is cleared on every claim
+ * ({@link import("./execute-epic-ticket-bookends")}) and set on nearly every timeout/no-delivery/
+ * retirement path (execute-epic-ticket-settle.ts, execute-epic-dispatch.ts) — routine dispatch
+ * traffic on an UNRELATED ticket flips it while this ticket's own evidence window is open, which
+ * would otherwise fingerprint as this ticket's delivery.
+ */
+const BOOKKEEPING_LABELS: readonly string[] = [LABELS.notDelivered];
+
+/** `b`'s labels, minus anton's own bookkeeping prefixes and exact labels, in a stable order so
+ * re-fetching the same content twice (labels can come back in a different order) never reads as a
+ * change. */
 function contentLabels(b: Bead): string[] {
   return (b.labels ?? [])
     .filter((l) => !BOOKKEEPING_LABEL_PREFIXES.some((prefix) => l.startsWith(prefix)))
+    .filter((l) => !BOOKKEEPING_LABELS.includes(l))
     .toSorted();
 }
 
@@ -396,6 +410,20 @@ export async function ensureBoardBaselinePersisted(
 }
 
 /**
+ * How many extra lock/push/re-read rounds {@link lockDispatchBaseline} chases a moving baseline
+ * before giving up — the same bounded trade as {@link BASELINE_REFRESH_ROUNDS}, just for the drift
+ * that loop itself cannot see: its OWN confirming push (chatgpt-codex-connector, PR #284 review,
+ * "Re-read the board after syncing the baseline lock"). `beads.push` is a pull → commit → push
+ * pass, so that push can pull in a write that landed after the refresh loop's last stable read —
+ * on an embedded board, `readBoardEvidence`'s later `beads.push` would then pull that SAME write
+ * into the local Dolt DB while this function still hands back the older baseline, and the post-run
+ * diff would credit it to the dispatched agent as evidence it never produced. Each round below is
+ * one more such write this function can still absorb correctly; past that it fails closed (`null`)
+ * rather than loop indefinitely against a board under continuous unrelated churn.
+ */
+const LOCK_STABILITY_ROUNDS = 3;
+
+/**
  * Lock the settled pre-dispatch baseline onto `ticket` before this function ever hands it back for
  * dispatch (chatgpt-codex-connector, PR #284 review, "Lock the baseline before starting dispatch").
  * Without this, the lock was only ever set by {@link readBoardEvidence} AFTER the agent session ran —
@@ -408,21 +436,49 @@ export async function ensureBoardBaselinePersisted(
  * every later resume finds `recoveryBaseline` true and returns this exact baseline untouched, exactly
  * as `readBoardEvidence`'s own recovery locks already do for the post-dispatch case.
  *
- * Fails closed like every other write in this function: an unconfirmed lock refuses dispatch (`null`)
- * rather than risk repeating the exact loss it exists to prevent.
+ * Re-reads the board after every confirming push and loops back (bounded by
+ * {@link LOCK_STABILITY_ROUNDS}) whenever that read no longer matches what was just locked
+ * (chatgpt-codex-connector, PR #284 review): the push itself can pull in a concurrent write, so the
+ * baseline handed back must describe the board AFTER its own confirming push, not before it. The
+ * first round upgrades the still-unlocked baseline via {@link preserveRecoveryBaseline}; a later
+ * round re-persists the newer content directly — `preserveRecoveryBaseline` no-ops once a lock is
+ * already set, and a round that found drift needs the LOCKED value overwritten with the drifted one,
+ * not skipped.
+ *
+ * Fails closed like every other write in this function: an unconfirmed lock, an unreadable re-read,
+ * or a baseline that never stops drifting all refuse dispatch (`null`) rather than risk repeating the
+ * exact loss this locking exists to prevent.
  */
 async function lockDispatchBaseline(
   repo: string,
   ticket: Bead,
   baseline: BoardFingerprint,
 ): Promise<BoardFingerprint | null> {
-  const locked = await preserveRecoveryBaseline(repo, ticket, baseline);
-  if (!locked) return null;
-  const synced = await beads
-    .push(repo)
-    .then((outcome) => outcome === "synced" || outcome === "shared-server")
-    .catch(() => false);
-  return synced ? baseline : null;
+  let candidate = baseline;
+  let locked = false;
+  for (let round = 0; round < LOCK_STABILITY_ROUNDS; round += 1) {
+    const persisted = locked
+      ? await mustPersist(() =>
+          beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(candidate), true),
+        )
+      : await preserveRecoveryBaseline(repo, ticket, candidate);
+    if (!persisted) return null;
+    locked = true;
+    const synced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!synced) return null;
+    const board = await mustReadBoard(repo);
+    const hydrated = board && (await hydrateDescriptions(repo, board));
+    if (!hydrated) return null;
+    const refreshed = fingerprintBoard(hydrated, ticket.id);
+    if (boardEvidence(candidate, refreshed).length === 0) return candidate;
+    candidate = refreshed;
+  }
+  // The lock-confirming push kept pulling in further drift every round — fail closed rather than
+  // hand back a locked baseline that may still omit a change landing right now.
+  return null;
 }
 
 /**

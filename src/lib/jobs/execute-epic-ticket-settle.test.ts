@@ -461,4 +461,37 @@ describe("settling a board-only ticket's own no-delivery guard (PR #284 review)"
       expect(unassignMock).not.toHaveBeenCalled();
     },
   );
+
+  // A board-only ticket that ALSO left a real commit on the branch (a stray generated-file edit
+  // alongside its bd writes) must not take the reclaimable-without-review `open` path meant for a
+  // clean no-op failure — that commit needs a human to look at it first, exactly like every other
+  // ticket with `committed: true` (PR #284 review).
+  it("blocks (does not leave open) a board-only ticket that committed something and still found no board evidence", async () => {
+    setStatusMock.mockResolvedValue("");
+
+    await expect(
+      settleFailedTicket({
+        run: boardOnlyRun(),
+        ticket: boardOnlyTicket,
+        runTicketIds: [boardOnlyTicket.id],
+        session: { sessionId: "s1", logPath: "/dev/null" } as never,
+        ranOutOfTime: false,
+        baseline: null,
+        progress: {
+          committed: true,
+          delivered: false,
+          selfReport: { outcome: "blocked", klass: "other", reason: "no board evidence found" },
+        },
+        timeoutMs: 60_000,
+        standalone: false,
+        e: new NoDeliveryError("no diff"),
+      }),
+    ).rejects.toBeInstanceOf(NoDeliveryError);
+
+    expect(setStatusMock).toHaveBeenCalledWith("/tmp/anton", "anton-a", "blocked");
+    expect(setStatusMock).not.toHaveBeenCalledWith("/tmp/anton", "anton-a", "open");
+    // `not-delivered` is only written for the `keepOpen` (clean no-op) path — a committed-and-blocked
+    // ticket is a human-review state, not a "safe to reclaim" one, so this run must not tag it.
+    expect(tagMock).not.toHaveBeenCalled();
+  });
 });

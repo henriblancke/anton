@@ -779,7 +779,15 @@ async function releaseFailedTicket(args: {
   // resumed run needs to reclaim (the anton-f5f3 incident this ticket exists to fix). Left `open`
   // instead, with the `not-delivered` marker so a later read still knows this run reserved but did
   // not deliver it — `blockFailedTicket` still writes the operator-facing note either way.
-  const boardOnlyNoDelivery = noDelivery && isBoardOnlyRun(run, ticket);
+  //
+  // Gated on `!committed` (PR #284 review): a board-only ticket that ALSO left a real commit on the
+  // branch — a stray generated-file edit alongside its bd writes — is no longer a clean no-op
+  // failure. Every other ticket with `committed: true` takes the `"post-commit"` kind below instead,
+  // which blocks the bead so a human reviews the unreviewed commit before anything reclaims and
+  // re-dispatches into that same branch/worktree. A board-only ticket that committed something must
+  // take the same gate, not the reclaimable-without-review path meant for a ticket that changed
+  // nothing at all.
+  const boardOnlyNoDelivery = noDelivery && !committed && isBoardOnlyRun(run, ticket);
   if ((committed || noDelivery || agentBlocked) && !needsHuman && !staysClaimable) {
     await blockFailedTicket({
       run,

@@ -123,6 +123,17 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
   });
 
   it(
+    "ignores `not-delivered` churn on ANY bead — anton clears it on every claim and sets it on " +
+      "nearly every timeout/no-delivery/retirement path, so routine dispatch traffic on an " +
+      "unrelated ticket must never fingerprint as this ticket's own board-only evidence (PR #284 review)",
+    () => {
+      const before = fingerprintBoard([bead("a", { labels: [] })]);
+      const after = fingerprintBoard([bead("a", { labels: [LABELS.notDelivered] })]);
+      expect(boardEvidence(before, after)).toEqual([]);
+    },
+  );
+
+  it(
     "ignores the DISPATCHED ticket's own assignee churn — anton's claim/heartbeat rewrites it " +
       "regardless of what the agent did",
     () => {
@@ -1448,6 +1459,10 @@ describe(
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
       pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+      // The lock's own post-push stability re-read (chatgpt-codex-connector, PR #284 review, "Re-read
+      // the board after syncing the baseline lock") finds nothing further, so the lock is handed back
+      // without another round.
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       const pushCallsBefore = pushMock.mock.calls.length;
 
       await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toEqual(
@@ -1486,6 +1501,7 @@ describe(
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
       pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
 
       await expect(
         ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
@@ -1519,6 +1535,8 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
         pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+        // The lock's own post-push stability re-read finds nothing further either.
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
         const pushCallsBefore = pushMock.mock.calls.length;
 
         const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
@@ -1554,6 +1572,7 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]); // round 3 read: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
         pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]); // lock's own stability re-read: stable
         const pushCallsBefore = pushMock.mock.calls.length;
 
         const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
@@ -1695,6 +1714,8 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "before dispatch" })]); // stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // attempt 1's lock write
         pushMock.mockResolvedValueOnce("synced"); // attempt 1's lock-confirming push
+        // Attempt 1's lock's own post-push stability re-read finds nothing further.
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "before dispatch" })]);
 
         const attempt1 = await ensureBoardBaselinePersisted("/repo", bead("t-crash"), baseline);
         expect(attempt1).toEqual(baseline);
@@ -1718,6 +1739,62 @@ describe(
         // already changed, which is exactly what an unlocked baseline would have folded in.
         expect(attempt2).toEqual(baseline);
         expect(loadAllIssuesMock.mock.calls.length).toBe(loadCallsBefore);
+      },
+    );
+
+    it(
+      "re-locks onto a REFRESHED baseline when the lock's OWN confirming push pulls in a further " +
+        "change (chatgpt-codex-connector, PR #284 review, \"Re-read the board after syncing the " +
+        "baseline lock\") — `beads.push` is a pull -> commit -> push pass, so this push can itself " +
+        "absorb a write that landed after the refresh loop's last stable read, and locking the STALE " +
+        "value would let the post-run diff credit that pulled change to a no-op agent",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 1's lock write
+        pushMock.mockResolvedValueOnce("synced"); // round 1's lock-confirming push, which pulls in v1
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]); // round 1's stability re-read: drifted
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 2's re-persisted lock, now onto v1
+        pushMock.mockResolvedValueOnce("synced"); // round 2's lock-confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]); // round 2's stability re-read: stable
+
+        const locked = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
+
+        expect(locked).toEqual(fingerprintBoard([bead("a", { description: "v1" })]));
+        expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-fresh",
+          Object.fromEntries(locked!.beads),
+          true,
+        );
+      },
+    );
+
+    it(
+      "fails closed (returns null) when the lock's own confirming push keeps pulling in further " +
+        "drift across every bounded stability round, rather than hand back a locked baseline that " +
+        "may still omit a change landing right now",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        // Every lock round's push pulls in yet another change, forever.
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced");
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced");
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v2" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced");
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v3" })]);
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
       },
     );
   },
