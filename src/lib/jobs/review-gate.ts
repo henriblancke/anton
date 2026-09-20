@@ -1117,6 +1117,22 @@ async function runGateFixSession(args: {
       // gates run: nothing between here and the gate suite can touch the board, so there is no
       // reason to delay it, and doing so keeps this read next to the baseline it is diffed against.
       const boardAfter = boardBefore ? await args.readBoardFingerprint(repoPath!, target.id) : undefined;
+      // An unreadable post-fix fingerprint is refused the same way an unreadable pre-fix baseline is
+      // (PR #284 review round 16): folding it into "no board change" would let a board-capable
+      // fixer's real write pass as a stalled round — skipping `syncBoard` below, and leaving a retry
+      // to take a fresh baseline that silently absorbs the unconfirmed mutation before any review
+      // sees it. Thrown as `PoisonError` straight away, bypassing the retry path entirely, since a
+      // retry can't safely re-read this any better than the fixer's own session just did.
+      if (boardBefore && !boardAfter) {
+        throw new PoisonError(
+          `the review fix for ${target.id} could not read the board fingerprint after round ${round} — ` +
+            `\`mustReadBoard\` exhausted its retries. Refusing to treat this as no board change: a ` +
+            `board-only fixer may have written directly to the live board, and without this read that ` +
+            `write can never be told apart from no progress — a retry would take a fresh baseline that ` +
+            `silently absorbs it, and this run's own best-effort final sync could publish it before ` +
+            `anyone reviews it. Inspect and repair the board by hand, then resume.`,
+        );
+      }
       // Whether the fixer actually wrote to the board, for a board-only run only: `boardEvidence`
       // is the same pure diff `execute-epic-board-evidence.ts` uses for the run's OWN delivery
       // check, reused here only as an anti-stall SIGNAL for this loop — never as proof for anton's

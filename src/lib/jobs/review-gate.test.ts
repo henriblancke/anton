@@ -687,6 +687,55 @@ describe("runReviewGate — bounds", () => {
   );
 
   it(
+    "parks instead of treating an unreadable post-fix board read as no change (PR #284 review round " +
+      "16) — a board-capable fixer's real write must never fold into a false no-progress signal just " +
+      "because the confirming read failed",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      // First read (pre-fix baseline) succeeds; the second (post-fix) exhausts its retries.
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return reads === 1 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not read the board fingerprint after round/);
+      expect((error as Error).message).toContain(boardOnlyTarget.id);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
     "parks instead of stalling when a board-only fix's write cannot be confirmed synced " +
       "(PR #284 review round 15) — a local-only Dolt write must not read as a normal no-progress " +
       "round, since a resume or this run's own best-effort final sync could later publish it with no " +
