@@ -416,7 +416,10 @@ function closerPrefix(source: string, offset: number): string {
       expand(match[0]);
       kept = column;
     } else {
-      expand(match[0]);
+      // A list marker's width must still land in the prefix as spaces, or a later blockquote
+      // marker's `kept = column` jump silently discards the indentation it imposed.
+      prefix += expand(match[0]);
+      kept = column;
     }
     rest = rest.slice(match[0].length);
   }

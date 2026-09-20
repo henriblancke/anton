@@ -480,6 +480,10 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("-\t```md\n    some content")).toBe("    ```");
     expect(unterminatedCloser("-\t```md\n\tcontent")).toBe("    ```");
     expect(unterminatedCloser("1.\t```\n    code")).toBe("    ```");
+    // A blockquote nested inside a list item must keep the list's indentation in front of the `>`:
+    // dropping it left a bare `> ` closer, which leaves the list (already closed by the fence) and
+    // opens a new top-level quoted fence that swallows everything appended after it.
+    expect(unterminatedCloser("- > ```md\n  > sample")).toBe("  > ```");
   });
 
   it("does not let a closed fence's own content reopen it as a synthetic closer", () => {
