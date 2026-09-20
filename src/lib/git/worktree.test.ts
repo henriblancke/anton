@@ -515,6 +515,75 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review, third round): a base force-pushed BEHIND the branch's pinned fork
+    // point still shares an OLDER ancestor with it, so `hasCommonHistory` alone can't catch this —
+    // unlike the fully-unrelated-history case above. Merging here would still be unsafe: `branch`
+    // carries the dropped base commit as its own ancestry (it forked from it), so the merge reaches
+    // right back through the branch's side and reintroduces exactly what the base rewrite removed.
+    it("refuses to merge onto a base rewritten behind the branch's pinned fork point", async () => {
+      const ontoRepo = mkdtempSync(join(tmpdir(), "anton-wt-onto-merge-repo-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.name", "anton-test"], { cwd: ontoRepo });
+        writeFileSync(join(ontoRepo, "README.md"), "# tmp\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "."]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "init"]);
+        const ontoDefaultBranch = execFileSync(
+          "git",
+          ["-C", ontoRepo, "symbolic-ref", "--short", "HEAD"],
+          { encoding: "utf8" },
+        ).trim();
+
+        // Main advances to `sharedBase` — the commit the ticket branch will fork from.
+        writeFileSync(join(ontoRepo, "shared-base.txt"), "shared\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "shared-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (later dropped)"]);
+        const sharedBase = execFileSync("git", ["-C", ontoRepo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        const branch = "anton/refresh-merge-behind-fork";
+        const first = await createWorktree({ repoPath: ontoRepo, branch, baseBranch: ontoDefaultBranch });
+        expect(first.forkSha).toBe(sharedBase);
+
+        writeFileSync(join(first.path, "own-work.txt"), "already-pushed ticket work\n");
+        execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+        execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+        const uniqueSha = execFileSync("git", ["-C", first.path, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+        // Make it PUBLISHED so this hits the merge path, not the plain rebase one.
+        execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, uniqueSha], { cwd: ontoRepo });
+
+        // Force-push/recreate main: drop `sharedBase` back to the ORIGINAL root, then commit a new,
+        // unrelated tip — main and the ticket branch now only share that root commit, not `sharedBase`.
+        execFileSync("git", ["-C", ontoRepo, "reset", "--hard", `${sharedBase}~1`]);
+        writeFileSync(join(ontoRepo, "rewritten-base.txt"), "rewritten\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "rewritten-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (rewritten)"]);
+
+        await expect(
+          createWorktree({
+            repoPath: ontoRepo,
+            branch,
+            baseBranch: ontoDefaultBranch,
+            refresh: true,
+            forkSha: first.forkSha,
+          }),
+        ).rejects.toThrow(/no longer descends from .* fork point/);
+
+        // Never touched — no merge attempted, no residue, nothing dropped resurrected.
+        expect(
+          execFileSync("git", ["-C", ontoRepo, "rev-parse", branch], { encoding: "utf8" }).trim(),
+        ).toBe(uniqueSha);
+        const status = execFileSync("git", ["-C", first.path, "status"], { encoding: "utf8" });
+        expect(status).not.toContain("merge in progress");
+      } finally {
+        rmSync(ontoRepo, { recursive: true, force: true });
+      }
+    });
+
     // anton-s55u (PR #279 review): git accepts `rebase <base>` even across unrelated histories,
     // replaying the branch's entire history — root commit included — onto a tree that shares nothing
     // with it, rather than rejecting the operation. That's what a force-pushed or recreated

@@ -739,6 +739,31 @@ async function refreshOntoBase(opts: {
     );
   }
 
+  // `hasCommonHistory` above only demands SOME shared ancestor, not that `baseSha` still descends
+  // from the branch's own pinned fork point — a base that was force-pushed BEHIND that fork but still
+  // shares an OLDER ancestor with it passes that check regardless. The merge below is unsafe in
+  // exactly that case: `branch` still carries the removed base-side commits as its own ancestry (it
+  // forked from them), so merging a base that dropped them in a rewrite reaches right back through
+  // `branch`'s side of the merge and reintroduces them into the result — e.g. a branch cut at `A-B`
+  // merged into a base rewritten to `A-E` leaves `B` in `E..HEAD` (PR #279 review). `--onto` rebases
+  // sidestep this by construction (see the `forkSha` doc above), so this guard only needs to cover the
+  // merge path. Checked only when `forkSha` is both known and still reachable on `branch`: an unknown
+  // or already-stale pin can't distinguish this case from an ordinary divergence, so it's left to the
+  // merge/rebase paths' own conflict handling below.
+  if (
+    (remotelyPublished || preservedSha) &&
+    forkSha &&
+    (await branchContainsCommit(repoPath, branch, forkSha)) &&
+    !(await isAncestor(worktreePath, forkSha, baseSha))
+  ) {
+    throw new Error(
+      `[worktree] ${baseBranch} (${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork ` +
+        `point ${forkSha.slice(0, 12)} — ${baseBranch} looks like it was force-pushed or recreated ` +
+        `behind that commit. Merging would still reach ${branch}'s own copy of whatever ${baseBranch} ` +
+        `dropped, silently reintroducing it. Resolve manually in ${worktreePath} and retry.`,
+    );
+  }
+
   if (remotelyPublished || preservedSha) {
     try {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);

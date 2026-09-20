@@ -21,7 +21,7 @@ import {
   type Worktree,
 } from "../git/worktree";
 import { resolveOperator } from "../operator";
-import { findRunBaseForkShaForBranch, getRunBaseForkSha, updateRun } from "../runs";
+import { findRunBaseForkShaForBranch, findRunBaseRefreshShaForBranch, getRunBaseForkSha, updateRun } from "../runs";
 import { PoisonEpic } from "./errors";
 import { safe } from "./safe";
 import type { EpicRun } from "./execute-epic-run";
@@ -53,7 +53,6 @@ export async function warmRunWorktree(
     lease,
     target,
     tickets,
-    existing,
   } = run;
   // 2. Warm worktree (idempotent — reused on resume). Branch off the FRESHEST base
   // (anton-x3o): resolveFreshBase fetches origin/<base> and returns `origin/<base>` so a run
@@ -116,6 +115,19 @@ export async function warmRunWorktree(
   // even when the checkout turns out to be freshly created: refreshOntoBase never runs for one, so
   // the value is simply unused.
   const knownForkSha = await findRunBaseForkShaForBranch(db, projectId, run.targetId, branch);
+  // The last EFFECTIVE (non-`skipped_dirty`) refresh this branch received, from whichever row on it
+  // recorded one — branch-scoped, not this run's own row alone, for the same reason `knownForkSha`
+  // above is (findRunBaseRefreshShaForBranch's own doc comment): an ordinary handler failure settles
+  // its row `failed`, and the retry opens a FRESH row while reusing the same branch and worktree, so
+  // scoping to one row would miss a refresh an earlier, now-dead row on this branch already recorded.
+  //
+  // Preferred over `knownForkSha` as the `--onto` rebase boundary below (PR #279 review): after one
+  // successful `--onto` refresh, the branch's ORIGINAL fork point is no longer reachable on it at all
+  // (the rebase replayed only what came after it, onto the new base) — passing `knownForkSha` on a
+  // later refresh would find it missing and silently fall back to the plain, unsafe form of rebase.
+  // The most recently applied base IS still on the branch — it's what everything got rebased onto —
+  // and describes exactly the boundary a second `--onto` needs.
+  const priorEffectiveRefreshSha = await findRunBaseRefreshShaForBranch(db, projectId, run.targetId, branch);
   const worktree = await createWorktree({
     repoPath: repo,
     branch,
@@ -131,7 +143,7 @@ export async function warmRunWorktree(
     // from base by design and must never be rebased underneath an already-pushed PR).
     refresh: true,
     preserveShas,
-    forkSha: knownForkSha,
+    forkSha: priorEffectiveRefreshSha ?? knownForkSha,
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
@@ -156,16 +168,11 @@ export async function warmRunWorktree(
   // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
   let storedFork: string | undefined;
   let baseForkSha: string;
-  // The last EFFECTIVE (non-`skipped_dirty`) refresh this branch received, from a resume before this
-  // one — read off the row as this attempt found it, before the write below can overwrite it (PR #279
-  // review). A later resume's `skipped_dirty` records that THIS attempt didn't move the branch, not
-  // that no attempt ever did; without this, that skip would stomp a prior success's record with the
-  // fresh base it was never brought up to, losing the only base a truthful already-shipped claim
-  // naming that success's commits could still be checked against.
-  const priorEffectiveRefreshSha =
-    existing?.baseRefreshOutcome && existing.baseRefreshOutcome !== "skipped_dirty"
-      ? (existing.baseRefreshSha ?? undefined)
-      : undefined;
+  // `priorEffectiveRefreshSha` (resolved above, before the checkout) is also what the write below
+  // must NOT clobber: a later resume's `skipped_dirty` records that THIS attempt didn't move the
+  // branch, not that no attempt ever did, so overwriting a prior success's record with the fresh base
+  // it was never brought up to would lose the only base a truthful already-shipped claim naming that
+  // success's commits could still be checked against.
   try {
     // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither
     // must be removed, or a retry could reuse its branch and derive a fork from a moved base.

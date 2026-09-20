@@ -337,6 +337,7 @@ it("falls back alreadyShippedBase to a prior resume's recorded refresh when this
     baseForkSha: "old-fork-commit",
     baseRefreshOutcome: "merged",
     baseRefreshSha: "prior-base",
+    branch: BRANCH,
   });
   createWorktreeMock.mockResolvedValue({
     path: WORKTREE,
@@ -347,11 +348,7 @@ it("falls back alreadyShippedBase to a prior resume's recorded refresh when this
     refreshOutcome: { outcome: "skipped_dirty", baseSha: "this-attempt-dirty-base" },
   });
 
-  const { runStep } = await warmRunWorktree(
-    makeRun(RUN_ID, {
-      existing: { baseRefreshOutcome: "merged", baseRefreshSha: "prior-base" } as EpicRun["existing"],
-    }),
-  );
+  const { runStep } = await warmRunWorktree(makeRun(RUN_ID));
 
   expect(runStep.baseForkSha).toBe("old-fork-commit");
   expect(runStep.alreadyShippedBase).toBe("prior-base");
@@ -359,6 +356,54 @@ it("falls back alreadyShippedBase to a prior resume's recorded refresh when this
   const row = await actualRuns.getRunById(t.db, RUN_ID);
   expect(row?.baseRefreshOutcome).toBe("merged");
   expect(row?.baseRefreshSha).toBe("prior-base");
+});
+
+it("passes the last EFFECTIVE refresh's base as the --onto boundary, in preference to the original fork (PR #279 review)", async () => {
+  // Attempt 1 refreshed this reused checkout with `--onto` the original fork, landing on
+  // `first-refresh-base`, then failed for an ordinary reason (its row settles `failed`). Attempt 2
+  // opens a FRESH row over the same branch: the original fork point is no longer reachable on the
+  // branch at all (attempt 1's `--onto` rebase replayed only what came after it), so passing that
+  // stale fork forward would make refreshOntoBase silently fall back to the plain, unsafe rebase
+  // form. The most recently applied base is what must be forwarded instead.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "original-fork-commit",
+    baseRefreshOutcome: "rebased",
+    baseRefreshSha: "first-refresh-base",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "first-refresh-base" }),
+  );
+});
+
+it("falls back to the original fork as the --onto boundary when no branch row ever recorded an effective refresh", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, { baseForkSha: "trueforkcommit", branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+
+  await warmRunWorktree(makeRun());
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "trueforkcommit" }),
+  );
 });
 
 it("poisons the run when failed fork-pin cleanup cannot prove complete removal", async () => {

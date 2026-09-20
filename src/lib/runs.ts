@@ -291,6 +291,46 @@ export async function findRunBaseForkShaForBranch(
   return rows[0]?.baseForkSha ?? undefined;
 }
 
+/**
+ * The base sha the most recent EFFECTIVE (non-`skipped_dirty`) refresh on this epic's BRANCH
+ * settled on, from whichever row recorded it, whatever became of that row (PR #279 review) — the
+ * refresh half of {@link findRunBaseForkShaForBranch}, needed for the same reason: an ordinary
+ * handler failure settles its row `failed`, and the retry opens a FRESH row while reusing the same
+ * branch and worktree, so a lookup scoped to that one row alone never sees a refresh an earlier,
+ * now-dead row on this branch already recorded.
+ *
+ * Also doubles as the `--onto` rebase boundary a later refresh should pass as `forkSha`, in
+ * preference to the branch's original fork point: after one successful `--onto` refresh, that
+ * original fork point is no longer reachable on the branch at all (the rebase replayed only what
+ * came after it, onto the new base), so `refreshOntoBase` would silently fall back to the plain,
+ * unsafe form of `rebase` on a later refresh. The most recently applied base IS still on the branch
+ * — it's what everything got rebased onto — and describes the same boundary a second `--onto` needs.
+ */
+export async function findRunBaseRefreshShaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({ baseRefreshSha: schema.runs.baseRefreshSha })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.baseRefreshSha),
+        ne(schema.runs.baseRefreshOutcome, "skipped_dirty"),
+      ),
+    )
+    // Ordered exactly as findRunBaseForkShaForBranch is, and for its reason: `updatedAt` is
+    // second-granular, so `writeSeq` breaks a tie by which attempt settled last.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
+    .limit(1);
+  return rows[0]?.baseRefreshSha ?? undefined;
+}
+
 /** A clean verdict's resume key, as {@link findRunReviewKeyForBranch} recovers it for a fresh row. */
 export interface RecordedReviewKey {
   reviewKey: string;
