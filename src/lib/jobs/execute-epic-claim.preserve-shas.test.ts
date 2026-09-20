@@ -132,8 +132,9 @@ it("forwards a block note's committed sha alongside a satisfied-note's, for this
   expect(createWorktreeMock).toHaveBeenCalledTimes(1);
   const call = createWorktreeMock.mock.calls[0]![0] as { preserveShas?: string[] };
   expect(call.preserveShas).toContain(satisfiedSha);
-  // blockNoteEvidence truncates the sha it embeds to 7 chars, so only that prefix round-trips.
-  expect(call.preserveShas).toContain(blockSha.slice(0, 7));
+  // blockNoteEvidence embeds the full sha (PR #279 review, P1) — a truncated prefix could go
+  // ambiguous in a growing repo and silently read as absent by the isAncestor check that consumes it.
+  expect(call.preserveShas).toContain(blockSha);
 });
 
 it("drops a block note's sha when it names a different branch, and when nothing committed", async () => {

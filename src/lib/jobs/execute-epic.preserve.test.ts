@@ -1170,7 +1170,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
     expect(note).toMatch(/Nothing was rolled back/);
     expect(note).not.toMatch(/partial work/);
     // The evidence clause cites the commit it settled on, so the park gate reads "review and close".
-    expect(note).toContain(`committed on ${BRANCH} @ ${earlier.slice(0, 7)}`);
+    expect(note).toContain(`committed on ${BRANCH} @ ${earlier}`);
     // And the branch is exactly where it was: nothing reset, the earlier commit still the tip.
     expect(head()).toBe(earlier);
     expect(existsSync(join(repo, "EARLIER.md"))).toBe(true);

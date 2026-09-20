@@ -1017,8 +1017,15 @@ async function refreshOntoBase(opts: {
   // recreated past the real fork point. A fork point that isn't actually on `branch` (a stale or
   // mismatched pin) is ignored, same as no pin at all. Resolved here, ahead of the published/
   // preserved/merge-commit checks below, because the merge-commit one needs it too.
+  //
+  // `isAncestor`, not `branchContainsCommit` (PR #279 review, P1): the latter folds every git error,
+  // operational failures included, to `false`. That reads a killed process the same as a genuinely
+  // untrustworthy pin — a published or preserved branch would then lose `trustedForkSha`, skip the
+  // pinned rewrite guard below, and fall into the merge path, which silently restores whatever the
+  // base rewrite was meant to drop. `isAncestor` answers the same reachability question but rethrows
+  // anything that isn't git's own "not an ancestor", so only genuine absence clears the pin.
   const trustedForkSha =
-    forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
+    forkSha && (await isAncestor(repoPath, forkSha, branch)) ? forkSha : undefined;
 
   // `git rebase --rebase-merges` does not replay a merge commit's recorded TREE — it reconstructs
   // the merge by re-merging its parents from scratch. Anything that tree recorded beyond a clean
