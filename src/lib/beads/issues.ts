@@ -111,20 +111,6 @@ export async function loadAllIssues(
   cwd: string,
   opts: LoadIssuesOptions = {},
 ): Promise<Bead[]> {
-  // Fired alongside `loadWorkIssues`, not after the board is fully assembled (PR #274 review,
-  // round 5 on this file): `bd dep cycles` and `bd list` are two independent CLI reads with no
-  // shared transaction, so SOME window where they see different graph revisions is unavoidable.
-  // Starting this one concurrently shrinks that window to the listing's own duration instead of
-  // stacking the cycles read after it (and after the conditional gate read besides) — the gap in
-  // which a concurrently-repaired cycle could make the attached evidence stale against `board`'s
-  // own edges.
-  const cyclesPromise = opts.withCycles ? beads.depCycles(cwd) : undefined;
-  // Observed right away: if `loadWorkIssues` throws first, this function returns before the
-  // `await cyclesPromise` below ever runs, and a `cyclesPromise` that also rejects would
-  // otherwise be an unhandled rejection — which Bun can escalate to a process-level failure
-  // instead of the recoverable board-read error it actually is. This handler only marks the
-  // rejection observed; the `await` below still sees (and propagates) the original rejection.
-  cyclesPromise?.catch(() => {});
   const work = await loadWorkIssues(cwd);
   // CONDITIONAL, not unconditional: a board read sits on the operator's critical path behind the
   // Dolt lock, and anton-hwkx trimmed approve down to exactly one. A board with no dangling blocker
@@ -136,7 +122,16 @@ export async function loadAllIssues(
   const board = dangling.length === 0
     ? work
     : dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false, dangling)]);
-  return cyclesPromise ? attachCycleEvidence(board, await cyclesPromise) : board;
+  // Fetched AFTER `board` is fully assembled, not alongside `loadWorkIssues` (PR #274 review):
+  // `bd dep cycles` and `bd list`/gate listing are independent CLI reads with no shared transaction,
+  // so starting the cycles read first — or even just concurrently — lets it settle against an OLDER
+  // graph revision than the one `board`'s edges end up reflecting (another machine can repair or
+  // introduce a cycle in the gap). `structureGaps` trusts this evidence rather than re-traversing
+  // `board`'s edges, so stale-but-empty evidence would let a genuinely cyclic board read as clean.
+  // Starting this read only once `board` is in hand guarantees (under the store's monotonic-read
+  // guarantee) it observes a graph at least as current as `board`'s own — evidence can be newer than
+  // the board it's attached to, never older.
+  return opts.withCycles ? attachCycleEvidence(board, await beads.depCycles(cwd)) : board;
 }
 
 

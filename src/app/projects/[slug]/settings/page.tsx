@@ -6,6 +6,7 @@ import {
   resolvePickerApplyOverride,
 } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
+import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { discoverVocabulary } from "@/lib/policy/vocabulary";
 import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
@@ -69,9 +70,13 @@ export default async function ProjectSettingsPage({
     bundledAgentIds().catch(() => []),
     // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
     // no work look identical downstream, and the work policy panel must not let an operator arm a
-    // fallback policy fitted to a read failure.
+    // fallback policy fitted to a read failure. `allIssues` itself only best-effort-attaches cycle
+    // evidence — a `bd dep cycles` timeout is swallowed there and the call still resolves — so `ok`
+    // must also check `cycleEvidenceFor`, not just that the promise didn't reject: without evidence,
+    // every target reads as non-startable (missingCycleEvidenceGap) and `policyCandidates` would
+    // report a misleading zero-candidate board as if it were a real, empty one instead of unavailable.
     allIssues(project.repoPath, { blockOnPendingWrite: false, withCycles: true }).then(
-      (issues) => ({ issues, ok: true }),
+      (issues) => ({ issues, ok: cycleEvidenceFor(issues) !== undefined }),
       () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
     ),
   ]);
