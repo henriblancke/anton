@@ -1262,15 +1262,37 @@ export async function stageAllAndHashTree(worktreePath: string): Promise<string>
  * earlier ticket's commits — and adopting that would open a PR missing work anton has already
  * closed the bead for.
  *
- * Only git's own "no" (exit 1) is an answer; anything else propagates rather than reading as one.
+ * `ancestor` can also be a sha cited on a synced satisfied/block note — unpublished, and so absent
+ * from this clone, or short enough to have gone ambiguous against objects fetched since. Either way
+ * `merge-base --is-ancestor` answers with exit 128, not git's "no" (exit 1), so it's checked to
+ * resolve FIRST: a citation that doesn't resolve here is read as not present, the same answer a
+ * caller preserving cited work needs to fall back to regenerating it, while a resolvable `ancestor`
+ * still goes through `merge-base` and any operational failure there still propagates rather than
+ * reading as one.
  */
 export async function isAncestor(
   worktreePath: string,
   ancestor: string,
   descendant: string,
 ): Promise<boolean> {
+  if (!(await revisionResolves(worktreePath, ancestor))) return false;
   try {
     await git(worktreePath, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch (e) {
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
+ * Whether `ref` names an actual commit in this repo — missing and ambiguous both read as "no" via
+ * `--verify --quiet`, which git documents as discarding ambiguous short SHA-1s silently rather than
+ * erroring, so both collapse to the same clean exit 1 {@link isAncestor} reads as absent.
+ */
+async function revisionResolves(worktreePath: string, ref: string): Promise<boolean> {
+  try {
+    await git(worktreePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
     return true;
   } catch (e) {
     if (exitedWith(e, 1)) return false;

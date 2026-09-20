@@ -986,6 +986,51 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review, P2): a synced note can cite a commit unpublished elsewhere —
+    // this repo may never have received it — or an abbreviation short enough to have gone
+    // ambiguous against objects fetched since. `merge-base --is-ancestor` answers either shape
+    // with exit 128, not git's own "no" (exit 1), so `isAncestor` used to rethrow and abort the
+    // whole refresh instead of treating the missing citation as absent and just regenerating the
+    // work a resume would otherwise recreate anyway.
+    it("rebases normally instead of throwing when a preserveShas entry cites a commit absent from this repo", async () => {
+      const branch = "anton/refresh-preserve-missing";
+      const first = await createWorktree({ repoPath: repo, branch });
+      writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+      const uniqueSha = headOf(first.path);
+
+      advanceDefaultBranch("preserve-missing-base.txt", "advance 6b\n", "advance main (preserve missing)");
+      const freshMain = branchTip(defaultBranch());
+
+      const missingSha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: defaultBranch(),
+          refresh: true,
+          forkSha: first.forkSha,
+          preserveShas: [missingSha],
+        });
+
+        expect(second.path).toBe(first.path);
+        const rebaseLog = execFileSync(
+          "git",
+          ["-C", second.path, "log", "--oneline", `${freshMain}..HEAD`],
+          { encoding: "utf8" },
+        );
+        expect(rebaseLog).toContain("unique ticket commit");
+        expect(headOf(second.path)).not.toBe(uniqueSha); // rebased onto a new base commit
+        expect(log.mock.calls.flat().join(" ")).toContain("rebased");
+        expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     // anton-s55u (PR #279 review, third round): a base force-pushed BEHIND the branch's pinned fork
     // point still shares an OLDER ancestor with it, so `hasCommonHistory` alone can't catch this —
     // unlike the fully-unrelated-history case above. Merging here would still be unsafe: `branch`
