@@ -441,6 +441,18 @@ describe("reviewContext", () => {
     expect(out).not.toContain("confirmed evidence covers");
   });
 
+  it(
+    "omits the live-board instruction for an ORDINARY run with a real diff and no board evidence, " +
+      "even though repoPath is given (PR #284 review) — `repoPath` is a required field every gate " +
+      "forwards regardless of whether this run has any board-only ticket, so gating on repoPath " +
+      "alone would leak this paragraph into every ordinary code review",
+    () => {
+      const out = reviewContext({ target: epic, tickets: [ticket], diff, repoPath: "/repos/anton" });
+      expect(out).not.toContain("bd -C");
+      expect(out).not.toContain("confirmed evidence covers");
+    },
+  );
+
   it("repeats a truncated patch's deletions, which the worktree cannot show", () => {
     // "Read the files in the worktree" is impossible for a file the run removed, and the reviewer has
     // no `git` to fetch it from the base — so a removed route past the cut would be reviewed by nobody.

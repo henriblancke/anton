@@ -495,7 +495,10 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
 
   it(
     "does not re-persist the baseline when the ticket already carries one — a repeated read " +
-      "failure must not churn the write every attempt",
+      "failure must not churn the write every attempt — but still retries the confirming push and " +
+      "still reports baselineUnconfirmed (chatgpt-codex-connector, PR #284 review, \"track whether " +
+      "preserved baselines were synced\") rather than silently dropping the flag now that the write " +
+      "itself is skipped",
     async () => {
       const preserved = { a: "already-preserved-hash" };
       const ticketWithBaseline = bead("t-baseline-again", {
@@ -505,8 +508,37 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       const baseline = (await readBoardBaseline("/repo"))!;
       rejectEveryRetry();
       const callsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
-      await readBoardEvidence("/repo", baseline, ticketWithBaseline);
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(readBoardEvidence("/repo", baseline, ticketWithBaseline)).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+        baselineUnconfirmed: true,
+      });
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
+    "confirms an already-preserved baseline as synced once a retried push succeeds " +
+      "(chatgpt-codex-connector, PR #284 review) — a same-machine retry must keep trying to confirm " +
+      "the recovery baseline, not give up after the first failed push",
+    async () => {
+      const preserved = { a: "already-preserved-hash" };
+      const ticketWithBaseline = bead("t-baseline-retry-ok", {
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      pushMock.mockResolvedValueOnce("synced");
+      await expect(readBoardEvidence("/repo", baseline, ticketWithBaseline)).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+      });
     },
   );
 
@@ -656,7 +688,11 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
 
   it(
     "does not re-persist the baseline on a confirming-push failure when the ticket already carries " +
-      "one — a repeated push failure must not churn the write every attempt",
+      "one — a repeated push failure must not churn the write every attempt — but still reports " +
+      "baselineUnconfirmed (chatgpt-codex-connector, PR #284 review, \"track whether preserved " +
+      "baselines were synced\"): this shortcut used to return bare `synced: false` with neither flag " +
+      "set, silently dropping the same-machine-safe warning for a baseline that survived from an " +
+      "earlier attempt",
     async () => {
       const preserved = { a: "already-preserved-hash" };
       const ticketWithBaseline = bead("t-fast-path-baseline-again", {
@@ -669,7 +705,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       pushMock.mockResolvedValueOnce("not-wired");
       const callsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
       const result = await readBoardEvidence("/repo", baseline, ticketWithBaseline);
-      expect(result).toEqual({ found: true, ids: ["a"], synced: false });
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
     },
   );

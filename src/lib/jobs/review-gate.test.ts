@@ -635,7 +635,9 @@ describe("runReviewGate — bounds", () => {
       // prompt was told about the live board, and the bd-only write counted as progress rather than
       // a stall.
       expect(calls[1]?.prompt).toContain("This run may deliver via the board");
-      expect(calls[1]?.prompt).toContain(`bd -C /repos/anton update`);
+      // Shell-quoted, matching `shellQuotePath` (review-context.ts) — this assertion predated that
+      // and never followed the quoting change, failing every run regardless of this PR's own edits.
+      expect(calls[1]?.prompt).toContain(`bd -C '/repos/anton' update`);
       expect(out.outcome).toBe("clean");
       expect(out.rounds[0].fixCommitted).toBe(true);
       expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop

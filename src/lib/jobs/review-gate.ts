@@ -383,6 +383,15 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
    * session was actually dispatched to close (see {@link ReviewRun.previousBlocking}).
    */
   let previousBlocking: ReviewFinding[] | undefined;
+  /**
+   * The run's board-only per-ticket evidence, extended as each fix round confirms a NEW board write
+   * (chatgpt-codex-connector, PR #284 review, "carry board-fix IDs into the confirming review"):
+   * without this, a blocking finding that requires creating or modifying a bead outside the
+   * original evidence set left the next round's reviewer with only the stale ids from before this
+   * gate ever ran — no git diff records a board-only repair either, so the reviewer had nothing
+   * telling it which live-board state to inspect and could repeat the finding or clear it blind.
+   */
+  let boardEvidenceByTicket = args.boardEvidenceByTicket;
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -396,7 +405,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       runId,
       target,
       tickets,
-      boardEvidenceByTicket: args.boardEvidenceByTicket,
+      boardEvidenceByTicket,
       repoPath: args.repoPath,
       settings,
       worktreePath,
@@ -493,6 +502,21 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // The fix ran the gates on what it committed, so the next round is handed that evidence rather
     // than re-running the suite to learn the same thing.
     verified = fix.verified;
+    // Merge this round's confirmed board write into every board-only ticket's evidence entry
+    // (chatgpt-codex-connector, PR #284 review, "carry board-fix IDs into the confirming review") —
+    // attributed to every board-only ticket in this run rather than one specific ticket, since a fix
+    // session repairs findings against the whole `tickets` set and this diff cannot tell which of
+    // them the write was actually for. Unioned with whatever the run already carried, not replaced,
+    // so an earlier ticket's confirmed evidence from before this gate ran is never dropped.
+    if (fix.boardEvidenceIds?.length) {
+      const units = tickets.length > 0 ? tickets : [target];
+      const boardOnlyUnits = units.filter((t) => beads.isBoardOnly(t) || beads.isBoardOnly(target));
+      const merged = new Map(boardEvidenceByTicket ?? []);
+      for (const t of boardOnlyUnits) {
+        merged.set(t.id, [...new Set([...(merged.get(t.id) ?? []), ...fix.boardEvidenceIds])].toSorted());
+      }
+      boardEvidenceByTicket = merged;
+    }
 
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
@@ -1035,7 +1059,15 @@ async function runGateFixSession(args: {
   readBoardFingerprint: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
   /** See {@link ReviewGateDeps.syncBoard}. Only called when the board actually changed this round. */
   syncBoard: (repoPath: string) => Promise<boolean>;
-}): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
+}): Promise<{
+  sessionId: string;
+  committed: boolean;
+  verified?: VerifyGateOutcome[];
+  /** The bead ids this round's confirmed board write touched (chatgpt-codex-connector, PR #284
+   * review, "carry board-fix IDs into the confirming review") — empty/absent when the board did not
+   * change this round. See {@link runReviewGate}'s merge into the next round's `boardEvidenceByTicket`. */
+  boardEvidenceIds?: string[];
+}> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
   const { boardOnly, repoPath } = args;
@@ -1145,7 +1177,8 @@ async function runGateFixSession(args: {
       // check, reused here only as an anti-stall SIGNAL for this loop — never as proof for anton's
       // authoritative board-evidence gate, which still runs at ticket settlement regardless of what
       // this round observed.
-      const boardChanged = boardBefore && boardAfter ? boardEvidence(boardBefore, boardAfter).length > 0 : false;
+      const changedBoardIds = boardBefore && boardAfter ? boardEvidence(boardBefore, boardAfter) : [];
+      const boardChanged = changedBoardIds.length > 0;
       // A board-only fix's write only reaches another machine — and this run's own best-effort final
       // sync in `concludeRunAttempt`, which logs a push failure rather than surfacing it — once it is
       // actually pushed (PR #284 review). Confirmed here rather than assumed: without this, a change
@@ -1251,6 +1284,7 @@ async function runGateFixSession(args: {
         // an unconfirmed local-only write can never masquerade as this round's progress.
         committed: committed || selfCommitted || boardChanged,
         ...(treeProven ? { verified: gates } : {}),
+        ...(boardChanged ? { boardEvidenceIds: changedBoardIds } : {}),
       };
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer

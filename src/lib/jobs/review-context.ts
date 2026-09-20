@@ -674,17 +674,25 @@ export function hasBoardOnlyTicket(run: { target: Bead; tickets: Bead[] }): bool
  * reviewer's `bd show <id>` reads that frozen, pre-delivery copy regardless of whether this section
  * could name the changed ids — so the instruction is worth giving even when the ids themselves are
  * not, e.g. for the legacy shape where only the run target carries the `delivery:board` label.
+ *
+ * Gated on `boardOnly`, not on `repoPath` alone (PR #284 review, "board-checking instruction leaks
+ * into every ordinary review"): `repoPath` ({@link import("./steps/context").StepContext.repoPath})
+ * is a required field every gate forwards regardless of whether this run has any board-only ticket,
+ * so a bare `!repoPath` check never actually early-returns in production — every ordinary review
+ * with a real diff and zero board evidence got this paragraph appended after the diff, with no id to
+ * check it against.
  */
 function boardEvidenceSection(
   tickets: Bead[],
   boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
   repoPath: string | undefined,
+  boardOnly: boolean,
 ): string[] {
   const lines = tickets
     .map((t) => ({ ticket: t, ids: boardEvidenceByTicket?.get(t.id) }))
     .filter((e): e is { ticket: Bead; ids: string[] } => !!e.ids?.length)
     .map((e) => `- ${e.ticket.id}: ${e.ids.join(", ")}`);
-  if (lines.length === 0 && !repoPath) return [];
+  if (lines.length === 0 && !boardOnly) return [];
   return [
     ...(lines.length > 0 ? [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``] : []),
     ...(repoPath
@@ -725,7 +733,7 @@ function diffSection(
         `before this review ran — a zero-diff run is not, by itself, evidence of nothing delivered`,
         `here.`,
         ``,
-        ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath),
+        ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath, boardOnlyDelivery),
         `Judge the Acceptance criteria above against that confirmed board delivery instead of a code`,
         `diff; there is deliberately none to read. If Acceptance names a specific bead or field, check`,
         `it against the ids and beads named above (or their absence) rather than taking "the gate`,
@@ -759,7 +767,7 @@ function diffSection(
     // CONFIRMED board-only delivery, so surfacing it here is never a false claim, and omitting it
     // just because the diff happens to be nonempty would leave the reviewer with only the unrelated
     // patch and no way to check Acceptance against the bd writes that were the actual deliverable.
-    ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath),
+    ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath, boardOnlyDelivery),
     ...deletionsBlock(diff),
   ];
 }

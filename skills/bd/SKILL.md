@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 7b655b464b7b
+version: 590256e629b7
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -126,6 +126,14 @@ fresh read taken before dispatch, diffed against one taken after, confirmed sync
 This is a shaping-time decision, never inferred from the agent's own report: an agent cannot opt
 its own ticket out of the zero-diff guard, only shaping can, before the run ever claims it. If a
 ticket mixes code and board work, leave it unlabeled — the git diff already covers it.
+
+Placed on a legacy epic/feature run target (a container with plain `task`/`subtask` children, not
+a bead with its own `delivery:board` label), this label is inherited by **every child dispatched
+under it**, not just the target bead itself — the zero-diff guard is disabled for the whole group.
+Only label a container this way when every child's job really is bd writes; a mixed epic with
+ordinary code tickets underneath needs those tickets split out or the container relabeled, or a
+child that fails to produce a diff by mistake is misread as valid board-only delivery instead of a
+genuine zero-diff failure.
 
 ### `agent:human` — work no agent can finish
 

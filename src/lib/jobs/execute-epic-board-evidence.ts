@@ -411,42 +411,43 @@ export async function readBoardEvidence(
     // attempt has no prior marker to fall back on (PR #284 review). The baseline this attempt
     // already read is preserved instead, so a resumed attempt's `readBoardBaseline` reuses it
     // rather than taking a fresh one that may already have absorbed this ticket's writes through a
-    // sync pass this check never confirmed (see that function's docstring). Skipped once a baseline
-    // is already preserved, so a repeated read failure doesn't churn the write every attempt.
-    if (!beads.boardEvidenceBaseline(ticket)) {
-      // Persisted AND confirmed synced before this recovery baseline is trusted (PR #284 review
-      // round 9) — a write that only landed locally, or landed but never confirmed reaching the
-      // remote, does not help a resume on ANOTHER machine (the run-lease actor is machine-scoped,
-      // not run-scoped): that machine's `readBoardBaseline` finds no preserved baseline either and
-      // falls back to a fresh read that may already have absorbed this ticket's own — by-then synced
-      // through some other channel — writes, permanently rejecting an idempotent retry as unchanged.
-      // `baselineUnconfirmed` is reported (never silently folded into a plain `evidenceUnavailable`)
-      // so the operator note can say precisely that resuming on THIS machine is safe but resuming
-      // elsewhere is not — but only when the write actually landed locally and merely failed to
-      // confirm as synced. A write that failed outright (`!persisted`) leaves NO baseline anywhere,
-      // not even on this machine, so that same-machine safety claim would be false; that case is
-      // reported as `baselineUnpersisted` instead (anton-fc5x review round 7), which carries no such
-      // claim.
-      const persisted = await mustPersist(() =>
-        beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
-      );
-      const synced = persisted
-        ? await beads
-            .push(repo)
-            .then((outcome) => outcome === "synced" || outcome === "shared-server")
-            .catch(() => false)
-        : false;
-      if (!persisted || !synced) {
-        return {
-          found: pending.length > 0,
-          ids: pending,
-          synced: false,
-          evidenceUnavailable: true,
-          ...(persisted ? { baselineUnconfirmed: true } : { baselineUnpersisted: true }),
-        };
-      }
+    // sync pass this check never confirmed (see that function's docstring). The WRITE is skipped
+    // once a baseline is already preserved, so a repeated read failure doesn't churn it every
+    // attempt — but the confirming PUSH below still runs every attempt (chatgpt-codex-connector, PR
+    // #284 review, "track whether preserved baselines were synced"): a same-machine retry that
+    // found a baseline already here used to skip this whole block, silently dropping
+    // `baselineUnconfirmed` from its result even though THIS baseline was never actually confirmed
+    // synced — the operator note then fell back to a plain "board read failed" with no warning to
+    // stay on this machine, exactly the false-success shape the flag exists to prevent.
+    const alreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
+    const persisted =
+      alreadyPreserved ||
+      (await mustPersist(() => beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline))));
+    if (!persisted) {
+      // A write that failed outright leaves NO baseline anywhere, not even on this machine, so a
+      // same-machine-safe claim would be false — reported as `baselineUnpersisted` instead
+      // (anton-fc5x review round 7), which carries no such claim.
+      return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true, baselineUnpersisted: true };
     }
-    return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
+    // Persisted (this attempt or a prior one) AND confirmed synced before this recovery baseline is
+    // trusted (PR #284 review round 9) — a write that only landed locally does not help a resume on
+    // ANOTHER machine (the run-lease actor is machine-scoped, not run-scoped): that machine's
+    // `readBoardBaseline` finds no preserved baseline either and falls back to a fresh read that may
+    // already have absorbed this ticket's own — by-then synced through some other channel — writes,
+    // permanently rejecting an idempotent retry as unchanged. `baselineUnconfirmed` is reported
+    // (never silently folded into a plain `evidenceUnavailable`) so the operator note can say
+    // precisely that resuming on THIS machine is safe but resuming elsewhere is not.
+    const synced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    return {
+      found: pending.length > 0,
+      ids: pending,
+      synced: false,
+      evidenceUnavailable: true,
+      ...(synced ? {} : { baselineUnconfirmed: true }),
+    };
   }
   const freshIds = boardEvidence(baseline, fingerprintBoard(hydrated, ticket.id));
   const pending = beads.pendingBoardEvidence(ticket);
@@ -517,7 +518,11 @@ export async function readBoardEvidence(
   // healthy this attempt, so a locally-persisted baseline here is `baselineUnconfirmed` by
   // definition — same-machine resume safe, never cross-machine, exactly like the two branches above.
   const baselineAlreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
-  if (baselineAlreadyPreserved) return { found: true, ids, synced };
+  // `baselineUnconfirmed: true` here too (chatgpt-codex-connector, PR #284 review, "track whether
+  // preserved baselines were synced") — this shortcut used to return bare `synced: false` with
+  // neither flag set, silently dropping the same-machine-safe warning the comment above already
+  // promises for a baseline that survived from an earlier attempt.
+  if (baselineAlreadyPreserved) return { found: true, ids, synced, baselineUnconfirmed: true };
   const baselinePersisted = await mustPersist(() =>
     beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
   );
@@ -621,7 +626,7 @@ export async function clearBoardEvidencePending(
   // way to tell "confirmed and cleaned up" from "closed with nothing behind it" and can
   // regenerate this ticket into a false `NoDeliveryError`. Idempotent (`--set-metadata` on an
   // already-`true` key), so retrying it on a resumed cleanup costs nothing.
-  const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId));
+  const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids));
   const cleared = markerCleared && baselineCleared && confirmedSet;
   const synced = cleared
     ? await beads

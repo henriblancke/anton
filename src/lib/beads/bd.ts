@@ -231,6 +231,13 @@ const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
  * before that branch was pushed, a fresh worktree on another machine) and independently of whether
  * this branch happens to carry that commit. See {@link beads.boardEvidenceConfirmed} /
  * {@link beads.setBoardEvidenceConfirmed}.
+ *
+ * Carries the confirmed evidence ids themselves (JSON array), not just a boolean (PR #284 review,
+ * "track which beads a durably-confirmed board-only delivery touched") — a dispatch resume that
+ * finds this flag set has no OTHER way to recover which ids were confirmed: the pending-marker
+ * label and preserved-baseline metadata that carried them are cleared in the same write that sets
+ * this key. Without the ids riding along, a resumed run's per-ticket board-evidence ledger entry
+ * for this ticket is silently empty even though its delivery was genuinely confirmed.
  */
 const BOARD_EVIDENCE_CONFIRMED_KEY = "boardEvidenceConfirmed";
 
@@ -1105,12 +1112,34 @@ export const beads = {
    * the durable proof that survives {@link beads.clearBoardEvidenceBaseline}/pending-marker
    * clearing. See {@link BOARD_EVIDENCE_CONFIRMED_KEY}. */
   boardEvidenceConfirmed: (b: Bead): boolean =>
-    b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY] === "true",
+    b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY] !== undefined,
+
+  /** The evidence ids a confirmed board-only delivery touched, parsed back off the same metadata
+   * {@link beads.boardEvidenceConfirmed} checks (PR #284 review) — empty when the stored value
+   * predates this field or is unreadable, read as "confirmed but nothing to attribute" rather than
+   * thrown, matching {@link beads.boardEvidenceBaseline}'s tolerance for a malformed value. */
+  confirmedBoardEvidenceIds: (b: Bead): string[] => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  },
 
   /** Record, permanently, that this ticket's board-only delivery was confirmed — written once,
-   * beside the pending-marker/baseline clear, and never unset. */
-  setBoardEvidenceConfirmed: (cwd: string, id: string) =>
-    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_CONFIRMED_KEY}=true`]),
+   * beside the pending-marker/baseline clear, and never unset. Carries `ids` (the confirmed
+   * evidence) along with the flag, since the pending-marker label and preserved-baseline metadata
+   * that otherwise carry them are cleared in the same handoff. */
+  setBoardEvidenceConfirmed: (cwd: string, id: string, ids: readonly string[] = []) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--set-metadata",
+      `${BOARD_EVIDENCE_CONFIRMED_KEY}=${JSON.stringify(ids)}`,
+    ]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,

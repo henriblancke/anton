@@ -1221,6 +1221,16 @@ async function dispatchTicket(
   // both the closed and the standalone-in-review case, so re-checking `closed` here only excluded
   // the second one.
   if (doneOnBoard && isBoardOnlyRun(run, ticket) && beads.boardEvidenceConfirmed(ticket)) {
+    // The pending marker and preserved baseline that would normally carry these ids are the very
+    // things `clearBoardEvidencePending` cleared when it set the confirmed flag — `bd.ts` persists
+    // them alongside it for exactly this resume (PR #284 review, "track which beads a
+    // durably-confirmed board-only delivery touched"), so the reviewer's per-ticket evidence
+    // section still names them instead of falling back to a generic "some board write happened"
+    // note for a ticket whose evidence genuinely was confirmed.
+    const confirmedIds = beads.confirmedBoardEvidenceIds(ticket);
+    if (confirmedIds.length > 0) {
+      ledger.boardEvidence.set(ticket.id, confirmedIds);
+    }
     await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
     onBranch.add(ticket.id);
     if (ledger.skipCause.has(ticket.id)) {

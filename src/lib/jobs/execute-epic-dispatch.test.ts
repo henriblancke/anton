@@ -1062,7 +1062,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
     const child = bead("anton-a", {
       status: "closed",
       labels: [LABELS.boardOnly],
-      metadata: { boardEvidenceConfirmed: "true" },
+      metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
     });
     hasCommitMock.mockResolvedValue(false);
 
@@ -1073,6 +1073,13 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
     expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
     expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
     expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+    // The pending marker and preserved baseline that would normally carry these ids are exactly
+    // what `clearBoardEvidencePending` cleared when it set this durable flag (PR #284 review,
+    // "track which beads a durably-confirmed board-only delivery touched") — asserted here so a
+    // regression that drops the ids from the confirmed-flag payload still fails: without them the
+    // reviewer's per-ticket evidence section falls back to a generic note for a ticket whose
+    // evidence genuinely was confirmed.
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
   });
 
   it("still reopens and regenerates a board-only ticket that was never durably confirmed", async () => {
