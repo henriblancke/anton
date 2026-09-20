@@ -20,6 +20,7 @@ const readBoardBaselineMock = vi.fn();
 const readBoardEvidenceMock = vi.fn();
 const clearBoardEvidencePendingMock = vi.fn();
 const ensureBoardBaselinePersistedMock = vi.fn();
+const mustReadMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
@@ -56,6 +57,18 @@ vi.mock("./execute-epic-board-evidence", async () => {
     readBoardEvidence: (...args: unknown[]) => readBoardEvidenceMock(...args),
     clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
     ensureBoardBaselinePersisted: (...args: unknown[]) => ensureBoardBaselinePersistedMock(...args),
+  };
+});
+
+vi.mock("./execute-epic-persist", async () => {
+  const actual = await vi.importActual<typeof import("./execute-epic-persist")>("./execute-epic-persist");
+  return {
+    ...actual,
+    // `runTicket` re-reads the ticket via `mustRead` right before releasing the pending marker
+    // (PR #284 review, "Refresh the ticket before clearing newly written evidence") — mocked here
+    // like every other bd seam in this file so the cleanup tests below exercise that call, not a
+    // live `bd show` against a fake "/tmp/anton".
+    mustRead: (...args: unknown[]) => mustReadMock(...args),
   };
 });
 
@@ -246,8 +259,34 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     });
   });
 
-  it("clears the pending marker once finishTicket confirms the transition landed", async () => {
+  it("clears the pending marker once finishTicket confirms the transition landed, using a " +
+    "freshly re-read ticket rather than the stale pre-dispatch snapshot (chatgpt-codex-connector, " +
+    "PR #284 review, 'Refresh the ticket before clearing newly written evidence')", async () => {
     finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
+    // The label `readBoardEvidence` would have added to the LIVE board bead after `boardTicket` was
+    // captured — absent from `boardTicket` itself, which is exactly what a stale-snapshot cleanup
+    // call would still be passing.
+    const freshTicket = {
+      ...boardTicket,
+      labels: ["delivery:board", "board-evidence-pending:anton-x1"],
+    } as Bead;
+    mustReadMock.mockResolvedValue(freshTicket);
+
+    await runTicket({
+      run: run(),
+      steps: [deliveredCommitStep()],
+      ticket: boardTicket,
+      runTicketIds: [boardTicket.id],
+      timeoutMs: 5_000,
+    });
+
+    expect(mustReadMock).toHaveBeenCalledWith("/tmp/anton", boardTicket.id);
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", freshTicket, ["anton-x1"]);
+  });
+
+  it("falls back to the pre-dispatch ticket when the re-read fails, rather than blocking cleanup on it", async () => {
+    finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
+    mustReadMock.mockResolvedValue(undefined);
 
     await runTicket({
       run: run(),

@@ -26,6 +26,7 @@ import {
 } from "./execute-epic-board-evidence";
 import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
 import { PoisonEpic } from "./errors";
+import { mustRead } from "./execute-epic-persist";
 import {
   claimTicket,
   finishTicket,
@@ -248,7 +249,17 @@ export async function runTicket(args: {
   // delivery that genuinely landed. The thrown error propagates straight out of `runTicket` instead.
   if (progress.boardEvidenceIds) {
     if (finished.transitioned) {
-      await clearBoardEvidencePending(run.repoPath, ticket, progress.boardEvidenceIds);
+      // Re-read the ticket immediately before cleanup (PR #284 review, "Refresh the ticket before
+      // clearing newly written evidence"): `ticket` is the snapshot loaded before dispatch, but
+      // `readBoardEvidence` (inside `walkTicketSteps` above) adds the `board-evidence-pending:*`
+      // label to the LIVE board bead after that snapshot was taken. `clearBoardEvidencePending`
+      // derives which label to remove from the bead it is passed, so handing it the stale snapshot
+      // makes it see no label, skip the removal, and still record confirmation as though cleanup
+      // succeeded — stranding the pending marker on the board for a later reopen to misread as
+      // current evidence. A failed re-read falls back to the stale snapshot rather than blocking
+      // cleanup on it, which costs nothing beyond the same stale-label risk this call always carried.
+      const freshTicket = (await mustRead(run.repoPath, ticket.id)) ?? ticket;
+      await clearBoardEvidencePending(run.repoPath, freshTicket, progress.boardEvidenceIds);
     } else {
       // `finishTicket`'s close/in-review write is best-effort — right for a normal ticket, where an
       // unclosed bead is a survivable, PR-visible state (PR #253 review). It is wrong for a
