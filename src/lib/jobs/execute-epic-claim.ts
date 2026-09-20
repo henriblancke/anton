@@ -100,10 +100,12 @@ async function confirmPendingRefreshMutation(
       const tip = await resolveCommitSha(repo, ref);
       const parents = await commitParentShas(repo, tip);
       if (parents.includes(pendingRefresh.fromSha) && parents.includes(pendingRefresh.sha)) return true;
-      // As with a fast-forward, post-merge may commit immediately after the successful merge. The
-      // reflog retains the merge commit below that hook commit; verify its exact parent pair rather
-      // than treating generic reachability as evidence the pending merge landed.
-      const entries = (await git(repo, ["reflog", "show", "--format=%H", ref])).split("\n");
+      // A post-merge hook may commit immediately after the successful merge. Search merge commits
+      // still reachable from the branch for its exact parent pair; unlike a reflog, reachable
+      // history survives disabled, expired, or pruned reflogs.
+      const entries = (await git(repo, ["log", "--format=%H", "--merges", ref]))
+        .split("\n")
+        .filter(Boolean);
       for (const sha of entries) {
         const reflogParents = await commitParentShas(repo, sha);
         if (reflogParents.includes(pendingRefresh.fromSha) && reflogParents.includes(pendingRefresh.sha)) return true;

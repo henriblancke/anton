@@ -12,6 +12,7 @@
  * Skipped when bd/git are absent.
  */
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
 import { beads } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import * as schema from "../db/schema";
@@ -212,6 +213,21 @@ describeBd("execute-epic e2e — a send-back's run path back (real handler · re
       expect(retired.status).not.toBe("closed");
 
       await resetPerCaseState(tdb);
+      // The reset deliberately clears run history between cases, but a real rework resumes the
+      // already-existing branch with its original fork pin intact. Preserve that durable branch
+      // provenance here so the authoritative-rewrite guard exercises the production shape.
+      const branch = `anton/${bugId}`;
+      const forkSha = execFileSync("git", ["-C", repo, "merge-base", "origin/main", branch], {
+        encoding: "utf8",
+      }).trim();
+      await tdb.db.insert(schema.runs).values({
+        id: `prior-${bugId}`,
+        projectId,
+        epicBeadId: bugId,
+        branch,
+        baseForkSha: forkSha,
+        status: "done",
+      });
       const job = await driveEpicRun(makeEpicRunner(ctx), { projectId, epicBeadId: bugId });
 
       // The agent ran again — the whole point of a send-back — and the run landed back on the SAME
