@@ -808,6 +808,38 @@ it("reconciles a pending refresh onto the boundary a crashed attempt actually ap
   );
 });
 
+// anton-s55u (PR #279 review, P1 fix): an OPERATIONAL failure on this probe — not git's own exit-1
+// "no" — must fail the resume rather than read as "mutation unconfirmed". Swallowing it used to fall
+// back silently to the stale pre-mutation boundary, which a later rewind-then-rewrite of the base
+// could rebase onto with `--onto`, resurrecting the very commit the rewrite dropped.
+it("propagates an operational failure from the mutation-confirmation ancestry probe instead of treating it as unconfirmed", async () => {
+  // Attempt 1's mutation onto `pending-base` genuinely moved the branch off its pre-mutation tip
+  // (confirmed below), but confirming `pending-base` is now reachable from the branch's tip fails for
+  // an operational reason, not because it's actually unreachable.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "pending-base" && descendant === "branch-tip-before-mutation") return false;
+    if (descendant === "branch-tip-before-mutation") return false;
+    if (ancestor === "pending-base" && descendant === `refs/heads/${BRANCH}`) {
+      throw new Error("git process killed");
+    }
+    return false;
+  });
+
+  await expect(warmRunWorktree(makeRun(RETRY))).rejects.toThrow("git process killed");
+  expect(createWorktreeMock).not.toHaveBeenCalled();
+});
+
 // anton-s55u (PR #279 review, fourth re-review): a NEWER `skipped_dirty` row between a dead attempt's
 // pending write-ahead record and this resume must be treated as a barrier, not walked through. The
 // dirty attempt still dispatched and committed real work onto the branch despite skipping its own

@@ -185,9 +185,18 @@ export async function warmRunWorktree(
     const branchStillAtPreMutationTip =
       (await isAncestor(repo, pendingRefresh.fromSha, `refs/heads/${branch}`).catch(() => true)) &&
       (await isAncestor(repo, `refs/heads/${branch}`, pendingRefresh.fromSha).catch(() => true));
+    // NOT defaulted on failure like the pair above (PR #279 review, P1 fix): those two fail closed
+    // into "unconfirmed" on an operational error, which only forgoes promoting a newer boundary —
+    // `reconciledRefreshSha` still falls back to `priorEffectiveRefreshSha`, an already-durable one.
+    // Defaulting THIS probe to `false` on the same kind of error would instead mean "not confirmed"
+    // for a mutation that may well have landed, silently discarding the real `B` boundary in favor of
+    // that same stale fallback — and if the base is later rewound past it (`A-B` back to `A`, then
+    // forward to `A-C`), a subsequent `--onto` rebase derived from the stale boundary replays `B`,
+    // history the rewind dropped, back onto the branch. `isAncestor` itself only resolves `false` for
+    // git's own exit-1 "no" and rethrows every other failure, so letting that propagate here — instead
+    // of swallowing it — fails the resume loudly rather than silently trusting a stale boundary.
     const mutationConfirmed =
-      !branchStillAtPreMutationTip &&
-      (await isAncestor(repo, pendingRefresh.sha, `refs/heads/${branch}`).catch(() => false));
+      !branchStillAtPreMutationTip && (await isAncestor(repo, pendingRefresh.sha, `refs/heads/${branch}`));
     if (mutationConfirmed) reconciledRefreshSha = pendingRefresh.sha;
   }
   const worktree = await createWorktree({
