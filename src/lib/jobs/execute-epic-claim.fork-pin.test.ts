@@ -808,6 +808,51 @@ it("reconciles a pending refresh onto the boundary a crashed attempt actually ap
   );
 });
 
+// anton-s55u (PR #279 review, third re-review): the dead attempt above is this branch's very FIRST
+// refresh ever, so there is no OLDER settled row for `priorEffectiveRefreshSha` to find — it reads
+// undefined even once the reconciliation above (same call) has confirmed the pending write actually
+// landed. THIS same attempt's own checkout is additionally dirty (e.g. a post-merge/post-rewrite hook
+// left generated edits), so its OWN refresh reports `skipped_dirty`. Falling back on the
+// pre-reconciliation `priorEffectiveRefreshSha` here would treat the branch as having no confirmed
+// refresh at all, rejecting a truthful already-shipped claim citing commits the reconciled refresh
+// already brought onto the branch — `reconciledRefreshSha` is what must be consulted instead.
+it("keeps alreadyShippedBase at the reconciled boundary, not the frozen fork, when this attempt's own refresh is skipped_dirty", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "this-attempt-dirty-base" },
+  });
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    // The branch moved off its recorded pre-mutation tip (the dead attempt's mutation landed).
+    if (ancestor === "branch-tip-before-mutation" && descendant === `refs/heads/${BRANCH}`) return false;
+    // The reconciled boundary is confirmed on the branch, and is itself an ancestor of the dirty
+    // resume's own resolved base — ordinary forward motion between the two.
+    return true;
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "pending-base" }),
+  );
+  expect(runStep.baseForkSha).toBe("old-fork-commit");
+  expect(runStep.alreadyShippedBase).toBe("pending-base");
+});
+
 it("ignores a pending refresh that never actually landed on the branch, falling back to the last confirmed boundary", async () => {
   // Same shape as above, but the crashed attempt's mutation never actually reached the branch (it
   // died before the git call ran, or the operation was aborted) — the pending sha must NOT be

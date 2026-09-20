@@ -259,11 +259,20 @@ export async function warmRunWorktree(
   // neither, and recomputes once — no worse than the old behaviour — storing the answer on its row.
   let storedFork: string | undefined;
   let baseForkSha: string;
-  // `priorEffectiveRefreshSha` (resolved above, before the checkout) is also what the write below
-  // must NOT clobber: a later resume's `skipped_dirty` records that THIS attempt didn't move the
-  // branch, not that no attempt ever did, so overwriting a prior success's record with the fresh base
-  // it was never brought up to would lose the only base a truthful already-shipped claim naming that
-  // success's commits could still be checked against.
+  // `reconciledRefreshSha` (resolved above, before the checkout) is also what the write below must
+  // NOT clobber: a later resume's `skipped_dirty` records that THIS attempt didn't move the branch,
+  // not that no attempt ever did, so overwriting a prior success's record with the fresh base it was
+  // never brought up to would lose the only base a truthful already-shipped claim naming that
+  // success's commits could still be checked against. `reconciledRefreshSha`, not the
+  // pre-reconciliation `priorEffectiveRefreshSha` (anton-s55u, PR #279 review, third re-review): a
+  // dead attempt's pending write can be the branch's ONLY refresh ever, so `priorEffectiveRefreshSha`
+  // (which only recognizes a SETTLED outcome) reads undefined even once this call's own reconciliation
+  // above has confirmed that pending write landed. Guarding on the pre-reconciliation value would let
+  // THIS clobber through regardless, overwriting the still-`pending` row (and the confirmed boundary
+  // its `priorBaseRefreshSha` carries) with this attempt's `skipped_dirty` — which
+  // `findRunBaseRefreshShaForBranch` skips outright without ever reading that field back, unlike its
+  // `PENDING_REFRESH_OUTCOME` branch. That would strand the confirmed boundary for good: a later walk
+  // finds neither the pending row (overwritten) nor a settled one to fall back to.
   //
   // Computed once, outside the try, so the catch below can retry the SAME payload (PR #279 review,
   // P1): `createWorktree` already mutated the branch (rebased/merged it) by this point — the payload
@@ -294,7 +303,7 @@ export async function warmRunWorktree(
   const refreshFields = isRecreatedBranch
     ? { baseRefreshOutcome: BRANCH_RECREATED_REFRESH_TOMBSTONE, baseRefreshSha: null }
     : worktree.refreshOutcome &&
-        !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
+        !(worktree.refreshOutcome.outcome === "skipped_dirty" && reconciledRefreshSha !== undefined)
       ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }
       : undefined;
   try {
@@ -408,13 +417,21 @@ export async function warmRunWorktree(
   // straight to `baseForkSha` (PR #279 review) — `skipped_dirty` means only that this attempt didn't
   // move the branch, and the commits an earlier resume's refresh brought in are still on it.
   //
-  // Only trusted for a REUSED checkout (PR #279 review): `priorEffectiveRefreshSha` is read from the
-  // branch's run-row history, not from the checkout itself, so it survives a branch delete-and-
-  // recreate that leaves old rows behind. A freshly CREATED checkout (`worktree.createdBranch`) forks
-  // straight off `freshBase` and carries none of that old branch's history — the old base normally
-  // stays an ancestor of the fresh one, so the frozen-sha guard below would accept the stale value
-  // rather than catch it, checking a truthful claim against a commit the recreated branch never had.
-  // `baseForkSha` — this checkout's own, freshly resolved fork — is the only value that describes it.
+  // Only trusted for a REUSED checkout (PR #279 review): `reconciledRefreshSha` is read from the
+  // branch's run-row history (reconciled, above, against a dead attempt's write-ahead pending write),
+  // not from the checkout itself, so it survives a branch delete-and-recreate that leaves old rows
+  // behind. A freshly CREATED checkout (`worktree.createdBranch`) forks straight off `freshBase` and
+  // carries none of that old branch's history — the old base normally stays an ancestor of the fresh
+  // one, so the frozen-sha guard below would accept the stale value rather than catch it, checking a
+  // truthful claim against a commit the recreated branch never had. `baseForkSha` — this checkout's
+  // own, freshly resolved fork — is the only value that describes it.
+  //
+  // `reconciledRefreshSha`, not the pre-reconciliation `priorEffectiveRefreshSha` (anton-s55u, PR #279
+  // review, third re-review): the same dead-attempt's-pending-write gap the `refreshFields` guard
+  // above closes applies here too — a confirmed-but-never-finalized refresh reads as undefined in
+  // `priorEffectiveRefreshSha` (a still-`pending` row isn't a recognized settled outcome), which would
+  // fall this straight to the stale, frozen `baseForkSha` and reject a truthful already-shipped claim
+  // citing commits the reconciled refresh already brought onto the branch.
   //
   // That fallback is itself frozen at the instant the refresh it came from ran, and origin can move
   // between then and now — including a force-push that drops a commit an already-shipped claim
@@ -441,7 +458,7 @@ export async function warmRunWorktree(
   // already the immutable commit this checkout was cut from — frozen at creation, before any warm
   // could rewind the base — so it, not the mutable ref, is what a fresh creation must pin against.
   const pinnedBase = worktree.refreshOutcome?.baseSha ?? (reusedCheckout ? freshBase : baseForkSha);
-  const shippedFallback = reusedCheckout ? (priorEffectiveRefreshSha ?? baseForkSha) : baseForkSha;
+  const shippedFallback = reusedCheckout ? (reconciledRefreshSha ?? baseForkSha) : baseForkSha;
   // Both ancestry directions, not just fallback-descends-from-base (PR #279 review): a dirty resume
   // whose `resolveFreshBase` fell back to a stale LOCAL base (no network) can leave `pinnedBase`
   // BEHIND `shippedFallback` — e.g. local `main` sits at A while an earlier, still-recorded refresh
