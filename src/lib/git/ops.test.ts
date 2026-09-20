@@ -4136,6 +4136,58 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
   });
 
   /**
+   * The same hangup, reported as 128 instead of 1 (PR #306 review). Git exits 128 when the
+   * transport dies BEFORE the push begins — verified locally: a push to an unreachable SSH remote
+   * exits 128 with empty porcelain output — so matching the diagnostics only in the `code === 1`
+   * branch left an ordinary connection loss classified permanent and never retried.
+   */
+  it("classifies a pre-transfer SSH hangup reported as exit 128 as transient too", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr:
+        "Connection to github.com closed by remote host.\nfatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+    expect(verdict.reason).toMatch(/transient transport failure/);
+    // Full transport budget, unlike the exit-1 case: git never reached the remote, and a pre-push
+    // decline is exit 1, so there is no hook-vs-transport ambiguity to bound here.
+    expect(verdict.retry).toBeUndefined();
+  });
+
+  /**
+   * The precedence the exit-128 hangup match depends on, pinned explicitly because it is now
+   * load-bearing (PR #306 review round 2). A local failure aborts the push mid-transport, so git
+   * prints its own `fatal: the remote end hung up unexpectedly` on top of the real reason — the
+   * local diagnostic is the specific evidence, the hangup is the generic consequence. This file's
+   * gpg test caught the inverted order; these pin the other two local causes the same way.
+   */
+  it.each([
+    ["a missing credential", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"],
+    ["a stuck index.lock", "fatal: Unable to create '/repo/.git/index.lock': File exists."],
+  ])("keeps %s permanent even though git also reports the remote hanging up", (_label, localCause) => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: `${localCause}\nfatal: the remote end hung up unexpectedly\n`,
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/permanent local failure/);
+  });
+
+  it("still calls an unrecognized exit 128 permanent", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: repository 'origin' does not exist\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  /**
    * PR #306 review, both reviewers. The transport check is scoped to the no-`Done` case, so a
    * remote that ANSWERED and rejected is decided by its own per-ref verdict no matter what else
    * lands in stderr — a server hanging up right after answering, or a verbose/jump-host ssh
@@ -5030,6 +5082,30 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
     const localHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "main"], { encoding: "utf8" }).trim();
     expect(remoteHead).toBe(localHead);
+  });
+
+  /**
+   * PR #306 review round 2. Reading `core.sshCommand` put an `await` ahead of `gitPush`'s
+   * `signal?.aborted` check, so an already-cancelled push would wait out that subprocess — up to
+   * its full 5s on the wedged-git case the read was made async to tolerate — before noticing, and
+   * would spend a subprocess on a push that is not going to happen. The check belongs first, as it
+   * is everywhere else in this file.
+   */
+  it("rejects an already-aborted push without spawning anything", async () => {
+    const counter = join(sandbox, "push-attempts-pre-abort.log");
+    const binDir = shimGitFailingPushOnce(sandbox, counter);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    const controller = new AbortController();
+    const reason = new Error("cancelled before the push started");
+    controller.abort(reason);
+    try {
+      await expect(pushBranch(repo, "main", undefined, undefined, controller.signal)).rejects.toBe(reason);
+      // The shim never ran: no attempt was made, so not even the config read reached a subprocess.
+      expect(existsSync(counter)).toBe(false);
+    } finally {
+      process.env.PATH = prevPath;
+    }
   });
 
   it("aborts immediately during backoff instead of waiting out the 1s delay", async () => {

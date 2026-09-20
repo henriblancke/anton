@@ -1681,11 +1681,18 @@ async function gitPush(
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
+  // FIRST, ahead of the async gap below — every other guarded spot in this file checks `aborted`
+  // with nothing awaited in front of it, and moving the config read up here broke that (PR #306
+  // review round 2). An already-cancelled push would otherwise wait out `readSshCommand` before
+  // noticing, up to its full 5s on the wedged-git case the read was made async to tolerate, and
+  // would spend a subprocess on a push that is not going to happen.
+  if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
   // Awaited OUTSIDE the executor, so nothing blocks the event loop: this runs inside the in-process
   // job runner, which drives up to ANTON_MAX_CONCURRENT jobs and the Next.js HTTP handlers on one
   // loop (PR #306 review). See {@link readSshCommand}.
   const sshCommand = await readSshCommand(cwd);
   return new Promise((resolvePromise, reject) => {
+    // Re-checked: the await above is a real window, and the signal may have fired during it.
     if (signal?.aborted) {
       reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
       return;
@@ -1881,10 +1888,16 @@ const PORCELAIN_ANY_REJECTED = /^!\t.*$/m;
 
 /**
  * The remote hung up the transport before anything was transferred — the shape a slow `pre-push`
- * gate produces when it outlasts the server's idle timeout (see {@link pushEnv}). Matched on stderr
- * for a `code === 1` push, where it would otherwise be read as a declined local hook.
+ * gate produces when it outlasts the server's idle timeout (see {@link pushEnv}).
  *
- * Tested ONLY when porcelain has no `Done` line, never ahead of a per-ref verdict (PR #306 review).
+ * Matched in BOTH exit-code branches, because git reports the same hangup either way depending on
+ * how far it got (PR #306 review): as `1` when the push itself fails, and as `128` when the
+ * transport dies before the push begins. They differ in what the verdict can claim, not in the
+ * evidence — see each call site. Exit 1 is the ambiguous one, since a `pre-push` hook's own nested
+ * git can print these diagnostics into the very same stderr; exit 128 is not, since git never got
+ * far enough for a hook verdict to exist.
+ *
+ * At exit 1, tested ONLY when porcelain has no `Done` line, never ahead of a per-ref verdict.
  * The incident this exists for never had one — nothing was transferred, so the remote never answered
  * — which means scoping it there costs the fix nothing. Testing it earlier would let stderr text
  * override porcelain's structural answer: a push the remote genuinely REJECTED, whose stderr happens
@@ -2068,6 +2081,20 @@ export function classifyPushFailure(result: {
   }
 
   if (code === 128) {
+    // The PERMANENT local causes come first, ahead of every transport pattern (PR #306 review
+    // round 2, caught by this file's own gpg test). A local failure aborts the push mid-transport,
+    // so git prints its own `fatal: the remote end hung up unexpectedly` on top of the real
+    // reason — `gpg failed to sign the push certificate` followed by exactly that line. Matching
+    // the hangup first would reclassify a misconfigured signing key, a missing credential, or a
+    // stuck index.lock as a transient transport fault and retry all three forever. The local
+    // diagnostic is the specific evidence; the hangup is the generic consequence.
+    if (
+      /could not read Username/i.test(stderr) ||
+      /Unable to create .*index\.lock/i.test(stderr) ||
+      /gpg failed to sign/i.test(stderr)
+    ) {
+      return { transient: false, reason: `a permanent local failure, not a transport fault: ${stderr}` };
+    }
     if (
       /Could not resolve host/i.test(stderr) ||
       /Connection reset/i.test(stderr) ||
@@ -2075,16 +2102,19 @@ export function classifyPushFailure(result: {
       // Git's own diagnostic for an HTTP remote that answers with a 5xx: confirmed against a real
       // 503 with `git push -h`'s porcelain mode — "The requested URL returned error: 503" — which
       // the `HTTP 5\d\d` form above never matches, so a transient 5xx was misclassified permanent.
-      /returned error: 5\d\d/.test(stderr)
+      /returned error: 5\d\d/.test(stderr) ||
+      // The SAME hangup the `code === 1` branch above recognizes: git reports a pre-transfer SSH
+      // failure as 128 whenever the transport dies before the push begins, rather than as 1, so
+      // matching it only there left an ordinary connection loss classified permanent and never
+      // retried (PR #306 review). Verified locally: a push to an unreachable SSH remote exits 128
+      // with empty porcelain output.
+      SSH_CONNECTION_DROPPED.test(stderr)
     ) {
+      // No `retry` shape here, unlike the `code === 1` case. Exit 128 means git never reached the
+      // remote at all, and a `pre-push` decline is exit 1 — so the hook-vs-transport ambiguity that
+      // bounds that branch to one retry does not exist here, and the normal transport budget
+      // applies. Nothing ran the project's gate, so a retry is cheap.
       return { transient: true, reason: `a transient transport failure reaching the remote: ${stderr}` };
-    }
-    if (
-      /could not read Username/i.test(stderr) ||
-      /Unable to create .*index\.lock/i.test(stderr) ||
-      /gpg failed to sign/i.test(stderr)
-    ) {
-      return { transient: false, reason: `a permanent local failure, not a transport fault: ${stderr}` };
     }
     return {
       transient: false,
