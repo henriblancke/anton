@@ -615,7 +615,30 @@ export async function clearBoardEvidencePending(
     );
   }
   if (hasCleanupObligation) {
-    await mustPersist(() => beads.clearBoardEvidenceCleanupUnsynced(repo, ticketId));
+    // Mirrors the marker/baseline clear above (thread on PR #284 line 618, "persist and sync the
+    // cleared cleanup obligation"): a local-only clear that's never confirmed reaching the remote is
+    // exactly the failure this obligation marker exists to prevent — silently trusting it here would
+    // let a refused write, or a push that lands after the process dies, leave the remote holding the
+    // obligation forever, for every later machine to rediscover and retry a cleanup this ticket
+    // already settled.
+    const obligationCleared = await mustPersist(() =>
+      beads.clearBoardEvidenceCleanupUnsynced(repo, ticketId),
+    );
+    const obligationSynced = obligationCleared
+      ? await beads
+          .push(repo)
+          .then((outcome) => outcome === "synced" || outcome === "shared-server")
+          .catch(() => false)
+      : false;
+    if (!obligationCleared || !obligationSynced) {
+      throw new PoisonEpic(
+        `${ticketId} delivered and closed, but the cleanup-sync retry obligation could not be ` +
+          `${obligationCleared ? "confirmed as synced to the remote" : "cleared locally"} (after ` +
+          `retries) — the run stopped rather than leave a later machine to rediscover and retry an ` +
+          `already-settled cleanup. Check the beads DB${obligationCleared ? " and the sync channel" : ""}, ` +
+          `then resume the run.`,
+      );
+    }
   }
 }
 

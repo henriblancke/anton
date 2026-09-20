@@ -821,13 +821,48 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "`hasCleanupObligation` even though nothing else is pending (PR #284 review) — the resume path " +
       "for a prior attempt whose two writes both succeeded locally but never confirmed syncing",
     async () => {
+      // Two pushes now: one confirming the marker/baseline clear, one confirming the obligation
+      // release itself (thread on PR #284 line 618) — the second is exactly what this test asserts.
+      pushMock.mockResolvedValueOnce("synced");
       pushMock.mockResolvedValueOnce("synced");
       const markerCallsBefore = setBoardEvidencePendingMock.mock.calls.length;
+      const pushCallsBefore = pushMock.mock.calls.length;
       await clearBoardEvidencePending("/repo", "t-cleanup-retry-push", [], false, true);
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 2);
       expect(pushMock).toHaveBeenCalledWith("/repo");
       // No pending ids means nothing for the marker write to remove.
       expect(setBoardEvidencePendingMock.mock.calls.length).toBe(markerCallsBefore);
       expect(clearBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith("/repo", "t-cleanup-retry-push");
+    },
+  );
+
+  it(
+    "throws, without treating the obligation as released, when the local clear itself is refused " +
+      "(thread on PR #284 line 618) — a swallowed `mustPersist` failure here would leave the " +
+      "obligation marker set locally with no error raised, and the caller would move on believing " +
+      "cleanup was done",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      clearBoardEvidenceCleanupUnsyncedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      clearBoardEvidenceCleanupUnsyncedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      clearBoardEvidenceCleanupUnsyncedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-release-refused", [], false, true),
+      ).rejects.toThrow(/t-cleanup-release-refused/);
+    },
+  );
+
+  it(
+    "throws, without treating the obligation as released, when the local clear lands but the " +
+      "confirming push cannot verify it reached the remote (thread on PR #284 line 618) — otherwise " +
+      "a later machine still sees the obligation on the board and unnecessarily retries an " +
+      "already-settled cleanup",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-release-unsynced", [], false, true),
+      ).rejects.toThrow(/t-cleanup-release-unsynced/);
     },
   );
 
