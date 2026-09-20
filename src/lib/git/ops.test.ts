@@ -4057,6 +4057,24 @@ describe("pushEnv — keepalives so a slow pre-push gate cannot outlast the serv
 
     expect(pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND).toBe(mine);
   });
+
+  /**
+   * PR #306 review. Appending would NOT have overridden their value — OpenSSH takes the first
+   * obtained value for a parameter, not the last (verified with `ssh -G`: `-o ServerAliveCountMax=3`
+   * followed by `-o ServerAliveCountMax=30` resolves to 3) — so this is about not writing options
+   * that provably do nothing, which would make the effective command misreport what is in force.
+   */
+  it("defers to an operator who set only ServerAliveCountMax, without an interval", () => {
+    const mine = "ssh -o ServerAliveCountMax=3";
+
+    expect(pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND).toBe(mine);
+  });
+
+  it("defers to a keepalive set through core.sshCommand too, not just the environment", () => {
+    const configured = "ssh -o ServerAliveCountMax=3";
+
+    expect(pushEnv({ PATH: "/usr/bin" }, configured).GIT_SSH_COMMAND).toBeUndefined();
+  });
 });
 
 // anton-1cjaw: the discriminator table measured on git 2.x/macOS via execFile — captured stderr and
@@ -4094,6 +4112,27 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
     // Must not be blamed on the hook, whose own PASSING output sits in that same stderr.
     expect(verdict.reason).not.toMatch(/hook declined/);
     expect(verdict.reason).toMatch(/closed before the push transferred anything/);
+  });
+
+  /**
+   * PR #306 review (P2). A local hook running its own nested git/ssh can print the identical
+   * diagnostic, and the hook's stderr IS the push's stderr — reproduced against real git: a hook
+   * echoing `fatal: the remote end hung up unexpectedly` and exiting 1 yields exit 1, empty stdout,
+   * that text on stderr. Since the output cannot separate the two, the verdict bounds the cost of
+   * being wrong instead of claiming certainty: ONE retry, not the transport default's three, so a
+   * misread costs one extra pre-push gate rather than two.
+   */
+  it("bounds the transport drop to a single retry, since a failing hook can print the same text", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr: "fatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+    expect(verdict.retry?.maxAttempts).toBe(2);
+    // The reason must not assert a cause the evidence cannot establish — it names both readings.
+    expect(verdict.reason).toMatch(/pre-push hook running its own git\/ssh can print the same/);
   });
 
   /**

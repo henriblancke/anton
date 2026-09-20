@@ -4,7 +4,7 @@
  * (ANTON_GH_BIN) so tests can point it at a fake. See DESIGN.md §4/§5.
  */
 import type { ChildProcess } from "node:child_process";
-import { execFile, spawn, spawnSync } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1605,7 +1605,14 @@ export function pushEnv(
     next.GIT_SSH_COMMAND = `ssh ${SSH_KEEPALIVE_OPTS}`;
     return next;
   }
-  if (/ServerAliveInterval/i.test(effective)) return next;
+  // EITHER keepalive option means the operator has an opinion about this mechanism, so anton adds
+  // nothing (PR #306 review). Appending would not actually override them — OpenSSH takes the FIRST
+  // value for a parameter, not the last ("unless noted otherwise, for each parameter, the first
+  // obtained value will be used"), verified with `ssh -G`: an operator's `-o ServerAliveCountMax=3`
+  // still wins with our `=30` appended after it. The reason to skip is honesty, not correctness —
+  // appending options that provably do nothing makes the effective command misreport what is in
+  // force, and leaves a later reader to rediscover the precedence rule to make sense of it.
+  if (/ServerAlive(?:Interval|CountMax)/i.test(effective)) return next;
   if (!isOpenSshCommand(effective)) return next;
   // Appending rather than replacing is what preserves an identity or jump host. When `effective`
   // came from `core.sshCommand`, the value written here CONTAINS that command, so the env var
@@ -1621,21 +1628,25 @@ const SSH_KEEPALIVE_OPTS = "-o ServerAliveInterval=30 -o ServerAliveCountMax=30"
  * `core.sshCommand` as it resolves for `cwd` (repo config, then global, then system), or undefined
  * when unset — what {@link pushEnv} must preserve rather than override.
  *
- * Synchronous and best-effort: it runs once per push, immediately before a spawn that may take
- * minutes, so the few milliseconds are irrelevant next to being correct about the operator's
- * identity. Every failure — no git, not a repo, the key simply unset (exit 1) — yields undefined,
- * which is exactly the common case, so nothing here can fail a push. A short timeout keeps a wedged
- * git from holding the push open.
+ * ASYNCHRONOUS on purpose (PR #306 review). A `spawnSync` here would be the only blocking subprocess
+ * call in this file, and everything else in it — detached process groups, bounded stdout/stderr,
+ * abort signals — exists precisely to avoid blocking. `pushBranch` runs inside the in-process job
+ * runner, which drives up to `ANTON_MAX_CONCURRENT` jobs and this server's HTTP handlers on a single
+ * event loop, so a wedged `git config` (contended `.git/config.lock`, a slow or NFS-mounted repo)
+ * would stall every other in-flight job and request, not just this push — the same class of stall
+ * this change sets out to fix for pre-push gates, one layer down.
+ *
+ * Best-effort: every failure — no git, not a repo, the key simply unset (exit 1) — yields undefined,
+ * which is also the common case, so nothing here can fail a push. The timeout bounds a wedged git.
  */
-function readSshCommand(cwd: string): string | undefined {
+async function readSshCommand(cwd: string): Promise<string | undefined> {
   try {
-    const r = spawnSync("git", ["-C", cwd, "config", "--get", "core.sshCommand"], {
-      encoding: "utf8",
+    const { stdout } = await execFileAsync("git", ["-C", cwd, "config", "--get", "core.sshCommand"], {
       timeout: 5_000,
     });
-    if (r.status !== 0) return undefined;
-    return r.stdout.trim() || undefined;
+    return stdout.trim() || undefined;
   } catch {
+    // Non-zero exit (the key is unset) lands here too, and is the normal case.
     return undefined;
   }
 }
@@ -1663,13 +1674,17 @@ function isOpenSshCommand(command: string): boolean {
  * Does NOT go through the shared {@link git} helper: that helper's fixed `execFile` timeout is the
  * exact mechanism this works around.
  */
-function gitPush(
+async function gitPush(
   cwd: string,
   args: string[],
   hooksPath?: string,
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
+  // Awaited OUTSIDE the executor, so nothing blocks the event loop: this runs inside the in-process
+  // job runner, which drives up to ANTON_MAX_CONCURRENT jobs and the Next.js HTTP handlers on one
+  // loop (PR #306 review). See {@link readSshCommand}.
+  const sshCommand = await readSshCommand(cwd);
   return new Promise((resolvePromise, reject) => {
     if (signal?.aborted) {
       reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
@@ -1683,9 +1698,9 @@ function gitPush(
     const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
-      // The repo's own `core.sshCommand` is read and passed in, so the keepalives extend it instead
-      // of overriding it — setting GIT_SSH_COMMAND outranks that config (PR #306 review).
-      env: pushEnv(process.env, readSshCommand(cwd)),
+      // The repo's own `core.sshCommand`, read above, so the keepalives extend it instead of
+      // overriding it — setting GIT_SSH_COMMAND outranks that config (PR #306 review).
+      env: pushEnv(process.env, sshCommand),
     });
     const stderr = boundedStderr(child);
     const stdout = boundedStdout(child);
@@ -1827,6 +1842,22 @@ export interface PushRetryShape {
  *   budget and long enough for a concurrent run's test suite to finish and hand its memory back.
  */
 const SIGNAL_KILL_RETRY: PushRetryShape = { maxAttempts: 2, backoffMs: 30_000 };
+
+/**
+ * The retry a dropped transport gets (PR #306 review), for the same "bound an ambiguous guess"
+ * reason as {@link SIGNAL_KILL_RETRY} above, though the ambiguity is a different one.
+ *
+ * - **Two attempts, not three.** The evidence cannot separate a server that hung up from a local
+ *   `pre-push` hook whose own nested git printed the identical diagnostic before failing — the
+ *   hook's stderr IS the push's stderr. Each attempt re-runs the project's whole gate (minutes),
+ *   so a wrong guess is expensive. One retry buys back the genuine transport drop, which is the
+ *   case that killed seven consecutive runs; a third would mostly buy another gate on a hook that
+ *   is going to fail again anyway.
+ * - **1 second.** Unlike an OOM kill, there is no pressure to wait out: the keepalives from
+ *   {@link pushEnv} are what prevent a recurrence, not elapsed time, so this keeps the transport
+ *   default's gap rather than inventing a longer one.
+ */
+const TRANSPORT_DROP_RETRY: PushRetryShape = { maxAttempts: 2, backoffMs: 1_000 };
 
 /**
  * A porcelain non-fast-forward rejection's ref-status line, shared by {@link classifyPushFailure}'s
@@ -1988,13 +2019,28 @@ export function classifyPushFailure(result: {
       // declined hook it is permanent, so the run dies having paid the full gate; read as what it
       // is, the retry costs another gate but can actually succeed. {@link pushEnv} makes this rare
       // rather than routine; this makes it survivable when it still happens.
+      //
+      // A local hook that FAILED can print the very same diagnostic — a hook running its own nested
+      // git or ssh, whose stderr is shared with the outer push (PR #306 review, reproduced: a hook
+      // echoing `fatal: the remote end hung up unexpectedly` and exiting 1 gives exit 1, empty
+      // stdout, that text on stderr). Nothing in the output distinguishes the two: the hook's
+      // stderr IS the push's stderr, and there is no marker saying which process wrote a line.
+      //
+      // So this does not claim to know, it bounds what being wrong costs. The verdict names both
+      // readings, and `TRANSPORT_DROP_RETRY` gives ONE retry instead of the transport default's
+      // three. Guessing "transient" and being wrong now costs one extra gate rather than two; the
+      // opposite guess costs a whole run, which is the failure that prompted this change. A hook
+      // that genuinely fails, fails again on the retry and ends the run permanently.
       if (SSH_CONNECTION_DROPPED.test(stderr)) {
         return {
           transient: true,
+          retry: TRANSPORT_DROP_RETRY,
           reason:
-            `the connection to the remote was closed before the push transferred anything — git opens ` +
-            `it before pre-push runs, so a slow gate can outlast the server's idle timeout. The hook's ` +
-            `own verdict is not what failed here: ${stderr}`,
+            `the connection to the remote closed before the push transferred anything — git opens it ` +
+            `before pre-push runs, so a slow gate can outlast the server's idle timeout. A pre-push ` +
+            `hook running its own git/ssh can print the same diagnostic, and the two are not ` +
+            `distinguishable from the output, so this gets ONE retry rather than the usual three: ` +
+            `${stderr}`,
         };
       }
       return {
