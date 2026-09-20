@@ -124,7 +124,7 @@ beforeEach(async () => {
   isAncestorMock.mockReset().mockResolvedValue(true);
   resolveCommitShaMock.mockReset();
   commitParentShasMock.mockReset();
-  gitMock.mockReset();
+  gitMock.mockReset().mockResolvedValue("");
   // The branch is present by default; the branch-deleted regression test overrides this itself.
   branchExistsMock.mockReset().mockResolvedValue(true);
 });
@@ -570,8 +570,8 @@ it("falls back alreadyShippedBase to a prior resume's recorded refresh when this
   expect(runStep.alreadyShippedBase).toBe("prior-base");
 
   const row = await actualRuns.getRunById(t.db, RUN_ID);
-  expect(row?.baseRefreshOutcome).toBe("merged");
-  expect(row?.baseRefreshSha).toBe("prior-base");
+  expect(row?.baseRefreshOutcome).toBe("skipped_dirty");
+  expect(row?.baseRefreshSha).toBe("this-attempt-dirty-base");
 });
 
 it("keeps the prior resume's recorded refresh when an offline dirty resume's fallback base is merely BEHIND it (PR #279 review)", async () => {

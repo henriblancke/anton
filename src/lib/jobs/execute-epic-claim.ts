@@ -105,7 +105,16 @@ async function confirmPendingRefreshMutation(
     case "merged": {
       const tip = await resolveCommitSha(repo, ref);
       const parents = await commitParentShas(repo, tip);
-      return parents.includes(pendingRefresh.fromSha) && parents.includes(pendingRefresh.sha);
+      if (parents.includes(pendingRefresh.fromSha) && parents.includes(pendingRefresh.sha)) return true;
+      // As with a fast-forward, post-merge may commit immediately after the successful merge. The
+      // reflog retains the merge commit below that hook commit; verify its exact parent pair rather
+      // than treating generic reachability as evidence the pending merge landed.
+      const entries = (await git(repo, ["reflog", "show", "--format=%H", ref])).split("\n");
+      for (const sha of entries) {
+        const reflogParents = await commitParentShas(repo, sha);
+        if (reflogParents.includes(pendingRefresh.fromSha) && reflogParents.includes(pendingRefresh.sha)) return true;
+      }
+      return false;
     }
     case "rebased":
       return (
@@ -433,9 +442,7 @@ export async function warmRunWorktree(
   // written. `isRecreatedBranch` (set from within that callback) is read below only to skip the
   // now-redundant write this block used to make.
   const refreshFields =
-    !isRecreatedBranch &&
-    worktree.refreshOutcome &&
-    !(worktree.refreshOutcome.outcome === "skipped_dirty" && reconciledRefreshSha !== undefined)
+    !isRecreatedBranch && worktree.refreshOutcome
       ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }
       : undefined;
   try {
