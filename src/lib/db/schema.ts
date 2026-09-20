@@ -181,12 +181,12 @@ export const jobs = sqliteTable(
     uniqueIndex("jobs_active_sync_push_unique")
       .on(table.projectId)
       .where(sql`${table.type} = 'sync-push' and ${table.status} = 'queued'`),
-    // The runner polls this hot path continuously. Terminal rows stay in the durable audit log, so
-    // index only the queued slice that can actually become runnable rather than scanning history.
-    index("jobs_queued_due_idx").on(table.runAt).where(sql`${table.status} = 'queued'`),
-    // A running row is reclaimable only after its lease expires. Keep that similarly-small state
-    // slice separate so `leaseDue` can use SQLite's multi-index OR for its runnable predicate.
-    index("jobs_running_lease_idx").on(table.leaseExpiresAt).where(sql`${table.status} = 'running'`),
+    // The runner binds lifecycle states as parameters. A normal composite index remains usable for
+    // those parameters, unlike a partial index whose state predicate SQLite cannot prove at plan time.
+    index("jobs_status_run_at_idx").on(table.status, table.runAt),
+    // The expired-lease arm of `leaseDue` has the same bound status predicate and participates in
+    // SQLite's multi-index OR plan, so give it a separate planner-compatible composite index.
+    index("jobs_status_lease_expires_at_idx").on(table.status, table.leaseExpiresAt),
     // The Jobs UI paginates and counts a project's complete durable history newest first. Finished
     // rows dominate this table, so the project prefix avoids scanning unrelated project histories.
     index("jobs_project_updated_idx").on(table.projectId, table.updatedAt),

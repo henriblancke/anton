@@ -47,10 +47,21 @@ describe("drizzle/0046 — SQLite hot-path indexes", () => {
   it("creates indexes that SQLite selects for the runner and operational-history reads", () => {
     applyMigrationFile(sqlite, MIGRATION);
 
-    expect(plan("select id from jobs where status = 'queued' and run_at <= 100 order by run_at limit 1"))
-      .toContain("jobs_queued_due_idx");
-    expect(plan("select id from jobs where status = 'running' and lease_expires_at <= 100"))
-      .toContain("jobs_running_lease_idx");
+    expect(plan("select id from jobs where status = ? and run_at <= ? order by run_at limit 1", "queued", 100)).toContain(
+      "jobs_status_run_at_idx",
+    );
+    expect(plan("select id from jobs where status = ? and lease_expires_at <= ?", "running", 100)).toContain(
+      "jobs_status_lease_expires_at_idx",
+    );
+    const leaseDuePlan = plan(
+      "select id from jobs where (status = ? and run_at <= ?) or (status = ? and lease_expires_at <= ?) order by run_at limit 1",
+      "queued",
+      100,
+      "running",
+      100,
+    );
+    expect(leaseDuePlan).toContain("jobs_status_run_at_idx");
+    expect(leaseDuePlan).toContain("jobs_status_lease_expires_at_idx");
     expect(plan("select id from jobs where project_id = 'project' order by updated_at desc limit 1"))
       .toContain("jobs_project_updated_idx");
     expect(

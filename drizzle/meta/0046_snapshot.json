@@ -947,21 +947,21 @@
           "isUnique": true,
           "where": "\"jobs\".\"type\" = 'sync-push' and \"jobs\".\"status\" = 'queued'"
         },
-        "jobs_queued_due_idx": {
-          "name": "jobs_queued_due_idx",
+        "jobs_status_run_at_idx": {
+          "name": "jobs_status_run_at_idx",
           "columns": [
+            "status",
             "run_at"
           ],
-          "isUnique": false,
-          "where": "\"jobs\".\"status\" = 'queued'"
+          "isUnique": false
         },
-        "jobs_running_lease_idx": {
-          "name": "jobs_running_lease_idx",
+        "jobs_status_lease_expires_at_idx": {
+          "name": "jobs_status_lease_expires_at_idx",
           "columns": [
+            "status",
             "lease_expires_at"
           ],
-          "isUnique": false,
-          "where": "\"jobs\".\"status\" = 'running'"
+          "isUnique": false
         },
         "jobs_project_updated_idx": {
           "name": "jobs_project_updated_idx",
