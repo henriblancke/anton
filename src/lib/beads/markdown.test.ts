@@ -322,6 +322,30 @@ describe("scanMarkdown", () => {
         undefined,
       ]);
     });
+
+    it("recovers a multiline Setext heading nested in a blockquote", () => {
+      // Each continuation line still carries the container's own `>` marker — that marker must not
+      // read as a block starter interrupting the paragraph mdast already fused into one heading, or
+      // `Backend`/`API` render as authored criteria instead of the heading they actually are.
+      expect(headings("> Backend\n> API\n> ---\nSome real criterion")).toEqual([
+        { depth: 2, key: "backendapi" },
+        undefined,
+        undefined,
+        undefined,
+      ]);
+      expect(rendered("> Backend\n> API\n> ---\nSome real criterion")).toEqual([
+        "> Backend",
+        "> API",
+        "> ---",
+        "Some real criterion",
+      ]);
+      expect(renderedLines("> Backend\n> API\n> ---\nSome real criterion").map((l) => l.heading)).toEqual([
+        true,
+        true,
+        true,
+        false,
+      ]);
+    });
   });
 });
 
@@ -456,6 +480,17 @@ describe("unterminatedCloser", () => {
     expect(unterminatedCloser("-\t```md\n    some content")).toBe("    ```");
     expect(unterminatedCloser("-\t```md\n\tcontent")).toBe("    ```");
     expect(unterminatedCloser("1.\t```\n    code")).toBe("    ```");
+  });
+
+  it("does not let a closed fence's own content reopen it as a synthetic closer", () => {
+    // The AST already closed this backtick fence; its literal `~~~` content line is not a
+    // delimiter. Scanning it as one anyway replaced the tracked backtick opener with that tilde
+    // run, so the real backtick closer below then read as a fresh opener — reporting a spurious
+    // unterminated fence for a construct that was already closed.
+    expect(unterminatedCloser("## Acceptance\n```\nfirst\n~~~\nsecond\n```\ntrailing prose")).toBeUndefined();
+    // A genuinely unterminated fence past a closed one — whose own content also looks fenced —
+    // must still be found.
+    expect(unterminatedCloser("```\nfirst\n~~~\nsecond\n```\n- item\n  ~~~\nopen")).toBe("  ~~~");
   });
 
   it("opens no HTML block from a tag the render never shows or reads as text", () => {

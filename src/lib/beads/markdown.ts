@@ -202,6 +202,18 @@ const paragraphLine = (line: Line): boolean =>
   !HTML_DECLARATION_LINE.test(line.masked);
 
 /**
+ * An interior heading line stripped of its own container markers, so a continuation nested in the
+ * same blockquote or list item as its Setext heading (`> API` under `> Backend`) classifies as
+ * plain paragraph text rather than tripping the "starts a new block" rejection in `paragraphLine`.
+ */
+function containerRelative(line: Line): Line {
+  const stripped = stripContainerMarkers(line.text);
+  const peeled = line.text.length - stripped.length;
+  if (peeled === 0) return line;
+  return { ...line, text: stripped, masked: line.masked.slice(peeled), visible: line.visible.slice(peeled) };
+}
+
+/**
  * Preserve the contract scanner's conservative Setext projection. Micromark correctly models
  * containers, but a flat contract section reader must never let an underlined line reach across a
  * block boundary; it may still recover a visible Setext heading immediately after a list item.
@@ -320,7 +332,7 @@ export function scanMarkdown(source: string): ScannedLine[] {
       const { start, end } = lineRange(lines, node.position);
       const line = lines[start];
       const uninterrupted = Array.from({ length: Math.max(0, end - start - 1) }, (_, offset) =>
-        paragraphLine(lines[start + offset + 1]!),
+        paragraphLine(containerRelative(lines[start + offset + 1]!)),
       ).every(Boolean);
       if (line && !line.fenced && !line.commented && (end === start || uninterrupted)) {
         line.heading = { depth: node.depth!, key: slug(textOf(node).replace(/<!--.*$/, "")) };
@@ -482,7 +494,11 @@ export function unterminatedCloser(source: string): string | undefined {
         commentOffset = offset + start;
         at = start + 4;
       }
-      const candidate = !line.commented && !inHtml[lineIndex] ? openingFence(line.text) : undefined;
+      // A fence's interior content (fenced but not itself a delimiter) is already accounted for by
+      // the AST; only delimiter lines — including an unterminated opener the primary pass above
+      // couldn't reach because its container closed the construct early — feed this scan.
+      const candidate =
+        (!fenced || line.delimiter) && !line.commented && !inHtml[lineIndex] ? openingFence(line.text) : undefined;
       if (candidate) {
         if (fence && closingFence(line.text, openingFence(fence.opener)!)) fence = undefined;
         else fence = { offset, opener: line.text };
