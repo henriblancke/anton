@@ -476,6 +476,17 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  * attacker-nameable path. Under the OLD no-clobber rule an existing symlink was never written to at
  * all, so this hazard arrives WITH the replace behavior and is fixed in the same change.
  *
+ * Those checks NARROW the window; they do not close it (PR #307 review). They are lstat-then-act,
+ * so a caller who can race the filesystem — swapping a path for a symlink between the check and the
+ * `copyFileSync` — can still redirect the write. Closing it properly needs `O_NOFOLLOW`-guarded
+ * file descriptors (open the parent, `openat` with `O_NOFOLLOW|O_CREAT`, write through the fd)
+ * rather than path-based checks, which is a larger change than this one. What is here stops the
+ * symlink that is simply SITTING there, which is the realistic shape: a repo checked out with one
+ * in it, or one left behind by a previous tool. It is not a defense against an attacker who already
+ * has write access to the repo directory and can time a swap — and someone with that access has
+ * better paths available anyway (a `.beads/formulas/*.toml` of their choosing, or the repo's own
+ * hooks).
+ *
  * Returns { status, detail? } — "installed" (nothing was there) | "replaced" (a differing copy was
  * overwritten; `detail` names the backup) | "already" (byte-identical) | "missing-asset" (the
  * bundled file isn't in this install, or could not be read — a warning, never fatal: anton's own
@@ -514,7 +525,8 @@ function ensureFormula(beadsDir, filename, src) {
 
   // Refused before the comparison, not just before the write: reading through a symlink to decide
   // "already" would let a link that happens to point at an identical file pass silently, leaving a
-  // link where the installer reports a file.
+  // link where the installer reports a file. (This is a check-then-act gate, not an atomic one —
+  // see the TOCTOU paragraph in the header for what it does and does not promise.)
   //
   // The DIRECTORY is checked whether or not a file is there, because an absent `dest` is reached
   // through it too — `mkdirSync(..., {recursive: true})` is satisfied by a symlink to a directory
@@ -548,8 +560,9 @@ function ensureFormula(beadsDir, filename, src) {
         // Same refusal as the destination, and for the same reason — this is a WRITE to a path the
         // repo names. A `.bak` that is a symlink (or anything else not a regular file) is skipped:
         // the install still proceeds, since git holds the durable copy, and `detail` says the backup
-        // is absent so the operator is not told about one that was never written.
-        if (lstatOrUndefined(`${dest}.bak`) === undefined || !unsafeDestDetail(`${dest}.bak`, `${filename}.bak`)) {
+        // is absent so the operator is not told about one that was never written. `missingIsSafe`
+        // because no prior `.bak` is the common case, not a suspicious one.
+        if (!unsafeDestDetail(`${dest}.bak`, `${filename}.bak`, { missingIsSafe: true })) {
           copyFileSync(dest, `${dest}.bak`);
           backup = `${filename}.bak`;
         }
@@ -593,7 +606,8 @@ function lstatOrUndefined(path) {
  *
  * Each segment is walked and `lstat`ed itself, so no link anywhere on the path is followed. A
  * segment that does not exist yet is fine — that is the fresh-install case, and `mkdirSync` will
- * create a real directory there.
+ * create a real directory there (the `missingIsSafe` reading; see {@link unsafeDestDetail} for why
+ * the destination takes the opposite one).
  */
 function unsafeDirDetail(beadsDir) {
   // `.beads` itself is an ancestor of the write too, and a symlinked workspace directory is the
@@ -622,12 +636,23 @@ function unsafeDirDetail(beadsDir) {
  * device nodes are refused by the same rule because none of them is a formula either, and a
  * `copyFileSync` onto one fails or does something surprising rather than installing an asset.
  *
- * A path that cannot be `lstat`ed at all is refused too: the check exists to establish what is
- * there, and an answer it could not get is not permission to write.
+ * `missingIsSafe` decides what an ABSENT path means, because the two callers genuinely disagree and
+ * the disagreement is not obvious (PR #307 review):
+ *
+ *   - The destination is checked only once something is known to be there, so `lstat` returning
+ *     nothing means the file vanished between the two calls — unknown, and unknown is not
+ *     permission to write. Refused (the default).
+ *   - The `.bak` is usually absent, because most installs have never written one. There, absent is
+ *     the ordinary case and means "nothing to write over". Safe (`missingIsSafe: true`).
+ *
+ * {@link unsafeDirDetail} takes the second reading for the same reason: a `formulas/` that is not
+ * there yet is a fresh install, and `mkdirSync` will make a real directory.
  */
-function unsafeDestDetail(path, label) {
+function unsafeDestDetail(path, label, { missingIsSafe = false } = {}) {
   const stat = lstatOrUndefined(path);
-  if (stat === undefined) return `${label} could not be inspected — refusing to write over it`;
+  if (stat === undefined) {
+    return missingIsSafe ? undefined : `${label} could not be inspected — refusing to write over it`;
+  }
   if (stat.isSymbolicLink()) {
     return (
       `${label} is a SYMLINK — refusing to write through it. Installing would follow the link and ` +
