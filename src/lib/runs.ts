@@ -275,15 +275,16 @@ export async function getRunBaseForkSha(db: AntonDb, runId: string): Promise<str
 }
 
 /**
- * The verify-gate failure a previous attempt on this run recorded (anton-vynb8), or undefined when
- * there is none — a first attempt, a run whose gates last went green, or a row written before the
- * column existed. Read at dispatch so a re-attempt opens with the gate that failed last time instead
- * of starting blind.
+ * The verify-gate failure recorded on THIS row alone, or undefined when there is none — a row with
+ * no recorded failure, or one written before the column existed. A raw single-row accessor; dispatch
+ * itself reads {@link findRunGateFailureForBranch}, below, not this.
  *
- * Keyed by run id alone, unlike {@link findRunBaseForkShaForBranch}: a gate failure describes THIS
- * attempt sequence over this row, and the resume that reuses the row is exactly the reader it exists
- * for. A fresh row for the same branch is a new sequence whose tree the old failure may no longer
- * describe.
+ * Kept as the low-level read the write path round-trips against (see runs.test.ts): `gateFailurePatch`
+ * (execute-epic-settle.ts) always writes `lastGateFailure` together with `status:"failed"` in the same
+ * `updateRun` call, and `"failed"` is excluded from `ACTIVE_RUN_STATUSES` — so a row this ever fires
+ * for is never found again by `findOpenRunForEpic`, and the runner's next attempt opens a FRESH row
+ * (anton-pm3kv). Reading THIS row's own column at dispatch therefore always sees a blank slate; only
+ * a branch-scoped read reaches back across the row boundary a real gate failure always creates.
  */
 export async function getRunGateFailure(
   db: AntonDb,
@@ -293,6 +294,45 @@ export async function getRunGateFailure(
     .select({ lastGateFailure: schema.runs.lastGateFailure })
     .from(schema.runs)
     .where(eq(schema.runs.id, runId))
+    .limit(1);
+  return decodeGateFailure(rows[0]?.lastGateFailure);
+}
+
+/**
+ * The verify-gate failure the most recent attempt on this epic's BRANCH recorded, whatever became of
+ * that run — the branch-scoped counterpart {@link findRunBaseForkShaForBranch} and
+ * {@link findRunFormulaForBranch} already exist for, and the read `implementStep` (steps/agent.ts)
+ * actually uses at dispatch.
+ *
+ * A gate failure is recorded by `gateFailurePatch` in the SAME `updateRun` call that sets
+ * `status:"failed"` (execute-epic-settle.ts), and `"failed"` is excluded from `ACTIVE_RUN_STATUSES` —
+ * so the row that ever carries one is never resumed by `findOpenRunForEpic`; the runner's next attempt
+ * always opens a fresh row on the same branch (see {@link findRunBaseForkShaForBranch}'s note). A read
+ * keyed by run id alone (`getRunGateFailure`) therefore only ever finds a blank column on that fresh
+ * row — it can never reach the failure the previous attempt recorded. This is keyed by branch instead,
+ * for exactly that reason: it walks every row this epic's branch has ever settled, newest first, so
+ * the fresh row's own attempt inherits what its predecessor found.
+ */
+export async function findRunGateFailureForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<RecordedGateFailure | undefined> {
+  const rows = await db
+    .select({ lastGateFailure: schema.runs.lastGateFailure })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.lastGateFailure),
+      ),
+    )
+    // Ordered exactly as findRunBaseForkShaForBranch/findRunFormulaForBranch are, and for the same
+    // reason: `updatedAt` is second-granular, so `writeSeq` breaks a tie by which attempt settled last.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
     .limit(1);
   return decodeGateFailure(rows[0]?.lastGateFailure);
 }

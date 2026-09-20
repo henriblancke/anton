@@ -7,7 +7,7 @@ import { beads, labelValueOf, type Bead } from "../../beads/bd";
 import { loadAgentPrompt } from "../../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
 import { readPreservedCommitFor } from "../../git/ops";
-import { getRunGateFailure } from "../../runs";
+import { findRunGateFailureForBranch } from "../../runs";
 import type { StepContext } from "./context";
 import { dispatchClaude } from "./dispatch";
 import { stepTaskBlock, ticketPrompt, type TicketPreserved } from "./prompts";
@@ -22,19 +22,20 @@ import type { StepResult, StepResultWith } from "./result";
  * The bead's notes are re-read at dispatch, not taken from the run's opening snapshot: an operator's
  * steer (anton-bfy4) can land while an earlier ticket is still running. The BRANCH is read here too
  * (anton-16pq) — a resume whose earlier attempt timed out is dispatched onto that attempt's
- * preserved work, and is told so rather than left to rediscover it. And the RUN's recorded gate
- * failure (anton-vynb8 / anton-pm3kv) is read here too, for the same reason: a resume dispatched
- * onto a red gate is told so rather than left to start blind.
+ * preserved work, and is told so rather than left to rediscover it. And the branch's most recently
+ * recorded gate failure (anton-vynb8 / anton-pm3kv) is read here too, for the same reason: the next
+ * attempt after a red gate — always a FRESH run row on this same branch, since a gate failure
+ * settles its row `failed` and `findOpenRunForEpic` never resumes one — is told so rather than left
+ * to start blind.
  */
 export async function implementStep(ctx: StepContext): Promise<StepResultWith<"sessionIds">> {
   const sessionIds: string[] = [];
   let last: StepResult = { ok: true };
-  // Once per call, not once per ticket: the record is keyed by run id alone (getRunGateFailure), so
-  // asking it per ticket would just repeat the same read. Read here rather than carried on
-  // StepContext so a multi-ticket walk sees a gate cleared mid-run by an earlier ticket's own
-  // passing verify (step:verify's `lastGateFailure: null`) instead of the value the run STARTED
-  // with.
-  const gateFailure = await getRunGateFailure(ctx.db, ctx.runId);
+  // Once per call, not once per ticket: asking it per ticket would just repeat the same read. Read
+  // here rather than carried on StepContext so a multi-ticket walk sees a gate cleared mid-run by an
+  // earlier ticket's own passing verify (step:verify's `lastGateFailure: null`) instead of the value
+  // the run STARTED with.
+  const gateFailure = await findRunGateFailureForBranch(ctx.db, ctx.projectId, ctx.target.id, ctx.branch);
   for (const ticket of ctx.tickets) {
     ctx.assertLeaseHeld?.();
     const agentTag = labelValueOf(ticket.labels, "agent");

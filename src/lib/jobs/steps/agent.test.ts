@@ -4,11 +4,13 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { InvocationDimensions } from "../../claude-invocations";
 import { beads, type Bead } from "../../beads/bd";
+import { schema } from "../../db";
 import { updateRun } from "../../runs";
 import { RunAlreadyLiveError, VerifyGateFailedError } from "../errors";
 import { encodeGateFailure } from "../gate-failure-record";
@@ -38,7 +40,7 @@ vi.mock("../../claude-invocations", async () => {
 });
 
 const { claudeStep, implementStep, readForDispatch } = await import("./agent");
-const { closeSandbox, clock, fakeClaude, openSandbox, target } = await import("./step.fixture");
+const { BRANCH, closeSandbox, clock, fakeClaude, openSandbox, target } = await import("./step.fixture");
 
 let sandbox: Awaited<ReturnType<typeof openSandbox>>;
 
@@ -130,8 +132,10 @@ describe("step:implement", () => {
   });
 });
 
-// Records a red verify gate against the sandbox's run row, the same way `step:verify` does
-// (execute-epic-settle's `gateFailurePatch`), so `implementStep` has something to read back.
+// Records a red verify gate against the sandbox's run row, the same way `gateFailurePatch`
+// (execute-epic-settle.ts) does, so `implementStep`'s branch-scoped read has something to find —
+// this row is the only one on the sandbox's branch, so it stands in for whichever attempt (this run
+// or an earlier, now-`failed` one on the same branch) actually recorded it.
 async function recordGateFailure(beadId: string, overrides: Partial<{ label: string; command: string; output: string }> = {}): Promise<void> {
   const label = overrides.label ?? "tests";
   const command = overrides.command ?? "bun run test";
@@ -156,9 +160,10 @@ describe("step:implement — the recorded gate failure (anton-pm3kv)", () => {
     expect(claude.calls[0].prompt).not.toContain("A gate failed on a previous attempt");
   });
 
-  // A resume reuses the same run row a previous attempt parked on a red gate — this is the read
-  // half of anton-vynb8 that actually reaches the agent.
-  it("names the failing gate when a previous attempt on this run recorded one", async () => {
+  // A gate failure always settles its row `failed`, so the attempt that recorded one is never THIS
+  // run's own row on a real retry — the branch-scoped read is what reaches across that boundary,
+  // and this is the read half of anton-vynb8 that actually reaches the agent.
+  it("names the failing gate when a previous attempt on this branch recorded one", async () => {
     await recordGateFailure("anton-a", { label: "typecheck", command: "bun run typecheck" });
     const claude = fakeClaude("ANTON-RESULT: delivered");
 
@@ -167,6 +172,33 @@ describe("step:implement — the recorded gate failure (anton-pm3kv)", () => {
     expect(claude.calls[0].prompt).toContain("A gate failed on a previous attempt");
     expect(claude.calls[0].prompt).toContain("**typecheck** gate failed");
     expect(claude.calls[0].prompt).toContain("`bun run typecheck`");
+  });
+
+  // The real shape a retry hits: a PRIOR row on this branch settled `failed` with the gate recorded
+  // (findOpenRunForEpic never resumes it), and the current attempt is a wholly separate, fresh row —
+  // no `lastGateFailure` of its own. Proves the branch-scoped read actually reaches across that row
+  // boundary, not just within one row (anton-q0lpo finding: a runId-scoped read never could).
+  it("names the failing gate a DIFFERENT, now-failed row on this branch recorded", async () => {
+    const priorRunId = randomUUID();
+    const e = new VerifyGateFailedError(
+      "lint gate failed for anton-a (exit 1)",
+      { label: "lint", command: "bun run lint", ok: false, code: 1, output: "FAIL lint" },
+      { beadId: "anton-a" },
+    );
+    await sandbox.tdb.db.insert(schema.runs).values({
+      id: priorRunId,
+      projectId: sandbox.projectId,
+      epicBeadId: target.id,
+      branch: BRANCH,
+      status: "failed",
+      lastGateFailure: encodeGateFailure(e, { beadId: "anton-a" }),
+    });
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+
+    await implementStep(sandbox.context({ tickets: [ticket("anton-a")], deps: { runClaude: claude.run } }));
+
+    expect(claude.calls[0].prompt).toContain("A gate failed on a previous attempt");
+    expect(claude.calls[0].prompt).toContain("**lint** gate failed");
   });
 
   // The record names the bead its gate ran under; a run-phase gate names the run target, and a

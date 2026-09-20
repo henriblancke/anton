@@ -14,11 +14,15 @@ import * as schema from "./db/schema";
 import { MAX_GATE_OUTPUT_CHARS } from "./jobs/gate-output";
 import { encodeGateFailure } from "./jobs/gate-failure-record";
 import { VerifyGateFailedError } from "./jobs/errors";
+import { settleStoppedRun } from "./jobs/execute-epic-settle";
+import type { EpicRun } from "./jobs/execute-epic-run";
 import {
   ANTHROPIC_DEFAULT_ENDPOINT_HOST,
   createRun,
   endpointHostFromBaseUrl,
+  findOpenRunForEpic,
   findRunFormulaForBranch,
+  findRunGateFailureForBranch,
   findRunReviewKeyForBranch,
   getRunBaseForkSha,
   getRunGateFailure,
@@ -63,6 +67,7 @@ interface SeedRun {
   reviewKeyScore?: number;
   narrative?: string;
   delivered?: boolean;
+  lastGateFailure?: string;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -80,6 +85,7 @@ async function seed(run: SeedRun): Promise<void> {
     reviewScore: run.reviewScore,
     reviewKeyScore: run.reviewKeyScore,
     narrative: run.narrative,
+    lastGateFailure: run.lastGateFailure,
     startedAt: new Date(run.startedAt ?? run.updatedAt),
     endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
@@ -289,6 +295,120 @@ describe("findRunReviewKeyForBranch (anton-nyz1v)", () => {
       await findRunReviewKeyForBranch(t.db, PROJECT, "anton-zzz", BRANCH, "r-current"),
     ).toMatchObject({ reviewKey: "other:key:fp" });
     expect(await findRunReviewKeyForBranch(t.db, "p2", "anton-zzz", BRANCH, "r-current")).toBeUndefined();
+  });
+});
+
+/** A gate failure encoded exactly as `gateFailurePatch` (execute-epic-settle.ts) writes it. */
+function encodedGate(beadId: string, label = "tests"): string {
+  return encodeGateFailure(
+    new VerifyGateFailedError(
+      `${label} gate failed for ${beadId} (exit 1)`,
+      { label, command: "bun run test", ok: false, code: 1, output: "FAIL one" },
+      { beadId },
+    ),
+    { beadId },
+  )!;
+}
+
+describe("findRunGateFailureForBranch (anton-q0lpo / anton-pm3kv)", () => {
+  // The scenario the read exists for: `gateFailurePatch` only ever fires bundled with
+  // `status:"failed"` (execute-epic-settle.ts), so the row that recorded it is never open again —
+  // the retry's own row is a fresh one, keyed by run id alone it would find nothing.
+  it("recovers the gate a FAILED attempt recorded — the retry's row is not open", async () => {
+    await seed({ id: "r1", status: "failed", updatedAt: 1_000_000, lastGateFailure: encodedGate("anton-t1") });
+
+    expect(await findRunGateFailureForBranch(t.db, PROJECT, EPIC, BRANCH)).toEqual({
+      label: "tests",
+      command: "bun run test",
+      code: 1,
+      output: "FAIL one",
+      beadId: "anton-t1",
+    });
+  });
+
+  it("takes the MOST RECENT attempt that recorded one, skipping rows that never got that far", async () => {
+    await seed({ id: "old", status: "failed", updatedAt: 1_000_000, lastGateFailure: encodedGate("anton-t1", "lint") });
+    await seed({ id: "newer", status: "failed", updatedAt: 2_000_000, lastGateFailure: encodedGate("anton-t1", "typecheck") });
+    // Crashed before any gate ran — it recorded nothing, so the choice above still stands.
+    await seed({ id: "newest", status: "failed", updatedAt: 3_000_000 });
+
+    expect((await findRunGateFailureForBranch(t.db, PROJECT, EPIC, BRANCH))?.label).toBe("typecheck");
+  });
+
+  it("reads as absent for a branch nothing has recorded a gate failure on", async () => {
+    await seed({ id: "r1", status: "failed", updatedAt: 1_000_000 });
+
+    expect(await findRunGateFailureForBranch(t.db, PROJECT, EPIC, BRANCH)).toBeUndefined();
+  });
+
+  it("never crosses branches, epics or projects", async () => {
+    await seed({
+      id: "other-branch",
+      status: "failed",
+      updatedAt: 1_000_000,
+      branch: "anton/anton-xyz",
+      lastGateFailure: encodedGate("anton-t1"),
+    });
+    await seed({
+      id: "other-epic",
+      status: "failed",
+      updatedAt: 1_000_000,
+      epicBeadId: "anton-zzz",
+      lastGateFailure: encodedGate("anton-t1"),
+    });
+
+    expect(await findRunGateFailureForBranch(t.db, PROJECT, EPIC, BRANCH)).toBeUndefined();
+    expect(await findRunGateFailureForBranch(t.db, PROJECT, "anton-zzz", BRANCH)).toBeDefined();
+    expect(await findRunGateFailureForBranch(t.db, "p2", "anton-zzz", BRANCH)).toBeUndefined();
+  });
+
+  // The real write→retry join: the REAL settle path (settleStoppedRun) records the gate failure on
+  // the failing attempt's row, and the retry — a wholly separate row `openRunRow` creates because
+  // `findOpenRunForEpic` will not return a `failed` one — is what this read has to serve. Neither
+  // row is hand-written; both go through the same code the runner does (`updateRun`, `createRun`).
+  it("survives the row boundary a real gate failure always creates on retry", async () => {
+    const NOW = 1_700_000_000_000;
+    const clock: Clock = { now: () => NOW };
+    const failedRunId = "r-attempt1";
+    await createRun(t.db, clock, { id: failedRunId, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+
+    const fakeRun = {
+      db: t.db,
+      clock,
+      ctx: { signal: new AbortController().signal },
+      projectId: PROJECT,
+      repo: "/tmp/anton-repo-does-not-exist",
+      targetId: EPIC,
+      runId: failedRunId,
+      orphanNotice: "",
+      timedOut: [],
+      childCascade: null,
+      worktree: undefined,
+    } as unknown as EpicRun;
+    await settleStoppedRun(
+      fakeRun,
+      new VerifyGateFailedError(
+        "tests gate failed for anton-t1 (exit 1)",
+        { label: "tests", command: "bun run test", ok: false, code: 1, output: "FAIL one" },
+        { beadId: "anton-t1" },
+      ),
+    );
+
+    // The row settleStoppedRun just wrote is terminal, not resumable — the premise findings
+    // anton-q0lpo/anton-pm3kv turned on.
+    expect(await findOpenRunForEpic(t.db, PROJECT, EPIC)).toBeUndefined();
+
+    // The retry: a fresh row on the same branch, exactly as `openRunRow` creates one.
+    const retryRunId = "r-attempt2";
+    await createRun(t.db, clock, { id: retryRunId, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+
+    expect(await findRunGateFailureForBranch(t.db, PROJECT, EPIC, BRANCH)).toEqual({
+      label: "tests",
+      command: "bun run test",
+      code: 1,
+      output: "FAIL one",
+      beadId: "anton-t1",
+    });
   });
 });
 
