@@ -582,15 +582,25 @@ export async function clearBoardEvidencePending(
         .catch(() => false)
     : false;
   if (!cleared || !synced) {
-    if (cleared) {
-      // Both writes landed locally — only the confirming push is missing. Best-effort: if this
-      // write itself fails to land or sync, the window this exists to close stays open exactly as
-      // wide as it is today, never wider, so a failure here is not worth its own throw.
-      await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId)).catch(() => {});
-    }
+    // Both writes landed locally — only the confirming push is missing. This obligation marker is
+    // what a resume's `hasCleanupUnsynced` check relies on (PR #284 review, "require the cleanup
+    // obligation write to succeed"): unlike the earlier `.catch(() => {})` here, its result is not
+    // discarded — `mustPersist` never throws, so a swallowed result meant a resume whose local db
+    // ALSO refused this write would see no pending marker, no baseline, and no obligation, and
+    // silently skip the retry forever while the remote still carries stale evidence. The `detail`
+    // below says so explicitly when it happens, since a plain resume can no longer be trusted to
+    // fix it.
+    const obligationPersisted = cleared
+      ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId))
+      : true;
     const detail = cleared
-      ? "both cleanup writes landed locally, but the confirming push could not verify they reached " +
-        "the remote"
+      ? obligationPersisted
+        ? "both cleanup writes landed locally, but the confirming push could not verify they reached " +
+          "the remote"
+        : "both cleanup writes landed locally, but the confirming push could not verify they reached " +
+          "the remote, and bd also refused the local retry-obligation marker (after retries) — a " +
+          "resume will NOT automatically retry this cleanup; clear the pending marker and preserved " +
+          "baseline for this ticket directly, or retry until the obligation marker persists"
       : `bd would not clear ${[
           !markerCleared && "the pending-evidence marker",
           !baselineCleared && "the preserved baseline",

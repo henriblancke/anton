@@ -786,6 +786,22 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "warns that a resume will not auto-retry when the cleanup-sync obligation write itself also " +
+      "fails to persist (PR #284 review, \"require the cleanup obligation write to succeed\") — " +
+      "with both writes cleared locally and no obligation marker to find, a same-machine resume " +
+      "would otherwise see nothing pending and silently skip the retry forever",
+    async () => {
+      pushMock.mockResolvedValueOnce("not-wired");
+      setBoardEvidenceCleanupUnsyncedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceCleanupUnsyncedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceCleanupUnsyncedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-obligation-lost", ["a"]),
+      ).rejects.toThrow(/will NOT automatically retry/);
+    },
+  );
+
+  it(
     "does not persist a cleanup-sync retry obligation when the local writes themselves never " +
       "landed — that failure is already covered by the surviving marker/baseline",
     async () => {
