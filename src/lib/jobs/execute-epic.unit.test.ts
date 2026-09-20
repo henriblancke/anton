@@ -1910,6 +1910,46 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     expect(p).toMatchObject({ committed: false, delivered: true });
   });
 
+  describe(
+    "a `satisfied` claim never settles off the ticket's own `board-evidence-pending:*` label " +
+      "alone (PR #284 review round 12) — that label is written BEFORE its confirming push (see " +
+      "readBoardEvidence), so its mere presence proves a PRIOR attempt found writes once, never " +
+      "that they ever reached the remote; re-confirming via checkBoardEvidence is what actually " +
+      "answers that",
+    () => {
+      const pendingTicket: Bead = { ...ticket, labels: [LABELS.boardEvidencePending(["swept-1"])] };
+      const satisfiedReport = { outcome: "satisfied" as const, commit: "a1b2c3d", reason: "already landed" };
+
+      it(
+        "blocks a `satisfied` claim instead of trusting the pending label when a fresh check " +
+          "cannot confirm sync — never asking the branch about the named commit at all, since a " +
+          "commit an earlier, failed attempt left behind would satisfy that check too",
+        async () => {
+          const p = progress(satisfiedReport);
+          const check = async () => ({ found: true, ids: ["swept-1"], synced: false });
+
+          const err = await failure(
+            assertDelivered(pendingTicket, { committed: false }, p, neverAsked, check),
+          );
+
+          expect(err?.name).toBe("PoisonError");
+          expect(err?.message).toMatch(/could not be confirmed synced/);
+          expect(p).toMatchObject({ committed: false, delivered: false });
+        },
+      );
+
+      it("settles delivered on a `satisfied` claim once a fresh check confirms the pending evidence synced", async () => {
+        const p = progress(satisfiedReport);
+        const check = async () => ({ found: true, ids: ["swept-1"], synced: true });
+
+        await expect(
+          assertDelivered(pendingTicket, { committed: false }, p, neverAsked, check),
+        ).resolves.toBeUndefined();
+        expect(p).toMatchObject({ committed: false, delivered: true, boardEvidenceIds: ["swept-1"] });
+      });
+    },
+  );
+
   it(
     "records the confirmed ids on `progress.boardEvidenceIds` (anton-fc5x review round 4) — the " +
       "ticket's own success path reads this back to release the `board-evidence-pending:*` marker " +

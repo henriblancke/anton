@@ -10,7 +10,7 @@
  * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
-import { beads, type Bead } from "../beads/bd";
+import type { Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
@@ -449,7 +449,7 @@ export async function assertDelivered(
   // landed (PR #284 review round 2). Everything past this block assumes `checkBoardEvidence` is
   // absent.
   if (checkBoardEvidence) {
-    await assertBoardOnlyDelivered(ticket, committed, selfReport, progress, branchAdded, {
+    await assertBoardOnlyDelivered(ticket, committed, selfReport, progress, {
       checkBoardEvidence,
       recordBoardAttribution,
     });
@@ -521,50 +521,29 @@ export async function assertDelivered(
  * change (a stray generated file, an accidental edit) must not let it take the tree-based "commit
  * exists" path and settle delivered without the board ever being checked (PR #284 review round 2).
  *
- * Mirrors the shape of the tree-based gate on purpose, with one deliberate difference: a
- * `satisfied` claim settles first ONLY when it is backed by confirmed pending board evidence
- * (still meaningful here — e.g. this ticket's own previously recorded attribution commit from an
- * earlier dispatch); a `delivered` claim, or a `satisfied` one with nothing pending, settles on
- * confirmed board evidence via {@link evidence.checkBoardEvidence}; and everything else (an
- * honest `blocked`, a missing line, or a claim neither of those confirms) is the same
- * false-success shape a plain zero diff is, regardless of what — if anything — the tree happened
- * to pick up.
+ * Mirrors the shape of the tree-based gate on purpose, with one deliberate difference: neither a
+ * `satisfied` claim nor a `delivered` one ever settles straight off `branchAdded` or the ticket's
+ * own `board-evidence-pending:*` label — both always re-confirm via {@link
+ * evidence.checkBoardEvidence} (PR #284 review round 12, walking back round 11's shortcut). The
+ * label records IDs a PRIOR attempt found, written BEFORE that attempt's confirming push (see
+ * `readBoardEvidence`), so its presence alone proves writes were found once, never that they ever
+ * reached the remote — a `satisfied` resume naming an incidental or sibling commit on the branch
+ * (which `branchAdded` cannot tell from this ticket's own delivery) would otherwise settle
+ * delivered, close the ticket, and clear that label without ever retrying the confirming push.
+ * Everything else (an honest `blocked`, a missing line, or a claim `checkBoardEvidence` does not
+ * confirm) is the same false-success shape a plain zero diff is, regardless of what — if
+ * anything — the tree happened to pick up.
  */
 async function assertBoardOnlyDelivered(
   ticket: Bead,
   committed: boolean,
   selfReport: TicketProgress["selfReport"],
   progress: TicketProgress,
-  branchAdded: BranchAddedCommit,
   evidence: {
     checkBoardEvidence: () => Promise<BoardEvidenceResult>;
     recordBoardAttribution?: () => Promise<void>;
   },
 ): Promise<void> {
-  if (
-    selfReport?.outcome === "satisfied" &&
-    selfReport.commit &&
-    (await branchAdded(selfReport.commit))
-  ) {
-    // Settle here ONLY when confirmed pending board evidence backs the claim (PR #284 review
-    // round 11): `branchAdded` proves a commit with this sha exists on the branch, never that IT
-    // — or anything else — actually delivered this ticket's board-only work. A commit an EARLIER,
-    // failed attempt left behind (its own incidental tree change, or any other commit that
-    // happens to share the name) satisfies `branchAdded` too, so accepting the claim on that
-    // alone would close a board-only ticket whose deliverable never landed. Carrying forward
-    // pending evidence when present is still needed (PR #284 review round 10): a `satisfied`
-    // resume settles on the branch alone and never calls `checkBoardEvidence`, so without this
-    // `progress.boardEvidenceIds` stays unset and `runTicket`'s cleanup never calls
-    // `clearBoardEvidencePending` — the marker (and its preserved baseline) survive this ticket's
-    // close/transition with nothing left to release them. With nothing pending, fall through to
-    // the same evidence check a `delivered` claim needs, rather than accepting the claim on trust.
-    const pending = beads.pendingBoardEvidence(ticket);
-    if (pending.length > 0) {
-      progress.boardEvidenceIds = pending;
-      progress.delivered = true;
-      return;
-    }
-  }
   if (selfReport?.outcome === "delivered" || selfReport?.outcome === "satisfied") {
     const result = await evidence.checkBoardEvidence();
     if (result.found && result.synced && !result.markerUnpersisted) {
@@ -591,9 +570,10 @@ async function assertBoardOnlyDelivered(
   // (anton-j5i8) — never worded as a "zero diff", since this ticket's tree may well have changed.
   throw new NoDeliveryError(
     `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
-      `is bd writes to the board, not the git tree — and nothing here confirms any landed. Blocking ` +
-      `the ticket for operator review and halting the epic — nothing verified landed, so closing it ` +
-      `would be a false success.${selfReportSuffix(selfReport)}`,
+      `is bd writes to the board, not the git tree — and nothing here confirms any landed. Halting ` +
+      `the epic for operator review — nothing verified landed, so closing it would be a false ` +
+      `success. The ticket is left open (not blocked) so a resumed run can reclaim and retry it ` +
+      `without a manual status edit.${selfReportSuffix(selfReport)}`,
   );
 }
 
@@ -606,10 +586,10 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
     return (
       `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
       `is bd writes to the board, not the git tree — but the pre-dispatch board baseline could not be ` +
-      `read (after retries), so no comparison against it could be made at all. Blocking the ticket for ` +
-      `operator review until the board read is healthy, then resume the run — an unreadable baseline ` +
-      `fails closed rather than falling through to the tree-based check a board-only ticket must never ` +
-      `settle on.`
+      `read (after retries), so no comparison against it could be made at all. Halting the epic until ` +
+      `the board read is healthy, then resume the run — an unreadable baseline fails closed rather ` +
+      `than falling through to the tree-based check a board-only ticket must never settle on. The ` +
+      `ticket is left open (not blocked) so that resume can reclaim it directly.`
     );
   }
   if (evidence.baselineUnpersisted) {
@@ -617,11 +597,12 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
       `is bd writes to the board, not the git tree — the post-run board read failed (after retries), ` +
       `and the recovery baseline this attempt tried to preserve for a resume could not be written even ` +
-      `LOCALLY (after retries). Blocking the ticket for operator review — resuming on this machine is ` +
+      `LOCALLY (after retries). Halting the epic for operator review — resuming on this machine is ` +
       `NOT specially safe here: with no baseline persisted anywhere, a same-machine resume falls back ` +
       `to the same fresh board read a different machine would, one that may already have absorbed this ` +
       `ticket's own already-synced writes as pre-existing, permanently rejecting an idempotent retry as ` +
-      `unchanged. Check the beads DB and the sync channel, then resume the run.`
+      `unchanged. Check the beads DB and the sync channel, then resume the run — the ticket is left ` +
+      `open (not blocked) so that resume can reclaim it directly.`
     );
   }
   if (evidence.baselineUnconfirmed) {
@@ -629,11 +610,12 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
       `is bd writes to the board, not the git tree — the post-run board read failed (after retries), ` +
       `and the recovery baseline this attempt preserved locally could not be confirmed synced. ` +
-      `Blocking the ticket for operator review — RESUMING ON THIS SAME MACHINE is safe (the baseline ` +
+      `Halting the epic for operator review — RESUMING ON THIS SAME MACHINE is safe (the baseline ` +
       `landed locally regardless of the push), but resuming on a different one will not see this ` +
       `attempt's baseline and may silently absorb this ticket's own already-synced writes as ` +
       `pre-existing, permanently rejecting an idempotent retry as unchanged. Check the beads DB and ` +
-      `the sync channel, then resume the run on this machine.`
+      `the sync channel, then resume the run on this machine — the ticket is left open (not blocked) ` +
+      `so that resume can reclaim it directly.`
     );
   }
   if (evidence.evidenceUnavailable) {
@@ -645,8 +627,9 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
         ? ` A prior attempt already confirmed evidence on ${evidence.ids.join(", ")}, which stays ` +
           `pending on the ticket and will be picked up once the board read is healthy again.`
         : "") +
-      ` Blocking the ticket for operator review until the board read is healthy, then resume the run — ` +
-      `an unreadable post-run board fails closed rather than being asserted unchanged.`
+      ` Halting the epic until the board read is healthy, then resume the run — an unreadable ` +
+      `post-run board fails closed rather than being asserted unchanged. The ticket is left open ` +
+      `(not blocked) so that resume can reclaim it directly.`
     );
   }
   if (!evidence.found) {
@@ -654,8 +637,9 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `${ticket.id} produced no delivery: claude exited cleanly, self-reported delivered, and this ` +
       `ticket is marked \`delivery:board\` — but no bd write landed on the board since the ticket ` +
       `started (the whole board's title/description/status was compared against the pre-dispatch ` +
-      `read and nothing differs). Blocking the ticket for operator review — a board-only ticket ` +
-      `with no board evidence is the same false success a git zero diff is.`
+      `read and nothing differs). Halting the epic for operator review — a board-only ticket with ` +
+      `no board evidence is the same false success a git zero diff is. The ticket is left open (not ` +
+      `blocked) so a resumed run can reclaim and retry it without a manual status edit.`
     );
   }
   if (evidence.markerUnpersisted) {
@@ -663,16 +647,17 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
       `${ticket.id} produced no delivery: bd writes were found on ${evidence.ids.join(", ")}` +
       (evidence.synced ? " and confirmed synced" : "") +
       `, but the pending-evidence marker that records them could not be persisted to the board ` +
-      `(after retries). Blocking the ticket for operator review until the board write channel is ` +
-      `healthy, then resume the run — without that marker, a crash before this ticket's ` +
-      `attribution/close completes would strand this evidence with nothing left to recover it from.`
+      `(after retries). Halting the epic until the board write channel is healthy, then resume the ` +
+      `run — without that marker, a crash before this ticket's attribution/close completes would ` +
+      `strand this evidence with nothing left to recover it from. The ticket is left open (not ` +
+      `blocked) so that resume can reclaim it directly.`
     );
   }
   return (
     `${ticket.id} produced no delivery: bd writes were found on ${evidence.ids.join(", ")} since ` +
     `the ticket started, but they could not be confirmed synced (\`bd dolt push\` did not report ` +
-    `synced or shared-server). Blocking the ticket for operator review until the sync channel is ` +
-    `healthy, then resume the run.`
+    `synced or shared-server). Halting the epic until the sync channel is healthy, then resume the ` +
+    `run — the ticket is left open (not blocked) so that resume can reclaim it directly.`
   );
 }
 
