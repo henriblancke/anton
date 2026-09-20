@@ -47,6 +47,7 @@ import {
   pullRequestCommitUnder,
   readPathHistory,
   distanceBehindUpstream,
+  hasRemote,
   readPreservedCommitFor,
   readWorktreeState,
   SIGNAL_KILL_BACKOFF_ENV,
@@ -2731,6 +2732,15 @@ suite("resolveFreshBase (real git)", () => {
     expect(result).toEqual({ ref: "main", baseIsAuthoritative: true });
     // No remote → no fetch attempt → no warning.
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("detects a missing remote from successful enumeration, not a localized get-url diagnostic", async () => {
+    g(repo, ["remote", "remove", "origin"]);
+
+    expect(await hasRemote(repo)).toBe(false);
+    g(repo, ["remote", "add", "upstream", bare]);
+    expect(await hasRemote(repo)).toBe(false);
+    expect(await hasRemote(repo, "upstream")).toBe(true);
   });
 
   it("falls back to a NON-authoritative local <base>, without crashing, when even probing for a remote fails operationally (PR #279 review, P1)", async () => {

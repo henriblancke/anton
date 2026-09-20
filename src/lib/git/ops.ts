@@ -1594,32 +1594,18 @@ export async function branchSatisfiesTicket(
 }
 
 /**
- * Whether git's rejection of `remote get-url <name>` is its own CONFIRMED answer that no such
- * remote is configured (exit 2, "No such remote '<name>'" — stable since long before this project
- * existed) rather than an operational failure that merely prevented the probe from completing.
- */
-function isNoSuchRemoteError(error: unknown, name: string): boolean {
-  if (!exitedWith(error, 2)) return false;
-  const stderr = (error as { stderr?: unknown } | null)?.stderr;
-  return typeof stderr === "string" && stderr.includes(`No such remote '${name}'`);
-}
-
-/**
  * Whether `repoPath` has a remote named `name` — confirmed, never guessed. Only git's own
- * "No such remote" exit is folded into `false`; anything else (permission error, corrupt config,
- * a git binary that failed to run at all) is rethrown rather than swallowed into the same `false`
- * (PR #279 review, P1) — a caller that can't tell "confirmed absent" from "the probe itself broke"
- * risks treating a merely-unlucky check as proof there's no remote to be stale relative to. See
- * {@link resolveFreshBase}, the caller this distinction protects.
+ * successful, locale-independent remote enumeration is folded into `false`; anything else
+ * (permission error, corrupt config, a git binary that failed to run at all) is rethrown rather
+ * than swallowed into the same `false` (PR #279 review, P1) — a caller that can't tell "confirmed
+ * absent" from "the probe itself broke" risks treating a merely-unlucky check as proof there's no
+ * remote to be stale relative to. `git remote` emits configured names on stdout and succeeds with
+ * no output when none exist, unlike `remote get-url`, whose missing-name diagnostic is localized.
+ * See {@link resolveFreshBase}, the caller this distinction protects.
  */
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
-  try {
-    await git(repoPath, ["remote", "get-url", name]);
-    return true;
-  } catch (e) {
-    if (isNoSuchRemoteError(e, name)) return false;
-    throw e;
-  }
+  const remotes = await git(repoPath, ["remote"]);
+  return remotes.split("\n").some((remote) => remote === name);
 }
 
 /**
