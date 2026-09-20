@@ -122,7 +122,7 @@ export async function runTicket(args: {
   const boardOnly = isBoardOnlyRun(run, ticket);
   // `ticket` is passed so a resumed attempt reuses a PRIOR attempt's preserved baseline instead of
   // taking a fresh one (PR #284 review round 8) — see readBoardBaseline's own docstring.
-  const boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
+  let boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
   // Durably persisted BEFORE the agent is ever dispatched (PR #284 review, "Persist the board
   // baseline before dispatch") — a freshly-read baseline otherwise lives only in this process's
   // memory until `readBoardEvidence` first writes a pending marker, and on a shared-server board the
@@ -132,10 +132,18 @@ export async function runTicket(args: {
   // diffs as no evidence at all, permanently. Kept SEPARATE from `!boardBaseline` below (never folded
   // into it) so the operator note can say precisely which of "unreadable" or "read fine but could not
   // be anchored" happened, instead of a persist failure claiming a read never occurred.
-  const boardBaselinePersistFailed =
-    boardOnly && boardBaseline
-      ? !(await ensureBoardBaselinePersisted(run.repoPath, ticket, boardBaseline))
-      : false;
+  //
+  // `ensureBoardBaselinePersisted`'s confirming push is a pull → commit → push pass, so it can pull
+  // in remote changes made by something else with access to the same board between the read above and
+  // here — it returns a REFRESHED baseline accounting for them (chatgpt-codex-connector, PR #284
+  // review, "Refresh the baseline after the confirming pull"). Reassigned into `boardBaseline` on
+  // success so `walkTicketSteps` and the failure-path audit below both measure against the board as it
+  // stood after that one guaranteed pull, never the pre-pull read a pulled-in change would otherwise be
+  // credited against.
+  const refreshedBoardBaseline =
+    boardOnly && boardBaseline ? await ensureBoardBaselinePersisted(run.repoPath, ticket, boardBaseline) : null;
+  const boardBaselinePersistFailed = boardOnly && boardBaseline ? !refreshedBoardBaseline : false;
+  if (refreshedBoardBaseline) boardBaseline = refreshedBoardBaseline;
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
   // Set only once the ticket itself has genuinely finished (PR #284 review round 9) — kept outside

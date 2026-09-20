@@ -1302,12 +1302,19 @@ describe(
   "ensureBoardBaselinePersisted — durably anchors a fresh baseline before dispatch (PR #284 review, " +
     "\"Persist the board baseline before dispatch\")",
   () => {
-    it("persists and confirms synced when the ticket carries no preserved baseline yet", async () => {
+    it("persists and confirms synced when the ticket carries no preserved baseline yet, and returns " +
+      "the same baseline when the confirming push's pull found nothing new", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("synced");
+      // The post-push refresh read (chatgpt-codex-connector, PR #284 review, "Refresh the baseline
+      // after the confirming pull") finds the board unchanged, so no second persist/push is expected.
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const pushCallsBefore = pushMock.mock.calls.length;
 
-      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBe(true);
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toEqual(
+        baseline,
+      );
 
       expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
         "/repo",
@@ -1315,27 +1322,79 @@ describe(
         Object.fromEntries(baseline.beads),
       );
       expect(pushMock).toHaveBeenCalledWith("/repo");
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 1);
     });
 
-    it("skips re-persisting when the ticket already carries a preserved baseline, but still " +
-      "reconfirms sync (chatgpt-codex-connector, PR #284 review, \"Reconfirm a preserved baseline " +
-      "before dispatching a retry\")", async () => {
+    it("skips re-persisting the ORIGINAL baseline when the ticket already carries a preserved one, " +
+      "but still reconfirms sync (chatgpt-codex-connector, PR #284 review, \"Reconfirm a preserved " +
+      "baseline before dispatching a retry\")", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       const ticketWithBaseline = bead("t-preserved", {
         metadata: { boardEvidenceBaseline: JSON.stringify({ a: "preserved-hash" }) },
       });
       const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
       pushMock.mockResolvedValueOnce("synced");
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
 
       await expect(
         ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
-      ).resolves.toBe(true);
+      ).resolves.toEqual(baseline);
 
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore);
       expect(pushMock).toHaveBeenCalledWith("/repo");
     });
 
-    it("returns false when a preserved baseline's confirming push was never actually synced " +
+    it(
+      "refreshes and re-persists the baseline when the confirming push's pull (runDoltSync: pull -> " +
+        "commit -> push) brought in a remote change the original baseline predates (chatgpt-codex-" +
+        "connector, PR #284 review, \"Refresh the baseline after the confirming pull\") — otherwise " +
+        "the post-run diff would credit that pulled bead to this ticket's own, no-op delivery",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "before the pull" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // the confirming push, which absorbs the pull below
+        // The board, re-read AFTER that push, already reflects a bead another machine changed.
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the refreshed persist
+        pushMock.mockResolvedValueOnce("synced"); // the refreshed confirming push
+        const pushCallsBefore = pushMock.mock.calls.length;
+
+        const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
+
+        expect(refreshed).toEqual(fingerprintBoard([bead("a", { description: "after the pull" })]));
+        expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-fresh",
+          Object.fromEntries(refreshed!.beads),
+        );
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 2);
+      },
+    );
+
+    it("returns null when the refreshed baseline's own confirming push never syncs", async () => {
+      const baseline = fingerprintBoard([bead("a", { description: "before the pull" })]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired");
+
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBeNull();
+    });
+
+    it("returns null when the post-push refresh read cannot be trusted (after retries), rather " +
+      "than dispatch against a baseline that may already be stale", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable"));
+      }
+
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBeNull();
+    });
+
+    it("returns null when a preserved baseline's confirming push was never actually synced " +
       "(same bug, resumed-retry shape: the first attempt's write landed but its push failed, so " +
       "this attempt must not skip confirmation just because metadata presence looks done)", async () => {
       const baseline = fingerprintBoard([bead("a")]);
@@ -1346,26 +1405,26 @@ describe(
 
       await expect(
         ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
-      ).resolves.toBe(false);
+      ).resolves.toBeNull();
     });
 
-    it("returns false, never throws, when the persist itself exhausts every retry", async () => {
+    it("returns null, never throws, when the persist itself exhausts every retry", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
       setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
       setBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
       const pushCallsBefore = pushMock.mock.calls.length;
 
-      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBe(false);
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBeNull();
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
     });
 
-    it("returns false when the persist lands locally but the confirming push never syncs", async () => {
+    it("returns null when the persist lands locally but the confirming push never syncs", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("not-wired");
 
-      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBe(false);
+      await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toBeNull();
     });
   },
 );

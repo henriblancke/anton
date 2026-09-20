@@ -253,7 +253,7 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     vi.resetAllMocks();
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x1"], synced: true });
-    ensureBoardBaselinePersistedMock.mockResolvedValue(true);
+    ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -351,7 +351,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
   beforeEach(() => {
     vi.resetAllMocks();
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
-    ensureBoardBaselinePersistedMock.mockResolvedValue(true);
+    ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -503,7 +503,7 @@ describe(
     });
 
     it("fails closed before the agent ever dispatches, without claiming the baseline read failed", async () => {
-      ensureBoardBaselinePersistedMock.mockResolvedValue(false);
+      ensureBoardBaselinePersistedMock.mockResolvedValue(null);
 
       await expect(
         runTicket({
@@ -525,7 +525,7 @@ describe(
     });
 
     it("dispatches normally once the baseline is durably persisted", async () => {
-      ensureBoardBaselinePersistedMock.mockResolvedValue(true);
+      ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
       readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x2"], synced: true });
       finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
       // The post-dispatch cleanup re-reads the ticket before clearing its pending marker (see the

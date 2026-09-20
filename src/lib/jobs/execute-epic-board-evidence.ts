@@ -289,35 +289,59 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
  * (chatgpt-codex-connector, PR #284 review, "Reconfirm a preserved baseline before dispatching a
  * retry") — mirrors the same fix already made in {@link readBoardEvidence}'s `!hydrated` branch, for
  * the same reason: a same-machine retry that finds the write already done used to return `true`
- * without ever confirming THAT sync succeeded. `beads.push` is a pull → commit → push pass, so the
- * FIRST attempt's confirming push can pull unrelated remote changes into the local board before
- * failing on the push itself — changes `baseline` (read before that pull) does not reflect. Returning
- * `true` unconfirmed left a resumed attempt dispatch straight onto that already-polluted local board:
- * `readBoardEvidence`'s post-run diff, still measured against the stale `baseline`, would then credit
- * those pre-dispatch pulled changes as this ticket's own evidence and accept a no-op `delivered`
- * report. Retrying the push every call is safe here specifically because a caller only ever reaches
- * dispatch once this function returns `true` (`runTicket` refuses to dispatch on `false`) — so a prior
- * attempt that returned unconfirmed never let an agent run, and there is nothing this retry could lose
- * by confirming again. Never throws: a persist or confirming-push failure (after {@link mustPersist}'s
- * own retries) returns `false` so `runTicket` can refuse to dispatch on the same closed-fail path it
- * already takes for an unreadable baseline, rather than dispatch an agent whose writes this attempt
- * could not durably anchor.
+ * without ever confirming THAT sync succeeded.
+ *
+ * `beads.push` is a pull → commit → push pass (`runDoltSync`), so EVERY confirming push here — the
+ * fresh-persist path above and the reconfirm-only path alike — can pull in remote changes made by
+ * something else with access to the same board (a sibling run, a gardener pass) between
+ * `readBoardBaseline` and this call, changes `baseline` does not reflect (chatgpt-codex-connector, PR
+ * #284 review, "Refresh the baseline after the confirming pull"). Left uncorrected, `readBoardEvidence`'s
+ * post-run diff — still measured against that stale `baseline` — would credit those pre-dispatch pulled
+ * beads as this ticket's own evidence and accept a no-op agent as `delivered`. So once the confirming
+ * push lands, this re-reads the board and, if the pull actually changed anything, persists and confirms
+ * a REFRESHED baseline taken after it — the caller uses THAT for the rest of this attempt (dispatch
+ * hasn't happened yet, so a refreshed read here still describes pre-dispatch state) instead of the one
+ * read before the pull. Skipped when the refresh finds no difference from `baseline`, so a healthy pass
+ * with nothing to pull costs exactly the one push it always cost.
+ *
+ * Never throws: any failure — the initial persist, the confirming push, the post-pull re-read, or the
+ * refreshed persist/push — returns `null` so `runTicket` can refuse to dispatch on the same closed-fail
+ * path it already takes for an unreadable baseline, rather than dispatch an agent whose writes this
+ * attempt could not durably anchor. Retrying every push here is safe specifically because a caller only
+ * ever reaches dispatch once this function returns non-null (`runTicket` refuses to dispatch on `null`)
+ * — so a prior attempt that returned unconfirmed never let an agent run, and there is nothing a retry
+ * could lose by confirming again.
  */
 export async function ensureBoardBaselinePersisted(
   repo: string,
   ticket: Bead,
   baseline: BoardFingerprint,
-): Promise<boolean> {
+): Promise<BoardFingerprint | null> {
   if (!beads.boardEvidenceBaseline(ticket)) {
     const persisted = await mustPersist(() =>
       beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
     );
-    if (!persisted) return false;
+    if (!persisted) return null;
   }
-  return beads
+  const synced = await beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
+  if (!synced) return null;
+  const board = await mustReadBoard(repo);
+  const hydrated = board && (await hydrateDescriptions(repo, board));
+  if (!hydrated) return null;
+  const refreshed = fingerprintBoard(hydrated, ticket.id);
+  if (boardEvidence(baseline, refreshed).length === 0) return baseline;
+  const refreshedPersisted = await mustPersist(() =>
+    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(refreshed)),
+  );
+  if (!refreshedPersisted) return null;
+  const refreshedSynced = await beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+  return refreshedSynced ? refreshed : null;
 }
 
 /** What the post-run board read found, relative to the baseline. */
