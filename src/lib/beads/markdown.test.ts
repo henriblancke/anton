@@ -295,6 +295,17 @@ describe("scanMarkdown", () => {
       expect(headings("Acceptance\n1. item\n===")[0]).toBeUndefined();
     });
 
+    it("does not mistake ordered-marker text for a stripped container when it is not nested", () => {
+      // `2. ---` still can't interrupt the paragraph, so CommonMark fuses the whole run into one
+      // h1 Setext heading. Nothing here is actually inside a list item, so no marker should be
+      // peeled before `---` is judged — peeling it would misread it as a thematic break and drop
+      // the heading, exposing "Backend"/"2. ---" as authored Acceptance criteria.
+      expect(headings("## Acceptance\nBackend\n2. ---\n===\n- [ ] implement it")[1]).toEqual({
+        depth: 1,
+        key: "backend2",
+      });
+    });
+
     it("stops at a thematic break, which ends the paragraph before any underline reaches it", () => {
       // `***` is a rule, not paragraph text: it closes `Acceptance` and opens nothing, so the
       // `===` under it underlines no paragraph at all.

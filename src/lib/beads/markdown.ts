@@ -225,12 +225,29 @@ const headingInteriorLine = (line: Line): boolean =>
   !HTML_DECLARATION_LINE.test(line.masked);
 
 /**
- * An interior heading line stripped of its own container markers, so a continuation nested in the
- * same blockquote or list item as its Setext heading (`> API` under `> Backend`) classifies as
- * plain paragraph text rather than tripping the "starts a new block" rejection in `headingInteriorLine`.
+ * A blockquote marker repeats on every line of its content, unlike a list marker — a list item's
+ * continuation lines carry only the matching indentation, never the marker again. So peeling
+ * blockquote markers reflects a container actually still open on this line; peeling anything
+ * shaped like a list marker would not, since no genuine list continuation ever carries one.
+ */
+function stripBlockquoteMarkers(text: string): string {
+  let rest = text;
+  while (/^ {0,3}>[ \t]?/.test(rest)) rest = rest.replace(/^ {0,3}>[ \t]?/, "");
+  return rest;
+}
+
+/**
+ * An interior heading line stripped of the blockquote markers it repeats from its Setext heading
+ * (`> API` under `> Backend`), so it classifies as plain paragraph text rather than tripping the
+ * "starts a new block" rejection in `headingInteriorLine`. Must not reuse `stripContainerMarkers`'s
+ * list-marker branch: that branch peels a container's *establishing* line (e.g. a fence opener like
+ * `- ````), but an interior line was never such a line, so text that merely looks like an ordered
+ * marker (`2. ---`, where `2.` can't interrupt the open paragraph) is real heading text, not a
+ * marker to peel — peeling it exposed `---` to `headingInteriorLine` as a thematic break and
+ * silently closed the heading early.
  */
 function containerRelative(line: Line): Line {
-  const stripped = stripContainerMarkers(line.text);
+  const stripped = stripBlockquoteMarkers(line.text);
   const peeled = line.text.length - stripped.length;
   if (peeled === 0) return line;
   return { ...line, text: stripped, masked: line.masked.slice(peeled), visible: line.visible.slice(peeled) };
