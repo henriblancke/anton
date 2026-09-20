@@ -45,7 +45,7 @@ import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
-  isBoardOnlyDelivery,
+  hasBoardOnlyTicket,
   parseReviewFindings,
   type ReviewFinding,
   type ReviewProtocolViolation,
@@ -310,10 +310,16 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const rounds: ReviewRound[] = args.rounds ?? [];
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
-  // Whether EVERY ticket this run had to deliver is board-only (PR #284 review round 12/13): decided
-  // once, off the same bead pair the reviewer's own {@link diffSection} judges — never re-derived per
-  // round, since the tickets' labels don't change mid-gate.
-  const boardOnly = isBoardOnlyDelivery({ target, tickets });
+  // Whether the FIX SESSION this gate may dispatch needs board-fix handling (PR #284 review round
+  // 15): decided once, off the same bead pair the reviewer's own {@link diffSection} judges — never
+  // re-derived per round, since the tickets' labels don't change mid-gate. Deliberately the "any
+  // ticket" predicate ({@link hasBoardOnlyTicket}), not the "every ticket" one
+  // ({@link isBoardOnlyDelivery}) `diffSection` uses to decide how to render the diff: a MIXED run
+  // (some tickets git-delivered, one `delivery:board`) fails the all-tickets rule, but a fix session
+  // repairing a blocking finding against that one board-only ticket still needs the live-board
+  // instructions and board-progress handling, or it runs `bd` against the worktree's frozen copy and
+  // a correct repair that writes no git diff gets misclassified as stalled.
+  const boardOnly = hasBoardOnlyTicket({ target, tickets });
   const driver = args.deps?.runClaude ?? runClaude;
   // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
   // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
@@ -1061,10 +1067,25 @@ async function runGateFixSession(args: {
     const before = await args.readState(worktreePath);
     // The board's OWN "before", read alongside the tree's (PR #284 review round 13) — only for a
     // board-only run, whose fixer's actual deliverable is a bd write this worktree's git state can
-    // never show. Best-effort like every other board read in this codebase: `mustReadBoard`'s own
-    // retries exhausted just means this round falls back to the tree-only signal below, exactly as
-    // it did before this existed.
+    // never show.
     const boardBefore = boardOnly && repoPath ? await args.readBoardFingerprint(repoPath, target.id) : undefined;
+    // A board-only round is refused BEFORE dispatch when that baseline could not be read (PR #284
+    // review round 15), the same fail-closed rule `execute-epic-ticket.ts` already applies before a
+    // ticket's own first dispatch. Letting the fixer run anyway risks it making the very bd writes
+    // this round exists to repair with no baseline to diff against: `boardAfter` below is only read
+    // when `boardBefore` is set, so an unreadable baseline would make `boardChanged` read false no
+    // matter what the fixer wrote, misclassifying a genuine board-only repair as stalled — and a
+    // resumed attempt's fresh baseline would then silently absorb that write, so the round's own
+    // progress could never be proven either way.
+    if (boardOnly && repoPath && !boardBefore) {
+      throw new PoisonError(
+        `the review fix for ${target.id} could not read a board-only baseline before round ${round} — ` +
+          `\`mustReadBoard\` exhausted its retries. Refusing to dispatch: without that baseline this ` +
+          `round's board writes (if any) could never be told apart from no progress, so a real repair ` +
+          `would misclassify as stalled while a resumed attempt takes a fresh baseline that already ` +
+          `absorbed it. Resolve the board read, then resume.`,
+      );
+    }
     // Flips once the gates have passed AND the work is committed: past that point the round's output
     // is verified, and the rollback below must not touch it however the session ends.
     let verified = false;
@@ -1111,6 +1132,22 @@ async function runGateFixSession(args: {
       // never actually seen the fix. Only attempted when the board actually changed — nothing to
       // confirm otherwise.
       const boardSynced = boardChanged ? await args.syncBoard(repoPath!) : false;
+
+      // A detected-but-unsynced board change is a poisoned board-writing failure, never a normal
+      // no-progress return (PR #284 review round 15) — thrown as a plain error so it runs through the
+      // SAME catch below that a red gate or a failed commit does: `discardSessionWrites` still cleans
+      // up any incidental git dirt, and the board-still-changed check re-reads the fingerprint and
+      // escalates to `PoisonError` from the one place that already knows how to phrase it. Reported as
+      // `committed: false` instead, this round would read as merely "stalled" and leave the unconfirmed
+      // local mutation standing on the board for a resume — or this run's OWN best-effort final
+      // `beads.sync` in `concludeRunAttempt`, which logs a push failure rather than surfacing it — to
+      // publish later with no confirming review ever having looked at the repair.
+      if (boardChanged && !boardSynced) {
+        throw new Error(
+          `the review fix for ${target.id} wrote directly to the board but the write could not be ` +
+            `confirmed synced against the remote`,
+        );
+      }
 
       // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
       // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
@@ -1163,13 +1200,11 @@ async function runGateFixSession(args: {
           ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
           : selfCommitted
             ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
+            // Reaching here with `boardChanged` true means it is also `boardSynced` — the unsynced
+            // case is thrown above as a poisoned board-writing failure before this log line runs.
             : boardChanged
-              ? boardSynced
-                ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed and is ` +
-                  `confirmed synced, which is this run's actual deliverable (delivery:board)\n`
-                : `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed but could ` +
-                  `not be confirmed synced, so this round is NOT counted as progress until the sync ` +
-                  `channel recovers\n`
+              ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed and is ` +
+                `confirmed synced, which is this run's actual deliverable (delivery:board)\n`
               : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
       );
       if (!treeProven) {
@@ -1187,12 +1222,11 @@ async function runGateFixSession(args: {
         // `boardChanged` is this round's progress signal for a board-only run (PR #284 review round
         // 13): its fix leaves no git diff by design, so `committed`/`selfCommitted` alone would read
         // a genuine bd repair as `!committed` and the caller's stall check would park a healthy round
-        // as stalled — exactly the false negative this thread reported. Gated on `boardSynced` too
-        // (PR #284 review round 14): an unconfirmed local-only write must not count as progress
-        // either, since the next round's clean review — and a PR it opens — would then be reading
-        // evidence a resume on another machine, or this run's own best-effort final sync, may never
-        // actually see.
-        committed: committed || selfCommitted || (boardChanged && boardSynced),
+        // as stalled — exactly the false negative this thread reported. Reaching here with
+        // `boardChanged` true already guarantees `boardSynced` (PR #284 review round 15) — the
+        // unconfirmed case is thrown above as a poisoned failure rather than reaching this return, so
+        // an unconfirmed local-only write can never masquerade as this round's progress.
+        committed: committed || selfCommitted || boardChanged,
         ...(treeProven ? { verified: gates } : {}),
       };
     } catch (e) {

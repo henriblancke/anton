@@ -633,11 +633,30 @@ function truncatedContractNote(cut: boolean): string[] {
  * (review-gate.ts) can reuse the identical rule to decide whether a fix session it is about to
  * dispatch is repairing a board-only delivery too (PR #284 review round 12) — that caller has no
  * diff, principles, or reviewer contract to build a `ReviewRun` from, only the same bead pair this
- * check actually reads.
+ * check actually reads. Only fit for the ALL-tickets question this section answers (how to render a
+ * run's diff to its reviewer); a MIXED run's fix routing wants {@link hasBoardOnlyTicket} instead —
+ * see that function's docstring for why the two must not share one predicate.
  */
 export function isBoardOnlyDelivery(run: { target: Bead; tickets: Bead[] }): boolean {
   const units = run.tickets.length > 0 ? run.tickets : [run.target];
   return units.every((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
+}
+
+/**
+ * Whether ANY ticket this run had to deliver is board-only (PR #284 review round 15) — the predicate
+ * FIX ROUTING reads, as opposed to {@link isBoardOnlyDelivery}'s "every ticket" rule that governs how
+ * this run's diff is rendered to its reviewer. A mixed run — some tickets delivered as an ordinary
+ * commit, one labelled `delivery:board` — fails the all-tickets rule, but a blocking finding raised
+ * against that one board-only ticket still needs its fix session dispatched with the live-board
+ * instructions, fingerprinting, and board-progress handling: the reviewer was shown that ticket's OWN
+ * confirmed board evidence, so a fixer sent to repair it without those must not be pointed only at the
+ * worktree's frozen `bd` copy, nor have a real repair that writes no git diff misread as a stalled
+ * round. Safe by the same guarantee `isBoardOnlyDelivery` documents: a ticket that failed its OWN
+ * board-evidence check never reaches this run's tickets at all.
+ */
+export function hasBoardOnlyTicket(run: { target: Bead; tickets: Bead[] }): boolean {
+  const units = run.tickets.length > 0 ? run.tickets : [run.target];
+  return units.some((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
 }
 
 /**
@@ -1203,11 +1222,13 @@ export async function buildFindingsFixPrompt(args: {
   round: number;
   maxRounds: number;
   /**
-   * Set when EVERY ticket in this run is labelled `delivery:board` ({@link isBoardOnlyDelivery}) —
-   * this fix session's findings are then almost certainly about the board delivery itself, since the
-   * run's diff is empty by design. Carried so the fixer is told its outcome-reporting rule differs
-   * from an ordinary fix (PR #284 review round 12): an unchanged tree here is not "no progress", and
-   * the gate's own stall check reads the board, not the diff, for exactly this run.
+   * Set when this fix session may be repairing a `delivery:board` ticket ({@link hasBoardOnlyTicket},
+   * PR #284 review round 15) — true both for a run where EVERY ticket is board-only ({@link
+   * isBoardOnlyDelivery}) and for a MIXED run where only some are, since the caller cannot tell from
+   * the findings alone which ticket a given one is about. Carried so the fixer is told its
+   * outcome-reporting rule differs from an ordinary fix (PR #284 review round 12): an unchanged tree
+   * here is not necessarily "no progress", and the gate's own stall check reads the board, not just
+   * the diff, for this run.
    */
   boardOnly?: boolean;
   /** See {@link ReviewRun.repoPath} — only meaningful when {@link boardOnly} is set. */
@@ -1246,13 +1267,14 @@ export async function buildFindingsFixPrompt(args: {
     ...(boardOnly
       ? [
           ``,
-          `### This run is board-only`,
+          `### This run may deliver via the board`,
           ``,
-          `Every ticket in this run is labelled \`delivery:board\`: its deliverable is \`bd\` writes, not`,
-          `a code change, so the finding(s) above are almost certainly about the board delivery itself`,
-          `rather than this (empty) diff. Fix them there. An unchanged git tree when you finish is`,
-          `expected and is NOT evidence you made no progress — anton checks this round's outcome`,
-          `against the board, not the diff.`,
+          `At least one ticket in this run is labelled \`delivery:board\`: its deliverable is \`bd\``,
+          `writes, not a code change, so the finding(s) above may be about that board delivery itself`,
+          `rather than a code diff. If a finding is about the board-only ticket, fix it there — an`,
+          `unchanged git tree when you finish is NOT evidence you made no progress on it, since anton`,
+          `checks that ticket's outcome against the board, not the diff. Fix findings about any other`,
+          `ticket the ordinary way, with a code change.`,
           ...(repoPath
             ? [
                 ``,

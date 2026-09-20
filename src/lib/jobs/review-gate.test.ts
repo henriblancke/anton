@@ -592,8 +592,105 @@ describe("runReviewGate — bounds", () => {
   );
 
   it(
-    "does not count a board-only fix as progress until its write is confirmed synced " +
-      "(PR #284 review round 14) — a local-only Dolt write must not read as a clean round",
+    "still gives the fix session board-fix handling for a MIXED run — one ticket is `delivery:board`, " +
+      "another is not (PR #284 review round 15) — so a fix to the board-only ticket isn't sent " +
+      "against the worktree's frozen bd copy and a real bd-only repair isn't misread as a stall",
+    async () => {
+      const codeTarget: Bead = { ...target, labels: [] };
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-gate1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-gate1.2", labels: [] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: codeTarget,
+        tickets: [boardOnlyTicket, plainTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }), // no code change staged — the fix was on the board
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true,
+        },
+      });
+
+      // Board handling kicked in even though this run is NOT all-board-only: the fix session's own
+      // prompt was told about the live board, and the bd-only write counted as progress rather than
+      // a stall.
+      expect(calls[1]?.prompt).toContain("This run may deliver via the board");
+      expect(calls[1]?.prompt).toContain(`bd -C /repos/anton update`);
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
+      expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "refuses to dispatch a board-only fix when the pre-fix board baseline could not be read " +
+      "(PR #284 review round 15) — the same fail-closed rule execute-epic-ticket.ts already applies " +
+      "before a ticket's first dispatch, so a fixer never runs with nothing to diff its bd writes against",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint: async () => undefined, // mustReadBoard exhausted its retries
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not read a board-only baseline/);
+      // The review itself still ran (round 1 dispatched a review), but the fix session it triggered
+      // was refused before it ever reached claude.
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it(
+    "parks instead of stalling when a board-only fix's write cannot be confirmed synced " +
+      "(PR #284 review round 15) — a local-only Dolt write must not read as a normal no-progress " +
+      "round, since a resume or this run's own best-effort final sync could later publish it with no " +
+      "confirming review ever having looked at it",
     async () => {
       const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
       const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
@@ -604,7 +701,7 @@ describe("runReviewGate — bounds", () => {
         return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
-      const out = await runReviewGate({
+      const error = await runReviewGate({
         db: tdb.db,
         clock,
         ctx,
@@ -627,11 +724,15 @@ describe("runReviewGate — bounds", () => {
           readBoardFingerprint,
           syncBoard: async () => false, // the confirming push never lands
         },
-      });
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
 
-      expect(out.outcome).toBe("stalled");
-      expect(out.rounds[0].fixCommitted).toBe(false);
-      expect(calls).toHaveLength(2); // no confirming review dispatched on a stall
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not be confirmed synced/);
+      expect((error as Error).message).toContain(boardOnlyTicket.id);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
     },
   );
 

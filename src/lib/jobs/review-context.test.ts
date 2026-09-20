@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
+  hasBoardOnlyTicket,
   parseReviewFindings,
   reviewContext,
 } from "./review-context";
@@ -382,6 +383,19 @@ describe("reviewContext", () => {
         diff: { files: [], patch: "", truncated: false },
       });
       expect(out).toContain("report that as blocking");
+    },
+  );
+
+  it(
+    "hasBoardOnlyTicket reads a MIXED run as board-capable — unlike isBoardOnlyDelivery's " +
+      "all-tickets rule, review-gate's fix routing (PR #284 review round 15) must still give the " +
+      "board-only ticket's fix session live-board handling even though a sibling ticket isn't board-only",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-x1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-x1.2", labels: [] };
+      const codeEpic: Bead = { ...epic, labels: [] };
+      expect(hasBoardOnlyTicket({ target: codeEpic, tickets: [boardOnlyTicket, plainTicket] })).toBe(true);
+      expect(hasBoardOnlyTicket({ target: codeEpic, tickets: [plainTicket] })).toBe(false);
     },
   );
 
@@ -1113,8 +1127,8 @@ describe("buildFindingsFixPrompt", () => {
         repoPath: "/repos/anton",
       });
 
-      expect(prompt).toContain("This run is board-only");
-      expect(prompt).toContain("An unchanged git tree when you finish is");
+      expect(prompt).toContain("This run may deliver via the board");
+      expect(prompt).toContain("is NOT evidence you made no progress");
       expect(prompt).toContain("bd -C /repos/anton update <id>");
     },
   );
@@ -1129,7 +1143,7 @@ describe("buildFindingsFixPrompt", () => {
       maxRounds: 2,
     });
 
-    expect(prompt).not.toContain("This run is board-only");
+    expect(prompt).not.toContain("This run may deliver via the board");
     expect(prompt).not.toContain("bd -C");
   });
 });
