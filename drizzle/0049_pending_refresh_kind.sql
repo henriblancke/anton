@@ -1,0 +1,23 @@
+-- The SPECIFIC git operation a still-pending refresh (base_refresh_outcome = 'pending',
+-- PENDING_REFRESH_OUTCOME in runs.ts) is mutating the branch with — fast_forwarded | merged | rebased
+-- (anton-s55u, PR #279 review, P1, seventh round). Written alongside pending_refresh_from_sha by
+-- execute-epic-claim.ts's `beforeMutate` write-ahead hook, before the mutating git call runs.
+--
+-- Ancestry of base_refresh_sha from the branch's current tip alone can't confirm the mutation
+-- actually landed: that reachability is identical whether the mutation ran, OR base_refresh_sha was
+-- already an ancestor of the branch before anything touched it (e.g. an authoritative rewind) and
+-- something UNRELATED — a `pre-rebase` hook committing as a side effect before rejecting the rebase —
+-- moved the branch off pending_refresh_from_sha instead. Confirming the mutation actually happened
+-- needs evidence specific to WHICH one was attempted: a fast-forward lands on EXACTLY
+-- base_refresh_sha; a merge's tip is a commit whose parents are exactly pending_refresh_from_sha and
+-- base_refresh_sha; a rebase always replays onto brand-new commit objects, so a genuinely landed one
+-- leaves pending_refresh_from_sha unreachable from the new tip — which the hook side-effect shape
+-- above does not. See execute-epic-claim.ts's reconciliation.
+--
+-- Nullable and NOT backfilled: only meaningful while base_refresh_outcome = 'pending'. A row written
+-- before this column existed reads it as null, and reconciliation fails closed on that (the same
+-- discipline already applied to a pending row with no recorded pending_refresh_from_sha).
+--
+-- Reverse:
+--   ALTER TABLE `runs` DROP COLUMN `pending_refresh_kind`;
+ALTER TABLE `runs` ADD `pending_refresh_kind` text;

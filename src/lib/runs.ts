@@ -207,6 +207,8 @@ export type RunPatch = Partial<{
   baseRefreshSha: string | null;
   /** The branch's tip just before a still-pending refresh above was attempted (anton-s55u) — see schema. */
   pendingRefreshFromSha: string | null;
+  /** The specific git operation a still-pending refresh above is mutating with (anton-s55u) — see schema. */
+  pendingRefreshKind: string | null;
   /** This row's own last effective refresh boundary, snapshotted before it goes pending (anton-s55u) — see schema. */
   priorBaseRefreshSha: string | null;
   attempts: number;
@@ -404,6 +406,15 @@ export interface PendingRefresh {
    * rather than reconcile it against nothing.
    */
   fromSha: string | undefined;
+  /**
+   * The specific git operation (`fast_forwarded` | `merged` | `rebased`) the dead attempt was
+   * mutating the branch with — see the column's own note on schema.ts for why reachability of `sha`
+   * alone, even reconciled against `fromSha`, still isn't proof: it needs THIS to know what shape of
+   * evidence would actually confirm it. Undefined for a pending row written before this field
+   * existed, or one whose `beforeMutate` call predates it; the caller must then refuse to trust the
+   * pending sha rather than guess which confirmation shape applies.
+   */
+  kind: string | undefined;
 }
 
 /**
@@ -443,6 +454,7 @@ export async function findPendingRefreshShaForBranch(
       baseRefreshOutcome: schema.runs.baseRefreshOutcome,
       baseRefreshSha: schema.runs.baseRefreshSha,
       pendingRefreshFromSha: schema.runs.pendingRefreshFromSha,
+      pendingRefreshKind: schema.runs.pendingRefreshKind,
     })
     .from(schema.runs)
     .where(
@@ -459,7 +471,11 @@ export async function findPendingRefreshShaForBranch(
     if (row.baseRefreshOutcome === "skipped_dirty") return undefined;
     if (row.baseRefreshOutcome !== PENDING_REFRESH_OUTCOME) return undefined;
     return row.baseRefreshSha
-      ? { sha: row.baseRefreshSha, fromSha: row.pendingRefreshFromSha ?? undefined }
+      ? {
+          sha: row.baseRefreshSha,
+          fromSha: row.pendingRefreshFromSha ?? undefined,
+          kind: row.pendingRefreshKind ?? undefined,
+        }
       : undefined;
   }
   return undefined;

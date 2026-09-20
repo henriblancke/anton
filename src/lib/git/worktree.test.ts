@@ -380,7 +380,7 @@ suite("worktree manager (real git)", () => {
       });
 
       expect(beforeMutate).toHaveBeenCalledTimes(1);
-      expect(beforeMutate).toHaveBeenCalledWith(freshMain, preRebaseHead);
+      expect(beforeMutate).toHaveBeenCalledWith(freshMain, preRebaseHead, "rebased");
       expect(seenAtCallTime).toEqual([{ headOfBranch: preRebaseHead, baseArg: freshMain, branchArg: preRebaseHead }]);
       expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: freshMain });
     });
@@ -407,7 +407,7 @@ suite("worktree manager (real git)", () => {
       });
 
       expect(beforeMutate).toHaveBeenCalledTimes(1);
-      expect(beforeMutate).toHaveBeenCalledWith(freshMain, preFfHead);
+      expect(beforeMutate).toHaveBeenCalledWith(freshMain, preFfHead, "fast_forwarded");
       expect(second.refreshOutcome).toEqual({ outcome: "fast_forwarded", baseSha: freshMain });
     });
 

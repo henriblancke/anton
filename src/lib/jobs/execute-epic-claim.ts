@@ -12,15 +12,17 @@ import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { latestBlockNoteCommit } from "../beads/block-note";
 import { parseTicketNotes } from "../beads/notes";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
-import { hasRemote, isAncestor, resolveForkPoint, resolveFreshBase } from "../git/ops";
+import { commitParentShas, hasRemote, isAncestor, resolveCommitSha, resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
   createWorktree,
   releaseWorktreeClaim,
   removeWorktree,
   warmWorktreeBestEffort,
+  type MutatingRefreshOutcome,
   type Worktree,
 } from "../git/worktree";
+import type { PendingRefresh } from "../runs";
 import { resolveOperator } from "../operator";
 import {
   BRANCH_RECREATED_REFRESH_TOMBSTONE,
@@ -43,6 +45,55 @@ import type { StepContext } from "./step-registry";
  */
 export function claimOwnerFor(runId: string): string {
   return `execute-epic#${runId}`;
+}
+
+/**
+ * Whether a dead attempt's pending mutation (see PENDING_REFRESH_OUTCOME) actually landed on
+ * `branch`, verified with evidence specific to WHICH git operation it was (PR #279 review, P1,
+ * seventh round) — not by "the target base is reachable and the branch moved off its pre-mutation
+ * tip," which any unrelated commit landing on that tip satisfies just as well. A `pre-rebase` hook
+ * that commits as a side effect before rejecting the rebase is exactly that: the branch moves off
+ * `pendingRefresh.fromSha`, and `pendingRefresh.sha` — the rebase's unapplied TARGET — can already be
+ * an ancestor of the branch regardless (an authoritative rewind is already reachable from the
+ * branch's own pre-rewind history), so the old, kind-blind check would promote a rebase that never
+ * ran, and a later `--onto` refresh derived from it replays commits the rewind meant to drop.
+ *
+ * Each operation leaves a different, checkable trace:
+ * - `fast_forwarded` moves the branch to EXACTLY `pendingRefresh.sha` — nothing else produces that.
+ * - `merged` leaves a tip whose parents are exactly the pre-mutation tip and the merged-in base.
+ * - `rebased` always replays onto brand-new commit objects: a landed rebase makes the pre-mutation
+ *   tip UNREACHABLE from the new one, which the hook side-effect shape above does not (the hook's
+ *   commit sits directly on top of the untouched pre-mutation tip).
+ *
+ * Undefined `kind` (a pending row written before this field existed, or one whose `beforeMutate` call
+ * predates it) fails closed, same as an undefined `fromSha` already does: there is no confirmation
+ * shape to check, so the pending sha is never trusted.
+ */
+async function confirmPendingRefreshMutation(
+  repo: string,
+  branch: string,
+  pendingRefresh: Pick<PendingRefresh, "sha" | "kind"> & { fromSha: string },
+): Promise<boolean> {
+  const ref = `refs/heads/${branch}`;
+  const kind = pendingRefresh.kind as MutatingRefreshOutcome | undefined;
+  switch (kind) {
+    case "fast_forwarded": {
+      const tip = await resolveCommitSha(repo, ref);
+      return tip === pendingRefresh.sha;
+    }
+    case "merged": {
+      const tip = await resolveCommitSha(repo, ref);
+      const parents = await commitParentShas(repo, tip);
+      return parents.includes(pendingRefresh.fromSha) && parents.includes(pendingRefresh.sha);
+    }
+    case "rebased":
+      return (
+        (await isAncestor(repo, pendingRefresh.sha, ref)) &&
+        !(await isAncestor(repo, pendingRefresh.fromSha, ref))
+      );
+    default:
+      return false;
+  }
 }
 
 /** Step 2. Warm (or reuse) the run's checkout and build the context every step is narrowed from. */
@@ -163,41 +214,32 @@ export async function warmRunWorktree(
   // derive `--onto`'s boundary from `A` regardless, and `git rebase --onto <newbase> A` replays `B` —
   // history the rewind dropped — back onto the branch as if it were the branch's own work.
   //
-  // The tie is broken by asking whether the branch's CURRENT tip is still its recorded pre-mutation
-  // tip at all (PR #279 review, P2 re-review), not by re-testing `pendingRefresh.sha`'s reachability
-  // from that stale pre-mutation snapshot: a merge/rebase/fast-forward that actually lands always
-  // moves the branch off `pendingRefresh.fromSha` — a rebase replays onto entirely new commits, a
-  // fast-forward moves the ref straight to `pendingRefresh.sha`, and even a merge (whose tip still has
-  // `fromSha` as one parent) is never EQUAL to it — so mutual ancestry between `fromSha` and the
-  // branch's current tip (i.e. the two being the same commit) holds if and only if the mutation never
-  // ran. That still correctly rejects the rewound-but-never-mutated case the ancestry-alone check
-  // exists to catch (the branch is unchanged, so it stays equal to `fromSha`), while also recovering
-  // the case that check wrongly treated as unconfirmed: an authoritative rewind whose merge/rebase
-  // genuinely landed. A row written before `fromSha` existed has nothing to reconcile against and
-  // fails closed: its pending sha is never trusted.
+  // The tie is broken with evidence specific to WHICH git operation the pending mutation was
+  // attempting (PR #279 review, P1, seventh round) — not by asking merely whether the branch moved
+  // off its recorded pre-mutation tip. Any commit landing on `pendingRefresh.fromSha` satisfies "the
+  // branch moved" (a `pre-rebase` hook can commit as a side effect before rejecting the rebase
+  // itself), and in the authoritative-rewind shape above `pendingRefresh.sha` is already reachable
+  // from that same `fromSha` regardless of whether anything ever actually rebased onto it — so
+  // neither signal alone, nor their conjunction, tells a landed mutation apart from an unrelated one
+  // that happened to move the branch off the same tip. `confirmPendingRefreshMutation` checks each
+  // operation's own specific trace instead — see its own doc comment. A row written before `fromSha`
+  // or `kind` existed has nothing to check against and fails closed: its pending sha is never
+  // trusted. Every probe it makes is `isAncestor`, which only resolves `false` for git's own exit-1
+  // "no" and rethrows anything else (PR #279 review, P1 fix) — an operational failure here fails the
+  // resume loudly rather than silently discarding a real boundary or trusting a stale one.
   const pendingRefresh = await findPendingRefreshShaForBranch(db, projectId, run.targetId, branch);
   let reconciledRefreshSha = priorEffectiveRefreshSha;
   if (
     pendingRefresh !== undefined &&
     pendingRefresh.fromSha !== undefined &&
-    pendingRefresh.sha !== priorEffectiveRefreshSha
+    pendingRefresh.sha !== priorEffectiveRefreshSha &&
+    (await confirmPendingRefreshMutation(repo, branch, {
+      sha: pendingRefresh.sha,
+      fromSha: pendingRefresh.fromSha,
+      kind: pendingRefresh.kind,
+    }))
   ) {
-    const branchStillAtPreMutationTip =
-      (await isAncestor(repo, pendingRefresh.fromSha, `refs/heads/${branch}`).catch(() => true)) &&
-      (await isAncestor(repo, `refs/heads/${branch}`, pendingRefresh.fromSha).catch(() => true));
-    // NOT defaulted on failure like the pair above (PR #279 review, P1 fix): those two fail closed
-    // into "unconfirmed" on an operational error, which only forgoes promoting a newer boundary —
-    // `reconciledRefreshSha` still falls back to `priorEffectiveRefreshSha`, an already-durable one.
-    // Defaulting THIS probe to `false` on the same kind of error would instead mean "not confirmed"
-    // for a mutation that may well have landed, silently discarding the real `B` boundary in favor of
-    // that same stale fallback — and if the base is later rewound past it (`A-B` back to `A`, then
-    // forward to `A-C`), a subsequent `--onto` rebase derived from the stale boundary replays `B`,
-    // history the rewind dropped, back onto the branch. `isAncestor` itself only resolves `false` for
-    // git's own exit-1 "no" and rethrows every other failure, so letting that propagate here — instead
-    // of swallowing it — fails the resume loudly rather than silently trusting a stale boundary.
-    const mutationConfirmed =
-      !branchStillAtPreMutationTip && (await isAncestor(repo, pendingRefresh.sha, `refs/heads/${branch}`));
-    if (mutationConfirmed) reconciledRefreshSha = pendingRefresh.sha;
+    reconciledRefreshSha = pendingRefresh.sha;
   }
   const worktree = await createWorktree({
     repoPath: repo,
@@ -237,11 +279,16 @@ export async function warmRunWorktree(
     // true last-confirmed boundary — snapshotting the older `priorEffectiveRefreshSha` instead would
     // lose it the moment this new pending write lands, and a later crash recovery would fall back to
     // the stale pre-reconciliation boundary, replaying history the confirmed refresh already dropped.
-    beforeMutate: (baseSha, branchSha) =>
+    // `kind` (PR #279 review, P1, seventh round): recorded alongside the boundary and pre-mutation
+    // tip above so a resume's reconciliation knows WHICH operation this pending write describes — see
+    // `confirmPendingRefreshMutation`'s own doc comment for why that's required evidence, not just the
+    // boundary and tip.
+    beforeMutate: (baseSha, branchSha, kind) =>
       updateRun(db, clock, runId, {
         baseRefreshOutcome: PENDING_REFRESH_OUTCOME,
         baseRefreshSha: baseSha,
         pendingRefreshFromSha: branchSha,
+        pendingRefreshKind: kind,
         priorBaseRefreshSha: reconciledRefreshSha ?? null,
       }),
   });

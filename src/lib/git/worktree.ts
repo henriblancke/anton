@@ -66,6 +66,16 @@ export interface RefreshOutcome {
 }
 
 /**
+ * The three outcomes of {@link RefreshOutcome} that actually mutate `branch` — the only ones
+ * `beforeMutate` ever fires for. Passed to it so a caller recording a write-ahead marker (anton-s55u,
+ * PR #279 review) can later tell WHICH git operation it must reconcile against: a landed fast-forward,
+ * merge, and rebase each leave a different, specific trace on the branch, and ancestry of the target
+ * base alone can't tell any of them apart from an unrelated commit that moved the branch off its
+ * pre-mutation tip for some other reason (see execute-epic-claim.ts's reconciliation).
+ */
+export type MutatingRefreshOutcome = "fast_forwarded" | "merged" | "rebased";
+
+/**
  * Run a git command in `repoPath`, returning trimmed stdout. `hooksPath`, when given, is passed as
  * `-c core.hooksPath=<value>` — see {@link refreshOntoBase}'s use of it for why a reset/rebase onto
  * a fresh base needs the same override review-fix's premerge already resolves for its own merges.
@@ -740,7 +750,7 @@ async function refreshOntoBase(opts: {
    * pre-mutation tip lets that reconciliation ask the question reachability alone can't answer: did
    * the branch actually move past where it already was.
    */
-  beforeMutate?: (baseSha: string, branchSha: string) => Promise<void>;
+  beforeMutate?: (baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>;
 }): Promise<RefreshOutcome> {
   const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha, baseIsAuthoritative, beforeMutate } =
     opts;
@@ -909,7 +919,7 @@ async function refreshOntoBase(opts: {
     // The caller's own write-ahead record, same as the merge/rebase paths below (PR #279 review,
     // P1) — a fast-forward moves the branch just as durably as either of them, and a process killed
     // right after this call returns leaves the caller's row exactly as unrecorded without it.
-    await beforeMutate?.(baseSha, branchSha);
+    await beforeMutate?.(baseSha, branchSha, "fast_forwarded");
     await git(worktreePath, ["merge", "--ff-only", baseSha], hooksPath);
     console.log(
       `[worktree] fast-forwarded ${branch} to ${baseBranch} (${baseSha.slice(0, 12)}) — no unique commits`,
@@ -1133,7 +1143,7 @@ async function refreshOntoBase(opts: {
     await writeRefreshMarkerOrThrow(markerPath, `merging ${baseBranch} into ${branch}`);
     // The caller's own write-ahead record, if any — awaited so it lands before the mutation it
     // describes (see `beforeMutate`'s own doc comment).
-    await beforeMutate?.(baseSha, branchSha);
+    await beforeMutate?.(baseSha, branchSha, "merged");
     try {
       await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
     } catch (err) {
@@ -1203,7 +1213,7 @@ async function refreshOntoBase(opts: {
   // own doc comment.
   await writeRefreshMarkerOrThrow(markerPath, `rebasing ${branch} onto ${baseBranch}`);
   // Same write-ahead record as the merge path above.
-  await beforeMutate?.(baseSha, branchSha);
+  await beforeMutate?.(baseSha, branchSha, "rebased");
   try {
     await git(worktreePath, rebaseArgs, hooksPath);
   } catch (err) {
@@ -1410,7 +1420,7 @@ async function reuseIfPresent(
   preserveShas: string[] | undefined,
   forkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
-  beforeMutate: ((baseSha: string, branchSha: string) => Promise<void>) | undefined,
+  beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
 ): Promise<Worktree | undefined> {
   if (!existing || !existsSync(existing.path)) return undefined;
   if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
@@ -1438,7 +1448,7 @@ async function materializeFreshWorktree(
   preserveShas: string[] | undefined,
   knownForkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
-  beforeMutate: ((baseSha: string, branchSha: string) => Promise<void>) | undefined,
+  beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
 ): Promise<Worktree> {
   const path = worktreePathFor(repoPath, branch);
   await mkdir(dirname(path), { recursive: true });
@@ -1482,7 +1492,7 @@ async function materializeClaimedWorktree(
   preserveShas: string[] | undefined,
   forkSha: string | undefined,
   baseIsAuthoritative: boolean | undefined,
-  beforeMutate: ((baseSha: string, branchSha: string) => Promise<void>) | undefined,
+  beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
 ): Promise<Worktree> {
   const { claimed, existing, baseBranch } = await resolveClaimForCreate(repoPath, branch, baseBranchOpt, claimedBy);
   const reused = await reuseIfPresent(
@@ -1545,7 +1555,7 @@ export async function createWorktree(opts: {
    */
   baseIsAuthoritative?: boolean;
   /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
-  beforeMutate?: (baseSha: string, branchSha: string) => Promise<void>;
+  beforeMutate?: (baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 

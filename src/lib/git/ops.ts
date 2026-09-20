@@ -1286,6 +1286,28 @@ export async function isAncestor(
 }
 
 /**
+ * The full commit sha `rev` names right now — used where exact tip identity is the evidence, not
+ * mere reachability. A landed fast-forward moves a branch to EXACTLY its target; a merge or rebase
+ * builds a NEW commit on top of one, so ancestry alone can't tell a fast-forward that landed from
+ * one that didn't (see execute-epic-claim.ts's pending-refresh reconciliation).
+ */
+export async function resolveCommitSha(worktreePath: string, rev: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--verify", `${rev}^{commit}`]);
+}
+
+/**
+ * `commit`'s parent shas, in the order git recorded them (empty for a root commit) — used to confirm
+ * a landed merge: its tip must be a commit whose parents are exactly the branch's pre-merge tip and
+ * the base it merged in, not merely a commit descended from both (see execute-epic-claim.ts's
+ * pending-refresh reconciliation).
+ */
+export async function commitParentShas(worktreePath: string, commit: string): Promise<string[]> {
+  const line = await git(worktreePath, ["rev-list", "--parents", "-n", "1", commit]);
+  const [, ...parents] = line.split(/\s+/).filter(Boolean);
+  return parents;
+}
+
+/**
  * Whether `ref` names an actual commit in this repo — missing and ambiguous both read as "no" via
  * `--verify --quiet`, which git documents as discarding ambiguous short SHA-1s silently rather than
  * erroring, so both collapse to the same clean exit 1 {@link isAncestor} reads as absent.

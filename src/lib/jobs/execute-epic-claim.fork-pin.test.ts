@@ -38,6 +38,8 @@ const resolveFreshBaseMock = vi.fn();
 const resolveForkPointMock = vi.fn();
 const isAncestorMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 const hasRemoteMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
+const resolveCommitShaMock = vi.fn<(...a: unknown[]) => Promise<string>>();
+const commitParentShasMock = vi.fn<(...a: unknown[]) => Promise<string[]>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
@@ -46,6 +48,8 @@ vi.mock("../git/ops", async () => {
     resolveForkPoint: (...a: unknown[]) => resolveForkPointMock(...a),
     isAncestor: (...a: unknown[]) => isAncestorMock(...a),
     hasRemote: (...a: unknown[]) => hasRemoteMock(...a),
+    resolveCommitSha: (...a: unknown[]) => resolveCommitShaMock(...a),
+    commitParentShas: (...a: unknown[]) => commitParentShasMock(...a),
   };
 });
 
@@ -117,6 +121,8 @@ beforeEach(async () => {
   // that means to exercise a rewritten-behind fallback overrides this itself.
   isAncestorMock.mockReset().mockResolvedValue(true);
   hasRemoteMock.mockReset().mockResolvedValue(true);
+  resolveCommitShaMock.mockReset();
+  commitParentShasMock.mockReset();
 });
 afterEach(() => t.close());
 
@@ -629,10 +635,14 @@ it("passes the last EFFECTIVE refresh's base as the --onto boundary, in preferen
 // gap by persisting a "pending" marker naming the boundary the mutation is ABOUT to apply, before
 // the mutating git call ever runs — see PENDING_REFRESH_OUTCOME's own doc comment.
 it("persists a pending refresh boundary via beforeMutate before the mutating git call resolves, recoverable if the process dies before finalize", async () => {
-  let rowDuringMutation: { baseRefreshOutcome: string | null; pendingRefreshFromSha: string | null } | undefined;
+  let rowDuringMutation:
+    | { baseRefreshOutcome: string | null; pendingRefreshFromSha: string | null; pendingRefreshKind: string | null }
+    | undefined;
   createWorktreeMock.mockImplementation(
-    async (opts: { beforeMutate?: (baseSha: string, branchSha: string) => Promise<void> }) => {
-      await opts.beforeMutate?.("about-to-refresh-onto-this", "branch-tip-before-mutation");
+    async (opts: {
+      beforeMutate?: (baseSha: string, branchSha: string, kind: "fast_forwarded" | "merged" | "rebased") => Promise<void>;
+    }) => {
+      await opts.beforeMutate?.("about-to-refresh-onto-this", "branch-tip-before-mutation", "rebased");
       rowDuringMutation = await actualRuns.getRunById(t.db, RUN_ID);
       return {
         path: WORKTREE,
@@ -652,6 +662,7 @@ it("persists a pending refresh boundary via beforeMutate before the mutating git
   // reconcile, instead of nothing at all (see the reconciliation tests below).
   expect(rowDuringMutation?.baseRefreshOutcome).toBe(actualRuns.PENDING_REFRESH_OUTCOME);
   expect(rowDuringMutation?.pendingRefreshFromSha).toBe("branch-tip-before-mutation");
+  expect(rowDuringMutation?.pendingRefreshKind).toBe("rebased");
   // The normal finalize write still overwrites it with the real outcome once createWorktree returns.
   const row = await actualRuns.getRunById(t.db, RUN_ID);
   expect(row?.baseRefreshOutcome).toBe("rebased");
@@ -672,8 +683,10 @@ it("snapshots this row's own prior confirmed boundary onto priorBaseRefreshSha b
   });
   let rowDuringMutation: { baseRefreshOutcome: string | null; priorBaseRefreshSha: string | null } | undefined;
   createWorktreeMock.mockImplementation(
-    async (opts: { beforeMutate?: (baseSha: string, branchSha: string) => Promise<void> }) => {
-      await opts.beforeMutate?.("second-refresh-target", "branch-tip-before-second-mutation");
+    async (opts: {
+      beforeMutate?: (baseSha: string, branchSha: string, kind: "fast_forwarded" | "merged" | "rebased") => Promise<void>;
+    }) => {
+      await opts.beforeMutate?.("second-refresh-target", "branch-tip-before-second-mutation", "rebased");
       rowDuringMutation = await actualRuns.getRunById(t.db, RUN_ID);
       return {
         path: WORKTREE,
@@ -703,6 +716,7 @@ it("snapshots the reconciled boundary, not the pre-reconciliation one, when this
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
     baseRefreshSha: "landed-base-b",
     pendingRefreshFromSha: "branch-tip-before-first-mutation",
+    pendingRefreshKind: "rebased",
     // This row's own earlier confirmed boundary, from before the crashed attempt's pending write
     // overwrote it — what `priorEffectiveRefreshSha` resolves to BEFORE reconciliation runs.
     priorBaseRefreshSha: "very-old-base-a",
@@ -712,8 +726,10 @@ it("snapshots the reconciled boundary, not the pre-reconciliation one, when this
     | { baseRefreshOutcome: string | null; priorBaseRefreshSha: string | null }
     | undefined;
   createWorktreeMock.mockImplementation(
-    async (opts: { beforeMutate?: (baseSha: string, branchSha: string) => Promise<void> }) => {
-      await opts.beforeMutate?.("new-mutation-target-c", "branch-tip-before-second-mutation");
+    async (opts: {
+      beforeMutate?: (baseSha: string, branchSha: string, kind: "fast_forwarded" | "merged" | "rebased") => Promise<void>;
+    }) => {
+      await opts.beforeMutate?.("new-mutation-target-c", "branch-tip-before-second-mutation", "rebased");
       rowDuringSecondMutation = await actualRuns.getRunById(t.db, RUN_ID);
       return {
         path: WORKTREE,
@@ -754,8 +770,10 @@ it("propagates a failure to persist the pending refresh boundary, instead of let
   });
   let mutationAttempted = false;
   createWorktreeMock.mockImplementation(
-    async (opts: { beforeMutate?: (baseSha: string, branchSha: string) => Promise<void> }) => {
-      await opts.beforeMutate?.("about-to-refresh-onto-this", "branch-tip-before-mutation");
+    async (opts: {
+      beforeMutate?: (baseSha: string, branchSha: string, kind: "fast_forwarded" | "merged" | "rebased") => Promise<void>;
+    }) => {
+      await opts.beforeMutate?.("about-to-refresh-onto-this", "branch-tip-before-mutation", "rebased");
       // Unreachable if beforeMutate's rejection is propagated rather than swallowed.
       mutationAttempted = true;
       return {
@@ -783,6 +801,7 @@ it("reconciles a pending refresh onto the boundary a crashed attempt actually ap
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
     baseRefreshSha: "pending-base",
     pendingRefreshFromSha: "branch-tip-before-mutation",
+    pendingRefreshKind: "rebased",
     branch: BRANCH,
     status: "failed",
   });
@@ -808,6 +827,207 @@ it("reconciles a pending refresh onto the boundary a crashed attempt actually ap
   );
 });
 
+// anton-s55u (PR #279 review, P1, seventh round): the false positive THIS closes — the old,
+// kind-blind check trusted `pending-base` here because SOME commit moved the branch off its
+// recorded pre-mutation tip and the rewind target was already reachable, without checking that the
+// movement was actually the rebase it claimed. A `pre-rebase` hook that commits a side effect (e.g.
+// writing generated state) before rejecting the rebase produces exactly that shape: the branch moves
+// off `fromSha`, but onto a commit built directly ON TOP of it — so `fromSha` stays reachable from
+// the new tip, unlike a genuine `--onto` rebase, which always replays onto brand-new commit objects
+// and leaves the old tip unreachable.
+it("does not trust a pending rebase when the branch moved for an unrelated reason (e.g. a pre-rebase hook side effect), even though the target is reachable", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "rewound-base",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    pendingRefreshKind: "rebased",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  // `rewound-base` is reachable from the branch's new tip (it always was, that's the rewind's
+  // premise) — but so is `branch-tip-before-mutation`, since the hook's stray commit was built
+  // directly on top of it rather than through an actual rebase replay.
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (descendant !== `refs/heads/${BRANCH}`) return false;
+    return ancestor === "rewound-base" || ancestor === "branch-tip-before-mutation";
+  });
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
+// anton-s55u (PR #279 review, P1, seventh round): a landed fast-forward's own specific trace — the
+// branch tip is EXACTLY the target base, not merely a descendant of it — is what confirms it, not
+// ancestry (which a fast-forward's own precondition, `fromSha` already behind `sha`, makes trivially
+// true even before anything runs).
+it("confirms a pending fast-forward only when the branch tip is EXACTLY the target base", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "ff-target",
+    pendingRefreshFromSha: "branch-tip-before-ff",
+    pendingRefreshKind: "fast_forwarded",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  resolveCommitShaMock.mockResolvedValue("ff-target");
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "ff-target" }),
+  );
+});
+
+it("does not trust a pending fast-forward when the branch tip is merely a descendant of the target, not exactly it", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "ff-target",
+    pendingRefreshFromSha: "branch-tip-before-ff",
+    pendingRefreshKind: "fast_forwarded",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  // Some OTHER commit landed on the branch after `ff-target` — the tip descends from it but isn't it.
+  resolveCommitShaMock.mockResolvedValue("some-later-commit");
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
+// anton-s55u (PR #279 review, P1, seventh round): a landed merge's own specific trace — its tip is a
+// commit whose parents are exactly the pre-mutation tip and the merged-in base.
+it("confirms a pending merge only when the branch tip's parents are exactly the pre-mutation tip and the merged base", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "merge-target",
+    pendingRefreshFromSha: "branch-tip-before-merge",
+    pendingRefreshKind: "merged",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  resolveCommitShaMock.mockResolvedValue("merge-commit-tip");
+  commitParentShasMock.mockResolvedValue(["branch-tip-before-merge", "merge-target"]);
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "merge-target" }),
+  );
+});
+
+it("does not trust a pending merge when the tip's parents don't include the pre-mutation tip", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "merge-target",
+    pendingRefreshFromSha: "branch-tip-before-merge",
+    pendingRefreshKind: "merged",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  resolveCommitShaMock.mockResolvedValue("unrelated-commit");
+  // Some unrelated commit, not a merge of the pre-mutation tip at all.
+  commitParentShasMock.mockResolvedValue(["some-other-parent"]);
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
+// anton-s55u (PR #279 review, P1, seventh round): a pending row written before `pendingRefreshKind`
+// existed has no confirmation shape to check against — fails closed, same discipline as an undefined
+// `fromSha` already gets, even though ancestry alone would suggest the mutation landed.
+it("fails closed on a legacy pending refresh with no recorded kind, even though ancestry alone would suggest it landed", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  // Reachability alone looks exactly like a landed rebase — the branch moved off its pre-mutation
+  // tip, and the target is now reachable. Without a recorded `kind`, none of that is trusted.
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "branch-tip-before-mutation" && descendant === `refs/heads/${BRANCH}`) return false;
+    return ancestor === "pending-base" && descendant === `refs/heads/${BRANCH}`;
+  });
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
 // anton-s55u (PR #279 review, P1 fix): an OPERATIONAL failure on this probe — not git's own exit-1
 // "no" — must fail the resume rather than read as "mutation unconfirmed". Swallowing it used to fall
 // back silently to the stale pre-mutation boundary, which a later rewind-then-rewrite of the base
@@ -821,6 +1041,7 @@ it("propagates an operational failure from the mutation-confirmation ancestry pr
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
     baseRefreshSha: "pending-base",
     pendingRefreshFromSha: "branch-tip-before-mutation",
+    pendingRefreshKind: "rebased",
     branch: BRANCH,
     status: "failed",
   });
@@ -908,6 +1129,7 @@ it("keeps alreadyShippedBase at the reconciled boundary, not the frozen fork, wh
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
     baseRefreshSha: "pending-base",
     pendingRefreshFromSha: "branch-tip-before-mutation",
+    pendingRefreshKind: "rebased",
     branch: BRANCH,
     status: "failed",
   });
@@ -1015,6 +1237,7 @@ it("does not trust a pending refresh whose target base was already an ancestor o
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
     baseRefreshSha: "rewound-base",
     pendingRefreshFromSha: "branch-tip-before-mutation",
+    pendingRefreshKind: "rebased",
     branch: BRANCH,
     status: "failed",
   });
@@ -1060,6 +1283,7 @@ it("trusts a pending refresh onto a rewound base once the branch's tip has moved
     baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
     baseRefreshSha: "rewound-base",
     pendingRefreshFromSha: "branch-tip-before-mutation",
+    pendingRefreshKind: "rebased",
     branch: BRANCH,
     status: "failed",
   });

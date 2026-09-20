@@ -85,6 +85,18 @@ export const runs = sqliteTable("runs", {
   // inconclusive and the pending sha is not trusted; only when it wasn't, and is now, has the branch
   // actually moved. See findPendingRefreshShaForBranch's reconciliation caller in execute-epic-claim.ts.
   pendingRefreshFromSha: text("pending_refresh_from_sha"),
+  // The SPECIFIC git operation the pending mutation above is (fast_forwarded | merged | rebased) —
+  // written alongside pendingRefreshFromSha (PR #279 review, P1, seventh round). Ancestry of
+  // baseRefreshSha from the branch's current tip alone can't confirm the mutation actually landed:
+  // that reachability is identical whether the mutation ran OR baseRefreshSha was already an ancestor
+  // of the branch before anything touched it (e.g. an authoritative rewind) and something UNRELATED —
+  // a `pre-rebase` hook committing as a side effect before rejecting the rebase — moved the branch off
+  // pendingRefreshFromSha instead. The confirmation this column enables is specific to each operation:
+  // a fast-forward lands on EXACTLY baseRefreshSha; a merge's tip is a commit whose parents are
+  // exactly pendingRefreshFromSha and baseRefreshSha; a rebase always replays onto brand-new commit
+  // objects, so a genuinely landed one leaves pendingRefreshFromSha unreachable from the new tip —
+  // which the hook side-effect shape above does not. See execute-epic-claim.ts's reconciliation.
+  pendingRefreshKind: text("pending_refresh_kind"),
   // This row's own last EFFECTIVE (non-pending, non-skipped_dirty) refresh boundary, snapshotted onto
   // a SEPARATE column the instant baseRefreshOutcome/baseRefreshSha above are overwritten with the
   // pending marker (PR #279 review, P1) — a resumed run (parked, then picked back up) calls
