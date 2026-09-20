@@ -330,10 +330,32 @@ export const BEADS_GITIGNORE_ENTRIES = [
 /**
  * Idempotently ensure `.beads/.gitignore` untracks the JSONL exports + Dolt runtime state. Appends
  * only the missing entries (never clobbers existing lines/content) and creates the file if absent.
- * Returns { path, added } — `added` is empty on a no-op.
+ * Returns { path, added, refused } — `added` is empty on a no-op, and `refused` carries why nothing
+ * was written when the path could not be written to safely.
+ *
+ * Links are refused rather than followed (PR #307 review, P1), for the same reason the formula
+ * install refuses them — and this function became reachable WITH SOMETHING TO WRITE precisely
+ * because that change added `formulas/*.bak` to {@link BEADS_GITIGNORE_ENTRIES}. An established
+ * repo whose `.gitignore` already carried the four older rules took the `added.length === 0`
+ * early return and never wrote at all; a fifth entry makes it write, and `writeFileSync` follows a
+ * symlink to whatever is on the other end — outside the repository, if that is where it points.
+ * Reproduced before fixing: a `.beads/.gitignore` symlinked out of the repo had anton's header and
+ * the new entry appended to the external target, and the call reported an ordinary success.
+ *
+ * The write goes through {@link writeNewFile}, so it replaces the DIRECTORY ENTRY instead of
+ * truncating the inode in place — which is what keeps a HARD-LINKED `.gitignore` (invisible to
+ * `lstat`, an ordinary regular file by every check) from taking the new bytes on its other name too.
  */
 export function ensureBeadsGitignore(beadsDir, entries = BEADS_GITIGNORE_ENTRIES) {
   const path = join(beadsDir, ".gitignore");
+  // Checked BEFORE the read, not merely before the write: a symlinked `.beads` or `.gitignore` is a
+  // refusal whatever its target happens to contain. `missingIsSafe` because an absent `.gitignore`
+  // is the ordinary create case here, exactly as it is for the `.bak` — see {@link unsafeDestDetail}.
+  const refused =
+    unsafeDirDetail(beadsDir, { what: "ignore file" }) ??
+    unsafeDestDetail(path, ".beads/.gitignore", { missingIsSafe: true });
+  if (refused) return { path, added: [], refused };
+
   let existing = "";
   try {
     existing = readFileSync(path, "utf8");
@@ -346,7 +368,7 @@ export function ensureBeadsGitignore(beadsDir, entries = BEADS_GITIGNORE_ENTRIES
 
   const header = "# anton: beads exports are derived from Dolt — never commit them";
   const sep = existing.length === 0 ? "" : existing.endsWith("\n") ? "\n" : "\n\n";
-  writeFileSync(path, existing + sep + header + "\n" + added.join("\n") + "\n");
+  writeNewFile(path, existing + sep + header + "\n" + added.join("\n") + "\n");
   return { path, added };
 }
 
@@ -539,7 +561,9 @@ function ensureFormula(beadsDir, filename, src) {
   // The DIRECTORY is checked whether or not a file is there, because an absent `dest` is reached
   // through it too — `mkdirSync(..., {recursive: true})` is satisfied by a symlink to a directory
   // and creates nothing, so the copy lands wherever the link points.
-  const unsafe = unsafeDirDetail(beadsDir) ?? (present ? unsafeDestDetail(dest, filename) : undefined);
+  const unsafe =
+    unsafeDirDetail(beadsDir, { subdir: "formulas", what: "formula" }) ??
+    (present ? unsafeDestDetail(dest, filename) : undefined);
   if (unsafe) return { status: "unsafe-dest", detail: unsafe };
 
   // The bytes the comparison below saw, kept for the backup to write (PR #307 review). Re-reading
@@ -676,18 +700,18 @@ function lstatOrUndefined(path) {
  * create a real directory there (the `missingIsSafe` reading; see {@link unsafeDestDetail} for why
  * the destination takes the opposite one).
  */
-function unsafeDirDetail(beadsDir) {
+function unsafeDirDetail(beadsDir, { subdir, what = "file" } = {}) {
   // `.beads` itself is an ancestor of the write too, and a symlinked workspace directory is the
-  // same escape one level further up.
-  for (const [dir, label] of [
-    [beadsDir, ".beads"],
-    [join(beadsDir, "formulas"), ".beads/formulas"],
-  ]) {
+  // same escape one level further up. `subdir` adds the deeper directory a caller writes into
+  // (`formulas/`); the gitignore writes straight into `.beads`, so it passes none.
+  const dirs = [[beadsDir, ".beads"]];
+  if (subdir) dirs.push([join(beadsDir, subdir), `.beads/${subdir}`]);
+  for (const [dir, label] of dirs) {
     const stat = lstatOrUndefined(dir);
     if (stat === undefined) return undefined; // not there yet — mkdirSync makes a real one
     if (stat.isSymbolicLink()) {
       return (
-        `${label} is a SYMLINK — refusing to install through it. The formula would be written to ` +
+        `${label} is a SYMLINK — refusing to install through it. The ${what} would be written to ` +
         `the link's target, which may be outside the repository. Replace it with a real directory ` +
         `and re-run.`
       );
@@ -2198,7 +2222,14 @@ export function configureBeadsForRepo(dir, opts = {}) {
 
   // 3. Ensure .beads/.gitignore untracks the derived exports + Dolt runtime state.
   const gi = ensureBeadsGitignore(beadsDir);
-  if (gi.added.length) {
+  if (gi.refused) {
+    // A refusal, not a no-op: the entries are NOT in place, so the `.bak` a replacement writes two
+    // steps below is committable. Collected as an error rather than emitted and forgotten, the same
+    // call the refused formula install makes.
+    emit(`refused to update .beads/.gitignore: ${gi.refused}`);
+    errors.push(`refused to update .beads/.gitignore: ${gi.refused}`);
+    steps.push({ name: ".beads/.gitignore", status: "failed", detail: gi.refused });
+  } else if (gi.added.length) {
     emit(`.beads/.gitignore += ${gi.added.join(", ")}`);
     steps.push({ name: ".beads/.gitignore", status: "set", detail: gi.added.join(", ") });
   } else {

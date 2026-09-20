@@ -1837,7 +1837,11 @@ async function cmdSetup(args = []) {
   // reason to fail setup.
   if (existsSync(join(APP_ROOT, ".beads"))) {
     try {
-      ensureBeadsGitignore(join(APP_ROOT, ".beads"));
+      // A link the installer refuses to write through returns instead of throwing, so the warning
+      // has to cover BOTH shapes — otherwise a refusal is the one failure mode that prints nothing
+      // while the `.bak` below stays committable (PR #307 review).
+      const gi = ensureBeadsGitignore(join(APP_ROOT, ".beads"));
+      if (gi.refused) throw new Error(gi.refused);
     } catch (e) {
       console.log(
         c.yellow(`\n! could not update .beads/.gitignore: ${e?.message ?? e}`) +
