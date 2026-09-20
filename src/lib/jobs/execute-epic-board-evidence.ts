@@ -680,18 +680,42 @@ export async function clearBoardEvidencePending(
     // carry them are exactly what `markerCleared`/`baselineCleared` just cleared, so this
     // obligation is the only place left for a resume, on this machine or a fresh cross-machine
     // worktree with no attribution commit of its own, to recover which ids still need confirming.
-    const obligationPersisted =
-      cleared || survivorsGone
-        ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids))
-        : true;
+    const obligationWritten = cleared || survivorsGone;
+    const obligationPersisted = obligationWritten
+      ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids))
+      : true;
+    // Confirmed synced too, not just persisted (PR #284 review, "confirm the cleanup-retry
+    // obligation reaches the remote before throwing"): this obligation is the ONLY remaining trace
+    // that confirmation is still owed once `survivorsGone` clears the marker and baseline, so a
+    // local-only obligation is exactly the false-success shape this whole function otherwise
+    // guards against. It gets its OWN push rather than reusing `synced` above — that push ran
+    // BEFORE this write ever landed on the board (or, in the `survivorsGone`-but-`!cleared` case,
+    // never ran at all, since `cleared` gates it), so it cannot have confirmed this marker either
+    // way. A same-machine resume can still see a local-only obligation and retry correctly, but a
+    // resume on a FRESH cross-machine worktree — the exact case this obligation exists to carry
+    // the retry across — reads `hasBoardEvidenceCleanupUnsynced` as false there and never retries
+    // at all, so the detail below says so explicitly when the push cannot confirm it.
+    const obligationSynced =
+      obligationWritten && obligationPersisted
+        ? await beads
+            .push(repo)
+            .then((outcome) => outcome === "synced" || outcome === "shared-server")
+            .catch(() => false)
+        : obligationPersisted;
     const detail = cleared
-      ? obligationPersisted
+      ? !obligationPersisted
         ? "every cleanup write landed locally, but the confirming push could not verify they reached " +
-          "the remote"
-        : "every cleanup write landed locally, but the confirming push could not verify they reached " +
           "the remote, and bd also refused the local retry-obligation marker (after retries) — a " +
           "resume will NOT automatically retry this cleanup; clear the pending marker and preserved " +
           "baseline for this ticket directly, or retry until the obligation marker persists"
+        : obligationSynced
+          ? "every cleanup write landed locally, but the confirming push could not verify they reached " +
+            "the remote"
+          : "every cleanup write landed locally, but the confirming push could not verify they reached " +
+            "the remote, and the retry-obligation marker persisted only locally, not confirmed synced " +
+            "— a resume on THIS machine will retry the cleanup, but a resume on a different machine " +
+            "will not see the obligation and will not retry it; check the sync channel before resuming " +
+            "elsewhere"
       : `bd would not clear ${[
           !markerCleared && "the pending-evidence marker",
           !baselineCleared && "the preserved baseline",
@@ -700,12 +724,17 @@ export async function clearBoardEvidencePending(
           .filter((s): s is string => s !== false)
           .join(" and ")} it left on the board (after retries)${
           survivorsGone
-            ? obligationPersisted
-              ? " — a resume will retry the rest of this cleanup via the retry-obligation marker " +
-                "this run persisted"
-              : ", and bd also refused the local retry-obligation marker (after retries) — a resume " +
+            ? !obligationPersisted
+              ? ", and bd also refused the local retry-obligation marker (after retries) — a resume " +
                 "will NOT automatically retry the rest of this cleanup; clear or complete it for " +
                 "this ticket directly, or retry until the obligation marker persists"
+              : obligationSynced
+                ? " — a resume will retry the rest of this cleanup via the retry-obligation marker " +
+                  "this run persisted"
+                : " — a resume on THIS machine will retry the rest of this cleanup via the " +
+                  "retry-obligation marker this run persisted locally, but that marker was not " +
+                  "confirmed reaching the remote — a resume on a different machine will not see it " +
+                  "and will not retry; check the sync channel before resuming elsewhere"
             : ""
         }`;
     throw new PoisonEpic(

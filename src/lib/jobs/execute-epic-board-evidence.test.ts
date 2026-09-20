@@ -855,6 +855,8 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "evidence on an already-closed ticket",
     async () => {
       pushMock.mockResolvedValueOnce("not-wired");
+      // The retry-obligation marker this failure writes gets its own confirming push too.
+      pushMock.mockResolvedValueOnce("not-wired");
       await expect(clearBoardEvidencePending("/repo", "t-cleanup-unsynced", ["a"])).rejects.toThrow(
         /t-cleanup-unsynced/,
       );
@@ -867,6 +869,8 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "failure\") — neither the pending marker nor the preserved baseline survives that failure to " +
       "tell a same-machine resume there is still work to retry, so this is the only trace left",
     async () => {
+      pushMock.mockResolvedValueOnce("not-wired");
+      // The retry-obligation marker this failure writes gets its own confirming push too.
       pushMock.mockResolvedValueOnce("not-wired");
       await expect(
         clearBoardEvidencePending("/repo", "t-cleanup-obligation", ["a"]),
@@ -911,15 +915,19 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
-    "persists a cleanup-sync retry obligation when the marker and baseline clear locally but " +
-      "`setBoardEvidenceConfirmed` alone exhausts its retries (PR #284 review, \"preserve an " +
-      "obligation when confirmation persistence fails\") — the marker and baseline are both gone " +
-      "from the board at that point, so a same-machine resume checking only those two survivors " +
-      "would otherwise see nothing pending and never retry confirming delivery",
+    "persists AND confirms syncing a cleanup-sync retry obligation when the marker and baseline " +
+      "clear locally but `setBoardEvidenceConfirmed` alone exhausts its retries (PR #284 review, " +
+      "\"preserve an obligation when confirmation persistence fails\" / \"confirm the cleanup-retry " +
+      "obligation reaches the remote before throwing\") — the marker and baseline are both gone from " +
+      "the board at that point, so a same-machine resume checking only those two survivors would " +
+      "otherwise see nothing pending, and a resume on a DIFFERENT machine sees nothing at all unless " +
+      "this brand-new obligation write is itself confirmed synced — the earlier combined push never " +
+      "ran to cover it, since `cleared` was already false",
     async () => {
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      pushMock.mockResolvedValueOnce("synced");
       const pushCallsBefore = pushMock.mock.calls.length;
       await expect(
         clearBoardEvidencePending("/repo", "t-cleanup-confirm-failed", ["a"]),
@@ -929,8 +937,24 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-cleanup-confirm-failed",
         ["a"],
       );
-      // Nothing was pushed — the failure is purely local, so there is no sync channel to report yet.
-      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 1);
+      expect(pushMock).toHaveBeenCalledWith("/repo");
+    },
+  );
+
+  it(
+    "warns that a cross-machine resume will not see the obligation when its own confirming push " +
+      "cannot verify it synced (PR #284 review, \"confirm the cleanup-retry obligation reaches the " +
+      "remote before throwing\") — a resume on THIS machine still finds the obligation locally, but " +
+      "one on a fresh worktree relies entirely on it having reached the remote",
+    async () => {
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-confirm-failed-unsynced", ["a"]),
+      ).rejects.toThrow(/resuming elsewhere/);
     },
   );
 
@@ -989,6 +1013,8 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "still cannot confirm (PR #284 review)",
     async () => {
       pushMock.mockResolvedValueOnce("not-wired");
+      // The retry-obligation marker this failure re-writes gets its own confirming push too.
+      pushMock.mockResolvedValueOnce("not-wired");
       await expect(
         clearBoardEvidencePending("/repo", "t-cleanup-retry-fails", [], false, true),
       ).rejects.toThrow(/t-cleanup-retry-fails/);
@@ -1003,6 +1029,8 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     "clearBoardEvidencePending throws when the confirming push itself throws, rather than crashing " +
       "the ticket walk (thread on PR #284 line 406)",
     async () => {
+      pushMock.mockRejectedValueOnce(new Error("push failed: auth"));
+      // The retry-obligation marker this failure writes gets its own confirming push too.
       pushMock.mockRejectedValueOnce(new Error("push failed: auth"));
       await expect(clearBoardEvidencePending("/repo", "t-cleanup-push-throws", ["a"])).rejects.toThrow(
         /t-cleanup-push-throws/,

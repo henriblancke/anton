@@ -55,6 +55,29 @@ describe("reviewSandboxDenyWrite (anton-t6tu)", () => {
   it("collapses the two in a plain checkout, where they are the same path", () => {
     expect(reviewSandboxDenyWrite("/repos/anton", "/repos/anton/.git")).toEqual(["/repos/anton/.git"]);
   });
+
+  it(
+    "also denies the live board's checkout when a board-only run hands one over (PR #284 review, " +
+      "\"protect the live board from review-session writes\") — boardEvidenceSection teaches the " +
+      "reviewer the exact `bd -C <repoPath>` syntax to READ confirmed evidence, and a stray write " +
+      "there would mutate the canonical board unseen by `enforceReadOnly`, which only watches this " +
+      "worktree",
+    () => {
+      const repoPath = "/repos/anton-live";
+      expect(reviewSandboxDenyWrite(WORKTREE, COMMON_DIR, repoPath)).toEqual([
+        COMMON_DIR,
+        `${WORKTREE}/.git`,
+        repoPath,
+      ]);
+    },
+  );
+
+  it("omits the live board's checkout when the run carries no board evidence at all", () => {
+    expect(reviewSandboxDenyWrite(WORKTREE, COMMON_DIR, undefined)).toEqual([
+      COMMON_DIR,
+      `${WORKTREE}/.git`,
+    ]);
+  });
 });
 
 describe("assertReviewSandboxSupported (anton-t6tu)", () => {
@@ -87,6 +110,17 @@ describe("resolveReviewSandbox (anton-t6tu)", () => {
     });
     expect(settings.sandbox.filesystem.denyWrite).toEqual([COMMON_DIR, `${WORKTREE}/.git`]);
     expect(settings.sandbox.enabled).toBe(true);
+  });
+
+  it("also pins the live board's checkout shut when the run passes a repoPath", async () => {
+    const repoPath = "/repos/anton-live";
+    const settings = await resolveReviewSandbox({
+      worktreePath: WORKTREE,
+      readGitCommonDir: async () => COMMON_DIR,
+      repoPath,
+      platform: "darwin",
+    });
+    expect(settings.sandbox.filesystem.denyWrite).toEqual([COMMON_DIR, `${WORKTREE}/.git`, repoPath]);
   });
 
   it("refuses a relative git-common-dir rather than sandboxing a path that matches nothing", async () => {

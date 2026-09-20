@@ -1205,17 +1205,6 @@ async function dispatchTicket(
     }
     return;
   }
-  // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The
-  // rollback took the mechanism it was written against off the branch, so its agent can only
-  // report the absence and exit with a zero diff — which the no-delivery gate then reads as a
-  // failed run, poisoning the tickets that DID deliver. Checked after the done-on-board skip
-  // above (work already on this branch is delivered, whatever timed out later) and before the
-  // re-gates below, which must not park a run over a ticket that is no longer going to run.
-  const skipping = ledger.skipCause.get(ticket.id);
-  if (skipping) {
-    await recordSkipped(ticket, skipping, doneOnBoard);
-    return;
-  }
   // A board-only ticket already CONFIRMED delivered — `clearBoardEvidencePending` set this
   // durable flag and cleared the pending marker/baseline that would otherwise recover it (PR
   // #284 review, "no record that this bead's board-only delivery ever happened") — has nothing
@@ -1298,14 +1287,31 @@ async function dispatchTicket(
     // finish that survivor cleanup before trusting `confirmed` as fully settled — otherwise a
     // stale preserved baseline anchors a future, unrelated reopen of this ticket to a board
     // snapshot from before this delivery, or a stale pending marker is read as current evidence
-    // for a ticket that got no new work. Checked independently of `hasBoardEvidenceCleanupUnsynced`
-    // (the block above), which already retries the confirming-push-only failure shape on its own —
-    // this only covers the marker/baseline survivors that shape doesn't leave behind.
+    // for a ticket that got no new work.
+    //
+    // `hasBoardEvidenceCleanupUnsynced` is checked here too, not left to the block above (chatgpt-
+    // codex-connector, PR #284 review, "Clear obligations on confirmed cross-machine resumes"): the
+    // block above requires `!boardEvidenceConfirmed`, so a failed cleanup push that wrote BOTH
+    // `boardEvidenceConfirmed` and the obligation locally — then had a later best-effort sync
+    // publish both together — reaches a fresh machine with `confirmed` already true, which skips
+    // that block entirely. Left uncleared here, the obligation survives indefinitely on an
+    // already-fully-settled ticket and can later be unioned into a REOPENED delivery's evidence ids
+    // (the `if (delivery)` resume-retry above reads `cleanupUnsyncedBoardEvidenceIds`
+    // unconditionally), misattributing this stale evidence to a future, unrelated delivery.
     const stalePending = beads.pendingBoardEvidence(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
-    if (stalePending.length > 0 || hasPreservedBaseline) {
-      const recoveredIds = [...new Set([...stalePending, ...confirmedIds])].toSorted();
-      await clearBoardEvidencePending(repo, ticket.id, recoveredIds, hasPreservedBaseline, false);
+    const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    if (stalePending.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
+      const recoveredIds = [
+        ...new Set([...stalePending, ...confirmedIds, ...beads.cleanupUnsyncedBoardEvidenceIds(ticket)]),
+      ].toSorted();
+      await clearBoardEvidencePending(
+        repo,
+        ticket.id,
+        recoveredIds,
+        hasPreservedBaseline,
+        hasCleanupUnsynced,
+      );
       if (recoveredIds.length > 0) {
         ledger.boardEvidence.set(ticket.id, recoveredIds);
       }
@@ -1317,6 +1323,24 @@ async function dispatchTicket(
     if (ledger.skipCause.has(ticket.id)) {
       ledger.skipCause = skippedDependents(timedOut, tickets, all, onBranch);
     }
+    return;
+  }
+  // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The
+  // rollback took the mechanism it was written against off the branch, so its agent can only
+  // report the absence and exit with a zero diff — which the no-delivery gate then reads as a
+  // failed run, poisoning the tickets that DID deliver. Checked AFTER the two board-only fast
+  // paths above, not before them (PR #284 review, "board-only confirmed dependent wrongly
+  // skipped by an unrelated timeout"): `skipCause` is a graph verdict recomputed from `onBranch`
+  // as each timeout lands, and a board-only ticket already closed with `boardEvidenceConfirmed`
+  // (or a pending cleanup obligation) from an EARLIER attempt has not yet been added to
+  // `onBranch` — that only happens when this loop actually reaches it — so an unrelated ticket's
+  // timeout could cascade onto it here and have `recordSkipped` reopen an already-durably-
+  // delivered ticket and tag it `not-delivered`, even though its board-only delivery has nothing
+  // to do with the timed-out ticket's rolled-back mechanism. Checked before the re-gates below,
+  // which must not park a run over a ticket that is no longer going to run.
+  const skipping = ledger.skipCause.get(ticket.id);
+  if (skipping) {
+    await recordSkipped(ticket, skipping, doneOnBoard);
     return;
   }
   // Done on the board but the commit is missing from this branch (cross-machine resume): the

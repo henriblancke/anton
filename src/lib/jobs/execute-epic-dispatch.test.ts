@@ -83,7 +83,7 @@ vi.mock("../beads/bd", async () => {
 });
 
 const { dispatchRunTickets } = await import("./execute-epic-dispatch");
-const { TicketRetiredError } = await import("./execute-epic-errors");
+const { TicketRetiredError, TicketTimeoutError } = await import("./execute-epic-errors");
 const { PoisonEpic } = await import("./errors");
 const { beads } = await import("../beads/bd");
 const reopenMock = vi.mocked(beads.reopen);
@@ -1192,6 +1192,46 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       false,
     );
   });
+
+  // PR #284 review (critical, "board-only confirmed dependent wrongly skipped by an unrelated
+  // timeout"): `skipCause` used to be checked BEFORE the two board-only fast paths above. A
+  // board-only ticket already durably confirmed by an EARLIER attempt has not yet been added to
+  // `onBranch` when a sibling times out THIS attempt — that only happens once the loop actually
+  // reaches it — so `skippedDependents` could sweep it into the cascade even though its delivery
+  // has nothing to do with the timed-out ticket's rolled-back mechanism, and the old ordering would
+  // then reopen it and tag it `not-delivered`.
+  it(
+    "still recognizes a board-only confirmed dependent even when an unrelated sibling's timeout " +
+      "cascade reaches it first",
+    async () => {
+      const timedOutTicket = bead("anton-a");
+      const confirmedChild = bead("anton-b", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+        dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+      });
+      hasCommitMock.mockResolvedValue(false);
+      runTicketMock.mockImplementation(async ({ ticket }) => {
+        if (ticket.id === "anton-a") {
+          throw new TicketTimeoutError("anton-a", 60_000, false);
+        }
+        return COMMITTED;
+      });
+
+      const outcome = await dispatchRunTickets(
+        makeRun([timedOutTicket, confirmedChild], new AbortController().signal),
+        prep(),
+      );
+
+      // The confirmed board-only delivery is honored, not reopened and marked undelivered.
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(markedNotDelivered()).not.toContain("anton-b");
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([confirmedChild]);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-b");
+    },
+  );
 });
 
 // PR #284 review ("Recover cleanup-only resumes before regeneration"): a prior attempt can clear
@@ -1256,7 +1296,13 @@ describe(
       );
     });
 
-    it("leaves an already-confirmed ticket to the ordinary fast path instead of retrying twice", async () => {
+    // PR #284 review (chatgpt-codex-connector, "Clear obligations on confirmed cross-machine
+    // resumes"): a failed cleanup push can write BOTH `boardEvidenceConfirmed` and the obligation
+    // locally, and a later best-effort sync can publish both together — so a fresh machine can see
+    // this exact combination. The confirmed fast path used to leave the stale obligation behind
+    // uncleared; it now finishes that cleanup too, so the obligation cannot survive indefinitely
+    // and later get unioned into a REOPENED delivery's evidence ids.
+    it("clears a stale cleanup obligation left behind on an already-confirmed ticket", async () => {
       const child = bead("anton-a", {
         status: "closed",
         labels: [LABELS.boardOnly],
@@ -1272,7 +1318,13 @@ describe(
         prep(),
       );
 
-      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        "anton-a",
+        ["anton-eb1"],
+        false,
+        true,
+      );
       expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
       expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
     });

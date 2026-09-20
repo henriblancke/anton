@@ -355,6 +355,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const sandbox = await resolveReviewSandbox({
     worktreePath,
     readGitCommonDir: args.deps?.gitCommonDir ?? gitCommonDir,
+    // Denies the live board's checkout too (PR #284 review, "protect the live board from
+    // review-session writes"): `boardEvidenceSection` hands the reviewer the exact `bd -C
+    // <repoPath>` syntax to READ confirmed evidence, and a stray write-capable command against
+    // that same path would mutate the canonical board unseen by `enforceReadOnly`, which only
+    // watches this worktree.
+    repoPath: args.repoPath,
   });
 
   // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
