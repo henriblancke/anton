@@ -439,7 +439,14 @@ export async function warmRunWorktree(
   // now-redundant write this block used to make.
   const refreshFields =
     !isRecreatedBranch && worktree.refreshOutcome
-      ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }
+      ? {
+          baseRefreshOutcome: worktree.refreshOutcome.outcome,
+          baseRefreshSha: worktree.refreshOutcome.baseSha,
+          // A dirty resume is a barrier for pending-refresh reconciliation, but it must not erase
+          // a boundary an earlier clean refresh already confirmed on this same branch.
+          priorBaseRefreshSha:
+            worktree.refreshOutcome.outcome === "skipped_dirty" ? (reconciledRefreshSha ?? null) : undefined,
+        }
       : undefined;
   try {
     // Pin reads are part of the same atomic setup as the pin write: a fresh checkout with neither

@@ -361,7 +361,13 @@ export async function findRunBaseRefreshShaForBranch(
     .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt));
   for (const row of rows) {
     if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
-    if (row.baseRefreshOutcome === "skipped_dirty") continue;
+    if (row.baseRefreshOutcome === "skipped_dirty") {
+      // A dirty attempt is a barrier only for pending-mutation reconciliation: its branch may have
+      // advanced through ordinary agent work. Its own snapshotted prior boundary, however, remains
+      // a confirmed refresh and is safe to recover for a later `--onto` refresh.
+      if (row.priorBaseRefreshSha) return row.priorBaseRefreshSha;
+      continue;
+    }
     // A still-PENDING row (see PENDING_REFRESH_OUTCOME below) records what a dead attempt INTENDED,
     // not a confirmed outcome — trusting its sha here as if it were a settled boundary would recreate
     // exactly the unsafe blind trust this whole mechanism exists to avoid, just via a new sentinel
