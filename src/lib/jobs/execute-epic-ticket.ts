@@ -129,6 +129,23 @@ export async function runTicket(args: {
   let finished: { settlement: TicketSettlement; closed: boolean; transitioned: boolean } | undefined;
 
   try {
+    // A board-only ticket with no baseline is refused BEFORE dispatch, not just at the commit
+    // step's evidence gate (PR #284 review round 12): letting the agent run anyway risks it making
+    // the very bd writes this ticket is meant to deliver, which `concludeRunAttempt` syncs to the
+    // remote regardless of this ticket ultimately failing. A resumed attempt would then take a
+    // FRESH baseline that already absorbed those writes, so its idempotent retry produces no delta
+    // and can never prove the delivery this attempt actually made. Failing closed here — before any
+    // step has a chance to write — keeps that baseline untouched for the resume that follows.
+    if (boardOnly && !boardBaseline) {
+      throw new NoDeliveryError(
+        boardOnlyNoDeliveryMessage(ticket, {
+          found: false,
+          ids: [],
+          synced: false,
+          baselineUnavailable: true,
+        }),
+      );
+    }
     await walkTicketSteps({
       run,
       steps: args.steps,
