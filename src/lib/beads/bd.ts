@@ -1088,15 +1088,33 @@ export const beads = {
     }
   },
 
-  /** Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
-   * pre-dispatch baseline. */
-  setBoardEvidenceBaseline: (cwd: string, id: string, fingerprint: Record<string, string>) =>
-    bdWrite(cwd, [
-      "update",
-      id,
-      "--set-metadata",
-      `${BOARD_EVIDENCE_BASELINE_KEY}=${JSON.stringify(fingerprint)}`,
-    ]),
+  /**
+   * Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
+   * pre-dispatch baseline.
+   *
+   * Written through `--metadata @file` (a temp file, cleaned up in `finally` like {@link
+   * beads.createGraph}'s plan file), never `--set-metadata key=value` (chatgpt-codex-connector,
+   * PR #284 review, "Bound the complete baseline metadata argument") — `fingerprintOf` already
+   * hashes each bead down to 16 hex chars, but `fingerprint` still holds one entry per bead in the
+   * WHOLE board (see {@link BoardFingerprint}'s own docstring on that tradeoff), so the serialized
+   * JSON stays proportional to board size with no per-bead cap. A board of several thousand beads
+   * can still push that single argv argument past Linux's ~128KiB single-argument ceiling and fail
+   * `E2BIG` outright, parking every board-only ticket before dispatch ever starts. `--metadata`
+   * merges into existing custom metadata rather than replacing it (verified against bd 1.1.2: prior
+   * keys, including this one on a resumed ticket, survive untouched aside from the key being
+   * written) — the same replace-one-key semantics `--set-metadata` had, just off a bounded file
+   * instead of an unbounded argv string.
+   */
+  setBoardEvidenceBaseline: async (cwd: string, id: string, fingerprint: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-baseline-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_BASELINE_KEY]: JSON.stringify(fingerprint) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
 
   /** Release a preserved baseline once the handoff it backed has completed. */
   clearBoardEvidenceBaseline: (cwd: string, id: string) =>

@@ -1317,20 +1317,36 @@ describe(
       expect(pushMock).toHaveBeenCalledWith("/repo");
     });
 
-    it("is a no-op when the ticket already carries a preserved baseline — nothing new to anchor", async () => {
+    it("skips re-persisting when the ticket already carries a preserved baseline, but still " +
+      "reconfirms sync (chatgpt-codex-connector, PR #284 review, \"Reconfirm a preserved baseline " +
+      "before dispatching a retry\")", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       const ticketWithBaseline = bead("t-preserved", {
         metadata: { boardEvidenceBaseline: JSON.stringify({ a: "preserved-hash" }) },
       });
       const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
-      const pushCallsBefore = pushMock.mock.calls.length;
+      pushMock.mockResolvedValueOnce("synced");
 
       await expect(
         ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
       ).resolves.toBe(true);
 
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore);
-      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+      expect(pushMock).toHaveBeenCalledWith("/repo");
+    });
+
+    it("returns false when a preserved baseline's confirming push was never actually synced " +
+      "(same bug, resumed-retry shape: the first attempt's write landed but its push failed, so " +
+      "this attempt must not skip confirmation just because metadata presence looks done)", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const ticketWithBaseline = bead("t-preserved", {
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "preserved-hash" }) },
+      });
+      pushMock.mockResolvedValueOnce("not-wired");
+
+      await expect(
+        ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
+      ).resolves.toBe(false);
     });
 
     it("returns false, never throws, when the persist itself exhausts every retry", async () => {

@@ -284,19 +284,24 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", freshTicket, ["anton-x1"]);
   });
 
-  it("falls back to the pre-dispatch ticket when the re-read fails, rather than blocking cleanup on it", async () => {
+  it("fails loud instead of falling back to the stale pre-dispatch ticket when the re-read fails " +
+    "(chatgpt-codex-connector, PR #284 review, 'Fail closed when the cleanup re-read is " +
+    "unavailable') — on a first-attempt success the stale ticket predates the pending label " +
+    "entirely, so cleaning up from it would strand the live label on the board undetected", async () => {
     finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
     mustReadMock.mockResolvedValue(undefined);
 
-    await runTicket({
-      run: run(),
-      steps: [deliveredCommitStep()],
-      ticket: boardTicket,
-      runTicketIds: [boardTicket.id],
-      timeoutMs: 5_000,
-    });
+    await expect(
+      runTicket({
+        run: run(),
+        steps: [deliveredCommitStep()],
+        ticket: boardTicket,
+        runTicketIds: [boardTicket.id],
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/could not be re-read/);
 
-    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton", boardTicket, ["anton-x1"]);
+    expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
   });
 
   it("fails loud instead of returning success when bd refused the requested transition — a " +
@@ -523,6 +528,10 @@ describe(
       ensureBoardBaselinePersistedMock.mockResolvedValue(true);
       readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x2"], synced: true });
       finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
+      // The post-dispatch cleanup re-reads the ticket before clearing its pending marker (see the
+      // "clears the pending marker..." test above) — stubbed here since this test cares about
+      // dispatch happening, not that cleanup path's own behavior.
+      mustReadMock.mockResolvedValue(boardTicket);
 
       await runTicket({
         run: run(),

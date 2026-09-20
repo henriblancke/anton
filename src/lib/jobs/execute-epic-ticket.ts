@@ -255,10 +255,29 @@ export async function runTicket(args: {
       // label to the LIVE board bead after that snapshot was taken. `clearBoardEvidencePending`
       // derives which label to remove from the bead it is passed, so handing it the stale snapshot
       // makes it see no label, skip the removal, and still record confirmation as though cleanup
-      // succeeded — stranding the pending marker on the board for a later reopen to misread as
-      // current evidence. A failed re-read falls back to the stale snapshot rather than blocking
-      // cleanup on it, which costs nothing beyond the same stale-label risk this call always carried.
-      const freshTicket = (await mustRead(run.repoPath, ticket.id)) ?? ticket;
+      // succeeded — stranding the live pending label on the board for a later reopen to union its
+      // old ids into `readBoardEvidence` and misread them as current evidence.
+      //
+      // A failed re-read must NOT fall back to `ticket` (chatgpt-codex-connector, PR #284 review,
+      // "Fail closed when the cleanup re-read is unavailable"): on a FIRST-attempt success `ticket`
+      // predates the pending label entirely (it was added later, inside this same call), so a
+      // fallback here reproduces exactly the staleness this re-read exists to fix, just moved one
+      // step later and made to look handled. Poisoning instead matches every other unrecoverable
+      // cleanup-write state in this block (see the `else` branch below, and
+      // `clearBoardEvidencePending`'s own all-or-nothing gate): the ticket has already
+      // closed/transitioned successfully, so halting for a human costs nothing this run has not
+      // already delivered, while silently mislabeling the cleanup would strand a false-evidence risk
+      // no later attempt would know to look for.
+      const freshTicket = await mustRead(run.repoPath, ticket.id);
+      if (!freshTicket) {
+        throw new PoisonEpic(
+          `${ticket.id}'s board evidence was confirmed and its handoff landed, but the ticket could ` +
+            `not be re-read to find its live board-evidence-pending label before cleanup — clearing ` +
+            `it from the stale pre-dispatch snapshot risks leaving that label on the board, which a ` +
+            `later reopen could misread as current evidence for no new work. Check the beads DB, ` +
+            `then resume the run.`,
+        );
+      }
       await clearBoardEvidencePending(run.repoPath, freshTicket, progress.boardEvidenceIds);
     } else {
       // `finishTicket`'s close/in-review write is best-effort — right for a normal ticket, where an

@@ -149,10 +149,13 @@ function fingerprintOf(b: Bead, dispatchedTicketId: string): string {
     b.id === dispatchedTicketId ? "" : (b.assignee ?? ""),
   ]);
   // Hashed, not stored raw (PR #284 review round 16): the baseline this fingerprints into
-  // (setBoardEvidenceBaseline) is persisted as ONE `bd update --set-metadata` argv argument, and a
-  // mature board's full titles/descriptions serialized per bead can exceed Linux's ~128KiB
-  // single-argument ceiling, failing that write outright. A fixed-size digest bounds each bead's
-  // contribution regardless of description length while still changing whenever the content does.
+  // (setBoardEvidenceBaseline) holds one entry per bead on the WHOLE board, so its serialized size
+  // is proportional to board size regardless of how it is persisted. A fixed-size digest bounds
+  // each bead's contribution regardless of description length while still changing whenever the
+  // content does — `setBoardEvidenceBaseline` itself writes through a bounded file, not an argv
+  // argument (chatgpt-codex-connector, PR #284 review, "Bound the complete baseline metadata
+  // argument"), so this hashing is what keeps that file's own size from scaling with description
+  // length rather than with bead count.
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
@@ -280,23 +283,37 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
  * that already absorbed the delivered state, and an idempotent retry then diffs as no evidence at all,
  * permanently.
  *
- * A no-op (returns `true` without writing) when `baseline` was already reused from a preserved value —
- * a resumed attempt whose baseline `readBoardBaseline` pulled off the ticket's own metadata is already
- * durable; re-persisting it would cost a write for nothing. Never throws: a persist or confirming-push
- * failure (after {@link mustPersist}'s own retries) returns `false` so `runTicket` can refuse to
- * dispatch on the same closed-fail path it already takes for an unreadable baseline, rather than
- * dispatch an agent whose writes this attempt could not durably anchor.
+ * The WRITE is a no-op when `baseline` was already reused from a preserved value — a resumed attempt
+ * whose baseline `readBoardBaseline` pulled off the ticket's own metadata is already durable locally;
+ * re-persisting it would cost a write for nothing. The confirming PUSH below still runs every attempt
+ * (chatgpt-codex-connector, PR #284 review, "Reconfirm a preserved baseline before dispatching a
+ * retry") — mirrors the same fix already made in {@link readBoardEvidence}'s `!hydrated` branch, for
+ * the same reason: a same-machine retry that finds the write already done used to return `true`
+ * without ever confirming THAT sync succeeded. `beads.push` is a pull → commit → push pass, so the
+ * FIRST attempt's confirming push can pull unrelated remote changes into the local board before
+ * failing on the push itself — changes `baseline` (read before that pull) does not reflect. Returning
+ * `true` unconfirmed left a resumed attempt dispatch straight onto that already-polluted local board:
+ * `readBoardEvidence`'s post-run diff, still measured against the stale `baseline`, would then credit
+ * those pre-dispatch pulled changes as this ticket's own evidence and accept a no-op `delivered`
+ * report. Retrying the push every call is safe here specifically because a caller only ever reaches
+ * dispatch once this function returns `true` (`runTicket` refuses to dispatch on `false`) — so a prior
+ * attempt that returned unconfirmed never let an agent run, and there is nothing this retry could lose
+ * by confirming again. Never throws: a persist or confirming-push failure (after {@link mustPersist}'s
+ * own retries) returns `false` so `runTicket` can refuse to dispatch on the same closed-fail path it
+ * already takes for an unreadable baseline, rather than dispatch an agent whose writes this attempt
+ * could not durably anchor.
  */
 export async function ensureBoardBaselinePersisted(
   repo: string,
   ticket: Bead,
   baseline: BoardFingerprint,
 ): Promise<boolean> {
-  if (beads.boardEvidenceBaseline(ticket)) return true;
-  const persisted = await mustPersist(() =>
-    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
-  );
-  if (!persisted) return false;
+  if (!beads.boardEvidenceBaseline(ticket)) {
+    const persisted = await mustPersist(() =>
+      beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+    );
+    if (!persisted) return false;
+  }
   return beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
