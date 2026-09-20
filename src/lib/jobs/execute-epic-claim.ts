@@ -22,7 +22,13 @@ import {
   type Worktree,
 } from "../git/worktree";
 import { resolveOperator } from "../operator";
-import { findRunBaseForkShaForBranch, findRunBaseRefreshShaForBranch, getRunBaseForkSha, updateRun } from "../runs";
+import {
+  BRANCH_RECREATED_REFRESH_TOMBSTONE,
+  findRunBaseForkShaForBranch,
+  findRunBaseRefreshShaForBranch,
+  getRunBaseForkSha,
+  updateRun,
+} from "../runs";
 import { PoisonEpic } from "./errors";
 import { safe } from "./safe";
 import type { EpicRun } from "./execute-epic-run";
@@ -67,6 +73,13 @@ export async function warmRunWorktree(
   // Held for the review gate below too: it diffs the branch against this base's MERGE BASE, so
   // the remote-tracking ref is the accurate fork point even when the local base has drifted.
   const freshBase = await resolveFreshBase(repo, baseBranch);
+  // `resolveFreshBase` returns `origin/<baseBranch>` only once it has fetched AND verified that ref
+  // (anton-nyz1v, PR #279 review, fifth round) — anything else (no remote, a failed fetch) falls back
+  // to the plain local `<baseBranch>` name instead. `refreshOntoBase` needs to tell those apart: a
+  // fallback that reads behind this branch's own fork point is merely stale and safe to leave alone,
+  // but a CONFIRMED fetch reading the same way means origin was genuinely force-pushed or recreated
+  // behind that commit — see `baseIsAuthoritative`'s own doc comment on `refreshOntoBase`.
+  const baseIsAuthoritative = freshBase === `origin/${baseBranch}`;
   // Claim the checkout for the whole run (anton-hrun.1). The claim's `git worktree lock` is the
   // ONLY evidence a second anton process over this repository has that the directory is in use:
   // its teardown and its sweep judge residue from their own run rows and the board, which say
@@ -147,6 +160,7 @@ export async function warmRunWorktree(
     refresh: true,
     preserveShas,
     forkSha: priorEffectiveRefreshSha ?? knownForkSha,
+    baseIsAuthoritative,
   });
   run.worktree = worktree;
   // `createWorktree` made this decision under its branch lock; a caller-side ref probe could go
@@ -188,9 +202,13 @@ export async function warmRunWorktree(
   // deleted and recreated (PR #279 review). Leaving that stale pair in place (by writing neither key)
   // would let a later `findRunBaseRefreshShaForBranch` on this same branch prefer it over the
   // recreated branch's fresh `baseForkSha` as the `--onto` rebase boundary, replaying whatever the
-  // deletion/recreation dropped. Explicit nulls clear it — a harmless no-op when the row never had one.
+  // deletion/recreation dropped. The tombstone (anton-nyz1v, PR #279 review, fifth round), not a
+  // plain null: a null `baseRefreshOutcome` is also what THIS row carried before this call ever ran
+  // (every row starts that way), so a later walk over this branch's rows can't tell "nothing
+  // recorded" from "deliberately cleared" without a value only a genuine recreation ever writes —
+  // see the constant's own doc comment for how `findRunBaseRefreshShaForBranch` reads it back.
   const refreshFields = worktree.createdBranch
-    ? { baseRefreshOutcome: null, baseRefreshSha: null }
+    ? { baseRefreshOutcome: BRANCH_RECREATED_REFRESH_TOMBSTONE, baseRefreshSha: null }
     : worktree.refreshOutcome &&
         !(worktree.refreshOutcome.outcome === "skipped_dirty" && priorEffectiveRefreshSha !== undefined)
       ? { baseRefreshOutcome: worktree.refreshOutcome.outcome, baseRefreshSha: worktree.refreshOutcome.baseSha }

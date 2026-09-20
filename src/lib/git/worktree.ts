@@ -653,8 +653,23 @@ async function refreshOntoBase(opts: {
    * upstream boundary instead, so only what's actually unique to `branch` gets replayed.
    */
   forkSha?: string;
+  /**
+   * Whether `baseBranch` resolved from a CONFIRMED fetch of `origin/<baseBranch>` (anton-nyz1v, PR
+   * #279 review, fifth round) — `resolveFreshBase`'s success path, as opposed to its best-effort
+   * fallback to the plain local branch name when the fetch failed or there was no remote. The two
+   * shapes below that leave a checkout untouched when `baseSha` sits BEHIND `branch`'s own fork point
+   * are safe ONLY for that fallback: there, `baseSha` being behind the fork just means this repo's
+   * last successful fetch predates a NEWER commit `branch` already forked from, and origin genuinely
+   * still has both — nothing to reconcile. A CONFIRMED fetch landing behind the fork means the
+   * opposite: origin's tip was force-pushed or recreated BACKWARD past that commit, so it's the fork
+   * point that's now stale, not this reading of origin — `baseSha` is the authoritative truth, and
+   * leaving `branch` untouched would let its eventual PR silently reintroduce whatever origin's
+   * rewind just dropped. Defaults to `false` (the conservative, no-op-preferring reading) so a caller
+   * that never resolves this stays exactly as safe as before this parameter existed.
+   */
+  baseIsAuthoritative?: boolean;
 }): Promise<RefreshOutcome> {
-  const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha } = opts;
+  const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha, baseIsAuthoritative } = opts;
 
   let baseSha: string;
   try {
@@ -730,10 +745,15 @@ async function refreshOntoBase(opts: {
     const trustedForkSha =
       forkSha && (await branchContainsCommit(repoPath, branch, forkSha)) ? forkSha : undefined;
     if (trustedForkSha) {
-      if (
-        !(await isAncestor(worktreePath, trustedForkSha, baseSha)) &&
-        !(await isAncestor(worktreePath, baseSha, trustedForkSha))
-      ) {
+      // Safe to leave untouched when the fork point descends from `baseSha` (the ordinary case), OR
+      // when `baseSha` descends from the fork point but that reading is only a stale LOCAL fallback
+      // (anton-nyz1v, PR #279 review, fifth round) — never when it's a CONFIRMED fetch, which makes
+      // `baseSha` authoritative and a `baseSha` behind the fork point a genuine rewind, not staleness
+      // (see `baseIsAuthoritative`'s own doc comment).
+      const forkDescendsFromBase = await isAncestor(worktreePath, trustedForkSha, baseSha);
+      const baseIsMerelyStaleFallback =
+        !baseIsAuthoritative && (await isAncestor(worktreePath, baseSha, trustedForkSha));
+      if (!forkDescendsFromBase && !baseIsMerelyStaleFallback) {
         throw new Error(
           `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${baseBranch} ` +
             `(${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork point ${trustedForkSha.slice(0, 12)} — ` +
@@ -850,7 +870,19 @@ async function refreshOntoBase(opts: {
   // baseSha)` and is true for the stale case too (an older `baseSha` is no more an ancestor of
   // `forkSha` than a rewritten one is). Checking this first, unconditionally, lets both the
   // published/preserved and the ordinary path share the same safe answer for a merely-stale base.
+  //
+  // Gated on `!baseIsAuthoritative` (anton-nyz1v, PR #279 review, fifth round): the shape above —
+  // `baseSha` behind `forkSha` — is genuinely ambiguous on its own. A stale LOCAL fallback reads it
+  // exactly like a CONFIRMED fetch of an `origin/<baseBranch>` that was force-pushed or recreated
+  // backward past the fork point does: both leave `baseSha` an ancestor of `forkSha`. Only the former
+  // is safe to no-op; the latter means origin authoritatively dropped `forkSha` (and everything after
+  // it up to the old tip), and `branch` — cut from `forkSha` — still carries that dropped history as
+  // its own ancestry. Leaving it untouched would let its eventual PR against the rewound `baseSha`
+  // silently reintroduce exactly what the rewind was meant to drop. An authoritative rewind instead
+  // falls through to the checks below, which rebase (or, for a published/preserved branch, refuse and
+  // ask for manual resolution) using `baseSha` as the real, current truth.
   if (
+    !baseIsAuthoritative &&
     forkSha &&
     (await branchContainsCommit(repoPath, branch, forkSha)) &&
     (await isAncestor(worktreePath, baseSha, forkSha))
@@ -1167,6 +1199,7 @@ async function reuseIfPresent(
   refresh: boolean | undefined,
   preserveShas: string[] | undefined,
   forkSha: string | undefined,
+  baseIsAuthoritative: boolean | undefined,
 ): Promise<Worktree | undefined> {
   if (!existing || !existsSync(existing.path)) return undefined;
   if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
@@ -1178,6 +1211,7 @@ async function reuseIfPresent(
     baseBranch,
     preserveShas,
     forkSha,
+    baseIsAuthoritative,
   });
   return { ...existing, refreshOutcome };
 }
@@ -1191,6 +1225,7 @@ async function materializeFreshWorktree(
   refresh: boolean | undefined,
   preserveShas: string[] | undefined,
   knownForkSha: string | undefined,
+  baseIsAuthoritative: boolean | undefined,
 ): Promise<Worktree> {
   const path = worktreePathFor(repoPath, branch);
   await mkdir(dirname(path), { recursive: true });
@@ -1214,6 +1249,7 @@ async function materializeFreshWorktree(
       baseBranch,
       preserveShas,
       forkSha: knownForkSha,
+      baseIsAuthoritative,
     });
     const refreshedForkSha = await readForkAtCreation(path);
     return { path: resolved, branch, baseBranch, forkSha: refreshedForkSha, createdBranch, repoPath, refreshOutcome };
@@ -1231,13 +1267,24 @@ async function materializeClaimedWorktree(
   refresh: boolean | undefined,
   preserveShas: string[] | undefined,
   forkSha: string | undefined,
+  baseIsAuthoritative: boolean | undefined,
 ): Promise<Worktree> {
   const { claimed, existing, baseBranch } = await resolveClaimForCreate(repoPath, branch, baseBranchOpt, claimedBy);
-  const reused = await reuseIfPresent(repoPath, branch, baseBranch, claimed, existing, refresh, preserveShas, forkSha);
+  const reused = await reuseIfPresent(
+    repoPath,
+    branch,
+    baseBranch,
+    claimed,
+    existing,
+    refresh,
+    preserveShas,
+    forkSha,
+    baseIsAuthoritative,
+  );
   if (reused) return reused;
   // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
   if (existing) await forgetStaleWorktree(repoPath, existing.path);
-  return materializeFreshWorktree(repoPath, branch, baseBranch, claimed, refresh, preserveShas, forkSha);
+  return materializeFreshWorktree(repoPath, branch, baseBranch, claimed, refresh, preserveShas, forkSha, baseIsAuthoritative);
 }
 
 export async function createWorktree(opts: {
@@ -1265,6 +1312,12 @@ export async function createWorktree(opts: {
   preserveShas?: string[];
   /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its `forkSha` doc comment. */
   forkSha?: string;
+  /**
+   * Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. The
+   * caller resolves this, not `createWorktree` itself: only the caller knows whether `baseBranch`
+   * came from a confirmed fetch (e.g. `resolveFreshBase`'s success path) or a best-effort fallback.
+   */
+  baseIsAuthoritative?: boolean;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -1280,6 +1333,7 @@ export async function createWorktree(opts: {
       opts.refresh,
       opts.preserveShas,
       opts.forkSha,
+      opts.baseIsAuthoritative,
     ),
   );
 

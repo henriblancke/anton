@@ -502,6 +502,118 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-nyz1v (PR #279 review, fifth round): the two tests above stand in for
+    // `resolveFreshBase`'s best-effort FALLBACK — a base reading behind the branch's own fork point
+    // there just means this repo's last successful fetch predates a newer commit the branch already
+    // forked from, so leaving the branch alone is safe. A base from a CONFIRMED fetch reading the
+    // same way means the opposite: origin was actually force-pushed or recreated backward past that
+    // commit, and the branch — cut from it — still carries whatever the rewind dropped as its own
+    // ancestry. `baseIsAuthoritative: true` must therefore NOT take the no-op shortcut; it falls
+    // through to the ordinary rebase/merge machinery, using the rewound base as the real truth.
+    it("rebases past an authoritatively confirmed rewind behind its own fork point, dropping what it removed", async () => {
+      const branch = "anton/refresh-authoritative-rewind";
+      const rewoundBase = branchTip(defaultBranch());
+      advanceDefaultBranch("dropped-by-rewind.txt", "advance 5f\n", "advance main (later dropped by rewind)");
+      const forkPoint = branchTip(defaultBranch());
+      expect(forkPoint).not.toBe(rewoundBase);
+
+      const first = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch() });
+      expect(first.forkSha).toBe(forkPoint);
+      writeFileSync(join(first.path, "own-work.txt"), "ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "unique ticket commit"]);
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        // `rewoundBase` stands in for a CONFIRMED fetch of `origin/<base>` reporting that origin was
+        // force-pushed backward past `forkPoint` — not a stale, unfetched local fallback.
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: rewoundBase,
+          refresh: true,
+          forkSha: first.forkSha,
+          baseIsAuthoritative: true,
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(second.refreshOutcome).toEqual({ outcome: "rebased", baseSha: rewoundBase });
+        const rebaseLog = execFileSync(
+          "git",
+          ["-C", second.path, "log", "--oneline", `${rewoundBase}..HEAD`],
+          { encoding: "utf8" },
+        );
+        expect(rebaseLog).toContain("unique ticket commit");
+        expect(existsSync(join(second.path, "own-work.txt"))).toBe(true);
+        // What the rewind dropped must never be replayed back in as if it were the branch's own work.
+        expect(existsSync(join(second.path, "dropped-by-rewind.txt"))).toBe(false);
+        expect(log.mock.calls.flat().join(" ")).toContain("rebased");
+      } finally {
+        log.mockRestore();
+      }
+    });
+
+    it("refuses an authoritatively confirmed rewind behind an already-published branch's fork point, rather than silently reintroduce it", async () => {
+      const branch = "anton/refresh-authoritative-rewind-published";
+      const rewoundBase = branchTip(defaultBranch());
+      advanceDefaultBranch(
+        "dropped-by-rewind-published.txt",
+        "advance 5g\n",
+        "advance main (later dropped by rewind, published)",
+      );
+      const forkPoint = branchTip(defaultBranch());
+
+      const first = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch() });
+      expect(first.forkSha).toBe(forkPoint);
+      writeFileSync(join(first.path, "own-work.txt"), "already-pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const uniqueSha = headOf(first.path);
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, uniqueSha], { cwd: repo });
+
+      await expect(
+        createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: rewoundBase,
+          refresh: true,
+          forkSha: first.forkSha,
+          baseIsAuthoritative: true,
+        }),
+      ).rejects.toThrow(/no longer descends from .*fork point/);
+      // Untouched — refused, not silently merged over.
+      expect(headOf(first.path)).toBe(uniqueSha);
+    });
+
+    it("refuses to leave a dirty checkout's uncommitted work untouched over an authoritatively confirmed rewind behind its fork point", async () => {
+      const branch = "anton/refresh-authoritative-rewind-dirty";
+      const rewoundBase = branchTip(defaultBranch());
+      advanceDefaultBranch(
+        "dropped-by-rewind-dirty.txt",
+        "advance 5h\n",
+        "advance main (later dropped by rewind, dirty)",
+      );
+      const forkPoint = branchTip(defaultBranch());
+
+      const first = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch() });
+      expect(first.forkSha).toBe(forkPoint);
+      // Uncommitted, parked work — nothing staged or committed.
+      writeFileSync(join(first.path, "parked-edit.txt"), "in-flight work\n");
+
+      await expect(
+        createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: rewoundBase,
+          refresh: true,
+          forkSha: first.forkSha,
+          baseIsAuthoritative: true,
+        }),
+      ).rejects.toThrow(/no longer descends from .*fork point/);
+      // The parked edit is preserved, untouched, exactly as the dirty-tree escape always leaves it.
+      expect(readFileSync(join(first.path, "parked-edit.txt"), "utf8")).toBe("in-flight work\n");
+    });
+
     // anton-s55u (PR #279 review): a prior attempt can push the branch via `pushBranch` and then
     // fail before `gh pr create` completes; the resumed run's refresh must not rewrite those
     // already-public commits, or the retry's own non-forcing push rejects the rebased branch forever.

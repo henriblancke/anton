@@ -292,6 +292,19 @@ export async function findRunBaseForkShaForBranch(
 }
 
 /**
+ * Written onto a row's `baseRefreshOutcome` in place of a plain null when its checkout's branch was
+ * DELETED and RECREATED (anton-nyz1v, PR #279 review, fifth round) — `execute-epic-claim.ts` writes
+ * this whenever `createWorktree` reports `createdBranch: true`, instead of leaving the column at its
+ * default null. A plain null cannot serve as that marker: it's also what the CURRENT attempt's own
+ * row carries before ITS refresh has run (every row is inserted, and is therefore already the
+ * newest row for its branch, well before `warmRunWorktree` gets far enough to populate this column),
+ * so a query that just took "the newest null row" as a stop signal would stop on its own
+ * not-yet-written row on every single call and never see a real boundary at all. This sentinel is
+ * unambiguous: only a deliberate recreation writes it, never an unwritten column.
+ */
+export const BRANCH_RECREATED_REFRESH_TOMBSTONE = "branch_recreated";
+
+/**
  * The base sha the most recent EFFECTIVE (non-`skipped_dirty`) refresh on this epic's BRANCH
  * settled on, from whichever row recorded it, whatever became of that row (PR #279 review) — the
  * refresh half of {@link findRunBaseForkShaForBranch}, needed for the same reason: an ordinary
@@ -305,6 +318,16 @@ export async function findRunBaseForkShaForBranch(
  * came after it, onto the new base), so `refreshOntoBase` would silently fall back to the plain,
  * unsafe form of `rebase` on a later refresh. The most recently applied base IS still on the branch
  * — it's what everything got rebased onto — and describes the same boundary a second `--onto` needs.
+ *
+ * Walked in recency order rather than filtered to one row in SQL (anton-nyz1v, PR #279 review, fifth
+ * round): a row recording an OLDER effective refresh can outlive the branch it describes — a later
+ * attempt deletes and recreates the branch, records {@link BRANCH_RECREATED_REFRESH_TOMBSTONE} on
+ * its own row, and dies before ever running its own refresh. Filtering straight to
+ * `isNotNull(baseRefreshSha)` skips that tombstone row (its `baseRefreshSha` stays null) and returns
+ * the older row's boundary as if the recreation never happened — replaying whatever the deletion
+ * dropped back onto the recreated branch. Walking newest-first and stopping at the first tombstone
+ * makes that row the wall it's meant to be; a `skipped_dirty` row in between is skipped, never
+ * mistaken for a wall or a boundary, exactly as the old `ne(...)` filter treated it.
  */
 export async function findRunBaseRefreshShaForBranch(
   db: AntonDb,
@@ -313,22 +336,25 @@ export async function findRunBaseRefreshShaForBranch(
   branch: string,
 ): Promise<string | undefined> {
   const rows = await db
-    .select({ baseRefreshSha: schema.runs.baseRefreshSha })
+    .select({ baseRefreshOutcome: schema.runs.baseRefreshOutcome, baseRefreshSha: schema.runs.baseRefreshSha })
     .from(schema.runs)
     .where(
       and(
         eq(schema.runs.projectId, projectId),
         eq(schema.runs.epicBeadId, epicBeadId),
         eq(schema.runs.branch, branch),
-        isNotNull(schema.runs.baseRefreshSha),
-        ne(schema.runs.baseRefreshOutcome, "skipped_dirty"),
+        isNotNull(schema.runs.baseRefreshOutcome),
       ),
     )
     // Ordered exactly as findRunBaseForkShaForBranch is, and for its reason: `updatedAt` is
     // second-granular, so `writeSeq` breaks a tie by which attempt settled last.
-    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
-    .limit(1);
-  return rows[0]?.baseRefreshSha ?? undefined;
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt));
+  for (const row of rows) {
+    if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
+    if (row.baseRefreshOutcome === "skipped_dirty") continue;
+    if (row.baseRefreshSha) return row.baseRefreshSha;
+  }
+  return undefined;
 }
 
 /** A clean verdict's resume key, as {@link findRunReviewKeyForBranch} recovers it for a fresh row. */
