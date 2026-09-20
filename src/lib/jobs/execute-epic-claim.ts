@@ -275,18 +275,37 @@ export async function warmRunWorktree(
   // That fallback is itself frozen at the instant the refresh it came from ran, and origin can move
   // between then and now — including a force-push that drops a commit an already-shipped claim
   // cites (PR #279 review). Verifying against the frozen sha regardless would accept evidence the
-  // CURRENT base no longer holds. So it is kept only while `freshBase` — resolved moments ago, at
-  // the top of this very attempt — still descends from it: ordinary forward motion, where nothing
-  // the fallback already proved could have been dropped. Once it doesn't, the fallback is stale in
-  // exactly the way a rewritten base makes it, and `freshBase` is asked instead — the only read here
-  // that reflects origin as it stands now.
+  // CURRENT base no longer holds. So it is kept only while `pinnedBase` below — resolved moments
+  // ago, at the top of this very attempt — still descends from it: ordinary forward motion, where
+  // nothing the fallback already proved could have been dropped. Once it doesn't, the fallback is
+  // stale in exactly the way a rewritten base makes it, and `pinnedBase` is asked instead — the only
+  // read here that reflects origin as it stands now.
+  //
+  // `pinnedBase`, not the bare `freshBase` local (PR #279 review): two `await`s sit between
+  // `refreshOntoBase` pinning its base sha and this check, during which a sibling run's fetch on the
+  // same local repo can move `origin/<base>` out from under the mutable ref `freshBase` names.
+  // `refreshOntoBase` resolves its base sha once, up front, for exactly this reason — including on
+  // `skipped_dirty`, which still returns the sha it reasoned about (`refreshOntoBase`'s own
+  // `return { outcome: "skipped_dirty", baseSha }`) — so reusing that pin here keeps this check
+  // evaluated against the same commit the refresh itself saw, rather than one a race moved on to.
+  const pinnedBase = worktree.refreshOutcome?.baseSha ?? freshBase;
   const shippedFallback = reusedCheckout ? (priorEffectiveRefreshSha ?? baseForkSha) : baseForkSha;
+  // Both ancestry directions, not just fallback-descends-from-base (PR #279 review): a dirty resume
+  // whose `resolveFreshBase` fell back to a stale LOCAL base (no network) can leave `pinnedBase`
+  // BEHIND `shippedFallback` — e.g. local `main` sits at A while an earlier, still-recorded refresh
+  // already carried this branch to B. Checking only whether `shippedFallback` descends from
+  // `pinnedBase` answers no in that case and falls through to `pinnedBase`, even though the checkout
+  // still holds B — rejecting a truthful already-shipped claim that cites B's commits. So
+  // `shippedFallback` is kept whenever EITHER side is an ancestor of the other — ordinary forward
+  // motion, or this offline lag — and only a genuine divergence (neither an ancestor of the other,
+  // the shape a history-rewriting force-push leaves) falls through to `pinnedBase`.
   const alreadyShippedBase =
     worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
       ? worktree.refreshOutcome.baseSha
-      : (await isAncestor(worktree.path, shippedFallback, freshBase))
+      : (await isAncestor(worktree.path, shippedFallback, pinnedBase)) ||
+          (await isAncestor(worktree.path, pinnedBase, shippedFallback))
         ? shippedFallback
-        : freshBase;
+        : pinnedBase;
 
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
   // dispatched in the order the project's formula declares. This is what they all operate on; each

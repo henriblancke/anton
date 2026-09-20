@@ -967,7 +967,11 @@ function worktreeReads(
   run: Pick<StepContext, "repoPath" | "branch" | "baseRef">,
 ): BranchDeliveryReads {
   return {
-    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id),
+    // Exclude commits reachable from the base AS IT READS NOW (PR #279 review): a refresh can bring
+    // in a commit for a child already closed on the board, and an unbounded scan would then read
+    // that INHERITED base commit as this branch's own delivery of the ticket rather than base
+    // history — the same widening `excludeBase` closes for the dispatch partition above.
+    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id, { excludeBase: run.baseRef }),
     satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
     notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket),
     branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, sha),
@@ -1310,7 +1314,7 @@ async function deliveredOrPark(
 ): Promise<{ delivered: Bead[]; targetRetired: boolean }> {
   const { targetId: epicBeadId, timedOut } = run;
   const { skipped } = ledger;
-  const { worktree } = prep;
+  const { worktree, runStep } = prep;
   // What the RUN phase then speaks for (anton-lnkt): its steps read this run's whole diff and put
   //     these ids in the PR body, so the set has to be the work actually on the branch.
   //     `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
@@ -1343,10 +1347,15 @@ async function deliveredOrPark(
   const retired = new Set(run.retired.map((r) => r.id));
   //     A human ticket a SIBLING's commit satisfied stays too (PR #258 review): the ledger proved
   //     the work is on this branch under another name, so the branch question above cannot see it.
+  //     `excludeBase: runStep.baseRef` (PR #279 review): a refresh can bring in a commit for a
+  //     ticket already closed on the board, and an unbounded scan would then count that INHERITED
+  //     base commit as work THIS branch delivered — a nonempty ledger built entirely from base
+  //     history would bypass the empty-delivery park below and open a PR with an empty diff, or
+  //     (with other branch work) falsely attribute the inherited ticket to it.
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id) && !retired.has(t.id)),
     stoppedShort,
-    (id) => worktreeHasCommitFor(worktree.path, id),
+    (id) => worktreeHasCommitFor(worktree.path, id, { excludeBase: runStep.baseRef }),
     new Set(ledger.satisfied.keys()),
   );
 

@@ -396,13 +396,51 @@ it("falls back alreadyShippedBase to a prior resume's recorded refresh when this
   expect(row?.baseRefreshSha).toBe("prior-base");
 });
 
-it("verifies against the freshly-resolved base, not a dirty resume's stale recorded refresh, once origin has moved past it (PR #279 review)", async () => {
+it("keeps the prior resume's recorded refresh when an offline dirty resume's fallback base is merely BEHIND it (PR #279 review)", async () => {
+  // Attempt 1 refreshed this reused checkout onto `prior-base` (recorded as `merged`) while online.
+  // Attempt 2 (this one) is a DIRTY resume that also can't reach the network, so `resolveFreshBase`
+  // falls back to the local, stale base ref — and `refreshOntoBase` pins that same stale value as
+  // its `skipped_dirty` base sha before ever fetching. `prior-base` is AHEAD of that stale pin (the
+  // checkout still carries it from the earlier successful refresh) rather than genuinely diverged
+  // from it, so `alreadyShippedBase` must keep citing `prior-base` — checking only whether
+  // `prior-base` descends from the stale pin (and not the reverse) would wrongly answer no here and
+  // fall through to the stale pin, rejecting a truthful already-shipped claim that cites commits the
+  // checkout still has.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "prior-base",
+    branch: BRANCH,
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "stale-offline-base" },
+  });
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, a, b] = args as [string, string, string];
+    return a === "stale-offline-base" && b === "prior-base";
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun(RUN_ID));
+
+  expect(runStep.baseForkSha).toBe("old-fork-commit");
+  expect(runStep.alreadyShippedBase).toBe("prior-base");
+});
+
+it("verifies against the pinned dirty-resume base, not a stale recorded refresh, once neither descends from the other (PR #279 review)", async () => {
   // Attempt 1 refreshed this reused checkout onto `prior-base` (recorded as `merged`). Before
   // attempt 2, origin's base was force-pushed past `prior-base` — dropping a commit an
   // already-shipped claim could cite — and this attempt finds the checkout dirty, so
-  // `refreshOntoBase` reports `skipped_dirty` without re-fetching. `prior-base` no longer descends
-  // to the freshly-resolved base, so `alreadyShippedBase` must ask the fresh base instead of the
-  // stale recorded one.
+  // `refreshOntoBase` reports `skipped_dirty` without re-fetching, returning the base sha it
+  // resolved and pinned before finding the checkout dirty. `prior-base` and that pinned base
+  // share no ancestry in either direction (the force-push truly diverged them), so
+  // `alreadyShippedBase` must ask the pinned base `refreshOntoBase` itself reasoned about —
+  // never a `freshBase` re-resolved here, which a sibling run's fetch could have moved on to a
+  // different commit in the two `await`s since.
   await actualRuns.updateRun(t.db, clock, RUN_ID, {
     baseForkSha: "old-fork-commit",
     baseRefreshOutcome: "merged",
@@ -422,7 +460,7 @@ it("verifies against the freshly-resolved base, not a dirty resume's stale recor
   const { runStep } = await warmRunWorktree(makeRun(RUN_ID));
 
   expect(runStep.baseForkSha).toBe("old-fork-commit");
-  expect(runStep.alreadyShippedBase).toBe(FRESH_BASE);
+  expect(runStep.alreadyShippedBase).toBe("this-attempt-dirty-base");
 });
 
 it("passes the last EFFECTIVE refresh's base as the --onto boundary, in preference to the original fork (PR #279 review)", async () => {

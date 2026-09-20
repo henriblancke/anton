@@ -876,6 +876,20 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(dispatchedIds()).toEqual(["anton-a"]);
   });
 
+  // A base refresh can bring in a commit for a child already closed on the board (PR #279 review):
+  // an unbounded scan here would read that INHERITED base commit as this branch's own delivery and
+  // skip re-dispatching a ticket whose work is not actually in this run's diff. Excluding what the
+  // current base already carries is what keeps this "present under any name" read scoped to what
+  // THIS branch added, matching the bound the dispatch partition itself already applies.
+  it("excludes commits reachable from the current base when checking a closed child's delivery", async () => {
+    const child = closedChild("anton-a");
+    showMock.mockResolvedValue(child);
+
+    await dispatchRunTickets(makeResume(child), prep());
+
+    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { excludeBase: BASE_REF });
+  });
+
   it("leaves alone a bead somebody reopened since the run's snapshot", async () => {
     const child = closedChild("anton-a");
     showMock.mockResolvedValue({ ...child, status: "open" });
