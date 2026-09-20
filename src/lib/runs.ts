@@ -207,6 +207,8 @@ export type RunPatch = Partial<{
   baseRefreshSha: string | null;
   /** The branch's tip just before a still-pending refresh above was attempted (anton-s55u) — see schema. */
   pendingRefreshFromSha: string | null;
+  /** This row's own last effective refresh boundary, snapshotted before it goes pending (anton-s55u) — see schema. */
+  priorBaseRefreshSha: string | null;
   attempts: number;
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
@@ -338,7 +340,11 @@ export async function findRunBaseRefreshShaForBranch(
   branch: string,
 ): Promise<string | undefined> {
   const rows = await db
-    .select({ baseRefreshOutcome: schema.runs.baseRefreshOutcome, baseRefreshSha: schema.runs.baseRefreshSha })
+    .select({
+      baseRefreshOutcome: schema.runs.baseRefreshOutcome,
+      baseRefreshSha: schema.runs.baseRefreshSha,
+      priorBaseRefreshSha: schema.runs.priorBaseRefreshSha,
+    })
     .from(schema.runs)
     .where(
       and(
@@ -357,11 +363,16 @@ export async function findRunBaseRefreshShaForBranch(
     // A still-PENDING row (see PENDING_REFRESH_OUTCOME below) records what a dead attempt INTENDED,
     // not a confirmed outcome — trusting its sha here as if it were a settled boundary would recreate
     // exactly the unsafe blind trust this whole mechanism exists to avoid, just via a new sentinel
-    // instead of stale data. Skipped like `skipped_dirty`, not treated as a wall like the tombstone:
-    // an OLDER row's genuinely confirmed boundary is still the right answer until something
-    // reconciles the pending one. See `findPendingRefreshShaForBranch` for how a caller with git
-    // access resolves it.
-    if (row.baseRefreshOutcome === PENDING_REFRESH_OUTCOME) continue;
+    // instead of stale data. Its OWN `priorBaseRefreshSha`, when recorded, is different: it's this
+    // same row's last EFFECTIVE boundary, snapshotted the instant this pending write overwrote it (PR
+    // #279 review, P1) — trusting that is not a new blind trust, it's recovering what this row itself
+    // already confirmed before starting a refresh a crash then left unresolved. Only when neither is
+    // available (a legacy pending row, or one written before this attempt ever had a boundary of its
+    // own) does the walk fall through to an OLDER row's genuinely confirmed boundary, same as before.
+    if (row.baseRefreshOutcome === PENDING_REFRESH_OUTCOME) {
+      if (row.priorBaseRefreshSha) return row.priorBaseRefreshSha;
+      continue;
+    }
     if (row.baseRefreshSha) return row.baseRefreshSha;
   }
   return undefined;

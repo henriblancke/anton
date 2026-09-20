@@ -85,6 +85,19 @@ export const runs = sqliteTable("runs", {
   // inconclusive and the pending sha is not trusted; only when it wasn't, and is now, has the branch
   // actually moved. See findPendingRefreshShaForBranch's reconciliation caller in execute-epic-claim.ts.
   pendingRefreshFromSha: text("pending_refresh_from_sha"),
+  // This row's own last EFFECTIVE (non-pending, non-skipped_dirty) refresh boundary, snapshotted onto
+  // a SEPARATE column the instant baseRefreshOutcome/baseRefreshSha above are overwritten with the
+  // pending marker (PR #279 review, P1) — a resumed run (parked, then picked back up) calls
+  // warmRunWorktree again on this SAME row, and a plain overwrite would discard the row's own prior,
+  // already-confirmed boundary the moment it starts a NEW refresh. Without this, a crash between that
+  // overwrite and the finalize write leaves nothing on this row (or any other) recording the boundary
+  // that prior refresh actually landed on: findRunBaseRefreshShaForBranch's branch-wide walk skips
+  // this row (now pending) and falls through to an older row or `baseForkSha`, both further back than
+  // the checkout's own confirmed history — a later `--onto` rebase can then replay commits that
+  // earlier refresh already carried forward as if they were still-unapplied base history.
+  // Read back only while baseRefreshOutcome = pending (see findRunBaseRefreshShaForBranch); inert and
+  // never cleared once a real outcome resettles the row, since nothing reads it in that state.
+  priorBaseRefreshSha: text("prior_base_refresh_sha"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports

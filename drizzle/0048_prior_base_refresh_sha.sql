@@ -1,0 +1,21 @@
+-- This row's own last EFFECTIVE (non-pending, non-skipped_dirty) refresh boundary, snapshotted onto
+-- this SEPARATE column the instant base_refresh_outcome/base_refresh_sha are overwritten with the
+-- pending marker (base_refresh_outcome = 'pending', PENDING_REFRESH_OUTCOME in runs.ts) (anton-s55u,
+-- PR #279 review, P1) — execute-epic-claim.ts's `beforeMutate` write-ahead hook writes it alongside
+-- the pending marker.
+--
+-- A resumed run (parked, then picked back up) calls warmRunWorktree again on this SAME row, and a
+-- plain overwrite would discard the row's own prior, already-confirmed boundary the moment it starts
+-- a NEW refresh. Without this column, a crash between that overwrite and the finalize write leaves
+-- nothing on this row (or any other) recording the boundary that prior refresh actually landed on:
+-- findRunBaseRefreshShaForBranch's branch-wide walk skips this row (now pending) and falls through to
+-- an older row or the frozen base_fork_sha, both further back than the checkout's own confirmed
+-- history — a later `--onto` rebase can then replay commits that earlier refresh already carried
+-- forward as if they were still-unapplied base history.
+--
+-- Nullable and NOT backfilled: only meaningful while base_refresh_outcome = 'pending'; ignored once a
+-- real outcome resettles the row.
+--
+-- Reverse:
+--   ALTER TABLE `runs` DROP COLUMN `prior_base_refresh_sha`;
+ALTER TABLE `runs` ADD `prior_base_refresh_sha` text;

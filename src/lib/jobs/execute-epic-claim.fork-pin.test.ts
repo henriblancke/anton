@@ -633,6 +633,40 @@ it("persists a pending refresh boundary via beforeMutate before the mutating git
   expect(row?.baseRefreshSha).toBe("about-to-refresh-onto-this");
 });
 
+// anton-s55u (PR #279 review, P1, re-review): a resumed run calls warmRunWorktree again on the SAME
+// row that already carries a confirmed refresh from an earlier warm — beforeMutate's pending write is
+// about to overwrite that row's own baseRefreshOutcome/baseRefreshSha, so it must snapshot the
+// boundary onto priorBaseRefreshSha first, or a crash in the mutation window that follows loses it
+// for good (see findRunBaseRefreshShaForBranch's read-back of this same column).
+it("snapshots this row's own prior confirmed boundary onto priorBaseRefreshSha before overwriting it with the pending marker", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "rebased",
+    baseRefreshSha: "earlier-confirmed-base",
+    branch: BRANCH,
+  });
+  let rowDuringMutation: { baseRefreshOutcome: string | null; priorBaseRefreshSha: string | null } | undefined;
+  createWorktreeMock.mockImplementation(
+    async (opts: { beforeMutate?: (baseSha: string, branchSha: string) => Promise<void> }) => {
+      await opts.beforeMutate?.("second-refresh-target", "branch-tip-before-second-mutation");
+      rowDuringMutation = await actualRuns.getRunById(t.db, RUN_ID);
+      return {
+        path: WORKTREE,
+        branch: BRANCH,
+        baseBranch: FRESH_BASE,
+        createdBranch: false,
+        repoPath: "/repo",
+        refreshOutcome: { outcome: "rebased", baseSha: "second-refresh-target" },
+      };
+    },
+  );
+
+  await warmRunWorktree(makeRun(RUN_ID));
+
+  expect(rowDuringMutation?.baseRefreshOutcome).toBe(actualRuns.PENDING_REFRESH_OUTCOME);
+  expect(rowDuringMutation?.priorBaseRefreshSha).toBe("earlier-confirmed-base");
+});
+
 // anton-s55u (PR #279 review, P2): swallowing this write's failure used to let refreshOntoBase's
 // mutating call proceed with no write-ahead record at all — the exact unrecorded-mutation gap
 // `beforeMutate` exists to close. The rejection must propagate instead, so the mutation never runs.
@@ -727,6 +761,42 @@ it("ignores a pending refresh that never actually landed on the branch, falling 
 
   expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
     expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
+// anton-s55u (PR #279 review, P1, re-review): this row itself, not just an older one, can already
+// carry a genuinely confirmed boundary — a resumed run calls warmRunWorktree again on the SAME row,
+// and its beforeMutate write-ahead hook overwrites baseRefreshOutcome/baseRefreshSha with the pending
+// marker the instant it starts a SECOND refresh. Losing that prior boundary would make a crash right
+// after this overwrite fall all the way back to the original fork, even though the branch's own
+// history already carries a later, confirmed base this row itself applied.
+it("falls back to this row's own prior confirmed boundary, not the original fork, when its pending refresh never landed", async () => {
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base-never-applied",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    // This row's OWN last effective refresh, snapshotted by beforeMutate right before the pending
+    // write above overwrote baseRefreshOutcome/baseRefreshSha with it.
+    priorBaseRefreshSha: "this-rows-own-earlier-confirmed-base",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  isAncestorMock.mockResolvedValue(false);
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "this-rows-own-earlier-confirmed-base" }),
   );
 });
 

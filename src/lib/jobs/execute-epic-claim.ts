@@ -219,11 +219,19 @@ export async function warmRunWorktree(
     // mutation gap this mechanism exists to close, so the rejection propagates and the mutating call
     // never runs. `refreshOntoBase` awaits this before touching the branch, so the checkout is left
     // untouched — the retry that follows finds the same, still-unmutated branch.
+    // `priorBaseRefreshSha` alongside the pending marker (PR #279 review, P1): this write is about to
+    // overwrite THIS row's own `baseRefreshOutcome`/`baseRefreshSha` — which, on a resumed run calling
+    // this a second time, can already hold a genuinely confirmed boundary from an earlier, successful
+    // refresh on this same row. `priorEffectiveRefreshSha`, resolved above before any of this call's
+    // own writes ran, is exactly that boundary (or an older row's, or undefined) — snapshotting it here
+    // is what lets findRunBaseRefreshShaForBranch recover it later if a crash leaves this write as the
+    // last one this row ever makes.
     beforeMutate: (baseSha, branchSha) =>
       updateRun(db, clock, runId, {
         baseRefreshOutcome: PENDING_REFRESH_OUTCOME,
         baseRefreshSha: baseSha,
         pendingRefreshFromSha: branchSha,
+        priorBaseRefreshSha: priorEffectiveRefreshSha ?? null,
       }),
   });
   run.worktree = worktree;
