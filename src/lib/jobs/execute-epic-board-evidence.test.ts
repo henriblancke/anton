@@ -483,6 +483,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-baseline",
         Object.fromEntries(baseline.beads),
         true,
+        true,
       );
     },
   );
@@ -544,6 +545,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         metadata: {
           boardEvidenceBaseline: JSON.stringify(preserved),
           boardEvidenceBaselineLocked: "1",
+          boardEvidenceBaselineVerified: "1",
         },
       });
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
@@ -588,6 +590,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-baseline-upgrade",
         Object.fromEntries(baseline.beads),
+        true,
         true,
       );
     },
@@ -648,7 +651,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         evidenceUnavailable: true,
       });
       const preserved = Object.fromEntries(firstBaseline.beads);
-      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-recover", preserved, true);
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-recover", preserved, true, true);
 
       // Resume: a heartbeat/backstop sync (outside this check) already pushed the write, so a
       // FRESH board read alone would show no diff at all. But the ticket now carries the baseline
@@ -756,6 +759,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-fast-path-baseline",
         Object.fromEntries(baseline.beads),
         true,
+        true,
       );
     },
   );
@@ -774,6 +778,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         metadata: {
           boardEvidenceBaseline: JSON.stringify(preserved),
           boardEvidenceBaselineLocked: "1",
+          boardEvidenceBaselineVerified: "1",
         },
       });
       loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
@@ -808,6 +813,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-fast-path-baseline-upgrade",
         Object.fromEntries(baseline.beads),
+        true,
         true,
       );
     },
@@ -875,6 +881,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-marker-unpersisted-baseline",
         Object.fromEntries(baseline.beads),
         true,
+        true,
       );
     },
   );
@@ -888,6 +895,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         metadata: {
           boardEvidenceBaseline: JSON.stringify(preserved),
           boardEvidenceBaselineLocked: "1",
+          boardEvidenceBaselineVerified: "1",
         },
       });
       loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
@@ -924,6 +932,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-marker-unpersisted-upgrade",
         Object.fromEntries(baseline.beads),
+        true,
         true,
       );
     },
@@ -1463,6 +1472,10 @@ describe(
       // the board after syncing the baseline lock") finds nothing further, so the lock is handed back
       // without another round.
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      // Verified once the lock's own stability re-read comes back stable (chatgpt-codex-connector,
+      // PR #284 review, "Distinguish tentative locks before trusting them on resume") — a second
+      // write, distinct from the tentative lock write above.
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
       const pushCallsBefore = pushMock.mock.calls.length;
 
       await expect(ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline)).resolves.toEqual(
@@ -1474,17 +1487,19 @@ describe(
         "t-fresh",
         Object.fromEntries(baseline.beads),
       );
-      // The lock write (chatgpt-codex-connector, PR #284 review, "Lock the baseline before starting
-      // dispatch") — the settled baseline is persisted a second time, now marked as a recovery
-      // baseline, before this function ever hands it back for dispatch.
+      // The final write (chatgpt-codex-connector, PR #284 review, "Lock the baseline before starting
+      // dispatch" / "Distinguish tentative locks before trusting them on resume") marks the settled
+      // baseline both locked AND verified, before this function ever hands it back for dispatch.
       expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
         "/repo",
         "t-fresh",
         Object.fromEntries(baseline.beads),
         true,
+        true,
       );
       expect(pushMock).toHaveBeenCalledWith("/repo");
-      // The initial confirming push, plus the lock's own confirming push.
+      // The initial confirming push, plus the lock's own confirming push — the verified-marking
+      // write itself triggers no additional push (same-machine dispatch is about to follow anyway).
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 2);
     });
 
@@ -1499,20 +1514,23 @@ describe(
       const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
       pushMock.mockResolvedValueOnce("synced");
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
-      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
       pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
 
       await expect(
         ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
       ).resolves.toEqual(baseline);
 
-      // The only write is the lock — no re-persist of the unlocked original.
-      expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore + 1);
+      // The only writes are the tentative lock and its verified upgrade — no re-persist of the
+      // unlocked original.
+      expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore + 2);
       expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
         "/repo",
         "t-preserved",
         Object.fromEntries(baseline.beads),
+        true,
         true,
       );
       expect(pushMock).toHaveBeenCalledWith("/repo");
@@ -1533,20 +1551,22 @@ describe(
         pushMock.mockResolvedValueOnce("synced"); // the refreshed confirming push
         // The stabilizing re-read after THAT push finds nothing further, so the loop stops here.
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
-        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the lock write
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
         pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
         // The lock's own post-push stability re-read finds nothing further either.
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "after the pull" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
         const pushCallsBefore = pushMock.mock.calls.length;
 
         const refreshed = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
 
         expect(refreshed).toEqual(fingerprintBoard([bead("a", { description: "after the pull" })]));
-        // The last write is the lock — settled onto the REFRESHED baseline, not the original.
+        // The last write marks the REFRESHED baseline locked AND verified, not the original.
         expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
           "/repo",
           "t-fresh",
           Object.fromEntries(refreshed!.beads),
+          true,
           true,
         );
         // Only ONE refresh round actually changed anything (one extra persist/push), plus the lock's
@@ -1674,20 +1694,27 @@ describe(
         "needs to diff against",
       async () => {
         const baseline = fingerprintBoard([bead("a", { description: "before dispatch" })]);
+        // VERIFIED, not just locked (chatgpt-codex-connector, PR #284 review, "Distinguish
+        // tentative locks before trusting them on resume") — this represents a lock
+        // `lockDispatchBaseline` already finished proving stable before the prior attempt ever
+        // dispatched, the only shape that is safe to trust untouched here. A locked-but-unverified
+        // ticket is the DIFFERENT, unsafe case covered by its own test below.
         const recoveryTicket = bead("t-recovery-locked", {
           metadata: {
             boardEvidenceBaseline: JSON.stringify(Object.fromEntries(baseline.beads)),
             boardEvidenceBaselineLocked: "1",
+            boardEvidenceBaselineVerified: "1",
           },
         });
         pushMock.mockResolvedValueOnce("synced");
         const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
         const loadCallsBefore = loadAllIssuesMock.mock.calls.length;
 
-        // Deliberately no `loadAllIssuesMock` stub queued: were this baseline NOT locked, the
-        // confirming pull's post-push refresh read would consume one here (reflecting the prior
-        // dispatched attempt's own delivery, still landing) and fold it into a "refreshed"
-        // baseline, erasing this recovery snapshot. Locked, that read must never happen at all.
+        // Deliberately no `loadAllIssuesMock` stub queued: were this baseline NOT locked and
+        // verified, the confirming pull's post-push refresh read would consume one here (reflecting
+        // the prior dispatched attempt's own delivery, still landing) and fold it into a "refreshed"
+        // baseline, erasing this recovery snapshot. Locked and verified, that read must never happen
+        // at all.
 
         await expect(
           ensureBoardBaselinePersisted("/repo", recoveryTicket, baseline),
@@ -1712,22 +1739,24 @@ describe(
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist, attempt 1
         pushMock.mockResolvedValueOnce("synced"); // attempt 1's confirming push
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "before dispatch" })]); // stable
-        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // attempt 1's lock write
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // attempt 1's tentative lock write
         pushMock.mockResolvedValueOnce("synced"); // attempt 1's lock-confirming push
         // Attempt 1's lock's own post-push stability re-read finds nothing further.
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "before dispatch" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // attempt 1's verified-marking write
 
         const attempt1 = await ensureBoardBaselinePersisted("/repo", bead("t-crash"), baseline);
         expect(attempt1).toEqual(baseline);
 
         // The process dies here, mid-agent-session — after the fixer's own writes land on the board,
-        // before this ticket ever reaches `readBoardEvidence`. A resumed attempt reads the LOCKED
-        // baseline this call just persisted (never a fresh read that would already absorb those
-        // writes), and its confirming pull would otherwise pull them straight in.
+        // before this ticket ever reaches `readBoardEvidence`. A resumed attempt reads the LOCKED AND
+        // VERIFIED baseline this call just persisted (never a fresh read that would already absorb
+        // those writes), and its confirming pull would otherwise pull them straight in.
         const resumedTicket = bead("t-crash", {
           metadata: {
             boardEvidenceBaseline: JSON.stringify(Object.fromEntries(baseline.beads)),
             boardEvidenceBaselineLocked: "1",
+            boardEvidenceBaselineVerified: "1",
           },
         });
         pushMock.mockResolvedValueOnce("synced"); // attempt 2's reconfirm push
@@ -1739,6 +1768,51 @@ describe(
         // already changed, which is exactly what an unlocked baseline would have folded in.
         expect(attempt2).toEqual(baseline);
         expect(loadAllIssuesMock.mock.calls.length).toBe(loadCallsBefore);
+      },
+    );
+
+    it(
+      "treats a lock left LOCKED-BUT-UNVERIFIED as refreshable, never as a settled recovery baseline " +
+        "(chatgpt-codex-connector, PR #284 review, \"Distinguish tentative locks before trusting them " +
+        "on resume\") — a process death between `lockDispatchBaseline` persisting its tentative lock " +
+        "and that SAME round's own confirming push/re-read proving it stable leaves exactly this " +
+        "shape on the board. Blindly trusting it (as a bare `boardEvidenceBaselineLocked` check used " +
+        "to) would skip re-reading the board entirely, and a concurrent write landing in that crash " +
+        "window would then be credited to a no-op agent as its own delivery once the post-run diff " +
+        "runs against this untouched value",
+      async () => {
+        const staleCandidate = fingerprintBoard([bead("a", { description: "v0" })]);
+        const tentativelyLockedTicket = bead("t-tentative", {
+          metadata: {
+            boardEvidenceBaseline: JSON.stringify(Object.fromEntries(staleCandidate.beads)),
+            boardEvidenceBaselineLocked: "1",
+            // Deliberately no `boardEvidenceBaselineVerified` — this is the exact tentative shape
+            // `lockDispatchBaseline` can leave behind mid-round.
+          },
+        });
+        pushMock.mockResolvedValueOnce("synced"); // ensureBoardBaselinePersisted's own confirming push
+        // `lockDispatchBaseline` is re-entered directly (never the free-refresh loop, which would
+        // leave a stale `locked` flag behind — see that branch's own comment) and re-verifies the
+        // candidate from scratch: its OWN confirming push pulls in a write from the crash window.
+        pushMock.mockResolvedValueOnce("synced"); // round 0's lock-confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1 — landed during the crash window" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 1's re-persisted lock, now onto v1
+        pushMock.mockResolvedValueOnce("synced"); // round 1's lock-confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1 — landed during the crash window" })]); // stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 1's verified-marking write
+
+        const result = await ensureBoardBaselinePersisted("/repo", tentativelyLockedTicket, staleCandidate);
+
+        // Never the stale tentative value — the concurrent write is folded in, not silently trusted
+        // away, so a no-op agent dispatched against this baseline can never be credited with it.
+        expect(result).toEqual(fingerprintBoard([bead("a", { description: "v1 — landed during the crash window" })]));
+        expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-tentative",
+          Object.fromEntries(result!.beads),
+          true,
+          true,
+        );
       },
     );
 
@@ -1759,6 +1833,7 @@ describe(
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 2's re-persisted lock, now onto v1
         pushMock.mockResolvedValueOnce("synced"); // round 2's lock-confirming push
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1" })]); // round 2's stability re-read: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 2's verified-marking write
 
         const locked = await ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline);
 
@@ -1767,6 +1842,7 @@ describe(
           "/repo",
           "t-fresh",
           Object.fromEntries(locked!.beads),
+          true,
           true,
         );
       },

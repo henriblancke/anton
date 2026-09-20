@@ -372,7 +372,8 @@ export async function ensureBoardBaselinePersisted(
   baseline: BoardFingerprint,
 ): Promise<BoardFingerprint | null> {
   const hadBaseline = Boolean(beads.boardEvidenceBaseline(ticket));
-  const recoveryBaseline = hadBaseline && beads.boardEvidenceBaselineLocked(ticket);
+  const locked = hadBaseline && beads.boardEvidenceBaselineLocked(ticket);
+  const recoveryBaseline = locked && beads.boardEvidenceBaselineVerified(ticket);
   if (!hadBaseline) {
     const persisted = await mustPersist(() =>
       beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
@@ -385,6 +386,15 @@ export async function ensureBoardBaselinePersisted(
     .catch(() => false);
   if (!synced) return null;
   if (recoveryBaseline) return baseline;
+  // A lock left mid-verification (chatgpt-codex-connector, PR #284 review, "Distinguish tentative
+  // locks before trusting them on resume") is NOT the never-dispatched baseline the free-refresh
+  // loop below assumes: that loop's own persist omits the locked/verified keys entirely, and `bd`
+  // MERGES metadata rather than replacing it, so writing through it here would leave a stale
+  // `locked` flag pointing at a candidate this call is about to replace with `refreshed`. Re-enter
+  // `lockDispatchBaseline` directly instead — it already knows how to re-verify (or move past) a
+  // candidate it may have locked tentatively itself, on a PRIOR attempt that crashed before ever
+  // confirming it stable.
+  if (locked) return lockDispatchBaseline(repo, ticket, baseline);
 
   let confirmed = baseline;
   for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
@@ -493,7 +503,7 @@ async function lockDispatchBaseline(
       ? await mustPersist(() =>
           beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(candidate), true),
         )
-      : await preserveRecoveryBaseline(repo, ticket, candidate);
+      : await preserveRecoveryBaseline(repo, ticket, candidate, false);
     if (!persisted) return locked ? abandonDispatchBaseline(repo, ticket) : null;
     locked = true;
     const synced = await beads
@@ -505,7 +515,16 @@ async function lockDispatchBaseline(
     const hydrated = board && (await hydrateDescriptions(repo, board));
     if (!hydrated) return abandonDispatchBaseline(repo, ticket);
     const refreshed = fingerprintBoard(hydrated, ticket.id);
-    if (boardEvidence(candidate, refreshed).length === 0) return candidate;
+    if (boardEvidence(candidate, refreshed).length === 0) {
+      // Every write above locked `candidate` as a TENTATIVE value, before this very comparison had
+      // a chance to prove it stable (chatgpt-codex-connector, PR #284 review, "Distinguish tentative
+      // locks before trusting them on resume") — a process death between that write and here left a
+      // resume's `recoveryBaseline` fast path with nothing to tell it apart from a value this loop
+      // actually finished proving. Only now, once the comparison itself has passed, is `candidate`
+      // safe to mark verified — see {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}.
+      const verified = await preserveRecoveryBaseline(repo, ticket, candidate, true);
+      return verified ? candidate : abandonDispatchBaseline(repo, ticket);
+    }
     candidate = refreshed;
   }
   // The lock-confirming push kept pulling in further drift every round — fail closed rather than
@@ -526,16 +545,34 @@ async function lockDispatchBaseline(
  * free to refresh across its own confirming pull — which can fold in THIS attempt's own
  * not-yet-confirmed delivery — and a subsequent idempotent retry then diffs against a baseline that
  * already contains its own writes, permanently rejecting it as unchanged. Already-locked is still a
- * true no-op: nothing to upgrade, and re-writing identical content would cost a write for nothing.
+ * true no-op (once already verified to the level THIS call needs): nothing to upgrade, and
+ * re-writing identical content would cost a write for nothing.
+ *
+ * `verified` (chatgpt-codex-connector, PR #284 review, "Distinguish tentative locks before trusting
+ * them on resume") says whether the caller can vouch for `baseline` as final the instant this write
+ * lands, or is asking for a TENTATIVE lock still pending its own confirmation — see
+ * {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}. Every post-dispatch call from {@link
+ * readBoardEvidence} passes `true`: those preserve a snapshot that is already as final as it will
+ * ever get, with no further round to confirm it. `lockDispatchBaseline`'s own PRE-dispatch round
+ * passes `false` for its first, optimistic write — made before that SAME round's own confirming
+ * push and re-read have proven the candidate stable — and only calls back in with `true` once they
+ * have. The no-op check honors this: a lock already present but not yet verified is not treated as
+ * "nothing to do" when THIS call is the one trying to verify it.
  */
 async function preserveRecoveryBaseline(
   repo: string,
   ticket: Bead,
   baseline: BoardFingerprint,
+  verified: boolean,
 ): Promise<boolean> {
-  if (beads.boardEvidenceBaselineLocked(ticket)) return true;
+  if (
+    beads.boardEvidenceBaselineLocked(ticket) &&
+    (!verified || beads.boardEvidenceBaselineVerified(ticket))
+  ) {
+    return true;
+  }
   return mustPersist(() =>
-    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
+    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true, verified),
   );
 }
 
@@ -697,7 +734,7 @@ export async function readBoardEvidence(
     // baseline was never actually confirmed synced — the operator note then fell back to a plain
     // "board read failed" with no warning to stay on this machine, exactly the false-success shape
     // the flag exists to prevent.
-    const persisted = await preserveRecoveryBaseline(repo, ticket, baseline);
+    const persisted = await preserveRecoveryBaseline(repo, ticket, baseline, true);
     if (!persisted) {
       // A write that failed outright leaves NO baseline anywhere, not even on this machine, so a
       // same-machine-safe claim would be false — reported as `baselineUnpersisted` instead
@@ -753,7 +790,7 @@ export async function readBoardEvidence(
       // Guarded on already LOCKED, not merely already preserved (see {@link
       // preserveRecoveryBaseline}), so a repeated retry doesn't churn the write every attempt once
       // the lock itself has landed.
-      const baselinePersisted = await preserveRecoveryBaseline(repo, ticket, baseline);
+      const baselinePersisted = await preserveRecoveryBaseline(repo, ticket, baseline, true);
       const outcome = await beads.push(repo).catch(() => "not-wired" as const);
       const synced = outcome === "synced" || outcome === "shared-server";
       // Confirmed (persisted AND synced) exactly like the `!hydrated` branch's recovery baseline (PR
@@ -796,7 +833,7 @@ export async function readBoardEvidence(
   // confirm it: the one just above already answered whether the sync channel is healthy this
   // attempt, so a locally-persisted baseline here is `baselineUnconfirmed` by definition —
   // same-machine resume safe, never cross-machine, exactly like the two branches above.
-  const baselinePersisted = await preserveRecoveryBaseline(repo, ticket, baseline);
+  const baselinePersisted = await preserveRecoveryBaseline(repo, ticket, baseline, true);
   return {
     found: true,
     ids,
@@ -965,28 +1002,37 @@ export async function clearBoardEvidencePending(
     // neither survivor, never calls this function again, and `boardEvidenceConfirmed` is left
     // permanently unset with no record anything is still owed — the same false-success shape
     // `hasCleanupObligation` exists to prevent, just reached through a different partial-write
-    // combination. Gated on `markerCleared && baselineCleared` rather than "any of the three", since
-    // when only the MARKER or only the BASELINE fails alone, that write's own surviving, uncleared
-    // state on the board (still-pending ids, or a still-present baseline) is exactly the signal a
-    // resume already checks — an extra obligation there would be redundant, not protective.
-    const survivorsGone = markerCleared && baselineCleared;
+    // combination. Gated on whether `ids` survive somewhere ELSE a resume already reads, not on whether the
+    // BASELINE survives (chatgpt-codex-connector, PR #284 review, "Preserve IDs when confirmation
+    // and baseline cleanup both fail") — a still-present pending marker carries `ids` directly (its
+    // labels ARE the ids), and a landed `confirmedSet` carries them via
+    // `beads.confirmedBoardEvidenceIds`, but a still-present preserved BASELINE carries none of
+    // this: it is a whole-board content fingerprint, never diffed for ids by any resume path in
+    // `execute-epic-dispatch.ts`. The old `markerCleared && baselineCleared` gate treated a
+    // surviving baseline as if it were an equally good ids carrier — so whenever confirmation AND
+    // the baseline clear both failed while the marker clear alone succeeded, no obligation was
+    // written at all, and a resume's `recoveredIds` union (pending ∪ cleanup-unsynced ∪ confirmed)
+    // came back empty despite the baseline's presence: `clearBoardEvidencePending`'s own retry then
+    // overwrote the durable confirmation with `[]`, permanently losing which beads this ticket's
+    // delivery touched.
+    const idsRecoverableElsewhere = !markerCleared || confirmedSet;
     // Carries `ids` along with the obligation (PR #284 review, "Recover cleanup-only resumes
     // before regeneration") — the pending marker and preserved baseline that would otherwise
     // carry them are exactly what `markerCleared`/`baselineCleared` just cleared, so this
     // obligation is the only place left for a resume, on this machine or a fresh cross-machine
     // worktree with no attribution commit of its own, to recover which ids still need confirming.
-    const obligationWritten = cleared || survivorsGone;
+    const obligationWritten = cleared || !idsRecoverableElsewhere;
     const obligationPersisted = obligationWritten
       ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids))
       : true;
     // Confirmed synced too, not just persisted (PR #284 review, "confirm the cleanup-retry
     // obligation reaches the remote before throwing"): this obligation is the ONLY remaining trace
-    // that confirmation is still owed once `survivorsGone` clears the marker and baseline, so a
-    // local-only obligation is exactly the false-success shape this whole function otherwise
+    // that confirmation is still owed once the marker clears with the ids not otherwise recoverable,
+    // so a local-only obligation is exactly the false-success shape this whole function otherwise
     // guards against. It gets its OWN push rather than reusing `synced` above — that push ran
-    // BEFORE this write ever landed on the board (or, in the `survivorsGone`-but-`!cleared` case,
-    // never ran at all, since `cleared` gates it), so it cannot have confirmed this marker either
-    // way. A same-machine resume can still see a local-only obligation and retry correctly, but a
+    // BEFORE this write ever landed on the board (or, in the ids-not-recoverable-but-`!cleared`
+    // case, never ran at all, since `cleared` gates it), so it cannot have confirmed this marker
+    // either way. A same-machine resume can still see a local-only obligation and retry correctly, but a
     // resume on a FRESH cross-machine worktree — the exact case this obligation exists to carry
     // the retry across — reads `hasBoardEvidenceCleanupUnsynced` as false there and never retries
     // at all, so the detail below says so explicitly when the push cannot confirm it.
@@ -1018,7 +1064,7 @@ export async function clearBoardEvidencePending(
         ]
           .filter((s): s is string => s !== false)
           .join(" and ")} it left on the board (after retries)${
-          survivorsGone
+          !idsRecoverableElsewhere
             ? !obligationPersisted
               ? ", and bd also refused the local retry-obligation marker (after retries) — a resume " +
                 "will NOT automatically retry the rest of this cleanup; clear or complete it for " +

@@ -259,6 +259,26 @@ const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
 const BOARD_EVIDENCE_BASELINE_LOCKED_KEY = "boardEvidenceBaselineLocked";
 
 /**
+ * Metadata key marking {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY} as VERIFIED — set only once
+ * {@link execute-epic-board-evidence.ts!lockDispatchBaseline}'s own stability round actually
+ * confirmed the locked value against a fresh board read, as opposed to the instant it merely wrote
+ * the tentative lock (chatgpt-codex-connector, PR #284 review, "Distinguish tentative locks before
+ * trusting them on resume"). A round locks its candidate BEFORE that same round's own confirming
+ * push and re-read prove it stable — a process death in that exact window leaves `locked` set on a
+ * value nothing has actually verified yet. Without this key, `ensureBoardBaselinePersisted`'s
+ * `recoveryBaseline` fast path cannot tell that tentative lock apart from one a completed
+ * `lockDispatchBaseline` call (or a post-dispatch `readBoardEvidence` recovery lock) already proved
+ * stable, and would trust it blindly on resume — on a shared-server board the tentative write is
+ * already global the instant it lands, and the fast path's skipped refresh means any board write
+ * concurrent with that unfinished round is later credited to a no-op agent as its own evidence.
+ * Absent is read as "not yet verified", the correct default for a tentative lock; every OTHER lock
+ * this codebase writes (a `readBoardEvidence` recovery lock, or `lockDispatchBaseline`'s own
+ * completed round) sets this key in the SAME write as the lock itself, so it is never left stale on
+ * a resumed candidate that changes after {@link beads.setBoardEvidenceBaseline} last ran.
+ */
+const BOARD_EVIDENCE_BASELINE_VERIFIED_KEY = "boardEvidenceBaselineVerified";
+
+/**
  * Metadata key marking that a board-evidence cleanup ({@link beads.setBoardEvidencePending} /
  * {@link beads.clearBoardEvidenceBaseline} clearing to empty) wrote successfully to the LOCAL bd
  * DB but its confirming push failed (PR #284 review, "retain a retry obligation after cleanup
@@ -313,6 +333,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   RETIRED_PR_KEY,
   BOARD_EVIDENCE_BASELINE_KEY,
   BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
+  BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
   BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
   BOARD_EVIDENCE_CONFIRMED_KEY,
 ];
@@ -1158,12 +1179,21 @@ export const beads = {
   boardEvidenceBaselineLocked: (b: Bead): boolean =>
     b.metadata?.[BOARD_EVIDENCE_BASELINE_LOCKED_KEY] !== undefined,
 
+  /** Whether the locked baseline above was actually VERIFIED stable, as opposed to a tentative lock
+   * a round wrote before its own confirming push and re-read had a chance to prove it so. See
+   * {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}. */
+  boardEvidenceBaselineVerified: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_BASELINE_VERIFIED_KEY] !== undefined,
+
   /**
    * Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
    * pre-dispatch baseline. `locked` (default false) marks it a RECOVERY baseline — set by callers
    * preserving it AFTER a dispatch attempt already ran (see {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY})
    * — so `ensureBoardBaselinePersisted`'s own confirming-pull refresh never overwrites it with a
    * "refreshed" value that folds in that same prior attempt's own not-yet-confirmed delivery.
+   * `verified` (default false) additionally marks the lock as proven stable — see
+   * {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY} — and is meaningless (ignored) when `locked` is
+   * false, since there is no lock yet for it to describe.
    *
    * Written through `--metadata @file` (a temp file, cleaned up in `finally` like {@link
    * beads.createGraph}'s plan file), never `--set-metadata key=value` (chatgpt-codex-connector,
@@ -1183,6 +1213,7 @@ export const beads = {
     id: string,
     fingerprint: Record<string, string>,
     locked = false,
+    verified = false,
   ) => {
     const dir = mkdtempSync(join(tmpdir(), "anton-bd-baseline-"));
     try {
@@ -1192,6 +1223,7 @@ export const beads = {
         JSON.stringify({
           [BOARD_EVIDENCE_BASELINE_KEY]: JSON.stringify(fingerprint),
           ...(locked ? { [BOARD_EVIDENCE_BASELINE_LOCKED_KEY]: "1" } : {}),
+          ...(locked && verified ? { [BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]: "1" } : {}),
         }),
       );
       return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
@@ -1200,8 +1232,8 @@ export const beads = {
     }
   },
 
-  /** Release a preserved baseline (and its recovery lock, if any) once the handoff it backed has
-   * completed. */
+  /** Release a preserved baseline (and its recovery lock/verification, if any) once the handoff it
+   * backed has completed. */
   clearBoardEvidenceBaseline: (cwd: string, id: string) =>
     bdWrite(cwd, [
       "update",
@@ -1210,6 +1242,8 @@ export const beads = {
       BOARD_EVIDENCE_BASELINE_KEY,
       "--unset-metadata",
       BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
+      "--unset-metadata",
+      BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
     ]),
 
   /** Whether a prior attempt's board-evidence cleanup wrote locally but never confirmed reaching
