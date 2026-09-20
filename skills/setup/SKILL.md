@@ -1,6 +1,6 @@
 ---
 name: setup
-version: e14c7c0f8fa5
+version: 9598d4960b10
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -105,6 +105,15 @@ beside a formula is staged by the next `git add -A` and a stale pipeline gets co
 to every clone. Append `formulas/*.bak` to `.beads/.gitignore` (creating the file if absent, and
 leaving any existing lines alone) before you create the backup. `anton init` adds this entry through
 `ensureBeadsGitignore` for the same reason.
+
+**Check `.beads/.gitignore` for links first, exactly as you did the formula and its `.bak`.** An
+established repo already carries the other entries, so this one line is the only thing you would
+write — and appending to a `.gitignore` that is a SYMLINK follows it and edits a file outside the
+repository. `ls -l .beads/.gitignore` and `ls -ld .beads`: if either is a symlink (an arrow), do NOT
+write — report it and leave the formula alone too, since its `.bak` would then be committable. If
+the file's LINK COUNT is above 1 it shares its bytes with another file, so append into a new file
+and `mv` it into place rather than `>>`-ing the existing one, which writes through to the peer.
+`ensureBeadsGitignore` makes all three of these checks (PR #307 review).
 
 The bead formula is the skeleton `/shape` and anton's Add-work UI pour every bead from (one step per
 tier, the contract sections pre-stubbed), so the conformant shape is structural instead of a prompt
