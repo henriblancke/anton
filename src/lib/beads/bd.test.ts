@@ -5,9 +5,11 @@ import { isBoardUnreachableError } from "../jobs/errors";
 import {
   beads,
   boardUnreachableCause,
+  BOARD_EVIDENCE_UPDATE_ARGV_BUDGET,
   buildCookArgs,
   buildPruneArgs,
   buildUpdateArgs,
+  chunkLabelFlags,
   getSyncStatus,
   getSyncStatusToken,
   isBenignSyncOutput,
@@ -1321,6 +1323,46 @@ function recordingExec(stdout: string) {
     },
   };
 }
+
+describe("chunkLabelFlags (PR #284 review, \"Bound the total pending-label argument vector\")", () => {
+  it("keeps every flag in ONE group when the total is under budget", () => {
+    const flags: [string, string][] = [
+      ["--remove-label", "board-evidence-pending:a"],
+      ["--add-label", "board-evidence-pending:b,c"],
+    ];
+    expect(chunkLabelFlags(flags, 1000)).toEqual([flags]);
+  });
+
+  it("splits into multiple groups once the combined label length would exceed the budget", () => {
+    const flags: [string, string][] = [
+      ["--add-label", "a".repeat(60)],
+      ["--add-label", "b".repeat(60)],
+      ["--add-label", "c".repeat(60)],
+    ];
+    // Budget of 100 fits at most one 60-char value per group.
+    const groups = chunkLabelFlags(flags, 100);
+    expect(groups).toEqual([[flags[0]], [flags[1]], [flags[2]]]);
+  });
+
+  it("never drops or reorders a flag across groups, and each group stays within budget", () => {
+    const flags: [string, string][] = Array.from({ length: 120 }, (_, i) => [
+      "--add-label",
+      `board-evidence-pending:${"x".repeat(9000)}-${i}`,
+    ]);
+    const groups = chunkLabelFlags(flags, BOARD_EVIDENCE_UPDATE_ARGV_BUDGET);
+    // Every flag survives, in order, across however many groups it took.
+    expect(groups.flat()).toEqual(flags);
+    expect(groups.length).toBeGreaterThan(1);
+    for (const group of groups) {
+      const total = group.reduce((sum, [, value]) => sum + value.length, 0);
+      expect(total).toBeLessThanOrEqual(BOARD_EVIDENCE_UPDATE_ARGV_BUDGET);
+    }
+  });
+
+  it("still makes progress on an empty input", () => {
+    expect(chunkLabelFlags([], 1000)).toEqual([]);
+  });
+});
 
 describe("buildCookArgs (anton-brdg)", () => {
   it("cooks compile-time by default: --mode is explicit and --json is always on", () => {

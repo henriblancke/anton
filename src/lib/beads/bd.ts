@@ -208,6 +208,43 @@ function chunkBoardEvidenceIds(ids: readonly string[]): string[][] {
   return chunks;
 }
 
+/**
+ * Safe combined-argv budget for ONE `bd update` invocation's `--add-label`/`--remove-label` flags
+ * (chatgpt-codex-connector, PR #284 review, "Bound the total pending-label argument vector"). Each
+ * individual label already stays under {@link BOARD_EVIDENCE_PENDING_LABEL_BUDGET}, but
+ * {@link setBoardEvidencePending} previously put every stale label to remove AND every chunked
+ * replacement label to add into that SAME invocation — so a board sweep large enough to need many
+ * chunks, or a replacement carrying both a large stale set and a large new set, could still sum past
+ * Linux's total `ARG_MAX` (commonly ~2 MiB, shared with the process environment) and fail `E2BIG`
+ * after the confirming board read already landed. Kept well under that ceiling so label flags are
+ * instead split across as many `bd update` calls as needed — see {@link chunkLabelFlags}.
+ */
+export const BOARD_EVIDENCE_UPDATE_ARGV_BUDGET = 500_000;
+
+/**
+ * Split `--add-label`/`--remove-label` flag pairs into groups whose combined label-value length
+ * stays under `budget` — see {@link BOARD_EVIDENCE_UPDATE_ARGV_BUDGET}. Each group is later issued
+ * as its own `bd update` invocation, so order across groups doesn't matter for correctness: adds and
+ * removes never target the same label value. Exposed for testing, like `buildUpdateArgs`.
+ */
+export function chunkLabelFlags(flags: readonly (readonly [string, string])[], budget: number): (readonly [string, string])[][] {
+  const groups: (readonly [string, string])[][] = [];
+  let current: (readonly [string, string])[] = [];
+  let currentLen = 0;
+  for (const flag of flags) {
+    const len = flag[1].length;
+    if (current.length > 0 && currentLen + len > budget) {
+      groups.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(flag);
+    currentLen += len;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
 /** Prefix of the stage label (see LABELS.stage). */
 export const STAGE_PREFIX = "stage:";
 
@@ -1142,19 +1179,25 @@ export const beads = {
     chunkBoardEvidenceIds(ids).map((chunk) => LABELS.boardEvidencePending(chunk)),
 
   /**
-   * Publish the board-only evidence still awaiting sync confirmation as state label(s) in ONE
-   * update, like {@link beads.setReviewScore}: drop every prior `board-evidence-pending:*` (pass
-   * them as `stale`) and add the new set. An empty `ids` with a non-empty `stale` clears the marker
-   * (confirmed synced) without adding a replacement. `ids` is split across multiple labels when it
-   * would otherwise overflow one argv argument — see {@link beads.boardEvidencePendingLabelsFor}.
+   * Publish the board-only evidence still awaiting sync confirmation as state label(s), like
+   * {@link beads.setReviewScore}: drop every prior `board-evidence-pending:*` (pass them as `stale`)
+   * and add the new set. An empty `ids` with a non-empty `stale` clears the marker (confirmed synced)
+   * without adding a replacement. `ids` is split across multiple labels when it would otherwise
+   * overflow one argv argument — see {@link beads.boardEvidencePendingLabelsFor}. The resulting
+   * `--add-label`/`--remove-label` flags are then split across as many `bd update` calls as
+   * {@link BOARD_EVIDENCE_UPDATE_ARGV_BUDGET} requires (chatgpt-codex-connector, PR #284 review):
+   * a batch with enough chunks could otherwise sum past Linux's total `ARG_MAX` even with every
+   * individual label bounded.
    */
-  setBoardEvidencePending: (cwd: string, id: string, ids: readonly string[], stale: string[] = []) =>
-    bdWrite(cwd, [
-      "update",
-      id,
-      ...stale.flatMap((l) => ["--remove-label", l]),
-      ...beads.boardEvidencePendingLabelsFor(ids).flatMap((label) => ["--add-label", label]),
-    ]),
+  setBoardEvidencePending: async (cwd: string, id: string, ids: readonly string[], stale: string[] = []) => {
+    const flags: [string, string][] = [
+      ...stale.map((l): [string, string] => ["--remove-label", l]),
+      ...beads.boardEvidencePendingLabelsFor(ids).map((label): [string, string] => ["--add-label", label]),
+    ];
+    for (const group of chunkLabelFlags(flags, BOARD_EVIDENCE_UPDATE_ARGV_BUDGET)) {
+      await bdWrite(cwd, ["update", id, ...group.flat()]);
+    }
+  },
 
   /**
    * A prior attempt's PRESERVED pre-dispatch board fingerprint (PR #284 review), parsed back off
