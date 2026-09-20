@@ -17,7 +17,8 @@
  * proposal beads through the same emitter, so they shadow through the same code; a per-producer copy
  * would be two answers to "what would this have done" that drift.
  */
-import type { Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
@@ -114,21 +115,34 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
   const targets = shadowable(input.created, input.policy, input.record);
   if (targets.length === 0 || input.signal?.aborted) return [];
 
-  // Fetched only when a shadowed target's move actually consults cycle evidence (`approve` /
-  // `unapprove` — `planApply` only reaches the approval gate for those). Every other move
-  // (`reparent`, `link`, `retire`, …) is cycle-blind, so an unconditional `bd dep cycles` call would
-  // pay a subprocess this shadow never uses — and worse, if that call fails, `loadAllIssues`'s
-  // `withCycles: true` rejects the WHOLE read, discarding otherwise-valid shadow records for moves
-  // that never asked for cycle evidence in the first place.
-  const needsCycles = targets.some(({ plan }) => CYCLE_AWARE_MOVES.has(plan.move));
   let board: Bead[];
   try {
-    board = await loadAllIssues(input.repo, { withCycles: needsCycles });
+    board = await loadAllIssues(input.repo);
   } catch (e) {
     // The read is the shadow's whole input, so losing it loses every record — but it costs the pass
     // nothing else, because a shadow has nothing to leave half-done.
     await write(input, `SHADOW could not read the board — ${messageOf(e)}; nothing shadowed`);
     return [];
+  }
+
+  // Fetched separately from the board, and only when a shadowed target's move actually consults
+  // cycle evidence (`approve` / `unapprove` — `planApply` only reaches the approval gate for those).
+  // Every other move (`reparent`, `link`, `retire`, …) is cycle-blind, so an unconditional
+  // `bd dep cycles` call would pay a subprocess this shadow never uses. Kept OUT of `loadAllIssues`'s
+  // `withCycles: true` deliberately (mirrors apply.ts's `withCycleEvidenceIfNeeded`): that option
+  // rejects the WHOLE read on a cycles failure, which would erase every shadow record — including
+  // the cycle-blind ones the board read alone was sufficient for. A failure here instead leaves
+  // `board` without cycle evidence, so only `decide()`'s cycle-aware verdicts fail closed on the gap
+  // (`missingCycleEvidenceGap`); every other target still shadows normally.
+  if (targets.some(({ plan }) => CYCLE_AWARE_MOVES.has(plan.move))) {
+    try {
+      attachCycleEvidence(board, await beads.depCycles(input.repo));
+    } catch (e) {
+      await write(
+        input,
+        `SHADOW could not read cycle evidence — ${messageOf(e)}; approve/unapprove verdicts fail closed`,
+      );
+    }
   }
 
   // Floored to bd's stamp grid exactly as `observedAtOf` floors the armed path's fence. The armed
