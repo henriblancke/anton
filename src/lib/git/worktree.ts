@@ -16,6 +16,7 @@ import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
 import {
   branchContainsCommit,
+  exitedWith,
   hasCommonHistory,
   isAncestor,
   needsHooksPathOverrideForMerge,
@@ -918,20 +919,36 @@ async function refreshOntoBase(opts: {
   // local tip rather than equal to it (PR #279 review) — exact equality would misclassify that as
   // unpublished, rebase it, and turn the later non-forcing `pushBranch` into a rejected non-fast-
   // forward push.
+  //
+  // The blanket `.catch(() => undefined)` this used to have folded an OPERATIONAL failure (a killed
+  // process, a broken object store) into the same outcome as "no such ref" (PR #279 review, round 2)
+  // — `--verify --quiet` answers "absent" with a clean exit 1 and no output, so only THAT is read as
+  // unpublished; anything else propagates rather than silently clearing the way to rebase over commits
+  // this probe simply failed to see.
   const remoteSha = await git(
     repoPath,
     ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
-  ).catch(() => undefined);
+  ).catch((e) => {
+    if (exitedWith(e, 1)) return undefined;
+    throw e;
+  });
   const remotelyPublished =
     remoteSha !== undefined && (await isAncestor(worktreePath, remoteSha, branchSha));
 
   // A commit already cited as evidence on a bead (a satisfied-note's `by.commit`) is just as
   // unsafe to rewrite as a pushed one — the board's record of it would otherwise survive the
   // rebase while the object it names doesn't (PR #279 review).
+  //
+  // `isAncestor`, not `branchContainsCommit` (PR #279 review, round 2): the latter folds EVERY git
+  // error to `false` by design (its own doc comment) — right for a caller whose safe answer is "treat
+  // as absent" either way, wrong here, where "absent" is what licenses rewriting history a bead cites
+  // as evidence. `isAncestor` answers the identical ancestry question but rethrows anything that isn't
+  // git's own "not an ancestor" (exit 1), so a transient failure stops the refresh instead of quietly
+  // reporting the protected sha as unreachable.
   let preservedSha: string | undefined;
   if (!remotelyPublished && preserveShas && preserveShas.length > 0) {
     for (const sha of preserveShas) {
-      if (await branchContainsCommit(repoPath, branch, sha)) {
+      if (await isAncestor(worktreePath, sha, branch)) {
         preservedSha = sha;
         break;
       }

@@ -1166,7 +1166,7 @@ export async function resolveForkPoint(worktreePath: string, base: string): Prom
  * run that never got one. A process killed by a timeout carries `code: null` and a signal, and a
  * spawn failure carries a string errno, so neither is mistaken for an exit status.
  */
-function exitedWith(error: unknown, code: number): boolean {
+export function exitedWith(error: unknown, code: number): boolean {
   const err = error as { code?: unknown; killed?: boolean } | null;
   return err?.code === code && err.killed !== true;
 }

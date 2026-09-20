@@ -18,6 +18,7 @@ import { appendSessionLog } from "../sessions";
 import { resumeSkipped } from "../ticket-view";
 import {
   branchAddedCommit,
+  branchContainsCommit,
   branchSatisfiesTicket,
   describeCommit,
   satisfiedMarkerTarget,
@@ -974,20 +975,19 @@ function worktreeReads(
   run: Pick<StepContext, "repoPath" | "branch" | "alreadyShippedBase">,
 ): BranchDeliveryReads {
   return {
-    // Exclude commits reachable from the base AS IT READS NOW (PR #279 review): a refresh can bring
-    // in a commit for a child already closed on the board, and an unbounded scan would then read
-    // that INHERITED base commit as this branch's own delivery of the ticket rather than base
-    // history — the same widening `excludeBase` closes for the dispatch partition above.
-    //
-    // `alreadyShippedBase`, not `baseRef` (PR #279 review): `baseRef` is a movable ref name that a
-    // failed fetch resolves LOCALLY, which can read behind the base a reused checkout's refresh
-    // already committed the branch onto — undercounting the exclusion and letting an inherited base
-    // commit (a sibling's `<id>:` subject or `Anton-Satisfies` trailer for an already-closed ticket)
-    // read as this branch's own delivery. `alreadyShippedBase` is the base the checkout actually sits
-    // on right now, on every refresh outcome (`StepContext.alreadyShippedBase`'s own doc comment).
-    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id, { excludeBase: run.alreadyShippedBase }),
-    satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id, { excludeBase: run.alreadyShippedBase }),
-    notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket),
+    // UNBOUNDED (PR #279 review, round 2) — deliberately not `excludeBase`. This function answers
+    // "is the ticket's work already in the checkout", the question `dispatchTicket` uses to decide
+    // whether to SKIP re-running it; excluding the base conflated that with a different question —
+    // "is the work in THIS PR's diff" — which belongs to the delivery SET (`deliveredOrPark`'s own
+    // bounded scan), not to this presence check. Bounded, a refresh that folds an already-closed
+    // child's commit into the base made this read "no commit" even though the checkout carries the
+    // work, so `dispatchTicket` took the regeneration path: reopening the closed bead and rerunning
+    // its agent against work already in the tree. `branchAdded` below still answers the diff question
+    // correctly — a base-only commit reads `inherited: true`, which keeps it out of the pull request's
+    // attribution — so widening presence here costs nothing on that side.
+    hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id),
+    satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
+    notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket, { presenceOnly: true }),
     branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, sha),
   };
 }
@@ -1008,12 +1008,15 @@ function worktreeReads(
  * unrelated branch is no proof this one carries the work. So a note naming a commit this branch
  * never got still regenerates, which is what keeps the cross-machine reasoning intact.
  *
- * The same effective-base exclusion the trailer and subject scans apply (PR #279 review): the cited
- * commit must be one `run.branch` ADDED over `run.alreadyShippedBase`, not merely reachable from it.
- * A legacy note can cite a commit that a base refresh mid-run has since folded into the base — closed
- * on another machine, or by hand, before the trailer existed — and reading that as evidence would
- * let a base-only settlement flow into `ledger.satisfied` and count as this run's delivery, the same
- * false success `excludeBase` closes for {@link BranchDeliveryReads.satisfiedBy}.
+ * `presenceOnly` picks which question the cited commit must answer (PR #279 review, round 2).
+ * `dispatchTicket`'s resume-skip check (via {@link worktreeReads}) asks "is the work in the checkout
+ * at all" — a base-only commit still proves the ticket needs no regeneration, so `presenceOnly` tests
+ * with {@link branchContainsCommit}, unbounded. `partitionTickets`'s superseded-ticket check asks a
+ * narrower question — "did `run.branch` itself ADD this, as opposed to inheriting it from a refreshed
+ * base" — so it keeps the default, {@link branchAddedCommit}. Conflating the two was the bug: gating
+ * the presence check on "branch added" made a legacy note citing a commit a base refresh has since
+ * folded into the base read as absent, even though the checkout carries the work, and sent a resume
+ * down the regeneration path over a ticket that needed none.
  *
  * Fails closed to `undefined` on every read that cannot answer, for the reason the branch reads do:
  * re-running work is the safe error, skipping it is not.
@@ -1021,11 +1024,14 @@ function worktreeReads(
 async function notedSatisfaction(
   run: Pick<StepContext, "repoPath" | "branch" | "alreadyShippedBase">,
   ticket: Bead,
+  options: { presenceOnly?: boolean } = {},
 ): Promise<SatisfiedClaim | undefined> {
   const record = latestSatisfiedRecord(ticket.notes);
   if (!record || record.branch !== run.branch) return undefined;
-  if (!(await branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, record.commit)))
-    return undefined;
+  const cited = options.presenceOnly
+    ? await branchContainsCommit(run.repoPath, run.branch, record.commit)
+    : await branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, record.commit);
+  if (!cited) return undefined;
   // The full sha and subject, so the pull request cites the work rather than the note's abbreviation
   // — and so a note pointing at the attribution MARKER of an earlier settlement is followed to the
   // commit that did the work, the same hop `ticketSettlement` takes.

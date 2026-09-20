@@ -878,18 +878,19 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(dispatchedIds()).toEqual(["anton-a"]);
   });
 
-  // A base refresh can bring in a commit for a child already closed on the board (PR #279 review):
-  // an unbounded scan here would read that INHERITED base commit as this branch's own delivery and
-  // skip re-dispatching a ticket whose work is not actually in this run's diff. Excluding what the
-  // current base already carries is what keeps this "present under any name" read scoped to what
-  // THIS branch added, matching the bound the dispatch partition itself already applies.
-  it("excludes commits reachable from the current base when checking a closed child's delivery", async () => {
+  // A base refresh can bring in a commit for a child already closed on the board (PR #279 review,
+  // round 2): a BOUNDED scan here reads that INHERITED base commit as absent and sends the ticket
+  // down the regeneration path — reopening the closed bead and rerunning its agent against work
+  // already in the checkout. This read answers "is the work in the checkout at all", so it must be
+  // UNBOUNDED; excluding it from the pull request's own delivery set is `deliveredOrPark`'s job, not
+  // this one's (see `worktreeReads`'s own doc comment).
+  it("checks the whole checkout, not just what this branch added, for a closed child's delivery", async () => {
     const child = closedChild("anton-a");
     showMock.mockResolvedValue(child);
 
     await dispatchRunTickets(makeResume(child), prep());
 
-    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", { excludeBase: BASE_REF });
+    expect(hasCommitMock).toHaveBeenCalledWith(WORKTREE, "anton-a", undefined);
   });
 
   it("leaves alone a bead somebody reopened since the run's snapshot", async () => {
