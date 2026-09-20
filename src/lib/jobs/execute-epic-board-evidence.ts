@@ -583,16 +583,21 @@ export async function readBoardEvidence(
  * two survivors still needs clearing; either alone is enough to avoid the no-op early return.
  *
  * `hasCleanupObligation` (PR #284 review, "retain a retry obligation after cleanup push failure")
- * covers the THIRD case those two survivors both miss: both cleanup writes land locally, but the
- * confirming push itself fails. `markerCleared` and `baselineCleared` are then both true, so
- * `pending`/`boardEvidenceBaseline` come back empty on a same-machine resume — a plain
- * `stalePending.length > 0 || hasPreservedBaseline` check reads that as "nothing left to do" and
+ * covers the THIRD and FOURTH cases those two survivors both miss: either both cleanup writes land
+ * locally and only the confirming push fails, or the marker and baseline clear locally but
+ * `setBoardEvidenceConfirmed` itself exhausts its retries (PR #284 review, "preserve an obligation
+ * when confirmation persistence fails") — both leave `markerCleared`/`baselineCleared` true, so
+ * `pending`/`boardEvidenceBaseline` come back empty on a same-machine resume. A plain
+ * `stalePending.length > 0 || hasPreservedBaseline` check reads either as "nothing left to do" and
  * never calls this again, leaving the remote holding a stale pending marker and baseline on an
  * already-closed bead indefinitely (only `concludeRunAttempt`'s best-effort final sync might catch
- * it, and that failure is logged, not retried). The `cleared && !synced` branch below persists
- * {@link beads.setBoardEvidenceCleanupUnsynced} as exactly that obligation before throwing, so a
- * caller can pass it back on resume even with `ids` empty and `hasBaseline` false; once a later
- * push confirms, it is released the same way the other two survivors are.
+ * it, and that failure is logged, not retried) — or, in the fourth case, leaving
+ * `boardEvidenceConfirmed` permanently unset with nothing left to signal a resume should retry it.
+ * The `!cleared || !synced` branch below persists {@link beads.setBoardEvidenceCleanupUnsynced} as
+ * exactly that obligation before throwing whenever ANY of the three writes may have landed, not
+ * only when all three (`cleared`) did, so a caller can pass it back on resume even with `ids` empty
+ * and `hasBaseline` false; once a later attempt clears and confirms and syncs successfully, it is
+ * released the same way the other two survivors are.
  */
 export async function clearBoardEvidencePending(
   repo: string,
@@ -633,9 +638,25 @@ export async function clearBoardEvidencePending(
     // silently skip the retry forever while the remote still carries stale evidence. The `detail`
     // below says so explicitly when it happens, since a plain resume can no longer be trusted to
     // fix it.
-    const obligationPersisted = cleared
-      ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId))
-      : true;
+    //
+    // Persisted whenever BOTH the marker and the baseline cleared, not only when `cleared` (all
+    // three, including confirmation) did (PR #284 review, "preserve an obligation when confirmation
+    // persistence fails"): a prior call can clear the marker and the baseline but exhaust its
+    // retries on `setBoardEvidenceConfirmed` alone — `cleared` is then false, yet the two survivors
+    // a resume would otherwise check (`pendingBoardEvidence`, `boardEvidenceBaseline`) are already
+    // gone from the board. Without persisting an obligation here too, a same-machine resume sees
+    // neither survivor, never calls this function again, and `boardEvidenceConfirmed` is left
+    // permanently unset with no record anything is still owed — the same false-success shape
+    // `hasCleanupObligation` exists to prevent, just reached through a different partial-write
+    // combination. Gated on `markerCleared && baselineCleared` rather than "any of the three", since
+    // when only the MARKER or only the BASELINE fails alone, that write's own surviving, uncleared
+    // state on the board (still-pending ids, or a still-present baseline) is exactly the signal a
+    // resume already checks — an extra obligation there would be redundant, not protective.
+    const survivorsGone = markerCleared && baselineCleared;
+    const obligationPersisted =
+      cleared || survivorsGone
+        ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId))
+        : true;
     const detail = cleared
       ? obligationPersisted
         ? "every cleanup write landed locally, but the confirming push could not verify they reached " +
@@ -650,7 +671,16 @@ export async function clearBoardEvidencePending(
           !confirmedSet && "the delivery-confirmed marker",
         ]
           .filter((s): s is string => s !== false)
-          .join(" and ")} it left on the board (after retries)`;
+          .join(" and ")} it left on the board (after retries)${
+          survivorsGone
+            ? obligationPersisted
+              ? " — a resume will retry the rest of this cleanup via the retry-obligation marker " +
+                "this run persisted"
+              : ", and bd also refused the local retry-obligation marker (after retries) — a resume " +
+                "will NOT automatically retry the rest of this cleanup; clear or complete it for " +
+                "this ticket directly, or retry until the obligation marker persists"
+            : ""
+        }`;
     throw new PoisonEpic(
       `${ticketId} delivered and closed, but ${detail} — the run stopped rather than leave a stale ` +
         `board-evidence record on an already-closed ticket, which a later reopen could read as ` +

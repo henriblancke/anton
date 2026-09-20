@@ -8,6 +8,7 @@ import {
   composeSystemPrompt,
   loadBaseSystemPrompt,
   buildExecutionSystemPrompt,
+  shellQuotePath,
   _resetBaseSystemPromptCache,
 } from "./system-prompt";
 
@@ -86,7 +87,7 @@ describe("composeSystemPrompt", () => {
   // non-server board. The carve-out must tell the agent to point writes at the live board explicitly.
   it("tells a board-only agent to redirect bd writes at the live repo path via -C", () => {
     const out = composeSystemPrompt({ base, boardOnly: true, repoPath: "/live/repo" });
-    expect(out).toContain("bd -C /live/repo update <id> --status done");
+    expect(out).toContain("bd -C '/live/repo' update <id> --status done");
     expect(out.toLowerCase()).toContain("separate, unsynced copy");
   });
 
@@ -94,6 +95,28 @@ describe("composeSystemPrompt", () => {
     const out = composeSystemPrompt({ base, boardOnly: true });
     expect(out).toContain("This ticket is board-only");
     expect(out).not.toContain("-C");
+  });
+
+  // PR #284 review (P2): a registered repo path may contain whitespace (src/lib/projects.test.ts
+  // exercises `addProject` against a path named "Repo One") — an unquoted path here would be split
+  // by the agent's shell into multiple arguments, silently misdirecting the `-C` flag.
+  it("shell-quotes a repo path containing whitespace in the -C example", () => {
+    const out = composeSystemPrompt({ base, boardOnly: true, repoPath: "/tmp/Repo One" });
+    expect(out).toContain("bd -C '/tmp/Repo One' update <id> --status done");
+  });
+});
+
+describe("shellQuotePath", () => {
+  it("wraps a plain path in single quotes", () => {
+    expect(shellQuotePath("/live/repo")).toBe("'/live/repo'");
+  });
+
+  it("wraps a path containing whitespace so a shell reads it as one argument", () => {
+    expect(shellQuotePath("/tmp/Repo One")).toBe("'/tmp/Repo One'");
+  });
+
+  it("escapes an embedded single quote", () => {
+    expect(shellQuotePath("/tmp/it's-a-repo")).toBe("'/tmp/it'\\''s-a-repo'");
   });
 });
 

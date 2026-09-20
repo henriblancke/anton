@@ -25,7 +25,7 @@ import {
   worktreeHasCommitFor,
   type SatisfiedClaim,
 } from "../git/ops";
-import { clearBoardEvidencePending } from "./execute-epic-board-evidence";
+import { clearBoardEvidencePending, isBoardOnlyRun } from "./execute-epic-board-evidence";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -1211,7 +1211,16 @@ async function dispatchTicket(
   // closed is not this path's business. Only the attribution commit `step:pr` needs (this
   // branch, unlike the one that confirmed the delivery, carries no commit ahead of base for this
   // ticket) is missing, so write it directly instead of re-dispatching.
-  if (doneOnBoard && ticket.status === "closed" && beads.isBoardOnly(ticket) && beads.boardEvidenceConfirmed(ticket)) {
+  //
+  // `isBoardOnlyRun`, not a bare `beads.isBoardOnly(ticket)` (PR #284 review, "honor every
+  // confirmed board-only resume shape"): a child of a board-only run TARGET inherits the label
+  // from the target, not from itself, and would otherwise fall through here into regeneration
+  // against a fresh baseline that already contains its delivered writes. Dropping the redundant
+  // `ticket.status === "closed"` admits the other missed shape, a standalone success that stays
+  // OPEN at `stage:in-review` by design — `doneOnBoard` (via `resumeSkipped`) already accounts for
+  // both the closed and the standalone-in-review case, so re-checking `closed` here only excluded
+  // the second one.
+  if (doneOnBoard && isBoardOnlyRun(run, ticket) && beads.boardEvidenceConfirmed(ticket)) {
     await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
     onBranch.add(ticket.id);
     if (ledger.skipCause.has(ticket.id)) {

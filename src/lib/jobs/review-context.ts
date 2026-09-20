@@ -13,7 +13,7 @@ import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/c
 import { beads, type Bead } from "../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
-import { buildExecutionSystemPrompt } from "../claude/system-prompt";
+import { buildExecutionSystemPrompt, shellQuotePath } from "../claude/system-prompt";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
@@ -695,7 +695,7 @@ function boardEvidenceSection(
           `live board, not this worktree's default \`bd\`, e.g.:`,
           ``,
           "```",
-          `bd -C ${repoPath} show <id>`,
+          `bd -C ${shellQuotePath(repoPath)} show <id>`,
           "```",
           ``,
           `A plain \`bd show <id>\` here reports this worktree's frozen, pre-delivery copy — not usable`,
@@ -1282,7 +1282,7 @@ export async function buildFindingsFixPrompt(args: {
                 `copy — pass \`bd\`'s own directory flag rather than relying on your cwd, e.g.:`,
                 ``,
                 "```",
-                `bd -C ${repoPath} update <id> --status done`,
+                `bd -C ${shellQuotePath(repoPath)} update <id> --status done`,
                 "```",
               ]
             : []),

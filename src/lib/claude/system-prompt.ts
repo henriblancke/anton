@@ -39,6 +39,18 @@ export function _resetBaseSystemPromptCache(): void {
   _baseCache = null;
 }
 
+/**
+ * Quote `path` for safe interpolation into a POSIX shell command SHOWN to an agent as a `bd -C`
+ * example (PR #284 review, "quote the repository path in generated bd commands"). A registered
+ * repository path may contain whitespace — `src/lib/projects.test.ts` exercises `addProject`
+ * against a path named `Repo One` — and an unquoted path in these examples would be parsed by the
+ * agent's shell as multiple arguments, so `bd -C` silently targets the wrong (or a nonexistent)
+ * directory and the board-only evidence gate parks otherwise valid work.
+ */
+export function shellQuotePath(path: string): string {
+  return `'${path.replaceAll("'", `'\\''`)}'`;
+}
+
 export interface SystemPromptLayers {
   /** The locked base contract (from loadBaseSystemPrompt). Required. */
   base: string;
@@ -108,7 +120,7 @@ function boardOnlySection(repoPath?: string): string {
             "copy — pass `bd`'s own directory flag rather than relying on where you happen to be, e.g.:",
           "",
           "```",
-          `bd -C ${repoPath} update <id> --status done`,
+          `bd -C ${shellQuotePath(repoPath)} update <id> --status done`,
           "```",
           "",
           "This worktree's embedded beads database is a separate, unsynced copy on a non-server board: " +

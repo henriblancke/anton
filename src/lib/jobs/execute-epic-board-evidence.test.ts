@@ -871,6 +871,29 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "persists a cleanup-sync retry obligation when the marker and baseline clear locally but " +
+      "`setBoardEvidenceConfirmed` alone exhausts its retries (PR #284 review, \"preserve an " +
+      "obligation when confirmation persistence fails\") — the marker and baseline are both gone " +
+      "from the board at that point, so a same-machine resume checking only those two survivors " +
+      "would otherwise see nothing pending and never retry confirming delivery",
+    async () => {
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-confirm-failed", ["a"]),
+      ).rejects.toThrow(/t-cleanup-confirm-failed/);
+      expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-cleanup-confirm-failed",
+      );
+      // Nothing was pushed — the failure is purely local, so there is no sync channel to report yet.
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    },
+  );
+
+  it(
     "retries just the confirming push, and releases the obligation once it lands, when called with " +
       "`hasCleanupObligation` even though nothing else is pending (PR #284 review) — the resume path " +
       "for a prior attempt whose two writes both succeeded locally but never confirmed syncing",

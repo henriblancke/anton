@@ -1091,4 +1091,50 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
     expect(reopenMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a");
     expect(dispatchedIds()).toEqual(["anton-a"]);
   });
+
+  // PR #284 review (P1, "honor every confirmed board-only resume shape"): `delivery:board` is
+  // documented as a label shapers put on the run TARGET, inherited by every child — the child
+  // itself carries no label of its own. A bare `beads.isBoardOnly(ticket)` check misses this shape
+  // entirely and falls through to regeneration against a fresh baseline that already contains the
+  // child's delivered writes, where an idempotent retry is rejected as a zero diff.
+  it("writes the attribution commit for a child whose board-only label lives on the run TARGET", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      metadata: { boardEvidenceConfirmed: "true" },
+    });
+    const run = makeRun([child], new AbortController().signal);
+    (run.target as Bead).labels = [LABELS.boardOnly];
+    hasCommitMock.mockResolvedValue(false);
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
+    expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+  });
+
+  // Same finding, second missed shape: a standalone success stays OPEN at `stage:in-review` by
+  // design (its PR step is all that is left), so requiring `ticket.status === "closed"` excluded it
+  // even though `doneOnBoard` (via `resumeSkipped`) already treats it as done.
+  it("writes the attribution commit for a standalone success left OPEN at stage:in-review", async () => {
+    const target = bead(EPIC, {
+      issue_type: "task",
+      status: "open",
+      parent: undefined,
+      labels: [LABELS.boardOnly, LABELS.stage("in-review")],
+      metadata: { boardEvidenceConfirmed: "true" },
+    });
+    const run = makeStandaloneRun(target, new AbortController().signal);
+    hasCommitMock.mockResolvedValue(false);
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([target]);
+    expect(outcome.delivered.map((b) => b.id)).toContain(EPIC);
+  });
 });

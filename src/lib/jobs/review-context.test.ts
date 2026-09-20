@@ -413,7 +413,7 @@ describe("reviewContext", () => {
         repoPath: "/repos/anton",
       });
       expect(out).toContain("- anton-x1.1: anton-y9");
-      expect(out).toContain("bd -C /repos/anton show <id>");
+      expect(out).toContain("bd -C '/repos/anton' show <id>");
       expect(out).toContain("frozen, pre-delivery copy");
     },
   );
@@ -429,7 +429,7 @@ describe("reviewContext", () => {
         diff: { files: [], patch: "", truncated: false },
         repoPath: "/repos/anton",
       });
-      expect(out).toContain("bd -C /repos/anton show <id>");
+      expect(out).toContain("bd -C '/repos/anton' show <id>");
       // No evidence map was given, so there is nothing to list — but the instruction still fires.
       expect(out).not.toContain("confirmed evidence covers");
     },
@@ -1129,7 +1129,7 @@ describe("buildFindingsFixPrompt", () => {
 
       expect(prompt).toContain("This run may deliver via the board");
       expect(prompt).toContain("is NOT evidence you made no progress");
-      expect(prompt).toContain("bd -C /repos/anton update <id>");
+      expect(prompt).toContain("bd -C '/repos/anton' update <id>");
     },
   );
 
