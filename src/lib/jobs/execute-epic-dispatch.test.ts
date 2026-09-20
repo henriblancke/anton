@@ -48,6 +48,12 @@ vi.mock("../git/ops", async () => {
 });
 
 const clearBoardEvidencePendingMock = vi.fn();
+// Mocked alongside `clearBoardEvidencePending` (not left to run for real) so a baseline-alone
+// resume's re-diff (anton-fc5x review, "Do not confirm baseline-only resumes as delivered") is
+// deterministic in tests — the real implementation would shell out to `bd` for the marker/baseline
+// writes a found diff triggers, which isn't wired up here.
+const readBoardEvidenceMock = vi.fn();
+const readBoardBaselineMock = vi.fn();
 vi.mock("./execute-epic-board-evidence", async () => {
   const actual = await vi.importActual<typeof import("./execute-epic-board-evidence")>(
     "./execute-epic-board-evidence",
@@ -55,6 +61,8 @@ vi.mock("./execute-epic-board-evidence", async () => {
   return {
     ...actual,
     clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
+    readBoardEvidence: (...args: unknown[]) => readBoardEvidenceMock(...args),
+    readBoardBaseline: (...args: unknown[]) => readBoardBaselineMock(...args),
   };
 });
 
@@ -184,6 +192,8 @@ beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
   clearBoardEvidencePendingMock.mockReset();
+  readBoardEvidenceMock.mockReset().mockResolvedValue({ found: false, ids: [], synced: false });
+  readBoardBaselineMock.mockReset().mockResolvedValue({ beads: new Map() });
   recordBoardOnlyAttributionMock.mockReset().mockResolvedValue(undefined);
   hasCommitMock.mockReset().mockResolvedValue(false);
   satisfiedByMock.mockReset().mockResolvedValue(undefined);
@@ -1353,20 +1363,54 @@ describe(
       expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
     });
 
-    it("finishes confirming a surviving preserved baseline alone, with no pending marker either", async () => {
+    // chatgpt-codex-connector, PR #284 review, "Do not confirm baseline-only resumes as
+    // delivered": the preserved baseline alone is not evidence — `lockDispatchBaseline` writes it
+    // BEFORE every board-only dispatch, whether or not the agent (or `readBoardEvidence`) ever
+    // ran. A resume that finds only this survivor must re-diff it against the board rather than
+    // accept an empty id set as a settled (if empty) confirmation.
+    it("re-diffs a surviving preserved baseline alone instead of confirming it empty", async () => {
       const child = bead("anton-a", {
         status: "closed",
         labels: [LABELS.boardOnly],
         metadata: { boardEvidenceBaseline: JSON.stringify({ x: "hash" }) },
       });
       hasCommitMock.mockResolvedValue(false);
+      readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-eb1"], synced: true });
 
-      await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
 
       expect(reopenMock).not.toHaveBeenCalled();
       expect(runTicketMock).not.toHaveBeenCalled();
-      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", child, [], true, false);
+      expect(readBoardBaselineMock).toHaveBeenCalledWith("/tmp/anton-repo", child);
+      expect(readBoardEvidenceMock).toHaveBeenCalledWith("/tmp/anton-repo", { beads: new Map() }, child);
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        true,
+        false,
+      );
       expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+
+    it("halts instead of confirming a baseline-alone resume the re-diff finds no evidence for", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ x: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
     });
   },
 );

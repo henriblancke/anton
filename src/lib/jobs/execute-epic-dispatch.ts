@@ -25,7 +25,12 @@ import {
   worktreeHasCommitFor,
   type SatisfiedClaim,
 } from "../git/ops";
-import { clearBoardEvidencePending, isBoardOnlyRun } from "./execute-epic-board-evidence";
+import {
+  clearBoardEvidencePending,
+  isBoardOnlyRun,
+  readBoardBaseline,
+  readBoardEvidence,
+} from "./execute-epic-board-evidence";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -1257,13 +1262,45 @@ async function dispatchTicket(
   ) {
     const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
-    const recoveredIds = [
+    let recoveredIds = [
       ...new Set([
         ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
         ...beads.pendingBoardEvidence(ticket),
         ...beads.confirmedBoardEvidenceIds(ticket),
       ]),
     ].toSorted();
+    // An empty `recoveredIds` here means the ONLY reason this block was entered is the OR
+    // condition's third branch, `hasPreservedBaseline` alone (chatgpt-codex-connector, PR #284
+    // review, "Do not confirm baseline-only resumes as delivered") — the other two branches each
+    // union real ids into `recoveredIds` above, so a nonempty `stalePending` or
+    // `hasCleanupUnsynced` can never leave it empty. That baseline is written by
+    // `lockDispatchBaseline`/`ensureBoardBaselinePersisted` BEFORE every board-only dispatch,
+    // unconditionally — its mere presence says nothing about whether the agent ever ran, let
+    // alone whether `readBoardEvidence` ever confirmed a board delta. Reaching `doneOnBoard` with
+    // only this survivor means the post-run evidence check never completed (the process died, or
+    // something else closed the ticket directly), so there is no real record of delivery to
+    // recover — accepting it here would write `boardEvidenceConfirmed: []` and record an
+    // attribution commit for a ticket nothing ever proved changed the board. Re-diff the preserved
+    // baseline against the board now, the same comparison the original evidence check would have
+    // made, before trusting this as a delivery.
+    if (recoveredIds.length === 0) {
+      const baseline = await readBoardBaseline(repo, ticket);
+      const result = baseline ? await readBoardEvidence(repo, baseline, ticket) : undefined;
+      if (!result?.found) {
+        throw new PoisonEpic(
+          `${ticket.id} is done on the board (closed, or moved to review) and this run is marked ` +
+            `\`delivery:board\`, whose deliverable is bd writes to the board — but only a ` +
+            `pre-dispatch baseline survives from a prior attempt whose evidence check never ` +
+            `completed, and re-diffing that baseline against the board just now found ` +
+            `${result ? "no bd write since the baseline was taken" : "the board unreadable"}. ` +
+            `Accepting this ticket as delivered on the baseline's presence alone would be a false ` +
+            `success. Check the beads DB and the sync channel, then resume the run once the board ` +
+            `read is healthy — or, if ${ticket.id}'s board delivery genuinely happened outside this ` +
+            `evidence check, resolve it by hand before reclaiming the epic.`,
+        );
+      }
+      recoveredIds = result.ids;
+    }
     await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
     if (recoveredIds.length > 0) {
       ledger.boardEvidence.set(ticket.id, recoveredIds);
