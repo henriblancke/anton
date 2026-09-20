@@ -18,7 +18,7 @@
  * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
  * `.beads/metadata.json` (anton-4gd2).
  */
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -312,8 +312,20 @@ export function beadsPrereqs(dir, opts = {}) {
   return tooling.ok ? beadsBoardPrereqs(dir, opts) : tooling;
 }
 
-/** The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime state. */
-export const BEADS_GITIGNORE_ENTRIES = ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"];
+/**
+ * The `.beads/.gitignore` entries anton's team-config requires: derived exports + Dolt runtime
+ * state, plus the `.bak` a replaced formula leaves behind ({@link ensureFormula}). The backup is a
+ * local recovery aid for ONE machine's uncommitted tuning, and it lands in a directory git tracks —
+ * so without this line the next `git add -A` (an agent's, typically) would commit a stale pipeline
+ * copy into the repo and ship it to every clone.
+ */
+export const BEADS_GITIGNORE_ENTRIES = [
+  "issues.jsonl",
+  "interactions.jsonl",
+  "dolt/",
+  "embeddeddolt/",
+  "formulas/*.bak",
+];
 
 /**
  * Idempotently ensure `.beads/.gitignore` untracks the JSONL exports + Dolt runtime state. Appends
@@ -384,8 +396,8 @@ export const BEAD_FORMULA_FILENAME = "anton-bead.formula.json";
 
 /**
  * The run-formula asset's filename (anton-hrql) — the PIPELINE anton walks, as opposed to the bead
- * SKELETON above. Same install shape, same no-clobber rule, same `.beads/formulas/` home, so a
- * project owns its pipeline the way it already owns its bead shape.
+ * SKELETON above. Same install shape, same replace-on-drift rule ({@link ensureFormula}), same
+ * `.beads/formulas/` home.
  */
 export const RUN_FORMULA_FILENAME = "anton-run.formula.toml";
 
@@ -425,19 +437,75 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
 }
 
 /**
- * Install a bundled formula into `<repo>/.beads/formulas/`, NO-CLOBBER (anton-8mnr). A project-local
- * copy always wins: once a team has tuned its own bead shape or pipeline, re-running setup must never
- * overwrite it. Living under `.beads/` (which git tracks — only the JSONL exports and the Dolt runtime
- * are ignored) is what carries it to every clone and teammate.
+ * Install a bundled formula into `<repo>/.beads/formulas/`, OVERWRITING a project-local copy that
+ * differs from the shipped one (anton-8mnr, revised).
+ *
+ * The original rule was no-clobber on mere existence, and that silently stranded every shipped
+ * pipeline change: `step:describe` (anton-gzyjd) reached zero registered projects, because each had
+ * a byte-identical copy of an older template and `existsSync` cannot tell a TUNED pipeline from a
+ * STALE default. Every re-run printed "already present" and changed nothing, so the one signal an
+ * operator had said the opposite of the truth.
+ *
+ * So the comparison is now on CONTENT, not existence:
+ *   - byte-identical to the shipped asset  → "already", silent, the common case.
+ *   - differs in any way                   → "replaced", and the caller REPORTS it, naming the
+ *                                            backup that holds what was there.
+ *
+ * A differing file is overwritten rather than preserved, by explicit instruction: anton's shipped
+ * pipeline is the one its code is written against, and a project running a stale copy fails in ways
+ * that look like anton bugs. The cost is real and is mitigated, not denied — a project that TUNED
+ * its formula loses that tuning here. Two things make it recoverable: the file lives under `.beads/`
+ * which git tracks, so `git diff` shows the change and `git checkout` undoes it; and the prior
+ * contents are written beside it as `<filename>.bak` FIRST, the replacement being abandoned if that
+ * write cannot happen — git is no help for tuning that was never committed, which is the case the
+ * backup exists for. A project that wants a pipeline of its own should name it something else
+ * and point at it through the per-label variant map (anton-aa3m), which is the supported way to own
+ * a pipeline and is never touched by this installer.
  *
  * Never CREATES the workspace: a formula under a `.beads/` that no `bd init` made is a half-
  * workspace, and every downstream probe reads the directory's mere existence as "this is a beads
  * repo" (configureBeadsDoltSync does exactly that, then aborts `anton setup` for having no git
  * origin). So an absent `.beads/` is a skip, not a mkdir.
  *
- * Returns { status, detail? } — "installed" | "already" | "missing-asset" (the bundled file isn't in
- * this install — a warning, never fatal: anton's own loaders fall back to their packaged copy) |
- * "no-workspace" | "failed".
+ * A destination that is not a REGULAR FILE is refused outright ("unsafe-dest"), and that gate only
+ * matters because this function now writes over things. `copyFileSync` follows symlinks: it opens
+ * the link's TARGET and writes there, so a `.beads/formulas/anton-run.formula.toml` that is a
+ * symlink would have this installer write anton's asset to whatever the link points at — anywhere
+ * on disk the anton process can write, outside the repo entirely. `POST /api/projects` takes a
+ * repository path from a caller and runs this installer over it, so the path reaches here from
+ * input. The `.bak` is checked the same way for the same reason: it is a second write to an
+ * attacker-nameable path. Under the OLD no-clobber rule an existing symlink was never written to at
+ * all, so this hazard arrives WITH the replace behavior and is fixed in the same change.
+ *
+ * The write itself goes through {@link writeNewFile} — a new file renamed into place — rather than
+ * `copyFileSync`, which would open the existing destination and truncate it. That is what covers
+ * the case no `lstat` can see: a HARD LINK is an ordinary regular file by every check here, so a
+ * destination hard-linked to a file elsewhere would have had that file clobbered through the shared
+ * inode. Replacing the directory entry leaves the link pointing at the old inode and its old
+ * contents.
+ *
+ * Those checks NARROW the remaining race; they do not close it (PR #307 review). They are
+ * lstat-then-act, so a caller who can swap a path between the check and the write can still
+ * redirect it — though the atomic rename means a swap must now beat the check rather than the
+ * copy. Closing it outright needs `O_NOFOLLOW`-guarded descriptors (open the parent, `openat` the
+ * child) rather than path-based checks, which is a larger change than this one. What is here stops
+ * the symlink or hard link that is simply SITTING there, which is the realistic shape: a repo
+ * checked out with one in it, or one left by a previous tool. It is not a defense against an
+ * attacker who already has write access to the repo directory and can time a swap — and someone
+ * with that access has better paths available anyway (a `.beads/formulas/*.toml` of their choosing,
+ * or the repo's own hooks).
+ *
+ * Returns { status, detail? } — "installed" (nothing was there) | "replaced" (a differing copy was
+ * overwritten; `detail` names the backup) | "already" (byte-identical) | "missing-asset" (the
+ * bundled file isn't in this install, or could not be read — a warning, never fatal: anton's own
+ * loaders fall back to their packaged copy) | "unsafe-dest" | "no-workspace" | "failed".
+ *
+ * NOTE on "missing-asset" when the project's own copy EXISTS: the old rule returned "already"
+ * without ever looking at `src`, because existence alone decided the outcome. Comparing content
+ * requires reading `src`, so that combination now reports "missing-asset" — a warning naming an
+ * install problem, while the project's file is left untouched. Warning over silence is deliberate:
+ * "already" would claim the local copy had been checked against the shipped one when nothing was
+ * read.
  *
  * A filesystem error (read-only checkout, no write permission, transient I/O) is REPORTED as
  * "failed", never thrown: this is one best-effort step among a dozen in setup/registration, and an
@@ -445,24 +513,238 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  */
 function ensureFormula(beadsDir, filename, src) {
   const dest = join(beadsDir, "formulas", filename);
-  if (existsSync(dest)) return { status: "already" };
-  if (!existsSync(beadsDir)) return { status: "no-workspace" };
+  // lstat, never existsSync: a symlink pointing at nothing is "absent" to existsSync but is still a
+  // path this function must refuse rather than write through. `present` means "something is here",
+  // not "a file is here" — what KIND it is decides the refusal below.
+  const present = lstatOrUndefined(dest) !== undefined;
+  // The workspace gate runs BEFORE the asset gate for an absent dest, matching the original order:
+  // a release bundle with no `.beads/` must report "no-workspace" whether or not it ships the asset.
+  if (!present && !existsSync(beadsDir)) return { status: "no-workspace" };
   if (!existsSync(src)) return { status: "missing-asset" };
+
+  let shipped;
+  try {
+    shipped = readFileSync(src);
+  } catch (err) {
+    // An unreadable ASSET is the same class of problem as an absent one: anton falls back to its
+    // packaged copy, and nothing about the project is touched.
+    return { status: "missing-asset", detail: err?.message || String(err) };
+  }
+
+  // Refused before the comparison, not just before the write: reading through a symlink to decide
+  // "already" would let a link that happens to point at an identical file pass silently, leaving a
+  // link where the installer reports a file. (This is a check-then-act gate, not an atomic one —
+  // see the TOCTOU paragraph in the header for what it does and does not promise.)
+  //
+  // The DIRECTORY is checked whether or not a file is there, because an absent `dest` is reached
+  // through it too — `mkdirSync(..., {recursive: true})` is satisfied by a symlink to a directory
+  // and creates nothing, so the copy lands wherever the link points.
+  const unsafe = unsafeDirDetail(beadsDir) ?? (present ? unsafeDestDetail(dest, filename) : undefined);
+  if (unsafe) return { status: "unsafe-dest", detail: unsafe };
+
+  // The bytes the comparison below saw, kept for the backup to write (PR #307 review). Re-reading
+  // `dest` at backup time instead would open a window where a CONCURRENT installer — two `anton
+  // init`s on one repo — has already replaced the file, so the second process would back up the
+  // shipped formula it just found and the operator's real customization would exist nowhere: not
+  // in `dest`, not in the `.bak`. Backing up what was actually compared cannot lose it that way.
+  let current;
+  if (present) {
+    // An existing copy that cannot be READ is not "already": unknown is treated as differing, the
+    // same way the describer's read-only guard treats an unreadable worktree state as dirty rather
+    // than clean. That decides only that this is not a no-op — the replacement itself then refuses,
+    // because contents nobody could read are contents no backup can hold.
+    try {
+      current = readFileSync(dest);
+    } catch {
+      current = undefined;
+    }
+    if (current !== undefined && current.equals(shipped)) return { status: "already" };
+  }
+
   try {
     mkdirSync(dirname(dest), { recursive: true });
-    copyFileSync(src, dest);
+    // The backup is written BEFORE the replacement and only when something is being replaced, so a
+    // fresh install leaves no stray `.bak` and a re-run that replaces twice keeps the copy from
+    // just before the current one.
+    //
+    // The backup is a PRECONDITION of the replacement, not a courtesy attempted alongside it (PR
+    // #307 review, P1). An earlier version let it fail and overwrote anyway, reasoning that git
+    // holds the durable copy — which is false for exactly the case the backup exists to protect:
+    // uncommitted tuning. Git cannot recover bytes that were never committed, so "NOT backed up"
+    // reported AFTER the overwrite announces an irreversible loss instead of preventing one.
+    //
+    // So a backup that cannot be written — an unsafe `.bak` path, a full disk, an unreadable
+    // source — abandons the replacement and leaves the project's file exactly as it was. That
+    // trades a stale formula (recoverable: fix the path, re-run) for destroyed local work
+    // (not recoverable at all), which is the right way round.
+    if (present) {
+      const unsafeBak = unsafeDestDetail(`${dest}.bak`, `${filename}.bak`, { missingIsSafe: true });
+      if (unsafeBak) {
+        return {
+          status: "unsafe-dest",
+          detail: `${unsafeBak} — leaving ${filename} untouched, since replacing it without a backup could destroy uncommitted changes`,
+        };
+      }
+      // An UNREADABLE original is refused, not replaced-without-a-backup (PR #307 review, P1). It
+      // reaches here by being treated as "differing" — the right call for deciding whether to
+      // replace — but "anton could not read it" says nothing about whether it mattered. A mode-000
+      // formula in a writable directory is still somebody's file, and replacing it destroys bytes
+      // no backup holds and git may never have seen. An earlier version reasoned the guarantee was
+      // "never destroy contents anton could read"; that is the wrong guarantee, and it was written
+      // to fit the code rather than the other way round.
+      if (current === undefined) {
+        return {
+          status: "failed",
+          detail: `${filename} exists but could not be read, so it cannot be backed up — leaving it untouched rather than replacing contents nothing has a copy of`,
+        };
+      }
+      // `current`, NOT a fresh read of `dest` — the bytes the comparison saw are the ones worth
+      // keeping; see where it is captured.
+      // Any throw here propagates to the outer catch as "failed"; nothing has been overwritten yet.
+      writeNewFile(`${dest}.bak`, current);
+    }
+    writeNewFile(dest, shipped);
+    if (!present) return { status: "installed" };
+    return {
+      status: "replaced",
+      detail: `differed from the shipped pipeline — previous contents saved as ${filename}.bak`,
+    };
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };
   }
-  return { status: "installed" };
 }
 
-/** Install the bead skeleton every bead anton creates is rendered from (anton-8mnr). */
+/**
+ * Write `contents` to `path` by creating a NEW file and renaming it into place, never by writing
+ * through whatever is already there (PR #307 review, P1).
+ *
+ * `copyFileSync` opens the existing destination and truncates it, so it writes through the inode
+ * rather than replacing it. A `dest` HARD-LINKED to a file elsewhere on the same filesystem shares
+ * that inode, so the other file is clobbered too — and `lstat` cannot see it coming: a hard link is
+ * an ordinary regular file by every check {@link unsafeDestDetail} makes. Reproduced before fixing:
+ * an external hard-linked file was overwritten with the shipped formula while the call reported
+ * "replaced".
+ *
+ * Writing a temp file and renaming replaces the DIRECTORY ENTRY instead. The hard link keeps
+ * pointing at the old inode, which still holds the old contents, so only the name inside `.beads/`
+ * takes the new bytes. `rename` within one directory is atomic, which also shrinks the TOCTOU
+ * window the header describes — the checks still race, but the write itself no longer follows a
+ * path that changed underneath it.
+ *
+ * The temp name lives in the destination's own directory, because `rename` cannot cross
+ * filesystems. Cleaned up on failure so a botched install leaves no litter beside the formulas.
+ */
+function writeNewFile(path, contents) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    // `wx` fails if the temp name somehow exists rather than following or truncating it.
+    writeFileSync(tmp, contents, { flag: "wx" });
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Best-effort cleanup; the original error is the one worth reporting.
+    }
+    throw err;
+  }
+}
+
+/** `lstatSync` without the throw — undefined when nothing is at `path`, never following a symlink. */
+function lstatOrUndefined(path) {
+  try {
+    return lstatSync(path);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Why the `formulas/` directory under `beadsDir` must not be written INTO, or undefined when the
+ * path from the workspace down to it is real directories all the way.
+ *
+ * Checking the destination file alone is not enough (PR #307 review, second P1): `lstat` on the
+ * final component resolves every ANCESTOR, so a `.beads/formulas` that is a symlink to a directory
+ * outside the repo reports its target's contents as ordinary files and the check passes. Nor does
+ * the `mkdirSync(..., {recursive: true})` below catch it — a symlink to an existing directory
+ * satisfies it and it creates nothing. The copy then lands outside the repo, which is the same
+ * escape the final-component check closed, one level up. Reproduced before fixing: a symlinked
+ * `formulas/` had `ensureBeadFormula` return "replaced" over an external file.
+ *
+ * Each segment is walked and `lstat`ed itself, so no link anywhere on the path is followed. A
+ * segment that does not exist yet is fine — that is the fresh-install case, and `mkdirSync` will
+ * create a real directory there (the `missingIsSafe` reading; see {@link unsafeDestDetail} for why
+ * the destination takes the opposite one).
+ */
+function unsafeDirDetail(beadsDir) {
+  // `.beads` itself is an ancestor of the write too, and a symlinked workspace directory is the
+  // same escape one level further up.
+  for (const [dir, label] of [
+    [beadsDir, ".beads"],
+    [join(beadsDir, "formulas"), ".beads/formulas"],
+  ]) {
+    const stat = lstatOrUndefined(dir);
+    if (stat === undefined) return undefined; // not there yet — mkdirSync makes a real one
+    if (stat.isSymbolicLink()) {
+      return (
+        `${label} is a SYMLINK — refusing to install through it. The formula would be written to ` +
+        `the link's target, which may be outside the repository. Replace it with a real directory ` +
+        `and re-run.`
+      );
+    }
+    if (!stat.isDirectory()) return `${label} exists but is not a directory — refusing to install into it`;
+  }
+  return undefined;
+}
+
+/**
+ * Why `path` must not be written to, or undefined when it is an ordinary file this installer may
+ * replace. Symlinks are the case that matters ({@link ensureFormula}); directories, sockets and
+ * device nodes are refused by the same rule because none of them is a formula either, and a
+ * `copyFileSync` onto one fails or does something surprising rather than installing an asset.
+ *
+ * `missingIsSafe` decides what an ABSENT path means, because the two callers genuinely disagree and
+ * the disagreement is not obvious (PR #307 review):
+ *
+ *   - The destination is checked only once something is known to be there, so `lstat` returning
+ *     nothing means the file vanished between the two calls — unknown, and unknown is not
+ *     permission to write. Refused (the default).
+ *   - The `.bak` is usually absent, because most installs have never written one. There, absent is
+ *     the ordinary case and means "nothing to write over". Safe (`missingIsSafe: true`).
+ *
+ * {@link unsafeDirDetail} takes the second reading for the same reason: a `formulas/` that is not
+ * there yet is a fresh install, and `mkdirSync` will make a real directory.
+ */
+function unsafeDestDetail(path, label, { missingIsSafe = false } = {}) {
+  const stat = lstatOrUndefined(path);
+  if (stat === undefined) {
+    return missingIsSafe ? undefined : `${label} could not be inspected — refusing to write over it`;
+  }
+  if (stat.isSymbolicLink()) {
+    return (
+      `${label} is a SYMLINK — refusing to write through it. Installing would follow the link and ` +
+      `overwrite its target, which may be anywhere on disk. Replace it with a regular file (or ` +
+      `delete it) and re-run.`
+    );
+  }
+  if (!stat.isFile()) return `${label} is not a regular file — refusing to write over it`;
+  return undefined;
+}
+
+/**
+ * Install the bead skeleton every bead anton creates is rendered from (anton-8mnr). Replaces a copy
+ * that differs from the shipped one — see {@link ensureFormula} for why, and for what a project that
+ * wants a skeleton of its own should do instead.
+ */
 export function ensureBeadFormula(beadsDir, src = bundledBeadFormulaPath()) {
   return ensureFormula(beadsDir, BEAD_FORMULA_FILENAME, src);
 }
 
-/** Install the run pipeline anton walks (anton-hrql). */
+/**
+ * Install the run pipeline anton walks (anton-hrql). Replaces a copy that differs from the shipped
+ * one: this is the asset a shipped step (`step:describe`, anton-gzyjd) has to reach, and the one
+ * whose staleness reads as an anton bug. See {@link ensureFormula}.
+ */
 export function ensureRunFormula(beadsDir, src = bundledRunFormulaPath()) {
   return ensureFormula(beadsDir, RUN_FORMULA_FILENAME, src);
 }
@@ -1938,8 +2220,9 @@ export function configureBeadsForRepo(dir, opts = {}) {
   }
 
   // 3c. Install anton's formulas: the bead skeleton, so every bead this project creates starts
-  //     contract-shaped (anton-8mnr), and the run pipeline anton walks (anton-hrql). No-clobber —
-  //     a project that tuned either one keeps it.
+  //     contract-shaped (anton-8mnr), and the run pipeline anton walks (anton-hrql). A copy that
+  //     DIFFERS from the shipped asset is replaced, not kept — this is the path a registered project
+  //     actually installs through, so it is the one that has to carry a new shipped step.
   for (const asset of [
     { label: "bead formula", filename: BEAD_FORMULA_FILENAME, src: bundledBeadFormulaPath(appRoot), install: ensureBeadFormula },
     { label: "run formula", filename: RUN_FORMULA_FILENAME, src: bundledRunFormulaPath(appRoot), install: ensureRunFormula },
@@ -1947,13 +2230,26 @@ export function configureBeadsForRepo(dir, opts = {}) {
     const formula = asset.install(beadsDir, asset.src);
     steps.push({ name: asset.label, status: formula.status, detail: formula.detail });
     if (formula.status === "missing-asset") {
-      emit(`${asset.label} asset missing from this install (${asset.src}) — skipping.`);
+      // `detail` is present when the asset EXISTS but could not be read (permission, I/O) — a
+      // different problem from an absent file, and the only thing that tells them apart here.
+      emit(
+        `${asset.label} asset missing from this install (${asset.src})` +
+          `${formula.detail ? `: ${formula.detail}` : ""} — skipping.`,
+      );
+    } else if (formula.status === "unsafe-dest") {
+      // A refusal, not a no-op: the project's formula is NOT what anton ships and was left that
+      // way, so it is collected as an error rather than emitted and forgotten.
+      emit(`refused to install the ${asset.label}: ${formula.detail}`);
+      errors.push(`refused to install the ${asset.label}: ${formula.detail}`);
     } else if (formula.status === "no-workspace") {
       // Only reachable if the init/bootstrap above reported success without producing `.beads/`.
       emit(`no .beads workspace to install the ${asset.label} into — skipping.`);
     } else if (formula.status === "failed") {
       emit(`could not install the ${asset.label}: ${formula.detail}`);
       errors.push(`could not install the ${asset.label}: ${formula.detail}`);
+    } else if (formula.status === "replaced") {
+      // Loud, and never silent: this is the one status that DESTROYED something the project had.
+      emit(`.beads/formulas/${asset.filename} (replaced) — ${formula.detail}`);
     } else {
       emit(`.beads/formulas/${asset.filename} (${formula.status})`);
     }
