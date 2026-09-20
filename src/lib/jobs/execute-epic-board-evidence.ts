@@ -546,14 +546,27 @@ export async function readBoardEvidence(
  * cleanup path is done — leaving the preserved baseline stranded on an already-closed bead for a
  * later, unrelated reopen to misread as a stale-but-current snapshot. Callers pass whichever of the
  * two survivors still needs clearing; either alone is enough to avoid the no-op early return.
+ *
+ * `hasCleanupObligation` (PR #284 review, "retain a retry obligation after cleanup push failure")
+ * covers the THIRD case those two survivors both miss: both cleanup writes land locally, but the
+ * confirming push itself fails. `markerCleared` and `baselineCleared` are then both true, so
+ * `pending`/`boardEvidenceBaseline` come back empty on a same-machine resume — a plain
+ * `stalePending.length > 0 || hasPreservedBaseline` check reads that as "nothing left to do" and
+ * never calls this again, leaving the remote holding a stale pending marker and baseline on an
+ * already-closed bead indefinitely (only `concludeRunAttempt`'s best-effort final sync might catch
+ * it, and that failure is logged, not retried). The `cleared && !synced` branch below persists
+ * {@link beads.setBoardEvidenceCleanupUnsynced} as exactly that obligation before throwing, so a
+ * caller can pass it back on resume even with `ids` empty and `hasBaseline` false; once a later
+ * push confirms, it is released the same way the other two survivors are.
  */
 export async function clearBoardEvidencePending(
   repo: string,
   ticketId: string,
   ids: readonly string[],
   hasBaseline = false,
+  hasCleanupObligation = false,
 ): Promise<void> {
-  if (ids.length === 0 && !hasBaseline) return;
+  if (ids.length === 0 && !hasBaseline && !hasCleanupObligation) return;
   const markerCleared =
     ids.length === 0
       ? true
@@ -569,6 +582,12 @@ export async function clearBoardEvidencePending(
         .catch(() => false)
     : false;
   if (!cleared || !synced) {
+    if (cleared) {
+      // Both writes landed locally — only the confirming push is missing. Best-effort: if this
+      // write itself fails to land or sync, the window this exists to close stays open exactly as
+      // wide as it is today, never wider, so a failure here is not worth its own throw.
+      await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId)).catch(() => {});
+    }
     const detail = cleared
       ? "both cleanup writes landed locally, but the confirming push could not verify they reached " +
         "the remote"
@@ -584,6 +603,9 @@ export async function clearBoardEvidencePending(
         `current evidence for no new work. Check the beads DB${cleared ? " and the sync channel" : ""}, ` +
         `then resume the run.`,
     );
+  }
+  if (hasCleanupObligation) {
+    await mustPersist(() => beads.clearBoardEvidenceCleanupUnsynced(repo, ticketId));
   }
 }
 

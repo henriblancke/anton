@@ -207,13 +207,31 @@ const RETIRED_PR_KEY = "retiredPr";
 const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
 
 /**
+ * Metadata key marking that a board-evidence cleanup ({@link beads.setBoardEvidencePending} /
+ * {@link beads.clearBoardEvidenceBaseline} clearing to empty) wrote successfully to the LOCAL bd
+ * DB but its confirming push failed (PR #284 review, "retain a retry obligation after cleanup
+ * push failure") — the one case the pending-ids marker and the preserved baseline cannot cover,
+ * because both are already cleared locally by the time the push fails, so neither survives to
+ * tell a same-machine resume there is still an unconfirmed remote write. Set right before
+ * `clearBoardEvidencePending` throws in exactly that case, and released only once a later push
+ * actually confirms — see {@link beads.setBoardEvidenceCleanupUnsynced} /
+ * {@link beads.clearBoardEvidenceCleanupUnsynced} / {@link beads.hasBoardEvidenceCleanupUnsynced}.
+ */
+const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
+
+/**
  * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
  * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
  * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
  * everything else in the object as real, fingerprintable data — the same shape as the
  * `*_PREFIX` label exclusions above, just for metadata keys instead of label prefixes.
  */
-export const ANTON_METADATA_KEYS: readonly string[] = ["pr", RETIRED_PR_KEY, BOARD_EVIDENCE_BASELINE_KEY];
+export const ANTON_METADATA_KEYS: readonly string[] = [
+  "pr",
+  RETIRED_PR_KEY,
+  BOARD_EVIDENCE_BASELINE_KEY,
+  BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
+];
 
 /**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
@@ -1052,6 +1070,20 @@ export const beads = {
   /** Release a preserved baseline once the handoff it backed has completed. */
   clearBoardEvidenceBaseline: (cwd: string, id: string) =>
     bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_KEY]),
+
+  /** Whether a prior attempt's board-evidence cleanup wrote locally but never confirmed reaching
+   * the remote — parsed off the bead's own metadata. See {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}. */
+  hasBoardEvidenceCleanupUnsynced: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY] === "true",
+
+  /** Record that this ticket's board-evidence cleanup landed locally but its confirming push
+   * failed, so a same-machine resume knows to retry the push even with nothing else pending. */
+  setBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}=true`]),
+
+  /** Release the retry obligation once a later push actually confirms the cleanup reached the remote. */
+  clearBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,

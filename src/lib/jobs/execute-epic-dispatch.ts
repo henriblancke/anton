@@ -1122,12 +1122,20 @@ async function dispatchTicket(
     // cleanup on, so retrying it now is exactly as safe as the original call was. A no-op for every
     // ticket with nothing pending — not board-only, or one whose marker already cleared.
     //
-    // Checked as two independent survivors, not just the marker (PR #284 review): a prior halt can
+    // Checked as THREE independent survivors, not just the marker (PR #284 review): a prior halt can
     // clear the marker and then exhaust its retries on the preserved baseline, so `stalePending`
     // alone reads as "nothing left to do" while the baseline is still stranded on the bead. Passing
     // `hasPreservedBaseline` lets the retry reach it even when no ids are pending at all.
+    //
+    // A third halt shape clears BOTH writes locally and only the confirming push fails — that
+    // leaves neither of the first two survivors behind, so `hasCleanupUnsynced` (PR #284 review,
+    // "retain a retry obligation after cleanup push failure") is checked independently too: without
+    // it this fast path reads "nothing pending" and never retries the push, silently leaving the
+    // remote holding a stale marker/baseline on an already-closed bead for a later, unrelated reopen
+    // to misread as current evidence.
     const stalePending = beads.pendingBoardEvidence(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
     // Recorded into the ledger BEFORE the clear, mirroring the fresh-run path below (PR #284
     // review): these ids are exactly the confirmed evidence the reviewer's board-only section
     // cross-checks, and `deliveredTickets` carries this ticket into `ReviewRun.tickets`
@@ -1136,8 +1144,14 @@ async function dispatchTicket(
     if (stalePending.length > 0) {
       ledger.boardEvidence.set(ticket.id, stalePending);
     }
-    if (stalePending.length > 0 || hasPreservedBaseline) {
-      await clearBoardEvidencePending(repo, ticket.id, stalePending, hasPreservedBaseline);
+    if (stalePending.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
+      await clearBoardEvidencePending(
+        repo,
+        ticket.id,
+        stalePending,
+        hasPreservedBaseline,
+        hasCleanupUnsynced,
+      );
     }
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review

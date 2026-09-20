@@ -17,6 +17,11 @@ const setBoardEvidenceBaselineMock = vi.fn<
   (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
 >();
 const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// The cleanup-push retry obligation (PR #284 review, "retain a retry obligation after cleanup
+// push failure") shells out to `bd update` too — mocked for the same reason the baseline writes
+// above are.
+const setBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+const clearBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // `ensureDescription`'s fallback for a bead the LIST read omitted a description for (PR #284
 // review) — mocked so the hydration tests below exercise that fallback, not a live `bd show`
 // against a fake "/repo".
@@ -32,6 +37,8 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidencePending: setBoardEvidencePendingMock,
       setBoardEvidenceBaseline: setBoardEvidenceBaselineMock,
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
+      setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
+      clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
       show: showMock,
     },
   };
@@ -57,6 +64,8 @@ const { LABELS } = await import("../beads/bd");
 setBoardEvidencePendingMock.mockResolvedValue("");
 setBoardEvidenceBaselineMock.mockResolvedValue("");
 clearBoardEvidenceBaselineMock.mockResolvedValue("");
+setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
+clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -758,6 +767,65 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       pushMock.mockResolvedValueOnce("not-wired");
       await expect(clearBoardEvidencePending("/repo", "t-cleanup-unsynced", ["a"])).rejects.toThrow(
         /t-cleanup-unsynced/,
+      );
+    },
+  );
+
+  it(
+    "persists a cleanup-sync retry obligation before throwing when both writes land locally but " +
+      "the push cannot confirm (PR #284 review, \"retain a retry obligation after cleanup push " +
+      "failure\") — neither the pending marker nor the preserved baseline survives that failure to " +
+      "tell a same-machine resume there is still work to retry, so this is the only trace left",
+    async () => {
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-obligation", ["a"]),
+      ).rejects.toThrow(/t-cleanup-obligation/);
+      expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith("/repo", "t-cleanup-obligation");
+    },
+  );
+
+  it(
+    "does not persist a cleanup-sync retry obligation when the local writes themselves never " +
+      "landed — that failure is already covered by the surviving marker/baseline",
+    async () => {
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      const callsBefore = setBoardEvidenceCleanupUnsyncedMock.mock.calls.length;
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-no-obligation", ["a"]),
+      ).rejects.toThrow(/t-cleanup-no-obligation/);
+      expect(setBoardEvidenceCleanupUnsyncedMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
+    "retries just the confirming push, and releases the obligation once it lands, when called with " +
+      "`hasCleanupObligation` even though nothing else is pending (PR #284 review) — the resume path " +
+      "for a prior attempt whose two writes both succeeded locally but never confirmed syncing",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      const markerCallsBefore = setBoardEvidencePendingMock.mock.calls.length;
+      await clearBoardEvidencePending("/repo", "t-cleanup-retry-push", [], false, true);
+      expect(pushMock).toHaveBeenCalledWith("/repo");
+      // No pending ids means nothing for the marker write to remove.
+      expect(setBoardEvidencePendingMock.mock.calls.length).toBe(markerCallsBefore);
+      expect(clearBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith("/repo", "t-cleanup-retry-push");
+    },
+  );
+
+  it(
+    "throws again, without releasing the obligation, when a resumed cleanup-only retry's push " +
+      "still cannot confirm (PR #284 review)",
+    async () => {
+      pushMock.mockResolvedValueOnce("not-wired");
+      await expect(
+        clearBoardEvidencePending("/repo", "t-cleanup-retry-fails", [], false, true),
+      ).rejects.toThrow(/t-cleanup-retry-fails/);
+      expect(clearBoardEvidenceCleanupUnsyncedMock).not.toHaveBeenCalledWith(
+        "/repo",
+        "t-cleanup-retry-fails",
       );
     },
   );

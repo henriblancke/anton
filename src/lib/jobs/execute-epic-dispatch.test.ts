@@ -966,6 +966,7 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
       "anton-a",
       ["anton-eb1"],
       false,
+      false,
     );
     // The companion fix in the `if (delivery)` branch above records the stale-pending ids into the
     // ledger BEFORE clearing them (`ledger.boardEvidence.set(ticket.id, stalePending)`) — asserted
@@ -1002,6 +1003,34 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
           "/tmp/anton-repo",
           "anton-a",
           [],
+          true,
+          false,
+        );
+      });
+    },
+  );
+
+  it(
+    "retries the confirming push alone when a prior cleanup's two writes both landed locally but " +
+      "the push never confirmed (PR #284 review, \"retain a retry obligation after cleanup push " +
+      "failure\") — neither the pending marker nor the preserved baseline survives that failure, so " +
+      "only the dedicated obligation flag can tell a same-machine resume there is still an " +
+      "unconfirmed remote write",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceCleanupUnsynced: "true" },
+      });
+      hasCommitMock.mockResolvedValue(true);
+
+      return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+          "/tmp/anton-repo",
+          "anton-a",
+          [],
+          false,
           true,
         );
       });
