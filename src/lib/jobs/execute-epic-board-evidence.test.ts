@@ -593,14 +593,19 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     expect(result.synced).toBe(true);
   });
 
-  it("reports found but UNSYNCED when the push cannot confirm it — never trusts presence alone", async () => {
-    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
-    const baseline = (await readBoardBaseline("/repo"))!;
-    loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
-    pushMock.mockResolvedValueOnce("not-wired");
-    const result = await readBoardEvidence("/repo", baseline, ticket);
-    expect(result).toEqual({ found: true, ids: ["a"], synced: false });
-  });
+  it(
+    "reports found but UNSYNCED when the push cannot confirm it — never trusts presence alone — and " +
+      "preserves a recovery baseline for the resume (PR #284 review round 13, thread on " +
+      "execute-epic-board-evidence.ts:504)",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("not-wired");
+      const result = await readBoardEvidence("/repo", baseline, ticket);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
+    },
+  );
 
   it("reports found but unsynced when the push itself throws, rather than crashing the ticket walk", async () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
@@ -608,7 +613,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
     pushMock.mockRejectedValueOnce(new Error("push failed: auth"));
     const result = await readBoardEvidence("/repo", baseline, ticket);
-    expect(result).toEqual({ found: true, ids: ["a"], synced: false });
+    expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
   });
 
   it("persists the found-but-unsynced ids on the ticket as a `board-evidence-pending:*` label", async () => {
@@ -621,6 +626,49 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   });
 
   it(
+    "preserves this attempt's baseline when the CONFIRMING push fails, even on the fast path where " +
+      "the marker already matched `ids` going in and nothing else this call wrote anything (thread " +
+      "on execute-epic-board-evidence.ts:504, \"persist recovery state when evidence sync fails\") " +
+      "— otherwise a resume on a different machine, where an independent sync channel already " +
+      "published this ticket's content, would see that content folded into a fresh baseline as " +
+      "pre-existing and reject an idempotent retry as unchanged",
+    async () => {
+      const wasPending = bead("t-fast-path-baseline", { labels: [LABELS.boardEvidencePending(["a"])] });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("not-wired");
+      const result = await readBoardEvidence("/repo", baseline, wasPending);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-fast-path-baseline",
+        Object.fromEntries(baseline.beads),
+      );
+    },
+  );
+
+  it(
+    "does not re-persist the baseline on a confirming-push failure when the ticket already carries " +
+      "one — a repeated push failure must not churn the write every attempt",
+    async () => {
+      const preserved = { a: "already-preserved-hash" };
+      const ticketWithBaseline = bead("t-fast-path-baseline-again", {
+        labels: [LABELS.boardEvidencePending(["a"])],
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("not-wired");
+      const callsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
+      const result = await readBoardEvidence("/repo", baseline, ticketWithBaseline);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false });
+      expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
     "retries the marker write through `mustPersist` rather than swallowing the first failure (PR " +
       "#284 review) — a single contended Dolt write must not permanently strand this evidence",
     async () => {
@@ -631,7 +679,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidencePendingMock.mockResolvedValueOnce("");
       const result = await readBoardEvidence("/repo", baseline, ticket);
-      expect(result).toEqual({ found: true, ids: ["a"], synced: false });
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
       // First attempt rejected, second (the retry) landed — both targeted the same write.
       const calls = setBoardEvidencePendingMock.mock.calls.slice(-2);
       expect(calls[0]).toEqual(["/repo", ticket.id, ["a"], []]);
@@ -1027,7 +1075,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
       pushMock.mockResolvedValueOnce("not-wired");
       const firstAttempt = await readBoardEvidence("/repo", firstBaseline, ticket);
-      expect(firstAttempt).toEqual({ found: true, ids: ["a"], synced: false });
+      expect(firstAttempt).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
 
       // Resume: a NEW baseline is read against the board as it now stands — already carrying
       // attempt 1's write — and the ticket bead comes back with the marker attempt 1 persisted.

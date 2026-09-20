@@ -295,29 +295,31 @@ export interface BoardEvidenceResult {
    */
   markerUnpersisted?: boolean;
   /**
-   * The FIRST attempt's recovery baseline (see {@link readBoardEvidence}'s `!hydrated` branch)
-   * PERSISTED LOCALLY but could not be confirmed synced before this attempt gave up (PR #284 review
-   * round 9). Always paired with `evidenceUnavailable: true`. Named separately because it is a
-   * sharper warning than a merely unreadable post-run board: if this ticket resumes on ANOTHER
-   * machine (the run-lease actor is machine-scoped, not run-scoped), that machine never sees this
-   * preserved baseline either, so `readBoardBaseline` takes a FRESH read there too — one that may
-   * already have absorbed this ticket's own writes through an independent sync pass — and an
-   * idempotent retry that correctly makes no further writes then reads as no evidence at all,
-   * permanently. Resuming on the SAME machine is still safe (the baseline sits in this process's
-   * local Dolt state regardless of whether it pushed), so the operator note has to say which. Only
-   * ever set when the local persist itself succeeded — see {@link baselineUnpersisted} for the case
-   * where it did not.
+   * A recovery baseline this attempt tried to preserve — because nothing else on the ticket already
+   * anchors a resume to the pre-dispatch board (see {@link readBoardEvidence}'s `!hydrated` branch,
+   * its marker-write-exhausted-every-retry branch, or its own confirming-push-failed branch at the
+   * very end) — PERSISTED LOCALLY but could not be confirmed synced before this attempt gave up (PR
+   * #284 review round 9, extended round 13). Usually paired with `evidenceUnavailable: true`, except
+   * from the last of those three branches, where `found`/`ids`/`synced` describe real (if unconfirmed)
+   * evidence instead. Named separately because it is a sharper warning than a merely unreadable
+   * post-run board: if this ticket resumes on ANOTHER machine (the run-lease actor is machine-scoped,
+   * not run-scoped), that machine never sees this preserved baseline either, so `readBoardBaseline`
+   * takes a FRESH read there too — one that may already have absorbed this ticket's own writes
+   * through an independent sync pass — and an idempotent retry that correctly makes no further writes
+   * then reads as no evidence at all, permanently. Resuming on the SAME machine is still safe (the
+   * baseline sits in this process's local Dolt state regardless of whether it pushed), so the
+   * operator note has to say which. Only ever set when the local persist itself succeeded — see
+   * {@link baselineUnpersisted} for the case where it did not.
    */
   baselineUnconfirmed?: boolean;
   /**
-   * The FIRST attempt's recovery baseline could not be written even LOCALLY, after every retry
-   * (anton-fc5x review round 7) — the sibling case to {@link baselineUnconfirmed}, which requires the
-   * local write to have actually landed. With nothing persisted anywhere, resuming on THIS machine is
-   * NOT specially safe: a same-machine resume finds no preserved baseline either and falls back to
-   * the same fresh read a different machine would, one that may already have absorbed this ticket's
-   * own writes through an independent sync pass. Named separately so `boardOnlyNoDeliveryMessage`
-   * never repeats `baselineUnconfirmed`'s same-machine safety claim for a write that never landed at
-   * all.
+   * The same recovery baseline as {@link baselineUnconfirmed} could not be written even LOCALLY,
+   * after every retry (anton-fc5x review round 7) — the sibling case, which requires the local write
+   * to have actually landed. With nothing persisted anywhere, resuming on THIS machine is NOT
+   * specially safe: a same-machine resume finds no preserved baseline either and falls back to the
+   * same fresh read a different machine would, one that may already have absorbed this ticket's own
+   * writes through an independent sync pass. Named separately so `boardOnlyNoDeliveryMessage` never
+   * repeats `baselineUnconfirmed`'s same-machine safety claim for a write that never landed at all.
    */
   baselineUnpersisted?: boolean;
 }
@@ -501,7 +503,31 @@ export async function readBoardEvidence(
   // content edits and the recovery marker together.
   const outcome = await beads.push(repo).catch(() => "not-wired" as const);
   const synced = outcome === "synced" || outcome === "shared-server";
-  return { found: true, ids, synced };
+  if (synced) return { found: true, ids, synced };
+  // The confirming push failed — including the fast path where the marker already matched `ids`
+  // going in (e.g. left by an earlier attempt, or by the heartbeat backstop that syncs independently
+  // of this check), so nothing above wrote anything this call and there is otherwise NO recovery
+  // state for a resume to fall back on (PR #284 review). If that independent channel already
+  // published the content to the remote, another machine's resume never sees this local-only
+  // marker: its own `readBoardBaseline` falls back to a fresh read that already reflects the
+  // published content, diffs it against itself, and finds nothing — permanently rejecting an
+  // idempotent retry as unchanged, exactly the stranding the two branches above already guard
+  // against on their own push failures. Preserve the same recovery baseline here, guarded on nothing
+  // already preserved so a repeated retry doesn't churn the write every attempt. No second push is
+  // worth attempting to confirm it: the one just above already answered whether the sync channel is
+  // healthy this attempt, so a locally-persisted baseline here is `baselineUnconfirmed` by
+  // definition — same-machine resume safe, never cross-machine, exactly like the two branches above.
+  const baselineAlreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
+  if (baselineAlreadyPreserved) return { found: true, ids, synced };
+  const baselinePersisted = await mustPersist(() =>
+    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
+  );
+  return {
+    found: true,
+    ids,
+    synced,
+    ...(baselinePersisted ? { baselineUnconfirmed: true } : { baselineUnpersisted: true }),
+  };
 }
 
 /**
