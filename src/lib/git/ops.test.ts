@@ -4232,6 +4232,24 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
       expect(verdict.reason).not.toMatch(/already accepted the update/);
     });
 
+    // #305 review round 3: a rejection reason this classifier has no specific pattern for (e.g. a
+    // hidden-ref deny) must still be read as a proven rejection via the generic `!` porcelain flag
+    // (git-push(1)) — not fall through to the Done-based "transient" path just because neither of
+    // the two known-wording patterns matched.
+    it("reports a rejection with unrecognized wording as permanent via the generic '!' flag", () => {
+      const verdict = classifyPushFailure({
+        code: null,
+        signal: "SIGKILL",
+        stdout:
+          "To origin\n!\trefs/heads/main:refs/heads/main\t[remote rejected] (deny updating a hidden ref)\nDone\n",
+        stderr: "",
+      });
+
+      expect(verdict.transient).toBe(false);
+      expect(verdict.reason).toMatch(/deny updating a hidden ref/);
+      expect(verdict.reason).not.toMatch(/already accepted the update/);
+    });
+
     it("points at the OOM killer for SIGKILL specifically — the measured cause on a loaded host", () => {
       const verdict = classifyPushFailure({ code: null, signal: "SIGKILL", stdout: "", stderr: "" });
 

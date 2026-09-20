@@ -1709,6 +1709,16 @@ const PORCELAIN_NON_FF_REJECTED = /\[rejected\]\s*\((?:fetch first|non-fast-forw
 const PORCELAIN_HOOK_REJECTED = /\[remote rejected\]\s*\(.*hook declined.*\)/;
 
 /**
+ * Any porcelain ref-status line reporting a rejection, per git-push(1)'s porcelain flags: `!` marks
+ * "a ref that was rejected or failed to push", independent of the reason text after it. The two
+ * patterns above exist only to phrase a friendlier reason for the causes seen so far; this is the
+ * backstop that catches every OTHER rejection wording (a hidden-ref deny, a quarantine failure,
+ * anything) — matching the flag generically is what tells "rejected, worded a way we've never
+ * seen" from "genuinely accepted", where the two specific patterns alone would tell neither.
+ */
+const PORCELAIN_ANY_REJECTED = /^!\t.*$/m;
+
+/**
  * Caps {@link SIGNAL_KILL_RETRY}'s gap, same CAP-never-an-override contract as {@link PUSH_TIMEOUT_ENV}
  * and read per call for the same reason. Exists so the retry can be exercised without waiting out a
  * real 30 seconds; a lower value can only shorten the wait, never lengthen it.
@@ -1783,8 +1793,21 @@ export function classifyPushFailure(result: {
           `fault: ${stdout}`,
       };
     }
+    // Neither specific pattern matched, but the `!` porcelain flag means "rejected" regardless of
+    // wording (git-push(1)) — catch every rejection this classifier has no friendly phrasing for
+    // before ever reading `Done` as acceptance.
+    const rejectedLine = stdout.match(PORCELAIN_ANY_REJECTED)?.[0];
+    if (rejectedLine) {
+      return {
+        transient: false,
+        reason:
+          `the push was killed by ${named} from outside anton${oom}, but the remote had already ` +
+          `rejected the update before the signal arrived — a retry of the same push cannot fix ` +
+          `that: ${rejectedLine}`,
+      };
+    }
     // A `Done` line only appears once `--porcelain` heard back from the remote for every ref, so
-    // its presence (absent either rejection pattern above) is the one thing this can assert about
+    // its presence (absent any rejection flag above) is the one thing this can assert about
     // ref state; its absence proves nothing — the signal could still have landed after the remote
     // accepted the update but before the line was written back.
     const refState = /^Done\s*$/m.test(stdout)
