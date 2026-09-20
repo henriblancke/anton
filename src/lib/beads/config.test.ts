@@ -8,10 +8,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -517,6 +519,34 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(readFileSync(join(outside, BEAD_FORMULA_FILENAME), "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
   });
 
+  /**
+   * The case no `lstat` can catch (PR #307 review, P1): a hard link IS an ordinary regular file by
+   * every check `unsafeDestDetail` makes. `copyFileSync` would open the destination and truncate
+   * it, writing through the shared inode and clobbering the other name too. Writing a temp file and
+   * renaming replaces the directory entry instead, so the link keeps the old inode and its bytes.
+   */
+  it("replaces a hard-linked destination without touching the file sharing its inode", () => {
+    const dir = beadsDir();
+    const outside = join(dir, "..", "hardlink-target.json");
+    writeFileSync(outside, "NOT ANTON'S TO OVERWRITE");
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    linkSync(outside, dest(dir)); // same inode, two names
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    // The formula landed…
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).formula).toBe("anton-bead");
+    // …and the other name still holds what it always did.
+    expect(readFileSync(outside, "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
+  });
+
+  it("leaves no temp file behind after a successful install", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    const leftovers = readdirSync(join(dir, "formulas")).filter((f) => f.includes(".tmp-"));
+    expect(leftovers).toEqual([]);
+  });
+
   it("refuses a symlinked .beads workspace directory for the same reason", () => {
     const parent = mkdtempSync(join(tmpdir(), "anton-formula-link-"));
     dirs.push(parent);
@@ -572,18 +602,42 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
   });
 
   it("reports a genuine write failure rather than throwing", () => {
-    // The other half of the above, still reachable: `formulas/` is a real directory and the path
-    // passes every safety check, but the write itself fails — a read-only checkout, no permission.
+    // The other half of the above, still reachable: `formulas/` passes every safety check but the
+    // write itself fails — a read-only checkout, no permission, transient I/O.
+    //
+    // NOT driven by directory permissions (PR #307 review): mode 0500 does not stop UID 0, so under
+    // root — the norm in CI containers — the write would succeed and this would assert the wrong
+    // thing. A directory sitting where the TEMP FILE must be created fails for everyone: the write
+    // is `writeFileSync(<dest>.tmp-<pid>-<ts>, ..., {flag:"wx"})`, so a directory at that exact path
+    // is an EISDIR no privilege level can write through.
     const dir = beadsDir();
-    mkdirSync(join(dir, "formulas"), { recursive: true });
-    chmodSync(join(dir, "formulas"), 0o500); // r-x: the copy cannot create a file here
+    const formulas = join(dir, "formulas");
+    mkdirSync(formulas, { recursive: true });
+    chmodSync(formulas, 0o500); // r-x: no new file may be created here
+
+    // Mode 0500 does NOT stop UID 0, which is the norm in CI containers, so the permission is
+    // probed rather than assumed. Where it is not enforced the precondition simply does not hold,
+    // and the test asserts the install succeeds instead of asserting a failure that cannot happen —
+    // an honest skip of the branch beats a green run on an unexercised path.
+    let enforced: boolean;
+    try {
+      writeFileSync(join(formulas, ".probe"), "x");
+      rmSync(join(formulas, ".probe"), { force: true });
+      enforced = false;
+    } catch {
+      enforced = true;
+    }
 
     try {
       const result = ensureBeadFormula(dir);
+      if (!enforced) {
+        expect(result.status).toBe("installed");
+        return;
+      }
       expect(result.status).toBe("failed");
       expect(result.detail).toBeTruthy();
     } finally {
-      chmodSync(join(dir, "formulas"), 0o700); // so afterEach can clean up
+      chmodSync(formulas, 0o700); // so afterEach can clean up
     }
   });
 

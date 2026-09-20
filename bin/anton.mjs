@@ -1825,6 +1825,12 @@ async function cmdSetup(args = []) {
   // Registered projects get their formulas from configureBeadsForRepo (`anton init` / addProject),
   // which is the path shaping and the run pipeline actually read — so `anton setup` alone never
   // refreshes a registered project's pipeline, and `anton init <repo>` is what does.
+  // BEFORE the installs, because a replacement writes a `.bak` beside the formula and that lands in
+  // a git-tracked directory (PR #307 review). `configureBeadsForRepo` reaches the ignore through its
+  // own step; this path never called it, so a backup made here would be staged by the next
+  // `git add -A` and a stale pipeline committed. Idempotent and additive — it only appends entries
+  // the file lacks.
+  if (existsSync(join(APP_ROOT, ".beads"))) ensureBeadsGitignore(join(APP_ROOT, ".beads"));
   for (const asset of [
     { label: "Bead formula", filename: BEAD_FORMULA_FILENAME, install: ensureBeadFormula },
     { label: "Run formula", filename: RUN_FORMULA_FILENAME, install: ensureRunFormula },

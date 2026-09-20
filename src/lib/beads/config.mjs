@@ -18,7 +18,7 @@
  * `teamConfigKeys` / `SERVER_CONNECTION_KEYS`, selected by the mode this file reads from
  * `.beads/metadata.json` (anton-4gd2).
  */
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
@@ -476,16 +476,23 @@ export function bundledRunFormulaPath(appRoot = PACKAGE_ROOT) {
  * attacker-nameable path. Under the OLD no-clobber rule an existing symlink was never written to at
  * all, so this hazard arrives WITH the replace behavior and is fixed in the same change.
  *
- * Those checks NARROW the window; they do not close it (PR #307 review). They are lstat-then-act,
- * so a caller who can race the filesystem — swapping a path for a symlink between the check and the
- * `copyFileSync` — can still redirect the write. Closing it properly needs `O_NOFOLLOW`-guarded
- * file descriptors (open the parent, `openat` with `O_NOFOLLOW|O_CREAT`, write through the fd)
- * rather than path-based checks, which is a larger change than this one. What is here stops the
- * symlink that is simply SITTING there, which is the realistic shape: a repo checked out with one
- * in it, or one left behind by a previous tool. It is not a defense against an attacker who already
- * has write access to the repo directory and can time a swap — and someone with that access has
- * better paths available anyway (a `.beads/formulas/*.toml` of their choosing, or the repo's own
- * hooks).
+ * The write itself goes through {@link writeNewFile} — a new file renamed into place — rather than
+ * `copyFileSync`, which would open the existing destination and truncate it. That is what covers
+ * the case no `lstat` can see: a HARD LINK is an ordinary regular file by every check here, so a
+ * destination hard-linked to a file elsewhere would have had that file clobbered through the shared
+ * inode. Replacing the directory entry leaves the link pointing at the old inode and its old
+ * contents.
+ *
+ * Those checks NARROW the remaining race; they do not close it (PR #307 review). They are
+ * lstat-then-act, so a caller who can swap a path between the check and the write can still
+ * redirect it — though the atomic rename means a swap must now beat the check rather than the
+ * copy. Closing it outright needs `O_NOFOLLOW`-guarded descriptors (open the parent, `openat` the
+ * child) rather than path-based checks, which is a larger change than this one. What is here stops
+ * the symlink or hard link that is simply SITTING there, which is the realistic shape: a repo
+ * checked out with one in it, or one left by a previous tool. It is not a defense against an
+ * attacker who already has write access to the repo directory and can time a swap — and someone
+ * with that access has better paths available anyway (a `.beads/formulas/*.toml` of their choosing,
+ * or the repo's own hooks).
  *
  * Returns { status, detail? } — "installed" (nothing was there) | "replaced" (a differing copy was
  * overwritten; `detail` names the backup) | "already" (byte-identical) | "missing-asset" (the
@@ -563,14 +570,14 @@ function ensureFormula(beadsDir, filename, src) {
         // is absent so the operator is not told about one that was never written. `missingIsSafe`
         // because no prior `.bak` is the common case, not a suspicious one.
         if (!unsafeDestDetail(`${dest}.bak`, `${filename}.bak`, { missingIsSafe: true })) {
-          copyFileSync(dest, `${dest}.bak`);
+          writeNewFile(`${dest}.bak`, readFileSync(dest));
           backup = `${filename}.bak`;
         }
       } catch {
         backup = undefined;
       }
     }
-    copyFileSync(src, dest);
+    writeNewFile(dest, shipped);
     if (!present) return { status: "installed" };
     return {
       status: "replaced",
@@ -580,6 +587,42 @@ function ensureFormula(beadsDir, filename, src) {
     };
   } catch (err) {
     return { status: "failed", detail: err?.message || String(err) };
+  }
+}
+
+/**
+ * Write `contents` to `path` by creating a NEW file and renaming it into place, never by writing
+ * through whatever is already there (PR #307 review, P1).
+ *
+ * `copyFileSync` opens the existing destination and truncates it, so it writes through the inode
+ * rather than replacing it. A `dest` HARD-LINKED to a file elsewhere on the same filesystem shares
+ * that inode, so the other file is clobbered too — and `lstat` cannot see it coming: a hard link is
+ * an ordinary regular file by every check {@link unsafeDestDetail} makes. Reproduced before fixing:
+ * an external hard-linked file was overwritten with the shipped formula while the call reported
+ * "replaced".
+ *
+ * Writing a temp file and renaming replaces the DIRECTORY ENTRY instead. The hard link keeps
+ * pointing at the old inode, which still holds the old contents, so only the name inside `.beads/`
+ * takes the new bytes. `rename` within one directory is atomic, which also shrinks the TOCTOU
+ * window the header describes — the checks still race, but the write itself no longer follows a
+ * path that changed underneath it.
+ *
+ * The temp name lives in the destination's own directory, because `rename` cannot cross
+ * filesystems. Cleaned up on failure so a botched install leaves no litter beside the formulas.
+ */
+function writeNewFile(path, contents) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    // `wx` fails if the temp name somehow exists rather than following or truncating it.
+    writeFileSync(tmp, contents, { flag: "wx" });
+    renameSync(tmp, path);
+  } catch (err) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // Best-effort cleanup; the original error is the one worth reporting.
+    }
+    throw err;
   }
 }
 
