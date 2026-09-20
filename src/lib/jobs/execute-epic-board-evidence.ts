@@ -54,7 +54,7 @@ import {
   type Bead,
 } from "../beads/bd";
 import { PoisonEpic } from "./errors";
-import { mustPersist, mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
 
 /**
  * Label prefixes anton itself rewrites on a claim, a heartbeat lease refresh or a review round,
@@ -159,17 +159,24 @@ export function fingerprintBoard(board: readonly Bead[]): BoardFingerprint {
  * worktree process. Sharing that cache across the baseline and post-run reads would serve the
  * baseline's stale description right back on the post-run read, hiding exactly the description-only
  * edit this hydration exists to surface. A fresh, uncached `bd show` per read is the correct (if
- * costlier) fix; a failed show leaves that bead's description empty rather than failing the whole
- * board read, matching `ensureDescription`'s own missing-field fallback.
+ * costlier) fix.
+ *
+ * Returns `undefined` if ANY bead's description could not be hydrated after {@link mustRead}'s own
+ * retries (PR #284 review round 11) — a single transient `bd show` failure used to fold to `""`
+ * unconditionally, and a real (non-empty) description on the other side of the baseline/post-run
+ * comparison would then diff against that synthetic empty value as if the bead had changed, crediting
+ * a board-only agent with evidence it never produced. The caller folds this the same way it already
+ * folds a failed {@link mustReadBoard}: an unreadable comparison, never a fabricated one.
  */
-function hydrateDescriptions(repo: string, board: readonly Bead[]): Promise<Bead[]> {
-  return Promise.all(
+async function hydrateDescriptions(repo: string, board: readonly Bead[]): Promise<Bead[] | undefined> {
+  const hydrated = await Promise.all(
     board.map(async (b) => {
       if (b.description !== undefined) return b;
-      const full = await beads.show(repo, b.id).catch(() => undefined);
-      return { ...b, description: full?.description ?? "" };
+      const full = await mustRead(repo, b.id);
+      return full && { ...b, description: full.description ?? "" };
     }),
   );
+  return hydrated.every((b): b is Bead => Boolean(b)) ? hydrated : undefined;
 }
 
 /**
@@ -209,7 +216,8 @@ function deserializeFingerprint(serialized: Record<string, string>): BoardFinger
  *
  * `ticket` (PR #284 review) lets a RESUMED attempt reuse a PRIOR attempt's preserved baseline
  * instead of taking a fresh one. A fresh read on every attempt is wrong the moment a post-run read
- * fails outright (see {@link readBoardEvidence}'s `!board` branch): this ticket's own writes can
+ * fails outright, or whose description hydration cannot be trusted (see {@link readBoardEvidence}'s
+ * `!hydrated` branch): this ticket's own writes can
  * still reach the remote through a sync pass that runs independently of this check (the heartbeat
  * backstop, a write-nudged push), so a resumed attempt's fresh baseline would already include them
  * — and an idempotent agent that correctly makes no further writes would then diff as no evidence
@@ -221,7 +229,8 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
   const preserved = ticket && beads.boardEvidenceBaseline(ticket);
   if (preserved) return deserializeFingerprint(preserved);
   const board = await mustReadBoard(repo);
-  return board ? fingerprintBoard(await hydrateDescriptions(repo, board)) : null;
+  const hydrated = board && (await hydrateDescriptions(repo, board));
+  return hydrated ? fingerprintBoard(hydrated) : null;
 }
 
 /** What the post-run board read found, relative to the baseline. */
@@ -256,7 +265,7 @@ export interface BoardEvidenceResult {
    */
   markerUnpersisted?: boolean;
   /**
-   * The FIRST attempt's recovery baseline (see {@link readBoardEvidence}'s `!board` branch) could
+   * The FIRST attempt's recovery baseline (see {@link readBoardEvidence}'s `!hydrated` branch) could
    * not be made durable — persisted AND confirmed synced — before this attempt gave up (PR #284
    * review round 9). Always paired with `evidenceUnavailable: true`. Named separately because it is
    * a sharper warning than a merely unreadable post-run board: if this ticket resumes on ANOTHER
@@ -288,7 +297,7 @@ export interface BoardEvidenceResult {
  * reason: the caller's gate must fail closed on "found, but unconfirmed" exactly as it does on "not
  * found", never crash the ticket walk over the sync probe.
  *
- * A TOTAL read failure (`!board`) with NO prior pending ids (PR #284 review round 8) is the one
+ * A TOTAL read failure, OR a read whose description hydration could not be trusted (`!hydrated`), with NO prior pending ids (PR #284 review round 8) is the one
  * case `pending` cannot cover — a first attempt has nothing to fall back on. This ticket's own
  * writes can still reach the remote through a sync pass that runs independently of this check (the
  * heartbeat backstop, a write-nudged push), so leaving no trace here would let a resumed attempt's
@@ -349,9 +358,11 @@ export async function readBoardEvidence(
   ticket: Bead,
 ): Promise<BoardEvidenceResult> {
   const board = await mustReadBoard(repo);
-  if (!board) {
+  const hydrated = board && (await hydrateDescriptions(repo, board));
+  if (!hydrated) {
     const pending = beads.pendingBoardEvidence(ticket);
-    // No post-run read at all means `freshIds` can never be computed THIS attempt — the one case
+    // No post-run read at all — or a read whose description hydration could not be trusted (PR #284
+    // review round 11) — means `freshIds` can never be computed THIS attempt — the one case
     // `pending` alone (a PRIOR attempt's confirmed-but-unsynced ids) cannot cover, because a first
     // attempt has no prior marker to fall back on (PR #284 review). The baseline this attempt
     // already read is preserved instead, so a resumed attempt's `readBoardBaseline` reuses it
@@ -389,7 +400,7 @@ export async function readBoardEvidence(
     }
     return { found: pending.length > 0, ids: pending, synced: false, evidenceUnavailable: true };
   }
-  const freshIds = boardEvidence(baseline, fingerprintBoard(await hydrateDescriptions(repo, board)));
+  const freshIds = boardEvidence(baseline, fingerprintBoard(hydrated));
   const pending = beads.pendingBoardEvidence(ticket);
   const ids = [...new Set([...pending, ...freshIds])].toSorted();
   if (ids.length === 0) return { found: false, ids: [], synced: false };
@@ -403,7 +414,7 @@ export async function readBoardEvidence(
       // to cover — but the content edits still might be, and the caller's message distinguishes
       // `markerUnpersisted` from `!synced` regardless of this value, so it is still worth reporting.
       //
-      // The baseline is preserved too, reusing the same recovery mechanism as the `!board` branch
+      // The baseline is preserved too, reusing the same recovery mechanism as the `!hydrated` branch
       // above (PR #284 review): `freshIds` is real here — the board content already changed — but
       // with no marker AND no preserved baseline, a resumed attempt's `readBoardBaseline` takes a
       // FRESH read that already reflects this change, diffs it against itself, and finds nothing —
@@ -418,7 +429,7 @@ export async function readBoardEvidence(
         ));
       const outcome = await beads.push(repo).catch(() => "not-wired" as const);
       const synced = outcome === "synced" || outcome === "shared-server";
-      // Confirmed (persisted AND synced) exactly like the `!board` branch's recovery baseline (PR
+      // Confirmed (persisted AND synced) exactly like the `!hydrated` branch's recovery baseline (PR
       // #284 review round 10) — both marker and baseline are unrecoverable state once this attempt's
       // baseline is superseded, so a baseline write that landed only locally, or never landed at all,
       // is reported the same way that branch reports it: `baselineUnconfirmed`, not silently folded

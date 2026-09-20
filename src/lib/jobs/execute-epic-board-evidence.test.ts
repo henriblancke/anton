@@ -297,6 +297,32 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "treats a description hydration that fails all its retries as an unreadable board, not a " +
+      "fabricated empty description (PR #284 review round 11) — a real description on the other " +
+      "side of the comparison must never diff against a synthetic '' just because one side's `bd " +
+      "show` was flaky",
+    async () => {
+      loadAllIssuesMock.mockResolvedValueOnce([bead("hydrate-c", { description: "real description" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      expect(baseline).toEqual(
+        fingerprintBoard([bead("hydrate-c", { description: "real description" })]),
+      );
+
+      loadAllIssuesMock.mockResolvedValueOnce([bead("hydrate-c", { description: undefined })]);
+      showMock.mockRejectedValueOnce(new Error("bd unreachable"));
+      showMock.mockRejectedValueOnce(new Error("bd unreachable"));
+      showMock.mockRejectedValueOnce(new Error("bd unreachable"));
+      pushMock.mockResolvedValueOnce("synced");
+      await expect(readBoardEvidence("/repo", baseline, bead("t-hydrate-fail"))).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+      });
+    },
+  );
+
   const ticket = bead("t-1");
 
   it(
