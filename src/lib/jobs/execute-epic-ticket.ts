@@ -167,12 +167,12 @@ export async function runTicket(args: {
     // step has a chance to write — keeps that baseline untouched for the resume that follows.
     if (boardOnly && !boardBaseline) {
       throw new NoDeliveryError(
-        boardOnlyNoDeliveryMessage(ticket, {
-          found: false,
-          ids: [],
-          synced: false,
-          baselineUnavailable: true,
-        }),
+        boardOnlyNoDeliveryMessage(
+          ticket,
+          { found: false, ids: [], synced: false, baselineUnavailable: true },
+          // No agent has run yet at this pre-dispatch check, so there is no self-report to fold in.
+          null,
+        ),
       );
     }
     // The baseline itself read fine but could not be durably anchored to the ticket before dispatch
@@ -703,7 +703,7 @@ async function assertBoardOnlyDelivered(
       progress.delivered = true;
       return;
     }
-    throw new NoDeliveryError(boardOnlyNoDeliveryMessage(ticket, result));
+    throw new NoDeliveryError(boardOnlyNoDeliveryMessage(ticket, result, selfReport));
   }
   // No verified evidence: an honest `blocked`, a missing line, or a `satisfied` claim the branch did
   // not bear out. Cross-checked and folded into the reason exactly as the tree-based gate does
@@ -740,8 +740,20 @@ function boardOnlyBaselineNotPersistedMessage(ticket: Bead): string {
 /**
  * Why a board-only ticket's zero diff still did not settle (anton-fc5x) — the two ways the board
  * evidence check can come up short, named precisely so the operator note says which.
+ *
+ * `selfReport` (chatgpt-codex-connector, PR #284 review, "message hardcodes 'self-reported
+ * delivered'") lets the `!evidence.found` branch below report what the agent actually claimed via
+ * {@link selfReportSuffix} rather than a literal "self-reported delivered" — `assertBoardOnlyDelivered`
+ * reaches this whole function on EITHER a `delivered` or an unconfirmed `satisfied` self-report, and
+ * the two read very differently to an operator: `satisfied` names a specific commit it claims already
+ * covers this ticket, `delivered` claims a change this attempt itself made. The hardcoded wording
+ * described only the first.
  */
-function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult): string {
+function boardOnlyNoDeliveryMessage(
+  ticket: Bead,
+  evidence: BoardEvidenceResult,
+  selfReport: TicketProgress["selfReport"],
+): string {
   if (evidence.baselineUnavailable) {
     return (
       `${ticket.id} produced no delivery: this ticket is marked \`delivery:board\`, whose deliverable ` +
@@ -804,12 +816,12 @@ function boardOnlyNoDeliveryMessage(ticket: Bead, evidence: BoardEvidenceResult)
   }
   if (!evidence.found) {
     return (
-      `${ticket.id} produced no delivery: claude exited cleanly, self-reported delivered, and this ` +
-      `ticket is marked \`delivery:board\` — but no bd write landed on the board since the ticket ` +
-      `started (the whole board's title/description/status was compared against the pre-dispatch ` +
-      `read and nothing differs). Halting the epic for operator review — a board-only ticket with ` +
-      `no board evidence is the same false success a git zero diff is. The ticket is left open (not ` +
-      `blocked) so a resumed run can reclaim and retry it without a manual status edit.`
+      `${ticket.id} produced no delivery: claude exited cleanly and this ticket is marked ` +
+      `\`delivery:board\` — but no bd write landed on the board since the ticket started (the whole ` +
+      `board's title/description/status was compared against the pre-dispatch read and nothing ` +
+      `differs). Halting the epic for operator review — a board-only ticket with no board evidence ` +
+      `is the same false success a git zero diff is. The ticket is left open (not blocked) so a ` +
+      `resumed run can reclaim and retry it without a manual status edit.${selfReportSuffix(selfReport)}`
     );
   }
   if (evidence.markerUnpersisted) {

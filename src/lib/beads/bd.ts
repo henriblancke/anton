@@ -171,6 +171,43 @@ export const REVIEW_SCORE_PREFIX = "review-score:";
 /** Prefix of the board-evidence-pending label (see LABELS.boardEvidencePending). */
 export const BOARD_EVIDENCE_PENDING_PREFIX = "board-evidence-pending:";
 
+/**
+ * Safe byte budget for one `board-evidence-pending:<ids>` label value (chatgpt-codex-connector, PR
+ * #284 review, "Bound pending evidence before adding it as one label") — comfortably under Linux's
+ * `MAX_ARG_STRLEN` (~128 KiB), the same ceiling {@link beads.setBoardEvidenceBaseline} moved off
+ * argv entirely for by writing through a temp file instead. A label can't go through a temp file
+ * the same way (`--add-label` takes its value straight on argv), so a board-only batch large enough
+ * to overflow a single argument instead spans MULTIPLE `board-evidence-pending:*` labels, each kept
+ * under this budget — see {@link chunkBoardEvidenceIds}.
+ */
+const BOARD_EVIDENCE_PENDING_LABEL_BUDGET = 100_000;
+
+/**
+ * Split `ids` into contiguous groups whose serialized `board-evidence-pending:<ids>` label stays
+ * under {@link BOARD_EVIDENCE_PENDING_LABEL_BUDGET}. `ids` is expected sorted (every caller passes
+ * the already-deduped, sorted evidence set), so chunk boundaries fall in sorted order too — which
+ * is what lets a caller compare the resulting label set against a bead's current labels by sorting
+ * both sides, rather than needing write order preserved.
+ */
+function chunkBoardEvidenceIds(ids: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let currentLen = 0;
+  for (const id of ids) {
+    const nextLen = currentLen + id.length + (current.length > 0 ? 1 : 0);
+    if (current.length > 0 && BOARD_EVIDENCE_PENDING_PREFIX.length + nextLen > BOARD_EVIDENCE_PENDING_LABEL_BUDGET) {
+      chunks.push(current);
+      current = [id];
+      currentLen = id.length;
+    } else {
+      current.push(id);
+      currentLen = nextLen;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
 /** Prefix of the stage label (see LABELS.stage). */
 export const STAGE_PREFIX = "stage:";
 
@@ -1062,29 +1099,40 @@ export const beads = {
     (b.labels ?? []).filter((l) => l.startsWith(BOARD_EVIDENCE_PENDING_PREFIX)),
 
   /** Ids a PRIOR attempt found changed but could not confirm synced, parsed back off the bead's own
-   * label (anton-fc5x) — empty when none is pending. See {@link LABELS.boardEvidencePending}. */
+   * label(s) (anton-fc5x) — empty when none is pending. Reads EVERY `board-evidence-pending:*`
+   * label, not just the first (PR #284 review, "Bound pending evidence before adding it as one
+   * label"): a batch large enough to need {@link chunkBoardEvidenceIds} spreads its ids across
+   * several labels, and reading only one would silently drop the rest. See
+   * {@link LABELS.boardEvidencePending}. */
   pendingBoardEvidence: (b: Bead): string[] => {
-    const label = beads.boardEvidencePendingLabels(b)[0];
-    return label
-      ? label
-          .slice(BOARD_EVIDENCE_PENDING_PREFIX.length)
-          .split(",")
-          .filter(Boolean)
-      : [];
+    const ids = beads
+      .boardEvidencePendingLabels(b)
+      .flatMap((label) => label.slice(BOARD_EVIDENCE_PENDING_PREFIX.length).split(",").filter(Boolean));
+    return [...new Set(ids)];
   },
 
   /**
-   * Publish the board-only evidence still awaiting sync confirmation as a state label in ONE
+   * The exact `board-evidence-pending:*` label SET {@link beads.setBoardEvidencePending} would
+   * write for `ids` (PR #284 review) — exposed so a caller can compare it against a bead's current
+   * labels ({@link beads.boardEvidencePendingLabels}) to decide whether a write is a no-op, without
+   * duplicating {@link chunkBoardEvidenceIds}'s chunking itself.
+   */
+  boardEvidencePendingLabelsFor: (ids: readonly string[]): string[] =>
+    chunkBoardEvidenceIds(ids).map((chunk) => LABELS.boardEvidencePending(chunk)),
+
+  /**
+   * Publish the board-only evidence still awaiting sync confirmation as state label(s) in ONE
    * update, like {@link beads.setReviewScore}: drop every prior `board-evidence-pending:*` (pass
    * them as `stale`) and add the new set. An empty `ids` with a non-empty `stale` clears the marker
-   * (confirmed synced) without adding a replacement.
+   * (confirmed synced) without adding a replacement. `ids` is split across multiple labels when it
+   * would otherwise overflow one argv argument — see {@link beads.boardEvidencePendingLabelsFor}.
    */
   setBoardEvidencePending: (cwd: string, id: string, ids: readonly string[], stale: string[] = []) =>
     bdWrite(cwd, [
       "update",
       id,
       ...stale.flatMap((l) => ["--remove-label", l]),
-      ...(ids.length > 0 ? ["--add-label", LABELS.boardEvidencePending(ids)] : []),
+      ...beads.boardEvidencePendingLabelsFor(ids).flatMap((label) => ["--add-label", label]),
     ]),
 
   /**

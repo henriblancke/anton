@@ -2064,6 +2064,28 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
   });
 
   it(
+    "names what the agent actually claimed — `satisfied`, not `delivered` — when a `satisfied` " +
+      "claim with no board evidence reaches this same no-delivery message (chatgpt-codex-connector, " +
+      "PR #284 review, \"message hardcodes 'self-reported delivered'\") — a satisfied claim names a " +
+      "commit it claims already covers this ticket, a delivered claim names no commit at all, and " +
+      "the two must not read the same to an operator debugging which one this was",
+    async () => {
+      const satisfiedReport = { outcome: "satisfied" as const, commit: "a1b2c3d", reason: "already landed" };
+      const p = progress(satisfiedReport);
+      const check = async () => ({ found: false, ids: [], synced: false });
+
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+
+      expect(err?.name).toBe("PoisonError");
+      expect(err?.message).toMatch(/anton-board produced no delivery/);
+      expect(err?.message).not.toMatch(/self-reported delivered/);
+      expect(err?.message).toMatch(/ANTON-RESULT: satisfied — a1b2c3d — already landed/);
+      expect(err?.message).toMatch(/names no commit this run's branch added over its base/);
+      expect(p).toMatchObject({ committed: false, delivered: false });
+    },
+  );
+
+  it(
     "blocks and fails closed — rather than settling delivered — when the evidence marker itself " +
       "could not be persisted (PR #284 review round 5): found+synced alone is not a settled verdict " +
       "when the durable record of it never landed, since a crash right after this point would strand " +

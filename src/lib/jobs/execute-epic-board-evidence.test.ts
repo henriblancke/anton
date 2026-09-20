@@ -511,15 +511,18 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
-    "does not re-persist the baseline when the ticket already carries one — a repeated read " +
-      "failure must not churn the write every attempt — but still retries the confirming push and " +
-      "still reports baselineUnconfirmed (chatgpt-codex-connector, PR #284 review, \"track whether " +
-      "preserved baselines were synced\") rather than silently dropping the flag now that the write " +
-      "itself is skipped",
+    "does not re-persist the baseline when the ticket already carries a LOCKED one — a repeated " +
+      "read failure must not churn the write every attempt — but still retries the confirming push " +
+      "and still reports baselineUnconfirmed (chatgpt-codex-connector, PR #284 review, \"track " +
+      "whether preserved baselines were synced\") rather than silently dropping the flag now that " +
+      "the write itself is skipped",
     async () => {
       const preserved = { a: "already-preserved-hash" };
       const ticketWithBaseline = bead("t-baseline-again", {
-        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+        metadata: {
+          boardEvidenceBaseline: JSON.stringify(preserved),
+          boardEvidenceBaselineLocked: "1",
+        },
       });
       loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
       const baseline = (await readBoardBaseline("/repo"))!;
@@ -534,6 +537,37 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         baselineUnconfirmed: true,
       });
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
+    "UPGRADES an existing UNLOCKED baseline to locked rather than skipping the write " +
+      "(chatgpt-codex-connector, PR #284 review, \"Set the recovery lock when a baseline already " +
+      "exists\") — the pre-dispatch path always leaves an unlocked baseline behind, so treating " +
+      "`alreadyPreserved` alone as \"nothing to do\" would let a NEXT attempt's " +
+      "`ensureBoardBaselinePersisted` keep refreshing it across a confirming pull, folding in this " +
+      "attempt's own delivery and permanently rejecting an idempotent retry as unchanged",
+    async () => {
+      const preserved = { a: "already-preserved-hash" };
+      const ticketWithUnlockedBaseline = bead("t-baseline-upgrade", {
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      rejectEveryRetry();
+      pushMock.mockResolvedValueOnce("synced");
+      await expect(readBoardEvidence("/repo", baseline, ticketWithUnlockedBaseline)).resolves.toEqual({
+        found: false,
+        ids: [],
+        synced: false,
+        evidenceUnavailable: true,
+      });
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-baseline-upgrade",
+        Object.fromEntries(baseline.beads),
+        true,
+      );
     },
   );
 
@@ -706,16 +740,19 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
 
   it(
     "does not re-persist the baseline on a confirming-push failure when the ticket already carries " +
-      "one — a repeated push failure must not churn the write every attempt — but still reports " +
-      "baselineUnconfirmed (chatgpt-codex-connector, PR #284 review, \"track whether preserved " +
-      "baselines were synced\"): this shortcut used to return bare `synced: false` with neither flag " +
-      "set, silently dropping the same-machine-safe warning for a baseline that survived from an " +
-      "earlier attempt",
+      "a LOCKED one — a repeated push failure must not churn the write every attempt — but still " +
+      "reports baselineUnconfirmed (chatgpt-codex-connector, PR #284 review, \"track whether " +
+      "preserved baselines were synced\"): this shortcut used to return bare `synced: false` with " +
+      "neither flag set, silently dropping the same-machine-safe warning for a baseline that " +
+      "survived from an earlier attempt",
     async () => {
       const preserved = { a: "already-preserved-hash" };
       const ticketWithBaseline = bead("t-fast-path-baseline-again", {
         labels: [LABELS.boardEvidencePending(["a"])],
-        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+        metadata: {
+          boardEvidenceBaseline: JSON.stringify(preserved),
+          boardEvidenceBaselineLocked: "1",
+        },
       });
       loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
       const baseline = (await readBoardBaseline("/repo"))!;
@@ -725,6 +762,32 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       const result = await readBoardEvidence("/repo", baseline, ticketWithBaseline);
       expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
+    "UPGRADES an existing UNLOCKED baseline to locked on a confirming-push failure too " +
+      "(chatgpt-codex-connector, PR #284 review, \"Set the recovery lock when a baseline already " +
+      "exists\") — every recovery-preserve attempt in this function must upgrade an unlocked " +
+      "baseline rather than treat its mere presence as nothing left to do",
+    async () => {
+      const preserved = { a: "already-preserved-hash" };
+      const ticketWithUnlockedBaseline = bead("t-fast-path-baseline-upgrade", {
+        labels: [LABELS.boardEvidencePending(["a"])],
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("not-wired");
+      const result = await readBoardEvidence("/repo", baseline, ticketWithUnlockedBaseline);
+      expect(result).toEqual({ found: true, ids: ["a"], synced: false, baselineUnconfirmed: true });
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-fast-path-baseline-upgrade",
+        Object.fromEntries(baseline.beads),
+        true,
+      );
     },
   );
 
@@ -795,12 +858,15 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
-    "does not re-persist the baseline on a marker-write failure when the ticket already carries " +
-      "one — a repeated failure must not churn the write every attempt",
+    "does not re-persist the baseline on a marker-write failure when the ticket already carries a " +
+      "LOCKED one — a repeated failure must not churn the write every attempt",
     async () => {
       const preserved = { a: "already-preserved-hash" };
       const ticketWithBaseline = bead("t-marker-unpersisted-again", {
-        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+        metadata: {
+          boardEvidenceBaseline: JSON.stringify(preserved),
+          boardEvidenceBaselineLocked: "1",
+        },
       });
       loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
       const baseline = (await readBoardBaseline("/repo"))!;
@@ -812,6 +878,32 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       const callsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
       await readBoardEvidence("/repo", baseline, ticketWithBaseline);
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(callsBefore);
+    },
+  );
+
+  it(
+    "UPGRADES an existing UNLOCKED baseline to locked on a marker-write failure too " +
+      "(chatgpt-codex-connector, PR #284 review, \"Set the recovery lock when a baseline already " +
+      "exists\")",
+    async () => {
+      const preserved = { a: "already-preserved-hash" };
+      const ticketWithUnlockedBaseline = bead("t-marker-unpersisted-upgrade", {
+        metadata: { boardEvidenceBaseline: JSON.stringify(preserved) },
+      });
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "old" })]);
+      const baseline = (await readBoardBaseline("/repo"))!;
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "swept" })]);
+      pushMock.mockResolvedValueOnce("synced");
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidencePendingMock.mockRejectedValueOnce(new Error("dolt contention"));
+      await readBoardEvidence("/repo", baseline, ticketWithUnlockedBaseline);
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-marker-unpersisted-upgrade",
+        Object.fromEntries(baseline.beads),
+        true,
+      );
     },
   );
 

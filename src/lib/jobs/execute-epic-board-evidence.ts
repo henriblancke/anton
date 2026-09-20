@@ -47,7 +47,6 @@ import {
   ANTON_METADATA_KEYS,
   BOARD_EVIDENCE_PENDING_PREFIX,
   beads,
-  LABELS,
   REVIEW_SCORE_PREFIX,
   RUN_LEASE_PREFIX,
   STAGE_PREFIX,
@@ -359,6 +358,31 @@ export async function ensureBoardBaselinePersisted(
   return refreshedSynced ? refreshed : null;
 }
 
+/**
+ * Preserve `baseline` as `ticket`'s recovery baseline, UPGRADING an existing unlocked baseline to
+ * locked rather than skipping the write (chatgpt-codex-connector, PR #284 review, "Set the recovery
+ * lock when a baseline already exists"). `ensureBoardBaselinePersisted` now always leaves an
+ * unlocked, freely-refreshed baseline on a board-only ticket before dispatch, so every one of
+ * `readBoardEvidence`'s own recovery-preserve attempts below finds `alreadyPreserved` true on
+ * basically every dispatched attempt — treating that alone as "nothing to do" (the old behavior)
+ * means the lock this function exists to set never gets written at all. Left unlocked, a LATER
+ * attempt's `ensureBoardBaselinePersisted` still treats it as the never-dispatched baseline it is
+ * free to refresh across its own confirming pull — which can fold in THIS attempt's own
+ * not-yet-confirmed delivery — and a subsequent idempotent retry then diffs against a baseline that
+ * already contains its own writes, permanently rejecting it as unchanged. Already-locked is still a
+ * true no-op: nothing to upgrade, and re-writing identical content would cost a write for nothing.
+ */
+async function preserveRecoveryBaseline(
+  repo: string,
+  ticket: Bead,
+  baseline: BoardFingerprint,
+): Promise<boolean> {
+  if (beads.boardEvidenceBaselineLocked(ticket)) return true;
+  return mustPersist(() =>
+    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
+  );
+}
+
 /** What the post-run board read found, relative to the baseline. */
 export interface BoardEvidenceResult {
   /** At least one bead's content differs from the baseline. */
@@ -509,19 +533,15 @@ export async function readBoardEvidence(
     // already read is preserved instead, so a resumed attempt's `readBoardBaseline` reuses it
     // rather than taking a fresh one that may already have absorbed this ticket's writes through a
     // sync pass this check never confirmed (see that function's docstring). The WRITE is skipped
-    // once a baseline is already preserved, so a repeated read failure doesn't churn it every
-    // attempt — but the confirming PUSH below still runs every attempt (chatgpt-codex-connector, PR
-    // #284 review, "track whether preserved baselines were synced"): a same-machine retry that
-    // found a baseline already here used to skip this whole block, silently dropping
-    // `baselineUnconfirmed` from its result even though THIS baseline was never actually confirmed
-    // synced — the operator note then fell back to a plain "board read failed" with no warning to
-    // stay on this machine, exactly the false-success shape the flag exists to prevent.
-    const alreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
-    const persisted =
-      alreadyPreserved ||
-      (await mustPersist(() =>
-        beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
-      ));
+    // once a baseline is already preserved AND LOCKED (see {@link preserveRecoveryBaseline}), so a
+    // repeated read failure doesn't churn it every attempt — but the confirming PUSH below still
+    // runs every attempt (chatgpt-codex-connector, PR #284 review, "track whether preserved
+    // baselines were synced"): a same-machine retry that found a baseline already here used to skip
+    // this whole block, silently dropping `baselineUnconfirmed` from its result even though THIS
+    // baseline was never actually confirmed synced — the operator note then fell back to a plain
+    // "board read failed" with no warning to stay on this machine, exactly the false-success shape
+    // the flag exists to prevent.
+    const persisted = await preserveRecoveryBaseline(repo, ticket, baseline);
     if (!persisted) {
       // A write that failed outright leaves NO baseline anywhere, not even on this machine, so a
       // same-machine-safe claim would be false — reported as `baselineUnpersisted` instead
@@ -553,7 +573,14 @@ export async function readBoardEvidence(
   const ids = [...new Set([...pending, ...freshIds])].toSorted();
   if (ids.length === 0) return { found: false, ids: [], synced: false };
   const stale = beads.boardEvidencePendingLabels(ticket);
-  if (stale.length !== 1 || stale[0] !== LABELS.boardEvidencePending(ids)) {
+  // Compared as SETS, not `stale[0] !== ...` (PR #284 review, "Bound pending evidence before adding
+  // it as one label") — a batch large enough to need `chunkBoardEvidenceIds` now spans several
+  // `board-evidence-pending:*` labels, so the single-label equality check below would treat every
+  // such ticket as changed on every attempt, churning the write (and its confirming push) forever.
+  const desired = beads.boardEvidencePendingLabelsFor(ids);
+  const unchanged =
+    stale.length === desired.length && stale.toSorted().every((label, i) => label === desired.toSorted()[i]);
+  if (!unchanged) {
     const persisted = await mustPersist(() =>
       beads.setBoardEvidencePending(repo, ticket.id, ids, stale),
     );
@@ -567,14 +594,10 @@ export async function readBoardEvidence(
       // with no marker AND no preserved baseline, a resumed attempt's `readBoardBaseline` takes a
       // FRESH read that already reflects this change, diffs it against itself, and finds nothing —
       // permanently losing this attempt's confirmed evidence even once the write channel recovers.
-      // Guarded on nothing already preserved so a repeated retry doesn't churn the write every
-      // attempt.
-      const baselineAlreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
-      const baselinePersisted =
-        baselineAlreadyPreserved ||
-        (await mustPersist(() =>
-          beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
-        ));
+      // Guarded on already LOCKED, not merely already preserved (see {@link
+      // preserveRecoveryBaseline}), so a repeated retry doesn't churn the write every attempt once
+      // the lock itself has landed.
+      const baselinePersisted = await preserveRecoveryBaseline(repo, ticket, baseline);
       const outcome = await beads.push(repo).catch(() => "not-wired" as const);
       const synced = outcome === "synced" || outcome === "shared-server";
       // Confirmed (persisted AND synced) exactly like the `!hydrated` branch's recovery baseline (PR
@@ -611,20 +634,13 @@ export async function readBoardEvidence(
   // marker: its own `readBoardBaseline` falls back to a fresh read that already reflects the
   // published content, diffs it against itself, and finds nothing — permanently rejecting an
   // idempotent retry as unchanged, exactly the stranding the two branches above already guard
-  // against on their own push failures. Preserve the same recovery baseline here, guarded on nothing
-  // already preserved so a repeated retry doesn't churn the write every attempt. No second push is
-  // worth attempting to confirm it: the one just above already answered whether the sync channel is
-  // healthy this attempt, so a locally-persisted baseline here is `baselineUnconfirmed` by
-  // definition — same-machine resume safe, never cross-machine, exactly like the two branches above.
-  const baselineAlreadyPreserved = Boolean(beads.boardEvidenceBaseline(ticket));
-  // `baselineUnconfirmed: true` here too (chatgpt-codex-connector, PR #284 review, "track whether
-  // preserved baselines were synced") — this shortcut used to return bare `synced: false` with
-  // neither flag set, silently dropping the same-machine-safe warning the comment above already
-  // promises for a baseline that survived from an earlier attempt.
-  if (baselineAlreadyPreserved) return { found: true, ids, synced, baselineUnconfirmed: true };
-  const baselinePersisted = await mustPersist(() =>
-    beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline), true),
-  );
+  // against on their own push failures. Preserve the same recovery baseline here, guarded on
+  // already LOCKED (see {@link preserveRecoveryBaseline}) so a repeated retry doesn't churn the
+  // write every attempt once the lock itself has landed. No second push is worth attempting to
+  // confirm it: the one just above already answered whether the sync channel is healthy this
+  // attempt, so a locally-persisted baseline here is `baselineUnconfirmed` by definition —
+  // same-machine resume safe, never cross-machine, exactly like the two branches above.
+  const baselinePersisted = await preserveRecoveryBaseline(repo, ticket, baseline);
   return {
     found: true,
     ids,
