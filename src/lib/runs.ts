@@ -413,11 +413,19 @@ export interface PendingRefresh {
  * attempt that finished its own refresh cleanly, whether or not it's the same one that went pending)
  * or the recreation tombstone (the branch the pending sha describes is gone).
  *
- * Walked exactly like {@link findRunBaseRefreshShaForBranch} and for the same reason: attempts don't
- * all share a row, and a `skipped_dirty` row in between must be skipped rather than mistaken for the
- * answer. Returning undefined here is not itself proof nothing is pending — it means the newest
- * row that actually settled something settled it for real, so whatever this function would have
- * found is already superseded.
+ * Unlike {@link findRunBaseRefreshShaForBranch}, a NEWER `skipped_dirty` row is a barrier here, not a
+ * row to skip past (anton-s55u, PR #279 review, fourth re-review): that function's boundary stays
+ * true regardless of what a later dirty attempt does, but `skipped_dirty` only means the REFRESH was
+ * skipped — the attempt can still dispatch and commit real work onto the branch, moving its tip for
+ * reasons that have nothing to do with whether an OLDER pending write-ahead record's mutation ever
+ * landed. Walking through to that older row would hand the caller a `fromSha` reconciliation baseline
+ * those intervening commits already invalidated: the branch no longer equals `fromSha` because of the
+ * dirty attempt's own unrelated work, not because the pending mutation ran, so the caller's ancestry
+ * check could mistake a rewind target that was always an ancestor of the branch for a just-landed
+ * rebase and confirm a mutation that never actually happened. Returning undefined here is not itself
+ * proof nothing is pending — it means the newest row that actually settled something (including a
+ * dirty skip) settled it for real, so whatever this function would have found further back is already
+ * superseded or no longer safely reconcilable.
  *
  * Neither field this returns is trustworthy on its own: `sha` describes what a dead attempt
  * INTENDED, not what it necessarily achieved. The caller (execute-epic-claim.ts) is the one with git
@@ -448,7 +456,7 @@ export async function findPendingRefreshShaForBranch(
     .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt));
   for (const row of rows) {
     if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
-    if (row.baseRefreshOutcome === "skipped_dirty") continue;
+    if (row.baseRefreshOutcome === "skipped_dirty") return undefined;
     if (row.baseRefreshOutcome !== PENDING_REFRESH_OUTCOME) return undefined;
     return row.baseRefreshSha
       ? { sha: row.baseRefreshSha, fromSha: row.pendingRefreshFromSha ?? undefined }

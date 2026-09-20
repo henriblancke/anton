@@ -808,6 +808,60 @@ it("reconciles a pending refresh onto the boundary a crashed attempt actually ap
   );
 });
 
+// anton-s55u (PR #279 review, fourth re-review): a NEWER `skipped_dirty` row between a dead attempt's
+// pending write-ahead record and this resume must be treated as a barrier, not walked through. The
+// dirty attempt still dispatched and committed real work onto the branch despite skipping its own
+// refresh, moving the branch's tip for reasons that have nothing to do with whether attempt 1's
+// pending mutation ever landed — reconciling against the stale `fromSha` here would let the dirty
+// attempt's unrelated commits masquerade as proof the pending rebase actually ran.
+it("does not reconcile a pending refresh past a newer skipped_dirty attempt that may have moved the branch on its own", async () => {
+  // Attempt 1 started (but never lived to finalize) a refresh onto `pending-base` and crashed.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: actualRuns.PENDING_REFRESH_OUTCOME,
+    baseRefreshSha: "pending-base",
+    pendingRefreshFromSha: "branch-tip-before-mutation",
+    branch: BRANCH,
+    status: "failed",
+  });
+  // Attempt 2 resumed, found the checkout dirty (its own refresh reports `skipped_dirty`), but still
+  // dispatched and committed new work onto the branch — moving its tip on its own.
+  const ATTEMPT_2 = "run-2";
+  await createRun(t.db, clock, { id: ATTEMPT_2, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  await actualRuns.updateRun(t.db, clock, ATTEMPT_2, {
+    baseRefreshOutcome: "skipped_dirty",
+    baseRefreshSha: "attempt-2-dirty-base",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-3";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+  });
+  // If reconciliation wrongly walked through attempt 2's skipped_dirty row to attempt 1's pending
+  // record, this would look confirmed: the branch is no longer at its pre-mutation tip (attempt 2
+  // moved it on its own), and `pending-base` happens to still be an ancestor of the branch regardless.
+  isAncestorMock.mockImplementation(async (...args: unknown[]) => {
+    const [, ancestor, descendant] = args as [string, string, string];
+    if (ancestor === "pending-base" && descendant === `refs/heads/${BRANCH}`) return true;
+    if (ancestor === "branch-tip-before-mutation" && descendant === `refs/heads/${BRANCH}`) return false;
+    if (ancestor === `refs/heads/${BRANCH}` && descendant === "branch-tip-before-mutation") return false;
+    return false;
+  });
+
+  await warmRunWorktree(makeRun(RETRY));
+
+  // Must NOT reconcile onto attempt 1's stale pending boundary — falls back to the original fork.
+  expect(createWorktreeMock).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ forkSha: "old-fork-commit" }),
+  );
+});
+
 // anton-s55u (PR #279 review, third re-review): the dead attempt above is this branch's very FIRST
 // refresh ever, so there is no OLDER settled row for `priorEffectiveRefreshSha` to find — it reads
 // undefined even once the reconciliation above (same call) has confirmed the pending write actually
