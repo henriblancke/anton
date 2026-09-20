@@ -264,6 +264,14 @@ export async function warmRunWorktree(
   // straight to `baseForkSha` (PR #279 review) — `skipped_dirty` means only that this attempt didn't
   // move the branch, and the commits an earlier resume's refresh brought in are still on it.
   //
+  // Only trusted for a REUSED checkout (PR #279 review): `priorEffectiveRefreshSha` is read from the
+  // branch's run-row history, not from the checkout itself, so it survives a branch delete-and-
+  // recreate that leaves old rows behind. A freshly CREATED checkout (`worktree.createdBranch`) forks
+  // straight off `freshBase` and carries none of that old branch's history — the old base normally
+  // stays an ancestor of the fresh one, so the frozen-sha guard below would accept the stale value
+  // rather than catch it, checking a truthful claim against a commit the recreated branch never had.
+  // `baseForkSha` — this checkout's own, freshly resolved fork — is the only value that describes it.
+  //
   // That fallback is itself frozen at the instant the refresh it came from ran, and origin can move
   // between then and now — including a force-push that drops a commit an already-shipped claim
   // cites (PR #279 review). Verifying against the frozen sha regardless would accept evidence the
@@ -272,7 +280,7 @@ export async function warmRunWorktree(
   // the fallback already proved could have been dropped. Once it doesn't, the fallback is stale in
   // exactly the way a rewritten base makes it, and `freshBase` is asked instead — the only read here
   // that reflects origin as it stands now.
-  const shippedFallback = priorEffectiveRefreshSha ?? baseForkSha;
+  const shippedFallback = reusedCheckout ? (priorEffectiveRefreshSha ?? baseForkSha) : baseForkSha;
   const alreadyShippedBase =
     worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
       ? worktree.refreshOutcome.baseSha

@@ -739,6 +739,32 @@ async function refreshOntoBase(opts: {
     );
   }
 
+  // `baseSha` itself can be STALE rather than moved (PR #279 review): `resolveFreshBase`'s caller
+  // falls back to the LOCAL `<base>` branch when its fetch fails, and that local ref can already sit
+  // BEHIND the commit this checkout's own branch was forked from by an earlier, successful fetch — a
+  // clean branch cut from `A-B` while local `main` still sits at `A`. That is a different shape from
+  // the force-push-behind-fork case the guard below exists for: there, `baseSha` shares no straight
+  // line back to `forkSha` at all (it was rewritten PAST it); here, `baseSha` (`A`) IS an ancestor of
+  // `forkSha` (`B`) — genuinely older, not rewritten, and leaving `branch` untouched is always safe
+  // regardless of whether it's published or cited on a bead: nothing needs to move. Checked BEFORE
+  // that guard, not folded into its `remotelyPublished || preservedSha` gate (PR #279 review) — a
+  // published or preserved branch reaching this same stale-base shape must ALSO fall through to this
+  // no-op rather than trip the force-push guard below, which only demands `!isAncestor(forkSha,
+  // baseSha)` and is true for the stale case too (an older `baseSha` is no more an ancestor of
+  // `forkSha` than a rewritten one is). Checking this first, unconditionally, lets both the
+  // published/preserved and the ordinary path share the same safe answer for a merely-stale base.
+  if (
+    forkSha &&
+    (await branchContainsCommit(repoPath, branch, forkSha)) &&
+    (await isAncestor(worktreePath, baseSha, forkSha))
+  ) {
+    console.log(
+      `[worktree] resolved base for ${branch} (${baseSha.slice(0, 12)}) is behind its own fork ` +
+        `point ${forkSha.slice(0, 12)} — leaving ${branch} where it is instead of rebasing backward`,
+    );
+    return { outcome: "noop", baseSha: forkSha };
+  }
+
   // `hasCommonHistory` above only demands SOME shared ancestor, not that `baseSha` still descends
   // from the branch's own pinned fork point — a base that was force-pushed BEHIND that fork but still
   // shares an OLDER ancestor with it passes that check regardless. The merge below is unsafe in
@@ -749,7 +775,9 @@ async function refreshOntoBase(opts: {
   // sidestep this by construction (see the `forkSha` doc above), so this guard only needs to cover the
   // merge path. Checked only when `forkSha` is both known and still reachable on `branch`: an unknown
   // or already-stale pin can't distinguish this case from an ordinary divergence, so it's left to the
-  // merge/rebase paths' own conflict handling below.
+  // merge/rebase paths' own conflict handling below. The stale-base shape is already ruled out by the
+  // no-op above, so a `!isAncestor(forkSha, baseSha)` reaching here is always the genuine force-push-
+  // past-fork case.
   if (
     (remotelyPublished || preservedSha) &&
     forkSha &&
@@ -788,32 +816,6 @@ async function refreshOntoBase(opts: {
           `retry (${gitError(err)})`,
       );
     }
-  }
-
-  // `baseSha` itself can be STALE rather than moved, not just this checkout's remote-tracking ref
-  // (PR #279 review): `resolveFreshBase`'s caller falls back to the LOCAL `<base>` branch when its
-  // fetch fails, and that local ref can already sit BEHIND the commit this checkout's own branch was
-  // forked from by an earlier, successful fetch — a clean, unpublished branch cut from `A-B` while
-  // local `main` still sits at `A`. That is a different shape from the force-push case the `--onto`
-  // form below exists for: there, `baseSha` shares no straight line back to `forkSha` at all (it was
-  // rewritten PAST it); here, `baseSha` (`A`) IS an ancestor of `forkSha` (`B`) — genuinely older,
-  // not rewritten. `--onto baseSha forkSha branch` does not care which one it is: it transplants
-  // `forkSha..branch` onto `baseSha` regardless, so given the stale case it would discard `A..B` —
-  // exactly the commits that made this checkout fresher than the fallback — and dispatch the run
-  // against an OLDER tree than the fallback was ever meant to regress to. Checked here rather than
-  // folded into the throwing guard above (which only runs for a published/preserved branch, where
-  // the safe answer is a human's): an unpublished branch with no preserved commit is free to be left
-  // exactly where it is instead of rebased backward.
-  if (
-    forkSha &&
-    (await branchContainsCommit(repoPath, branch, forkSha)) &&
-    (await isAncestor(worktreePath, baseSha, forkSha))
-  ) {
-    console.log(
-      `[worktree] resolved base for ${branch} (${baseSha.slice(0, 12)}) is behind its own fork ` +
-        `point ${forkSha.slice(0, 12)} — leaving ${branch} where it is instead of rebasing backward`,
-    );
-    return { outcome: "noop", baseSha: forkSha };
   }
 
   // The plain one-argument form below replays `merge-base(baseSha, branch)..branch` — the branch's

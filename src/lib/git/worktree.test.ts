@@ -429,6 +429,55 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review, fourth round): the same stale-fallback shape as above, but on a
+    // PUBLISHED branch — offline retries of an already-pushed PR hit this after a failed fetch falls
+    // back to a local base ref that hasn't caught up to the fork yet. The force-push-behind-fork
+    // guard's `!isAncestor(forkSha, baseSha)` is also true for a merely-stale base (it's older, not
+    // rewritten), so without checking the stale shape first this would wrongly throw and block every
+    // offline retry even though the checkout already contains everything the newer base has.
+    it("leaves a published branch untouched, rather than throw, when the base fallback is merely stale behind its fork", async () => {
+      const branch = "anton/refresh-stale-fallback-published";
+      const staleBase = branchTip(defaultBranch());
+      advanceDefaultBranch(
+        "stale-fallback-published.txt",
+        "advance 5e\n",
+        "advance main (ahead of stale fallback, published)",
+      );
+      const freshFork = branchTip(defaultBranch());
+      expect(freshFork).not.toBe(staleBase);
+
+      const first = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch() });
+      expect(first.forkSha).toBe(freshFork);
+
+      writeFileSync(join(first.path, "own-work.txt"), "already-pushed ticket work\n");
+      execFileSync("git", ["-C", first.path, "add", "own-work.txt"]);
+      execFileSync("git", ["-C", first.path, "commit", "-q", "-m", "already-pushed ticket commit"]);
+      const uniqueSha = headOf(first.path);
+      // Simulate a prior `pushBranch` having already published this tip.
+      execFileSync("git", ["update-ref", `refs/remotes/origin/${branch}`, uniqueSha], { cwd: repo });
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        // `staleBase` stands in for resolveFreshBase's local-branch fallback after a failed fetch —
+        // behind the fork this published checkout was already cut from.
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: staleBase,
+          refresh: true,
+          forkSha: first.forkSha,
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(second.refreshOutcome).toEqual({ outcome: "noop", baseSha: freshFork });
+        // Untouched — no merge attempted, still sitting at its own published tip.
+        expect(headOf(second.path)).toBe(uniqueSha);
+        expect(log.mock.calls.flat().join(" ")).toContain("behind its own fork point");
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     // anton-s55u (PR #279 review): a prior attempt can push the branch via `pushBranch` and then
     // fail before `gh pr create` completes; the resumed run's refresh must not rewrite those
     // already-public commits, or the retry's own non-forcing push rejects the rebased branch forever.

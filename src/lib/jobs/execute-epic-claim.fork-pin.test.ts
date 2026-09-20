@@ -292,6 +292,38 @@ it("pins alreadyShippedBase to baseForkSha on a fresh creation — nothing to re
   expect(runStep.alreadyShippedBase).toBe(runStep.baseForkSha);
 });
 
+it("ignores a stale branch-scoped refresh record on a freshly RECREATED checkout, using its own fork instead (PR #279 review)", async () => {
+  // An earlier attempt refreshed this branch onto `stale-recorded-base` and recorded it on its row
+  // (now dead — an operator deleted the checkout and branch after it parked). This attempt's
+  // `createWorktree` therefore creates a brand-new branch, forked straight off the fresh base — it
+  // shares none of the deleted checkout's history. `priorEffectiveRefreshSha` is read from the DEAD
+  // row's branch-scoped record, not from the checkout, so it still resolves to the stale value; using
+  // it here would check a truthful already-shipped claim against a commit the recreated branch never
+  // had, since the old base normally remains an ancestor of the fresh one and the ancestor guard below
+  // would accept it rather than catch it.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "stale-recorded-base",
+    branch: BRANCH,
+    status: "failed",
+  });
+  const RETRY = "run-2";
+  await createRun(t.db, clock, { id: RETRY, projectId: PROJECT, epicBeadId: EPIC, branch: BRANCH });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: true,
+    repoPath: "/repo",
+    forkSha: "recreated-branch-fork",
+  });
+
+  const { runStep } = await warmRunWorktree(makeRun(RETRY));
+
+  expect(runStep.baseForkSha).toBe("recreated-branch-fork");
+  expect(runStep.alreadyShippedBase).toBe("recreated-branch-fork");
+});
+
 it("advances alreadyShippedBase to the refreshed base when a stale reused checkout was brought forward (PR #279 review)", async () => {
   // A resume reuses a branch pinned to an OLD fork — baseForkSha stays frozen at it, by design, so
   // dispatch keeps partitioning against the checkout's true fork. But the refresh that just merged
