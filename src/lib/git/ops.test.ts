@@ -20,6 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { PassThrough } from "node:stream";
 import { dirname, isAbsolute, join } from "node:path";
 import {
   classifyPushFailure,
@@ -68,6 +69,8 @@ import {
   satisfiedMarkerSubject,
   satisfiedMarkerTarget,
   SATISFIES_TRAILER,
+  boundedTail,
+  MAX_STDERR_CHARS,
 } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
@@ -3977,6 +3980,212 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
 
     expect(verdict.transient).toBe(false);
   });
+});
+
+// anton-yxlt6: the bound was right, the half it kept was not. A `pre-push` hook that runs a test
+// suite spends its first 4 KiB on banners and deliberate logging from PASSING tests, so a
+// head-keeping buffer recorded exactly that and dropped the failure summary — the only part an
+// operator needs. These pin the tail.
+describe("boundedTail (anton-yxlt6)", () => {
+  /** Drive a collector with `chunks` and read back what it kept, after the stream ends. */
+  async function collect(chunks: (string | Buffer)[]): Promise<string> {
+    const stream = new PassThrough();
+    const read = boundedTail(stream);
+    for (const chunk of chunks) stream.write(chunk);
+    stream.end();
+    await new Promise((resolve) => stream.on("end", resolve));
+    return read();
+  }
+
+  it("keeps the END of a stream that overflows the cap, not the beginning", async () => {
+    const verdict = "FAIL src/auth.test.ts > refuses an expired token\n  expected 401, got 200\n";
+    const kept = await collect([
+      "a".repeat(MAX_STDERR_CHARS),
+      "b".repeat(MAX_STDERR_CHARS),
+      verdict,
+    ]);
+
+    expect(kept).toContain(verdict.trim());
+    expect(kept).not.toContain("a".repeat(64));
+  });
+
+  it("keeps total retained output bounded — the memory bound is the point", async () => {
+    const kept = await collect(Array.from({ length: 50 }, () => "x".repeat(MAX_STDERR_CHARS)));
+
+    // The notice is anton's own prefix; the captured output itself never exceeds the cap.
+    const captured = kept.slice(kept.indexOf("\n") + 1);
+    expect(captured.length).toBeLessThanOrEqual(MAX_STDERR_CHARS);
+  });
+
+  it("makes truncation visible rather than silent, naming how much was dropped", async () => {
+    const kept = await collect(["q".repeat(MAX_STDERR_CHARS + 100), "tail\n"]);
+
+    expect(kept).toMatch(/^\[anton: dropped 105 earlier characters of output/);
+    expect(kept).toContain("tail");
+  });
+
+  it("leaves output that fits under the cap untouched — no notice, no truncation", async () => {
+    const kept = await collect(["husky - pre-push hook exited with code 1 (error)\n"]);
+
+    expect(kept).toBe("husky - pre-push hook exited with code 1 (error)");
+    expect(kept).not.toContain("[anton:");
+  });
+
+  it("counts characters, not bytes, and never mangles a multi-byte sequence split across chunks", async () => {
+    // "é" is two UTF-8 bytes; splitting it across two chunks is what a naive per-chunk
+    // `toString("utf8")` corrupts into U+FFFD.
+    const eacute = Buffer.from("é", "utf8");
+    const kept = await collect(["ok ", eacute.subarray(0, 1), eacute.subarray(1), " done"]);
+
+    expect(kept).toBe("ok é done");
+  });
+
+  it("drains every chunk past the cap so a chatty hook can never block on a full pipe", async () => {
+    const stream = new PassThrough();
+    const read = boundedTail(stream);
+    // Far more than the stream's own highWaterMark: if the collector stopped consuming past the
+    // cap, backpressure would leave these buffered and `write` would report the pipe as full.
+    let everyWriteAccepted = true;
+    for (let i = 0; i < 200; i += 1) {
+      if (!stream.write("z".repeat(1024))) everyWriteAccepted = false;
+    }
+    stream.end();
+    await new Promise((resolve) => stream.on("end", resolve));
+
+    expect(everyWriteAccepted).toBe(true);
+    expect(read()).toContain("[anton: dropped");
+  });
+});
+
+// anton-yxlt6: the porcelain contract is what separates a LOCAL hook decline from a REMOTE
+// rejection, so switching which half of stdout survives has to be proven against the classifier,
+// not assumed. git writes the per-ref status lines and the trailing `Done` at the END of stdout —
+// precisely what a tail-keeping buffer preserves and a head-keeping one would have dropped first.
+describe("classifyPushFailure under truncated porcelain stdout (anton-yxlt6)", () => {
+  /** What `boundedTail` hands the classifier once a chatty hook overflowed the cap. */
+  function truncatedTail(body: string): string {
+    return `[anton: dropped 9000 earlier characters of output — showing the last ${MAX_STDERR_CHARS}]\n${body}`;
+  }
+
+  it("still reads the trailing Done line, so a remote decline is not misread as a local one", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: truncatedTail(
+        [
+          "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[remote rejected] (pre-receive hook declined)",
+          "Done",
+        ].join("\n"),
+      ),
+      stderr: truncatedTail("error: failed to push some refs\n"),
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/remote policy/);
+  });
+
+  it("still reads a per-ref non-fast-forward status under truncation", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: truncatedTail(
+        [
+          "!\trefs/heads/anton/epic-1:refs/heads/anton/epic-1\t[rejected] (non-fast-forward)",
+          "Done",
+        ].join("\n"),
+      ),
+      stderr: truncatedTail("error: failed to push some refs\n"),
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/non-fast-forward/);
+  });
+
+  it("still calls a local hook decline local — a truncated stdout with no Done stays a hook decline", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr: truncatedTail("FAIL src/auth.test.ts > refuses an expired token\n"),
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-push hook/);
+    expect(verdict.reason).toMatch(/refuses an expired token/);
+  });
+
+  it("does not let anton's own truncation notice fabricate a Done line", () => {
+    // The notice is anton's text, not git's; it must never look like porcelain structure.
+    const notice = truncatedTail("");
+    expect(/^Done\s*$/m.test(notice)).toBe(false);
+  });
+});
+
+// anton-yxlt6: the reported failure, end to end against real git — a pre-push hook whose failure
+// summary lands AFTER 4 KB of passing-test chatter. Before the fix the captured stderr was entirely
+// that chatter and the summary appeared nowhere in the error an operator reads.
+suite("pushBranch (real git · a hook whose failure summary follows 4 KB of passing-test chatter)", () => {
+  let sandbox: string;
+  let repo: string;
+  let bare: string;
+
+  const g = (args: string[], cwd = repo) => execFileSync("git", ["-C", cwd, ...args], { stdio: "ignore" });
+
+  // The verdict an operator actually needs, written last — exactly where a test runner puts it.
+  const SUMMARY = "FAIL src/billing.test.ts > refunds a cancelled subscription";
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-push-tail-"));
+    repo = join(sandbox, "repo");
+    bare = join(sandbox, "remote.git");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "--bare", "-q", bare], { stdio: "ignore" });
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["remote", "add", "origin", bare]);
+
+    // A hook shaped like the real one: a banner, then deliberate logging from tests that PASS —
+    // well past the cap — and only then the failure summary and a non-zero exit.
+    const hookPath = join(repo, ".git", "hooks", "pre-push");
+    writeFileSync(
+      hookPath,
+      `#!/usr/bin/env node
+process.stderr.write("> vitest run\\n\\n RUN  v3.0.0\\n");
+for (let i = 0; i < 200; i += 1) {
+  process.stderr.write("stdout | src/circle.test.ts > backfill refuses a bad payload\\n");
+  process.stderr.write("circle session consent backfill failed { message: 'boom' }\\n");
+}
+process.stderr.write(${JSON.stringify(SUMMARY)} + "\\n  expected 402, got 200\\n");
+process.exit(1);
+`,
+    );
+    chmodSync(hookPath, 0o755);
+
+    g(["checkout", "-q", "-b", "anton/epic-1"]);
+    writeFileSync(join(repo, "work.md"), "work\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("records the hook's failure summary, not just the passing-test chatter that precedes it", async () => {
+    const error = await pushBranch(repo, "anton/epic-1").then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error).toBeDefined();
+    expect(error?.message).toContain(SUMMARY);
+    expect(error?.message).toContain("expected 402, got 200");
+    // Truncation is visible rather than silent — the operator can tell output was dropped.
+    expect(error?.message).toContain("[anton: dropped");
+    // And the classifier still places it: no `Done`, so the transport never ran — a LOCAL decline.
+    expect(error?.message).toMatch(/pre-push hook declined/);
+  }, 30_000);
 });
 
 // anton-o74nf: `git push` runs PROJECT code too — a `pre-push` hook — so it gets the same
