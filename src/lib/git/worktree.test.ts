@@ -882,6 +882,71 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // PR #279 review (P1): the dirty escape above sits BEFORE the fork-descendancy checks the clean
+    // path runs, so without a guard of its own it would skip straight past a base force-pushed BEHIND
+    // the checkout's pinned fork point and dispatch the agent onto stale history. Once the parked
+    // edits are committed, the eventual PR against the rewritten base would silently reintroduce
+    // whatever that rewrite dropped — so this must fail closed instead, leaving the edits untouched.
+    it("refuses to skip-dispatch a dirty checkout onto a base rewritten behind its pinned fork point", async () => {
+      const ontoRepo = mkdtempSync(join(tmpdir(), "anton-wt-dirty-behind-fork-repo-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: ontoRepo });
+        execFileSync("git", ["config", "user.name", "anton-test"], { cwd: ontoRepo });
+        writeFileSync(join(ontoRepo, "README.md"), "# tmp\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "."]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "init"]);
+        const ontoDefaultBranch = execFileSync(
+          "git",
+          ["-C", ontoRepo, "symbolic-ref", "--short", "HEAD"],
+          { encoding: "utf8" },
+        ).trim();
+
+        // Main advances to `sharedBase` — the commit the ticket branch will fork from.
+        writeFileSync(join(ontoRepo, "shared-base.txt"), "shared\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "shared-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (later dropped)"]);
+        const sharedBase = execFileSync("git", ["-C", ontoRepo, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        const branch = "anton/refresh-dirty-behind-fork";
+        const first = await createWorktree({ repoPath: ontoRepo, branch, baseBranch: ontoDefaultBranch });
+        expect(first.forkSha).toBe(sharedBase);
+
+        // Parked, uncommitted work — exactly what a run left mid-resolution leaves behind.
+        writeFileSync(join(first.path, "README.md"), "parked uncommitted edit\n");
+        const beforeSha = execFileSync("git", ["-C", first.path, "rev-parse", "HEAD"], {
+          encoding: "utf8",
+        }).trim();
+
+        // Force-push/recreate main: drop `sharedBase` back to the ORIGINAL root, then commit a new,
+        // unrelated tip — main and the ticket branch now only share that root commit, not `sharedBase`.
+        execFileSync("git", ["-C", ontoRepo, "reset", "--hard", `${sharedBase}~1`]);
+        writeFileSync(join(ontoRepo, "rewritten-base.txt"), "rewritten\n");
+        execFileSync("git", ["-C", ontoRepo, "add", "rewritten-base.txt"]);
+        execFileSync("git", ["-C", ontoRepo, "commit", "-q", "-m", "advance main (rewritten)"]);
+
+        await expect(
+          createWorktree({
+            repoPath: ontoRepo,
+            branch,
+            baseBranch: ontoDefaultBranch,
+            refresh: true,
+            forkSha: first.forkSha,
+          }),
+        ).rejects.toThrow(/no longer descends from .* fork point/);
+
+        // Never touched — the uncommitted edit is still there, HEAD hasn't moved.
+        expect(readFileSync(join(first.path, "README.md"), "utf8")).toBe("parked uncommitted edit\n");
+        expect(
+          execFileSync("git", ["-C", first.path, "rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
+        ).toBe(beforeSha);
+      } finally {
+        rmSync(ontoRepo, { recursive: true, force: true });
+      }
+    });
+
     it("refreshes onto the fresh base even when only the branch survives (worktree dir was removed)", async () => {
       const branch = "anton/refresh-recreated";
       const first = await createWorktree({ repoPath: repo, branch });

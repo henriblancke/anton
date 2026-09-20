@@ -619,7 +619,10 @@ async function refreshMarkerPath(worktreePath: string): Promise<string> {
  *   refusing the refresh outright would strand that resume forever, since every later attempt reuses
  *   the same worktree and hits the same dirty tree (PR #279 review). So the checkout dispatches
  *   against whatever base it already has instead; only a CLEAN reused checkout is worth the trip
- *   forward.
+ *   forward. Still preserved, but NOT dispatched, when a pinned `forkSha` shows the resolved base
+ *   diverged from it (a force-push or recreation behind the checkout's own fork point) — continuing
+ *   would let those parked edits get committed onto stale history and, once pushed, silently
+ *   reintroduce whatever the rewrite dropped (PR #279 review, P1).
  *
  * `baseBranch` is resolved to `baseSha` ONCE, up front, and every ancestry check, rebase/merge
  * target, and diagnostic log below uses that pinned sha rather than rereading the mutable branch
@@ -699,6 +702,31 @@ async function refreshOntoBase(opts: {
 
   const dirty = await dirtyPaths(worktreePath);
   if (dirty.length > 0) {
+    // Preserve the edits, but don't dispatch against them blind (PR #279 review, P1): this escape
+    // sits BEFORE the fork-descendancy checks the clean path runs below, so without this guard it
+    // would skip straight past a base that was force-pushed behind the checkout's own pinned fork
+    // point — the parked edits get committed atop stale history, and the eventual PR against the
+    // rewritten base silently reintroduces whatever commit(s) that rewrite dropped. Checked only when
+    // `forkSha` is both known and still reachable on `branch` (an unknown or stale pin can't
+    // distinguish this from an ordinary, unrewritten divergence, so it's left to the same reasoning
+    // the clean path already applies); and only when `baseSha` is neither a descendant of `forkSha`
+    // (the base moved forward normally, nothing dropped) nor an ancestor of it (the base is merely
+    // stale — e.g. a failed fetch fell back to a lagging local ref — safe to leave alone either way).
+    if (
+      forkSha &&
+      (await branchContainsCommit(repoPath, branch, forkSha)) &&
+      !(await isAncestor(worktreePath, forkSha, baseSha)) &&
+      !(await isAncestor(worktreePath, baseSha, forkSha))
+    ) {
+      throw new Error(
+        `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${baseBranch} ` +
+          `(${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork point ${forkSha.slice(0, 12)} — ` +
+          `${baseBranch} looks like it was force-pushed or recreated behind that commit. Committing and ` +
+          `dispatching against the checkout's stale history would silently reintroduce whatever ` +
+          `${baseBranch} dropped once those commits are pushed. Leaving the uncommitted changes in ` +
+          `${worktreePath} untouched — resolve manually and retry.`,
+      );
+    }
     console.log(
       `[worktree] skipping refresh of ${branch} onto ${baseBranch}: ${worktreePath} has uncommitted ` +
         `changes (${dirty.join(", ")}) — dispatching against its existing base instead of discarding them`,
