@@ -388,6 +388,47 @@ suite("worktree manager (real git)", () => {
       }
     });
 
+    // anton-s55u (PR #279 review, fourth round): `resolveFreshBase`'s caller falls back to the LOCAL
+    // `<base>` branch when its fetch fails, and that fallback can already be BEHIND the commit this
+    // checkout's own branch was forked from by an earlier, successful fetch — a clean, unpublished
+    // branch cut from a fresher base while the local one lags. Unlike the rewritten-base case above,
+    // the fallback here is a genuine ANCESTOR of the fork point, not a divergent rewrite, so `--onto`
+    // would still apply (it doesn't require `baseSha` to descend from `forkSha`) and rebase the
+    // branch backward onto it, discarding exactly the commit that made the checkout fresher than the
+    // fallback.
+    it("leaves a reused branch alone rather than rebase it backward onto a base fallback behind its own pinned fork point", async () => {
+      const branch = "anton/refresh-stale-fallback";
+      const staleBase = branchTip(defaultBranch());
+      advanceDefaultBranch("stale-fallback.txt", "advance 5c\n", "advance main (ahead of stale fallback)");
+      const freshFork = branchTip(defaultBranch());
+      expect(freshFork).not.toBe(staleBase);
+
+      const first = await createWorktree({ repoPath: repo, branch, baseBranch: defaultBranch() });
+      expect(first.forkSha).toBe(freshFork);
+
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        // `staleBase` stands in for resolveFreshBase's local-branch fallback — a ref that resolves
+        // BEHIND the fork this checkout was already cut from.
+        const second = await createWorktree({
+          repoPath: repo,
+          branch,
+          baseBranch: staleBase,
+          refresh: true,
+          forkSha: first.forkSha,
+        });
+
+        expect(second.path).toBe(first.path);
+        expect(second.refreshOutcome).toEqual({ outcome: "noop", baseSha: freshFork });
+        // Untouched — still sitting at its own fork, never rebased backward onto the stale fallback.
+        expect(headOf(second.path)).toBe(freshFork);
+        expect(existsSync(join(second.path, "stale-fallback.txt"))).toBe(true);
+        expect(log.mock.calls.flat().join(" ")).toContain("behind its own fork point");
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     // anton-s55u (PR #279 review): a prior attempt can push the branch via `pushBranch` and then
     // fail before `gh pr create` completes; the resumed run's refresh must not rewrite those
     // already-public commits, or the retry's own non-forcing push rejects the rebased branch forever.

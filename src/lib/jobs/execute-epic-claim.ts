@@ -12,7 +12,7 @@ import { assignChildren, formatReservedChildren } from "../beads/child-assign";
 import { latestBlockNoteCommit } from "../beads/block-note";
 import { parseTicketNotes } from "../beads/notes";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
-import { resolveForkPoint, resolveFreshBase } from "../git/ops";
+import { isAncestor, resolveForkPoint, resolveFreshBase } from "../git/ops";
 import {
   acquireWorktreeClaim,
   createWorktree,
@@ -263,10 +263,22 @@ export async function warmRunWorktree(
   // the last EFFECTIVE refresh a prior resume already applied and left recorded on the row, not
   // straight to `baseForkSha` (PR #279 review) — `skipped_dirty` means only that this attempt didn't
   // move the branch, and the commits an earlier resume's refresh brought in are still on it.
+  //
+  // That fallback is itself frozen at the instant the refresh it came from ran, and origin can move
+  // between then and now — including a force-push that drops a commit an already-shipped claim
+  // cites (PR #279 review). Verifying against the frozen sha regardless would accept evidence the
+  // CURRENT base no longer holds. So it is kept only while `freshBase` — resolved moments ago, at
+  // the top of this very attempt — still descends from it: ordinary forward motion, where nothing
+  // the fallback already proved could have been dropped. Once it doesn't, the fallback is stale in
+  // exactly the way a rewritten base makes it, and `freshBase` is asked instead — the only read here
+  // that reflects origin as it stands now.
+  const shippedFallback = priorEffectiveRefreshSha ?? baseForkSha;
   const alreadyShippedBase =
     worktree.refreshOutcome && worktree.refreshOutcome.outcome !== "skipped_dirty"
       ? worktree.refreshOutcome.baseSha
-      : (priorEffectiveRefreshSha ?? baseForkSha);
+      : (await isAncestor(worktree.path, shippedFallback, freshBase))
+        ? shippedFallback
+        : freshBase;
 
   // Every step of the walk runs through the step registry (anton-4npr) — one entry point per step,
   // dispatched in the order the project's formula declares. This is what they all operate on; each

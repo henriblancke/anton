@@ -790,6 +790,32 @@ async function refreshOntoBase(opts: {
     }
   }
 
+  // `baseSha` itself can be STALE rather than moved, not just this checkout's remote-tracking ref
+  // (PR #279 review): `resolveFreshBase`'s caller falls back to the LOCAL `<base>` branch when its
+  // fetch fails, and that local ref can already sit BEHIND the commit this checkout's own branch was
+  // forked from by an earlier, successful fetch — a clean, unpublished branch cut from `A-B` while
+  // local `main` still sits at `A`. That is a different shape from the force-push case the `--onto`
+  // form below exists for: there, `baseSha` shares no straight line back to `forkSha` at all (it was
+  // rewritten PAST it); here, `baseSha` (`A`) IS an ancestor of `forkSha` (`B`) — genuinely older,
+  // not rewritten. `--onto baseSha forkSha branch` does not care which one it is: it transplants
+  // `forkSha..branch` onto `baseSha` regardless, so given the stale case it would discard `A..B` —
+  // exactly the commits that made this checkout fresher than the fallback — and dispatch the run
+  // against an OLDER tree than the fallback was ever meant to regress to. Checked here rather than
+  // folded into the throwing guard above (which only runs for a published/preserved branch, where
+  // the safe answer is a human's): an unpublished branch with no preserved commit is free to be left
+  // exactly where it is instead of rebased backward.
+  if (
+    forkSha &&
+    (await branchContainsCommit(repoPath, branch, forkSha)) &&
+    (await isAncestor(worktreePath, baseSha, forkSha))
+  ) {
+    console.log(
+      `[worktree] resolved base for ${branch} (${baseSha.slice(0, 12)}) is behind its own fork ` +
+        `point ${forkSha.slice(0, 12)} — leaving ${branch} where it is instead of rebasing backward`,
+    );
+    return { outcome: "noop", baseSha: forkSha };
+  }
+
   // The plain one-argument form below replays `merge-base(baseSha, branch)..branch` — the branch's
   // own fork point only while `baseBranch` still contains it. Once `baseBranch` has been rewritten
   // past an older shared ancestor, that merge-base lands before the real fork and the plain form

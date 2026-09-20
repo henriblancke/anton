@@ -36,12 +36,14 @@ vi.mock("../git/worktree", async () => {
 
 const resolveFreshBaseMock = vi.fn();
 const resolveForkPointMock = vi.fn();
+const isAncestorMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
     resolveFreshBase: (...a: unknown[]) => resolveFreshBaseMock(...a),
     resolveForkPoint: (...a: unknown[]) => resolveForkPointMock(...a),
+    isAncestor: (...a: unknown[]) => isAncestorMock(...a),
   };
 });
 
@@ -108,6 +110,10 @@ beforeEach(async () => {
   updateRunMock.mockReset().mockImplementation(actualRuns.updateRun);
   resolveFreshBaseMock.mockReset().mockResolvedValue(FRESH_BASE);
   resolveForkPointMock.mockReset().mockResolvedValue("f0f0f0forkcommit");
+  // Ordinary forward motion by default — the freshly-resolved base still descends from whatever
+  // fallback base an already-shipped claim would be checked against (PR #279 review). The one test
+  // that means to exercise a rewritten-behind fallback overrides this itself.
+  isAncestorMock.mockReset().mockResolvedValue(true);
 });
 afterEach(() => t.close());
 
@@ -356,6 +362,35 @@ it("falls back alreadyShippedBase to a prior resume's recorded refresh when this
   const row = await actualRuns.getRunById(t.db, RUN_ID);
   expect(row?.baseRefreshOutcome).toBe("merged");
   expect(row?.baseRefreshSha).toBe("prior-base");
+});
+
+it("verifies against the freshly-resolved base, not a dirty resume's stale recorded refresh, once origin has moved past it (PR #279 review)", async () => {
+  // Attempt 1 refreshed this reused checkout onto `prior-base` (recorded as `merged`). Before
+  // attempt 2, origin's base was force-pushed past `prior-base` — dropping a commit an
+  // already-shipped claim could cite — and this attempt finds the checkout dirty, so
+  // `refreshOntoBase` reports `skipped_dirty` without re-fetching. `prior-base` no longer descends
+  // to the freshly-resolved base, so `alreadyShippedBase` must ask the fresh base instead of the
+  // stale recorded one.
+  await actualRuns.updateRun(t.db, clock, RUN_ID, {
+    baseForkSha: "old-fork-commit",
+    baseRefreshOutcome: "merged",
+    baseRefreshSha: "prior-base",
+    branch: BRANCH,
+  });
+  createWorktreeMock.mockResolvedValue({
+    path: WORKTREE,
+    branch: BRANCH,
+    baseBranch: FRESH_BASE,
+    createdBranch: false,
+    repoPath: "/repo",
+    refreshOutcome: { outcome: "skipped_dirty", baseSha: "this-attempt-dirty-base" },
+  });
+  isAncestorMock.mockResolvedValue(false);
+
+  const { runStep } = await warmRunWorktree(makeRun(RUN_ID));
+
+  expect(runStep.baseForkSha).toBe("old-fork-commit");
+  expect(runStep.alreadyShippedBase).toBe(FRESH_BASE);
 });
 
 it("passes the last EFFECTIVE refresh's base as the --onto boundary, in preference to the original fork (PR #279 review)", async () => {

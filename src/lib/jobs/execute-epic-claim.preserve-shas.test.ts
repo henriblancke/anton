@@ -39,12 +39,14 @@ vi.mock("../git/worktree", async () => {
 
 const resolveFreshBaseMock = vi.fn();
 const resolveForkPointMock = vi.fn();
+const isAncestorMock = vi.fn<(...a: unknown[]) => Promise<boolean>>();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
     resolveFreshBase: (...a: unknown[]) => resolveFreshBaseMock(...a),
     resolveForkPoint: (...a: unknown[]) => resolveForkPointMock(...a),
+    isAncestor: (...a: unknown[]) => isAncestorMock(...a),
   };
 });
 
@@ -101,6 +103,7 @@ beforeEach(async () => {
   removeWorktreeMock.mockReset().mockResolvedValue({ removed: true, branchDeleted: true });
   resolveFreshBaseMock.mockReset().mockResolvedValue(FRESH_BASE);
   resolveForkPointMock.mockReset().mockResolvedValue("f0f0f0forkcommit");
+  isAncestorMock.mockReset().mockResolvedValue(true);
 });
 afterEach(() => t.close());
 
