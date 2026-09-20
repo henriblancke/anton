@@ -1581,26 +1581,46 @@ function pushTimedOut(args: string[], timeoutMs: number, stderr: string): Error 
  * identity survives and the channel still stays open. An existing `GIT_SSH_COMMAND` is extended the
  * same way.
  *
- * Three cases are left strictly alone:
+ * Five cases are left strictly alone:
  *   - `GIT_SSH` with no `GIT_SSH_COMMAND`/`core.sshCommand`. That variable names a helper BINARY,
  *     and git documents it for programs that do not accept extra command-line arguments (plink and
  *     friends) — which is why `GIT_SSH_COMMAND` exists at all. Appending `-o` to one would break it,
  *     and setting `GIT_SSH_COMMAND` at all would override it. No keepalives there.
  *   - A command whose program is not `ssh`. Git applies the same basename test before assuming
  *     OpenSSH options are understood; a wrapper script may reject `-o` outright.
- *   - A command that already sets `ServerAliveInterval`. The operator has an opinion; it wins.
+ *   - A `GIT_SSH_VARIANT` / `ssh.variant` naming anything but `auto`/`ssh`. Git documents these as
+ *     OVERRIDING its basename detection, so an operator running plink through a binary that happens
+ *     to be called `ssh` is taken at their word rather than by the filename.
+ *   - A command that already sets `ServerAliveInterval` or `ServerAliveCountMax`. The operator has
+ *     an opinion about this mechanism; it wins.
+ *   - A probe that came back `unknown` — see {@link SshCommandProbe}. Not knowing whether
+ *     `core.sshCommand` is set is not the same as knowing it is not, and installing a plain
+ *     `GIT_SSH_COMMAND` on a guess would override a config anton failed to read.
  *
  * Harmless for an HTTPS remote, which never reads any of this.
  */
 export function pushEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
-  configuredSshCommand?: string,
+  configured: SshCommandProbe | string = { state: "unset" },
 ): NodeJS.ProcessEnv {
   const next = { ...env } as NodeJS.ProcessEnv;
+  const probe: SshCommandProbe = typeof configured === "string" ? { state: "set", command: configured } : configured;
+  // An operator who has NAMED a non-OpenSSH client is taken at their word, whatever the executable
+  // is called (PR #306 review round 5). Git's own basename detection is overridden by these two, so
+  // a custom binary named `ssh` that is really plink would pass `isOpenSshCommand` below and be
+  // handed `-o` flags it may reject, breaking every push. `ssh.variant` is read from the same probe
+  // family as `core.sshCommand`; only `auto`/`ssh` mean "OpenSSH options are fine".
+  const variant = (next.GIT_SSH_VARIANT || probe.variant || "").trim().toLowerCase();
+  if (variant && variant !== "auto" && variant !== "ssh") return next;
   // The command git would actually run, in the precedence git itself applies.
-  const effective = next.GIT_SSH_COMMAND?.trim() || configuredSshCommand?.trim() || "";
+  const effective = next.GIT_SSH_COMMAND?.trim() || (probe.state === "set" ? probe.command.trim() : "");
   if (!effective) {
-    // A bare GIT_SSH helper is the one case with nothing safe to add — see above.
+    // The probe could not say whether `core.sshCommand` is set. Installing a plain `ssh` here would
+    // OVERRIDE whatever it is — git documents the env var as outranking that config — so a repo
+    // relying on a deploy key or jump host would lose it and every push would fail. Keepalives are
+    // an optimization; the operator's transport is not. Add nothing.
+    if (probe.state === "unknown") return next;
+    // A bare GIT_SSH helper is the other case with nothing safe to add — see above.
     if (next.GIT_SSH) return next;
     next.GIT_SSH_COMMAND = `ssh ${SSH_KEEPALIVE_OPTS}`;
     return next;
@@ -1639,23 +1659,59 @@ const SSH_KEEPALIVE_OPTS = "-o ServerAliveInterval=30 -o ServerAliveCountMax=30"
  * Best-effort: every failure — no git, not a repo, the key simply unset (exit 1) — yields undefined,
  * which is also the common case, so nothing here can fail a push. The timeout bounds a wedged git.
  */
-async function readSshCommand(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+async function readSshCommand(cwd: string, signal?: AbortSignal): Promise<SshCommandProbe> {
+  // `ssh.variant` rides along on its own probe, because it decides whether OpenSSH flags may be
+  // added at all. Its failure is not fatal the way the command's is: not knowing the variant only
+  // costs the basename guess anton already made before, whereas not knowing the COMMAND risks
+  // overriding it. So it is read best-effort and an unreadable one simply leaves `variant` unset.
+  const variant = await readGitConfigValue(cwd, "ssh.variant", signal);
   try {
     const { stdout } = await execFileAsync("git", ["-C", cwd, "config", "--get", "core.sshCommand"], {
       timeout: 5_000,
       // The push's own signal, so a cancellation landing DURING the probe kills it instead of
-      // waiting out a wedged git (PR #306 review round 4). The abort surfaces as a rejection here
-      // and is swallowed like any other failure — `gitPush` re-checks `signal.aborted` immediately
-      // after this returns and rejects with the caller's reason, so cancellation is reported by
-      // that check rather than by whatever error the killed subprocess produced.
+      // waiting out a wedged git (PR #306 review round 4). An abort lands in the catch below as
+      // `unknown`, which suppresses the keepalives — the right call for a cancelled push, and
+      // `gitPush` re-checks `signal.aborted` immediately after and rejects with the caller's
+      // reason, so cancellation is reported by that check rather than by this probe.
       signal,
     });
+    const command = stdout.trim();
+    return command ? { state: "set", command, variant } : { state: "unset", variant };
+  } catch (e) {
+    // Exit 1 is git's "no such key" — the COMMON case, and a definite answer: nothing is
+    // configured, so there is nothing to preserve. Anything else (128 not-a-repo, 129 bad usage, a
+    // timeout, a kill, no git on PATH) means the probe could not determine the answer, which is NOT
+    // the same thing (PR #306 review round 5). Collapsing the two would let a wedged probe on a
+    // repo that DOES set `core.sshCommand` install a plain `GIT_SSH_COMMAND` — which overrides that
+    // config — and drop the deploy key or jump host the push needs, failing every push on the one
+    // machine slow enough to time out.
+    const code = (e as { code?: unknown } | null)?.code;
+    return code === 1 ? { state: "unset", variant } : { state: "unknown", variant };
+  }
+}
+
+/** One `git config --get <key>`, or undefined when unset or unreadable. Best-effort by design. */
+async function readGitConfigValue(cwd: string, key: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", cwd, "config", "--get", key], { timeout: 5_000, signal });
     return stdout.trim() || undefined;
   } catch {
-    // Non-zero exit (the key is unset) lands here too, and is the normal case.
     return undefined;
   }
 }
+
+/**
+ * What {@link readSshCommand} could establish about `core.sshCommand`:
+ *
+ *   - `set`     — the repo configures one; {@link pushEnv} appends keepalives to it.
+ *   - `unset`   — git said there is no such key; safe to install a plain `ssh` command.
+ *   - `unknown` — the probe failed. There may or may not be a command; anton must not install one,
+ *                 because doing so would override whatever is actually configured.
+ */
+type SshCommandProbe = ({ state: "set"; command: string } | { state: "unset" } | { state: "unknown" }) & {
+  /** `ssh.variant`, when the repo sets one — the config half of `GIT_SSH_VARIANT`. */
+  variant?: string;
+};
 
 /**
  * Whether `command`'s program is OpenSSH's `ssh`, so `-o` options are understood. Mirrors git's own

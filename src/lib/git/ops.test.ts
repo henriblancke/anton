@@ -4075,6 +4075,44 @@ describe("pushEnv — keepalives so a slow pre-push gate cannot outlast the serv
 
     expect(pushEnv({ PATH: "/usr/bin" }, configured).GIT_SSH_COMMAND).toBeUndefined();
   });
+
+  /**
+   * PR #306 review round 5. Git's `config --get` exits 1 for "no such key" and something else
+   * (128 not-a-repo, 129 bad usage, a timeout, a kill) when it could not answer. Collapsing the two
+   * let a wedged probe on a repo that DOES set `core.sshCommand` install a plain `GIT_SSH_COMMAND`,
+   * which overrides that config — dropping the deploy key or jump host the push needs, on exactly
+   * the slow machine where the probe timed out.
+   */
+  it("adds nothing when the probe could not determine whether core.sshCommand is set", () => {
+    const env = pushEnv({ PATH: "/usr/bin" }, { state: "unknown" });
+
+    expect(env.GIT_SSH_COMMAND).toBeUndefined();
+  });
+
+  it("still installs keepalives when the probe positively reports no core.sshCommand", () => {
+    const env = pushEnv({ PATH: "/usr/bin" }, { state: "unset" });
+
+    expect(env.GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+  });
+
+  /**
+   * Also round 5: git documents `GIT_SSH_VARIANT` / `ssh.variant` as overriding its basename
+   * detection, so an operator running plink through a binary that happens to be named `ssh` would
+   * pass the basename test and be handed `-o` flags their client may reject.
+   */
+  it.each([["GIT_SSH_VARIANT env"], ["ssh.variant config"]])("respects a plink variant named via %s", (which) => {
+    const env =
+      which === "GIT_SSH_VARIANT env"
+        ? pushEnv({ GIT_SSH_COMMAND: "ssh -batch", GIT_SSH_VARIANT: "plink" })
+        : pushEnv({ GIT_SSH_COMMAND: "ssh -batch" }, { state: "unset", variant: "putty" });
+
+    expect(env.GIT_SSH_COMMAND).toBe("ssh -batch");
+  });
+
+  it("still adds keepalives when the variant is explicitly ssh or auto", () => {
+    expect(pushEnv({ GIT_SSH_VARIANT: "ssh" }).GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+    expect(pushEnv({ GIT_SSH_VARIANT: "auto" }).GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+  });
 });
 
 // anton-1cjaw: the discriminator table measured on git 2.x/macOS via execFile — captured stderr and
