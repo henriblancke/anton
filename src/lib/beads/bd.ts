@@ -1239,14 +1239,24 @@ export const beads = {
   /** Record that this ticket's board-evidence cleanup landed locally but its confirming push
    * failed, carrying the ids still owed confirmation so a resume — same machine or, once this
    * state syncs, a fresh cross-machine worktree — can finish confirming them even after the
-   * pending marker and preserved baseline that otherwise carry them are already cleared. */
-  setBoardEvidenceCleanupUnsynced: (cwd: string, id: string, ids: readonly string[] = []) =>
-    bdWrite(cwd, [
-      "update",
-      id,
-      "--set-metadata",
-      `${BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}=${JSON.stringify(ids)}`,
-    ]),
+   * pending marker and preserved baseline that otherwise carry them are already cleared.
+   *
+   * Written through `--metadata @file`, never `--set-metadata key=value` (chatgpt-codex-connector,
+   * PR #284 review, "Keep confirmed evidence IDs out of a single argv argument") — `ids` is a
+   * board-only batch's whole confirmed-id set, so a large enough batch pushes this single argv
+   * argument past the ~128KiB single-argument ceiling and fails `E2BIG`, poisoning an
+   * already-transitioned ticket that can never persist its cross-machine recovery obligation. See
+   * {@link beads.setBoardEvidenceBaseline} for the same bound applied to the baseline write. */
+  setBoardEvidenceCleanupUnsynced: async (cwd: string, id: string, ids: readonly string[] = []) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-cleanup-unsynced-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]: JSON.stringify(ids) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
 
   /** Release the retry obligation once a later push actually confirms the cleanup reached the remote. */
   clearBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>
@@ -1276,14 +1286,25 @@ export const beads = {
   /** Record, permanently, that this ticket's board-only delivery was confirmed — written once,
    * beside the pending-marker/baseline clear, and never unset. Carries `ids` (the confirmed
    * evidence) along with the flag, since the pending-marker label and preserved-baseline metadata
-   * that otherwise carry them are cleared in the same handoff. */
-  setBoardEvidenceConfirmed: (cwd: string, id: string, ids: readonly string[] = []) =>
-    bdWrite(cwd, [
-      "update",
-      id,
-      "--set-metadata",
-      `${BOARD_EVIDENCE_CONFIRMED_KEY}=${JSON.stringify(ids)}`,
-    ]),
+   * that otherwise carry them are cleared in the same handoff.
+   *
+   * Written through `--metadata @file`, never `--set-metadata key=value` (chatgpt-codex-connector,
+   * PR #284 review, "Keep confirmed evidence IDs out of a single argv argument") — same ~128KiB
+   * argv ceiling and `E2BIG` failure mode as {@link beads.setBoardEvidenceCleanupUnsynced} above,
+   * and this write is the one that PERSISTS the confirmation, so failing it outright (rather than
+   * merely failing to retry a cleanup) leaves a large board-only batch unable to ever record its
+   * delivery as confirmed. See {@link beads.setBoardEvidenceBaseline} for the same bound applied to
+   * the baseline write. */
+  setBoardEvidenceConfirmed: async (cwd: string, id: string, ids: readonly string[] = []) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-confirmed-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CONFIRMED_KEY]: JSON.stringify(ids) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,

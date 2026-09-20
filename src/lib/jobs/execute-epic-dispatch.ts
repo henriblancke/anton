@@ -1258,6 +1258,13 @@ async function dispatchTicket(
     if (recoveredIds.length > 0) {
       ledger.boardEvidence.set(ticket.id, recoveredIds);
     }
+    if (standaloneRun) {
+      // Same cleanup as the `if (delivery)` fast path above (PR #284 review, "Clear the
+      // implementing tag on standalone confirmed resumes"): this resume also skips runTicket,
+      // the only standalone path that clears `stage:implementing`, so without this the target
+      // carries both stage labels into merge-finalize, which strips only in-review.
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
     await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
     onBranch.add(ticket.id);
     if (ledger.skipCause.has(ticket.id)) {
@@ -1305,6 +1312,13 @@ async function dispatchTicket(
       }
     } else if (confirmedIds.length > 0) {
       ledger.boardEvidence.set(ticket.id, confirmedIds);
+    }
+    if (standaloneRun) {
+      // Same cleanup as the `if (delivery)` fast path above (PR #284 review, "Clear the
+      // implementing tag on standalone confirmed resumes"): this resume also skips runTicket,
+      // the only standalone path that clears `stage:implementing`, so without this the target
+      // carries both stage labels into merge-finalize, which strips only in-review.
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
     }
     await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
     onBranch.add(ticket.id);
