@@ -336,7 +336,14 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
       // #274 review, round 18). Compared against a fresh `loadAllIssues`, not `loadWorkIssues`, so a
       // board that merged in gate beads is compared like-for-like instead of always mismatching on
       // their edges.
-      const consistent = sameBlocksEdges(board, await loadAllIssues(cwd));
+      //
+      // Gated on `board` actually carrying a `blocks` edge, same as `loadAllIssues`'s own
+      // `workHasBlocksEdge` clause: a board with zero `blocks` edges has no cyclic pair that could be
+      // stale, so this second full read would buy nothing — and every `getBoard`/`allIssues` caller
+      // hits this path on a cold read, so paying for it unconditionally breaks the documented
+      // at-most-one-`bd list` invariant for the common edge-free case.
+      const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
+      const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(cwd));
       // Re-check generation and evidence AFTER the `sameBlocksEdges` await, not just before it (PR
       // #274 review, round 19): that inner `loadAllIssues` call can itself take long enough for the
       // snapshot to be invalidated/replaced, or for a concurrent enrichment path to attach evidence to
@@ -635,8 +642,11 @@ export function probeCycleEvidence(cwd: string): void {
           // review, round 21: the `cycles.length > 0` shortcut here let that stale pairing through).
           // Always re-list and compare before attaching, same as `attachCyclesBestEffort` (PR #274
           // review, round 20), then recheck generation/evidence again after that await — the re-list
-          // itself can take long enough for another writer to land.
-          const consistent = sameBlocksEdges(board, await loadAllIssues(cwd));
+          // itself can take long enough for another writer to land. Gated on `board` actually
+          // carrying a `blocks` edge, same as `attachCyclesBestEffort`'s own guard: an edge-free
+          // board has no cyclic pair that could be stale, so the re-list would buy nothing.
+          const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
+          const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(cwd));
           if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
             attachCycleEvidence(board, cycles);
             markCycleEvidenceRecovered(cwd);
