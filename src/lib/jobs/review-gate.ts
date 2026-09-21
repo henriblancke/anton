@@ -14,6 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { beads, type Bead } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { metered } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -548,10 +549,20 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       // round's fix touched, defeating the crash-recovery purpose documented above.
       const repo = args.repoPath;
       if (repo) {
+        // Preserve the closure fence this extends (chatgpt-codex-connector, PR #284 review,
+        // "Preserve the closure fence when extending evidence") — a ticket already carrying a
+        // stored closure keeps it; a closed ticket with none yet (this round's own fix just
+        // closed it) gets the current episode, same as `clearBoardEvidencePending` computes it.
+        // Writing `{ ids }` with no closure would erase the fence `confirmedForThisCycle`
+        // (execute-epic-dispatch.ts) relies on, letting a later reopen-and-reclose before this
+        // run redispatches the ticket pass as "same cycle" with no new evidence.
         const persisted = await Promise.all(
-          boardOnlyUnits.map((t) =>
-            mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [])),
-          ),
+          boardOnlyUnits.map(async (t) => {
+            const closure =
+              beads.confirmedBoardEvidenceClosure(t) ??
+              (t.status === "closed" ? await readCurrentClosureVersion(repo, t.id).catch(() => undefined) : undefined);
+            return mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure));
+          }),
         );
         const synced = await beads
           .push(repo)
