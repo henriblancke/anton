@@ -2554,6 +2554,75 @@ describe("resolveWarmCommand", () => {
     expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), off, isExec)).toBeNull();
   });
 
+  /**
+   * The precedence ladder (anton-z5li2), one case per rung. Each pins exactly the rungs under test
+   * and leaves a bun.lock present, so a rung that failed to short-circuit would fall through to a
+   * visibly different answer rather than silently agreeing.
+   */
+  describe("the project warm config", () => {
+    const pinnedEnv = { ...env, [WARM_COMMAND_ENV]: "echo env" };
+
+    it("beats ANTON_WARM_COMMAND with its own command", () => {
+      const warm = { command: "make setup", enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinnedEnv, isExec, warm)).toEqual({
+        file: "sh",
+        args: ["-c", "make setup"],
+        label: "make setup",
+      });
+    });
+
+    it("falls through to ANTON_WARM_COMMAND when its command is cleared", () => {
+      const warm = { command: undefined, enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinnedEnv, isExec, warm)).toEqual({
+        file: "sh",
+        args: ["-c", "echo env"],
+        label: "echo env",
+      });
+    });
+
+    // Clearing the setting is a fall-through, never a skip — so with neither pin set, detection runs.
+    it("falls through to the lockfile table with neither its command nor the env var", () => {
+      const warm = { command: undefined, enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), env, isExec, warm)).toMatchObject({
+        file: `${BIN}/bun`,
+        args: ["install", "--frozen-lockfile"],
+      });
+    });
+
+    it("skips the warm entirely when the project turned it off", () => {
+      const warm = { command: "make setup", enabled: false };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinnedEnv, isExec, warm)).toBeNull();
+    });
+
+    // The machine-wide opt-out is set on a box that cannot install at all, which no project command fixes.
+    it("loses to the machine-wide opt-out even with a command set", () => {
+      const off = { ...env, [WARM_ENV]: "0" };
+      const warm = { command: "make setup", enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), off, isExec, warm)).toBeNull();
+    });
+
+    // Rungs 2 and 3 sit above the guard by design; everything below it must still short-circuit.
+    it("still short-circuits under vitest when it pins no command", () => {
+      const underTest = { ...env, VITEST: "true" };
+
+      expect(
+        resolveWarmCommand(fixture({ "bun.lock": "{}" }), underTest, isExec, { enabled: true }),
+      ).toBeNull();
+    });
+
+    // anton-743gk threads the config in; until then every caller passes none and must be unchanged.
+    it("is optional: omitting it leaves detection exactly as it was", () => {
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), env, isExec)).toMatchObject({
+        file: `${BIN}/bun`,
+      });
+    });
+  });
+
   it("warns and skips when the package manager isn't on the search path", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {

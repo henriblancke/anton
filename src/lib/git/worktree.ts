@@ -1751,23 +1751,26 @@ export interface WarmCommand {
 }
 
 /**
- * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
- * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
- * install already newer than the lockfile (a resumed run reusing its worktree), or no package
- * manager on the search path. Exported as the single testable seam — the shell-out itself is a
- * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
- * real toolchain.
+ * A project's warming decision, narrowed to what {@link resolveWarmCommand} needs. Declared here
+ * rather than alongside the settings it comes from so the git layer owns its own seam and takes no
+ * dependency on the settings module; `resolveWarmConfig` in ../project-settings builds one.
  */
+export interface WarmConfig {
+  /** The operator's pinned setup command, or undefined to fall through to env/lockfile detection. */
+  command?: string;
+  /** False only when the operator explicitly turned warming off; absent stays ON. */
+  enabled: boolean;
+}
+
 /** The `off` spellings {@link WARM_ENV} recognizes. */
 function warmDisabledByEnv(env: Record<string, string | undefined>): boolean {
   const off = env[WARM_ENV]?.trim().toLowerCase();
   return off === "0" || off === "off" || off === "false" || off === "no";
 }
 
-/** An operator- or test-pinned warm command, overriding detection entirely. */
-function pinnedWarmCommand(env: Record<string, string | undefined>): WarmCommand | undefined {
-  const pinned = env[WARM_COMMAND_ENV]?.trim();
-  return pinned ? { file: "sh", args: ["-c", pinned], label: pinned } : undefined;
+/** A pinned command runs through a shell, so an operator can write a pipeline or an `&&` chain. */
+function shellWarmCommand(command: string): WarmCommand {
+  return { file: "sh", args: ["-c", command], label: command };
 }
 
 /** The lockfile-matched install `worktreePath` still needs, or undefined when none applies. */
@@ -1799,24 +1802,41 @@ function resolveInstallCommand(
   return { file, args: [...install.args], label: `${install.bin} ${install.args.join(" ")}` };
 }
 
-/** The checks that short-circuit before any lockfile detection: off, pinned, or running under vitest. */
-function warmOverride(env: Record<string, string | undefined>): { command: WarmCommand | null } | undefined {
-  if (warmDisabledByEnv(env)) return { command: null };
-  const pinned = pinnedWarmCommand(env);
-  if (pinned) return { command: pinned };
-  // Structural guard, mirroring the claude driver: never shell out to a real package manager under
-  // vitest. A test that wants the warm path pins WARM_COMMAND_ENV at a fake above.
-  if (env.VITEST) return { command: null };
-  return undefined;
-}
-
+/**
+ * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
+ * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
+ * install already newer than the lockfile (a resumed run reusing its worktree), or no package
+ * manager on the search path. Exported as the single testable seam — the shell-out itself is a
+ * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
+ * real toolchain.
+ *
+ * ── THE PRECEDENCE LADDER (anton-z5li2), highest rung first ──
+ * 1. `ANTON_WARM_WORKTREE` off  → null. Machine-wide opt-out, above every project setting: it is
+ *                                 set on a machine that cannot install at all, which no per-project
+ *                                 command can fix.
+ * 2. `warm.enabled === false`   → null. The project's own opt-out.
+ * 3. `warm.command`             → that command, through a shell. The operator's pinned setup.
+ * 4. `ANTON_WARM_COMMAND`       → that command, through a shell. The machine-wide pin, kept as the
+ *                                 fallback below the project's — and how tests inject a fake.
+ * 5. `VITEST`                   → null. Structural guard, mirroring the claude driver: no unit test
+ *                                 may reach a real package manager. Deliberately BELOW both pins,
+ *                                 so a test that wants the warm path pins a fake at rung 3 or 4.
+ * 6. lockfile table             → the frozen install {@link INSTALL_BY_LOCKFILE} matches, else null.
+ *
+ * `warm` is last and optional so every caller that has no project config — and there is one until
+ * anton-743gk threads it in — keeps behaving exactly as it did before rungs 2 and 3 existed.
+ */
 export function resolveWarmCommand(
   worktreePath: string,
   env: Record<string, string | undefined> = process.env,
   isExec: (p: string) => boolean = isExecutableFile,
+  warm?: WarmConfig,
 ): WarmCommand | null {
-  const override = warmOverride(env);
-  if (override) return override.command;
+  if (warmDisabledByEnv(env)) return null;
+  if (warm?.enabled === false) return null;
+  const pinned = warm?.command?.trim() || env[WARM_COMMAND_ENV]?.trim();
+  if (pinned) return shellWarmCommand(pinned);
+  if (env.VITEST) return null;
   const install = detectedInstall(worktreePath);
   return install ? (resolveInstallCommand(install, worktreePath, env, isExec) ?? null) : null;
 }
