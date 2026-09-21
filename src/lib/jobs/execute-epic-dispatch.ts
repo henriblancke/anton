@@ -1332,6 +1332,28 @@ async function dispatchTicket(
         );
       }
       recoveredIds = result.ids;
+      // Re-read before clearing, mirroring `runTicket`'s own success path in execute-epic-ticket.ts
+      // (chatgpt-codex-connector, PR #284 review, "Re-read the ticket before clearing re-diffed
+      // evidence"): `readBoardEvidence` just above may have added a fresh
+      // `board-evidence-pending:*` label to the LIVE bead, but `ticket` here is still the snapshot
+      // read before this resume began and carries none of it. `clearBoardEvidencePending` derives
+      // which label to remove from the bead it is passed, so handing it the stale snapshot leaves
+      // that new label stranded on the board for a later reopen to union into a fresh evidence
+      // check and misread as current evidence. A failed re-read must not fall back to the stale
+      // `ticket` (same reasoning as the mirrored path) — poison instead, since this ticket is
+      // already done on the board and silently mislabeling the cleanup risks a false-evidence
+      // strand no later attempt would know to look for.
+      const freshTicket = await mustRead(repo, ticket.id);
+      if (!freshTicket) {
+        throw new PoisonEpic(
+          `${ticket.id}'s board evidence was just re-diffed and found, but the ticket could not be ` +
+            `re-read to find its live board-evidence-pending label before cleanup — clearing it ` +
+            `from the stale pre-dispatch snapshot risks leaving that label on the board, which a ` +
+            `later reopen could misread as current evidence for no new work. Check the beads DB, ` +
+            `then resume the run.`,
+        );
+      }
+      ticket = freshTicket;
     }
     await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
     if (recoveredIds.length > 0) {
