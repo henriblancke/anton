@@ -596,8 +596,18 @@ export function probeCycleEvidence(cwd: string): void {
         // mid-fetch means `cycles` describes a graph this board no longer represents, so it must
         // not be stamped onto it as current (PR #274 review, round 7).
         if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
-          attachCycleEvidence(board, cycles);
-          markCycleEvidenceRecovered(cwd);
+          // An empty `cycles` result only proves the graph is clean AS OF this call, not that
+          // `board`'s OWN `blocks` edges still describe that same graph: on a shared-server board
+          // another machine can repair a cycle in the gap between this fetch starting and settling,
+          // without the local generation moving (generation only bumps on a LOCAL snapshot
+          // replacement). Re-list and compare before attaching, same as `attachCyclesBestEffort`
+          // (PR #274 review, round 20), then recheck generation/evidence again after that await —
+          // the re-list itself can take long enough for another writer to land.
+          const consistent = cycles.length > 0 || sameBlocksEdges(board, await loadAllIssues(cwd));
+          if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+            attachCycleEvidence(board, cycles);
+            markCycleEvidenceRecovered(cwd);
+          }
         }
       } catch {
         // Still unavailable — the next probe (or an explicit `withCycles` read) retries.
