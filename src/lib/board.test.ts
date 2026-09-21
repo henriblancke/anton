@@ -1569,6 +1569,34 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
       expect(served.upNextAbsence).toBe("policy-unreadable");
     });
 
+    it("names unavailable cycle evidence, rather than ranking as if every target were admitted", async () => {
+      // `bd dep cycles` timing out leaves the board without authoritative cycle evidence, and every
+      // target's approval gate fails closed on that absence (`missingCycleEvidenceGap`). Deriving
+      // anyway would rank nobody — indistinguishable from a board that is genuinely empty.
+      listMock.mockResolvedValue([feature()]);
+      cyclesMock.mockRejectedValue(new Error("bd dep cycles timed out"));
+
+      const served = await getBoard(project);
+      expect(served.upNext).toBeUndefined();
+      expect(served.upNextAbsence).toBe("cycles-unavailable");
+    });
+
+    it("never records the ranking it would have derived while cycle evidence is unavailable", async () => {
+      // The write below is what the finding is actually about: a `bd dep cycles` timeout must not
+      // reach `recordRanking` and persist an empty plan over a real one.
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = planOver(board, "f-1");
+      cyclesMock.mockRejectedValue(new Error("bd dep cycles timed out"));
+
+      const served = await getBoard(project);
+      expect(planWrites).toHaveLength(0);
+      expect(served.upNextAbsence).toBe("cycles-unavailable");
+      // The previously recorded plan's badge stays put — the auxiliary read failing is not a reason
+      // to retract a real decision a pass already made.
+      expect(served.columns.backlog[0]?.provenance).toBeDefined();
+    });
+
     it("withholds the RECORDED plan too, so no Backlog card offers a start beside that absence", async () => {
       // The plan row outlives the ranking otherwise (PR #226 review): its stamp is compared against
       // one taken with no policy, so an admit-all plan armed before the operator narrowed the policy

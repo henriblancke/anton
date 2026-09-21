@@ -97,9 +97,14 @@ export function upNextEntries(
  */
 export function upNextAbsence(
   stance: UpNextStance,
+  cyclesKnown: boolean,
   entries: UpNextEntry[] | undefined,
 ): UpNextAbsence | undefined {
   if (!stance.scheduled) return "disarmed";
+  // Ahead of the policy/level checks, same reasoning as `policyKnown` below: `bd dep cycles` failing
+  // is a board-read failure, not a verdict about the board, and it fails every target's approval gate
+  // closed (`missingCycleEvidenceGap`) regardless of what the picker settings say.
+  if (!cyclesKnown) return "cycles-unavailable";
   // Ahead of the level, which comes from the very read that failed: a fail-soft "it offers" must not
   // be reported as the reason when what is actually true is that anton could not read the settings.
   if (!stance.policyKnown) return "policy-unreadable";

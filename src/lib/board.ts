@@ -4,6 +4,7 @@
 import { compareBacklogEpics } from "@/components/board/board-utils";
 import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
+import { cycleEvidenceFor } from "./beads/cycle-evidence";
 import { readAllIssues } from "./beads/issues";
 import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
 import {
@@ -368,6 +369,14 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     readPickerStance(project),
   ]);
 
+  // Whether the `withCycles: true` read above actually got authoritative `bd dep cycles` evidence —
+  // it degrades to attaching none on a timeout/unreadable-output rather than rejecting the whole
+  // read (see `attachCyclesBestEffort`). Read once, up front: every startability projection downstream
+  // (`missingCycleEvidenceGap` via the picker's own approval gate) fails closed on the same absence,
+  // so the ranking must not be derived — or recorded — as if it had run against a board this is true
+  // of; see the ranking's own gate below.
+  const cyclesKnown = cycleEvidenceFor(allBeads) !== undefined;
+
   // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
   // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
   // renders as a card, a ticket or a chip.
@@ -531,7 +540,15 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // every structurally eligible target in the lane as what anton would start, including the ones the
   // armed policy rejects. An unknown policy is not an absent one, so the lane says so instead
   // (`policy-unreadable`) rather than showing a ranking anton would not act on.
-  const ranking = picker.offers && picker.policyKnown
+  //
+  // And on cycle evidence being KNOWN. `readAllIssues` above only best-effort-attaches it — a `bd dep
+  // cycles` timeout or unreadable output leaves `cyclesKnown` false rather than rejecting the whole
+  // read — and every candidate's approval gate fails closed on that absence
+  // (`missingCycleEvidenceGap`). Deriving anyway would reject every target, and `recordRanking` below
+  // would then persist that empty verdict as the project's plan, overwriting a real one with a
+  // decision this read never actually made. The lane says `cycles-unavailable` instead of the
+  // `no-claimable-work` that ranking-and-recording-nothing would otherwise produce.
+  const ranking = picker.offers && picker.policyKnown && cyclesKnown
     ? deriveRanking(project, () =>
         decideBoardPickerPlan({
           board: allBeads,
@@ -602,7 +619,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // Which nothing this is (anton-w579). A withheld lane that simply vanishes reads as "anton has
   // nothing to start" on a board where the pass is switched off, only proposing, or looking at
   // nothing it may claim — three states with three different clearing conditions.
-  const absence = upNextAbsence(picker, upNext);
+  const absence = upNextAbsence(picker, cyclesKnown, upNext);
   // A DONE target is never badged: provenance answers "should this run?", and a shipped run has
   // stopped asking. Off the stage rather than the card, so the rule holds for chips too.
   const marksFor = (stage: Stage, id: string): BeadProvenance[] | undefined =>

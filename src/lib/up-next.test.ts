@@ -192,39 +192,48 @@ describe("upNextAbsence", () => {
   const armed = { scheduled: true, levelOffers: true, policyKnown: true };
 
   it("names a disarmed pass ahead of the level, since nothing runs to reach it", () => {
-    expect(upNextAbsence({ ...armed, scheduled: false, levelOffers: false }, undefined)).toBe(
+    expect(upNextAbsence({ ...armed, scheduled: false, levelOffers: false }, true, undefined)).toBe(
       "disarmed",
     );
-    expect(upNextAbsence({ ...armed, scheduled: false }, undefined)).toBe("disarmed");
+    expect(upNextAbsence({ ...armed, scheduled: false }, true, undefined)).toBe("disarmed");
+  });
+
+  it("names unavailable cycle evidence ahead of the policy and the level, since neither ran", () => {
+    // `bd dep cycles` failing is a board-read failure, not a verdict about the board — it fails every
+    // target's approval gate closed regardless of what the picker settings say.
+    expect(upNextAbsence(armed, false, undefined)).toBe("cycles-unavailable");
+    expect(upNextAbsence({ ...armed, policyKnown: false }, false, undefined)).toBe(
+      "cycles-unavailable",
+    );
   });
 
   it("names the level when the pass runs but promises nothing offered", () => {
-    expect(upNextAbsence({ ...armed, levelOffers: false }, undefined)).toBe("proposes-only");
+    expect(upNextAbsence({ ...armed, levelOffers: false }, true, undefined)).toBe("proposes-only");
   });
 
   it("names an unreadable policy ahead of the level, which came from the same failed read", () => {
     // "It offers" is fail-soft guesswork once the settings read threw; what is actually true is that
     // anton cannot see the policy, and that is what the lane must say (PR #226 review).
-    expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: true }, undefined)).toBe(
+    expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: true }, true, undefined)).toBe(
       "policy-unreadable",
     );
-    expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: false }, undefined)).toBe(
+    expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: false }, true, undefined)).toBe(
       "policy-unreadable",
     );
   });
 
   it("names an empty ranking as a board with nothing claimable on it", () => {
-    expect(upNextAbsence(armed, [])).toBe("no-claimable-work");
+    expect(upNextAbsence(armed, true, [])).toBe("no-claimable-work");
   });
 
   it("names nothing for a ranking that was withheld rather than empty", () => {
     // No plan recorded, or one the board has moved past: the next pass clears it, not the operator.
-    expect(upNextAbsence(armed, undefined)).toBeUndefined();
+    expect(upNextAbsence(armed, true, undefined)).toBeUndefined();
   });
 
   it("names nothing while there is a lane to draw", () => {
     expect(
-      upNextAbsence(armed, [
+      upNextAbsence(armed, true, [
         { beadId: "anton-1", rank: 1, type: "feature", unblocks: 0, createdAt: AGE },
       ]),
     ).toBeUndefined();
