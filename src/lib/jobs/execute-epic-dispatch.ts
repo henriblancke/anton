@@ -1226,12 +1226,29 @@ async function dispatchTicket(
     const stalePending = beads.pendingBoardEvidence(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
     const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    // The durably-confirmed ids are only trustworthy for THIS closure episode (PR #284 review,
+    // "Fence the branch-delivery fast path by closure cycle"): a board-only ticket reopened and
+    // closed again — by this run or anything else — before this fast path ever redispatches it
+    // leaves `ensureBoardBaselinePersisted`'s reopen-reset unreached (that reset only fires on an
+    // actual redispatch), so `confirmedBoardEvidenceIds` can still name a PRIOR cycle's evidence.
+    // Unlike the pending/cleanup-unsynced ids below (which describe THIS resume's unfinished
+    // obligation), a stale confirmation says nothing about whether the reopen's new board delta was
+    // ever checked — mirroring the closure fence `confirmedForThisCycle` applies further down, which
+    // this earlier return bypasses entirely by skipping straight to `clearBoardEvidencePending`.
+    const staleConfirmedIds = beads.confirmedBoardEvidenceIds(ticket);
+    const confirmedClosure =
+      ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
+    const confirmedIdsTrusted =
+      staleConfirmedIds.length === 0 ||
+      ticket.status !== "closed" ||
+      confirmedClosure === undefined ||
+      confirmedClosure === (await readCurrentClosureVersion(repo, ticket.id).catch(() => undefined));
     // The ids to (re)confirm are the UNION of the still-pending marker, whatever a prior cleanup
-    // obligation already carried, and whatever is already durably confirmed (PR #284 review,
-    // "Preserve confirmed evidence IDs during cleanup retries") — never bare `stalePending` alone.
-    // A prior halt can clear the pending marker (and write the real confirmed ids) before failing
-    // only on the confirming push or on releasing the obligation itself, so `stalePending` reads
-    // empty on exactly the resume this retry exists for. Passing it alone into
+    // obligation already carried, and whatever is already durably confirmed for THIS closure (PR
+    // #284 review, "Preserve confirmed evidence IDs during cleanup retries") — never bare
+    // `stalePending` alone. A prior halt can clear the pending marker (and write the real confirmed
+    // ids) before failing only on the confirming push or on releasing the obligation itself, so
+    // `stalePending` reads empty on exactly the resume this retry exists for. Passing it alone into
     // `clearBoardEvidencePending` would overwrite the durable confirmation with an empty array
     // instead of retrying it with the real ids — `setBoardEvidenceConfirmed` is not idempotent on
     // its `ids` argument (see that function's own docstring).
@@ -1239,7 +1256,7 @@ async function dispatchTicket(
       ...new Set([
         ...stalePending,
         ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
-        ...beads.confirmedBoardEvidenceIds(ticket),
+        ...(confirmedIdsTrusted ? staleConfirmedIds : []),
       ]),
     ].toSorted();
     // A reopened board-only ticket can still carry an OLD attribution commit from a PRIOR delivery
@@ -1250,8 +1267,12 @@ async function dispatchTicket(
     // here is not proof nothing changed — it just means this cycle's own evidence check never
     // completed. Re-diffing before clearing (mirroring the no-commit recovery path below) keeps a
     // process death right after this new attempt closes the ticket from being confirmed as
-    // delivered with zero evidence.
-    if (idsToConfirm.length === 0 && hasPreservedBaseline) {
+    // delivered with zero evidence. Also forced when the closure fence just excluded a stale
+    // confirmation and left nothing else to trust: `reDiffPreservedBaseline` fails loud with a
+    // `PoisonEpic` when no baseline survives either, which is the right outcome here — a reopened,
+    // reclosed ticket with no fresh baseline and no valid confirmation has no evidence this cycle
+    // ever checked the board, and fabricating a delivery from the stale ids would be a false success.
+    if (idsToConfirm.length === 0 && (hasPreservedBaseline || !confirmedIdsTrusted)) {
       const rediffed = await reDiffPreservedBaseline(repo, ticket);
       idsToConfirm = rediffed.ids;
       ticket = rediffed.ticket;

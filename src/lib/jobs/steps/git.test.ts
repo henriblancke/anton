@@ -153,6 +153,10 @@ describe("recordBoardOnlyAttribution", () => {
   // as "already recorded" and skips writing this run's marker, leaving the branch byte-identical to
   // its base with nothing for step:pr to open against. Bounding the lookup to this run's own delta
   // closes that gap — assert the call is actually bounded, not just that some call happened.
+  //
+  // Bounded against `alreadyShippedBase`, not the movable `baseRef` (PR #284 review, "Exclude the
+  // refreshed base from attribution scans") — the fixture pins them to different values precisely so
+  // a regression back to `baseRef` fails this assertion instead of passing by coincidence.
   it("bounds the idempotency lookup to this run's delta, not full branch history", async () => {
     ops.worktreeHasCommitFor.mockResolvedValue(false);
 
@@ -161,7 +165,7 @@ describe("recordBoardOnlyAttribution", () => {
 
     expect(ops.worktreeHasCommitFor).toHaveBeenCalledWith(sandbox.dir, target.id, {
       base: ctx.baseForkSha,
-      excludeBase: ctx.baseRef,
+      excludeBase: ctx.alreadyShippedBase,
     });
     expect(ops.commitMarker).toHaveBeenCalled();
   });

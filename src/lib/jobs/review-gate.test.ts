@@ -18,6 +18,7 @@ import { asc } from "drizzle-orm";
 
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
+import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 
 // `runReviewGate`'s durable persist of board-fix evidence (PR #284 review, "Persist board-fix
@@ -29,10 +30,16 @@ import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 // before deriving its closure fence, which otherwise shells out for real and, unmocked, exhausts
 // `mustRead`'s retries against a `bd` that can never succeed at this fake path. Every fixture ticket
 // here is already closed, so the default mirrors that rather than leaving `beads.show` unmocked.
-// `beads.isBoardOnly` and everything else stays real: only these three calls shell out.
+// `beads.history` is mocked for the same reason (chatgpt-codex-connector, PR #284 review, "Fail
+// closed when the review-fix closure read fails"): the persist step now REQUIRES this read to
+// succeed for a closed ticket with no stored closure yet, via the retrying `mustReadClosureVersion`,
+// rather than tolerating a failure — unmocked, that would exhaust its retries against a `bd` that can
+// never succeed at this fake path and poison every board-only fix test below. `beads.isBoardOnly` and
+// everything else stays real: only these four calls shell out.
 const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string, ids: readonly string[]) => Promise<string>>();
 const boardPushMock = vi.fn<(repo: string) => Promise<string>>();
 const boardShowMock = vi.fn<(repo: string, id: string) => Promise<Bead>>();
+const boardHistoryMock = vi.fn<(repo: string, id: string) => Promise<import("../beads/bd").BeadVersion[]>>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -43,12 +50,17 @@ vi.mock("../beads/bd", async () => {
         setBoardEvidenceConfirmedMock(...args),
       push: (...args: [string]) => boardPushMock(...args),
       show: (...args: [string, string]) => boardShowMock(...args),
+      history: (...args: [string, string]) => boardHistoryMock(...args),
     },
   };
 });
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
 boardPushMock.mockResolvedValue("synced");
 boardShowMock.mockImplementation(async (_repo, id) => ({ id, status: "closed", title: "", issue_type: "task" }));
+// No closure episode by default — every fixture ticket above is already closed, but none of these
+// tests assert on the closure VALUE, only that the persist succeeds; `readCurrentClosureVersion`
+// reads this as "closed, no closure episode found" rather than a failure.
+boardHistoryMock.mockResolvedValue([]);
 import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";
@@ -56,7 +68,9 @@ import type { ReviewFinding } from "./review-context";
 import type { Clock } from "./queue";
 import {
   blockingFindings,
+  reviewDeniedTools,
   runReviewGate,
+  REVIEW_DENIED_TOOLS,
   REVIEW_SETTING_SOURCES,
   type ReviewGateContext,
   type ReviewGateResult,
@@ -677,6 +691,65 @@ describe("runReviewGate — bounds", () => {
       expect(out.outcome).toBe("clean");
       expect(out.rounds[0].fixCommitted).toBe(true);
       expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "fails closed rather than persist an unfenced board-fix confirmation when `bd history` stays " +
+      "unavailable (chatgpt-codex-connector, PR #284 review, \"Fail closed when the review-fix " +
+      "closure read fails\") — a closed ticket with no stored closure yet must have one READ, not " +
+      "silently dropped, or a later reopen-and-reclose could reuse this round's ids with no new work",
+    async () => {
+      boardHistoryMock.mockRejectedValue(new Error("database is locked"));
+      // No `beforeEach` clears this mock's call history across the file's tests, so the baseline is
+      // whatever earlier tests already left behind — not zero.
+      const callsBefore = setBoardEvidenceConfirmedMock.mock.calls.length;
+      try {
+        const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const worktree = fakeWorktree();
+        let reads = 0;
+        const readBoardFingerprint = async () => {
+          reads += 1;
+          return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+        };
+        const { run } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+        const result = runReviewGate({
+          db: tdb.db,
+          clock,
+          ctx,
+          projectId,
+          target: boardOnlyTarget,
+          tickets: [boardOnlyTicket],
+          settings: { reviewMaxRounds: 2 },
+          worktreePath: dir,
+          baseBranch: "main",
+          repoPath: "/repos/anton",
+          deps: {
+            runClaude: async (options) => {
+              worktree.onDispatch();
+              return run(options);
+            },
+            diff: async () => ({ files: [], patch: "", truncated: false }),
+            commit: async () => ({ committed: false }),
+            readState: worktree.readState,
+            restoreState: worktree.restoreState,
+            readBoardFingerprint,
+            syncBoard: async () => true,
+          },
+        });
+
+        const error = await result.then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(isPoisonError(error)).toBe(true);
+        expect((error as Error).message).toContain("board-fix evidence");
+        // Never reached the write it would have needed a closure fence for.
+        expect(setBoardEvidenceConfirmedMock.mock.calls.length).toBe(callsBefore);
+      } finally {
+        boardHistoryMock.mockResolvedValue([]);
+      }
     },
   );
 
@@ -1325,6 +1398,23 @@ describe("runReviewGate — sessions", () => {
     // The fixer writes code and commits it; denying it those tools would break the round.
     expect(calls[1].disallowedTools).toBeUndefined();
   });
+
+  it(
+    "also denies `bd` outright when the board is server-backed (PR #284 review, \"Block " +
+      "server-backed board writes during review\") — the OS sandbox only pins a filesystem-backed " +
+      "board shut, so a shared-server one gets a tool-level deny instead",
+    () => {
+      try {
+        pinBoardMode("/repos/server-board", { mode: "server" });
+        expect(reviewDeniedTools("/repos/server-board")).toEqual([...REVIEW_DENIED_TOOLS, "Bash(bd:*)"]);
+        // Unaffected for an embedded board, or when no live board path is in play at all.
+        expect(reviewDeniedTools("/repos/anton")).toEqual(REVIEW_DENIED_TOOLS);
+        expect(reviewDeniedTools(undefined)).toEqual(REVIEW_DENIED_TOOLS);
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
 
   it("loads the reviewer from the operator's settings only, never the branch's", async () => {
     // `.claude/settings.json` is source-controlled, so a diff that adds one would configure the

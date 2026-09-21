@@ -216,11 +216,20 @@ async function adoptPreservedWork(ctx: StepContext): Promise<StepResultWith<"com
  * Record the ticket attribution a commit's own subject lacks — false when one is already there, so
  * nothing is recorded twice.
  *
- * The idempotency check is bound to THIS run's delta (`baseForkSha..HEAD`, excluding whatever the
- * base ref carries now) rather than full branch history. A board-only ticket reopened under the same
- * id can otherwise find its own OLD attribution commit sitting in base history from an earlier
- * delivery, read that as "already recorded", and return `true` without ever writing a marker on this
- * branch — leaving it byte-identical to its base and `step:pr` with no delta to open a PR on.
+ * The idempotency check is bound to THIS run's delta (`baseForkSha..HEAD`, excluding whatever
+ * `alreadyShippedBase` carries now) rather than full branch history. A board-only ticket reopened
+ * under the same id can otherwise find its own OLD attribution commit sitting in base history from an
+ * earlier delivery, read that as "already recorded", and return `true` without ever writing a marker
+ * on this branch — leaving it byte-identical to its base and `step:pr` with no delta to open a PR on.
+ *
+ * `alreadyShippedBase`, not the movable `baseRef` (PR #284 review, "Exclude the refreshed base from
+ * attribution scans"): on a reused checkout refreshed onto a newer effective base, a failed fetch can
+ * resolve `baseRef` LOCALLY, behind the base that refresh actually incorporated into the branch.
+ * `alreadyShippedBase` is what tracks that refresh; using the stale `baseRef` here lets a same-ticket
+ * attribution commit inherited from the refreshed base still show up in this run's delta, so this
+ * check reads it as unrecorded and skips writing the marker `step:pr` needs to open a PR — the same
+ * bound the dispatch loop's own delivery-exclusion scans already apply (see `alreadyShippedBase`'s own
+ * doc comment).
  *
  * Left non-strict, unlike the dispatch loop's own bounded scan: a `git log` failure here should read
  * as "no commit found" and fall through to writing the marker. That is the safe direction for THIS
@@ -232,7 +241,7 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
   if (
     await worktreeHasCommitFor(ctx.worktreePath, subject.id, {
       base: ctx.baseForkSha,
-      excludeBase: ctx.baseRef,
+      excludeBase: ctx.alreadyShippedBase,
     })
   )
     return false;

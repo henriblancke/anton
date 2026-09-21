@@ -19,6 +19,7 @@ import {
 } from "./review-context";
 import type { BranchDiff } from "../git/ops";
 import type { Bead } from "../beads/bd";
+import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { ProjectSettings } from "../projects";
 
 /** An id no bundled/global agent can shadow, so precedence is measured, not guessed. */
@@ -432,6 +433,32 @@ describe("reviewContext", () => {
       expect(out).toContain("bd -C '/repos/anton' show <id>");
       // No evidence map was given, so there is nothing to list — but the instruction still fires.
       expect(out).not.toContain("confirmed evidence covers");
+    },
+  );
+
+  it(
+    "withholds the live `bd -C <repoPath>` read instruction for a server-backed board (PR #284 " +
+      "review, \"Block server-backed board writes during review\") — that path is write-capable and " +
+      "a shared server has no filesystem sandbox to contain it, so the reviewer is pointed at the " +
+      "already-confirmed ids instead",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+        });
+        expect(out).toContain("- anton-x1.1: anton-y9");
+        expect(out).not.toContain("bd -C");
+        expect(out).toContain("shared server");
+        expect(out).toContain("already read and confirmed them");
+      } finally {
+        resetBoardModeCache();
+      }
     },
   );
 

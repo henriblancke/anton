@@ -14,7 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { beads, type Bead } from "../beads/bd";
-import { readCurrentClosureVersion } from "../beads/closure-cycle";
+import { isServerMode } from "../beads/board-mode";
 import { metered } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -41,7 +41,7 @@ import {
   hydrateDescriptions,
   type BoardFingerprint,
 } from "./execute-epic-board-evidence";
-import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard, mustReadClosureVersion } from "./execute-epic-persist";
 import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
@@ -259,6 +259,24 @@ export interface ReviewGateArgs {
  * jobs/review-sandbox).
  */
 export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"];
+
+/**
+ * `REVIEW_DENIED_TOOLS`, widened to deny `bd` outright when the project's board is `dolt_mode:
+ * server` (PR #284 review, "Block server-backed board writes during review").
+ *
+ * The OS-level sandbox (`jobs/review-sandbox`) pins the ref store AND `<repoPath>/.beads` shut, but
+ * that only contains a FILESYSTEM-backed board — a server-backed one is mutated over a connection
+ * string, invisible to a filesystem deny rule by construction. `boardEvidenceSection`
+ * (review-context.ts) otherwise teaches this same session the live `bd -C <repoPath> show <id>`
+ * syntax so it can check confirmed evidence, and the session keeps general Bash — a stray `bd -C
+ * <repoPath> update ...` typed in place of `show` would mutate the canonical board directly, with no
+ * tool-name filter or OS sandbox in the way. Denying `bd` here closes that regardless of typo or
+ * intent, and costs nothing legitimate: `boardEvidenceSection` stops teaching the live-read command in
+ * server mode for the same reason (see there), so this session never needed `bd` to do its job.
+ */
+export function reviewDeniedTools(repoPath: string | undefined): string[] {
+  return repoPath && isServerMode(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash(bd:*)"] : REVIEW_DENIED_TOOLS;
+}
 
 /**
  * Settings sources a review session loads: the operator's `user` settings only.
@@ -564,15 +582,29 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
         // closure, so deriving off `t` would resolve `closure` to `undefined` and overwrite an
         // existing `{ ids, closure }` confirmation with an unfenced `{ ids }`. An unreadable live
         // ticket (after retries) fails this write rather than guess off the stale snapshot.
+        //
+        // The closure READ itself goes through `mustReadClosureVersion`, retried like every other
+        // guarded read here — NOT a bare `readCurrentClosureVersion(...).catch(() => undefined)`
+        // (chatgpt-codex-connector, PR #284 review, "Fail closed when the review-fix closure read
+        // fails"): a closed ticket with no stored closure yet (this round's own fix just closed it)
+        // that hits a transient `bd history` failure would otherwise persist an unfenced `{ ids }`
+        // confirmation, and `confirmedForThisCycle` (execute-epic-dispatch.ts) treats an absent
+        // closure as "cannot verify, pass anyway" — the same tolerance meant for a confirmation
+        // written before the fence existed — so a later reopen-and-reclose could reuse these ids as
+        // this new cycle's evidence with no new board delta ever checked. An unavailable read (after
+        // retries) fails this ticket's persist the same as an unreadable bead does, rather than
+        // silently produce the exact fenceless shape the closure fence exists to prevent.
         const persisted = await Promise.all(
           boardOnlyUnits.map(async (t) => {
             const live = await mustRead(repo, t.id);
             if (!live) return false;
-            const closure =
-              beads.confirmedBoardEvidenceClosure(live) ??
-              (live.status === "closed"
-                ? await readCurrentClosureVersion(repo, t.id).catch(() => undefined)
-                : undefined);
+            const storedClosure = beads.confirmedBoardEvidenceClosure(live);
+            let closure = storedClosure;
+            if (storedClosure === undefined && live.status === "closed") {
+              const read = await mustReadClosureVersion(repo, t.id);
+              if (!read.read) return false;
+              closure = read.closure;
+            }
             return mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure));
           }),
         );
@@ -801,7 +833,7 @@ async function runReviewSession(args: {
         }),
         routing: reviewRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
-        disallowedTools: REVIEW_DENIED_TOOLS,
+        disallowedTools: reviewDeniedTools(args.repoPath),
         settingSources: [...REVIEW_SETTING_SOURCES],
         // Outranks the `user` sources above, so the machine's own config cannot relax the sandbox
         // this session is contained by.

@@ -11,6 +11,7 @@
  */
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
 import { beads, type Bead } from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt, shellQuotePath } from "../claude/system-prompt";
@@ -681,6 +682,16 @@ export function hasBoardOnlyTicket(run: { target: Bead; tickets: Bead[] }): bool
  * so a bare `!repoPath` check never actually early-returns in production — every ordinary review
  * with a real diff and zero board evidence got this paragraph appended after the diff, with no id to
  * check it against.
+ *
+ * The live-read instruction itself is further gated on the board NOT being `dolt_mode: server` (PR
+ * #284 review, "Block server-backed board writes during review"): `resolveReviewSandbox`'s OS-level
+ * deny only reaches a filesystem-backed board (the ref store, and `<repoPath>/.beads` for an embedded
+ * Dolt checkout) — a server-backed one is mutated over a connection string, which no filesystem rule
+ * can see. Teaching this session `bd -C <repoPath>` there hands it a live, write-capable path with
+ * nothing but a tool-name filter standing between a typo and the canonical board, so
+ * `reviewDeniedTools` (review-gate.ts) denies `bd` outright for a server-backed board instead — this
+ * section stops teaching the command for the same reason, and points the reviewer at the
+ * already-confirmed ids instead of a live read it no longer has.
  */
 function boardEvidenceSection(
   tickets: Bead[],
@@ -693,9 +704,10 @@ function boardEvidenceSection(
     .filter((e): e is { ticket: Bead; ids: string[] } => !!e.ids?.length)
     .map((e) => `- ${e.ticket.id}: ${e.ids.join(", ")}`);
   if (lines.length === 0 && !boardOnly) return [];
+  const serverMode = repoPath !== undefined && isServerMode(repoPath);
   return [
     ...(lines.length > 0 ? [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``] : []),
-    ...(repoPath
+    ...(repoPath && !serverMode
       ? [
           `This worktree's own \`bd\` reads a separate, unsynced copy of the board — the same reason a`,
           `board-only implementer is told to point every \`bd\` write at the live path explicitly,`,
@@ -708,6 +720,17 @@ function boardEvidenceSection(
           ``,
           `A plain \`bd show <id>\` here reports this worktree's frozen, pre-delivery copy — not usable`,
           `evidence either way for whether Acceptance was met.`,
+          ``,
+        ]
+      : []),
+    ...(serverMode
+      ? [
+          `This project's board runs on a shared server rather than a local per-worktree copy, so this`,
+          `session has no \`bd\` access to it at all — a live read there would be a live write path too,`,
+          `and nothing here can sandbox a connection string the way a local checkout's files can be`,
+          `sandboxed. Judge Acceptance against the confirmed evidence ids above: anton's own`,
+          `board-evidence check already read and confirmed them against the live board before this`,
+          `review began.`,
           ``,
         ]
       : []),

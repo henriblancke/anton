@@ -95,10 +95,13 @@ export function assertReviewSandboxSupported(platform: NodeJS.Platform = process
  * and denying the whole ancestor would make the entire review worktree read-only, breaking the
  * project checks' own caches/coverage writes under the sandbox's normal cwd allowance. `.beads`
  * itself is never an ancestor of a worktree, so it stays denied without that collateral blast
- * radius. This closes the filesystem-backed case (a local or file-based Dolt checkout); a
+ * radius. This closes only the filesystem-backed case (a local or file-based Dolt checkout); a
  * shared-server Dolt board writes over a connection string rather than local files, so this sandbox
- * rule cannot reach that case — a residual gap `boardEvidenceSection`'s own review thread already
- * flags for follow-up.
+ * rule cannot reach that case. That case is closed a different way instead (PR #284 review, "Block
+ * server-backed board writes during review"): `reviewDeniedTools` (review-gate.ts) denies the `bd`
+ * TOOL outright when `readBoardMode(repoPath).mode === "server"`, and `boardEvidenceSection` stops
+ * teaching the live-read command in that mode — so a server-backed board never hands this session a
+ * write-capable path in the first place, rather than relying on a filesystem rule that cannot reach it.
  */
 export function reviewSandboxDenyWrite(
   worktreePath: string,

@@ -1100,6 +1100,64 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
       });
     },
   );
+
+  // chatgpt-codex-connector, PR #284 review, "Fence the branch-delivery fast path by closure cycle":
+  // this `if (delivery)` fast path unions `confirmedBoardEvidenceIds` into what it (re)confirms
+  // WITHOUT the closure-cycle check `confirmedForThisCycle` applies further down — so a ticket
+  // reopened and closed again, with an OLD attribution commit still sitting on this branch from the
+  // prior delivery, took this path straight to `clearBoardEvidencePending` and rewrote the stale
+  // confirmation with the new closure, accepting the new cycle with no new board delta ever checked.
+  it(
+    "does not trust a stale confirmed-evidence id set from an earlier closure cycle even when an " +
+      "old attribution commit is still on this branch, and fails loud rather than fabricate a " +
+      "delivery when nothing survives to re-diff",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "old-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true); // the prior cycle's attribution commit is still here
+      historyMock.mockResolvedValue([
+        { hash: "new-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "still trusts the confirmed-evidence ids in the `if (delivery)` fast path when the stored " +
+      "closure matches the ticket's current one — the ordinary resume, unaffected by the fence",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        false,
+      );
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    },
+  );
 });
 
 // A board-only ticket closed and cleaned up on ANOTHER machine (its pending marker and preserved
