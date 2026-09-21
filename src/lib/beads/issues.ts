@@ -209,19 +209,26 @@ export async function loadAllIssues(
   // and comparing edges catches either case — if the graph moved between the two reads, retry
   // against whatever is current instead of pairing evidence with a board it no longer describes.
   //
-  // Also gated on `work` actually carrying a `blocks` edge: a board with zero `blocks` edges has no
+  // Also gated on `board` actually carrying a `blocks` edge: a board with zero `blocks` edges has no
   // cyclic pair that could be stale, so the second `bd list` this recheck costs would buy nothing.
   // That alone is not enough to keep approve's read-economy invariant (at most two `bd list` calls)
   // true, though — any repo with an established `blocks` edge ANYWHERE still pays it on every
   // `withCycles` read, which is the common case, not the rare one. `skipCycleConsistencyRecheck` is
   // what actually restores the invariant for the callers that don't need this guarantee (see its
-  // doc above) — this `workHasBlocksEdge` clause only spares the genuinely edge-free board on top of
-  // that.
-  const workHasBlocksEdge = beads.edgesOf(work).some((e) => e.type === "blocks");
+  // doc above) — this `boardHasBlocksEdge` clause only spares the genuinely edge-free board on top
+  // of that.
+  //
+  // Compared against a fresh `loadAllIssues` (work + gates), not `loadWorkIssues` (work only, P2
+  // badge review, PR #274): `bd dep cycles` walks `blocks` edges owned by gate beads too, and a gate
+  // is exactly the thing `board` carries that `work` doesn't. A gate-owned edge added or removed
+  // between the `cycles` fetch above and this recheck would leave `work`'s own edge set unchanged,
+  // so comparing only `work` waves the recheck through with evidence that no longer describes
+  // `board`'s actual graph.
+  const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
   if (
-    workHasBlocksEdge &&
+    boardHasBlocksEdge &&
     !opts.skipCycleConsistencyRecheck &&
-    !sameBlocksEdges(work, await loadWorkIssues(cwd))
+    !sameBlocksEdges(board, await loadAllIssues(cwd))
   ) {
     if (attempt >= MAX_CYCLE_CONSISTENCY_RETRIES) {
       throw new Error(
@@ -389,8 +396,8 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
  * (`missingCycleEvidenceGap`), and a caller that must not proceed on a stale pairing gets exactly
  * that by falling through to the same closed failure a genuinely missing read produces.
  *
- * Also guarded by `issueSnapshotGeneration`, captured before the `depCycles` call and rechecked
- * after it AND after the `sameBlocksEdges` re-list (P2 badge review, PR #274, round 22): the
+ * Also guarded by `generation` — rechecked against `issueSnapshotGeneration` after the `depCycles`
+ * call AND after the `sameBlocksEdges` re-list (P2 badge review, PR #274, round 22): the
  * `consistent` check alone only proves `board`'s `blocks` edges still match a fresh listing, not
  * that `board` is still the entry's retained array. A background refresh (or another writer, on a
  * shared-server board) can swap the retained snapshot for a new array that happens to preserve the
@@ -398,10 +405,23 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
  * `board` is now a retired object no later reader can reach. Attaching evidence to it and calling
  * `markCycleEvidenceRecovered` would still bump the shared version, telling every poller the
  * retained board recovered when it, in fact, remains evidence-less.
+ *
+ * `generation` MUST be the value the caller captured atomically alongside `board` itself (e.g. from
+ * {@link refreshAllIssuesRead}/{@link readIssueSnapshot}), never sampled fresh from
+ * `issueSnapshotGeneration` inside this function (P2 badge review, PR #274, round 24 on this line):
+ * a caller routinely does real work — resolving an operator, parsing the request body, walking the
+ * bead contract — between fetching `board` and reaching this call, and a background refresh can
+ * replace the retained snapshot in that gap. Sampling the generation only here would then compare
+ * "current" against itself and trivially pass, even though `board` is already the retired array —
+ * exactly the bug {@link attachCyclesBestEffort} guards against by requiring its own `generation`
+ * parameter for the same reason.
  */
-export async function ensureCycleEvidence(cwd: string, board: Bead[]): Promise<Bead[]> {
+export async function ensureCycleEvidence(
+  cwd: string,
+  board: Bead[],
+  generation: number,
+): Promise<Bead[]> {
   if (cycleEvidenceFor(board) === undefined) {
-    const generation = issueSnapshotGeneration(cwd);
     const cycles = await beads.depCycles(cwd);
     const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
     const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(cwd));
@@ -507,6 +527,24 @@ export async function refreshAllIssues(
   opts: LoadIssuesOptions = {},
   attempt = 0,
 ): Promise<Bead[]> {
+  return (await refreshAllIssuesRead(cwd, opts, attempt)).beads;
+}
+
+/**
+ * Like {@link refreshAllIssues} but also returns the generation the resolved board was retained
+ * under, captured atomically alongside the array itself — for a caller that must hand both to a
+ * function like {@link ensureCycleEvidence} later, possibly after doing real work in between (P2
+ * badge review, PR #274, round 24). A caller that only has the plain `Bead[]` and re-derives the
+ * generation with a fresh `issueSnapshotGeneration(cwd)` call at that later point would compare
+ * "current" against itself and trivially pass even when the board it's pairing against has already
+ * been replaced by a background refresh — see `ensureCycleEvidence`'s own doc for the failure this
+ * closes.
+ */
+export async function refreshAllIssuesRead(
+  cwd: string,
+  opts: LoadIssuesOptions = {},
+  attempt = 0,
+): Promise<{ beads: Bead[]; generation: number }> {
   // Read via `refreshIssueSnapshotRead`, not `refreshIssueSnapshot` + a separate
   // `issueSnapshotGeneration(cwd)` call, so `boardGeneration` is the generation `board` was
   // actually retained under (PR #274 review, round 16): this promise is single-flight, and another
@@ -589,7 +627,7 @@ export async function refreshAllIssues(
               "strict-gate hydration reads — giving up rather than pairing gate evidence with a board it may not describe",
           );
         }
-        return refreshAllIssues(cwd, opts, attempt + 1);
+        return refreshAllIssuesRead(cwd, opts, attempt + 1);
       }
       // `dedupeById` allocates a new array, and the cycle sidecar is WeakMap-keyed on array identity
       // (cycle-evidence.ts) — so a caller combining `withCycles` and `strictGates` would otherwise
@@ -598,10 +636,13 @@ export async function refreshAllIssues(
       const cycles = cycleEvidenceFor(board);
       if (cycles !== undefined) attachCycleEvidence(hydrated, cycles);
       hydrateIssueSnapshot(cwd, hydrated, boardGeneration);
-      return hydrated;
+      // `hydrateIssueSnapshot` bumps the generation synchronously (no `await` between the call and
+      // this read), so `issueSnapshotGeneration(cwd)` here is exactly the generation `hydrated` was
+      // just retained under — not `boardGeneration`, which named the PRE-hydration entry.
+      return { beads: hydrated, generation: issueSnapshotGeneration(cwd) };
     }
   }
-  return board;
+  return { beads: board, generation: boardGeneration };
 }
 
 export function probeAllIssues(cwd: string): void {

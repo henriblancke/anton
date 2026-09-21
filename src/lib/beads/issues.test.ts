@@ -49,11 +49,17 @@ const {
   probeCycleEvidence,
   readAllIssues,
   refreshAllIssues,
+  refreshAllIssuesRead,
   resetCycleProbes,
 } = await import("./issues");
 const { attachCycleEvidence, cycleEvidenceFor } = await import("./cycle-evidence");
-const { invalidateIssueSnapshot, issueSnapshotVersion, refreshIssueSnapshot, resetIssueSnapshots } =
-  await import("./snapshot");
+const {
+  invalidateIssueSnapshot,
+  issueSnapshotGeneration,
+  issueSnapshotVersion,
+  refreshIssueSnapshot,
+  resetIssueSnapshots,
+} = await import("./snapshot");
 
 const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -273,6 +279,37 @@ describe("loadAllIssues", () => {
     expect(board).toEqual([repaired, other]);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
     expect(listMock).toHaveBeenCalledTimes(3);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("catches a gate-owned edge that moves between the cycles fetch and the recheck, not just a work-owned one (P2 badge review, issues.ts:224)", async () => {
+    // `target` dangles a blocker on `g-1`, so `board` merges the gate in. The gate itself gains a
+    // NEW `blocks` edge (gate-owned, never present on `work`) between this call's own board read and
+    // the recheck below — `bd dep cycles` walks gate-owned edges too, so a recheck that only compares
+    // `work` against a fresh `loadWorkIssues` would see identical work-edge sets and wave this
+    // through, attaching evidence that no longer describes `board`'s actual (now two-edge) graph.
+    const workBead: Bead = { ...target }; // t-1 -> g-1
+    const gateBefore: Bead = { id: "g-1", title: "Gate: gh:pr", status: "open", issue_type: "gate" };
+    const gateAfter: Bead = {
+      ...gateBefore,
+      dependencies: [{ issue_id: "g-1", depends_on_id: "t-9", type: "blocks" }],
+    };
+    listMock
+      .mockImplementationOnce(async () => [workBead]) // attempt 0's own work read
+      .mockImplementationOnce(async () => [gateBefore]) // attempt 0's own gate read
+      .mockImplementationOnce(async () => [workBead]) // attempt 0's recheck work read — unchanged
+      .mockImplementationOnce(async () => [gateAfter]) // attempt 0's recheck gate read — edge just landed
+      .mockImplementationOnce(async () => [workBead]) // attempt 1's own work read
+      .mockImplementationOnce(async () => [gateAfter]) // attempt 1's own gate read — edge now present
+      .mockImplementationOnce(async () => [workBead]) // attempt 1's recheck work read
+      .mockImplementationOnce(async () => [gateAfter]); // attempt 1's recheck gate read — now stable
+    cyclesMock.mockResolvedValue([]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-1", "g-1"]);
+    expect(cycleEvidenceFor(board)).toEqual([]);
+    expect(listMock).toHaveBeenCalledTimes(8);
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
@@ -777,8 +814,9 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
     const before = issueSnapshotVersion(REPO);
+    const generation = issueSnapshotGeneration(REPO);
 
-    const returned = await ensureCycleEvidence(REPO, board);
+    const returned = await ensureCycleEvidence(REPO, board, generation);
 
     expect(returned).toBe(board);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
@@ -789,7 +827,7 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     const board = [{ ...target, dependencies: [] }];
     attachCycleEvidence(board, []);
 
-    await ensureCycleEvidence(REPO, board);
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
 
     expect(cyclesMock).not.toHaveBeenCalled();
   });
@@ -798,7 +836,7 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     const board = [{ ...target, dependencies: [] }];
     cyclesMock.mockResolvedValue([]);
 
-    await ensureCycleEvidence(REPO, board);
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
 
     expect(listMock).not.toHaveBeenCalled();
     expect(cycleEvidenceFor(board)).toEqual([]);
@@ -819,7 +857,7 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     cyclesMock.mockResolvedValue([]);
     const before = issueSnapshotVersion(REPO);
 
-    await ensureCycleEvidence(REPO, board);
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
 
     expect(cycleEvidenceFor(board)).toBeUndefined();
     expect(issueSnapshotVersion(REPO)).toBe(before);
@@ -839,7 +877,7 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
     const before = issueSnapshotVersion(REPO);
 
-    await ensureCycleEvidence(REPO, board);
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
 
     expect(cycleEvidenceFor(board)).toBeUndefined();
     expect(issueSnapshotVersion(REPO)).toBe(before);
@@ -849,7 +887,9 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     const board = [{ ...target, dependencies: [] }];
     cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
 
-    await expect(ensureCycleEvidence(REPO, board)).rejects.toThrow("bd: dep cycles timed out");
+    await expect(ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO))).rejects.toThrow(
+      "bd: dep cycles timed out",
+    );
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
 
@@ -865,10 +905,41 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
       return [{ ids: ["t-1"], raw: { cycle: ["t-1"] } }];
     });
     const before = issueSnapshotVersion(REPO);
+    const generation = issueSnapshotGeneration(REPO);
 
-    await ensureCycleEvidence(REPO, board);
+    await ensureCycleEvidence(REPO, board, generation);
 
     expect(cycleEvidenceFor(board)).toBeUndefined();
     expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("declines to attach evidence when `board` was already retired before the call — the generation the caller passed no longer matches (P2 badge review, PR #274, round 24)", async () => {
+    // Simulates the approve route's own gap: `board` and its generation are captured atomically via
+    // `refreshAllIssuesRead`, then a background refresh replaces the retained snapshot (bumping the
+    // generation) before `ensureCycleEvidence` is finally called. Passing the STALE generation the
+    // caller actually captured — not a fresh `issueSnapshotGeneration(REPO)` read here — is what this
+    // test exists to force: sampling fresh at the call site would trivially match itself and mask
+    // exactly this staleness.
+    const board = [{ ...target, dependencies: [] }];
+    const staleGeneration = issueSnapshotGeneration(REPO);
+    invalidateIssueSnapshot(REPO); // a concurrent refresh moves the retained snapshot on
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board, staleGeneration);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+});
+
+describe("refreshAllIssuesRead", () => {
+  it("returns the generation the resolved board was actually retained under", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+
+    const { beads: board, generation } = await refreshAllIssuesRead(REPO);
+
+    expect(board.map((b) => b.id)).toEqual(["t-1"]);
+    expect(generation).toBe(issueSnapshotGeneration(REPO));
   });
 });

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getBoard } from "@/lib/board";
 import { humanGates } from "@/lib/approval-gate";
 import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
-import { ensureCycleEvidence, refreshAllIssues } from "@/lib/beads/issues";
+import { ensureCycleEvidence, refreshAllIssuesRead } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
 import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
@@ -189,7 +189,17 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // dangling one — reporting valid graph structure as corruption and telling the operator to delete
   // an edge that's fine. A transient `bd list --type gate` failure must surface as a failed read
   // (this request throws, the operator retries) rather than a misleading 422.
-  const allBeads = await refreshAllIssues(project.repoPath, { strictGates: true });
+  // Read via `refreshAllIssuesRead`, not `refreshAllIssues` + a separate generation lookup, so
+  // `allBeadsGeneration` is captured atomically alongside `allBeads` (P2 badge review, PR #274,
+  // round 24): `ensureCycleEvidence` below is called only after real work in between (operator
+  // resolution, request-body parsing, the contract/structure gates), during which a background
+  // refresh can replace the retained snapshot. A fresh `issueSnapshotGeneration` read taken at that
+  // later call site would compare "current" against itself and trivially pass even though `allBeads`
+  // is by then a retired array — see `ensureCycleEvidence`'s doc for the failure this closes.
+  const { beads: allBeads, generation: allBeadsGeneration } = await refreshAllIssuesRead(
+    project.repoPath,
+    { strictGates: true },
+  );
   // Validate the target is actually runnable *before* touching labels or enqueuing. Approval is the
   // run trigger, so labeling-and-enqueuing a bead that execute-epic will only poison-park is a false
   // green: the operator sees "approved" but no run ever reaches a PR. Reuse the same isRunTarget gate
@@ -358,7 +368,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // entirely. Attaches to the SAME `allBeads` array already in hand, so this costs at most one
   // `bd dep cycles` spawn, not a second `bd list`.
   if (willEnqueue) {
-    await ensureCycleEvidence(project.repoPath, allBeads);
+    await ensureCycleEvidence(project.repoPath, allBeads, allBeadsGeneration);
   }
   const structural = willEnqueue
     ? structureGaps(epicId, allBeads, { cycles: cycleEvidenceFor(allBeads) })
