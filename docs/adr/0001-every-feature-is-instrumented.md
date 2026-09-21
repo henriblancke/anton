@@ -45,10 +45,12 @@ into the delivery ledger as part of the feature — not as follow-up work.**
 
 Concretely:
 
-1. **Every Claude dispatch goes through the metered path.** New dispatch sites use
-   `dispatchClaude` (`src/lib/jobs/steps/dispatch.ts`) or wrap their driver in `metered(...)`
-   (`src/lib/claude-invocations.ts`). A new dispatch site that writes no ledger row is a defect,
-   not an omission.
+1. **Every Claude dispatch goes through `metered(...)`** (`src/lib/claude-invocations.ts`) —
+   directly, or via `dispatchClaude` (`src/lib/jobs/steps/dispatch.ts`), which is one of its six
+   call sites rather than the boundary itself. A new dispatch site that writes no ledger row is a
+   defect, not an omission. Anything the ledger needs on every row is resolved *inside* the
+   wrapper, never asked of each call site — a per-site obligation is one a new site forgets, which
+   is why the wrapper exists at all.
 
 2. **Every new dimension worth asking about later is a column, written at the time.** If a reader
    in three months would want to group by it, and it cannot be reconstructed from what is already
@@ -56,20 +58,26 @@ Concretely:
    table for things a join already answers.
 
 3. **Every new job type, pipeline step, and pass declares its phase.** The phase mapping in the
-   ledger fold is exhaustive: a `(jobType, step)` pair matching no phase must fail a test, not
-   fall into an `unattributed` bucket that nobody reads. New work is classified when it is
+   ledger fold is exhaustive: a `(jobType, handler)` pair matching no phase must fail a test, not
+   fall into an `unattributed` bucket that nobody reads. The **handler**, not the author's step id
+   — a project formula names its steps freely, so the id is not a stable classification key. New work is classified when it is
    written, by the person who knows what it is.
 
-4. **Every new failure, park, or human-intervention path is classified.** A new way for work to
+4. **Every new agent, skill, or prompt a dispatch can resolve is recorded by identity and
+   version.** Which specialist ran, and which text it ran, are per-invocation facts that vanish on
+   the next edit — and they are the unit a "did this change help?" question compares. A new
+   resolvable input that is not stamped is invisible to every cohort read.
+
+5. **Every new failure, park, or human-intervention path is classified.** A new way for work to
    stop is a new row in the friction taxonomy, explicitly marked as anton failing or not. An
    unclassified stop is invisible in exactly the metric built to catch it.
 
-5. **Recording never fails the work.** This is the existing `claude_invocations` rule and it is
+6. **Recording never fails the work.** This is the existing `claude_invocations` rule and it is
    not relaxed: unknown values record as null, a write that throws is swallowed. A run that did
    the work must not fail because a meter could not be written. Instrumentation that can break
    delivery will be removed, and rightly.
 
-6. **A feature that deliberately records nothing says so, in writing.** Instrumentation may be
+7. **A feature that deliberately records nothing says so, in writing.** Instrumentation may be
    skipped — some work genuinely has nothing to meter — but the bead's `## Out of scope` states
    it and why. Silence is not a decision.
 
@@ -103,13 +111,15 @@ pure refactors, documentation, or UI that reads existing data.
 Reviewable, not aspirational. A feature under this ADR is incomplete without:
 
 - a ledger row for every dispatch it adds (test: the dispatch path is metered);
-- a phase for every `(jobType, step)` it introduces (test: exhaustiveness fails on an unmapped pair);
+- a phase for every `(jobType, handler)` it introduces (test: exhaustiveness fails on an unmapped pair);
 - a friction classification for every new stop path (test: the stop increments the intended counter
   and no other);
 - or an explicit `## Out of scope` note saying none of the above applies, and why.
 
-The `/shape` skill surfaces this ADR when shaping work that spends tokens, so the instrumentation
-tickets are written onto the board with the feature rather than remembered afterwards.
+The `/shape` skill **should** surface this ADR when shaping work that spends tokens, so the
+instrumentation tickets are written onto the board with the feature rather than remembered
+afterwards. **Not yet wired** — `skills/shape/SKILL.md` has no mention of this ADR today. Tracked
+as `anton-67p0t`; until it lands, the enforcement above rests on review alone.
 
 ## Alternatives considered
 

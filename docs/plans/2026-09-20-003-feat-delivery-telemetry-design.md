@@ -17,7 +17,7 @@ Two questions anton cannot currently answer:
 2. **"Did my prompt change make anton better or worse?"** — the same figures, grouped by the
    prompt and formula that produced them, tracked across months and across projects.
 
-The first is a **read** over facts anton already records. The second needs **three new columns**,
+The first is a **read** over facts anton already records. The second needs **eight new columns**,
 and is the half that loses data every day it is not shipped: what prompt text ran is gone the
 moment the file is edited.
 
@@ -69,12 +69,13 @@ design that destroys data by being deferred.
 **Gap 2 — "Duration" is three numbers that diverge wildly.**
 
 - **active** — `Σ durationMs`. What Claude actually worked.
-- **wall** — `Σ (run.endedAt − run.attemptStartedAt)`. Includes retries.
+- **wall** — start-to-finish including retries. **Not recorded today** — `attemptStartedAt` is
+  overwritten on every resume, so prior intervals are already lost (see `timing`).
 - **lead** — first invocation → last delivery. Includes overnight quota parks.
 
 A feature parked 14h on a usage limit has ~20min active and ~14h lead. Reporting one number hides
-whichever question is being asked. `lead − wall` is queue/park time — the figure that says whether
-to buy more quota.
+whichever question is being asked. `lead − active` separates working from waiting — the figure that
+says whether to buy more quota.
 
 **Gap 3 — "Failures" is six things with opposite meanings.**
 
@@ -120,17 +121,56 @@ but it is not built now, and the stamps in D2 are what make it possible later.
 
 ### D2 — Attribution stamps are written, not derived
 
-Three columns on `claude_invocations`, written at `dispatchClaude`'s existing `dimensions`
-assembly (`src/lib/jobs/steps/dispatch.ts:71`), so every step gets them without remembering to:
+Eight columns on `claude_invocations`, written at the **`metered(...)` boundary**
+(`src/lib/claude-invocations.ts:244`) — not at `dispatchClaude`. Three are the attribution stamps,
+`step_handler` is required by the phase fold for the same reason, and four record **what ran**:
 
 | column | value | rationale |
 |---|---|---|
 | `prompt_digest` | 12-hex sha256 of the **composed** system prompt (base + agent + seed) | the prompt *is* the behavior of every producer; the composed text is what actually ran |
 | `formula_digest` | 12-hex content hash of the cooked formula | `runs.formula` is a path; a pipeline edit must be visible |
 | `anton_version` | `identity.mjs` version + git revision | separates "my prompt improved" from "I upgraded anton" |
+| `step_handler` | the resolved `stepName(step)` — the handler, not the author's step id | a custom formula's step id matches no phase predicate; the mapping is editable, so it is not reconstructible |
+| `agent_tag` | the `agent:<tag>` the ticket resolved to (`steps/agent.ts:31`), null when none | which specialist ran is a per-invocation fact; `runs.agent_tag` is per-RUN and misses a multi-ticket run's mix |
+| `skill_id` / `skill_digest` | the `skill:<id>` a `step:claude` resolved, and its content digest | a skill is edited in place and resolves project-local-first; both the identity and the version it ran at are gone by the next edit |
+| `prompt_id` | the `prompt:<id>` a `step:claude` resolved, null otherwise | the sibling of `skill_id` — `loadStepReasoning` takes one or the other |
 
 Reuses `skillDigest`'s conventions from `src/lib/claude/skill-stamp.mjs` — same length, same
 hashing discipline, already tested.
+
+**Which agent and which skill ran.** Both are resolved at dispatch and both are mutable, so they
+fall under the same rule as the prompt digest. `runs.agent_tag` already exists but is the wrong
+grain: it is per-RUN, while `agent:` is a per-TICKET label, so a run whose tickets used three
+different specialists records one of them. `loadStepReasoning` (`steps/resolve.ts:89`) resolves
+`prompt:<id>` XOR `skill:<id>`, and `loadProjectSkill` prefers the project's own copy over the
+bundled one — so the same `skill:review` means different text in different repos, and different
+text in the same repo a week later. `skill_digest` reuses `skillDigest` again, which makes
+"did the new reviewer skill help?" the same cohort question as "did the new prompt help?".
+
+These are cheap: every value is already computed at dispatch, and recording them is passing what
+is in hand rather than resolving anything new.
+
+**Why `metered(...)` and not `dispatchClaude` (PR #311 review).** `dispatchClaude` is *a* metered
+call site, not *the* metered boundary. There are six, and five bypass it:
+
+| site | phase it produces |
+|---|---|
+| `jobs/steps/dispatch.ts:82` | the formula walk (`implement`, `describe`, `claude`) |
+| `jobs/execute-epic-ticket.ts:169` | ticket retries (`recordsEachAttempt: true` — meters its own attempts) |
+| `jobs/review-gate.ts:289` | **self-review** |
+| `jobs/review-fix.ts:679` | **PR-fix** |
+| `jobs/product-master.ts:176` | overhead |
+| `jobs/nightly-stringer.ts:65` | overhead |
+
+Stamping only `dispatchClaude` would leave `prompt_digest` NULL on self-review and PR-fix — two of
+the three phases this design exists to attribute — and on every resumed ticket attempt. The stamps
+therefore belong on `InvocationDimensions`, resolved inside `metered(...)` so a site that forgets
+to pass them still records what can be resolved from process state (`anton_version` always;
+`formula_digest` whenever the run is known).
+
+This is the same reasoning `claude-invocations.ts`'s own header gives for the wrapper existing at
+all: *"a per-site recording call is one a new dispatch site forgets."* A per-site *stamp* is the
+same mistake one level down.
 
 **This is the only new write path in the design.** It follows `claude_invocations`' existing rule:
 **recording never fails a run.** A digest that cannot be computed is recorded as null, and a throw
@@ -168,20 +208,36 @@ featureLedger(project, beadId) →
   scope:    { beadId, childIds[], title, status, recorded: boolean }
   phases:   Map<Phase, PhaseTotals>
   totals:   PhaseTotals
-  timing:   { activeMs, wallMs, leadMs }
+  timing:   { activeMs, leadMs }        // wallMs: blocked on a per-attempt record
   friction: Friction
   stamps:   { promptDigests[], formulaDigests[], antonVersions[], models[] }
 ```
 
-**Phases** derive from `(jobType, step)` already recorded — no new dimension:
+**Phases** derive from `(jobType, handler)`:
 
 | phase | predicate |
 |---|---|
-| `implement` | `step ∈ {implement, verify, commit, claude}` |
-| `self-review` | `step = 'review'` |
-| `describe` | `step = 'describe'` |
-| `pr-fix` | `jobType ∈ {review-fix, review-fix-pr}` |
+| `implement` | `handler ∈ {implement, verify, commit, claude}` |
+| `self-review` | `handler = 'review'` |
+| `describe` | `handler = 'describe'` |
+| `pr-fix` | `jobType ∈ {review-fix, review-fix-pr}`, **or** `step = 'review-fix'` under `execute-epic` |
 | `overhead` | `jobType ∈ {gardener, product-master, board-picker, nightly-stringer}` — project-level only (D4) |
+
+**`handler`, not `step` (PR #311 review).** `dispatch.ts:75` records `ctx.step?.id` — the cooked
+step's *arbitrary author-chosen id*, not the `step:<name>` label that names its handler. On the
+bundled formula the two coincide; on a project formula whose implement step is called
+`code-ticket` they do not, and every predicate above would miss. A custom pipeline's whole spend
+would land in `unattributed`, which is honest but useless — and D4's discipline says an
+unallocated remainder is a last resort, not a design.
+
+So `claude_invocations` gains a fourth recorded dimension alongside D2's three: **`step_handler`**,
+the resolved `stepName(step)` value, written where `step` already is. It is the semantic fact; the
+step id is the author's label for it. Same argument as the stamps — it is not reconstructible
+later, because the formula that defined the mapping is editable.
+
+The `pr-fix` row's second clause covers the in-formula self-review correction dispatch, which
+records `step = 'review-fix'` while its `jobType` is still `execute-epic`, and would otherwise be
+counted as implement spend.
 
 `PhaseTotals`: `runs`, `tokens{in, out, thinking, cacheRead, cacheWrite}`, `usd`, `unpricedRows`,
 `activeMs`, `apiMs`, `turns`, `errors`.
@@ -210,7 +266,14 @@ number:
 | `cancels` | `jobs.status = 'cancelled'` |
 | `quotaParks` | `jobs.status = 'parked'` with a quota reason |
 
-`humanTouches = escalations + humanGates + sendBacks + cancels`.
+`humanTouches = nonGateEscalations + humanGates + sendBacks + cancels`, where
+`nonGateEscalations = escalations − humanGates`.
+
+**`humanGates` is a SUBSET of `escalations`, not a sibling (PR #311 review).** `needs-human` is a
+`kind` *within* the escalations table (`run-health.ts:498`), so summing both counted every gate
+twice — inflating exactly the features that needed the most attention, and biasing every cohort
+comparison toward whichever prompt raised more gates. The two are reported separately because they
+mean different things, and summed once.
 
 **`quotaParks` is excluded from `humanTouches` deliberately.** Counting a usage limit as anton
 failing would make the metric degrade every time anton is used more — the opposite of what it is
@@ -218,12 +281,29 @@ for. It is reported alongside, never inside.
 
 ### `timing`
 
-All three durations from Gap 2, all derived from existing columns:
+- `activeMs` = `Σ durationMs` over the scope's invocations. Derived; exact.
+- `leadMs` = first invocation → last delivery (`listDeliveriesByBead`). Derived; exact.
+- `wallMs` = **not derivable from what exists today.** See below.
 
-- `activeMs` = `Σ durationMs` over the scope's invocations
-- `wallMs` = `Σ (endedAt − attemptStartedAt)` per run, falling back to `startedAt` on rows written
-  before `attemptStartedAt` existed
-- `leadMs` = first invocation → last delivery (`listDeliveriesByBead`)
+**`wallMs` needs a per-attempt record (PR #311 review).** `attemptStartedAt` is *overwritten* every
+time a resume picks a parked run back up (`execute-epic-start.ts:338`) — the column's own comment
+says so, since that is precisely what the repair weigher needs it for. So a settled row carries
+only the LAST attempt's start beside a final `endedAt`; every earlier interval is already gone.
+`Σ (endedAt − attemptStartedAt)` therefore yields the last attempt's duration while claiming to be
+wall time *including retries*, and it understates exactly the runs that struggled most.
+
+Two honest options, and the design takes the first:
+
+1. **Report `activeMs` and `leadMs` now; add `wallMs` when a per-attempt record exists.** Both are
+   exact, and `lead − active` still separates "working" from "waiting", which is the question that
+   motivated the split. A `run_attempts` row (run id, attempt, started, ended, outcome) is the
+   prerequisite, and it is a fact table of the same shape as `claude_invocations` — filed as its
+   own bead rather than smuggled into the fold.
+2. Report the last attempt's duration and call it `lastAttemptMs`. Rejected: it is a third number
+   nobody asked for, and its resemblance to wall time is the trap.
+
+**Nothing derives a number it cannot stand behind** — the same rule as unpriced-is-not-zero. A
+missing `wallMs` is a gap; a plausible wrong one is a lie that survives into every cohort.
 
 ### The attribution read: `promptSeries(projectId, window)`
 
@@ -244,6 +324,17 @@ Two guardrails, because this is where a metrics surface most easily lies:
    no arrow at all.
 2. **A cohort spanning mixed `anton_version`s says so, in the cohort header.** Otherwise a runtime
    change gets credited to a prompt edit.
+
+### Cohorts by agent and by skill
+
+The same fold, keyed differently. `promptSeries` groups on a stamp tuple; agent and skill are two
+more dimensions of that tuple, so "is `agent:nextjs` worth its cost versus the default?" and "did
+the reviewer skill edit help?" are the same query with a different key — not new machinery.
+
+Both carry the same `MIN_COHORT` floor, and one extra caution: **an agent cohort is confounded by
+what it was given.** `agent:alembic` rides `risk:high` migration work by convention, so its higher
+cost per feature says as much about the tickets as the specialist. The view reports the key and the
+n; it does not claim a specialist caused a difference.
 
 ### The denominator
 
@@ -275,6 +366,8 @@ actively recommend the wrong prompt.
 | Stamp columns tempt a "recording must succeed" change | the never-fail-a-run rule is restated in the column comments, as `claude_invocations` already does |
 | Underpowered cohorts produce confident-looking noise | `MIN_COHORT` guardrail; no verdict under it |
 | Friction proxies get read as quality | surfaces label them as signals, never as a score |
+| A new `metered(...)` call site forgets the stamps | resolved inside the wrapper, not passed per-site; a site that passes nothing still records `anton_version` |
+| `wallMs` is wanted before the per-attempt record exists | it is absent rather than approximated; the gap is visible, a wrong number would not be |
 
 ---
 
@@ -286,7 +379,15 @@ actively recommend the wrong prompt.
 - A quota park increments `quotaParks` and does **not** increment `humanTouches`.
 - A digest that throws records null and does not fail the run.
 - `promptSeries` suppresses the verdict below `MIN_COHORT` and flags mixed `anton_version` cohorts.
-- Three timings are independently correct on a run that parked overnight and resumed.
+- `activeMs` and `leadMs` are independently correct on a run that parked overnight and resumed, and
+  no `wallMs` is reported until a per-attempt record exists.
+- A custom formula whose implement step is named something else still folds into `implement`, via
+  `step_handler` rather than the step id.
+- A feature with one `needs-human` escalation and nothing else reports `humanTouches: 1`, not 2.
+- A ticket carrying `agent:nextjs` records that tag on its invocation rows; a run mixing two
+  specialists records both, one per invocation, rather than one for the run.
+- A `skill:<id>` resolved from the project's own copy records a different `skill_digest` than the
+  bundled one of the same name.
 
 ---
 
