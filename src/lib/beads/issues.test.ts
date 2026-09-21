@@ -852,4 +852,23 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     await expect(ensureCycleEvidence(REPO, board)).rejects.toThrow("bd: dep cycles timed out");
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
+
+  it("declines to attach evidence, and does not bump the version, when the snapshot's generation moves while depCycles is in flight (P2 badge review, PR #274, round 22)", async () => {
+    // `board` itself carries no `blocks` edge, so `sameBlocksEdges`'s re-list can't be what catches
+    // this — a concurrent local write (another request, or another machine on a shared-server board)
+    // invalidates the retained snapshot while `bd dep cycles` is still running. Attaching evidence to
+    // `board` here and bumping the version would tell every poller the retained snapshot recovered
+    // when it, in fact, was just swapped out from under this call and remains evidence-less.
+    const board = [{ ...target, dependencies: [] }];
+    cyclesMock.mockImplementation(async () => {
+      invalidateIssueSnapshot(REPO);
+      return [{ ids: ["t-1"], raw: { cycle: ["t-1"] } }];
+    });
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
 });

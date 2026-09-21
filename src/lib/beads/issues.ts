@@ -388,16 +388,31 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
  * retried here — every consumer of `cycleEvidenceFor` already fails closed on `undefined`
  * (`missingCycleEvidenceGap`), and a caller that must not proceed on a stale pairing gets exactly
  * that by falling through to the same closed failure a genuinely missing read produces.
+ *
+ * Also guarded by `issueSnapshotGeneration`, captured before the `depCycles` call and rechecked
+ * after it AND after the `sameBlocksEdges` re-list (P2 badge review, PR #274, round 22): the
+ * `consistent` check alone only proves `board`'s `blocks` edges still match a fresh listing, not
+ * that `board` is still the entry's retained array. A background refresh (or another writer, on a
+ * shared-server board) can swap the retained snapshot for a new array that happens to preserve the
+ * same edges while either await above is in flight — `sameBlocksEdges` reads as consistent, but
+ * `board` is now a retired object no later reader can reach. Attaching evidence to it and calling
+ * `markCycleEvidenceRecovered` would still bump the shared version, telling every poller the
+ * retained board recovered when it, in fact, remains evidence-less.
  */
 export async function ensureCycleEvidence(cwd: string, board: Bead[]): Promise<Bead[]> {
   if (cycleEvidenceFor(board) === undefined) {
+    const generation = issueSnapshotGeneration(cwd);
     const cycles = await beads.depCycles(cwd);
     const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
     const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(cwd));
     // Recheck evidence AFTER the `sameBlocksEdges` await, not just before it, mirroring
     // `attachCyclesBestEffort`: a concurrent enrichment path sharing this same `board` array (evidence
     // is keyed by array identity) may have already attached it while the re-list above was in flight.
-    if (consistent && cycleEvidenceFor(board) === undefined) {
+    if (
+      consistent &&
+      issueSnapshotGeneration(cwd) === generation &&
+      cycleEvidenceFor(board) === undefined
+    ) {
       attachCycleEvidence(board, cycles);
       markCycleEvidenceRecovered(cwd);
     }
