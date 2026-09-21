@@ -108,6 +108,21 @@ export interface ProjectSettings {
   lintCommand?: string;
   typecheckCommand?: string;
   buildCommand?: string;
+  /**
+   * The project-setup command warming runs in a fresh worktree (anton-z5li2), overriding both
+   * `ANTON_WARM_COMMAND` and the lockfile table — the one env var is machine-wide, so a monorepo, a
+   * uv/make setup or a repo with two lockfiles cannot be fixed without it. Cleared → FALL BACK to
+   * the env var, then lockfile detection; clearing is never "skip warming" (that is
+   * {@link warmEnabled}).
+   */
+  warmCommand?: string;
+  /**
+   * Whether this project's worktrees are warmed at all (anton-z5li2). Absent → ON, so every
+   * existing project keeps warming without opting in; `false` skips the warm entirely for a repo
+   * whose install needs credentials anton doesn't have. The machine-wide `ANTON_WARM_WORKTREE=0`
+   * still ranks above this.
+   */
+  warmEnabled?: boolean;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   baseBranch?: string;
   /**
