@@ -407,3 +407,87 @@ describe("the display cut", () => {
     expect(failureStreakEvidence(streak)[0]).toBe(`r0 · ${EPIC} · failed · ${PREFIX}`);
   });
 });
+
+/**
+ * The structural half (anton-ocm4): `signatureOf` signs `run.structuralError` — anton's own account
+ * of the stop — instead of the rendered `error`, when a run carries one.
+ */
+describe("the structural half", () => {
+  const EPIC = "anton-kwi6";
+  const TWO: { threshold: number } = { threshold: 2 };
+
+  /**
+   * Anton's own reasoning for the stop (`execute-epic-ticket.ts`'s zero-diff `structural`),
+   * byte-identical on both real attempts below since both hit the same code path on the same ticket.
+   */
+  const STRUCTURAL =
+    `${EPIC} produced no delivery: claude exited cleanly and passed the verify gates but left no ` +
+    `changes to commit (zero diff). Blocking the ticket for operator review and halting the epic — ` +
+    `nothing landed, so closing it would be a false success.`;
+
+  /**
+   * The two REAL anton-kwi6 runs (2026-09-07): the same structural stop, each time followed by the
+   * agent's own self-report quoted verbatim — and the two self-reports do not share a single
+   * sentence, because each run reasoned about the earlier commit in its own words.
+   */
+  const RUN_ONE_ERROR =
+    `${STRUCTURAL} The agent self-reported blocked — anton-kwi6's full scope (setting + ` +
+    `default/range, PATCH validation, Review-fix slider, both Verify test suites) already landed in ` +
+    `commit 027dee22 under sibling ticket anton-96yu; tests and typecheck green, nothing left to ` +
+    `implement., corroborating the block.`;
+  const RUN_TWO_ERROR =
+    `${STRUCTURAL} The agent self-reported blocked — Acceptance verified complete and ticket closed ` +
+    `per operator note, but this session produced zero diff (the work landed earlier in commit ` +
+    `027dee22 under sibling anton-96yu), so there is nothing for anton to commit., corroborating the ` +
+    `block.`;
+
+  it("reports no common point from the rendered messages alone — the agent's own words differ", () => {
+    // Neither run carries a `structuralError`, so `signatureOf` falls back to `point` (today's
+    // behaviour) and signs the whole rendered message, self-report quote included.
+    const runs = [
+      run("two", { epicBeadId: EPIC, error: RUN_TWO_ERROR }),
+      run("one", { epicBeadId: EPIC, error: RUN_ONE_ERROR }),
+    ];
+    expect(detectFailureStreak(runs, TWO)?.commonFailure).toBeUndefined();
+  });
+
+  it("reports a common failure point once the structural half is available", () => {
+    const runs = [
+      run("two", { epicBeadId: EPIC, error: RUN_TWO_ERROR, structuralError: STRUCTURAL }),
+      run("one", { epicBeadId: EPIC, error: RUN_ONE_ERROR, structuralError: STRUCTURAL }),
+    ];
+    const streak = detectFailureStreak(runs, TWO);
+    expect(streak?.commonFailure).toBe(RUN_ONE_ERROR.slice(0, 140));
+  });
+
+  it("still reports none across a mixed streak — a zero-diff block and a timeout are not one break", () => {
+    const runs = [
+      run("timeout", {
+        epicBeadId: EPIC,
+        error: "worktree checkout timed out after 45m",
+        structuralError: "worktree checkout timed out after 45m",
+      }),
+      run("one", { epicBeadId: EPIC, error: RUN_ONE_ERROR, structuralError: STRUCTURAL }),
+    ];
+    expect(detectFailureStreak(runs, TWO)?.commonFailure).toBeUndefined();
+  });
+
+  it("still masks the bead id and every quantity once signed on the structural half", () => {
+    const point = (id: string, port: number) =>
+      `${id} produced no delivery: worktree could not bind localhost:${port} after 45m`;
+    const runs = [
+      run("b", {
+        epicBeadId: "anton-b2b2",
+        error: point("anton-b2b2", 3001),
+        structuralError: point("anton-b2b2", 3001),
+      }),
+      run("a", {
+        epicBeadId: "anton-a1a1",
+        error: point("anton-a1a1", 3000),
+        structuralError: point("anton-a1a1", 3000),
+      }),
+    ];
+    const streak = detectFailureStreak(runs, TWO);
+    expect(streak?.commonFailure).toBe(point("anton-a1a1", 3000));
+  });
+});
