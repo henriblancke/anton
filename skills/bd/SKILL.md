@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 590256e629b7
+version: 12cdf988742e
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
