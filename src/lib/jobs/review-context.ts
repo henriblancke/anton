@@ -17,6 +17,7 @@ import { loadSkill } from "../claude/prompt";
 import { buildExecutionSystemPrompt, shellQuotePath } from "../claude/system-prompt";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
+import { contentLabels, contentMetadata } from "./execute-epic-board-evidence";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
 import { mustRead } from "./execute-epic-persist";
 import { labelValue } from "./review-fix-context";
@@ -819,10 +820,12 @@ function boardEvidenceSection(
 
 /**
  * One confirmed bead's current field values, rendered for a reviewer with no `bd` of its own. Every
- * field a board-only write is documented to touch ({@link
- * import("./execute-epic-board-evidence").BoardFingerprint}'s own field list) so a status flip, a
- * mislabel, and a reparent onto the wrong parent are each independently checkable — the point of
- * handing over values instead of ids at all.
+ * field {@link import("./execute-epic-board-evidence").fingerprintOf} hashes is rendered here too
+ * (PR #284 review round 17, "Render all fingerprinted fields for server-board review") — a
+ * fingerprint change a reviewer can't see is a delivery it can't check, so this list must track that
+ * one field-for-field rather than only the subset a status/label/reparent check happens to need.
+ * `labels`/`metadata` reuse that module's own `contentLabels`/`contentMetadata` rather than
+ * reimplementing the bookkeeping-key filter, so the two can never drift apart again.
  *
  * `undefined` (the host-side `bd show` exhausted its retries) is rendered as an explicit refusal to
  * vouch, never silently skipped: a reviewer that never sees this id again would read its absence as
@@ -837,16 +840,26 @@ function confirmedBeadSummary(id: string, bead: Bead | undefined): string[] {
       ``,
     ];
   }
-  const labels = (bead.labels ?? []).toSorted().join(", ") || "(none)";
+  const labels = contentLabels(bead).join(", ") || "(none)";
   const deps =
     (bead.dependencies ?? [])
       .map((d) => `${d.type}:${d.depends_on_id}`)
       .toSorted()
       .join(", ") || "(none)";
+  const metadata =
+    contentMetadata(bead)
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+      .join(", ") || "(none)";
+  const field = (label: string, value: string | undefined): string =>
+    `  ${label}=${value?.trim() ? truncate(value.trim(), MAX_BEAD_FIELD_CHARS) : "(none)"}`;
   return [
     `- ${id}: status=${bead.status}, type=${bead.issue_type ?? "(none)"}, title="${bead.title}"`,
     `  labels=[${labels}], parent=${beads.parentOf(bead) ?? "(none)"}, assignee=${bead.assignee ?? "(none)"}`,
-    `  dependencies=[${deps}]`,
+    `  dependencies=[${deps}], priority=${bead.priority ?? "(none)"}, external_ref=${bead.external_ref ?? "(none)"}`,
+    `  metadata={${metadata}}`,
+    field("description", bead.description),
+    field("acceptance_criteria", bead.acceptance_criteria),
+    field("design", bead.design),
     ``,
   ];
 }

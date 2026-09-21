@@ -479,6 +479,12 @@ describe("reviewContext", () => {
           parent: "anton-fc5x",
           assignee: "anton",
           dependencies: [{ issue_id: "anton-y9", depends_on_id: "anton-fc5x", type: "parent-child" }],
+          description: "Move it under the right epic.",
+          acceptance_criteria: "- [ ] parent is anton-fc5x",
+          design: "Use `bd update --parent`.",
+          priority: 1,
+          external_ref: "LINEAR-42",
+          metadata: { source: "gardener" },
         };
         const out = reviewContext({
           target: epic,
@@ -490,7 +496,11 @@ describe("reviewContext", () => {
         });
         expect(out).toContain("- anton-y9: status=closed, type=task, title=\"Reparent the orphaned ticket\"");
         expect(out).toContain("labels=[domain:eng], parent=anton-fc5x, assignee=anton");
-        expect(out).toContain("dependencies=[parent-child:anton-fc5x]");
+        expect(out).toContain("dependencies=[parent-child:anton-fc5x], priority=1, external_ref=LINEAR-42");
+        expect(out).toContain('metadata={source="gardener"}');
+        expect(out).toContain("description=Move it under the right epic.");
+        expect(out).toContain("acceptance_criteria=- [ ] parent is anton-fc5x");
+        expect(out).toContain("design=Use `bd update --parent`.");
       } finally {
         resetBoardModeCache();
       }

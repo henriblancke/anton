@@ -87,7 +87,7 @@ const BOOKKEEPING_LABELS: readonly string[] = [LABELS.notDelivered];
 /** `b`'s labels, minus anton's own bookkeeping prefixes and exact labels, in a stable order so
  * re-fetching the same content twice (labels can come back in a different order) never reads as a
  * change. */
-function contentLabels(b: Bead): string[] {
+export function contentLabels(b: Bead): string[] {
   return (b.labels ?? [])
     .filter((l) => !BOOKKEEPING_LABEL_PREFIXES.some((prefix) => l.startsWith(prefix)))
     .filter((l) => !BOOKKEEPING_LABELS.includes(l))
@@ -99,7 +99,7 @@ function contentLabels(b: Bead): string[] {
  * and an unsorted array would read that as a change. `bd update --set-metadata k=v` (anton-fc5x
  * review round 6) is a supported board-only write with no other field it necessarily touches, so
  * a ticket whose sole deliverable is custom metadata must not fingerprint as unchanged. */
-function contentMetadata(b: Bead): [string, unknown][] {
+export function contentMetadata(b: Bead): [string, unknown][] {
   return Object.entries(b.metadata ?? {})
     .filter(([k]) => !ANTON_METADATA_KEYS.includes(k))
     .toSorted(([a], [c]) => (a < c ? -1 : a > c ? 1 : 0));
