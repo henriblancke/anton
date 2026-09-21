@@ -73,6 +73,8 @@ import {
   SATISFIES_TRAILER,
   boundedTail,
   MAX_STDERR_CHARS,
+  pushEnv,
+  readSshCommand,
 } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MS, DEFAULT_PUSH_TIMEOUT_MS, GH_BIN_ENV, PUSH_TIMEOUT_ENV } from "./ops";
 import { DEFAULT_COMMIT_TIMEOUT_MINUTES, DEFAULT_PUSH_TIMEOUT_MINUTES } from "@/lib/projects";
@@ -4019,6 +4021,193 @@ describe("push timeout default", () => {
   });
 });
 
+/**
+ * Direct coverage for the probe (PR #306 review round 5) — it had only end-to-end coverage through
+ * `pushBranch` against a real, healthy repo, so neither the unset/unknown distinction nor the
+ * variant read was exercised anywhere. These run real `git config` against real repositories, which
+ * is what makes them worth having: the three-state logic rests on a claim about git's EXIT CODES
+ * (1 for "no such key", 128 for a non-repo), and only a real git can confirm that claim holds.
+ */
+describe("readSshCommand — what could actually be established about core.sshCommand", () => {
+  const dirs: string[] = [];
+  const savedGitConfig = {
+    global: process.env.GIT_CONFIG_GLOBAL,
+    noSystem: process.env.GIT_CONFIG_NOSYSTEM,
+  };
+
+  beforeEach(() => {
+    // The probe deliberately reads Git's effective configuration, so keep these real-git tests
+    // independent of any SSH command or variant configured on the developer/CI machine.
+    const configDir = mkdtempSync(join(tmpdir(), "anton-sshprobe-global-"));
+    dirs.push(configDir);
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+    process.env.GIT_CONFIG_GLOBAL = join(configDir, "config");
+  });
+
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+    if (savedGitConfig.global === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = savedGitConfig.global;
+    if (savedGitConfig.noSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+    else process.env.GIT_CONFIG_NOSYSTEM = savedGitConfig.noSystem;
+  });
+
+  const plainDir = () => {
+    const d = mkdtempSync(join(tmpdir(), "anton-sshprobe-"));
+    dirs.push(d);
+    return d;
+  };
+
+  const repo = () => {
+    const d = plainDir();
+    execFileSync("git", ["-C", d, "init", "-q"]);
+    return d;
+  };
+
+  it("reports 'unset' for a repo that configures nothing — git's exit 1 is a definite answer", async () => {
+    await expect(readSshCommand(repo())).resolves.toEqual({ state: "unset", variant: undefined });
+  });
+
+  it("reports the configured command", async () => {
+    const d = repo();
+    execFileSync("git", ["-C", d, "config", "core.sshCommand", "ssh -i /etc/deploy/key"]);
+
+    await expect(readSshCommand(d)).resolves.toMatchObject({ state: "set", command: "ssh -i /etc/deploy/key" });
+  });
+
+  it("reports 'unknown' where git cannot answer at all, rather than 'unset'", async () => {
+    // A path that is not a repository: git exits 128, not 1. Treating that as "unset" is what let a
+    // failed probe install an overriding GIT_SSH_COMMAND.
+    await expect(readSshCommand(join(plainDir(), "no-such-dir"))).resolves.toMatchObject({ state: "unknown" });
+  });
+
+  it("carries ssh.variant alongside the command", async () => {
+    const d = repo();
+    execFileSync("git", ["-C", d, "config", "ssh.variant", "plink"]);
+
+    await expect(readSshCommand(d)).resolves.toMatchObject({ state: "unset", variant: "plink" });
+  });
+});
+
+describe("pushEnv — keepalives so a slow pre-push gate cannot outlast the server's idle timeout", () => {
+  it("sets keepalives when the operator has no GIT_SSH_COMMAND of their own", () => {
+    const env = pushEnv({ PATH: "/usr/bin" });
+
+    expect(env.GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+    expect(env.GIT_SSH_COMMAND).toMatch(/ServerAliveCountMax=30/);
+    // Carries the rest of the environment through — git still needs PATH, HOME, SSH_AUTH_SOCK.
+    expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("extends an operator's own GIT_SSH_COMMAND instead of discarding it", () => {
+    const mine = "ssh -i ~/.ssh/deploy_key -J bastion.example.com";
+
+    const got = pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND;
+    // The identity and the jump host BOTH survive — dropping either fails every push.
+    expect(got).toContain("-i ~/.ssh/deploy_key");
+    expect(got).toContain("-J bastion.example.com");
+    expect(got).toMatch(/ServerAliveInterval=30/);
+  });
+
+  /**
+   * PR #306 review (Codex P1). `GIT_SSH_COMMAND` OVERRIDES `core.sshCommand` — git's own docs say
+   * the config "is overridden when the environment variable is set" — so setting the variable on a
+   * repo that selects a deploy key or a jump host through config would silently drop it and fail
+   * every SSH push. The config is read at the call site and appended to here.
+   */
+  it("preserves a core.sshCommand by appending to it, never replacing it", () => {
+    const configured = "ssh -i /etc/deploy/id_ed25519 -o IdentitiesOnly=yes";
+
+    const got = pushEnv({ PATH: "/usr/bin" }, configured).GIT_SSH_COMMAND;
+    expect(got).toContain(configured);
+    expect(got).toMatch(/ServerAliveInterval=30/);
+  });
+
+  it("prefers GIT_SSH_COMMAND over core.sshCommand, matching git's own precedence", () => {
+    const got = pushEnv({ GIT_SSH_COMMAND: "ssh -i /from/env" }, "ssh -i /from/config").GIT_SSH_COMMAND;
+
+    expect(got).toContain("/from/env");
+    expect(got).not.toContain("/from/config");
+  });
+
+  it("leaves a bare GIT_SSH helper alone — it takes no extra arguments, and the variable would override it", () => {
+    // GIT_SSH names a BINARY, which is the whole reason GIT_SSH_COMMAND exists; plink and friends
+    // reject `-o` outright, and setting GIT_SSH_COMMAND at all would override the helper.
+    const env = pushEnv({ GIT_SSH: "/usr/bin/plink" });
+
+    expect(env.GIT_SSH_COMMAND).toBeUndefined();
+    expect(env.GIT_SSH).toBe("/usr/bin/plink");
+  });
+
+  it("leaves a non-ssh wrapper command alone rather than handing it OpenSSH flags", () => {
+    const wrapper = "/opt/corp/git-ssh-wrapper --profile ci";
+
+    expect(pushEnv({ GIT_SSH_COMMAND: wrapper }).GIT_SSH_COMMAND).toBe(wrapper);
+  });
+
+  it("defers to an operator who already set a keepalive interval of their own", () => {
+    const mine = "ssh -o ServerAliveInterval=5";
+
+    expect(pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND).toBe(mine);
+  });
+
+  /**
+   * PR #306 review. Appending would NOT have overridden their value — OpenSSH takes the first
+   * obtained value for a parameter, not the last (verified with `ssh -G`: `-o ServerAliveCountMax=3`
+   * followed by `-o ServerAliveCountMax=30` resolves to 3) — so this is about not writing options
+   * that provably do nothing, which would make the effective command misreport what is in force.
+   */
+  it("defers to an operator who set only ServerAliveCountMax, without an interval", () => {
+    const mine = "ssh -o ServerAliveCountMax=3";
+
+    expect(pushEnv({ GIT_SSH_COMMAND: mine }).GIT_SSH_COMMAND).toBe(mine);
+  });
+
+  it("defers to a keepalive set through core.sshCommand too, not just the environment", () => {
+    const configured = "ssh -o ServerAliveCountMax=3";
+
+    expect(pushEnv({ PATH: "/usr/bin" }, configured).GIT_SSH_COMMAND).toBeUndefined();
+  });
+
+  /**
+   * PR #306 review round 5. Git's `config --get` exits 1 for "no such key" and something else
+   * (128 not-a-repo, 129 bad usage, a timeout, a kill) when it could not answer. Collapsing the two
+   * let a wedged probe on a repo that DOES set `core.sshCommand` install a plain `GIT_SSH_COMMAND`,
+   * which overrides that config — dropping the deploy key or jump host the push needs, on exactly
+   * the slow machine where the probe timed out.
+   */
+  it("adds nothing when the probe could not determine whether core.sshCommand is set", () => {
+    const env = pushEnv({ PATH: "/usr/bin" }, { state: "unknown" });
+
+    expect(env.GIT_SSH_COMMAND).toBeUndefined();
+  });
+
+  it("still installs keepalives when the probe positively reports no core.sshCommand", () => {
+    const env = pushEnv({ PATH: "/usr/bin" }, { state: "unset" });
+
+    expect(env.GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+  });
+
+  /**
+   * Also round 5: git documents `GIT_SSH_VARIANT` / `ssh.variant` as overriding its basename
+   * detection, so an operator running plink through a binary that happens to be named `ssh` would
+   * pass the basename test and be handed `-o` flags their client may reject.
+   */
+  it.each([["GIT_SSH_VARIANT env"], ["ssh.variant config"]])("respects a plink variant named via %s", (which) => {
+    const env =
+      which === "GIT_SSH_VARIANT env"
+        ? pushEnv({ GIT_SSH_COMMAND: "ssh -batch", GIT_SSH_VARIANT: "plink" })
+        : pushEnv({ GIT_SSH_COMMAND: "ssh -batch" }, { state: "unset", variant: "putty" });
+
+    expect(env.GIT_SSH_COMMAND).toBe("ssh -batch");
+  });
+
+  it("still adds keepalives when the variant is explicitly ssh or auto", () => {
+    expect(pushEnv({ GIT_SSH_VARIANT: "ssh" }).GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+    expect(pushEnv({ GIT_SSH_VARIANT: "auto" }).GIT_SSH_COMMAND).toMatch(/ServerAliveInterval=30/);
+  });
+});
+
 // anton-1cjaw: the discriminator table measured on git 2.x/macOS via execFile — captured stderr and
 // `--porcelain` stdout fed straight to the classifier, no live push involved. The exit code alone
 // cannot separate transient from permanent, so every case here pins BOTH the code and the porcelain
@@ -4034,6 +4223,177 @@ describe("classifyPushFailure (captured stderr/porcelain, anton-1cjaw)", () => {
     expect(verdict.transient).toBe(false);
     expect(verdict.reason).toMatch(/pre-push hook/);
     expect(verdict.reason).toMatch(/husky - pre-push hook exited with code 1/);
+  });
+
+  // The real fati-uhya stderr, verbatim: the gate PASSED and printed so, then the push was lost
+  // because git had opened the SSH channel before pre-push ran and the server dropped it as idle.
+  // Read as a hook decline this is permanent, so seven consecutive runs died having paid the full
+  // ~11-minute gate. It is a transport fault, and the retry can actually succeed.
+  it("classifies a connection the remote hung up on as transient, not as the hook declining", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr:
+        "pre-push: ✅ tests passed for the changed side(s).\n" +
+        "Connection to github.com closed by remote host.\n" +
+        "fatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+    // Must not be blamed on the hook, whose own PASSING output sits in that same stderr.
+    expect(verdict.reason).not.toMatch(/hook declined/);
+    expect(verdict.reason).toMatch(/closed before the push transferred anything/);
+  });
+
+  /**
+   * PR #306 review (P2). A local hook running its own nested git/ssh can print the identical
+   * diagnostic, and the hook's stderr IS the push's stderr — reproduced against real git: a hook
+   * echoing `fatal: the remote end hung up unexpectedly` and exiting 1 yields exit 1, empty stdout,
+   * that text on stderr. Since the output cannot separate the two, the verdict bounds the cost of
+   * being wrong instead of claiming certainty: ONE retry, not the transport default's three, so a
+   * misread costs one extra pre-push gate rather than two.
+   */
+  it("bounds the transport drop to a single retry, since a failing hook can print the same text", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr: "fatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+    expect(verdict.retry?.maxAttempts).toBe(2);
+    // The reason must not assert a cause the evidence cannot establish — it names both readings.
+    expect(verdict.reason).toMatch(/pre-push hook running its own git\/ssh can print the same/);
+  });
+
+  /**
+   * The same hangup, reported as 128 instead of 1 (PR #306 review). Git exits 128 when the
+   * transport dies BEFORE the push begins — verified locally: a push to an unreachable SSH remote
+   * exits 128 with empty porcelain output — so matching the diagnostics only in the `code === 1`
+   * branch left an ordinary connection loss classified permanent and never retried.
+   */
+  it("classifies a pre-transfer SSH hangup reported as exit 128 as transient too", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr:
+        "Connection to github.com closed by remote host.\nfatal: the remote end hung up unexpectedly\n",
+    });
+
+    expect(verdict.transient).toBe(true);
+    expect(verdict.reason).toMatch(/transient transport failure/);
+    // Full transport budget, unlike the exit-1 case: git never reached the remote, and a pre-push
+    // decline is exit 1, so there is no hook-vs-transport ambiguity to bound here.
+    expect(verdict.retry).toBeUndefined();
+  });
+
+  /**
+   * The precedence the exit-128 hangup match depends on, pinned explicitly because it is now
+   * load-bearing (PR #306 review round 2). A local failure aborts the push mid-transport, so git
+   * prints its own `fatal: the remote end hung up unexpectedly` on top of the real reason — the
+   * local diagnostic is the specific evidence, the hangup is the generic consequence. This file's
+   * gpg test caught the inverted order; these pin the other two local causes the same way.
+   */
+  it.each([
+    ["a missing credential", "fatal: could not read Username for 'https://github.com': terminal prompts disabled"],
+    ["a stuck index.lock", "fatal: Unable to create '/repo/.git/index.lock': File exists."],
+  ])("keeps %s permanent even though git also reports the remote hanging up", (_label, localCause) => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: `${localCause}\nfatal: the remote end hung up unexpectedly\n`,
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/permanent local failure/);
+  });
+
+  it("still calls an unrecognized exit 128 permanent", () => {
+    const verdict = classifyPushFailure({
+      code: 128,
+      stdout: "",
+      stderr: "fatal: repository 'origin' does not exist\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+  });
+
+  /**
+   * PR #306 review, both reviewers. The transport check is scoped to the no-`Done` case, so a
+   * remote that ANSWERED and rejected is decided by its own per-ref verdict no matter what else
+   * lands in stderr — a server hanging up right after answering, or a verbose/jump-host ssh
+   * printing `client_loop: send disconnect` during teardown. Classified transient, these would burn
+   * three retries, each paying the full slow gate, on a push that can never succeed.
+   */
+  it("keeps a non-fast-forward rejection permanent even when stderr also shows the connection dropping", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "!\trefs/heads/main:refs/heads/main\t[rejected] (non-fast-forward)\nDone\n",
+      stderr: "client_loop: send disconnect: Broken pipe\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/non-fast-forward/);
+  });
+
+  /**
+   * The gap the `Done`-only gate left (PR #306 review round 4). Porcelain writes each ref's status
+   * as it learns it and `Done` only as a footer, so a transport dying in between leaves a PROVEN
+   * `!` rejection with no `Done` — which the earlier gate handed to the stderr heuristic and
+   * retried, spending another full pre-push gate on a rejection no retry can fix. The earlier
+   * regression tests all included `Done`, so none of them covered this.
+   */
+  it.each([
+    ["non-fast-forward", "[rejected] (non-fast-forward)", /non-fast-forward/],
+    ["remote hook", "[remote rejected] (pre-receive hook declined)", /pre-receive hook/],
+  ])("keeps a %s rejection permanent when the transport died before the Done footer", (_l, status, reason) => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      // The ref-status line landed; the connection dropped before `Done` could follow.
+      stdout: `!\trefs/heads/main:refs/heads/main\t${status}\n`,
+      stderr: "Connection to github.com closed by remote host.\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(reason);
+  });
+
+  it("keeps an unrecognized rejection permanent without a Done footer, rather than reading stderr", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      // `!` is "rejected or failed to push" whatever the reason text — the generic backstop.
+      stdout: "!\trefs/heads/main:refs/heads/main\t[remote rejected] (refusing to update hidden ref)\n",
+      stderr: "client_loop: send disconnect: Broken pipe\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/rejected the push/);
+  });
+
+  it("keeps a remote hook rejection permanent even when stderr also shows the connection dropping", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "!\trefs/heads/main:refs/heads/main\t[remote rejected] (pre-receive hook declined)\nDone\n",
+      stderr: "Connection to github.com closed by remote host.\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-receive hook/);
+  });
+
+  // The narrowness of SSH_CONNECTION_DROPPED is the point: a hook is free to print the word
+  // "connection" in a failure of its own, and that must stay permanent.
+  it("still calls a hook decline permanent when the hook's own output mentions a connection", () => {
+    const verdict = classifyPushFailure({
+      code: 1,
+      stdout: "",
+      stderr:
+        "pre-push: ❌ tests failed — a test could not reach the database connection\n" +
+        "husky - pre-push hook exited with code 1 (error)\n",
+    });
+
+    expect(verdict.transient).toBe(false);
+    expect(verdict.reason).toMatch(/pre-push hook/);
   });
 
   it("classifies a remote pre-receive decline as permanent — Done present, named as remote policy", () => {
@@ -4887,6 +5247,30 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
     const localHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     const remoteHead = execFileSync("git", ["-C", bare, "rev-parse", "main"], { encoding: "utf8" }).trim();
     expect(remoteHead).toBe(localHead);
+  });
+
+  /**
+   * PR #306 review round 2. Reading `core.sshCommand` put an `await` ahead of `gitPush`'s
+   * `signal?.aborted` check, so an already-cancelled push would wait out that subprocess — up to
+   * its full 5s on the wedged-git case the read was made async to tolerate — before noticing, and
+   * would spend a subprocess on a push that is not going to happen. The check belongs first, as it
+   * is everywhere else in this file.
+   */
+  it("rejects an already-aborted push without spawning anything", async () => {
+    const counter = join(sandbox, "push-attempts-pre-abort.log");
+    const binDir = shimGitFailingPushOnce(sandbox, counter);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    const controller = new AbortController();
+    const reason = new Error("cancelled before the push started");
+    controller.abort(reason);
+    try {
+      await expect(pushBranch(repo, "main", undefined, undefined, controller.signal)).rejects.toBe(reason);
+      // The shim never ran: no attempt was made, so not even the config read reached a subprocess.
+      expect(existsSync(counter)).toBe(false);
+    } finally {
+      process.env.PATH = prevPath;
+    }
   });
 
   it("aborts immediately during backoff instead of waiting out the 1s delay", async () => {
