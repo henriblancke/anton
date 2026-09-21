@@ -10,9 +10,11 @@
  * contract (claude reads the earlier, stronger framing first, and the composed text re-states
  * that these layers refine — never relax — the base).
  */
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { stripFrontmatter } from "./agent-prompt";
+import { STAMP_LENGTH } from "./skill-stamp.mjs";
 
 /** The locked base prompt file, relative to anton's repo root (process.cwd()). */
 export const BASE_SYSTEM_PROMPT_PATH = "src/prompts/system-base.md";
@@ -82,6 +84,30 @@ export function composeSystemPrompt(layers: SystemPromptLayers): string {
 
   // Blank line between sections keeps the layers visually distinct in the session log / arg.
   return sections.join("\n\n");
+}
+
+/**
+ * 12-hex content digest of a COMPOSED system prompt (anton-tw37r) — the text an invocation actually
+ * ran with, base plus agent plus seed, after {@link composeSystemPrompt} has assembled it.
+ *
+ * Composed rather than per-file because behaviour is the whole prompt, never one layer of it. Two
+ * runs whose `system-base.md` is byte-identical still ran different instructions when one carried a
+ * specialist and the other didn't, or when the project edited its seed between them — digesting the
+ * base file alone would pool those under one key and report a prompt change as noise in the cohort.
+ * The seed in particular is edited in place, so by the time anyone asks whether an edit helped, the
+ * text that ran is gone; this is the only record of it.
+ *
+ * Input is the composed string's exact UTF-8 bytes, hashed with the same algorithm and truncated to
+ * the same {@link STAMP_LENGTH} as every other stamp anton takes — one convention, so two stamps are
+ * never told apart by their shape. Nothing is normalized away: a seed edited from LF to CRLF is
+ * different text delivered to claude, and the ledger's job is to say so rather than to judge which
+ * differences matter.
+ *
+ * Pure: no filesystem, no clock, no cwd. The per-ticket USER prompt is deliberately NOT digested —
+ * it is unique per bead, so its digest is a cohort of one.
+ */
+export function systemPromptDigest(composed: string): string {
+  return createHash("sha256").update(composed, "utf8").digest("hex").slice(0, STAMP_LENGTH);
 }
 
 /**
