@@ -9,7 +9,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -1615,10 +1615,18 @@ export async function createWorktree(opts: {
  * re-derives one against a base that may have moved again — risking the very resurrected-commit bug
  * the pin exists to prevent. Such a caller materializes with `warm: false`, persists once the
  * checkout settles, then calls this directly.
+ *
+ * @param warm the project's own warming decision (anton-z5li2) — see {@link resolveWarmCommand}'s
+ *   precedence ladder. Optional: a caller with no project in hand (createWorktree's inline
+ *   `warm: true`) falls through to the env/lockfile rungs exactly as before.
  */
-export async function warmWorktreeBestEffort(wt: Worktree, signal?: AbortSignal): Promise<void> {
+export async function warmWorktreeBestEffort(
+  wt: Worktree,
+  signal?: AbortSignal,
+  warm?: WarmConfig,
+): Promise<void> {
   try {
-    await warmWorktree(wt, signal);
+    await warmWorktree(wt, signal, warm);
   } catch (err) {
     console.warn(
       `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
@@ -1751,23 +1759,26 @@ export interface WarmCommand {
 }
 
 /**
- * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
- * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
- * install already newer than the lockfile (a resumed run reusing its worktree), or no package
- * manager on the search path. Exported as the single testable seam — the shell-out itself is a
- * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
- * real toolchain.
+ * A project's warming decision, narrowed to what {@link resolveWarmCommand} needs. Declared here
+ * rather than alongside the settings it comes from so the git layer owns its own seam and takes no
+ * dependency on the settings module; `resolveWarmConfig` in ../project-settings builds one.
  */
+export interface WarmConfig {
+  /** The operator's pinned setup command, or undefined to fall through to env/lockfile detection. */
+  command?: string;
+  /** False only when the operator explicitly turned warming off; absent stays ON. */
+  enabled: boolean;
+}
+
 /** The `off` spellings {@link WARM_ENV} recognizes. */
 function warmDisabledByEnv(env: Record<string, string | undefined>): boolean {
   const off = env[WARM_ENV]?.trim().toLowerCase();
   return off === "0" || off === "off" || off === "false" || off === "no";
 }
 
-/** An operator- or test-pinned warm command, overriding detection entirely. */
-function pinnedWarmCommand(env: Record<string, string | undefined>): WarmCommand | undefined {
-  const pinned = env[WARM_COMMAND_ENV]?.trim();
-  return pinned ? { file: "sh", args: ["-c", pinned], label: pinned } : undefined;
+/** A pinned command runs through a shell, so an operator can write a pipeline or an `&&` chain. */
+function shellWarmCommand(command: string): WarmCommand {
+  return { file: "sh", args: ["-c", command], label: command };
 }
 
 /** The lockfile-matched install `worktreePath` still needs, or undefined when none applies. */
@@ -1799,24 +1810,41 @@ function resolveInstallCommand(
   return { file, args: [...install.args], label: `${install.bin} ${install.args.join(" ")}` };
 }
 
-/** The checks that short-circuit before any lockfile detection: off, pinned, or running under vitest. */
-function warmOverride(env: Record<string, string | undefined>): { command: WarmCommand | null } | undefined {
-  if (warmDisabledByEnv(env)) return { command: null };
-  const pinned = pinnedWarmCommand(env);
-  if (pinned) return { command: pinned };
-  // Structural guard, mirroring the claude driver: never shell out to a real package manager under
-  // vitest. A test that wants the warm path pins WARM_COMMAND_ENV at a fake above.
-  if (env.VITEST) return { command: null };
-  return undefined;
-}
-
+/**
+ * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
+ * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
+ * install already newer than the lockfile (a resumed run reusing its worktree), or no package
+ * manager on the search path. Exported as the single testable seam — the shell-out itself is a
+ * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
+ * real toolchain.
+ *
+ * ── THE PRECEDENCE LADDER (anton-z5li2), highest rung first ──
+ * 1. `ANTON_WARM_WORKTREE` off  → null. Machine-wide opt-out, above every project setting: it is
+ *                                 set on a machine that cannot install at all, which no per-project
+ *                                 command can fix.
+ * 2. `warm.enabled === false`   → null. The project's own opt-out.
+ * 3. `warm.command`             → that command, through a shell. The operator's pinned setup.
+ * 4. `ANTON_WARM_COMMAND`       → that command, through a shell. The machine-wide pin, kept as the
+ *                                 fallback below the project's — and how tests inject a fake.
+ * 5. `VITEST`                   → null. Structural guard, mirroring the claude driver: no unit test
+ *                                 may reach a real package manager. Deliberately BELOW both pins,
+ *                                 so a test that wants the warm path pins a fake at rung 3 or 4.
+ * 6. lockfile table             → the frozen install {@link INSTALL_BY_LOCKFILE} matches, else null.
+ *
+ * `warm` is last and optional so every caller that has no project config — and there is one until
+ * anton-743gk threads it in — keeps behaving exactly as it did before rungs 2 and 3 existed.
+ */
 export function resolveWarmCommand(
   worktreePath: string,
   env: Record<string, string | undefined> = process.env,
   isExec: (p: string) => boolean = isExecutableFile,
+  warm?: WarmConfig,
 ): WarmCommand | null {
-  const override = warmOverride(env);
-  if (override) return override.command;
+  if (warmDisabledByEnv(env)) return null;
+  if (warm?.enabled === false) return null;
+  const pinned = warm?.command?.trim() || env[WARM_COMMAND_ENV]?.trim();
+  if (pinned) return shellWarmCommand(pinned);
+  if (env.VITEST) return null;
   const install = detectedInstall(worktreePath);
   return install ? (resolveInstallCommand(install, worktreePath, env, isExec) ?? null) : null;
 }
@@ -1828,19 +1856,57 @@ export function resolveWarmCommand(
 const WARM_STAMP = ".anton-warm";
 
 /**
- * True unless a COMPLETED install is on record newer than the lockfile. The stamp, not `node_modules`
- * itself, is the witness: an install killed partway (OOM, SIGKILL, dropped network) has already
- * written into `node_modules`, so its mtime is newer than the lockfile and a directory-mtime check
- * would call the half-populated tree current — surfacing later as `Cannot find module` inside a
- * supposedly pre-warmed worktree, with no further warming attempt.
+ * Bump whenever what the stamp vouches for changes, so an already-written stamp from before the
+ * change stops being trusted. Bumped past its unversioned origin (anton-db82f/anton-ph94g): a
+ * `NODE_ENV=production`-launched anton used to warm every worktree with devDependencies skipped, so
+ * a stamp written by that install vouches for a tree that is missing them even though the lockfile
+ * hasn't changed since — {@link installNeeded} must not treat that stamp as current.
+ */
+const WARM_STAMP_VERSION = 2;
+
+/**
+ * True unless a COMPLETED, current-version install is on record newer than the lockfile. The stamp,
+ * not `node_modules` itself, is the witness: an install killed partway (OOM, SIGKILL, dropped
+ * network) has already written into `node_modules`, so its mtime is newer than the lockfile and a
+ * directory-mtime check would call the half-populated tree current — surfacing later as `Cannot find
+ * module` inside a supposedly pre-warmed worktree, with no further warming attempt. A stamp from an
+ * older {@link WARM_STAMP_VERSION} is treated the same as no stamp at all (see above).
  */
 function installNeeded(worktreePath: string, lockfile: string): boolean {
   try {
-    const warmed = statSync(join(worktreePath, "node_modules", WARM_STAMP)).mtimeMs;
+    const stampPath = join(worktreePath, "node_modules", WARM_STAMP);
+    const stamp = readFileSync(stampPath, "utf8");
+    if (!stamp.startsWith(`${WARM_STAMP_VERSION}\n`)) return true;
+    const warmed = statSync(stampPath).mtimeMs;
     return warmed < statSync(join(worktreePath, lockfile)).mtimeMs;
   } catch {
     return true; // no stamp (fresh worktree, partial install, pre-stamp worktree) → install
   }
+}
+
+/**
+ * The environment the install runs under. `NODE_ENV` is dropped rather than inherited: `anton start`
+ * launches the daemon with `NODE_ENV=production` (bin/anton.mjs), and every package manager reads
+ * that as "skip devDependencies" — so a production-launched anton warmed each worktree into a tree
+ * missing vitest, typescript and the rest, and the run's first verify gate failed on modules the
+ * lockfile does list. Unset lets each manager apply its own default (install everything).
+ *
+ * @param parent the environment to derive from; injectable so the rule can be tested without
+ *   mutating the real process env.
+ */
+export function warmChildEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: Record<string, string | undefined> = {
+    ...parent,
+    // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
+    // package manager was resolved against, not the daemon's minimal one.
+    PATH: [parent.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter),
+  };
+  // Dropped rather than set to a value: there is no "install everything" spelling every manager
+  // agrees on, and an absent NODE_ENV is exactly what a developer's own shell hands `bun install`.
+  delete env.NODE_ENV;
+  // Next augments ProcessEnv with a REQUIRED, readonly NODE_ENV (its own TODO calls that wrong), so
+  // the type cannot express the env this function exists to build. Asserted once, here.
+  return env as NodeJS.ProcessEnv;
 }
 
 /**
@@ -1854,8 +1920,8 @@ function installNeeded(worktreePath: string, lockfile: string): boolean {
  * required, and an install anton can't complete (private registry, no network) must not be able to
  * lose an otherwise-good run.
  */
-async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
-  const cmd = resolveWarmCommand(wt.path);
+async function warmWorktree(wt: Worktree, signal?: AbortSignal, warm?: WarmConfig): Promise<void> {
+  const cmd = resolveWarmCommand(wt.path, process.env, isExecutableFile, warm);
   if (!cmd) return;
 
   try {
@@ -1863,9 +1929,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
       cwd: wt.path,
       timeout: WARM_TIMEOUT_MS,
       maxBuffer: 16 * 1024 * 1024,
-      // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
-      // package manager was resolved against, not the daemon's minimal one.
-      env: { ...process.env, PATH: [process.env.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter) },
+      env: warmChildEnv(),
       // An operator's kill must not be stuck behind a 10-minute install; aborting degrades into the
       // logged, non-fatal path below, exactly like a registry timeout.
       signal,
@@ -1888,7 +1952,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
  */
 async function stampWarmed(worktreePath: string, label: string): Promise<void> {
   try {
-    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${label}\n`);
+    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${WARM_STAMP_VERSION}\n${label}\n`);
   } catch {
     // no node_modules / read-only tree → next warm re-runs the install
   }

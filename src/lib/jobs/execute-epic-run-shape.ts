@@ -31,7 +31,7 @@ export { assertSelfCheckoutFresh } from "./execute-epic-freshness";
 /** Step 0d. Cook, floor-check and pin the pipeline this run walks, then split it into its phases. */
 export async function resolveRunPipeline(
   run: EpicRun,
-): Promise<{ ticketSteps: ResolvedStep[]; runSteps: ResolvedStep[] }> {
+): Promise<{ ticketSteps: ResolvedStep[]; runSteps: ResolvedStep[]; formulaDigest: string }> {
   const { db, clock, projectId, repo, runId, branch, targetId: epicBeadId, settings, existing, target } = run;
   // 0d. Validate the project's run pipeline (anton-hrql). The formula is what a run walks, so a
   //     broken one must fail at the START of a run rather than halfway through: cook it and
@@ -85,7 +85,10 @@ export async function resolveRunPipeline(
   // ONE AT A TIME — they share one worktree and one PR, so a formula whose steps could run
   // concurrently is not a licence to fan out.
   const { ticketSteps, runSteps } = splitFormulaPhases(formula);
-  return { ticketSteps, runSteps };
+  // The digest of what this run WALKS, carried down to the ledger beside the steps (anton-jpmdw).
+  // `formula.recorded` above says which file; only this says what was in it, and the file is
+  // editable underneath two runs that both name it.
+  return { ticketSteps, runSteps, formulaDigest: formula.digest };
 }
 
 /** The board-facing half of the lease: re-confirm the selection once the lease can be SEEN. */

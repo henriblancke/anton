@@ -64,7 +64,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { delimiter, join, relative } from "node:path";
+import { extraBinDirs } from "../bin";
 import {
   acquireWorktreeClaim,
   branchExists,
@@ -1672,6 +1673,27 @@ suite("worktree manager (real git)", () => {
     }
   });
 
+  // `anton start` launches the daemon with NODE_ENV=production, and every package manager reads that
+  // as "skip devDependencies" — so the warm left a tree missing vitest and the run's first verify gate
+  // failed on modules the lockfile does list. The install child must inherit the augmented PATH but
+  // not that NODE_ENV. Pinned rather than detected, so nothing shells out to a real package manager.
+  it("runs the install with no production NODE_ENV, keeping the augmented PATH", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env[WARM_COMMAND_ENV] =
+      'mkdir -p node_modules && printf %s "${NODE_ENV-<unset>}" > node_modules/.node-env && ' +
+      'printf %s "$PATH" > node_modules/.path';
+    try {
+      const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-node-env", warm: true });
+
+      expect(readFileSync(join(wt.path, "node_modules", ".node-env"), "utf8")).toBe("<unset>");
+      const childPath = readFileSync(join(wt.path, "node_modules", ".path"), "utf8").split(delimiter);
+      for (const dir of extraBinDirs()) expect(childPath).toContain(dir);
+    } finally {
+      delete process.env[WARM_COMMAND_ENV];
+      vi.unstubAllEnvs();
+    }
+  });
+
   // Warming is an accelerator, not a gate: an install anton can't complete must not lose the run.
   // The half-written node_modules it leaves behind must NOT be stamped — that's what stops the next
   // run from mistaking a partial install for a warm one.
@@ -2466,7 +2488,7 @@ describe("resolveWarmCommand", () => {
   /** A worktree whose deps carry a completion stamp, as a finished install leaves behind. */
   function stamped(dir: string): string {
     mkdirSync(join(dir, "node_modules"));
-    writeFileSync(join(dir, "node_modules", ".anton-warm"), "bun install --frozen-lockfile\n");
+    writeFileSync(join(dir, "node_modules", ".anton-warm"), "2\nbun install --frozen-lockfile\n");
     return dir;
   }
 
@@ -2498,6 +2520,19 @@ describe("resolveWarmCommand", () => {
     expect(resolveWarmCommand(dir, env, isExec)?.file).toBe(`${BIN}/bun`);
   });
 
+  // anton-ph94g/anton-db82f: a stamp written before NODE_ENV was dropped from the install env may
+  // vouch for a production-only install missing devDependencies. Such a resumed worktree must
+  // reinstall even though its (unversioned) stamp is newer than the lockfile.
+  it("installs again when the completed install predates the stamp's version bump", () => {
+    const dir = fixture({ "bun.lock": "{}" });
+    mkdirSync(join(dir, "node_modules"));
+    writeFileSync(join(dir, "node_modules", ".anton-warm"), "bun install --frozen-lockfile\n");
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "bun.lock"), old, old);
+
+    expect(resolveWarmCommand(dir, env, isExec)?.file).toBe(`${BIN}/bun`);
+  });
+
   // Structural guard: unit tests must stay deterministic and never shell out to a real installer.
   it("never detects an install under vitest", () => {
     expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), { ...env, VITEST: "true" }, isExec)).toBeNull();
@@ -2517,6 +2552,75 @@ describe("resolveWarmCommand", () => {
     const off = { ...env, [WARM_ENV]: "off", [WARM_COMMAND_ENV]: "echo hi" };
 
     expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), off, isExec)).toBeNull();
+  });
+
+  /**
+   * The precedence ladder (anton-z5li2), one case per rung. Each pins exactly the rungs under test
+   * and leaves a bun.lock present, so a rung that failed to short-circuit would fall through to a
+   * visibly different answer rather than silently agreeing.
+   */
+  describe("the project warm config", () => {
+    const pinnedEnv = { ...env, [WARM_COMMAND_ENV]: "echo env" };
+
+    it("beats ANTON_WARM_COMMAND with its own command", () => {
+      const warm = { command: "make setup", enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinnedEnv, isExec, warm)).toEqual({
+        file: "sh",
+        args: ["-c", "make setup"],
+        label: "make setup",
+      });
+    });
+
+    it("falls through to ANTON_WARM_COMMAND when its command is cleared", () => {
+      const warm = { command: undefined, enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinnedEnv, isExec, warm)).toEqual({
+        file: "sh",
+        args: ["-c", "echo env"],
+        label: "echo env",
+      });
+    });
+
+    // Clearing the setting is a fall-through, never a skip — so with neither pin set, detection runs.
+    it("falls through to the lockfile table with neither its command nor the env var", () => {
+      const warm = { command: undefined, enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), env, isExec, warm)).toMatchObject({
+        file: `${BIN}/bun`,
+        args: ["install", "--frozen-lockfile"],
+      });
+    });
+
+    it("skips the warm entirely when the project turned it off", () => {
+      const warm = { command: "make setup", enabled: false };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), pinnedEnv, isExec, warm)).toBeNull();
+    });
+
+    // The machine-wide opt-out is set on a box that cannot install at all, which no project command fixes.
+    it("loses to the machine-wide opt-out even with a command set", () => {
+      const off = { ...env, [WARM_ENV]: "0" };
+      const warm = { command: "make setup", enabled: true };
+
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), off, isExec, warm)).toBeNull();
+    });
+
+    // Rungs 2 and 3 sit above the guard by design; everything below it must still short-circuit.
+    it("still short-circuits under vitest when it pins no command", () => {
+      const underTest = { ...env, VITEST: "true" };
+
+      expect(
+        resolveWarmCommand(fixture({ "bun.lock": "{}" }), underTest, isExec, { enabled: true }),
+      ).toBeNull();
+    });
+
+    // anton-743gk threads the config in; until then every caller passes none and must be unchanged.
+    it("is optional: omitting it leaves detection exactly as it was", () => {
+      expect(resolveWarmCommand(fixture({ "bun.lock": "{}" }), env, isExec)).toMatchObject({
+        file: `${BIN}/bun`,
+      });
+    });
   });
 
   it("warns and skips when the package manager isn't on the search path", () => {

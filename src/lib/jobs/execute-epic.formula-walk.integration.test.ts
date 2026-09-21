@@ -23,6 +23,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { beads } from "../beads/bd";
+import { selfBuildVersion } from "../build/drift";
 import * as schema from "../db/schema";
 import { getJob, park, resumeJob } from "./queue";
 import { resetOperatorCache } from "../operator";
@@ -182,6 +183,52 @@ process.exit(0);`),
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }
+  });
+
+  /**
+   * The attribution stamps over a REAL walk (anton-234ja). The unit suites prove each stamp resolves;
+   * this proves they survive the whole path a run actually takes — including the resume-aware ticket
+   * driver, which meters its own attempts and so never passes through `dispatchClaude`'s meter.
+   */
+  it("stamps every invocation of a real run with what produced it", async () => {
+    // A project formula whose implement step is named by its AUTHOR, not by its handler — the case
+    // `step_handler` exists for: `step` records `code-ticket`, and only the handler classifies.
+    writeProjectFormula(
+      step("code-ticket", "implement") +
+        "\n" +
+        step("commit", "commit", "code-ticket") +
+        "\n" +
+        step("pr", "pr", "commit"),
+    );
+    const { id: epicId } = await approvedEpic("Stamped pipeline");
+
+    const jobId = await driveEpicRun(runnerFor(), { projectId, epicBeadId: epicId });
+    expect((await getJob(tdb.db, jobId))?.status).toBe("done");
+
+    // Scoped to THIS run's target: the ledger is a fact table, so `resetPerCaseState` deliberately
+    // does not truncate it between cases — an unscoped read here would count earlier cases' rows.
+    const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epicId)!;
+    const rows = (await tdb.db.select().from(schema.claudeInvocations)).filter(
+      (r) => r.runId === run.id,
+    );
+    // Two tickets, one dispatching step each.
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.step).toBe("code-ticket");
+      // The handler the phase fold reads — the author's id above would match no phase predicate.
+      expect(row.stepHandler).toBe("implement");
+      // The pipeline's CONTENT, not the path `runs.formula` records: this project's own formula is
+      // a different pipeline from the bundled default, and only the digest says so.
+      expect(row.formulaDigest).toMatch(/^[0-9a-f]{12}$/);
+      // The composed system prompt these agents actually ran with, and the anton that ran them.
+      expect(row.promptDigest).toMatch(/^[0-9a-f]{12}$/);
+      expect(row.antonVersion).toBe(selfBuildVersion());
+    }
+    // One run, one pipeline: a formula edited mid-run would be the only way these could differ.
+    expect(new Set(rows.map((r) => r.formulaDigest)).size).toBe(1);
+    // And the digest is of the PROJECT's formula, not anton's default — the run recorded a path of
+    // its own, so a digest matching the bundled default's would mean the stamp tracked the wrong file.
+    expect(run.formula).not.toBe(BUNDLED_FORMULA_SOURCE);
   });
 
   it("reorders the run when the project reorders the formula — verify AFTER the commit, no code change", async () => {

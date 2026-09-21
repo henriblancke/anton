@@ -5,7 +5,7 @@
  * the same for all of them: EVERY invocation gets a row. Unknown usage is recorded as unknown, and
  * nothing about the field's condition may drop the row or fail the run that produced it.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ClaudeResult } from "./claude/driver";
 import { createStreamState } from "./claude/driver-events";
 import { toClaudeResult } from "./claude/driver-exit";
@@ -17,7 +17,14 @@ import {
   spendBreakdowns,
   metered,
   recordInvocation,
+  stampOf,
 } from "./claude-invocations";
+// Imported as namespaces so the stamp resolvers can be forced to throw — the regression that proves
+// a broken digest costs no delivery. The named bindings beside them are what the assertions read.
+import * as driftModule from "./build/drift";
+import * as promptModule from "./claude/system-prompt";
+import { selfBuildVersion } from "./build/drift";
+import { systemPromptDigest } from "./claude/system-prompt";
 import { makeProjectDb, type TestProjectDb } from "./testing/project";
 import type { Clock } from "./jobs/queue";
 
@@ -301,6 +308,191 @@ describe("metered", () => {
         modelRequested: DIMENSIONS.modelRequested,
       },
     ]);
+    tdb.close();
+  });
+});
+
+/**
+ * The attribution stamps (anton-z33ia) — what produced the invocation, recorded because none of it
+ * is reconstructible later: the composed prompt is gone the moment a layer is edited, the formula's
+ * path says nothing about the pipeline it names, and a skill resolves differently per repo.
+ *
+ * Two rules carry this suite, and the second is the load-bearing one: a caller that passes NOTHING
+ * still gets the version stamp, and a resolver that THROWS costs its stamp and nothing else —
+ * neither the row nor the run that produced it.
+ */
+describe("the attribution stamps", () => {
+  const stamps = {
+    promptDigest: "a3f19c2e77b1",
+    formulaDigest: "9c2e4410ab77",
+    antonVersion: "0.5.1 (25ec011)",
+    stepHandler: "implement",
+    agentTag: "nextjs",
+    skillId: "review",
+    skillDigest: "77b1a3f19c2e",
+    promptId: undefined,
+  };
+
+  it("persists every stamp it is handed", () => {
+    const [row] = invocationRows({ ...DIMENSIONS, ...stamps }, result({ modelUsage: USAGE.slice(0, 1) }));
+
+    expect(row).toMatchObject({
+      promptDigest: "a3f19c2e77b1",
+      formulaDigest: "9c2e4410ab77",
+      antonVersion: "0.5.1 (25ec011)",
+      stepHandler: "implement",
+      agentTag: "nextjs",
+      skillId: "review",
+      skillDigest: "77b1a3f19c2e",
+    });
+    // NULL, never a placeholder: `loadStepReasoning` resolves prompt XOR skill, so a skill-backed
+    // step genuinely has no prompt id — and a reader must be able to tell that from "not recorded".
+    expect(row.promptId).toBeNull();
+  });
+
+  it("records a NULL for every stamp nothing resolved, rather than dropping the row", () => {
+    const [row] = invocationRows(DIMENSIONS, result({ modelUsage: [] }));
+
+    expect(row).toMatchObject({
+      promptDigest: null,
+      formulaDigest: null,
+      antonVersion: null,
+      stepHandler: null,
+      agentTag: null,
+      skillId: null,
+      skillDigest: null,
+      promptId: null,
+      // The invocation itself is still the fact the table exists to hold.
+      beadId: "anton-77l9",
+      outcome: "ok",
+    });
+  });
+
+  it("stamps every row of a multi-model invocation, not just the requested model's", () => {
+    const rows = invocationRows({ ...DIMENSIONS, ...stamps }, result({ modelUsage: USAGE }));
+
+    // The sidecar is the same invocation, so it carries the same attribution: a fold grouping by
+    // prompt digest must not silently drop half an invocation's tokens.
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.promptDigest)).toEqual(["a3f19c2e77b1", "a3f19c2e77b1"]);
+  });
+
+  /** A call site passing NO stamps still records which anton produced the row. */
+  it("resolves the anton version inside the wrapper, so no call site has to remember it", async () => {
+    const tdb = makeProjectDb();
+    const driver = metered(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      async () => result({ modelUsage: USAGE.slice(0, 1) }),
+    );
+
+    await driver({ cwd: "/tmp/wt", prompt: "work", routing });
+
+    const [row] = await listInvocations(tdb.db, tdb.projectId);
+    expect(row.antonVersion).toBe(selfBuildVersion());
+    // The suite runs in a real checkout, so there IS a version to name — a stamp that silently
+    // resolved to null here would make every assertion above vacuous.
+    expect(row.antonVersion).toEqual(expect.stringContaining("."));
+    tdb.close();
+  });
+
+  it("digests the composed prompt the invocation is actually SPAWNED with", async () => {
+    const tdb = makeProjectDb();
+    const composed = "# operating contract\n\nthe base, an agent layer, and the operator's seed";
+    const driver = metered(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      async () => result({ modelUsage: USAGE.slice(0, 1) }),
+    );
+
+    await driver({ cwd: "/tmp/wt", prompt: "work", appendSystemPrompt: composed, routing });
+
+    const [row] = await listInvocations(tdb.db, tdb.projectId);
+    // Taken from the spawn options rather than asked of the caller — which is what stamps the sites
+    // no shared dispatch covers: self-review, PR-fix, and every resumed ticket attempt.
+    expect(row.promptDigest).toBe(systemPromptDigest(composed));
+    tdb.close();
+  });
+
+  it("records no prompt digest for an invocation that ran with no composed prompt", async () => {
+    const tdb = makeProjectDb();
+    const driver = metered(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId },
+      async () => result({ modelUsage: USAGE.slice(0, 1) }),
+    );
+
+    // The overhead passes (product-master, scan-triage) dispatch with no system prompt at all.
+    await driver({ cwd: "/tmp/wt", prompt: "work", routing });
+
+    const [row] = await listInvocations(tdb.db, tdb.projectId);
+    // Null, not the digest of an empty string: nothing composed a prompt, so nothing is claimed.
+    expect(row.promptDigest).toBeNull();
+    tdb.close();
+  });
+
+  it("prefers the caller's own stamps over anything the wrapper would resolve", async () => {
+    const tdb = makeProjectDb();
+    const driver = metered(
+      tdb.db,
+      clock,
+      { ...DIMENSIONS, projectId: tdb.projectId, antonVersion: "0.4.0 (deadbee)", promptDigest: "ffffffffffff" },
+      async () => result({ modelUsage: USAGE.slice(0, 1) }),
+    );
+
+    await driver({ cwd: "/tmp/wt", prompt: "work", appendSystemPrompt: "some other text", routing });
+
+    const [row] = await listInvocations(tdb.db, tdb.projectId);
+    // A caller that resolved a stamp where the resolution HAPPENED is more authoritative than a
+    // second resolution here, which could answer differently from the one that actually ran.
+    expect(row.antonVersion).toBe("0.4.0 (deadbee)");
+    expect(row.promptDigest).toBe("ffffffffffff");
+    tdb.close();
+  });
+});
+
+/**
+ * The regression this feature stands or falls on: attribution is a DIMENSION, never a precondition.
+ * Every stamp is resolved from something mutable — a prompt file, a formula, a git checkout — so a
+ * resolver failing is ordinary. It must cost that one stamp: not the row, and not the delivery.
+ */
+describe("a resolver that throws", () => {
+  it("costs its own stamp and nothing else", () => {
+    expect(
+      stampOf(() => {
+        throw new Error("the checkout is gone");
+      }),
+    ).toBeUndefined();
+    // A resolver that simply cannot answer is not an error, and reads the same way.
+    expect(stampOf(() => undefined)).toBeUndefined();
+    expect(stampOf(() => "a3f19c2e77b1")).toBe("a3f19c2e77b1");
+  });
+
+  it.each([
+    ["the version resolver", () => vi.spyOn(driftModule, "selfBuildVersion")],
+    ["the prompt digester", () => vi.spyOn(promptModule, "systemPromptDigest")],
+  ])("lets the run complete and the row land when %s throws", async (_label, spyOn) => {
+    const tdb = makeProjectDb();
+    const spy = spyOn().mockImplementation(() => {
+      throw new Error("resolver is broken");
+    });
+    const reply = result({ modelUsage: USAGE.slice(0, 1), text: "ANTON-RESULT: delivered" });
+    const driver = metered(tdb.db, clock, { ...DIMENSIONS, projectId: tdb.projectId }, async () => reply);
+
+    // The delivery survives the broken resolver, which is the whole point.
+    await expect(
+      driver({ cwd: "/tmp/wt", prompt: "work", appendSystemPrompt: "the contract", routing }),
+    ).resolves.toBe(reply);
+
+    const [row] = await listInvocations(tdb.db, tdb.projectId);
+    // And so does the row: the invocation happened, and losing that fact is worse than a null stamp.
+    expect(row.beadId).toBe("anton-77l9");
+    expect(row.inputTokens).toBe(438);
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
     tdb.close();
   });
 });

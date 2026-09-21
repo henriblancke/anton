@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "0c25507c-09d6-4144-8d0c-82ab1efce4e7",
-  "prevId": "609d572a-465d-4d0e-9b90-25853974d7e2",
+  "id": "1db3f8d5-6d2a-44e6-9c05-3d8247ef99f9",
+  "prevId": "8d37296b-a1d4-4c99-bfe9-994546e5f7c2",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -451,6 +451,13 @@
         },
         "prompt_id": {
           "name": "prompt_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "prompt_body_digest": {
+          "name": "prompt_body_digest",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -1667,6 +1674,13 @@
         },
         "error": {
           "name": "error",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "structural_error": {
+          "name": "structural_error",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

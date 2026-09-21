@@ -1,0 +1,1 @@
+ALTER TABLE `claude_invocations` ADD `prompt_body_digest` text;

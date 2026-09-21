@@ -13,6 +13,7 @@ import { and } from "drizzle-orm";
 import { describeBd, makeBdRepo, saveEnv, withOperator, type BdRepo } from "@/lib/testing/integration";
 import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { beads, LABELS } from "../beads/bd";
+import { selfBuildVersion } from "../build/drift";
 import * as schema from "../db/schema";
 import { getJob, type Clock } from "./queue";
 
@@ -260,6 +261,29 @@ process.exit(0);`,
     expect(ghLog).toContain("resolve");
     expect(ghLog).toContain("comment");
     expect(ghLog).toContain("rerequest");
+
+    // The PR-fix phase lands a STAMPED ledger row (anton-234ja). This is the second of the two sites
+    // PR #311 found the original plan would have missed — the job meters its own driver and never
+    // reaches `dispatchClaude` — so the stamps are asserted end-to-end here, on what a real fix wrote.
+    const ledger = await tdb.db.select().from(schema.claudeInvocations);
+    expect(ledger).toHaveLength(1);
+    expect(ledger[0]).toMatchObject({
+      beadId: epicId,
+      step: "review-fix",
+      // What the phase fold reads: this whole job IS the pr-fix phase.
+      stepHandler: "review-fix",
+    });
+    // Digested from the system prompt this fix actually ran with — the one asserted above to carry
+    // the operating contract. Recorded because that text is gone the moment a layer is edited.
+    expect(ledger[0].promptDigest).toMatch(/^[0-9a-f]{12}$/);
+    // That's the EXECUTION contract (agent + seed), not the review-fix REASONING contract itself —
+    // that text rides in the user prompt asserted above ("review feedback"/"Reporting format"),
+    // which `metered` never sees. No `reviewFixPrompt` override is configured, so the shipped
+    // `review-fix` skill ran, and its own identity is what names it (PR #313 review).
+    expect(ledger[0]).toMatchObject({ skillId: "review-fix", promptBodyDigest: null });
+    expect(ledger[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
+    // Resolved inside the meter from process state, so the job passes no version and still records one.
+    expect(ledger[0].antonVersion).toBe(selfBuildVersion());
 
     // A review-fix session was recorded + finished.
     const sessions = await tdb.db.select().from(schema.sessions);

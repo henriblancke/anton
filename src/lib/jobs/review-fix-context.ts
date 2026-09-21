@@ -11,7 +11,9 @@
 import { type Bead } from "../beads/bd";
 import { loadAgentPrompt } from "../claude/agent-prompt";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
-import { loadSkill } from "../claude/prompt";
+import { bundledSkillDigest, loadSkill } from "../claude/prompt";
+import { textDigest } from "../claude/skill-stamp.mjs";
+import type { ReasoningAttribution } from "../claude-invocations";
 import { threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
 import { type ProjectSettings } from "../projects";
 
@@ -33,6 +35,12 @@ export function labelValue(labels: string[] | undefined, prefix: string): string
  * default) reasoning contract, then the concrete PR context anton fetched — plus the layered
  * execution system prompt so the fix obeys the operating contract. Returns both so the caller
  * passes them straight to runClaude.
+ *
+ * `attribution` carries this resolution's {@link ReasoningAttribution} for the ledger (PR #313
+ * review): `appendSystemPrompt` here is the EXECUTION contract (agent + seed), which `metered`
+ * digests unaided — this text, the review-fix REASONING contract, rides in `prompt` beside the PR's
+ * own context instead, so an edited `reviewFixPrompt` or a rewritten `review-fix` skill needs its
+ * own stamp or it pools silently into the same cohort as before the edit.
  */
 export async function buildReviewFixPrompt(args: {
   epic: Bead;
@@ -42,7 +50,7 @@ export async function buildReviewFixPrompt(args: {
   settings: ProjectSettings;
   /** The worktree the fix runs in (for resolving a project-local agent prompt). */
   projectDir: string;
-}): Promise<{ prompt: string; appendSystemPrompt: string }> {
+}): Promise<{ prompt: string; appendSystemPrompt: string; attribution: ReasoningAttribution }> {
   const { epic, pr, reasons, conflicts, settings, projectDir } = args;
 
   // Compose the same layered system prompt used for execution (base + agent + seed). Use the
@@ -55,10 +63,14 @@ export async function buildReviewFixPrompt(args: {
 
   // The editable reasoning contract (per-project override, else the shipped default) followed by
   // the concrete PR context anton fetched.
-  const reasoning = settings.reviewFixPrompt?.trim() || (await loadSkill("review-fix"));
+  const override = settings.reviewFixPrompt?.trim();
+  const reasoning = override || (await loadSkill("review-fix"));
+  const attribution: ReasoningAttribution = override
+    ? { promptBodyDigest: textDigest(override) }
+    : { skillId: "review-fix", skillDigest: bundledSkillDigest("review-fix") };
   const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, reasons, conflicts)].join("\n");
 
-  return { prompt, appendSystemPrompt };
+  return { prompt, appendSystemPrompt, attribution };
 }
 
 /**

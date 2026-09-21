@@ -90,6 +90,10 @@ export interface EditableSettings {
   lintCommand?: string;
   typecheckCommand?: string;
   buildCommand?: string;
+  /** The pinned worktree-warm command (anton-z5li2); absent = the env var, then lockfile detection. */
+  warmCommand?: string;
+  /** Whether this project's worktrees are warmed at all (anton-z5li2); absent = ON. */
+  warmEnabled?: boolean;
   /** Per-label pipeline variants (anton-aa3m), in precedence order — first matching label wins. */
   formulaVariants?: FormulaVariant[];
   /** The model routing table (anton-uu7r), in evaluation order — first match wins, `model` is the

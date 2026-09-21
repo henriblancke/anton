@@ -20,6 +20,7 @@ import {
   type JobHandler,
   type RunnerConfig,
 } from "./runner";
+import { FRESH_CHECKOUT } from "@/lib/testing/jobs";
 import { insertProject } from "@/lib/testing/project";
 
 /** Fixed start-of-test wall clock, so every suite reads its deadlines off the same epoch. */
@@ -85,7 +86,17 @@ export function useRunnerHarness(): RunnerHarness {
   afterEach(() => tdb.close());
 
   const makeRunner = ({ handlers, config, ...deps }: MakeRunnerOptions): JobRunner => {
-    const r = new JobRunner({ db: tdb.db, clock, config: { ...CONFIG, ...config }, ...deps });
+    // A fresh process by default (anton-kqst): the dispatch staleness gate's real reader fetches a
+    // git remote and judges the checkout the tests themselves run in, so every case here would
+    // otherwise depend on the developer's tree being current. A case about the gate injects its own
+    // `readSelfCheckoutRefusal`, which `deps` spreads over this.
+    const r = new JobRunner({
+      db: tdb.db,
+      clock,
+      config: { ...CONFIG, ...config },
+      readSelfCheckoutRefusal: FRESH_CHECKOUT,
+      ...deps,
+    });
     for (const [type, handler] of Object.entries(handlers)) {
       if (handler) r.registerHandler(type as JobType, handler);
     }

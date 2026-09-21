@@ -14,6 +14,7 @@ import { JobRunner } from "./runner";
 import { systemClock } from "./queue";
 import { beads } from "../beads/bd";
 import { describeBd, makeBdRepo } from "@/lib/testing/integration";
+import { FRESH_CHECKOUT } from "@/lib/testing/jobs";
 import { insertProject } from "@/lib/testing/project";
 
 let bdRepo: ReturnType<typeof makeBdRepo>;
@@ -26,6 +27,9 @@ function machine(store: TestDb): JobRunner {
   return new JobRunner({
     db: store.db,
     clock: systemClock,
+    // A fresh process: this suite is about cross-machine lease dedupe, not the staleness gate, and
+    // the real reader would judge the anton checkout the test itself runs in (anton-kqst).
+    readSelfCheckoutRefusal: FRESH_CHECKOUT,
     liveRunCheck: async (_projectId, epicBeadId) =>
       beads.isRunLive(await beads.show(repo, epicBeadId), Date.now()),
   });

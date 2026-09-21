@@ -901,6 +901,54 @@ export const claudeInvocations = sqliteTable(
      * to the risk of a credential landing in one.
      */
     endpointHost: text("endpoint_host"),
+    /**
+     * 12-hex digest of the COMPOSED system prompt (base + agent + seed) this invocation ran with.
+     * The prompt is the behavior of every producer, and it is edited in place — by the time anyone
+     * asks whether a prompt change helped, the text that ran is gone. Recorded, never derived.
+     */
+    promptDigest: text("prompt_digest"),
+    /**
+     * 12-hex content digest of the COOKED formula. `runs.formula` is a path, and a path says
+     * nothing about a pipeline edited between two runs that both point at it.
+     */
+    formulaDigest: text("formula_digest"),
+    /**
+     * The anton release + git revision that ran it. Separates "my prompt improved" from "I upgraded
+     * anton" — two explanations for the same cohort shift that are indistinguishable without it.
+     */
+    antonVersion: text("anton_version"),
+    /**
+     * The resolved `stepName(step)` — the HANDLER, not the author's step id already in `step`. A
+     * project formula names its steps freely, so the id matches no phase predicate, and the id →
+     * handler mapping is itself editable: the classification cannot be reconstructed later.
+     */
+    stepHandler: text("step_handler"),
+    /**
+     * The `agent:<tag>` the TICKET resolved to, null when it named none. Duplicates `runs.agent_tag`
+     * deliberately: that one is per-RUN, while `agent:` is a per-ticket label, so a run whose three
+     * tickets used three specialists records one of them and loses the mix.
+     */
+    agentTag: text("agent_tag"),
+    /**
+     * The `skill:<id>` a `step:claude` resolved, and the digest of the text it resolved TO. A skill
+     * resolves project-local-first and is edited in place, so the same id is different text in
+     * another repo and different text in this one next week — the id alone would pool two cohorts
+     * that ran different instructions.
+     */
+    skillId: text("skill_id"),
+    skillDigest: text("skill_digest"),
+    /**
+     * The `prompt:<id>` a `step:claude` resolved — the sibling of `skill_id`, and mutually exclusive
+     * with it by construction, since `loadStepReasoning` dispatches exactly one.
+     */
+    promptId: text("prompt_id"),
+    /**
+     * The digest of the resolved PROMPT body that ran — the sibling of `skill_digest`. `prompt_id`
+     * resolves project-local-first and is edited in place, so the id alone would pool two cohorts
+     * that ran different text under one key. Distinct from `prompt_digest` above, which digests the
+     * composed SYSTEM prompt rather than this step's own instruction text.
+     */
+    promptBodyDigest: text("prompt_body_digest"),
     inputTokens: integer("input_tokens"),
     outputTokens: integer("output_tokens"),
     thinkingTokens: integer("thinking_tokens"),

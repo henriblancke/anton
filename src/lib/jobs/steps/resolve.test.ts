@@ -5,7 +5,7 @@
  * These drive `resolveStepIn` against a STUB registry, which is what makes the rules testable apart
  * from anton's own built-ins — the registry suite covers the built-ins themselves.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,7 @@ import type { CookedStep } from "../../beads/bd";
 import { isPoisonError } from "../errors";
 import type { StepContext } from "./context";
 import type { StepDefinition } from "./result";
+import * as stamp from "../../claude/skill-stamp.mjs";
 import { loadStepReasoning, resolveStepIn, stepName, STEP_LABEL_PREFIX } from "./resolve";
 
 const FORMULA = ".beads/formulas/anton-run.formula.toml";
@@ -45,7 +46,10 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "anton-steps-resolve-"));
 });
 
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.restoreAllMocks();
+  rmSync(dir, { recursive: true, force: true });
+});
 
 describe("stepName", () => {
   it("reads the handler name off the step's labels", () => {
@@ -91,20 +95,81 @@ describe("loadStepReasoning", () => {
   const ctx = (labels: string[]): StepContext =>
     ({ worktreePath: dir, step: cooked("custom", labels) }) as StepContext;
 
-  it("reads a project prompt named by prompt:<id>", async () => {
+  /** Write a project-local skill and return its resolved reasoning. */
+  const projectSkill = async (id: string, body: string) => {
+    mkdirSync(join(dir, ".claude", "skills", id), { recursive: true });
+    writeFileSync(join(dir, ".claude", "skills", id, "SKILL.md"), body);
+    return loadStepReasoning(ctx(["step:claude", `skill:${id}`]), "custom");
+  };
+
+  it("reads a project prompt named by prompt:<id>, and names it as what resolved", async () => {
     mkdirSync(join(dir, ".claude", "agents"), { recursive: true });
     writeFileSync(join(dir, ".claude", "agents", "audit.md"), "---\nname: audit\n---\nAudit it.");
 
-    expect(await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom")).toBe("Audit it.");
+    const resolved = await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom");
+    // A prompt carries no SKILL digest: the pair is mutually exclusive, so `skillId` must stay absent.
+    expect(resolved).toMatchObject({ text: "Audit it.", promptId: "audit" });
+    expect(resolved.skillId).toBeUndefined();
+    // But it IS versioned by its own content, exactly like a skill (PR #313 review) — an edit to the
+    // agent file that ran must move the stamp, or "did the prompt edit help" is unanswerable.
+    expect(resolved.promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
   });
 
-  it("reads a project skill named by skill:<id>", async () => {
-    mkdirSync(join(dir, ".claude", "skills", "smoke"), { recursive: true });
-    writeFileSync(join(dir, ".claude", "skills", "smoke", "SKILL.md"), "Run the smoke checks.");
+  // The same `prompt:<id>` is different TEXT after an edit — an id alone would pool two cohorts that
+  // ran different instructions under one key.
+  it("moves the prompt digest when the prompt that runs is edited", async () => {
+    mkdirSync(join(dir, ".claude", "agents"), { recursive: true });
+    writeFileSync(join(dir, ".claude", "agents", "audit.md"), "Audit it.");
+    const before = await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom");
 
-    expect(await loadStepReasoning(ctx(["step:claude", "skill:smoke"]), "custom")).toBe(
-      "Run the smoke checks.",
+    writeFileSync(join(dir, ".claude", "agents", "audit.md"), "Audit it twice.");
+    const after = await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom");
+
+    expect(after.promptBodyDigest).not.toBe(before.promptBodyDigest);
+  });
+
+  it("reads a project skill named by skill:<id>, and names it with the version that ran", async () => {
+    const resolved = await projectSkill("smoke", "Run the smoke checks.");
+
+    expect(resolved).toMatchObject({ text: "Run the smoke checks.", skillId: "smoke" });
+    expect(resolved.promptId).toBeUndefined();
+    expect(resolved.skillDigest).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // The same `skill:<id>` is different TEXT in another repo, and different text here after an edit
+  // — an id alone would pool two cohorts that ran different instructions under one key.
+  it("digests a project-local skill apart from the bundled one of the same name", async () => {
+    const local = await projectSkill("review", "Review it our way.");
+    const bundled = await loadStepReasoning(
+      { worktreePath: join(dir, "empty"), step: cooked("custom", ["step:claude", "skill:review"]) } as StepContext,
+      "custom",
     );
+
+    expect(local.skillId).toBe(bundled.skillId);
+    expect(local.text).not.toBe(bundled.text);
+    expect(local.skillDigest).not.toBe(bundled.skillDigest);
+    expect(bundled.skillDigest).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // An edit to the copy that runs must move the stamp, or "did the reviewer skill edit help" is
+  // unanswerable: both cohorts would carry the same key.
+  it("moves the digest when the skill that runs is edited", async () => {
+    const before = await projectSkill("smoke", "Run the smoke checks.");
+    const after = await projectSkill("smoke", "Run the smoke checks twice.");
+
+    expect(after.skillDigest).not.toBe(before.skillDigest);
+  });
+
+  // The digest is a ledger dimension, and recording never fails a run: a directory that cannot be
+  // hashed costs the cohort key, never the dispatch that was about to run from text in hand.
+  it("still dispatches when the skill's digest cannot be taken", async () => {
+    const resolved = await projectSkill("smoke", "Run the smoke checks.");
+    vi.spyOn(stamp, "skillDigest").mockImplementation(() => {
+      throw new Error("unreadable");
+    });
+
+    const degraded = await loadStepReasoning(ctx(["step:claude", "skill:smoke"]), "custom");
+    expect(degraded).toEqual({ text: resolved.text, skillId: "smoke", skillDigest: undefined });
   });
 
   // An agent dispatched with no instruction would burn a session and report whatever it invented.

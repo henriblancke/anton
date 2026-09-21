@@ -116,10 +116,9 @@ Reviewable, not aspirational. A feature under this ADR is incomplete without:
   and no other);
 - or an explicit `## Out of scope` note saying none of the above applies, and why.
 
-The `/shape` skill **should** surface this ADR when shaping work that spends tokens, so the
-instrumentation tickets are written onto the board with the feature rather than remembered
-afterwards. **Not yet wired** — `skills/shape/SKILL.md` has no mention of this ADR today. Tracked
-as `anton-67p0t`; until it lands, the enforcement above rests on review alone.
+The `/shape` skill surfaces this ADR when shaping work that spends tokens (Phase 4,
+`skills/shape/SKILL.md`), so the instrumentation obligation is written onto the board with the
+feature — as a ticket, or as an explicit `## Out of scope` line — rather than remembered afterwards.
 
 ## Alternatives considered
 

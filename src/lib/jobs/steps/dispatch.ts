@@ -5,7 +5,7 @@
  * `ANTON-RESULT` parsing are the SAME wherever an agent runs — a step that grew its own dispatch
  * would quietly drop one of the three.
  */
-import { metered } from "../../claude-invocations";
+import { metered, type InvocationDimensions } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { quotaMeterKey } from "../../quota-meter";
@@ -62,6 +62,16 @@ export async function dispatchClaude(
      * the same, via `REVIEW_SETTING_SOURCES`).
      */
     settingSources?: Array<"user" | "project" | "local">;
+    /**
+     * What this dispatch resolved to run FROM — the ticket's `agent:<tag>`, or the `prompt:`/`skill:`
+     * a `step:claude` named, with the skill's content digest. Passed from the caller that already
+     * resolved it (`steps/agent.ts`) rather than re-resolved here: a second resolution could answer
+     * differently from the one that actually ran, which is worse than not recording it at all.
+     */
+    attribution?: Pick<
+      InvocationDimensions,
+      "agentTag" | "promptId" | "promptBodyDigest" | "skillId" | "skillDigest"
+    >;
   },
 ): Promise<StepResult> {
   // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
@@ -73,10 +83,26 @@ export async function dispatchClaude(
     jobType: ctx.ctx.type,
     jobId: ctx.ctx.jobId,
     step: ctx.step?.id ?? "claude",
+    // The step's resolved HANDLER beside the author's id (anton-234ja). A project formula names its
+    // implement step `code-ticket` if it likes, so the id classifies nothing — and the id → handler
+    // mapping is itself editable, which is why the classification is recorded and not derived later.
+    stepHandler: ctx.step ? stepName(ctx.step) : "claude",
     runId: ctx.runId,
     beadId: args.beadId,
     modelRequested: ctx.settings.model,
+    // The prompt digest is NOT passed here: `metered` takes it from the composed text on the spawn
+    // options, which is the same string this dispatch hands the driver — and doing it there covers
+    // the resume-aware ticket driver below, which bypasses this meter entirely.
+    formulaDigest: ctx.formulaDigest,
+    ...args.attribution,
   };
+  if (ctx.deps?.recordsEachAttempt) {
+    // The per-attempt meter the ticket walk built around `ctx.deps.runClaude` closed over its
+    // dimensions before THIS dispatch resolved what to attribute them to (PR #313 review) — hand
+    // the resolution to the setter it left for exactly this, so the driver already wrapped around
+    // it stamps the same agentTag/promptId/skillId its own meter would have.
+    ctx.deps.setAttribution?.(args.attribution ?? {});
+  }
   const claude = ctx.deps?.recordsEachAttempt
     ? (ctx.deps.runClaude ?? runClaude)
     : metered(ctx.db, ctx.clock, dimensions, ctx.deps?.runClaude ?? runClaude);

@@ -12,8 +12,10 @@
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
 import { type Bead } from "../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
-import { loadSkill } from "../claude/prompt";
+import { bundledSkillDigest, loadSkill } from "../claude/prompt";
+import { textDigest } from "../claude/skill-stamp.mjs";
 import { buildExecutionSystemPrompt } from "../claude/system-prompt";
+import type { ReasoningAttribution } from "../claude-invocations";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
@@ -178,22 +180,41 @@ export interface InstructionFile {
  * same reason the full prompt is: a project-local `.claude/agents/<id>.md` IS the reasoning contract,
  * so resolving it from the worktree would let a run's own diff pick the standard it is graded
  * against.
+ *
+ * `attribution` carries this resolution's {@link ReasoningAttribution} for the ledger (PR #313
+ * review): this text rides in `options.prompt`, not `appendSystemPrompt`, so `metered` cannot digest
+ * it on its own — the caller must stamp it explicitly, or an edited reviewer agent / operator prompt
+ * / the shipped `review` skill pools silently into the same cohort as before the edit.
  */
 export async function resolveReviewerContract(
   settings: ProjectSettings,
   projectDir: string,
   baseRev: string,
-): Promise<{ reasoning: string; reviewer: ReviewerSource }> {
+): Promise<{ reasoning: string; reviewer: ReviewerSource; attribution: ReasoningAttribution }> {
   const config = resolveReviewConfig(settings);
   if (config.agent) {
     const reasoning = await loadTrustedAgentPrompt(config.agent, projectDir, baseRev);
-    if (reasoning) return { reasoning, reviewer: { kind: "agent", id: config.agent } };
+    if (reasoning) {
+      return {
+        reasoning,
+        reviewer: { kind: "agent", id: config.agent },
+        attribution: { promptBodyDigest: textDigest(reasoning) },
+      };
+    }
   }
   const operatorPrompt = config.prompt?.trim();
   if (operatorPrompt) {
-    return { reasoning: operatorPrompt, reviewer: { kind: "prompt" } };
+    return {
+      reasoning: operatorPrompt,
+      reviewer: { kind: "prompt" },
+      attribution: { promptBodyDigest: textDigest(operatorPrompt) },
+    };
   }
-  return { reasoning: await loadSkill("review"), reviewer: { kind: "default" } };
+  return {
+    reasoning: await loadSkill("review"),
+    reviewer: { kind: "default" },
+    attribution: { skillId: "review", skillDigest: bundledSkillDigest("review") },
+  };
 }
 
 /**
@@ -231,9 +252,21 @@ export async function buildReviewPrompt(args: {
   verified?: VerifyGateOutcome[];
   /** Gates ran but their results were discarded — they wrote to the tree. See {@link ReviewRun}. */
   gatesDiscarded?: boolean;
+  /**
+   * The reviewer contract already resolved for this gate — pass through the exact
+   * `resolveReviewerContract` result the caller stamped its ledger meter with, rather than letting
+   * this call resolve its own. `settings`/`projectDir`/`baseRev` are fixed for a whole gate, but
+   * `resolveReviewerContract` still reads live sources (a project-local agent prompt, the operator's
+   * saved review prompt, anton's own bundled `review` skill) that can change between the moment the
+   * gate stamped its meter and a later round's call here — an edited reviewer would then read a
+   * prompt the ledger never recorded producing it. Omit only when no gate-level contract exists yet
+   * (tests, or any other caller that wants a fresh resolution).
+   */
+  reviewerContract?: { reasoning: string; reviewer: ReviewerSource; attribution: ReasoningAttribution };
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
   const { target, tickets, diff, settings, projectDir, baseRev } = args;
-  const { reasoning, reviewer } = await resolveReviewerContract(settings, projectDir, baseRev);
+  const { reasoning, reviewer } =
+    args.reviewerContract ?? (await resolveReviewerContract(settings, projectDir, baseRev));
 
   // Both rulebooks, always: principles don't supersede the instruction files, they sit beside them.
   // A project can state a standing rule in either, and the caveat below tells the reviewer that only
