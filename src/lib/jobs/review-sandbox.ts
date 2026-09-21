@@ -83,22 +83,31 @@ export function assertReviewSandboxSupported(platform: NodeJS.Platform = process
  * writes go to the admin dir under the common dir, which is denied anyway.
  *
  * `repoPath` — the LIVE board's checkout ({@link import("./steps/context").StepContext.repoPath}) —
- * is denied too when a board-only run hands one over (PR #284 review, "protect the live board from
- * review-session writes"): `boardEvidenceSection` (review-context.ts) teaches the reviewer the exact
- * `bd -C <repoPath> show <id>` syntax and path so it can check confirmed board evidence, and the
- * reviewer keeps general Bash (only `Bash(git:*)` is a denied TOOL) — a stray `bd -C <repoPath>
- * update ...` in place of `show` would mutate the canonical board directly, invisible to
- * `enforceReadOnly`, which only snapshots THIS worktree's git state, never `repoPath`. This closes
- * the filesystem-backed case (a local or file-based Dolt checkout); a shared-server Dolt board
- * writes over a connection string rather than local files, so this sandbox rule cannot reach that
- * case — a residual gap `boardEvidenceSection`'s own review thread already flags for follow-up.
+ * has its `.beads` (the local Dolt checkout `bd` reads/writes) denied too when a board-only run
+ * hands one over (PR #284 review, "protect the live board from review-session writes"):
+ * `boardEvidenceSection` (review-context.ts) teaches the reviewer the exact `bd -C <repoPath> show
+ * <id>` syntax and path so it can check confirmed board evidence, and the reviewer keeps general
+ * Bash (only `Bash(git:*)` is a denied TOOL) — a stray `bd -C <repoPath> update ...` in place of
+ * `show` would mutate the canonical board directly, invisible to `enforceReadOnly`, which only
+ * snapshots THIS worktree's git state, never `repoPath`. Denying only `.beads` rather than the whole
+ * `repoPath` matters when `ANTON_WORKTREES_ROOT` is configured inside the project repo (a supported
+ * override existing integration fixtures use): there `repoPath` is an ancestor of `worktreePath`,
+ * and denying the whole ancestor would make the entire review worktree read-only, breaking the
+ * project checks' own caches/coverage writes under the sandbox's normal cwd allowance. `.beads`
+ * itself is never an ancestor of a worktree, so it stays denied without that collateral blast
+ * radius. This closes the filesystem-backed case (a local or file-based Dolt checkout); a
+ * shared-server Dolt board writes over a connection string rather than local files, so this sandbox
+ * rule cannot reach that case — a residual gap `boardEvidenceSection`'s own review thread already
+ * flags for follow-up.
  */
 export function reviewSandboxDenyWrite(
   worktreePath: string,
   gitCommonDir: string,
   repoPath?: string,
 ): string[] {
-  return [...new Set([gitCommonDir, join(worktreePath, ".git"), ...(repoPath ? [repoPath] : [])])];
+  return [
+    ...new Set([gitCommonDir, join(worktreePath, ".git"), ...(repoPath ? [join(repoPath, ".beads")] : [])]),
+  ];
 }
 
 /** The review session's `sandbox` block — what the driver hands Claude Code on `--settings`. */
