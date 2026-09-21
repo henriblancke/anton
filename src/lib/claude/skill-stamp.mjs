@@ -111,21 +111,34 @@ export function withoutStamp(md) {
 }
 
 /**
- * Content digest of a whole skill DIRECTORY — SKILL.md plus every bundled asset (setup's
- * `templates/`), so a template edit bumps the stamp exactly like a prose edit. Path names are part
- * of the input, so adding or renaming a file changes the digest too.
+ * Content digest of a skill directory's files, given as `[relativePath, bytes]` pairs rather than
+ * read from disk — the shared hashing core {@link skillDigest} and a caller reading the same shape
+ * from elsewhere (a git revision, for one — anton-z33ia review) both reduce to this, so two sources
+ * of the same content are guaranteed to land on the same digest rather than two hand-rolled hashes
+ * that could quietly drift apart.
+ *
+ * `SKILL.md`'s own declared stamp is stripped before hashing (see {@link withoutStamp}) — the stamp
+ * digests the file that carries it, so it has to be excluded from its own input. Every other path is
+ * hashed as-is. Path names are part of the input, so adding or renaming a file changes the digest.
  */
-export function skillDigest(dir) {
+export function digestFiles(entries) {
   const h = createHash("sha256");
-  for (const rel of listFiles(dir)) {
+  for (const [rel, raw] of entries) {
     if (IGNORED_FILES.has(basename(rel))) continue;
-    const raw = readFileSync(join(dir, rel));
     h.update(rel);
     h.update("\0");
     h.update(rel === "SKILL.md" ? Buffer.from(withoutStamp(raw.toString("utf8")), "utf8") : raw);
     h.update("\0");
   }
   return h.digest("hex").slice(0, STAMP_LENGTH);
+}
+
+/**
+ * Content digest of a whole skill DIRECTORY on disk — SKILL.md plus every bundled asset (setup's
+ * `templates/`), so a template edit bumps the stamp exactly like a prose edit.
+ */
+export function skillDigest(dir) {
+  return digestFiles(listFiles(dir).map((rel) => [rel, readFileSync(join(dir, rel))]));
 }
 
 /**

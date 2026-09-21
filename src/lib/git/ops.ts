@@ -1163,6 +1163,36 @@ export async function listDirBlobsAtRev(
 }
 
 /**
+ * Every FILE under `dir` at `rev`, recursively, as paths relative to `dir` — the at-rev sibling of
+ * {@link listFiles} in skill-stamp.mjs, which walks the same shape off disk. Exists so a directory
+ * digest (a `skill:<id>` step's content stamp) can be taken from a COMMITTED tree rather than the
+ * working copy, the same reason {@link readFileAtRev} exists: a run's own diff must not be able to
+ * pick the instruction it is judged or described against.
+ *
+ * `-r` recurses through subtrees itself, so this covers a skill's nested assets (`templates/…`), not
+ * just its top-level files — matching {@link listFiles}'s own recursive walk.
+ *
+ * FAILS CLOSED like {@link listDirBlobsAtRev}: empty output means `dir` has no files at `rev`, never
+ * that the read failed. Anything that rejects propagates rather than reading as "no files".
+ */
+export async function listFilesAtRev(worktreePath: string, rev: string, dir: string): Promise<string[]> {
+  const prefix = `${dir.replace(/\/+$/, "")}/`;
+  // `:(literal)`, same reason as {@link listDirBlobsAtRev}: `dir` can be operator-supplied.
+  const out = await git(worktreePath, ["ls-tree", "-r", "-z", rev, "--", `:(literal)${prefix}`]);
+  if (!out) return [];
+  return out
+    .split("\0")
+    .map((line) => {
+      const tab = line.indexOf("\t");
+      if (tab < 0) return undefined;
+      const path = line.slice(tab + 1);
+      return line.slice(0, tab).split(" ")[1] === "blob" ? path.slice(prefix.length) : undefined;
+    })
+    .filter((path): path is string => path !== undefined)
+    .sort();
+}
+
+/**
  * The commit a branch forked from `base`, pinned as a SHA — or `base` itself when it names nothing
  * this repo can resolve, which is what the callers diffed against before and never a failure.
  *

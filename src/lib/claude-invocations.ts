@@ -126,11 +126,16 @@ export interface InvocationDimensions {
  * to what it actually ran under — a rewritten skill or a changed operator prompt pools silently into
  * the same cohort as before.
  *
- * A skill id/digest pair identifies a NAMED, versioned source (mirrors `StepReasoning`); a bare
- * `promptBodyDigest` covers free-form operator text with no id of its own. The two are mutually
- * exclusive by construction — a resolver returns one or the other, never both.
+ * A skill id/digest pair, or a prompt id/digest pair, identifies a NAMED, versioned source (mirrors
+ * `StepReasoning`); a bare `promptBodyDigest` with no `promptId` covers free-form operator text with
+ * no id of its own (`step:describe`'s `describePrompt` setting, `resolveReviewerContract`'s operator
+ * prompt). `promptId`/`skillId` are mutually exclusive by construction — a resolver returns one
+ * named source or the other, never both — and either may be absent, which is the free-form case.
  */
-export type ReasoningAttribution = Pick<InvocationDimensions, "promptBodyDigest" | "skillId" | "skillDigest">;
+export type ReasoningAttribution = Pick<
+  InvocationDimensions,
+  "promptId" | "promptBodyDigest" | "skillId" | "skillDigest"
+>;
 
 /**
  * A base URL → its host, or undefined when there is none or it does not parse. Deliberately lossy:

@@ -20,12 +20,13 @@ import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../../claude
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import { runClaude } from "../../claude/driver";
 import { bundledSkillDigest, loadSkill } from "../../claude/prompt";
-import { textDigest } from "../../claude/skill-stamp.mjs";
+import { digestFiles, textDigest } from "../../claude/skill-stamp.mjs";
 import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
 import type { ReasoningAttribution } from "../../claude-invocations";
 import { isForbiddenByte } from "../../control-bytes";
 import {
   diffAgainstBase,
+  listFilesAtRev,
   readFileAtRev,
   readWorktreeState,
   resolveMergeBase,
@@ -263,6 +264,12 @@ async function dispatchAndCapture(
  * `dispatchClaude`'s own meter cannot digest it — the caller must stamp it explicitly, or every
  * describer invocation pools into one cohort regardless of which `prompt:`/`skill:`/`describePrompt`
  * contract actually ran.
+ *
+ * The `prompt:<id>` and `skill:<id>` branches stamp a NAMED, versioned source — `promptId`/`skillId`
+ * paired with a digest, mirroring `StepReasoning` (resolve.ts) — so an attribution query can tell
+ * which named producer ran, not just that "some prompt" did. `describePrompt` (the project setting)
+ * names nothing: it is free-form operator text with no id of its own, so it stays digest-only, same
+ * as `resolveReviewerContract`'s `operatorPrompt` branch.
  */
 async function resolveDescribeContract(
   ctx: StepContext,
@@ -271,12 +278,12 @@ async function resolveDescribeContract(
   const promptId = labelValueOf(ctx.step?.labels, "prompt");
   if (promptId) {
     const body = await loadBaseAgentPrompt(ctx.worktreePath, baseRev, promptId);
-    if (body) return { reasoning: body, attribution: { promptBodyDigest: textDigest(body) } };
+    if (body) return { reasoning: body, attribution: { promptId, promptBodyDigest: textDigest(body) } };
   }
   const skillId = labelValueOf(ctx.step?.labels, "skill");
   if (skillId) {
-    const body = await loadBaseProjectSkill(ctx.worktreePath, baseRev, skillId);
-    if (body) return { reasoning: body, attribution: { skillId, skillDigest: textDigest(body) } };
+    const skill = await loadBaseProjectSkill(ctx.worktreePath, baseRev, skillId);
+    if (skill) return { reasoning: skill.text, attribution: { skillId, skillDigest: skill.digest } };
   }
   const projectPrompt = resolveDescribeConfig(ctx.settings).prompt;
   if (projectPrompt) {
@@ -304,15 +311,55 @@ async function loadBaseAgentPrompt(
   return (await loadAgentPrompt(tag))?.trim() || undefined; // no projectDir: skips the worktree's own copy
 }
 
-/** A `skill:<id>` read as of `baseRev`: the project's own skill at the base commit, else anton's bundled one. */
+/**
+ * A `skill:<id>` read as of `baseRev`: the project's own skill at the base commit, else anton's
+ * bundled one — same precedence as `loadProjectSkill` in resolve.ts, the `step:claude` sibling this
+ * mirrors.
+ *
+ * `digest` uses the SAME directory-digest semantics every other skill attribution does
+ * ({@link skillDigestAtRev} for the project-local source, `bundledSkillDigest` for the fallback —
+ * both reduce to `digestFiles`, the shared core `skillDigest` itself reduces to) rather than hashing
+ * only the returned `SKILL.md` body: two rows for the same skill VERSION must land on the same
+ * digest regardless of which handler ran it, and a change to a bundled asset (`templates/…`) the
+ * skill instructs Claude to read must move the digest even though `SKILL.md`'s own bytes didn't
+ * change (PR #313 review).
+ */
 async function loadBaseProjectSkill(
   worktreePath: string,
   baseRev: string,
   id: string,
-): Promise<string | undefined> {
-  const raw = await readFileAtRev(worktreePath, baseRev, `.claude/skills/${id}/SKILL.md`).catch(() => undefined);
-  if (raw !== undefined) return stripFrontmatter(raw).trim() || undefined;
-  return (await loadSkill(id).catch(() => undefined))?.trim() || undefined;
+): Promise<{ text: string; digest: string | undefined } | undefined> {
+  const dir = `.claude/skills/${id}`;
+  const raw = await readFileAtRev(worktreePath, baseRev, `${dir}/SKILL.md`).catch(() => undefined);
+  if (raw !== undefined) {
+    const text = stripFrontmatter(raw).trim();
+    if (text) return { text, digest: await skillDigestAtRev(worktreePath, baseRev, dir) };
+  }
+  const bundled = (await loadSkill(id).catch(() => undefined))?.trim();
+  return bundled ? { text: bundled, digest: bundledSkillDigest(id) } : undefined;
+}
+
+/**
+ * {@link skillDigest}'s own algorithm (`digestFiles`), fed from a COMMITTED tree instead of disk —
+ * the at-rev sibling `listFilesAtRev`/`readFileAtRev` exist for. Swallowed to `undefined` on any
+ * failure, like `digestOf` in resolve.ts: the digest is a ledger dimension, and losing it costs only
+ * the cohort key, never the narrative this step is already committed to producing from the text in
+ * hand.
+ */
+async function skillDigestAtRev(worktreePath: string, rev: string, dir: string): Promise<string | undefined> {
+  try {
+    const files = await listFilesAtRev(worktreePath, rev, dir);
+    const entries = await Promise.all(
+      files.map(async (rel) => {
+        const raw = await readFileAtRev(worktreePath, rev, `${dir}/${rel}`);
+        return raw === undefined ? undefined : ([rel, Buffer.from(raw, "utf8")] as const);
+      }),
+    );
+    if (entries.some((e) => e === undefined)) return undefined;
+    return digestFiles(entries as Array<readonly [string, Buffer]>);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Cap on each narrative field — generous for PR-body prose, bounded against a runaway response. */
