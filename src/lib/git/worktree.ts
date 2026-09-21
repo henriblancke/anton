@@ -1615,10 +1615,18 @@ export async function createWorktree(opts: {
  * re-derives one against a base that may have moved again — risking the very resurrected-commit bug
  * the pin exists to prevent. Such a caller materializes with `warm: false`, persists once the
  * checkout settles, then calls this directly.
+ *
+ * @param warm the project's own warming decision (anton-z5li2) — see {@link resolveWarmCommand}'s
+ *   precedence ladder. Optional: a caller with no project in hand (createWorktree's inline
+ *   `warm: true`) falls through to the env/lockfile rungs exactly as before.
  */
-export async function warmWorktreeBestEffort(wt: Worktree, signal?: AbortSignal): Promise<void> {
+export async function warmWorktreeBestEffort(
+  wt: Worktree,
+  signal?: AbortSignal,
+  warm?: WarmConfig,
+): Promise<void> {
   try {
-    await warmWorktree(wt, signal);
+    await warmWorktree(wt, signal, warm);
   } catch (err) {
     console.warn(
       `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
@@ -1912,8 +1920,8 @@ export function warmChildEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.Pr
  * required, and an install anton can't complete (private registry, no network) must not be able to
  * lose an otherwise-good run.
  */
-async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
-  const cmd = resolveWarmCommand(wt.path);
+async function warmWorktree(wt: Worktree, signal?: AbortSignal, warm?: WarmConfig): Promise<void> {
+  const cmd = resolveWarmCommand(wt.path, process.env, isExecutableFile, warm);
   if (!cmd) return;
 
   try {
