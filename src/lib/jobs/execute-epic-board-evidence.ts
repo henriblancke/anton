@@ -1093,9 +1093,26 @@ export async function clearBoardEvidencePending(
   // `beads.confirmedBoardEvidenceIds`/`beads.cleanupUnsyncedBoardEvidenceIds` already know), never
   // just the ids freshly found this attempt.
   const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids));
+  // Gated on `confirmedSet` (chatgpt-codex-connector, PR #284 review, "Retain recovery evidence
+  // until confirmation succeeds") — an exhausted `setBoardEvidenceConfirmed` retry must NOT be
+  // followed by clearing the marker/baseline anyway. Both clears are immediately visible on a
+  // shared-server board, so attempting them regardless of `confirmedSet` left a window where a
+  // process exit right after (both succeed independently of the failed confirm write, e.g. a
+  // conflict specific to that field) landed a ticket with no confirmation, no marker, no baseline,
+  // and — until the obligation write below gets its own turn — no retry obligation either: a
+  // fresh-machine resume then finds nothing to recover and regenerates against a baseline that
+  // already absorbed this ticket's own delivery. Skipping the clears entirely when confirmation
+  // hasn't landed costs nothing (they retry for free next attempt) and keeps the two existing
+  // survivors intact as recovery signals instead of leaning on a third write to replace them.
   const markerCleared =
-    stale.length === 0 ? true : await mustPersist(() => beads.setBoardEvidencePending(repo, ticketId, [], stale));
-  const baselineCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId));
+    stale.length === 0
+      ? true
+      : confirmedSet
+        ? await mustPersist(() => beads.setBoardEvidencePending(repo, ticketId, [], stale))
+        : false;
+  const baselineCleared = confirmedSet
+    ? await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId))
+    : false;
   const cleared = markerCleared && baselineCleared && confirmedSet;
   const synced = cleared
     ? await beads
@@ -1177,27 +1194,30 @@ export async function clearBoardEvidencePending(
             "— a resume on THIS machine will retry the cleanup, but a resume on a different machine " +
             "will not see the obligation and will not retry it; check the sync channel before resuming " +
             "elsewhere"
-      : `bd would not clear ${[
-          !markerCleared && "the pending-evidence marker",
-          !baselineCleared && "the preserved baseline",
-          !confirmedSet && "the delivery-confirmed marker",
-        ]
-          .filter((s): s is string => s !== false)
-          .join(" and ")} it left on the board (after retries)${
-          !idsRecoverableElsewhere
-            ? !obligationPersisted
-              ? ", and bd also refused the local retry-obligation marker (after retries) — a resume " +
-                "will NOT automatically retry the rest of this cleanup; clear or complete it for " +
-                "this ticket directly, or retry until the obligation marker persists"
-              : obligationSynced
-                ? " — a resume will retry the rest of this cleanup via the retry-obligation marker " +
-                  "this run persisted"
-                : " — a resume on THIS machine will retry the rest of this cleanup via the " +
-                  "retry-obligation marker this run persisted locally, but that marker was not " +
-                  "confirmed reaching the remote — a resume on a different machine will not see it " +
-                  "and will not retry; check the sync channel before resuming elsewhere"
-            : ""
-        }`;
+      : !confirmedSet
+        ? `bd would not persist delivery confirmation for it (after retries) — the pending-evidence ` +
+          `marker and preserved baseline, if any, were left in place rather than cleared, so a ` +
+          `resume will retry confirming and clearing them together${
+            !idsRecoverableElsewhere
+              ? !obligationPersisted
+                ? ", and bd also refused the local retry-obligation marker (after retries) — a resume " +
+                  "will NOT automatically retry the rest of this cleanup; clear or complete it for " +
+                  "this ticket directly, or retry until the obligation marker persists"
+                : obligationSynced
+                  ? " — a resume will retry the rest of this cleanup via the retry-obligation marker " +
+                    "this run persisted"
+                  : " — a resume on THIS machine will retry the rest of this cleanup via the " +
+                    "retry-obligation marker this run persisted locally, but that marker was not " +
+                    "confirmed reaching the remote — a resume on a different machine will not see it " +
+                    "and will not retry; check the sync channel before resuming elsewhere"
+              : ""
+          }`
+        : `bd would not clear ${[
+            !markerCleared && "the pending-evidence marker",
+            !baselineCleared && "the preserved baseline",
+          ]
+            .filter((s): s is string => s !== false)
+            .join(" and ")} it left on the board (after retries)`;
     throw new PoisonEpic(
       `${ticketId} delivered and closed, but ${detail} — the run stopped rather than leave a stale ` +
         `board-evidence record on an already-closed ticket, which a later reopen could read as ` +

@@ -1125,19 +1125,20 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
-    "persists AND confirms syncing a cleanup-sync retry obligation when the marker and baseline " +
-      "clear locally but `setBoardEvidenceConfirmed` alone exhausts its retries (PR #284 review, " +
-      "\"preserve an obligation when confirmation persistence fails\" / \"confirm the cleanup-retry " +
-      "obligation reaches the remote before throwing\") — the marker and baseline are both gone from " +
-      "the board at that point, so a same-machine resume checking only those two survivors would " +
-      "otherwise see nothing pending, and a resume on a DIFFERENT machine sees nothing at all unless " +
-      "this brand-new obligation write is itself confirmed synced — the earlier combined push never " +
-      "ran to cover it, since `cleared` was already false",
+    "leaves the pending marker and preserved baseline untouched — never even attempts to clear " +
+      "them — when `setBoardEvidenceConfirmed` exhausts its retries (chatgpt-codex-connector, PR " +
+      "#284 review, \"Retain recovery evidence until confirmation succeeds\") — both clears are " +
+      "immediately visible on a shared-server board, so clearing them anyway while confirmation " +
+      "itself failed could strand a ticket with no confirmation, no marker, no baseline and (until " +
+      "a separate obligation write lands) no retry obligation either; leaving them in place costs " +
+      "nothing since a resume just retries the whole cleanup",
     async () => {
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
-      pushMock.mockResolvedValueOnce("synced");
+      const markerCallsBefore = setBoardEvidencePendingMock.mock.calls.length;
+      const baselineCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
+      const obligationCallsBefore = setBoardEvidenceCleanupUnsyncedMock.mock.calls.length;
       const pushCallsBefore = pushMock.mock.calls.length;
       await expect(
         clearBoardEvidencePending(
@@ -1146,9 +1147,34 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
           ["a"],
         ),
       ).rejects.toThrow(/t-cleanup-confirm-failed/);
+      // Neither clear is even attempted — the marker's own labels still name the ids directly, so
+      // there is nothing else worth persisting once a resume gets confirmation to land.
+      expect(setBoardEvidencePendingMock.mock.calls.length).toBe(markerCallsBefore);
+      expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(baselineCallsBefore);
+      expect(setBoardEvidenceCleanupUnsyncedMock.mock.calls.length).toBe(obligationCallsBefore);
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    },
+  );
+
+  it(
+    "persists AND confirms syncing a cleanup-sync retry obligation when `setBoardEvidenceConfirmed` " +
+      "exhausts its retries and no pending marker exists to carry the ids itself (PR #284 review, " +
+      "\"preserve an obligation when confirmation persistence fails\" / \"confirm the cleanup-retry " +
+      "obligation reaches the remote before throwing\") — with no marker to preserve, the newly " +
+      "written obligation is the only place left for a resume, on this machine or a fresh one, to " +
+      "recover which ids still need confirming",
+    async () => {
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      pushMock.mockResolvedValueOnce("synced");
+      const pushCallsBefore = pushMock.mock.calls.length;
+      await expect(
+        clearBoardEvidencePending("/repo", bead("t-cleanup-confirm-failed-no-marker"), ["a"]),
+      ).rejects.toThrow(/t-cleanup-confirm-failed-no-marker/);
       expect(setBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith(
         "/repo",
-        "t-cleanup-confirm-failed",
+        "t-cleanup-confirm-failed-no-marker",
         ["a"],
       );
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 1);
@@ -1167,11 +1193,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       setBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("dolt contention"));
       pushMock.mockResolvedValueOnce("not-wired");
       await expect(
-        clearBoardEvidencePending(
-          "/repo",
-          bead("t-cleanup-confirm-failed-unsynced", { labels: [LABELS.boardEvidencePending(["a"])] }),
-          ["a"],
-        ),
+        clearBoardEvidencePending("/repo", bead("t-cleanup-confirm-failed-unsynced"), ["a"]),
       ).rejects.toThrow(/resuming elsewhere/);
     },
   );
