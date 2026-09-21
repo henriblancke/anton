@@ -73,6 +73,7 @@ describe("step:describe", () => {
       baseBranch: "base",
       baseRef: "base",
       baseForkSha: "f0f0f0forkcommit",
+      alreadyShippedBase: "f0f0f0forkcommit",
       target,
       tickets: [target],
       settings: {},

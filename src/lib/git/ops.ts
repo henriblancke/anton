@@ -599,7 +599,7 @@ export async function resolveHooksPathOverrideForMerge(
   return resolveHooksPathOverride(repoPath, worktreePath);
 }
 
-async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
+export async function git(cwd: string, args: string[], hooksPath?: string): Promise<string> {
   const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
   const { stdout } = await execFileAsync("git", [...configArgs, "-C", cwd, ...args], {
     timeout: 120_000,
@@ -1240,7 +1240,7 @@ export async function resolveForkPoint(worktreePath: string, base: string): Prom
  * run that never got one. A process killed by a timeout carries `code: null` and a signal, and a
  * spawn failure carries a string errno, so neither is mistaken for an exit status.
  */
-function exitedWith(error: unknown, code: number): boolean {
+export function exitedWith(error: unknown, code: number): boolean {
   const err = error as { code?: unknown; killed?: boolean } | null;
   return err?.code === code && err.killed !== true;
 }
@@ -1336,15 +1336,82 @@ export async function stageAllAndHashTree(worktreePath: string): Promise<string>
  * earlier ticket's commits — and adopting that would open a PR missing work anton has already
  * closed the bead for.
  *
- * Only git's own "no" (exit 1) is an answer; anything else propagates rather than reading as one.
+ * `ancestor` can also be a sha cited on a synced satisfied/block note — unpublished, and so absent
+ * from this clone, or short enough to have gone ambiguous against objects fetched since. Either way
+ * `merge-base --is-ancestor` answers with exit 128, not git's "no" (exit 1), so it's checked to
+ * resolve FIRST: a citation that doesn't resolve here is read as not present, the same answer a
+ * caller preserving cited work needs to fall back to regenerating it, while a resolvable `ancestor`
+ * still goes through `merge-base` and any operational failure there still propagates rather than
+ * reading as one.
  */
 export async function isAncestor(
   worktreePath: string,
   ancestor: string,
   descendant: string,
 ): Promise<boolean> {
+  if (!(await revisionResolves(worktreePath, ancestor))) return false;
   try {
     await git(worktreePath, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch (e) {
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
+ * The full commit sha `rev` names right now — used where exact tip identity is the evidence, not
+ * mere reachability. A landed fast-forward moves a branch to EXACTLY its target; a merge or rebase
+ * builds a NEW commit on top of one, so ancestry alone can't tell a fast-forward that landed from
+ * one that didn't (see execute-epic-claim.ts's pending-refresh reconciliation).
+ */
+export async function resolveCommitSha(worktreePath: string, rev: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--verify", `${rev}^{commit}`]);
+}
+
+/**
+ * `commit`'s parent shas, in the order git recorded them (empty for a root commit) — used to confirm
+ * a landed merge: its tip must be a commit whose parents are exactly the branch's pre-merge tip and
+ * the base it merged in, not merely a commit descended from both (see execute-epic-claim.ts's
+ * pending-refresh reconciliation).
+ */
+export async function commitParentShas(worktreePath: string, commit: string): Promise<string[]> {
+  const line = await git(worktreePath, ["rev-list", "--parents", "-n", "1", commit]);
+  const [, ...parents] = line.split(/\s+/).filter(Boolean);
+  return parents;
+}
+
+/**
+ * Whether `ref` names an actual commit in this repo — missing and ambiguous both read as "no" via
+ * `--verify --quiet`, which git documents as discarding ambiguous short SHA-1s silently rather than
+ * erroring, so both collapse to the same clean exit 1 {@link isAncestor} reads as absent.
+ */
+async function revisionResolves(worktreePath: string, ref: string): Promise<boolean> {
+  try {
+    await git(worktreePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]);
+    return true;
+  } catch (e) {
+    if (exitedWith(e, 1)) return false;
+    throw e;
+  }
+}
+
+/**
+ * Whether `a` and `b` share ANY common history — the check `isAncestor` alone can't make, since a
+ * diverged branch and one with a wholly unrelated history both answer its question "no" (exit 1).
+ * A rebase treats the two very differently: onto a diverged base it replays only the commits unique
+ * to the branch, but onto an unrelated one — origin's `<base>` force-pushed or recreated with a new
+ * root — git still accepts the operation and replays the branch's ENTIRE history, root commit
+ * included, on top of a tree that has nothing to do with it. Callers that mean to rebase must check
+ * this FIRST and refuse when it's false, rather than let git's own permissiveness stand in for it.
+ */
+export async function hasCommonHistory(
+  worktreePath: string,
+  a: string,
+  b: string,
+): Promise<boolean> {
+  try {
+    await git(worktreePath, ["merge-base", a, b]);
     return true;
   } catch (e) {
     if (exitedWith(e, 1)) return false;
@@ -1488,10 +1555,15 @@ export interface SatisfiedClaim {
  * operator investigating a skip is owed. Fails closed to none, exactly as {@link branchCommits}
  * does and for the same reason — a `git log` that failed is not proof a ticket was satisfied, and
  * the safe error here is re-running work rather than skipping it.
+ *
+ * `excludeBase`, threaded straight through to {@link branchCommits}, matters here exactly as it does
+ * for {@link worktreeHasCommitFor} (PR #279 review): unbounded, this walks a refreshed checkout's
+ * WHOLE history, so a base commit carrying a sibling's `Anton-Satisfies` trailer for an already-closed
+ * ticket reads as this branch's own delivery of it rather than inherited base history.
  */
 export async function readSatisfiedClaims(
   worktreePath: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; excludeBase?: string } = {},
 ): Promise<SatisfiedClaim[]> {
   const commits = await branchCommits(worktreePath, options);
   return commits.flatMap((c) =>
@@ -1508,23 +1580,32 @@ export async function readSatisfiedClaims(
  * to say which commit it skipped on. Match is EXACT, never by prefix — `anton-jz1.2` satisfying
  * something says nothing about `anton-jz1`, the same collision {@link worktreeHasCommitFor} guards
  * against in its subject scan. Fails closed to `undefined` with {@link readSatisfiedClaims}.
+ *
+ * `excludeBase` — see {@link readSatisfiedClaims}'s own doc comment on why an unbounded scan
+ * misattributes inherited base history to this branch.
  */
 export async function branchSatisfiesTicket(
   worktreePath: string,
   ticketId: string,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; excludeBase?: string } = {},
 ): Promise<SatisfiedClaim | undefined> {
   const claims = await readSatisfiedClaims(worktreePath, options);
   return claims.find((c) => c.ticketIds.includes(ticketId));
 }
 
+/**
+ * Whether `repoPath` has a remote named `name` — confirmed, never guessed. Only git's own
+ * successful, locale-independent remote enumeration is folded into `false`; anything else
+ * (permission error, corrupt config, a git binary that failed to run at all) is rethrown rather
+ * than swallowed into the same `false` (PR #279 review, P1) — a caller that can't tell "confirmed
+ * absent" from "the probe itself broke" risks treating a merely-unlucky check as proof there's no
+ * remote to be stale relative to. `git remote` emits configured names on stdout and succeeds with
+ * no output when none exist, unlike `remote get-url`, whose missing-name diagnostic is localized.
+ * See {@link resolveFreshBase}, the caller this distinction protects.
+ */
 export async function hasRemote(repoPath: string, name = "origin"): Promise<boolean> {
-  try {
-    await git(repoPath, ["remote", "get-url", name]);
-    return true;
-  } catch {
-    return false;
-  }
+  const remotes = await git(repoPath, ["remote"]);
+  return remotes.split("\n").some((remote) => remote === name);
 }
 
 /**
@@ -2076,17 +2157,50 @@ export async function fetchOrigin(repoPath: string, refs: string[] = []): Promis
   await serializeFetch(repoPath, () => git(repoPath, ["fetch", "origin", ...refs]));
 }
 
+/** {@link resolveFreshBase}'s result: the ref to branch off, and whether it's authoritative truth. */
+export interface FreshBase {
+  /** `"origin/<base>"` on a confirmed fetch, otherwise the plain local `<base>`. */
+  ref: string;
+  /**
+   * Whether `ref` is authoritative truth rather than a possibly-stale reading — true for a
+   * CONFIRMED fetch of `origin/<base>` and for a repo with no `origin` remote at all (there is
+   * nothing else for the local branch to be stale relative to). False for the remaining fallback
+   * shape: a repo that has (or might have — see below) an origin whose fetch just failed. See
+   * `refreshOntoBase`'s own `baseIsAuthoritative` doc comment for why callers need this distinction
+   * rather than re-deriving it themselves.
+   */
+  baseIsAuthoritative: boolean;
+}
+
 /**
  * Resolve the freshest usable base ref for a new worktree (anton-l0h). Fetches `origin/<base>` and
  * returns `"origin/<base>"` so the job layer can branch off the remote tip. Best-effort: if the
  * repo has no `origin` remote, or the fetch fails (offline, auth, deleted ref), it logs loudly and
  * falls back to the local `<base>` so a run is never blocked on network access. Only updates the
  * remote-tracking ref — no local branch is mutated.
+ *
+ * Returns {@link FreshBase} rather than a bare string so a caller never has to re-probe
+ * {@link hasRemote} itself to learn whether the fallback is authoritative (PR #279 review, P1):
+ * a caller's OWN second call to `hasRemote` can fail for an operational reason unrelated to
+ * whether `origin` exists — a transient error `hasRemote` swallows into the same `false` it
+ * returns for a confirmed-absent remote — and a caller treating that `false` as "no remote"
+ * would wrongly mark a stale local fallback authoritative. Calling `hasRemote` exactly once here
+ * and carrying its answer out removes that second, redundant probe entirely.
  */
-export async function resolveFreshBase(repoPath: string, base: string): Promise<string> {
-  if (!(await hasRemote(repoPath))) {
-    // No origin (e.g. a local-only repo) — nothing to fetch; branch off the local base.
-    return base;
+export async function resolveFreshBase(repoPath: string, base: string): Promise<FreshBase> {
+  let remotePresent: boolean | undefined;
+  try {
+    remotePresent = await hasRemote(repoPath);
+  } catch (e) {
+    // The probe itself failed operationally (not a confirmed "no such remote") — indeterminate,
+    // never "confirmed absent". Fall through to the fetch attempt below, which surfaces the same
+    // underlying problem and lands in the non-authoritative fallback rather than the authoritative
+    // no-remote one.
+    console.warn(`[git] probing ${repoPath} for an "origin" remote failed`, e);
+  }
+  if (remotePresent === false) {
+    // Confirmed no origin (e.g. a local-only repo) — nothing to fetch; branch off the local base.
+    return { ref: base, baseIsAuthoritative: true };
   }
   const trackingRef = `refs/remotes/origin/${base}`;
   try {
@@ -2097,13 +2211,13 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
     await fetchOrigin(repoPath, [`+refs/heads/${base}:${trackingRef}`]);
     // Confirm the ref actually resolves before branching a run off it (throws → fall back).
     await git(repoPath, ["rev-parse", "--verify", "--quiet", trackingRef]);
-    return `origin/${base}`;
+    return { ref: `origin/${base}`, baseIsAuthoritative: true };
   } catch (e) {
     console.warn(
       `[git] fetch of origin/${base} in ${repoPath} failed; falling back to local ${base}`,
       e,
     );
-    return base;
+    return { ref: base, baseIsAuthoritative: false };
   }
 }
 

@@ -991,7 +991,7 @@ export type TicketBlockKind = "no-delivery" | "agent-blocked" | "post-commit";
  * causes got byte-identical notes and the only route to the difference was finding the run, finding
  * the session, and reading its log. The reason the agent already stated on its `ANTON-RESULT:
  * blocked` line — and the error behind a post-commit failure — belong on the bead, next to the
- * evidence that backs them: the session, and the branch + short sha when work was committed.
+ * evidence that backs them: the session, and the branch + full sha when work was committed.
  *
  * Exactly one line by construction: the reason is flattened and capped, so `parseTicketNotes` reads
  * it back as one machine note. A missing or unparseable self-report degrades to the category text

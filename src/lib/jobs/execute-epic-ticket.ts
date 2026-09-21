@@ -208,8 +208,16 @@ async function walkTicketSteps(args: {
       }
       continue;
     }
+    // `run.alreadyShippedBase`, not `run.baseRef` (PR #279 review, round 2 — this call site was the
+    // one the refactor missed): `baseRef` is a movable ref name that a failed fetch resolves LOCALLY,
+    // which can read behind the base a reused checkout's refresh already committed the branch onto.
+    // Before this run's own refresh could move the base mid-run, the two always agreed; now that they
+    // can diverge, checking a `satisfied` self-report against the stale `baseRef` instead of
+    // `alreadyShippedBase` can let a commit the checkout only carries because of the base refresh —
+    // not this run's own work — read as "added by the branch", the exact false success every sibling
+    // check in this file was updated to close (see `alreadyShippedBase`'s own doc comment).
     await assertDelivered(ticket, result.facts ?? {}, progress, (commit) =>
-      branchAddedCommit(run.repoPath, run.branch, run.baseRef, commit),
+      branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, commit),
     );
   }
 }
