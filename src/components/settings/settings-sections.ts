@@ -23,6 +23,14 @@ export const SECTIONS = [
   // and it shares the model knob's concern (anton-n16m).
   { id: "gateway", label: "Claude gateway", group: "The project", dirtyKeys: ["gateway"] },
   { id: "agents", label: "Active agents", group: "The project", dirtyKeys: ["agents"] },
+  // First in the group because it is first in a run: the worktree is cut and warmed before the
+  // agent reads a prompt (anton-z5li2). Setup, not a verify gate — those run after the agent.
+  {
+    id: "warm",
+    label: "Worktree warming",
+    group: "While a run works",
+    dirtyKeys: ["warm"],
+  },
   {
     id: "prompt",
     label: "Execution prompt",

@@ -14,6 +14,7 @@ import { DEFAULT_BUDGET_POLICY, withQuotaShare, type BudgetPolicy } from "./jobs
 import { resolveGovernedShare, type GovernedShare } from "./quota-share";
 import { eligibilityOf, observedWorkEligibility } from "./quota-eligibility";
 import { GARDENER_DETECTION_KINDS } from "./gardener/detections";
+import type { WarmConfig } from "./git/worktree";
 import {
   pickerApplyVerdict,
   PROPOSAL_AUTONOMY_LEVELS,
@@ -108,6 +109,21 @@ export interface ProjectSettings {
   lintCommand?: string;
   typecheckCommand?: string;
   buildCommand?: string;
+  /**
+   * The project-setup command warming runs in a fresh worktree (anton-z5li2), overriding both
+   * `ANTON_WARM_COMMAND` and the lockfile table — the one env var is machine-wide, so a monorepo, a
+   * uv/make setup or a repo with two lockfiles cannot be fixed without it. Cleared → FALL BACK to
+   * the env var, then lockfile detection; clearing is never "skip warming" (that is
+   * {@link warmEnabled}).
+   */
+  warmCommand?: string;
+  /**
+   * Whether this project's worktrees are warmed at all (anton-z5li2). Absent → ON, so every
+   * existing project keeps warming without opting in; `false` skips the warm entirely for a repo
+   * whose install needs credentials anton doesn't have. The machine-wide `ANTON_WARM_WORKTREE=0`
+   * still ranks above this.
+   */
+  warmEnabled?: boolean;
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
   baseBranch?: string;
   /**
@@ -455,6 +471,16 @@ export function resolveVerifyGates(settings: ProjectSettings): VerifyGate[] {
   }
   if (settings.buildCommand) gates.push({ label: "build", command: settings.buildCommand });
   return gates;
+}
+
+/**
+ * The warm config for a project (anton-z5li2) — the narrow value `resolveWarmCommand` reads, rather
+ * than the whole settings blob. Absent `warmEnabled` is ON, so every project that predates
+ * the setting keeps warming without opting in; a cleared `warmCommand` is a fall-through to
+ * `ANTON_WARM_COMMAND` and lockfile detection, never a skip.
+ */
+export function resolveWarmConfig(settings: ProjectSettings): WarmConfig {
+  return { command: settings.warmCommand || undefined, enabled: settings.warmEnabled !== false };
 }
 
 /** Defaults for the per-project job policy when a setting is unset. */

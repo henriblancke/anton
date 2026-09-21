@@ -24,6 +24,7 @@ import {
   type Worktree,
 } from "../git/worktree";
 import type { PendingRefresh } from "../runs";
+import { resolveWarmConfig } from "../projects";
 import { resolveOperator } from "../operator";
 import {
   BRANCH_RECREATED_REFRESH_TOMBSTONE,
@@ -546,7 +547,10 @@ export async function warmRunWorktree(
   // it may have just rebased/merged the branch onto is safely on the run row (anton-s55u, PR #279
   // review, P1) — this call is the only thing left that can run for minutes, and its own signal lets
   // an operator's kill interrupt it without holding the run's concurrency slot for the full timeout.
-  await warmWorktreeBestEffort(worktree, ctx.signal);
+  // The project's own warm setting rides along (anton-z5li2): this is the one call site a real run
+  // reaches, so it is what makes a pinned command — or a project that turned warming off — take
+  // effect instead of the machine-wide env var and lockfile detection alone.
+  await warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings));
   await ctx.heartbeat();
 
   // What an `already-shipped` claim is checked against (PR #279 review). `baseForkSha` above is
