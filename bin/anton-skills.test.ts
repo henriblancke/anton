@@ -302,6 +302,37 @@ describe("installSkillDir", () => {
       await rm(externalDir, { recursive: true, force: true });
     }
   });
+
+  // Same hazard one path component up: a bundled subdirectory (`templates/`) swapped for a symlink
+  // to an external directory must have that link replaced too — otherwise both the drifted-file
+  // copy and the extra-file cleanup resolve through it into the external directory (anton-z33ia review).
+  it("replaces a symlinked destination subdirectory instead of writing/deleting through it into an external dir", async () => {
+    mkdirSync(join(src, "templates"), { recursive: true });
+    writeFileSync(join(src, "templates", "file.md"), "bundled v2\n");
+    installSkillDir(src, dest);
+
+    const externalDir = await tempDir("anton-skill-external-");
+    try {
+      const externalFile = join(externalDir, "file.md");
+      const leftoverFile = join(externalDir, "leftover.md");
+      writeFileSync(externalFile, "external placeholder\n");
+      writeFileSync(leftoverFile, "external leftover\n");
+      rmSync(join(dest, "templates"), { recursive: true, force: true });
+      symlinkSync(externalDir, join(dest, "templates"));
+      // Digested through the symlink, so dest reads as pristine and "outdated".
+      seedOtherRelease(dest, "an older release\n");
+
+      writeFileSync(join(src, "templates", "file.md"), "bundled v3\n");
+      expect(installSkillDir(src, dest)).toBe("refreshed");
+
+      expect(lstatSync(join(dest, "templates")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, "templates", "file.md"), "utf8")).toBe("bundled v3\n");
+      expect(readFileSync(externalFile, "utf8")).toBe("external placeholder\n");
+      expect(existsSync(leftoverFile)).toBe(true);
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("staleSkills", () => {

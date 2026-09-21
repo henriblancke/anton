@@ -660,6 +660,28 @@ function pruneEmptyDirs(root) {
  * than the user's. Leaving them would keep the refreshed copy's own digest off the stamp it just
  * received, so it would read as hand-edited from then on and never auto-refresh again.
  */
+/**
+ * Neutralize any symlinked directory component between `destDir` and `destDir/rel`, top-down.
+ * A bundled subdir (e.g. `templates/`) swapped for a symlink to an external directory would
+ * otherwise make every write/delete under it resolve through the link — `copyFileSync` writes
+ * into whatever the link targets, and `rmSync` deletes through it too (anton-z33ia review).
+ * Removes the link itself, never its target (unlink semantics), so the caller's own
+ * mkdirSync/rmSync only ever touch real paths rooted under destDir.
+ */
+function realizeDestDirs(destDir, rel) {
+  const segments = [];
+  for (let d = dirname(rel); d !== "." && d !== ""; d = dirname(d)) segments.unshift(d);
+  for (const seg of segments) {
+    const cur = join(destDir, seg);
+    try {
+      if (lstatSync(cur).isSymbolicLink()) {
+        rmSync(cur, { force: true });
+        mkdirSync(cur, { recursive: true });
+      }
+    } catch {}
+  }
+}
+
 function installSkillDir(srcDir, destDir, { force = false } = {}) {
   const { state, drifted, extra } = skillState(srcDir, destDir);
   if (state === "missing") {
@@ -670,6 +692,7 @@ function installSkillDir(srcDir, destDir, { force = false } = {}) {
   if (state !== "outdated" && !force) return "stale";
   for (const rel of drifted) {
     const dest = join(destDir, rel);
+    realizeDestDirs(destDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
     // copyFileSync follows a destination symlink and writes through it into whatever it points
     // at — unlink first so a refresh replaces the link itself, never a file outside the skill dir.
@@ -679,7 +702,10 @@ function installSkillDir(srcDir, destDir, { force = false } = {}) {
     copyFileSync(join(srcDir, rel), dest);
   }
   if (state === "outdated") {
-    for (const rel of extra) rmSync(join(destDir, rel), { force: true });
+    for (const rel of extra) {
+      realizeDestDirs(destDir, rel);
+      rmSync(join(destDir, rel), { force: true });
+    }
     pruneEmptyDirs(destDir);
   }
   return state === "outdated" ? "refreshed" : "updated";
