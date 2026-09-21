@@ -64,7 +64,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { delimiter, join, relative } from "node:path";
+import { extraBinDirs } from "../bin";
 import {
   acquireWorktreeClaim,
   branchExists,
@@ -1669,6 +1670,27 @@ suite("worktree manager (real git)", () => {
       expect(existsSync(join(wt.path, "node_modules", ".anton-warm"))).toBe(true);
     } finally {
       delete process.env[WARM_COMMAND_ENV];
+    }
+  });
+
+  // `anton start` launches the daemon with NODE_ENV=production, and every package manager reads that
+  // as "skip devDependencies" — so the warm left a tree missing vitest and the run's first verify gate
+  // failed on modules the lockfile does list. The install child must inherit the augmented PATH but
+  // not that NODE_ENV. Pinned rather than detected, so nothing shells out to a real package manager.
+  it("runs the install with no production NODE_ENV, keeping the augmented PATH", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    process.env[WARM_COMMAND_ENV] =
+      'mkdir -p node_modules && printf %s "${NODE_ENV-<unset>}" > node_modules/.node-env && ' +
+      'printf %s "$PATH" > node_modules/.path';
+    try {
+      const wt = await createWorktree({ repoPath: repo, branch: "anton/run-warm-node-env", warm: true });
+
+      expect(readFileSync(join(wt.path, "node_modules", ".node-env"), "utf8")).toBe("<unset>");
+      const childPath = readFileSync(join(wt.path, "node_modules", ".path"), "utf8").split(delimiter);
+      for (const dir of extraBinDirs()) expect(childPath).toContain(dir);
+    } finally {
+      delete process.env[WARM_COMMAND_ENV];
+      vi.unstubAllEnvs();
     }
   });
 
