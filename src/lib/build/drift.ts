@@ -538,22 +538,25 @@ export function selfBootDependencies(): string | null {
  * pull left on disk. A row stamped with the checkout would attribute the invocation to code that
  * never ran it — which is the same lie {@link serverBuildDrift} exists to report.
  *
- * Resolved ONCE per process and held: the identity of a running process cannot change (a new build
- * is a new process), and `readBuildIdentity` spawns git synchronously — six reads on a cold path —
- * which no dispatch may pay per invocation. A process that never booted a server (a unit test, a
- * script) has no boot identity, so it falls back to reading the checkout: the value is still the
- * truth about the code in hand, and a test asserting a stamp lands must not be answered with null.
+ * Resolved once per process and held, save for the on-disk fallback below reopening on the same
+ * generation counter `onDiskCache`/`driftsCache` answer to (PR #313 review): a BOOTED process is
+ * genuinely inert to this (a new build is a new process), but a process with no boot identity — a
+ * CLI, a script, a test — resolves from the checkout, and a caller that pulled mid-life expects
+ * `invalidateCaches()` to reach this cache exactly as it reaches theirs. `readBuildIdentity` spawns
+ * git synchronously — six reads on a cold path — which no dispatch may pay per invocation, so the
+ * cache still stands within one generation.
  *
  * Null only when nothing can name a version at all. An absence is recorded as an absence — the
  * ledger's standing rule — never as a guess.
  */
-let selfVersionCache: { version: string | null } | null = null;
+let selfVersionCache: { version: string | null; generation: number } | null = null;
 
 export function selfBuildVersion(): string | null {
-  if (selfVersionCache) return selfVersionCache.version;
+  const generation = cacheGeneration();
+  if (selfVersionCache && selfVersionCache.generation === generation) return selfVersionCache.version;
   const identity = booted()?.identity ?? (appRoot() ? onDiskIdentity() : null);
   const version = identity?.version ? describeBuildIdentity(identity) : null;
-  selfVersionCache = { version };
+  selfVersionCache = { version, generation };
   return version;
 }
 

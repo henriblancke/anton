@@ -96,6 +96,7 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
     // text that never ran.
     attribution: {
       promptId: reasoning.promptId,
+      promptBodyDigest: reasoning.promptBodyDigest,
       skillId: reasoning.skillId,
       skillDigest: reasoning.skillDigest,
     },

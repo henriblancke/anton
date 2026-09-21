@@ -70,7 +70,7 @@ export async function dispatchClaude(
      */
     attribution?: Pick<
       InvocationDimensions,
-      "agentTag" | "promptId" | "skillId" | "skillDigest"
+      "agentTag" | "promptId" | "promptBodyDigest" | "skillId" | "skillDigest"
     >;
   },
 ): Promise<StepResult> {

@@ -6,13 +6,14 @@
  * id, the label, and the formula file. A silent skip would let a project formula quietly define a
  * run that never opens a PR, which is the failure this seam exists to make impossible.
  */
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { labelValueOf, type CookedStep } from "../../beads/bd";
 import { loadAgentPrompt, stripFrontmatter } from "../../claude/agent-prompt";
 import { loadSkill, skillDir } from "../../claude/prompt";
-import { skillDigest } from "../../claude/skill-stamp.mjs";
+import { skillDigest, STAMP_LENGTH } from "../../claude/skill-stamp.mjs";
 import { PoisonEpic } from "../errors";
 import type { StepContext } from "./context";
 import type { StepDefinition } from "./result";
@@ -90,6 +91,13 @@ export interface StepReasoning {
   text: string;
   /** The `prompt:<id>` that resolved, XOR {@link skillId}. */
   promptId?: string;
+  /**
+   * Content digest of the resolved PROMPT body, the sibling of {@link skillDigest} — a `prompt:<id>`
+   * resolves a project-local `.claude/agents/<id>.md` first, then the operator's global copy, then
+   * anton's bundled one, and every one of those is edited in place. Recording the id alone would pool
+   * two cohorts that ran different text under one key, exactly as an unversioned `skillId` would.
+   */
+  promptBodyDigest?: string;
   skillId?: string;
   /** Content digest of the skill directory that answered. Absent when it could not be taken. */
   skillDigest?: string;
@@ -111,7 +119,10 @@ export async function loadStepReasoning(ctx: StepContext, stepId: string): Promi
   const promptId = labelValueOf(ctx.step?.labels, "prompt");
   if (promptId) {
     const body = await loadAgentPrompt(promptId, { projectDir: ctx.worktreePath });
-    if (body?.trim()) return { text: body.trim(), promptId };
+    if (body?.trim()) {
+      const text = body.trim();
+      return { text, promptId, promptBodyDigest: promptDigestOf(text) };
+    }
     throw new PoisonEpic(
       `formula step "${stepId}" names \`prompt:${promptId}\`, which resolves to no prompt file — ` +
         `add \`.claude/agents/${promptId}.md\` to the project, or correct the label`,
@@ -157,6 +168,15 @@ function digestOf(dir: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * 12-hex content digest of a resolved PROMPT body — the `promptId` sibling of {@link digestOf}. The
+ * text is already in hand (no filesystem read), so unlike the skill digest there is nothing here to
+ * swallow a failure from.
+ */
+function promptDigestOf(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, STAMP_LENGTH);
 }
 
 /**

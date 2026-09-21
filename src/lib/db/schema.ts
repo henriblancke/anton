@@ -934,6 +934,13 @@ export const claudeInvocations = sqliteTable(
      * with it by construction, since `loadStepReasoning` dispatches exactly one.
      */
     promptId: text("prompt_id"),
+    /**
+     * The digest of the resolved PROMPT body that ran — the sibling of `skill_digest`. `prompt_id`
+     * resolves project-local-first and is edited in place, so the id alone would pool two cohorts
+     * that ran different text under one key. Distinct from `prompt_digest` above, which digests the
+     * composed SYSTEM prompt rather than this step's own instruction text.
+     */
+    promptBodyDigest: text("prompt_body_digest"),
     inputTokens: integer("input_tokens"),
     outputTokens: integer("output_tokens"),
     thinkingTokens: integer("thinking_tokens"),

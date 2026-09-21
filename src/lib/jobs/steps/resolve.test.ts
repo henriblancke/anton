@@ -106,11 +106,26 @@ describe("loadStepReasoning", () => {
     mkdirSync(join(dir, ".claude", "agents"), { recursive: true });
     writeFileSync(join(dir, ".claude", "agents", "audit.md"), "---\nname: audit\n---\nAudit it.");
 
-    // A prompt carries no digest: the pair is mutually exclusive, so `skillId` must stay absent.
-    expect(await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom")).toEqual({
-      text: "Audit it.",
-      promptId: "audit",
-    });
+    const resolved = await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom");
+    // A prompt carries no SKILL digest: the pair is mutually exclusive, so `skillId` must stay absent.
+    expect(resolved).toMatchObject({ text: "Audit it.", promptId: "audit" });
+    expect(resolved.skillId).toBeUndefined();
+    // But it IS versioned by its own content, exactly like a skill (PR #313 review) — an edit to the
+    // agent file that ran must move the stamp, or "did the prompt edit help" is unanswerable.
+    expect(resolved.promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // The same `prompt:<id>` is different TEXT after an edit — an id alone would pool two cohorts that
+  // ran different instructions under one key.
+  it("moves the prompt digest when the prompt that runs is edited", async () => {
+    mkdirSync(join(dir, ".claude", "agents"), { recursive: true });
+    writeFileSync(join(dir, ".claude", "agents", "audit.md"), "Audit it.");
+    const before = await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom");
+
+    writeFileSync(join(dir, ".claude", "agents", "audit.md"), "Audit it twice.");
+    const after = await loadStepReasoning(ctx(["step:claude", "prompt:audit"]), "custom");
+
+    expect(after.promptBodyDigest).not.toBe(before.promptBodyDigest);
   });
 
   it("reads a project skill named by skill:<id>, and names it with the version that ran", async () => {

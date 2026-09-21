@@ -1452,7 +1452,7 @@ describe("verify-gate evidence across a commit hook", () => {
  * here, on the rows, rather than assumed from the wrapper.
  */
 describe("runReviewGate — what produced each invocation", () => {
-  it("stamps the review and its fix round apart, each with the target's own attribution", async () => {
+  it("stamps the fix round with the target's agent, and the review with none when no reviewAgent is set", async () => {
     const { run, calls } = fakeClaude([report(4, [BLOCKING]), "fixed it", report(9, [])]);
     await runReviewGate({
       db: tdb.db,
@@ -1488,13 +1488,56 @@ describe("runReviewGate — what produced each invocation", () => {
     expect(rows.map((r) => r.step)).toEqual(["review", "review-fix", "review"]);
     expect(rows.map((r) => r.stepHandler)).toEqual(["review", "review", "review"]);
     for (const row of rows) {
-      expect(row).toMatchObject({ beadId: target.id, agentTag: "nextjs", formulaDigest: "9c2e4410ab77" });
+      expect(row).toMatchObject({ beadId: target.id, formulaDigest: "9c2e4410ab77" });
       // Resolved inside the meter: this gate passes no version and still records one.
       expect(row.antonVersion).toBe(selfBuildVersion());
     }
+    // No `reviewAgent` is configured, so the shipped default reviews — no named agent ran it, and
+    // pooling it under the target's tag would mix "who reviewed" with "who implemented" (PR #313
+    // review). The FIX session really is the target's own agent repairing its own work.
+    expect(rows.map((r) => r.agentTag)).toEqual([null, "nextjs", null]);
     // The FIX session composes a system prompt (the operating contract + the epic's agent layer);
     // the review deliberately does not, and records the absence rather than a digest of nothing.
     expect(rows[1].promptDigest).toBe(systemPromptDigest(calls[1].appendSystemPrompt ?? ""));
     expect(rows[0].promptDigest).toBeNull();
+  });
+
+  it("stamps the review with the configured reviewAgent, distinct from the target's own agent", async () => {
+    const REVIEWER_ID = "anton-security-reviewer";
+    const agentDir = join(dir, ".claude", "agents");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, `${REVIEWER_ID}.md`), `---\nname: ${REVIEWER_ID}\n---\n\nREVIEW AS SECURITY.\n`);
+    execFileSync("git", ["-C", dir, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", dir, "commit", "-qm", "add reviewer agent"], { stdio: "ignore" });
+
+    const { run } = fakeClaude([report(9, [])]);
+    await runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      runId: undefined,
+      target: { ...target, labels: ["agent:nextjs"] },
+      tickets: [ticket],
+      settings: { reviewAgent: REVIEWER_ID },
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diff,
+        commit: async () => ({ committed: true }),
+        readState: async () => ({ head: "c0ffee", ref: RUN_REF, status: "" }),
+        restoreState: async () => {},
+      },
+    });
+
+    const rows = await tdb.db
+      .select()
+      .from(schema.claudeInvocations)
+      .orderBy(asc(schema.claudeInvocations.recordedAt));
+    expect(rows).toHaveLength(1); // clean on round 1, no fix dispatched
+    // The reviewer that actually ran (`reviewAgent`) is distinct from the target's implementer, and
+    // each column must say which one it is (PR #313 review).
+    expect(rows[0]).toMatchObject({ beadId: target.id, agentTag: REVIEWER_ID });
   });
 });

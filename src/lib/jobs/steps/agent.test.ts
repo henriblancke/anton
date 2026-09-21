@@ -221,6 +221,7 @@ describe("step:claude", () => {
     expect(metered[0]).toMatchObject({ step: "audit", promptId: "audit" });
     expect(metered[0].skillId).toBeUndefined();
     expect(metered[0].skillDigest).toBeUndefined();
+    expect(metered[0].promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
   });
 
   // The skill that ran is versioned, not just named: it resolves project-local-first and is edited
@@ -239,5 +240,6 @@ describe("step:claude", () => {
     expect(metered[0]).toMatchObject({ step: "smoke", skillId: "smoke" });
     expect(metered[0].promptId).toBeUndefined();
     expect(metered[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
+    expect(metered[0].promptBodyDigest).toBeUndefined();
   });
 });

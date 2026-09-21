@@ -83,6 +83,14 @@ export interface InvocationDimensions {
    * Recording only the id would pool two cohorts that ran different instructions under one key.
    */
   promptId?: string;
+  /**
+   * 12-hex content digest of the resolved PROMPT body a `prompt:<id>` step named — the sibling of
+   * {@link skillDigest}. `promptId` resolves project-local-first and is edited in place, so the id
+   * alone would pool two cohorts that ran different instructions under one key, exactly as an
+   * unversioned `skillId` would. Distinct from {@link promptDigest}, which digests the composed
+   * SYSTEM prompt (base + agent + seed) rather than this step's USER-prompt instruction text.
+   */
+  promptBodyDigest?: string;
   skillId?: string;
   skillDigest?: string;
   /**
@@ -154,6 +162,7 @@ export function invocationRows(
     skillId: dimensions.skillId ?? null,
     skillDigest: dimensions.skillDigest ?? null,
     promptId: dimensions.promptId ?? null,
+    promptBodyDigest: dimensions.promptBodyDigest ?? null,
     numTurns: result.numTurns ?? null,
     costUsd: result.costUsd ?? null,
     durationMs: result.durationMs ?? null,

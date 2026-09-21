@@ -39,6 +39,7 @@ import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
   parseReviewFindings,
+  resolveReviewerContract,
   type ReviewFinding,
   type ReviewProtocolViolation,
   type ReviewReportResult,
@@ -286,30 +287,6 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
   const driver = args.deps?.runClaude ?? runClaude;
-  // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
-  // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
-  // the gates — and a ledger that filed both under one step could not tell which half of a run's
-  // review budget went where.
-  const meter = (step: string) =>
-    metered(db, clock, {
-      projectId,
-      jobType: ctx.type,
-      jobId: ctx.jobId,
-      step,
-      // The gate IS the `review` handler however a project's formula spelled the step that called
-      // it, so the handler is the constant here rather than a lookup: the fix dispatch is this same
-      // handler's own correction round, which the phase fold reads by `step` (anton-234ja).
-      stepHandler: "review",
-      runId,
-      beadId: target.id,
-      modelRequested: settings.model,
-      // The specialist the TARGET named — the gate is run-level, so the target's tag is the one that
-      // speaks for it. The prompt digest rides in from each dispatch's own composed system prompt.
-      agentTag: labelValueOf(target.labels, "agent"),
-      formulaDigest: args.formulaDigest,
-    }, driver);
-  const claude = meter("review");
-  const fixClaude = meter("review-fix");
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
   const commit =
@@ -335,7 +312,42 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
   const baseRev = await mergeBase(worktreePath, baseBranch);
 
-  let reviewer: ReviewerSource = { kind: "default" };
+  // Resolved once, up front, to stamp the REVIEW meter with who actually reviews (PR #313 review):
+  // `config` and `baseRev` are both fixed for the whole gate, so this answers identically whichever
+  // round asks. `buildReviewPrompt` re-resolves it per round for its own prompt text — a second read
+  // of the same fixed inputs, not a second answer.
+  const { reviewer: initialReviewer } = await resolveReviewerContract(settings, worktreePath, baseRev);
+
+  // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
+  // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
+  // the gates — and a ledger that filed both under one step could not tell which half of a run's
+  // review budget went where.
+  const meter = (step: string, agentTag: string | undefined) =>
+    metered(db, clock, {
+      projectId,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step,
+      // The gate IS the `review` handler however a project's formula spelled the step that called
+      // it, so the handler is the constant here rather than a lookup: the fix dispatch is this same
+      // handler's own correction round, which the phase fold reads by `step` (anton-234ja).
+      stepHandler: "review",
+      runId,
+      beadId: target.id,
+      modelRequested: settings.model,
+      agentTag,
+      formulaDigest: args.formulaDigest,
+    }, driver);
+  // The REVIEW session is metered under the specialist that actually reviewed — a configured
+  // `reviewAgent` is a different reasoning contract than the target's implementer, and stamping it
+  // with the target's tag pools two incompatible cohorts (PR #313 review). No named agent (an
+  // operator prompt or the shipped default) records no agent tag, same as a target with none. The
+  // FIX session really does run as the target's own agent repairing its own work, so it keeps that
+  // tag.
+  const claude = meter("review", initialReviewer.kind === "agent" ? initialReviewer.id : undefined);
+  const fixClaude = meter("review-fix", labelValueOf(target.labels, "agent"));
+
+  let reviewer: ReviewerSource = initialReviewer;
   /**
    * Advisories still open from earlier rounds — shown to the next review, which settles them. Seeded
    * from an earlier `step:review`'s open set when the formula runs more than one gate, so round 1
