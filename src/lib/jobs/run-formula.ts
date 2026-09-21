@@ -233,14 +233,17 @@ export function recordedFormulaSource(path: string): string {
  * digest differently by the target bead's id — a cohort of one, which answers nothing. `source` is
  * out for the same reason the path is.
  *
- * Fields are `\0`-delimited and each list length-prefixed, so no rearrangement of content can forge
- * another pipeline's digest (`labels: ["a", "b"]` and `labels: ["a\0b"]` hash differently).
+ * Every field is itself length-prefixed (not just lists), so no rearrangement of content — across
+ * a step's own id/type or between list entries — can forge another pipeline's digest: `id="a",
+ * type="b\0c"` and `id="a\0b", type="c"` hash differently because each value's length is encoded
+ * ahead of it, not inferred from a shared `\0` delimiter.
  */
 export function runFormulaDigest(cooked: CookedFormula): string {
   const h = createHash("sha256");
   const field = (v: string) => {
-    h.update(v);
+    h.update(String(v.length));
     h.update("\0");
+    h.update(v);
   };
   const list = (values: readonly string[]) => {
     field(String(values.length));

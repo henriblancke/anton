@@ -20,7 +20,7 @@
  * Pure Node, no deps: bin/anton.mjs (the launcher, which runs before any build) imports this.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
 /**
@@ -33,14 +33,32 @@ export const STAMP_LENGTH = 12;
 /** Editor/OS droppings that must not decide whether a skill copy counts as pristine. */
 const IGNORED_FILES = new Set([".DS_Store", "Thumbs.db"]);
 
-/** Recursively list every file under `dir` as paths relative to `dir` (files only, sorted). */
+/**
+ * Recursively list every file under `dir` as paths relative to `dir` (files only, sorted).
+ *
+ * A symlinked entry (e.g. `SKILL.md` pointing at a file shared outside the skill directory) reports
+ * `false` from both `Dirent.isFile()` and `isDirectory()` — those describe the link itself, not its
+ * target — so it is resolved via `statSync` instead. A broken link stats neither true and is skipped,
+ * same as it not existing.
+ */
 export function listFiles(dir, base = dir) {
   if (!existsSync(dir)) return [];
   const out = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const abs = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...listFiles(abs, base));
-    else if (entry.isFile()) out.push(abs.slice(base.length + 1));
+    let isDir = entry.isDirectory();
+    let isFile = entry.isFile();
+    if (entry.isSymbolicLink()) {
+      try {
+        const stat = statSync(abs);
+        isDir = stat.isDirectory();
+        isFile = stat.isFile();
+      } catch {
+        continue;
+      }
+    }
+    if (isDir) out.push(...listFiles(abs, base));
+    else if (isFile) out.push(abs.slice(base.length + 1));
   }
   return out.sort();
 }
