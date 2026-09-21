@@ -64,7 +64,11 @@ vi.mock("../beads/issues", async () => {
   const actual = await vi.importActual<typeof import("../beads/issues")>("../beads/issues");
   return {
     ...actual,
-    loadAllIssues: (...a: Parameters<typeof actual.loadAllIssues>) => loadMock(...a),
+    // `attempt` is `loadAllIssues`'s own internal recursion counter, never passed by a real
+    // caller — sliced off so this mock's arity matches what production code actually calls
+    // with (assertions below check `toHaveBeenCalledWith`, which is arity-sensitive).
+    loadAllIssues: (...a: Parameters<typeof actual.loadAllIssues>) =>
+      loadMock(...(a.slice(0, 2) as Parameters<typeof loadMock>)),
   };
 });
 

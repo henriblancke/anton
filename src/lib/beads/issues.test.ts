@@ -193,6 +193,24 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
+  it("fails closed instead of retrying forever when the graph keeps moving on every read (P2 review on PR #274)", async () => {
+    // Every work read disagrees with the one before it, so `sameBlocksEdges` never converges —
+    // simulating sustained shaping/concurrent writers on a shared-server board. Without a retry
+    // cap this recurses indefinitely, spawning `bd list`/`bd dep cycles` with no bound.
+    let call = 0;
+    listMock.mockImplementation(async () => {
+      call += 1;
+      return [{ ...target, dependencies: [{ issue_id: "t-1", depends_on_id: `g-${call}`, type: "blocks" }] }];
+    });
+    cyclesMock.mockResolvedValue([]);
+
+    await expect(loadAllIssues(REPO, { withCycles: true })).rejects.toThrow(
+      /dependency graph kept moving/,
+    );
+    // Bounded: one work read per attempt plus the recheck, capped rather than unbounded.
+    expect(listMock.mock.calls.length).toBeLessThan(20);
+  });
+
   it("skips the recheck entirely when cycles come back non-empty — already the fail-safe answer", async () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);

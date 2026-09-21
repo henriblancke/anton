@@ -107,9 +107,22 @@ export interface LoadIssuesOptions {
   strictGates?: boolean;
 }
 
+/**
+ * Bound on the `sameBlocksEdges` consistency retry below. Each retry is a full re-read of the
+ * board plus `bd dep cycles`, so an unbounded loop lets a board under sustained shaping (or
+ * concurrent writers on a shared-server board) keep a caller inside this function indefinitely,
+ * repeatedly spawning `bd list`/`bd dep cycles` with no wall-clock limit — per-command timeouts
+ * don't bound the *count* of commands. Past this many attempts the graph is moving faster than we
+ * can read it consistently, so this fails closed (rejects) rather than pairing evidence with a
+ * board it may not describe. Callers that need withCycles already treat rejection as a normal
+ * retry-elsewhere signal (see the `strictGates`/`withCycles` doc above and execute-epic-start).
+ */
+const MAX_CYCLE_CONSISTENCY_RETRIES = 3;
+
 export async function loadAllIssues(
   cwd: string,
   opts: LoadIssuesOptions = {},
+  attempt = 0,
 ): Promise<Bead[]> {
   const work = await loadWorkIssues(cwd);
   // CONDITIONAL, not unconditional: a board read sits on the operator's critical path behind the
@@ -146,7 +159,13 @@ export async function loadAllIssues(
   // between the two reads, retry against whatever is current instead of pairing evidence with a
   // board it no longer describes.
   if (cycles.length === 0 && !sameBlocksEdges(work, await loadWorkIssues(cwd))) {
-    return loadAllIssues(cwd, opts);
+    if (attempt >= MAX_CYCLE_CONSISTENCY_RETRIES) {
+      throw new Error(
+        `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_CYCLE_CONSISTENCY_RETRIES + 1} ` +
+          "reads of bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
+      );
+    }
+    return loadAllIssues(cwd, opts, attempt + 1);
   }
   return attachCycleEvidence(board, cycles);
 }
