@@ -19,8 +19,10 @@ import { labelValueOf } from "../../beads/bd";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../../claude/agent-prompt";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import { runClaude } from "../../claude/driver";
-import { loadSkill } from "../../claude/prompt";
+import { bundledSkillDigest, loadSkill } from "../../claude/prompt";
+import { textDigest } from "../../claude/skill-stamp.mjs";
 import { buildExecutionSystemPrompt } from "../../claude/system-prompt";
+import type { ReasoningAttribution } from "../../claude-invocations";
 import { isForbiddenByte } from "../../control-bytes";
 import {
   diffAgainstBase,
@@ -56,10 +58,11 @@ export async function describeStep(ctx: StepContext): Promise<StepResult> {
 
 async function runDescriber(ctx: StepContext): Promise<StepResult> {
   const baseRev = await resolveMergeBase(ctx.worktreePath, ctx.baseRef);
-  const [reasoning, diff] = await Promise.all([
+  const [contract, diff] = await Promise.all([
     resolveDescribeContract(ctx, baseRev),
     diffAgainstBase(ctx.worktreePath, baseRev),
   ]);
+  const { reasoning, attribution } = contract;
   const prompt = [
     reasoning,
     "",
@@ -93,6 +96,11 @@ async function runDescriber(ctx: StepContext): Promise<StepResult> {
       // (`listDeliveriesByBead` in runs.ts), and this step delivers nothing — it writes no code,
       // makes no commit, and cannot fail the run. See the `describe` kind's own note in sessions.ts.
       sessionKind: "describe",
+      // The resolved reasoning contract's identity (PR #313 review): this text rides in
+      // `options.prompt`, not `appendSystemPrompt`, so `dispatchClaude`'s own meter cannot digest it —
+      // without this, every describer invocation records only the execution system prompt's digest
+      // and pools invocations that ran under different `prompt:`/`skill:` contracts into one cohort.
+      attribution,
     });
   } catch (e) {
     // A describer that wrote and then DIED — quota exhaustion, the job's deadline, a lost lease —
@@ -249,21 +257,35 @@ async function dispatchAndCapture(
  * worktree would let a run's own diff rewrite the instruction that describes it. An id that resolves
  * to nothing (deleted after a formula named it, or never existed) falls through to the next source
  * rather than parking the run — this step has no park to fall back to, only the next tier.
+ *
+ * `attribution` carries this resolution's identity for the ledger (PR #313 review), mirroring
+ * `resolveReviewerContract`: this text rides in `options.prompt`, not `appendSystemPrompt`, so
+ * `dispatchClaude`'s own meter cannot digest it — the caller must stamp it explicitly, or every
+ * describer invocation pools into one cohort regardless of which `prompt:`/`skill:`/`describePrompt`
+ * contract actually ran.
  */
-async function resolveDescribeContract(ctx: StepContext, baseRev: string): Promise<string> {
+async function resolveDescribeContract(
+  ctx: StepContext,
+  baseRev: string,
+): Promise<{ reasoning: string; attribution: ReasoningAttribution }> {
   const promptId = labelValueOf(ctx.step?.labels, "prompt");
   if (promptId) {
     const body = await loadBaseAgentPrompt(ctx.worktreePath, baseRev, promptId);
-    if (body) return body;
+    if (body) return { reasoning: body, attribution: { promptBodyDigest: textDigest(body) } };
   }
   const skillId = labelValueOf(ctx.step?.labels, "skill");
   if (skillId) {
     const body = await loadBaseProjectSkill(ctx.worktreePath, baseRev, skillId);
-    if (body) return body;
+    if (body) return { reasoning: body, attribution: { skillId, skillDigest: textDigest(body) } };
   }
   const projectPrompt = resolveDescribeConfig(ctx.settings).prompt;
-  if (projectPrompt) return projectPrompt;
-  return loadSkill("describe");
+  if (projectPrompt) {
+    return { reasoning: projectPrompt, attribution: { promptBodyDigest: textDigest(projectPrompt) } };
+  }
+  return {
+    reasoning: await loadSkill("describe"),
+    attribution: { skillId: "describe", skillDigest: bundledSkillDigest("describe") },
+  };
 }
 
 /**
