@@ -264,6 +264,26 @@ describe("finalizeMergedEpic", () => {
   );
 
   it(
+    "leaves `stage:in-review` in place when `bd history` succeeds but returns no leading closed " +
+      "version (chatgpt-codex-connector, PR #284 review, 'Refuse fenceless confirmation for closed " +
+      "tickets') — e.g. an imported/legacy closed bead with empty history — rather than reporting " +
+      "the fence persisted with no closure hash at all",
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      historyMock.mockResolvedValue([]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
     "retries a closure fence a previous pass left unstamped, on a bead already closed in the " +
       "snapshot — the resumption point `stillOpen` alone could never offer again",
     async () => {

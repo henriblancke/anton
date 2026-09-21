@@ -1120,12 +1120,13 @@ export async function clearBoardEvidencePending(
   let closure: string | undefined;
   if (ticket.status === "closed") {
     const read = await mustReadClosureVersion(repo, ticketId);
-    if (!read.read) {
+    if (!read.read || read.closure === undefined) {
       throw new PoisonEpic(
         `${ticketId} delivered and closed, but its closure version could not be read from \`bd ` +
-          `history\` (after retries) — the run stopped rather than persist a delivery confirmation ` +
-          `with no closure fence, which a later reopen-and-reclose could pass as this cycle's ` +
-          `evidence with no new work. Check the beads DB, then resume the run.`,
+          `history\` (after retries), or \`bd history\` returned no leading closed version (e.g. an ` +
+          `imported/legacy closed bead with empty history) — the run stopped rather than persist a ` +
+          `delivery confirmation with no closure fence, which a later reopen-and-reclose could pass ` +
+          `as this cycle's evidence with no new work. Check the beads DB, then resume the run.`,
       );
     }
     closure = read.closure;

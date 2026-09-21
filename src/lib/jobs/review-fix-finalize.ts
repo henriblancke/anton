@@ -582,7 +582,7 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
   const fenced = await Promise.all(
     unfenced.map(async (b) => {
       const read = await mustReadClosureVersion(repo, b.id);
-      if (!read.read) return false;
+      if (!read.read || read.closure === undefined) return false;
       return mustPersist(() =>
         beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(b), read.closure),
       );

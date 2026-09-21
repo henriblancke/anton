@@ -1411,19 +1411,43 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
-    "omits the closure when `bd history` cannot be read, rather than failing the confirmation write " +
-      "over it — a resume then reads `confirmedBoardEvidenceClosure` as undefined and falls back to " +
-      "trusting the flag, exactly as it does for a confirmation written before this fence existed",
+    "refuses to persist a confirmation for a CLOSED ticket when `bd history` is unreadable after " +
+      "every retry, rather than falling through to an unfenced write a later reopen-and-reclose " +
+      "could pass as this cycle's own evidence with no new work",
     async () => {
-      pushMock.mockResolvedValueOnce("synced");
+      historyMock.mockRejectedValueOnce(new Error("dolt offline"));
+      historyMock.mockRejectedValueOnce(new Error("dolt offline"));
       historyMock.mockRejectedValueOnce(new Error("dolt offline"));
       const ticket = bead("t-closed-history-fails", { status: "closed" });
-      await clearBoardEvidencePending("/repo", ticket, ["a"]);
-      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+      await expect(clearBoardEvidencePending("/repo", ticket, ["a"])).rejects.toThrow(
+        /t-closed-history-fails/,
+      );
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalledWith(
         "/repo",
         "t-closed-history-fails",
-        ["a"],
-        undefined,
+        expect.anything(),
+        expect.anything(),
+      );
+    },
+  );
+
+  it(
+    "refuses to persist a confirmation for a CLOSED ticket when `bd history` succeeds but returns " +
+      "no leading closed version (chatgpt-codex-connector, PR #284 review, 'Refuse fenceless " +
+      "confirmation for closed tickets') — e.g. an imported/legacy closed bead with empty history — " +
+      "rather than persisting an unfenced confirmation a later reopen-and-reclose could reuse as this " +
+      "cycle's evidence with no new board delta",
+    async () => {
+      historyMock.mockResolvedValueOnce([]);
+      const ticket = bead("t-closed-history-empty", { status: "closed" });
+      await expect(clearBoardEvidencePending("/repo", ticket, ["a"])).rejects.toThrow(
+        /t-closed-history-empty/,
+      );
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalledWith(
+        "/repo",
+        "t-closed-history-empty",
+        expect.anything(),
+        expect.anything(),
       );
     },
   );
