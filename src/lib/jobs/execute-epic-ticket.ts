@@ -16,6 +16,7 @@ import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claud
 import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
 import {
+  abandonDispatchBaseline,
   clearBoardEvidencePending,
   ensureBoardBaselinePersisted,
   isBoardOnlyRun,
@@ -348,9 +349,19 @@ export async function runTicket(args: {
  * recovery baseline remains unsynced") — the run-lease actor is machine-scoped, not run-scoped, so a
  * resume that lands on a DIFFERENT machine never sees a baseline that only landed on this one, and its
  * fresh `readBoardBaseline` may already have absorbed this attempt's writes through an independent
- * sync, permanently losing attribution. Anything else (evidence found and its confirming push
- * verified synced) leaves the recovery state durably on the ticket for the next attempt to pick up,
- * so this ticket's own failure is left to settle exactly as it would have otherwise.
+ * sync, permanently losing attribution. Evidence found (and its confirming push verified synced)
+ * leaves the recovery state durably on the ticket for the next attempt to pick up, so this ticket's
+ * own failure is left to settle exactly as it would have otherwise.
+ *
+ * A CONCLUSIVE empty audit is different (chatgpt-codex-connector, PR #284 review, "Retire empty
+ * baselines after failed dispatches"): `found: false` here means the board genuinely has not moved
+ * since the locked, verified pre-dispatch baseline, so there is nothing to preserve — but leaving that
+ * baseline standing on the ticket is itself unsafe. `ensureBoardBaselinePersisted`'s `recoveryBaseline`
+ * fast path trusts a locked+verified baseline unconditionally on the next attempt, with no re-check
+ * that it still reflects the live board. If this failed ticket is later reopened after some UNRELATED
+ * board write lands in between, the next attempt would diff that unrelated change against this same
+ * stale baseline and credit a no-op agent with delivery it never produced. Retired via
+ * {@link abandonDispatchBaseline} instead, so the next attempt takes a genuinely fresh baseline.
  */
 async function auditBoardOnFailedTicket(
   run: Omit<StepContext, "tickets">,
@@ -390,7 +401,12 @@ async function auditBoardOnFailedTicket(
         `This ticket failed with: ${String(cause)}`,
     );
   }
-  if (!result.found) return;
+  if (!result.found) {
+    // Retire the locked, verified pre-dispatch baseline rather than leave it standing — see this
+    // function's own docstring for why a stale one is unsafe to trust on a later reopen.
+    await abandonDispatchBaseline(run.repoPath, ticket);
+    return;
+  }
   await appendSessionLog(
     logPath,
     `[board-audit] ${ticket.id} failed after board evidence was found on ${result.ids.join(", ")} — ` +

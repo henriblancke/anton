@@ -20,6 +20,7 @@ const readBoardBaselineMock = vi.fn();
 const readBoardEvidenceMock = vi.fn();
 const clearBoardEvidencePendingMock = vi.fn();
 const ensureBoardBaselinePersistedMock = vi.fn();
+const abandonDispatchBaselineMock = vi.fn();
 const mustReadMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
@@ -57,6 +58,7 @@ vi.mock("./execute-epic-board-evidence", async () => {
     readBoardEvidence: (...args: unknown[]) => readBoardEvidenceMock(...args),
     clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
     ensureBoardBaselinePersisted: (...args: unknown[]) => ensureBoardBaselinePersistedMock(...args),
+    abandonDispatchBaseline: (...args: unknown[]) => abandonDispatchBaselineMock(...args),
   };
 });
 
@@ -374,21 +376,28 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
     expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
   });
 
-  it("does not audit (or alter settlement) when nothing on the board changed", async () => {
-    readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+  it(
+    "retires the locked pre-dispatch baseline instead of leaving it standing when nothing on the " +
+      "board changed (chatgpt-codex-connector, PR #284 review, 'Retire empty baselines after " +
+      "failed dispatches') — otherwise a later reopen after an unrelated board write would have " +
+      "the next attempt trust this same stale baseline unchecked",
+    async () => {
+      readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
 
-    await expect(
-      runTicket({
-        run: run(),
-        steps: [failingVerifyStep()],
-        ticket: boardTicket,
-        runTicketIds: [boardTicket.id],
-        timeoutMs: 5_000,
-      }),
-    ).rejects.toThrow("settled as a failure");
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [failingVerifyStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow("settled as a failure");
 
-    expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
-  });
+      expect(abandonDispatchBaselineMock).toHaveBeenCalledWith("/tmp/anton", boardTicket);
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it(
     "halts instead of settling when the audit's own pending-evidence marker could not be persisted " +

@@ -501,8 +501,18 @@ const LOCK_STABILITY_ROUNDS = 3;
  * `lockDispatchBaseline`'s own re-verification loop instead of the blind recovery trust. Confirmed
  * the same way the clear itself is — retried, push-checked, and poisoning the epic rather than
  * silently returning `null` if it cannot be confirmed either persisted or synced.
+ *
+ * Exported for `auditBoardOnFailedTicket` (execute-epic-ticket.ts) too (chatgpt-codex-connector, PR
+ * #284 review, "Retire empty baselines after failed dispatches"): a failed dispatch whose audit finds
+ * NO board evidence at all otherwise leaves this same locked-and-verified baseline standing on the
+ * ticket. `ensureBoardBaselinePersisted`'s `recoveryBaseline` fast path trusts a locked+verified
+ * baseline unconditionally, with no re-check that it still reflects the live board — so a human
+ * reopening this failed ticket after some unrelated board write lands in between would have the NEXT
+ * attempt's audit diff that unrelated change against this stale baseline and credit a no-op agent
+ * with delivery it never produced. Retiring it here forces the next attempt to take a genuinely fresh
+ * baseline instead.
  */
-async function abandonDispatchBaseline(repo: string, ticket: Bead): Promise<null> {
+export async function abandonDispatchBaseline(repo: string, ticket: Bead): Promise<null> {
   const downgraded = await mustPersist(() => beads.unverifyBoardEvidenceBaseline(repo, ticket.id));
   const downgradeSynced = downgraded
     ? await beads
