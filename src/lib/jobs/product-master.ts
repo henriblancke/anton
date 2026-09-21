@@ -172,12 +172,15 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
         settings,
         boardInput,
         // Metered like every other invocation (anton-77l9). The pass writes no run row; `step` and
-        // `job_type` are what separate a board judgment's spend from a ticket's.
+        // `job_type` are what separate a board judgment's spend from a ticket's. No formula, no
+        // ticket and no composed system prompt, so the only stamp is the anton `metered` resolves —
+        // which is exactly the overhead row the phase fold expects (anton-234ja).
         claude: metered(db, clock, {
           projectId: project.id,
           jobType: ctx.type,
           jobId: ctx.jobId,
           step: "product-master",
+          stepHandler: "product-master",
           modelRequested: settings.model,
         }, claude),
         onEvent: session.onEvent,

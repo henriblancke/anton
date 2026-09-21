@@ -4,6 +4,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { selfBuildVersion } from "../../build/drift";
+import { systemPromptDigest } from "../../claude/system-prompt";
 import { schema } from "../../db";
 import { isUsageLimitError, UsageLimitError } from "../errors";
 import { dispatchClaude } from "./dispatch";
@@ -280,6 +282,49 @@ describe("dispatchClaude", () => {
       numTurns: 12,
       outcome: "ok",
     });
+  });
+
+  /**
+   * The attribution stamps (anton-z33ia). The handler is recorded BESIDE the author's step id
+   * because a project formula names its steps freely: `step` is what the author called it, and
+   * `step_handler` is what it actually is — the only one of the two the phase fold can read.
+   */
+  it("stamps the row with what produced it: the handler, the pipeline, the prompt and the agent", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const ctx = sandbox.context({
+      deps: { runClaude: claude.run },
+      step: { id: "code-ticket", labels: ["step:implement"] },
+      formulaDigest: "9c2e4410ab77",
+    });
+
+    await dispatchClaude(ctx, { ...args(), attribution: { agentTag: "nextjs" } });
+
+    const [row] = await sandbox.tdb.db.select().from(schema.claudeInvocations);
+    expect(row).toMatchObject({
+      // The author called it `code-ticket`; it IS the implement handler, and only the latter
+      // classifies — which is the whole reason both are recorded.
+      step: "code-ticket",
+      stepHandler: "implement",
+      formulaDigest: "9c2e4410ab77",
+      agentTag: "nextjs",
+      // Digested from the composed text this dispatch actually handed the driver.
+      promptDigest: systemPromptDigest("the operating contract"),
+    });
+    // Resolved inside the meter from process state, so no dispatch site has to remember it.
+    expect(row.antonVersion).toBe(selfBuildVersion());
+  });
+
+  it("records NULL stamps for a direct handler call that resolved none", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    // No formula step and no attribution — a caller invoking the handler directly.
+    await dispatchClaude(sandbox.context({ deps: { runClaude: claude.run } }), args());
+
+    const [row] = await sandbox.tdb.db.select().from(schema.claudeInvocations);
+    expect(row).toMatchObject({ formulaDigest: null, agentTag: null, skillId: null, promptId: null });
+    // A context with no formula step is the generic `step:claude` extension point, which is what
+    // both columns say rather than claiming nothing ran.
+    expect(row.step).toBe("claude");
+    expect(row.stepHandler).toBe("claude");
   });
 
   it("still records an invocation whose result reported no readable usage", async () => {

@@ -83,9 +83,17 @@ export async function dispatchClaude(
     jobType: ctx.ctx.type,
     jobId: ctx.ctx.jobId,
     step: ctx.step?.id ?? "claude",
+    // The step's resolved HANDLER beside the author's id (anton-234ja). A project formula names its
+    // implement step `code-ticket` if it likes, so the id classifies nothing — and the id → handler
+    // mapping is itself editable, which is why the classification is recorded and not derived later.
+    stepHandler: ctx.step ? stepName(ctx.step) : "claude",
     runId: ctx.runId,
     beadId: args.beadId,
     modelRequested: ctx.settings.model,
+    // The prompt digest is NOT passed here: `metered` takes it from the composed text on the spawn
+    // options, which is the same string this dispatch hands the driver — and doing it there covers
+    // the resume-aware ticket driver below, which bypasses this meter entirely.
+    formulaDigest: ctx.formulaDigest,
     ...args.attribution,
   };
   const claude = ctx.deps?.recordsEachAttempt

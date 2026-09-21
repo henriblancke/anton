@@ -13,7 +13,7 @@
  * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
  * wiring is what makes it unit-testable against a fake driver.
  */
-import { type Bead } from "../beads/bd";
+import { labelValueOf, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -158,6 +158,11 @@ export interface ReviewGateArgs {
   target: Bead;
   /** Every ticket the run implemented, in execution order. */
   tickets: Bead[];
+  /**
+   * The cooked pipeline's content digest, stamped on the gate's invocations (anton-jpmdw). Absent
+   * for a caller driving the gate directly, which records it as the absence it is.
+   */
+  formulaDigest?: string;
   settings: ProjectSettings;
   /** The run's worktree: where the diff is read and the fixes land. */
   worktreePath: string;
@@ -291,9 +296,17 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       jobType: ctx.type,
       jobId: ctx.jobId,
       step,
+      // The gate IS the `review` handler however a project's formula spelled the step that called
+      // it, so the handler is the constant here rather than a lookup: the fix dispatch is this same
+      // handler's own correction round, which the phase fold reads by `step` (anton-234ja).
+      stepHandler: "review",
       runId,
       beadId: target.id,
       modelRequested: settings.model,
+      // The specialist the TARGET named — the gate is run-level, so the target's tag is the one that
+      // speaks for it. The prompt digest rides in from each dispatch's own composed system prompt.
+      agentTag: labelValueOf(target.labels, "agent"),
+      formulaDigest: args.formulaDigest,
     }, driver);
   const claude = meter("review");
   const fixClaude = meter("review-fix");

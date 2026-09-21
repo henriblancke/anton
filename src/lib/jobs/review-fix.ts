@@ -48,7 +48,7 @@
  * in-review (never finalized twice).
  */
 import { existsSync } from "node:fs";
-import { beads, type Bead } from "../beads/bd";
+import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude } from "../claude/driver";
 import { quotaMeterKey } from "../quota-meter";
@@ -681,9 +681,15 @@ async function runFixSession(args: {
       jobType: ctx.type,
       jobId: ctx.jobId,
       step: "review-fix",
+      // This job IS the pr-fix phase; the handler names it for the fold the same way an in-formula
+      // step does, so both correction paths classify alike (anton-234ja).
+      stepHandler: "review-fix",
       runId: run?.id,
       beadId: epic.id,
       modelRequested: settings.model,
+      // The specialist the epic named — `buildReviewFixPrompt` above composed this session's system
+      // prompt from that same tag, and `metered` digests that composed text from the spawn options.
+      agentTag: labelValueOf(epic.labels, "agent"),
     }, runClaude)({
       cwd: worktree.path,
       prompt,

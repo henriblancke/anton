@@ -34,7 +34,7 @@ import {
   type TicketSettlement,
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
-import type { StepContext, StepFacts } from "./step-registry";
+import { stepName, type StepContext, type StepFacts } from "./step-registry";
 
 /**
  * How a finished ticket settled, plus whether its close actually landed (PR #253 review). The close
@@ -171,13 +171,19 @@ async function walkTicketSteps(args: {
             jobType: ticketCtx.ctx.type,
             jobId: ticketCtx.ctx.jobId,
             step: cooked.id,
+            // The handler beside the author's step id (anton-234ja) — same reason `dispatchClaude`
+            // records it: a project formula's own step id classifies nothing.
+            stepHandler: stepName(cooked),
             runId: ticketCtx.runId,
             beadId: ticket.id,
             modelRequested: ticketCtx.settings?.model,
             // This driver meters its own attempts, so `dispatchClaude` adds no outer row and its
             // attribution never reaches the ledger. The tag is a label on the ticket in hand, so
             // stamp it here too — otherwise every ticket-phase attempt records an unattributed row.
+            // Same for the pipeline digest; the prompt digest `metered` takes from the spawn options,
+            // which a resumed attempt carries unchanged.
             agentTag: labelValueOf(ticket.labels, "agent"),
+            formulaDigest: ticketCtx.formulaDigest,
           }, runClaude),
         }),
         recordsEachAttempt: true,

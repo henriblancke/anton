@@ -67,6 +67,7 @@ async function triageScan(
       jobType: ctx.type,
       jobId: ctx.jobId,
       step: "scan-triage",
+      stepHandler: "scan-triage",
       modelRequested: pass.settings.model,
     }, runClaude),
   });

@@ -526,6 +526,38 @@ export function selfBootDependencies(): string | null {
 }
 
 /**
+ * What THIS process is running, as one ledger stamp (anton-234ja): `0.5.1 (25ec011)`, or
+ * `0.5.1 (25ec011, uncommitted 71092ab)` where the checkout carries work HEAD does not.
+ *
+ * The spend ledger's version dimension. It answers the question no other stamp can — whether a
+ * cohort shift is the prompt that changed or the anton UNDER it — and the two are otherwise
+ * indistinguishable, since a release lands under a prompt nobody touched.
+ *
+ * Read from the BOOT identity, never the checkout: `bootIdentity` is what the running process
+ * actually executes, and in production that is the compiled artifact rather than whatever a later
+ * pull left on disk. A row stamped with the checkout would attribute the invocation to code that
+ * never ran it — which is the same lie {@link serverBuildDrift} exists to report.
+ *
+ * Resolved ONCE per process and held: the identity of a running process cannot change (a new build
+ * is a new process), and `readBuildIdentity` spawns git synchronously — six reads on a cold path —
+ * which no dispatch may pay per invocation. A process that never booted a server (a unit test, a
+ * script) has no boot identity, so it falls back to reading the checkout: the value is still the
+ * truth about the code in hand, and a test asserting a stamp lands must not be answered with null.
+ *
+ * Null only when nothing can name a version at all. An absence is recorded as an absence — the
+ * ledger's standing rule — never as a guess.
+ */
+let selfVersionCache: { version: string | null } | null = null;
+
+export function selfBuildVersion(): string | null {
+  if (selfVersionCache) return selfVersionCache.version;
+  const identity = booted()?.identity ?? (appRoot() ? onDiskIdentity() : null);
+  const version = identity?.version ? describeBuildIdentity(identity) : null;
+  selfVersionCache = { version };
+  return version;
+}
+
+/**
  * The dependency digest the process that RUNS the scheduled jobs booted with, or null when nothing
  * establishes one (PR #257 review).
  *

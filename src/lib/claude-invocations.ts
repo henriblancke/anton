@@ -26,8 +26,10 @@
  */
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
+import { selfBuildVersion } from "./build/drift";
 import type { ClaudeResult, RunClaudeOptions } from "./claude/driver";
 import type { ModelUsageEntry } from "./claude/model-usage";
+import { systemPromptDigest } from "./claude/system-prompt";
 import { getDb, schema } from "./db";
 import {
   divergenceSummary,
@@ -83,6 +85,28 @@ export interface InvocationDimensions {
   promptId?: string;
   skillId?: string;
   skillDigest?: string;
+  /**
+   * 12-hex digest of the COMPOSED system prompt this invocation ran with (anton-tw37r). Passed by
+   * the caller that composed it, never re-composed here: the text is edited in place, so a second
+   * composition could digest a prompt that never ran.
+   */
+  promptDigest?: string;
+  /**
+   * 12-hex content digest of the cooked pipeline the run walked (anton-jpmdw). `runs.formula` is a
+   * path, and a path says nothing about a formula edited between two runs that both name it.
+   */
+  formulaDigest?: string;
+  /**
+   * The resolved `stepName(step)` — the HANDLER, not the author's step id already in {@link step}.
+   * A project formula names its steps freely, so the id matches no phase predicate, and the id →
+   * handler mapping is itself editable: the classification cannot be reconstructed later.
+   */
+  stepHandler?: string;
+  /**
+   * The anton release + revision that ran it. Resolved INSIDE {@link metered} when a caller omits
+   * it, so a site that passes no stamps at all still records which anton produced the row.
+   */
+  antonVersion?: string;
 }
 
 /**
@@ -118,6 +142,18 @@ export function invocationRows(
     claudeSessionId: result.sessionId ?? null,
     modelRequested: dimensions.modelRequested ?? null,
     endpointHost: hostOf(dimensions.baseUrl) ?? null,
+    // The attribution stamps (anton-z33ia), each null when genuinely absent. A NULL here is a fact
+    // about the invocation — nothing resolved one — and never a placeholder a later read may fill
+    // in: rows written before these columns existed carry nulls forever, so every reader tolerates
+    // them already.
+    promptDigest: dimensions.promptDigest ?? null,
+    formulaDigest: dimensions.formulaDigest ?? null,
+    antonVersion: dimensions.antonVersion ?? null,
+    stepHandler: dimensions.stepHandler ?? null,
+    agentTag: dimensions.agentTag ?? null,
+    skillId: dimensions.skillId ?? null,
+    skillDigest: dimensions.skillDigest ?? null,
+    promptId: dimensions.promptId ?? null,
     numTurns: result.numTurns ?? null,
     costUsd: result.costUsd ?? null,
     durationMs: result.durationMs ?? null,
@@ -248,6 +284,30 @@ export async function invocationSpend(
 }
 
 /**
+ * Resolve one attribution stamp, or nothing (anton-234ja). A resolver that THROWS costs that stamp
+ * and nothing else — never the row, and never the run that produced it.
+ *
+ * The ledger's standing rule, applied one level in from {@link recordInvocation}'s own swallow. That
+ * one covers a write that fails; this covers the read that feeds it, which is the newer risk: every
+ * stamp is resolved from something mutable — a prompt file, a formula, a git checkout — so a broken
+ * repository or an unreadable file is a perfectly ordinary way for one to fail. An invocation that
+ * did the work must not be lost to it, and a delivery must not be lost to it either.
+ *
+ * Exported for the call sites, not only for {@link metered}: a site that resolves a stamp of its own
+ * does so OUTSIDE this wrapper, where an unguarded throw would reach the dispatch rather than the
+ * ledger. The six that exist today pass values already in hand — a label read, a digest the run
+ * cooked once — so none needs it yet; a site that grows a resolver must wrap it in this.
+ */
+export function stampOf<T>(resolve: () => T | undefined): T | undefined {
+  try {
+    return resolve();
+  } catch {
+    // Swallowed on purpose — a stamp is a dimension, never a precondition. See the contract above.
+    return undefined;
+  }
+}
+
+/**
  * Wrap a claude driver so every invocation THROUGH it is metered (anton-77l9).
  *
  * A wrapper rather than a call inside each dispatch, for the reason `dispatchClaude` itself is
@@ -259,6 +319,14 @@ export async function invocationSpend(
  * in-session produces an error row for the interrupted call and a result row for the retry. A
  * mid-stream death has no result event, so its token usage is unknown — but omitting the invocation
  * entirely would systematically understate spend.
+ *
+ * The attribution stamps (anton-z33ia) are resolved HERE, not asked of each caller, for the reason
+ * the wrapper exists at all: a per-site stamp is one a new dispatch site forgets, exactly as a
+ * per-site recording call would be. What a caller already holds it passes (the composed prompt's
+ * digest, the run's formula digest, the ticket's agent tag), because re-resolving could answer
+ * differently from the resolution that actually ran; what nothing but process state can answer —
+ * `anton_version` — this wrapper resolves, so a site passing no stamps at all still records which
+ * anton produced the row.
  */
 export function metered(
   db: AntonDb,
@@ -277,6 +345,18 @@ export function metered(
       baseUrl:
         dimensions.baseUrl ??
         (options.routing.routed ? options.routing.baseUrl : undefined),
+      // The one stamp no call site can be asked for: it is a fact about the PROCESS, not about the
+      // dispatch. Guarded, because it reads a git checkout that a broken repository can fail.
+      antonVersion: dimensions.antonVersion ?? stampOf(() => selfBuildVersion() ?? undefined),
+      // Digested from the text this invocation is SPAWNED with, for the same reason `modelRequested`
+      // is taken from the options: that string is what claude actually received. Resolving it here
+      // rather than per site is what stamps the sites no shared dispatch covers — self-review,
+      // PR-fix, and every resumed ticket attempt (PR #311 review).
+      promptDigest:
+        dimensions.promptDigest ??
+        stampOf(() =>
+          options.appendSystemPrompt ? systemPromptDigest(options.appendSystemPrompt) : undefined,
+        ),
     };
     try {
       const result = await driver(options);

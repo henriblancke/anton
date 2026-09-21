@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asc } from "drizzle-orm";
 
+import { selfBuildVersion } from "../build/drift";
+import { systemPromptDigest } from "../claude/system-prompt";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -1440,5 +1442,59 @@ describe("verify-gate evidence across a commit hook", () => {
     );
     await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
     expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+});
+
+/**
+ * The self-review half of the attribution stamps (anton-234ja). This gate is one of the two sites
+ * PR #311 found the original plan would have left unstamped — it dispatches its own driver and never
+ * touches `dispatchClaude` — so "every invocation through `metered(...)` is stamped" is asserted
+ * here, on the rows, rather than assumed from the wrapper.
+ */
+describe("runReviewGate — what produced each invocation", () => {
+  it("stamps the review and its fix round apart, each with the target's own attribution", async () => {
+    const { run, calls } = fakeClaude([report(4, [BLOCKING]), "fixed it", report(9, [])]);
+    await runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      runId: undefined,
+      target: { ...target, labels: ["agent:nextjs"] },
+      tickets: [ticket],
+      formulaDigest: "9c2e4410ab77",
+      settings: {},
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diff,
+        commit: async () => ({ committed: true }),
+        readState: async () => ({ head: "c0ffee", ref: RUN_REF, status: "" }),
+        restoreState: async () => {},
+      },
+    });
+
+    // By when they were RECORDED — `id` is a random uuid, which orders nothing. The suite's clock
+    // ticks a second per read, so dispatch order and record order are the same here.
+    const rows = await tdb.db
+      .select()
+      .from(schema.claudeInvocations)
+      .orderBy(asc(schema.claudeInvocations.recordedAt));
+    // Three dispatches: review, fix, re-review — each its own invocation, each its own row.
+    expect(rows).toHaveLength(3);
+    // The two kinds of session are metered APART by `step` — a review reads a diff, a fix rewrites
+    // the tree — while both are the same `review` handler, which is what the phase fold reads.
+    expect(rows.map((r) => r.step)).toEqual(["review", "review-fix", "review"]);
+    expect(rows.map((r) => r.stepHandler)).toEqual(["review", "review", "review"]);
+    for (const row of rows) {
+      expect(row).toMatchObject({ beadId: target.id, agentTag: "nextjs", formulaDigest: "9c2e4410ab77" });
+      // Resolved inside the meter: this gate passes no version and still records one.
+      expect(row.antonVersion).toBe(selfBuildVersion());
+    }
+    // The FIX session composes a system prompt (the operating contract + the epic's agent layer);
+    // the review deliberately does not, and records the absence rather than a digest of nothing.
+    expect(rows[1].promptDigest).toBe(systemPromptDigest(calls[1].appendSystemPrompt ?? ""));
+    expect(rows[0].promptDigest).toBeNull();
   });
 });

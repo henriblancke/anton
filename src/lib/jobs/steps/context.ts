@@ -139,6 +139,15 @@ export interface StepContext {
   /** The formula step being executed. Absent for a caller invoking a handler directly. */
   step?: CookedStep;
   /**
+   * 12-hex content digest of the cooked pipeline this run walks (anton-jpmdw), stamped on every
+   * invocation the walk produces. Carried on the context rather than re-derived at dispatch: the
+   * formula is cooked once per run, and a step that re-read the file would digest whatever an edit
+   * left there mid-run instead of what this run is actually walking.
+   *
+   * Absent for a caller invoking a handler directly, which records the stamp as the absence it is.
+   */
+  formulaDigest?: string;
+  /**
    * An already-open session the caller owns. A step that dispatches an agent or shells out records
    * into it (and leaves closing it to the caller) instead of opening its own, so a caller that keeps
    * ONE session across several steps — as execute-epic does per ticket — keeps doing so.
