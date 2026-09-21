@@ -305,7 +305,16 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
       // same gap `loadAllIssues`'s `sameBlocksEdges` retry closes for its own path (PR #274 review,
       // round 18). Compared against a fresh `loadAllIssues`, not `loadWorkIssues`, so a board that
       // merged in gate beads is compared like-for-like instead of always mismatching on their edges.
-      if (cycles.length > 0 || sameBlocksEdges(board, await loadAllIssues(cwd))) {
+      const consistent = cycles.length > 0 || sameBlocksEdges(board, await loadAllIssues(cwd));
+      // Re-check generation and evidence AFTER the `sameBlocksEdges` await, not just before it (PR
+      // #274 review, round 19): that inner `loadAllIssues` call can itself take long enough for the
+      // snapshot to be invalidated/replaced, or for a concurrent enrichment path to attach evidence to
+      // this same `board` (evidence is keyed by array identity, not by caller). Attaching on the stale
+      // pre-await checks alone would pair this cycles result with a board it may no longer describe,
+      // or clobber evidence a racing caller already attached, while still bumping the version as if
+      // this were the recovery — nothing downstream re-validates that pairing (`allIssues` has no
+      // post-enrichment generation check), so a mismatched board would flow straight to consumers.
+      if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
         attachCycleEvidence(board, cycles);
         markCycleEvidenceRecovered(cwd);
       }
