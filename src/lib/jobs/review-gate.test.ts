@@ -24,9 +24,15 @@ import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 // evidence IDs across review retries") shells out to real `bd` via `beads.setBoardEvidenceConfirmed`
 // / `beads.push` — mocked here so the many board-only fix tests below, which pass a fake `repoPath`
 // ("/repos/anton"), don't pay `mustPersist`'s real retry backoff against a `bd` that can never
-// succeed there. `beads.isBoardOnly` and everything else stays real: only these two writes shell out.
+// succeed there. `beads.show` is mocked too (chatgpt-codex-connector review, "Re-read tickets before
+// preserving closure fences") — the persist step now re-reads each board-only ticket's live state
+// before deriving its closure fence, which otherwise shells out for real and, unmocked, exhausts
+// `mustRead`'s retries against a `bd` that can never succeed at this fake path. Every fixture ticket
+// here is already closed, so the default mirrors that rather than leaving `beads.show` unmocked.
+// `beads.isBoardOnly` and everything else stays real: only these three calls shell out.
 const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string, ids: readonly string[]) => Promise<string>>();
 const boardPushMock = vi.fn<(repo: string) => Promise<string>>();
+const boardShowMock = vi.fn<(repo: string, id: string) => Promise<Bead>>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -36,11 +42,13 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidenceConfirmed: (...args: [string, string, readonly string[]]) =>
         setBoardEvidenceConfirmedMock(...args),
       push: (...args: [string]) => boardPushMock(...args),
+      show: (...args: [string, string]) => boardShowMock(...args),
     },
   };
 });
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
 boardPushMock.mockResolvedValue("synced");
+boardShowMock.mockImplementation(async (_repo, id) => ({ id, status: "closed", title: "", issue_type: "task" }));
 import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";

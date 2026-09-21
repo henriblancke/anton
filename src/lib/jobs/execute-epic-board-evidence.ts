@@ -53,9 +53,8 @@ import {
   STAGE_PREFIX,
   type Bead,
 } from "../beads/bd";
-import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { PoisonEpic } from "./errors";
-import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard, mustReadClosureVersion } from "./execute-epic-persist";
 
 /**
  * Label prefixes anton itself rewrites on a claim, a heartbeat lease refresh or a review round,
@@ -1099,11 +1098,28 @@ export async function clearBoardEvidencePending(
   // `ensureBoardBaselinePersisted`'s own reopen-reset only fires when this run redispatches the
   // ticket; a ticket reopened and closed again by anything else before that ever happens skips it
   // entirely, so the closure identity is the one signal that still catches it. Skipped for a ticket
-  // not closed (a standalone target parked at `stage:in-review` has no closure episode to name) and
-  // best-effort on a read failure — either way `setBoardEvidenceConfirmed` still lands with `closure`
-  // undefined, which a resume treats as "cannot verify" rather than as proof of staleness.
-  const closure =
-    ticket.status === "closed" ? await readCurrentClosureVersion(repo, ticketId).catch(() => undefined) : undefined;
+  // not closed (a standalone target parked at `stage:in-review` has no closure episode to name).
+  // NOT best-effort on a read failure (chatgpt-codex-connector review, "Require the closure read
+  // before confirming a closed ticket") — a swallowed `bd history` failure would land an unfenced
+  // `{ ids }` confirmation for a ticket that IS closed, and `confirmedForThisCycle`
+  // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass anyway" — the same
+  // tolerance meant for a confirmation written before this fence existed — so a later
+  // reopen-and-reclose could settle against this cycle's evidence with no new work. Retried like
+  // every other guarded read in this module; still unreadable after retries fails the whole cleanup
+  // below rather than persist a fenceless confirmation.
+  let closure: string | undefined;
+  if (ticket.status === "closed") {
+    const read = await mustReadClosureVersion(repo, ticketId);
+    if (!read.read) {
+      throw new PoisonEpic(
+        `${ticketId} delivered and closed, but its closure version could not be read from \`bd ` +
+          `history\` (after retries) — the run stopped rather than persist a delivery confirmation ` +
+          `with no closure fence, which a later reopen-and-reclose could pass as this cycle's ` +
+          `evidence with no new work. Check the beads DB, then resume the run.`,
+      );
+    }
+    closure = read.closure;
+  }
   const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure));
   // Gated on `confirmedSet` (chatgpt-codex-connector, PR #284 review, "Retain recovery evidence
   // until confirmation succeeds") — an exhausted `setBoardEvidenceConfirmed` retry must NOT be

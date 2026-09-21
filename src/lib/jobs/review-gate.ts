@@ -41,7 +41,7 @@ import {
   hydrateDescriptions,
   type BoardFingerprint,
 } from "./execute-epic-board-evidence";
-import { mustPersist, mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
 import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
@@ -556,11 +556,23 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
         // Writing `{ ids }` with no closure would erase the fence `confirmedForThisCycle`
         // (execute-epic-dispatch.ts) relies on, letting a later reopen-and-reclose before this
         // run redispatches the ticket pass as "same cycle" with no new evidence.
+        //
+        // Derived off a FRESH read, never `t` itself (chatgpt-codex-connector review, "Re-read
+        // tickets before preserving closure fences") — `t` is `tickets`/`target` as passed into
+        // this whole gate, a snapshot from before ANY round's fix ran. When THIS round's fix just
+        // closed the ticket, `t.status` still reads open/in_progress and carries no confirmed
+        // closure, so deriving off `t` would resolve `closure` to `undefined` and overwrite an
+        // existing `{ ids, closure }` confirmation with an unfenced `{ ids }`. An unreadable live
+        // ticket (after retries) fails this write rather than guess off the stale snapshot.
         const persisted = await Promise.all(
           boardOnlyUnits.map(async (t) => {
+            const live = await mustRead(repo, t.id);
+            if (!live) return false;
             const closure =
-              beads.confirmedBoardEvidenceClosure(t) ??
-              (t.status === "closed" ? await readCurrentClosureVersion(repo, t.id).catch(() => undefined) : undefined);
+              beads.confirmedBoardEvidenceClosure(live) ??
+              (live.status === "closed"
+                ? await readCurrentClosureVersion(repo, t.id).catch(() => undefined)
+                : undefined);
             return mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure));
           }),
         );
@@ -576,7 +588,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
                 allPersisted
                   ? "every ticket's write landed locally, but the confirming push could not verify " +
                     "it reached the remote"
-                  : "bd refused the write for at least one board-only ticket (after retries)"
+                  : "bd refused a read or write for at least one board-only ticket (after retries)"
               } — the run stopped rather than let a resumed attempt rebuild this round's evidence ` +
               `from stale metadata with no record of which beads this fix changed. Check the beads ` +
               `DB${allPersisted ? " and the sync channel" : ""}, then resume the run.`,

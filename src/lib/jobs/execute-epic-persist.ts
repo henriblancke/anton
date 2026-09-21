@@ -6,6 +6,7 @@
  * without, {@link mustRead} for the read a guarded write is decided on.
  */
 import { beads, type Bead } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { loadAllIssues } from "../beads/issues";
 import { sleepMs } from "../retry-helpers";
 
@@ -62,6 +63,32 @@ export async function mustRead(
     }
   }
   return undefined;
+}
+
+/**
+ * {@link readCurrentClosureVersion}, retried like every other guarded read here. Distinguishes "bd
+ * history refused every attempt" (`read: false`) from "bd history answered and this ticket has no
+ * closure episode" (`read: true, closure: undefined`) — a bare `.catch(() => undefined)` folds both
+ * into the same value, which a caller writing a closure fence cannot tell apart from a genuinely
+ * fenceless confirmation. That matters because an unfenced `{ ids }` confirmation is treated by
+ * `confirmedForThisCycle` (execute-epic-dispatch.ts) as "cannot verify, pass anyway" — the same
+ * pass-through meant for a confirmation written before the fence existed — so a transient read
+ * failure must not be allowed to silently produce one.
+ */
+export async function mustReadClosureVersion(
+  repo: string,
+  id: string,
+  attempts = 3,
+): Promise<{ read: true; closure: string | undefined } | { read: false }> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return { read: true, closure: await readCurrentClosureVersion(repo, id) };
+    } catch (e) {
+      console.error(`[execute-epic] bd history read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
+    }
+  }
+  return { read: false };
 }
 
 /**
