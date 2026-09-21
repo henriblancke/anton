@@ -659,13 +659,19 @@ function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
  * costs nothing extra, because every caller here already refuses on a read it could not make.
  *
  * `withCycles` is the caller's to decide, not this function's: only the approve/unapprove re-checks
- * ({@link CYCLE_AWARE_VERBS}) ever consult cycle evidence, and `loadAllIssues`'s `withCycles: true`
- * calls `beads.depCycles` with no try/catch — a `bd dep cycles` timeout or unreadable output would
- * otherwise reject this WHOLE read and refuse a reparent/retire/link step over a subsystem it never
- * needed (matches apply.ts's `withCycleEvidenceIfNeeded`/`CYCLE_AWARE_MOVES` for the decide half).
+ * ({@link CYCLE_AWARE_VERBS}) ever consult cycle evidence, and a reparent/retire/link step never
+ * needed the subsystem at all, let alone a refusal over it failing.
+ *
+ * `degradeCyclesOnFailure: withCycles` is what actually delivers that: a bare `withCycles: true`
+ * would still reject this WHOLE read on a `bd dep cycles` timeout or unreadable output (PR #274
+ * review) — matching apply.ts's `withCycleEvidenceIfNeeded`/`CYCLE_AWARE_MOVES` on WHICH verbs pay
+ * for cycle evidence, but not on how a failure to fetch it degrades. `lockedWrite`'s unapprove
+ * re-check and `assertStartHolds`'s approve re-check both need the latter too: their decide-time
+ * counterpart already treats a `depCycles` outage as missing evidence, which `approvalGaps`'s own
+ * `missingCycleEvidenceGap` fails closed on — not as a reason to refuse the re-check itself.
  */
 export function readWholeBoard(repo: string, withCycles: boolean): Promise<Bead[]> {
-  return loadAllIssues(repo, { strictGates: true, withCycles });
+  return loadAllIssues(repo, { strictGates: true, withCycles, degradeCyclesOnFailure: withCycles });
 }
 
 /** A bead read from inside its own write lock. A read that FAILED is never a bead that vanished. */

@@ -126,6 +126,20 @@ export interface LoadIssuesOptions {
    * `board`'s edges may set this.
    */
   skipCycleConsistencyRecheck?: boolean;
+  /**
+   * When the `bd dep cycles` fetch itself fails (timeout, unreadable output), return `board`
+   * without cycle evidence attached instead of rejecting the whole read.
+   *
+   * Mirrors gardener/apply.ts's `withCycleEvidenceIfNeeded`: a caller whose approve/unapprove
+   * write-time re-check is documented to degrade the same way its decide-time counterpart does
+   * (apply-steps.ts `readWholeBoard`, consumed by `lockedWrite`/`assertStartHolds`) must not have
+   * a `bd dep cycles` outage hard-fail the whole re-read — the move's own approval-gap check
+   * already fails closed on the missing evidence via `missingCycleEvidenceGap`. NOT the default:
+   * `approveAndClaim`'s locked guard deliberately wants the hard failure when it opts into cycles
+   * at all (see its own `withCycles` doc) — only a caller that reads `LoadIssuesOptions` docs and
+   * decides it wants graceful degradation should set this.
+   */
+  degradeCyclesOnFailure?: boolean;
 }
 
 /**
@@ -166,7 +180,18 @@ export async function loadAllIssues(
   // guarantee) it observes a graph at least as current as `board`'s own — evidence can be newer than
   // the board it's attached to, never older.
   if (!opts.withCycles) return board;
-  const cycles = await beads.depCycles(cwd);
+  let cycles: DepCycle[];
+  try {
+    cycles = await beads.depCycles(cwd);
+  } catch (e) {
+    if (!opts.degradeCyclesOnFailure) throw e;
+    console.warn(
+      `[beads.issues] ${cwd}: dep cycles read failed on a re-check that opted into graceful ` +
+        `degradation — returning the board without cycle evidence rather than failing the whole ` +
+        `read: ` + (e instanceof Error ? e.message : String(e)),
+    );
+    return board;
+  }
   // "Never older" is not "consistent": a `cycles` result only proves the graph's cycle set is
   // accurate AS OF this call, not that `work`'s own edges (snapshotted before it) still describe
   // that same graph. A repair landing in the gap between the two reads can remove one edge of a

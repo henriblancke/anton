@@ -1455,6 +1455,30 @@ function bdDepCycles(repo) {
 }
 
 /**
+ * Whether two board reads agree on every `blocks` edge — the only edge type `bd dep cycles` walks.
+ * Mirrors `src/lib/beads/issues.ts`'s `sameBlocksEdges`, which this plain-Node launcher can't import
+ * (that file is TS).
+ */
+function sameBlocksEdges(a, b) {
+  const toSet = (board) => {
+    const keys = new Set();
+    for (const bead of board) {
+      for (const dep of bead.dependencies ?? []) {
+        if (dep?.type === "blocks") keys.add(`${bead.id}>${dep.depends_on_id}`);
+      }
+    }
+    return keys;
+  };
+  const [setA, setB] = [toSet(a), toSet(b)];
+  return setA.size === setB.size && [...setA].every((k) => setB.has(k));
+}
+
+/** Bound on `cmdBoardCheck`'s re-list-and-compare retry — mirrors `issues.ts`'s
+ * `MAX_CYCLE_CONSISTENCY_RETRIES`, so a board under sustained shaping fails closed instead of
+ * spawning `bd list`/`bd dep cycles` forever. */
+const MAX_BOARD_CHECK_CYCLE_RETRIES = 3;
+
+/**
  * bd's listing as an array, or null when this build's output can't be parsed. bd --json returns
  * either a top-level array or a `{ <key>: [...] }` envelope — mirrors src/lib/beads/bd-json.ts's
  * `asArray`, which this CLI bundle can't import (that file is TS; this is a plain-Node launcher).
@@ -1567,6 +1591,15 @@ function readBoard(repo) {
  *
  * Read-only: it never writes a bead. Repair is authoring work — the report names the bead in the
  * wrong place and the command that moves it, never what the right shape of the work is.
+ *
+ * `bd list` and `bd dep cycles` are independent live reads with no shared transaction: on a
+ * shared-server board another machine can repair (or introduce) a cycle in the gap between them,
+ * leaving `cycles` describe a graph the listed `board`'s own `blocks` edges no longer match —
+ * `buildStructureReport` never independently re-traverses those edges for cycles, so this mandatory
+ * gate could exit clean against an inconsistent snapshot. Re-lists and compares `blocks` edges
+ * after the cycle query before trusting the pairing, the same `sameBlocksEdges` retry
+ * `src/lib/beads/issues.ts`'s `loadAllIssues` runs, bounded by `MAX_BOARD_CHECK_CYCLE_RETRIES` and
+ * failing closed on a graph that keeps moving faster than it can be read consistently.
  */
 function cmdBoardCheck(args) {
   const paths = args.filter((a) => !a.startsWith("-"));
@@ -1578,23 +1611,48 @@ function cmdBoardCheck(args) {
       console.error(c.red(`No .beads/ at ${repo}`) + c.dim(" — run `anton init` there, or pass a repo path."));
       return 1;
     }
-    const { board, error } = readBoard(repo);
-    if (error) {
-      console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${error}`));
-      return 1;
-    }
-    const cycleResult = bdDepCycles(repo);
-    if (cycleResult.error || cycleResult.status !== 0) {
-      const detail = cycleResult.error?.code === "ENOENT"
-        ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
-        : cycleResult.error?.message || (cycleResult.stderr ?? "").trim() || `bd dep cycles exited ${cycleResult.status}`;
-      console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
-      return 1;
-    }
-    const cycles = parseDepCycles(cycleResult.stdout);
-    if (cycles === null) {
-      console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
-      return 1;
+
+    let board, cycles;
+    for (let attempt = 0; ; attempt++) {
+      const read = readBoard(repo);
+      if (read.error) {
+        console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${read.error}`));
+        return 1;
+      }
+      const cycleResult = bdDepCycles(repo);
+      if (cycleResult.error || cycleResult.status !== 0) {
+        const detail = cycleResult.error?.code === "ENOENT"
+          ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+          : cycleResult.error?.message || (cycleResult.stderr ?? "").trim() || `bd dep cycles exited ${cycleResult.status}`;
+        console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
+        return 1;
+      }
+      const parsedCycles = parseDepCycles(cycleResult.stdout);
+      if (parsedCycles === null) {
+        console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
+        return 1;
+      }
+
+      const recheck = readBoard(repo);
+      if (recheck.error) {
+        console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${recheck.error}`));
+        return 1;
+      }
+      if (sameBlocksEdges(read.board, recheck.board)) {
+        board = read.board;
+        cycles = parsedCycles;
+        break;
+      }
+      if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) {
+        console.error(
+          c.red(`bd dep cycles failed in ${repo}`) +
+            c.dim(
+              `\ndependency graph kept moving across ${MAX_BOARD_CHECK_CYCLE_RETRIES + 1} reads of ` +
+                "bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
+            ),
+        );
+        return 1;
+      }
     }
 
     const report = buildStructureReport(board, { cycles });
