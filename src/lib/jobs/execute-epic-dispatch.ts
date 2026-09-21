@@ -12,6 +12,7 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { appendSessionLog } from "../sessions";
@@ -1403,7 +1404,35 @@ async function dispatchTicket(
     }
     return;
   }
-  if (doneOnBoard && isBoardOnlyRun(run, ticket) && beads.boardEvidenceConfirmed(ticket)) {
+  // A confirmed board-only ticket can be reopened for rework and closed again by something other
+  // than THIS run — another board writer, or a process outside anton entirely — before this run
+  // ever redispatches it (chatgpt-codex-connector, anton-fc5x review, "Invalidate confirmation when
+  // the ticket is reopened"). `ensureBoardBaselinePersisted`'s own reopen-reset only clears a stale
+  // `boardEvidenceConfirmed` when THIS run actually redispatches the ticket — the one call site that
+  // can prove a new cycle started — but this fast path is precisely what skips that redispatch, so a
+  // reopen-and-reclose with no new dispatch in between leaves the OLD confirmation standing and this
+  // fast path accepts the new cycle without finding any new board delta. `currentClosureVersion`
+  // survives exactly this: it names the closure EPISODE, not just the flag, from `bd history` rather
+  // than anton's own (possibly stale) board read, so a reopen this run's read never caught still
+  // changes it. Compared only for a ticket THIS read finds closed — a standalone target parked at
+  // `stage:in-review` never closes, so it has no episode to compare and keeps trusting the flag as
+  // before — and only when a closure was actually recorded at confirmation time, since a
+  // confirmation written before this fence existed (`confirmedClosure` undefined) cannot be checked
+  // either way; both fall back to the pre-fix behavior rather than block on an unanswerable question.
+  // A mismatch (or an unreadable current closure, which fails closed the same way) is treated as "not
+  // confirmed for this cycle" — this whole block is skipped, and the ticket falls through to the
+  // regeneration path below, which redispatches it and lets `ensureBoardBaselinePersisted` clear the
+  // stale confirmation as it establishes the new cycle's own baseline.
+  const confirmedClosure =
+    doneOnBoard && ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
+  const confirmedForThisCycle =
+    doneOnBoard &&
+    isBoardOnlyRun(run, ticket) &&
+    beads.boardEvidenceConfirmed(ticket) &&
+    (ticket.status !== "closed" ||
+      confirmedClosure === undefined ||
+      confirmedClosure === (await readCurrentClosureVersion(repo, ticket.id).catch(() => undefined)));
+  if (confirmedForThisCycle) {
     // The pending marker and preserved baseline that would normally carry these ids are the very
     // things `clearBoardEvidencePending` cleared when it set the confirmed flag — `bd.ts` persists
     // them alongside it for exactly this resume (PR #284 review, "track which beads a

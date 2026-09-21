@@ -18,7 +18,7 @@
  * loop and the delivery verdict all RUN.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { LABELS, type Bead } from "../beads/bd";
+import { LABELS, type Bead, type BeadVersion } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { resumeSkipped } from "../ticket-view";
 import type { EpicRun } from "./execute-epic-run";
@@ -74,6 +74,12 @@ vi.mock("./step-registry", () => ({
   recordBoardOnlyAttribution: (...args: unknown[]) => recordBoardOnlyAttributionMock(...args),
 }));
 
+// The confirmed-fast-path closure fence (anton-fc5x review, "Invalidate confirmation when the
+// ticket is reopened") reads `bd history` via `readCurrentClosureVersion` — mocked so a CLOSED
+// ticket's current closure episode is deterministic in tests, not a live `bd history` call. Every
+// test that reaches the confirmed fast path with a bare-array (legacy) `boardEvidenceConfirmed`
+// value never calls this at all, since the closure gate short-circuits on an absent stored closure.
+const historyMock = vi.fn<(repo: string, id: string) => Promise<BeadVersion[]>>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -86,6 +92,7 @@ vi.mock("../beads/bd", async () => {
       reopen: vi.fn(async () => ""),
       show: vi.fn(async () => undefined),
       list: vi.fn(async () => []),
+      history: (repo: string, id: string) => historyMock(repo, id),
     },
   };
 });
@@ -201,6 +208,7 @@ beforeEach(() => {
   satisfiedByMock.mockReset().mockResolvedValue(undefined);
   branchAddedMock.mockReset().mockResolvedValue(true);
   reopenMock.mockReset().mockResolvedValue("");
+  historyMock.mockReset().mockResolvedValue([]);
   // Faithful default: a tag/untag the subsequent `show` reads back on the board bead, so the
   // post-write reread in retireFound sees the marker it just wrote (PR #238 review).
   tagMock.mockReset().mockImplementation(async (_repo: string, id: string, labels: string[]) => {
@@ -1277,6 +1285,59 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
       expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([confirmedChild]);
       expect(outcome.delivered.map((b) => b.id)).toContain("anton-b");
+    },
+  );
+
+  // chatgpt-codex-connector, anton-fc5x review, "Invalidate confirmation when the ticket is
+  // reopened": a ticket reopened for rework and closed again by something other than THIS run,
+  // before this run ever redispatches it, still carries the OLD confirmation — the reopen-reset in
+  // `ensureBoardBaselinePersisted` only runs on redispatch, which this fast path is precisely what
+  // skips. The stored closure names the earlier, already-settled cycle, so it must not match the
+  // ticket's current one.
+  it(
+    "does not trust a durably confirmed delivery whose closure names an earlier, already-settled " +
+      "cycle — the ticket was reopened and closed again with no new dispatch in between",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "old-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([
+        { hash: "new-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+      expect(reopenMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a");
+      expect(dispatchedIds()).toEqual(["anton-a"]);
+    },
+  );
+
+  it(
+    "still trusts a durably confirmed delivery whose stored closure matches the ticket's current " +
+      "one — the ordinary resume, unaffected by the closure fence",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(dispatchedIds()).toEqual([]);
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
     },
   );
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Bead } from "../beads/bd";
+import type { Bead, BeadVersion } from "../beads/bd";
 
 const pushMock = vi.fn<(repo: string) => Promise<string>>();
 // The evidence check reads the board through `mustReadBoard` (anton-fc5x review round 2), never a
@@ -29,7 +29,8 @@ const clearBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) =
 // The durable delivery-confirmed marker (PR #284 review, "no record that this bead's board-only
 // delivery ever happened") shells out to `bd update` too — mocked for the same reason the other
 // board-evidence writes above are.
-const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+const setBoardEvidenceConfirmedMock =
+  vi.fn<(repo: string, id: string, ids?: readonly string[], closure?: string) => Promise<string>>();
 // The reopen-reset (PR #284 review, "Reset stale confirmations before a reopened delivery") shells
 // out to `bd update` too — mocked for the same reason the other board-evidence writes above are.
 const clearBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
@@ -37,6 +38,10 @@ const clearBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Prom
 // review) — mocked so the hydration tests below exercise that fallback, not a live `bd show`
 // against a fake "/repo".
 const showMock = vi.fn<(repo: string, id: string) => Promise<Bead | undefined>>();
+// The closure fence (anton-fc5x review, "Invalidate confirmation when the ticket is reopened")
+// reads `bd history` via `readCurrentClosureVersion` — mocked so the confirmation tests control
+// which closure episode a closed ticket reads as current, instead of a live `bd history` call.
+const historyMock = vi.fn<(repo: string, id: string) => Promise<BeadVersion[]>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -54,6 +59,7 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
       clearBoardEvidenceConfirmed: clearBoardEvidenceConfirmedMock,
       show: showMock,
+      history: historyMock,
     },
   };
 });
@@ -84,6 +90,9 @@ setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
 clearBoardEvidenceConfirmedMock.mockResolvedValue("");
+// No closed history by default — every existing test's fixture bead is `status: "open"`, which
+// never reaches the closure read at all; the tests that DO care about it set their own fixture.
+historyMock.mockResolvedValue([]);
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -1376,11 +1385,46 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         [],
         [LABELS.boardEvidencePending(["a"])],
       );
-      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "t-union-recover", [
-        "a",
-        "b",
-        "c",
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-union-recover",
+        ["a", "b", "c"],
+        undefined,
+      );
+    },
+  );
+
+  it(
+    "carries the ticket's current closure episode alongside the confirmation for a CLOSED ticket " +
+      "(anton-fc5x review, 'Invalidate confirmation when the ticket is reopened') — the one signal a " +
+      "later resume can use to tell this cycle's confirmation apart from an earlier one a reopen " +
+      "left standing",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      historyMock.mockResolvedValueOnce([
+        { hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
       ]);
+      const ticket = bead("t-closed-confirm", { status: "closed" });
+      await clearBoardEvidencePending("/repo", ticket, ["a"]);
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "t-closed-confirm", ["a"], "close-sha");
+    },
+  );
+
+  it(
+    "omits the closure when `bd history` cannot be read, rather than failing the confirmation write " +
+      "over it — a resume then reads `confirmedBoardEvidenceClosure` as undefined and falls back to " +
+      "trusting the flag, exactly as it does for a confirmation written before this fence existed",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      historyMock.mockRejectedValueOnce(new Error("dolt offline"));
+      const ticket = bead("t-closed-history-fails", { status: "closed" });
+      await clearBoardEvidencePending("/repo", ticket, ["a"]);
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-closed-history-fails",
+        ["a"],
+        undefined,
+      );
     },
   );
 

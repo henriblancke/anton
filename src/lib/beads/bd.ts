@@ -1387,22 +1387,51 @@ export const beads = {
   /** The evidence ids a confirmed board-only delivery touched, parsed back off the same metadata
    * {@link beads.boardEvidenceConfirmed} checks (PR #284 review) — empty when the stored value
    * predates this field or is unreadable, read as "confirmed but nothing to attribute" rather than
-   * thrown, matching {@link beads.boardEvidenceBaseline}'s tolerance for a malformed value. */
+   * thrown, matching {@link beads.boardEvidenceBaseline}'s tolerance for a malformed value. Reads
+   * both the legacy bare-array shape and the current `{ ids, closure }` shape (anton-fc5x review,
+   * "Invalidate confirmation when the ticket is reopened") — see {@link beads.confirmedBoardEvidenceClosure}. */
   confirmedBoardEvidenceIds: (b: Bead): string[] => {
     const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
     if (typeof raw !== "string" || !raw) return [];
     try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+      const parsed: unknown = JSON.parse(raw);
+      const ids = Array.isArray(parsed) ? parsed : (parsed as { ids?: unknown } | null)?.ids;
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
     } catch {
       return [];
+    }
+  },
+
+  /** The closure episode a confirmed board-only delivery was recorded against, if any (anton-fc5x
+   * review, "Invalidate confirmation when the ticket is reopened") — `undefined` for a confirmation
+   * written before this fence existed, or for one recorded while the ticket stayed open (a standalone
+   * target at `stage:in-review`, which has no closure episode to fence). `dispatchTicket`'s confirmed
+   * fast path (execute-epic-dispatch.ts) compares this against {@link
+   * import("./closure-cycle").readCurrentClosureVersion} before trusting a CLOSED ticket's
+   * confirmation: a ticket reopened and closed again by anything other than this run — before this
+   * run ever redispatches it — starts a new closure episode this stored value does not name, and
+   * `ensureBoardBaselinePersisted`'s own reopen-reset (see {@link beads.clearBoardEvidenceConfirmed})
+   * never runs for a ticket the confirmed fast path skips redispatching entirely. */
+  confirmedBoardEvidenceClosure: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const closure = (parsed as { closure?: unknown } | null)?.closure;
+      return typeof closure === "string" ? closure : undefined;
+    } catch {
+      return undefined;
     }
   },
 
   /** Record, permanently, that this ticket's board-only delivery was confirmed — written once,
    * beside the pending-marker/baseline clear, and never unset. Carries `ids` (the confirmed
    * evidence) along with the flag, since the pending-marker label and preserved-baseline metadata
-   * that otherwise carry them are cleared in the same handoff.
+   * that otherwise carry them are cleared in the same handoff. Also carries `closure` — the ticket's
+   * {@link import("./closure-cycle").currentClosureVersion} at confirmation time, for a ticket closed
+   * this cycle — so a later resume can tell THIS confirmation apart from one an earlier, already-
+   * settled cycle left behind (anton-fc5x review, "Invalidate confirmation when the ticket is
+   * reopened"); see {@link beads.confirmedBoardEvidenceClosure}.
    *
    * Written through `--metadata @file`, never `--set-metadata key=value` (chatgpt-codex-connector,
    * PR #284 review, "Keep confirmed evidence IDs out of a single argv argument") — same ~128KiB
@@ -1411,11 +1440,12 @@ export const beads = {
    * merely failing to retry a cleanup) leaves a large board-only batch unable to ever record its
    * delivery as confirmed. See {@link beads.setBoardEvidenceBaseline} for the same bound applied to
    * the baseline write. */
-  setBoardEvidenceConfirmed: async (cwd: string, id: string, ids: readonly string[] = []) => {
+  setBoardEvidenceConfirmed: async (cwd: string, id: string, ids: readonly string[] = [], closure?: string) => {
     const dir = mkdtempSync(join(tmpdir(), "anton-bd-confirmed-"));
     try {
       const file = join(dir, "metadata.json");
-      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CONFIRMED_KEY]: JSON.stringify(ids) }));
+      const value = closure === undefined ? { ids } : { ids, closure };
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CONFIRMED_KEY]: JSON.stringify(value) }));
       return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });

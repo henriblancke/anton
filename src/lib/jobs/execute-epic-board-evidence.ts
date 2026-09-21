@@ -53,6 +53,7 @@ import {
   STAGE_PREFIX,
   type Bead,
 } from "../beads/bd";
+import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { PoisonEpic } from "./errors";
 import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
 
@@ -1092,7 +1093,18 @@ export async function clearBoardEvidencePending(
   // known id set on a retry (pending ids UNIONED with whatever
   // `beads.confirmedBoardEvidenceIds`/`beads.cleanupUnsyncedBoardEvidenceIds` already know), never
   // just the ids freshly found this attempt.
-  const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids));
+  // The ticket's current closure episode, if it has one (anton-fc5x review, "Invalidate confirmation
+  // when the ticket is reopened") — carried alongside the confirmation so a LATER resume can tell
+  // this cycle's confirmation apart from an earlier one a reopen-and-reclose left standing.
+  // `ensureBoardBaselinePersisted`'s own reopen-reset only fires when this run redispatches the
+  // ticket; a ticket reopened and closed again by anything else before that ever happens skips it
+  // entirely, so the closure identity is the one signal that still catches it. Skipped for a ticket
+  // not closed (a standalone target parked at `stage:in-review` has no closure episode to name) and
+  // best-effort on a read failure — either way `setBoardEvidenceConfirmed` still lands with `closure`
+  // undefined, which a resume treats as "cannot verify" rather than as proof of staleness.
+  const closure =
+    ticket.status === "closed" ? await readCurrentClosureVersion(repo, ticketId).catch(() => undefined) : undefined;
+  const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure));
   // Gated on `confirmedSet` (chatgpt-codex-connector, PR #284 review, "Retain recovery evidence
   // until confirmation succeeds") — an exhausted `setBoardEvidenceConfirmed` retry must NOT be
   // followed by clearing the marker/baseline anyway. Both clears are immediately visible on a
