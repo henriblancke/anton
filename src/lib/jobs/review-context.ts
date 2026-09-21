@@ -252,9 +252,21 @@ export async function buildReviewPrompt(args: {
   verified?: VerifyGateOutcome[];
   /** Gates ran but their results were discarded — they wrote to the tree. See {@link ReviewRun}. */
   gatesDiscarded?: boolean;
+  /**
+   * The reviewer contract already resolved for this gate — pass through the exact
+   * `resolveReviewerContract` result the caller stamped its ledger meter with, rather than letting
+   * this call resolve its own. `settings`/`projectDir`/`baseRev` are fixed for a whole gate, but
+   * `resolveReviewerContract` still reads live sources (a project-local agent prompt, the operator's
+   * saved review prompt, anton's own bundled `review` skill) that can change between the moment the
+   * gate stamped its meter and a later round's call here — an edited reviewer would then read a
+   * prompt the ledger never recorded producing it. Omit only when no gate-level contract exists yet
+   * (tests, or any other caller that wants a fresh resolution).
+   */
+  reviewerContract?: { reasoning: string; reviewer: ReviewerSource; attribution: ReasoningAttribution };
 }): Promise<{ prompt: string; reviewer: ReviewerSource }> {
   const { target, tickets, diff, settings, projectDir, baseRev } = args;
-  const { reasoning, reviewer } = await resolveReviewerContract(settings, projectDir, baseRev);
+  const { reasoning, reviewer } =
+    args.reviewerContract ?? (await resolveReviewerContract(settings, projectDir, baseRev));
 
   // Both rulebooks, always: principles don't supersede the instruction files, they sit beside them.
   // A project can state a standing rule in either, and the caveat below tells the reviewer that only

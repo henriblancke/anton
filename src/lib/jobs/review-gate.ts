@@ -312,15 +312,17 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
   const baseRev = await mergeBase(worktreePath, baseBranch);
 
-  // Resolved once, up front, to stamp the REVIEW meter with who actually reviews (PR #313 review):
-  // `config` and `baseRev` are both fixed for the whole gate, so this answers identically whichever
-  // round asks. `buildReviewPrompt` re-resolves it per round for its own prompt text — a second read
-  // of the same fixed inputs, not a second answer.
-  const { reviewer: initialReviewer, attribution: reviewAttribution } = await resolveReviewerContract(
-    settings,
-    worktreePath,
-    baseRev,
-  );
+  // Resolved once, up front, to stamp the REVIEW meter with who actually reviews (PR #313 review),
+  // and handed to every round's `buildReviewPrompt` below instead of letting it re-resolve: `config`
+  // and `baseRev` are fixed for the whole gate, but `resolveReviewerContract` still reads LIVE
+  // sources for the reasoning text itself (a project-local agent prompt, the operator's saved review
+  // prompt, anton's own bundled `review` skill on disk) that can change between rounds — a
+  // multi-round gate can run long enough for an edited reviewer or a redeployed skill to land
+  // mid-gate. Re-resolving per round would then dispatch different reasoning text than the meter
+  // (built once, below) was stamped with, misattributing that round's cost/quality to the wrong
+  // producer. One resolution, reused everywhere, keeps the ledger and the actual prompt in lockstep.
+  const reviewerContract = await resolveReviewerContract(settings, worktreePath, baseRev);
+  const { reviewer: initialReviewer, attribution: reviewAttribution } = reviewerContract;
 
   // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
   // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
@@ -399,6 +401,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       round,
       maxRounds: config.maxRounds,
       claude,
+      reviewerContract,
       sandbox,
       readState,
       restoreState,
@@ -544,6 +547,12 @@ async function runReviewSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /**
+   * The reviewer contract `runReviewGate` resolved once and stamped its meter with — threaded
+   * through to `buildReviewPrompt` so every round dispatches exactly the reasoning text the ledger
+   * recorded, even if the underlying agent prompt or bundled skill changes on disk mid-gate.
+   */
+  reviewerContract: { reasoning: string; reviewer: ReviewerSource; attribution: ReasoningAttribution };
   /** OS-level filesystem containment for this session — resolved once per gate (anton-t6tu). */
   sandbox: ReviewSandboxSettings;
   readState: (worktreePath: string) => Promise<WorktreeState>;
@@ -662,6 +671,7 @@ async function runReviewSession(args: {
         previousBlocking: args.previousBlocking,
         verified,
         gatesDiscarded,
+        reviewerContract: args.reviewerContract,
       });
       await appendSessionLog(
         logPath,
