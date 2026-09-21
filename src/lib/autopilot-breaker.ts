@@ -209,8 +209,19 @@ function commits(n: number): string {
  *
  * The counterpart of the run-side `staleCheckoutRefusal` (jobs/execute-epic-freshness.ts): the same
  * halves, phrased for a card (detail + per-half evidence with its command) rather than a park line.
+ *
+ * `isBundle` picks the schema remedy (PR #281 review): `bun run db:migrate` is only executable in a
+ * source checkout — `scripts/build-bundle.mjs` ships no `drizzle-kit` devDep, so a release bundle has
+ * no `bun run` for it to invoke at all. A bundle install instead applies pending migrations
+ * in-process on every `anton start` (including the daemon's own startup), so its remedy is the
+ * restart every other latched half on this card already asks for, not a source-only script. The
+ * caller passes it rather than this module reading the filesystem itself, keeping this a pure
+ * function of its inputs.
  */
-export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefined {
+export function staleBreaker(
+  freshness: SelfFreshness,
+  { isBundle = false }: { isBundle?: boolean } = {},
+): AutopilotStale | undefined {
   const behind: string[] = [];
   const evidence: string[] = [];
 
@@ -242,6 +253,23 @@ export function staleBreaker(freshness: SelfFreshness): AutopilotStale | undefin
     // half `git pull`/`bun install` does not fix, cleared only by the restart the card already asks for.
     behind.push("its running build is out of date");
     evidence.push("The code on disk has moved past the build anton is running — restart anton");
+  }
+  if (freshness.schema.state === "pending") {
+    // The half `staleCheckoutRefusal` gained for anton-sm1l but this card did not (PR #281 review):
+    // without it, the dispatch gate defers every non-`execute-epic` job the instant schema goes
+    // pending while this band stays empty — "nothing renders when the checkout is clean" then lies,
+    // since the checkout is not clean, work is piling up `queued`, and the only visible trace is each
+    // job's own `lastError`. Database, not disk or process, so — unlike `replaced` and `drifted` —
+    // this clears for every process at once the moment the migration runs, no restart to wait for.
+    const { migrations } = freshness.schema;
+    const many = migrations.length !== 1;
+    behind.push(`${migrations.length} pending migration${many ? "s" : ""}`);
+    evidence.push(
+      `anton.db has pending migration${many ? "s" : ""} (${migrations.join(", ")}) — ` +
+        (isBundle
+          ? "restart anton (`anton stop` && `anton start`) to apply them"
+          : "run `bun run db:migrate`"),
+    );
   }
 
   if (evidence.length === 0) return undefined;

@@ -1,10 +1,13 @@
 /**
  * Real-git + real-fixture round-trip for {@link checkSelfFreshness} (anton-vzhf): each verdict is
- * exercised against a checkout or a node_modules built to produce it — behind, up to date, no
- * upstream, an unreachable remote, and a lockfile that matches or has drifted. Skipped when `git`
- * isn't installed.
+ * exercised against a checkout, a node_modules or a database built to produce it — behind, up to
+ * date, no upstream, an unreachable remote, a lockfile that matches or has drifted, and a schema
+ * with migrations still pending (anton-sm1l). Skipped when `git` isn't installed.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -64,6 +67,52 @@ function installPackage(dir: string, name: string, version: string): void {
   mkdirSync(pkgDir, { recursive: true });
   writeFileSync(join(pkgDir, "package.json"), JSON.stringify({ name, version }));
 }
+
+interface Migration {
+  name: string;
+  sql: string;
+}
+
+/**
+ * A migration set in the checkout's `drizzle/`, journal included — the source side of the schema
+ * half's comparison. Purpose-built rather than the repo's own 42, so a case can leave part of it
+ * unapplied without editing bookkeeping rows by hand.
+ */
+function writeMigrations(dir: string, migrations: Migration[]): string {
+  const out = join(dir, "drizzle");
+  mkdirSync(join(out, "meta"), { recursive: true });
+  for (const { name, sql } of migrations) writeFileSync(join(out, `${name}.sql`), sql);
+  writeFileSync(
+    join(out, "meta", "_journal.json"),
+    JSON.stringify({
+      version: "6",
+      dialect: "sqlite",
+      entries: migrations.map(({ name }, idx) => ({
+        idx,
+        version: "6",
+        when: 1_000 + idx,
+        tag: name,
+        breakpoints: true,
+      })),
+    }),
+  );
+  return out;
+}
+
+/** Apply `migrations` to `dbPath` the way a source checkout's `drizzle-kit migrate` does. */
+function applySchema(dbPath: string, migrationsFolder: string): void {
+  const sqlite = new Database(dbPath);
+  try {
+    migrate(drizzle(sqlite), { migrationsFolder });
+  } finally {
+    sqlite.close();
+  }
+}
+
+const SCHEMA: Migration[] = [
+  { name: "0000_first", sql: "CREATE TABLE first (id integer primary key);" },
+  { name: "0001_second", sql: "CREATE TABLE second (id integer primary key);" },
+];
 
 suite("checkSelfFreshness (real git + fixtures)", () => {
   let sandbox: string;
@@ -264,6 +313,86 @@ suite("checkSelfFreshness (real git + fixtures)", () => {
     it("leaves no snapshot to latch on when the lockfile cannot be read", async () => {
       rmSync(join(repo, "bun.lock"), { force: true });
       expect(await readBootDependencies(repo)).toBeNull();
+    });
+  });
+
+  /**
+   * The schema half (anton-sm1l) — the one the other three cannot see. A pull moves the code and
+   * the migration files together, so a checkout can be current, its packages matched and its build
+   * adopted while the database is still on the schema that code outgrew.
+   *
+   * `ANTON_DB` is what the half resolves the database through (via `build/drift`'s own resolver), so
+   * each case points it at a temp file of its own — never the sandbox's, and never the real one.
+   */
+  describe("the schema the database is on", () => {
+    const quiet: RunningProcess = {
+      id: "self",
+      buildDrift: () => null,
+      bootDependencies: () => null,
+    };
+    const realDb = process.env.ANTON_DB;
+    let dbPath: string;
+    let migrations: string;
+
+    beforeEach(() => {
+      dbPath = join(sandbox, "schema.db");
+      process.env.ANTON_DB = dbPath;
+      migrations = writeMigrations(repo, SCHEMA);
+    });
+
+    afterEach(() => {
+      process.env.ANTON_DB = realDb;
+    });
+
+    it("reports an all-applied database clean", async () => {
+      applySchema(dbPath, migrations);
+
+      const { schema } = await checkSelfFreshness(repo, quiet);
+
+      expect(schema).toEqual({ state: "current" });
+    });
+
+    it("names the migrations a pull added but nothing applied", async () => {
+      applySchema(dbPath, migrations);
+      // The operator's `git pull`: the checkout carries a migration the database has never seen.
+      writeMigrations(repo, [
+        ...SCHEMA,
+        { name: "0002_third", sql: "CREATE TABLE third (id integer primary key);" },
+      ]);
+
+      const { schema } = await checkSelfFreshness(repo, quiet);
+
+      expect(schema).toEqual({ state: "pending", migrations: ["0002_third.sql"] });
+    });
+
+    it("is stale on the schema alone while every other half reads current", async () => {
+      // The gap both observed failures fell through: nothing but this half can see it.
+      applySchema(dbPath, writeMigrations(join(sandbox, "applied"), SCHEMA.slice(0, 1)));
+
+      const { schema, checkout, dependencies, build } = await checkSelfFreshness(repo, quiet);
+
+      expect(schema).toEqual({ state: "pending", migrations: ["0001_second.sql"] });
+      expect(checkout).toEqual({ state: "current" });
+      expect(dependencies).toEqual({ state: "match" });
+      expect(build).toEqual({ state: "current" });
+    });
+
+    it("reports unknown, not clean, when there is no database to read yet", async () => {
+      // A first-run install before `anton setup`. Claiming current here is the false green this
+      // module refuses everywhere else — and the check must not CREATE the database either.
+      const { schema } = await checkSelfFreshness(repo, quiet);
+
+      expect(schema.state).toBe("unknown");
+      expect(() => new Database(dbPath, { readonly: true, fileMustExist: true })).toThrow();
+    });
+
+    it("reports unknown, not clean, when the checkout carries no migrations to compare", async () => {
+      applySchema(dbPath, migrations);
+      rmSync(migrations, { recursive: true, force: true });
+
+      const { schema } = await checkSelfFreshness(repo, quiet);
+
+      expect(schema.state).toBe("unknown");
     });
   });
 
