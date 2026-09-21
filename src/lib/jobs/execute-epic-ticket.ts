@@ -309,12 +309,11 @@ export async function assertDelivered(
     // false success the gate exists to catch; a `blocked` self-report corroborates the block and
     // carries the agent's own reason forward; a `satisfied` claim that the branch did not bear out
     // is named as unverified. A missing line just reads as the plain gate message.
-    throw new NoDeliveryError(
+    const structural =
       `${ticket.id} produced no delivery: claude exited cleanly and passed the verify gates but ` +
-        `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
-        `halting the epic — nothing landed, so closing it would be a false success.` +
-        selfReportSuffix(selfReport),
-    );
+      `left no changes to commit (zero diff). Blocking the ticket for operator review and ` +
+      `halting the epic — nothing landed, so closing it would be a false success.`;
+    throw new NoDeliveryError(structural + selfReportSuffix(selfReport), structural, selfReport);
   }
   // Commit evidence exists, but the agent SELF-REPORTED blocked (anton-j5i8): it is telling us
   // the ticket is not actually done. Honor that honest signal — block the ticket for a human
@@ -323,10 +322,19 @@ export async function assertDelivered(
   // block) so the partial work isn't lost and a human decides. A `delivered`/missing self-report
   // with a real commit is the normal path and proceeds to close/in-review below.
   if (selfReport?.outcome === "blocked") {
+    // `structural` skips the parenthetical agent quote `formatAntonResult` renders into the message
+    // below — that quote IS the agent's half, already held apart on `selfReport` — so anton's own
+    // half is recoverable without re-parsing it back out of the rendered sentence.
+    const structural =
+      `${ticket.id} was self-reported blocked by the agent even though it committed changes. ` +
+      `Blocking the ticket for operator review and halting the epic — the agent declared the work ` +
+      `incomplete, so closing it would be a false success.`;
     throw new BlockedByAgentError(
       `${ticket.id} was self-reported blocked by the agent (${formatAntonResult(selfReport)}) even ` +
         `though it committed changes. Blocking the ticket for operator review and halting the epic — ` +
         `the agent declared the work incomplete, so closing it would be a false success.`,
+      structural,
+      selfReport,
     );
   }
   // The evidence is a PREVIOUS attempt's preserved `WIP` commit and this run's agent never said the
@@ -337,15 +345,19 @@ export async function assertDelivered(
   // other ticket, and the presence of work someone else preserved is no reason to treat it as more
   // finished than it says it is.
   if (facts.preservedAdoption && selfReport?.outcome !== "delivered") {
-    throw new NoDeliveryError(
+    // No suffix is folded into the message here — the missing/non-delivered self-report is already
+    // anton's own reasoning (see the sentence below), not a quote of the agent's words — so
+    // `structural` is the whole message, and whatever the agent DID report (if anything short of
+    // `delivered`) still rides along on `selfReport` for a reader that wants it.
+    const structural =
       `${ticket.id} produced no delivery: claude left no changes to commit (zero diff) and no ` +
-        `\`ANTON-RESULT\` from this run says the ticket is finished, so the only work on the branch ` +
-        `is the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time. ` +
-        `Blocking the ticket for operator ` +
-        `review and halting the epic — nothing this run did says that work is finished, so ` +
-        `adopting it as the delivery would be a false success. Finish it by hand or resume the run ` +
-        `with a raised ticketTimeoutMinutes.`,
-    );
+      `\`ANTON-RESULT\` from this run says the ticket is finished, so the only work on the branch ` +
+      `is the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time. ` +
+      `Blocking the ticket for operator ` +
+      `review and halting the epic — nothing this run did says that work is finished, so ` +
+      `adopting it as the delivery would be a false success. Finish it by hand or resume the run ` +
+      `with a raised ticketTimeoutMinutes.`;
+    throw new NoDeliveryError(structural, structural, selfReport ?? null);
   }
   progress.delivered = true;
 }
