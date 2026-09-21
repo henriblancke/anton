@@ -173,7 +173,14 @@ export function validateBoardStructure(board, { cycles } = {}) {
         isTicketType(blocker) &&
         dispatchOwner !== undefined &&
         dispatchOwner === dispatchOwnerOf(blocker, byId, board);
-      if (partnerOfParent && !bothDispatchedTickets) {
+      // A gate/molecule on either end is never exempted by `bothDispatchedTickets` (it isn't a
+      // ticket type), yet its parent-child placement carries no tier ordering at all — an ad-hoc
+      // gate reparented under the ticket it blocks (gate-molecule.integration.test.ts) is the
+      // normal shape for "wait on this human/timer step", and the `blocks` edge IS that wait, not
+      // a redundant echo of a tier the parent-child edge already encodes.
+      const involvesPipelineType =
+        PIPELINE_TYPES.has(bead.issue_type ?? "") || PIPELINE_TYPES.has(blocker.issue_type ?? "");
+      if (partnerOfParent && !bothDispatchedTickets && !involvesPipelineType) {
         fault(
           bead.id,
           "blocks-duplicates-parent",

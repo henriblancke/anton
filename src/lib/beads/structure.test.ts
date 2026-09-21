@@ -121,6 +121,20 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "waiter")).toEqual([]);
     });
 
+    it("does not fault a gate reparented under the ticket it blocks (P2 review on PR #274)", () => {
+      // An ad-hoc `bd gate create --blocks <bead>` gate can be reparented under the bead it gates
+      // (gate-molecule.integration.test.ts) — a supported shape, and the normal one for "wait on
+      // this human/timer step". The gate's `blocks` edge on `waiter` IS that wait, not a redundant
+      // echo of a tier the parent-child edge already orders — `bothDispatchedTickets` can never
+      // exempt it (a gate isn't a ticket type), so the exemption must come from pipeline-type alone.
+      const board = [
+        ...HEALTHY,
+        task("waiter", "f1", { dependencies: [blocks("waiter", "gate1")] }),
+        bead("gate1", "gate", { parent: "waiter" }),
+      ];
+      expect(rulesFor(board, "waiter")).toEqual([]);
+    });
+
     it("faults a blocks edge on a pair already linked parent-child (parent waiting on its child)", () => {
       const board = [epic("e1", { dependencies: [blocks("e1", "f1")] }), feature("f1", "e1")];
       expect(rulesFor(board, "e1")).toEqual(["blocks-duplicates-parent"]);
