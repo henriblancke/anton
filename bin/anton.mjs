@@ -27,6 +27,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -670,6 +671,11 @@ function installSkillDir(srcDir, destDir, { force = false } = {}) {
   for (const rel of drifted) {
     const dest = join(destDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
+    // copyFileSync follows a destination symlink and writes through it into whatever it points
+    // at — unlink first so a refresh replaces the link itself, never a file outside the skill dir.
+    try {
+      if (lstatSync(dest).isSymbolicLink()) unlinkSync(dest);
+    } catch {}
     copyFileSync(join(srcDir, rel), dest);
   }
   if (state === "outdated") {

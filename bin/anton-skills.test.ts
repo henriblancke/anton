@@ -8,7 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -276,6 +276,31 @@ describe("installSkillDir", () => {
     expect(installSkillDir(src, dest)).toBe("stale");
     expect(installSkillDir(src, dest, { force: true })).toBe("updated");
     expect(existsSync(join(dest, "templates.md"))).toBe(true);
+  });
+
+  // A refresh copies with copyFileSync, which follows a destination symlink and writes through it
+  // — so a pristine copy whose SKILL.md happens to be a symlink to something outside the skill dir
+  // must have that link replaced, never overwritten in place (anton-z33ia review).
+  it("replaces a destination symlink instead of writing through it into an external file", async () => {
+    installSkillDir(src, dest);
+    const externalDir = await tempDir("anton-skill-external-");
+    try {
+      const externalFile = join(externalDir, "external-SKILL.md");
+      writeFileSync(externalFile, "placeholder\n");
+      rmSync(join(dest, "SKILL.md"));
+      symlinkSync(externalFile, join(dest, "SKILL.md"));
+      // Writes through the symlink into externalFile, stamped so `dest` reads as pristine.
+      seedOtherRelease(dest, "an older release\n");
+
+      writeFileSync(join(src, "SKILL.md"), "v3\n");
+      expect(installSkillDir(src, dest)).toBe("refreshed");
+
+      expect(lstatSync(join(dest, "SKILL.md")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, "SKILL.md"), "utf8")).toBe("v3\n");
+      expect(readFileSync(externalFile, "utf8")).not.toBe("v3\n");
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
   });
 });
 
