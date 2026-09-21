@@ -91,6 +91,41 @@ export interface RunDetail extends RunSummary {
   formula?: string;
   /** The bead label that selected that pipeline; absent ⇒ the project/bundled default. */
   formulaVariant?: string;
+  /**
+   * What warming did to this run's checkout before the agent was dispatched (anton-jyrhf) — see
+   * `schema.runs.warmOutcome` for the vocabulary. Absent means warming was never attempted: a row
+   * written before the column existed, or a caller that doesn't warm at all. That is deliberately
+   * NOT `skipped`, which is a warm that ran and found nothing to do.
+   */
+  warmOutcome?: RunWarmOutcome;
+  /** The command warming ran, as its log label — present only on `ok` and `failed`. */
+  warmCommand?: string;
+  /** The bounded tail of what a failed install said — present only on `failed`. */
+  warmError?: string;
+}
+
+/** The outcomes `schema.runs.warmOutcome` stores verbatim; mirrors `WarmOutcome` in git/worktree.ts. */
+export type RunWarmOutcome = "ok" | "failed" | "skipped" | "disabled";
+
+/** What the run detail view says about a warm that failed. */
+export interface WarmFailure {
+  /** The command that failed, when warming got far enough to resolve one. */
+  command?: string;
+  /** The tail of what it said. */
+  detail?: string;
+}
+
+/**
+ * The failed warm a run has to surface, or null when it has nothing to say (anton-rqwy8). Only
+ * `failed` speaks: `ok`, `skipped` and `disabled` are the ordinary outcomes, and an absent outcome
+ * is a row warming never touched — surfacing any of them would put a line on every run to report
+ * that nothing went wrong.
+ */
+export function warmFailure(
+  run: Pick<RunDetail, "warmOutcome" | "warmCommand" | "warmError">,
+): WarmFailure | null {
+  if (run.warmOutcome !== "failed") return null;
+  return { command: run.warmCommand, detail: run.warmError };
 }
 
 /**

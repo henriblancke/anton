@@ -11,13 +11,14 @@ import {
   type RunDetail,
   type RunStatus,
   type RunSummary,
+  type RunWarmOutcome,
 } from "@/components/runs/run-view-utils";
 
 /**
  * The run vocabulary is declared once, in the client-safe module, and imported here — never the
  * reverse (anton-f3qj). Re-exported so server callers keep asking `@/lib/runs` for it.
  */
-export type { RunDetail, RunStatus, RunSummary };
+export type { RunDetail, RunStatus, RunSummary, RunWarmOutcome };
 
 export type RunRow = typeof schema.runs.$inferSelect;
 
@@ -110,8 +111,28 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
     reviewScore: row.reviewScore ?? undefined,
     formula: row.formula ?? undefined,
     formulaVariant: row.formulaVariant ?? undefined,
+    ...toWarm(row),
   };
 }
+
+/**
+ * The warm columns as the detail view reads them (anton-rqwy8). The column is free text, so an
+ * outcome this build doesn't know is dropped rather than narrowed by assertion — a stored value
+ * from a newer writer must not make the view render a word it has no rule for. Null stays absent:
+ * "never attempted" is not an outcome.
+ */
+function toWarm(row: typeof schema.runs.$inferSelect): Pick<RunDetail, "warmOutcome" | "warmCommand" | "warmError"> {
+  const outcome = RUN_WARM_OUTCOMES.find((o) => o === row.warmOutcome);
+  if (!outcome) return {};
+  return {
+    warmOutcome: outcome,
+    warmCommand: row.warmCommand ?? undefined,
+    warmError: row.warmError ?? undefined,
+  };
+}
+
+/** The outcome vocabulary `warmOutcome` is validated against on read — see the column's own note. */
+const RUN_WARM_OUTCOMES: readonly RunWarmOutcome[] = ["ok", "failed", "skipped", "disabled"];
 
 export async function getRunDetail(
   projectId: string,
