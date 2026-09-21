@@ -28,6 +28,7 @@ import {
   diffAgainstBase,
   listFilesAtRev,
   readFileAtRev,
+  readFileBytesAtRev,
   readWorktreeState,
   resolveMergeBase,
   restoreWorktreeState,
@@ -341,18 +342,22 @@ async function loadBaseProjectSkill(
 
 /**
  * {@link skillDigest}'s own algorithm (`digestFiles`), fed from a COMMITTED tree instead of disk —
- * the at-rev sibling `listFilesAtRev`/`readFileAtRev` exist for. Swallowed to `undefined` on any
- * failure, like `digestOf` in resolve.ts: the digest is a ledger dimension, and losing it costs only
- * the cohort key, never the narrative this step is already committed to producing from the text in
- * hand.
+ * the at-rev sibling `listFilesAtRev`/`readFileBytesAtRev` exist for. Reads RAW bytes
+ * (`readFileBytesAtRev`), not `readFileAtRev`'s decoded-and-trimmed text: `digestFiles` hashes
+ * `skillDigest`'s disk reads byte-for-byte, and a `git show` round-tripped through UTF-8 decoding
+ * plus `stdout.trim()` would land a different digest on the same unchanged directory — losing a
+ * text file's trailing whitespace, corrupting a binary asset outright (anton-z33ia review).
+ * Swallowed to `undefined` on any failure, like `digestOf` in resolve.ts: the digest is a ledger
+ * dimension, and losing it costs only the cohort key, never the narrative this step is already
+ * committed to producing from the text in hand.
  */
 async function skillDigestAtRev(worktreePath: string, rev: string, dir: string): Promise<string | undefined> {
   try {
     const files = await listFilesAtRev(worktreePath, rev, dir);
     const entries = await Promise.all(
       files.map(async (rel) => {
-        const raw = await readFileAtRev(worktreePath, rev, `${dir}/${rel}`);
-        return raw === undefined ? undefined : ([rel, Buffer.from(raw, "utf8")] as const);
+        const raw = await readFileBytesAtRev(worktreePath, rev, `${dir}/${rel}`);
+        return raw === undefined ? undefined : ([rel, raw] as const);
       }),
     );
     if (entries.some((e) => e === undefined)) return undefined;

@@ -1060,6 +1060,47 @@ async function readBlobAtRev(
 }
 
 /**
+ * The RAW bytes of a blob at `rev`, for a caller that hashes it — `readFileAtRev` decodes through
+ * `git()`'s `utf8` + `stdout.trim()`, which is right for a rules file read as text but wrong for a
+ * digest input: it drops leading/trailing whitespace `skillDigest` (skill-stamp.mjs) hashes as-is
+ * from disk, and it corrupts a non-UTF-8 asset (a binary template) before the digest ever sees its
+ * bytes. Same symlink-following as `readFileAtRev` (anton-z33ia review) so a skill directory that
+ * shares a file via a symlink digests the same content either way.
+ */
+export async function readFileBytesAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<Buffer | undefined> {
+  return readBlobBytesAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+}
+
+async function readBlobBytesAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<Buffer | undefined> {
+  const mode = await blobModeAtRev(worktreePath, rev, path);
+  if (mode === undefined) return undefined;
+  // Deliberately uncaught, same as `readBlobAtRev`: the tree above just reported a blob here, so a
+  // failing `show` is a read failure, not absence.
+  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "show", `${rev}:${path}`, "--"], {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+    encoding: "buffer",
+  });
+  const bytes = stdout as unknown as Buffer;
+  if (mode !== SYMLINK_MODE) return bytes;
+
+  if (hops <= 0) return undefined;
+  // A symlink's blob content IS its target pathname — text, never binary — so decoding it to resolve
+  // the next hop loses nothing the way decoding a regular file's bytes would.
+  const target = resolveRepoPath(path, bytes.toString("utf8").trim());
+  return target ? readBlobBytesAtRev(worktreePath, rev, target, hops - 1) : undefined;
+}
+
+/**
  * The tree mode of `path` at `rev`, or undefined when it is not a file there (missing, or a
  * directory). The mode is the only thing that tells a regular file from a symlink — both are blobs,
  * and `git show` reads them identically.

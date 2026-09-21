@@ -14,6 +14,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { skillDigest } from "../../claude/skill-stamp.mjs";
 import { UsageLimitError } from "../errors";
 import { describeStep, parseNarrativeReport } from "./describe";
 import { clock, fakeClaude, target } from "./step.fixture";
@@ -598,6 +599,32 @@ describe("step:describe", () => {
 
       expect(claude.calls[0].prompt).toContain("DESCRIBE AS THE NAMED SKILL.");
       expect(claude.calls[0].prompt).not.toContain("OPERATOR DESCRIBE CONTRACT.");
+    });
+
+    it("digests a skill: label's base-revision content with skillDigest's own byte-for-byte semantics", async () => {
+      // SKILL.md ends in a newline like any real file — the byte the old `readFileAtRev` + `trim()`
+      // path silently dropped before hashing, splitting this row's digest from `skillDigest`'s
+      // on-disk read of the identical bytes (anton-z33ia review).
+      const skillMd = skillFile(SKILL_ID, "DESCRIBE AS THE NAMED SKILL.");
+      commitFile(`.claude/skills/${SKILL_ID}/SKILL.md`, skillMd);
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
+
+      await describeStep(
+        ctx({
+          step: { id: "describe", labels: ["step:describe", `skill:${SKILL_ID}`] },
+          deps: { runClaude: claude.run },
+        }),
+      );
+
+      const [invocation] = await tdb.db.select().from(schema.claudeInvocations);
+      const onDisk = mkdtempSync(join(tmpdir(), "anton-skill-digest-expect-"));
+      try {
+        writeFileSync(join(onDisk, "SKILL.md"), skillMd);
+        expect(invocation.skillId).toBe(SKILL_ID);
+        expect(invocation.skillDigest).toBe(skillDigest(onDisk));
+      } finally {
+        rmSync(onDisk, { recursive: true, force: true });
+      }
     });
 
     it("falls through to the next tier when the named prompt resolves to nothing", async () => {

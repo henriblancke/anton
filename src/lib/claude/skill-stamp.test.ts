@@ -52,6 +52,42 @@ describe("listFiles — symlinked skill contents", () => {
 
     expect(listFiles(skillDir)).toEqual(["SKILL.md"]);
   });
+
+  it("terminates on a directory symlink to itself instead of recursing forever", () => {
+    const skillDir = join(dir, "skills", "self-loop");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "---\nname: self-loop\ndescription: d\n---\nbody");
+    symlinkSync(skillDir, join(skillDir, "self"));
+
+    expect(listFiles(skillDir)).toEqual(["SKILL.md"]);
+  });
+
+  it("terminates on a directory symlink back to an ancestor (`loop -> ..`) instead of recursing forever", () => {
+    const skillsRoot = join(dir, "skills");
+    const skillDir = join(skillsRoot, "loop");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "---\nname: loop\ndescription: d\n---\nbody");
+    // Exactly the shape the finding names: a skill directory symlinking to its own ancestor, which
+    // (once followed) contains the skill directory again.
+    symlinkSync(skillsRoot, join(skillDir, "loop"));
+
+    expect(listFiles(skillDir)).toEqual(["SKILL.md"]);
+  });
+
+  it("still walks two sibling symlinks that legitimately share one target directory", () => {
+    const sharedDir = join(dir, "shared-assets");
+    mkdirSync(sharedDir);
+    writeFileSync(join(sharedDir, "template.md"), "asset");
+    const skillDir = join(dir, "skills", "dual-link");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, "SKILL.md"), "---\nname: dual-link\ndescription: d\n---\nbody");
+    symlinkSync(sharedDir, join(skillDir, "assets-a"));
+    symlinkSync(sharedDir, join(skillDir, "assets-b"));
+
+    expect(listFiles(skillDir).sort()).toEqual(
+      ["SKILL.md", join("assets-a", "template.md"), join("assets-b", "template.md")].sort(),
+    );
+  });
 });
 
 describe("skillDigest — symlinked SKILL.md", () => {

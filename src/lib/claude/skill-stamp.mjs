@@ -20,7 +20,7 @@
  * Pure Node, no deps: bin/anton.mjs (the launcher, which runs before any build) imports this.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
 /**
@@ -40,9 +40,23 @@ const IGNORED_FILES = new Set([".DS_Store", "Thumbs.db"]);
  * `false` from both `Dirent.isFile()` and `isDirectory()` — those describe the link itself, not its
  * target — so it is resolved via `statSync` instead. A broken link stats neither true and is skipped,
  * same as it not existing.
+ *
+ * `stack` tracks the REAL paths on the current descent (anton-z33ia review): a directory symlink
+ * back to itself or an ancestor (`.claude/skills/foo/loop -> ..`) would otherwise recurse forever
+ * and crash the CLI instead of being classified. Checked against the descent stack rather than
+ * every path ever visited, so two sibling symlinks that legitimately share one target directory —
+ * not a cycle, just reused content — are both still walked.
  */
-export function listFiles(dir, base = dir) {
+export function listFiles(dir, base = dir, stack = new Set()) {
   if (!existsSync(dir)) return [];
+  let real;
+  try {
+    real = realpathSync(dir);
+  } catch {
+    return [];
+  }
+  if (stack.has(real)) return [];
+  stack.add(real);
   const out = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const abs = join(dir, entry.name);
@@ -57,9 +71,10 @@ export function listFiles(dir, base = dir) {
         continue;
       }
     }
-    if (isDir) out.push(...listFiles(abs, base));
+    if (isDir) out.push(...listFiles(abs, base, stack));
     else if (isFile) out.push(abs.slice(base.length + 1));
   }
+  stack.delete(real);
   return out.sort();
 }
 

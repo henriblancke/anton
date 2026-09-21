@@ -40,6 +40,7 @@ import {
   pullRequestState,
   pushBranch,
   readFileAtRev,
+  readFileBytesAtRev,
   readPullRequestMerge,
   readPullRequestCommits,
   newestPullRequestCommit,
@@ -3519,6 +3520,71 @@ suite("readFileAtRev (real git)", () => {
     rmSync(join(repo, ".git/objects", blob.slice(0, 2), blob.slice(2)), { force: true });
 
     await expect(readFileAtRev(repo, "main", "AGENTS.md")).rejects.toThrow();
+  });
+});
+
+suite("readFileBytesAtRev (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const write = (rel: string, body: Buffer | string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  };
+  const link = (rel: string, target: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    symlinkSync(target, join(repo, rel));
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-readrevbytes-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    // Trailing whitespace `readFileAtRev`'s `stdout.trim()` would drop, and non-UTF-8 bytes a
+    // `utf8`-decoded read would corrupt — the two things a digest input must preserve
+    // (anton-z33ia review).
+    write("SKILL.md", "body\n\n");
+    write("asset.bin", Buffer.from([0x00, 0xff, 0xfe, 0x10, 0xc3, 0x28]));
+    link("linked.bin", "asset.bin");
+    link("loop-a.bin", "loop-b.bin");
+    link("loop-b.bin", "loop-a.bin");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("preserves trailing whitespace that `readFileAtRev`'s trim() would drop", async () => {
+    const bytes = await readFileBytesAtRev(repo, "main", "SKILL.md");
+    expect(bytes?.toString("utf8")).toBe("body\n\n");
+  });
+
+  it("preserves raw non-UTF-8 bytes instead of corrupting them through text decoding", async () => {
+    const bytes = await readFileBytesAtRev(repo, "main", "asset.bin");
+    expect(bytes).toEqual(Buffer.from([0x00, 0xff, 0xfe, 0x10, 0xc3, 0x28]));
+  });
+
+  it("follows a symlink to its target's raw bytes", async () => {
+    const bytes = await readFileBytesAtRev(repo, "main", "linked.bin");
+    expect(bytes).toEqual(Buffer.from([0x00, 0xff, 0xfe, 0x10, 0xc3, 0x28]));
+  });
+
+  it("gives up on a symlink cycle instead of looping", async () => {
+    expect(await readFileBytesAtRev(repo, "main", "loop-a.bin")).toBeUndefined();
+  });
+
+  it("returns undefined for a missing path and for a directory", async () => {
+    expect(await readFileBytesAtRev(repo, "main", "nope.bin")).toBeUndefined();
+  });
+
+  it("throws on a rev that does not resolve, instead of reporting the file absent", async () => {
+    await expect(readFileBytesAtRev(repo, "origin/nope", "SKILL.md")).rejects.toThrow();
   });
 });
 
