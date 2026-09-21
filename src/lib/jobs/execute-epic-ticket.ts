@@ -10,7 +10,7 @@
  * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
-import type { Bead } from "../beads/bd";
+import { labelValueOf, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
@@ -174,6 +174,10 @@ async function walkTicketSteps(args: {
             runId: ticketCtx.runId,
             beadId: ticket.id,
             modelRequested: ticketCtx.settings?.model,
+            // This driver meters its own attempts, so `dispatchClaude` adds no outer row and its
+            // attribution never reaches the ledger. The tag is a label on the ticket in hand, so
+            // stamp it here too — otherwise every ticket-phase attempt records an unattributed row.
+            agentTag: labelValueOf(ticket.labels, "agent"),
           }, runClaude),
         }),
         recordsEachAttempt: true,

@@ -64,6 +64,25 @@ export interface InvocationDimensions {
    * a credential in one.
    */
   baseUrl?: string;
+  /**
+   * The specialist that ran: the ticket's resolved `agent:<tag>`, absent when it named none.
+   *
+   * Per-INVOCATION rather than per-run, unlike `runs.agent_tag`. `agent:` is a per-ticket label, so
+   * a run whose three tickets used three specialists records one of them at the run grain — and
+   * "was this agent worth its cost" is unanswerable from a dimension that coarse.
+   */
+  agentTag?: string;
+  /**
+   * The reasoning text a `step:claude` resolved — WHICH instruction, and (for a skill) at what
+   * version. Mutually exclusive by construction: `loadStepReasoning` dispatches exactly one.
+   *
+   * Versioned because a skill resolves project-local-first and is edited in place, so the same
+   * `skill:review` is different text in another repo and different text in this one next week.
+   * Recording only the id would pool two cohorts that ran different instructions under one key.
+   */
+  promptId?: string;
+  skillId?: string;
+  skillDigest?: string;
 }
 
 /**

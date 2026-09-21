@@ -43,9 +43,14 @@ export const REQUIRED_SKILLS = [
  */
 export const INSTALLED_SKILLS = [...REQUIRED_SKILLS, "setup"] as const;
 
+/** Absolute path to a skill's DIRECTORY — SKILL.md plus whatever assets it ships beside it. */
+export function skillDir(name: string): string {
+  return join(process.cwd(), SKILLS_DIR, name);
+}
+
 /** Absolute path to a skill's `SKILL.md`, resolved against anton's repo root. */
 export function skillPath(name: string): string {
-  return join(process.cwd(), SKILLS_DIR, name, "SKILL.md");
+  return join(skillDir(name), "SKILL.md");
 }
 
 /**

@@ -6,14 +6,41 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import type { InvocationDimensions } from "../../claude-invocations";
 import { beads, type Bead } from "../../beads/bd";
 import { RunAlreadyLiveError } from "../errors";
-import { claudeStep, implementStep, readForDispatch } from "./agent";
-import { closeSandbox, fakeClaude, openSandbox, target } from "./step.fixture";
+
+/**
+ * Capture what reaches the spend ledger's metered boundary. Wrapping rather than stubbing: the
+ * dispatch still runs, so what is asserted is the dimensions a real dispatch produced.
+ */
+const metered: InvocationDimensions[] = [];
+
+vi.mock("../../claude-invocations", async () => {
+  const actual = await vi.importActual<typeof import("../../claude-invocations")>(
+    "../../claude-invocations",
+  );
+  return {
+    ...actual,
+    metered: (
+      db: Parameters<typeof actual.metered>[0],
+      clock: Parameters<typeof actual.metered>[1],
+      dimensions: InvocationDimensions,
+      driver: Parameters<typeof actual.metered>[3],
+    ) => {
+      metered.push(dimensions);
+      return actual.metered(db, clock, dimensions, driver);
+    },
+  };
+});
+
+const { claudeStep, implementStep, readForDispatch } = await import("./agent");
+const { closeSandbox, fakeClaude, openSandbox, target } = await import("./step.fixture");
 
 let sandbox: Awaited<ReturnType<typeof openSandbox>>;
 
 beforeEach(async () => {
+  metered.length = 0;
   sandbox = await openSandbox("steps-agent");
 });
 
@@ -58,6 +85,29 @@ describe("step:implement", () => {
     expect(result.detail).toContain("anton-a");
     expect(claude.calls).toHaveLength(1);
     expect(result.facts.sessionIds).toHaveLength(1);
+  });
+
+  // `runs.agent_tag` is per-RUN, so a run whose tickets used different specialists records one of
+  // them. Which agent ran is a per-TICKET fact, and the ledger's grain is where it stays true.
+  it("attributes each ticket's invocation to that ticket's own agent", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered", "ANTON-RESULT: delivered");
+    const tagged = (id: string, tag?: string): Bead => ({
+      ...ticket(id),
+      labels: tag ? [`agent:${tag}`, "domain:eng"] : ["domain:eng"],
+    });
+
+    await implementStep(
+      sandbox.context({
+        tickets: [tagged("anton-a", "nextjs"), tagged("anton-b")],
+        deps: { runClaude: claude.run },
+      }),
+    );
+
+    // The second names no agent, so it records null rather than inheriting its neighbour's.
+    expect(metered.map((d) => [d.beadId, d.agentTag])).toEqual([
+      ["anton-a", "nextjs"],
+      ["anton-b", undefined],
+    ]);
   });
 
   it("honours the run lease — a lapsed lease yields before any dispatch", async () => {
@@ -154,5 +204,40 @@ describe("step:claude", () => {
     expect(claude.calls[0].prompt).toContain(`## Ticket contract — ${dispatched.id}`);
     expect(claude.calls[0].prompt).toContain("- [ ] it ships");
     expect(result.facts?.dispatched).toEqual(dispatched);
+  });
+
+  it("attributes the invocation to the prompt it resolved, with no skill beside it", async () => {
+    mkdirSync(join(sandbox.dir, ".claude", "agents"), { recursive: true });
+    writeFileSync(join(sandbox.dir, ".claude", "agents", "audit.md"), "Audit the design system.");
+
+    await claudeStep(
+      sandbox.context({
+        step: { id: "audit", labels: ["step:claude", "prompt:audit"] },
+        deps: { runClaude: fakeClaude("ANTON-RESULT: delivered").run },
+      }),
+    );
+
+    expect(metered).toHaveLength(1);
+    expect(metered[0]).toMatchObject({ step: "audit", promptId: "audit" });
+    expect(metered[0].skillId).toBeUndefined();
+    expect(metered[0].skillDigest).toBeUndefined();
+  });
+
+  // The skill that ran is versioned, not just named: it resolves project-local-first and is edited
+  // in place, so the id alone cannot tell two cohorts' instructions apart.
+  it("attributes the invocation to the skill it resolved, at the version that ran", async () => {
+    mkdirSync(join(sandbox.dir, ".claude", "skills", "smoke"), { recursive: true });
+    writeFileSync(join(sandbox.dir, ".claude", "skills", "smoke", "SKILL.md"), "Smoke it.");
+
+    await claudeStep(
+      sandbox.context({
+        step: { id: "smoke", labels: ["step:claude", "skill:smoke"] },
+        deps: { runClaude: fakeClaude("ANTON-RESULT: delivered").run },
+      }),
+    );
+
+    expect(metered[0]).toMatchObject({ step: "smoke", skillId: "smoke" });
+    expect(metered[0].promptId).toBeUndefined();
+    expect(metered[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
   });
 });

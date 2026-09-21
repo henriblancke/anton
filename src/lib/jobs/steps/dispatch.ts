@@ -5,7 +5,7 @@
  * `ANTON-RESULT` parsing are the SAME wherever an agent runs — a step that grew its own dispatch
  * would quietly drop one of the three.
  */
-import { metered } from "../../claude-invocations";
+import { metered, type InvocationDimensions } from "../../claude-invocations";
 import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { quotaMeterKey } from "../../quota-meter";
@@ -62,6 +62,16 @@ export async function dispatchClaude(
      * the same, via `REVIEW_SETTING_SOURCES`).
      */
     settingSources?: Array<"user" | "project" | "local">;
+    /**
+     * What this dispatch resolved to run FROM — the ticket's `agent:<tag>`, or the `prompt:`/`skill:`
+     * a `step:claude` named, with the skill's content digest. Passed from the caller that already
+     * resolved it (`steps/agent.ts`) rather than re-resolved here: a second resolution could answer
+     * differently from the one that actually ran, which is worse than not recording it at all.
+     */
+    attribution?: Pick<
+      InvocationDimensions,
+      "agentTag" | "promptId" | "skillId" | "skillDigest"
+    >;
   },
 ): Promise<StepResult> {
   // Metered here rather than at each step (anton-77l9): this is the ONE dispatch every agent-running
@@ -76,6 +86,7 @@ export async function dispatchClaude(
     runId: ctx.runId,
     beadId: args.beadId,
     modelRequested: ctx.settings.model,
+    ...args.attribution,
   };
   const claude = ctx.deps?.recordsEachAttempt
     ? (ctx.deps.runClaude ?? runClaude)
