@@ -376,6 +376,15 @@ function cycleMembers(byId, cycles) {
     // bd reports the loop IN ORDER — id[i] waits on id[i+1], wrapping back to id[0] — so this
     // adjacency is the one real edge per member the loop actually walks, as opposed to `members`
     // (a Set) which can't distinguish that edge from an unrelated chord into the same cycle.
+    //
+    // This is not an assumption about an undocumented field (PR #274 review): the running `bd`
+    // (1.1.2, commit 20e493e56 — `bd --version`) builds this list from `DetectCyclesInTx`
+    // (internal/storage/issueops/cycles.go), which appends `path[cycleStart:]` straight off its
+    // DFS stack — a real walk, so consecutive entries are a real graph edge by construction, not
+    // a Set iteration order. Upstream's newer detector (issueops/cycledetector.go, ahead of what
+    // 1.1.2 ships) makes the same guarantee explicit on `Cycle.Members`: "members in EDGE ORDER,
+    // so member[i] blocks on member[i+1] and the last member blocks on the first" — confirming
+    // this isn't an artifact of the current DFS implementation that a future bd could drop.
     const next = new Map(ids.map((id, i) => [id, ids[(i + 1) % ids.length]]));
     const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length };
     for (const id of mapped) {

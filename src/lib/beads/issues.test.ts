@@ -167,6 +167,35 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledWith(REPO);
   });
 
+  it("refreshAllIssues degrades to a board without cycle evidence rather than fail the whole forced refresh (PR #274 review)", async () => {
+    // The enrichment branch below only runs its OWN `fetchCyclesShared` call when a concurrent
+    // non-cycled refresh won the shared loader (same race as "bumps the version when a concurrent
+    // non-cycled refresh wins the shared loader race" above) — otherwise this call's own
+    // `loadAllIssues(cwd, { withCycles: true })` would have fetched cycles itself as part of its
+    // ordinary load, a DIFFERENT, intentionally-not-best-effort path (jobs rely on that one
+    // rejecting to retry). Stage that same race, but let the enrichment's own fetch fail: unlike
+    // every other cycles path in this file (`attachCyclesBestEffort`, `probeCycleEvidence`), this
+    // one had no try/catch and let the rejection fail the whole forced refresh.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await refreshAllIssues(REPO);
+
+    let resolveList!: (value: Bead[]) => void;
+    listMock.mockImplementationOnce(() => new Promise<Bead[]>((resolve) => { resolveList = resolve; }));
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { withCycles: true });
+
+    resolveList([{ ...target, dependencies: [] }]);
+    const [ordinaryBoard, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    expect(approvalBoard).toBe(ordinaryBoard);
+    expect(approvalBoard.map((b) => b.id)).toEqual(["t-1"]);
+    expect(cycleEvidenceFor(approvalBoard)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("bd: dep cycles timed out");
+  });
+
   it("retries rather than attach empty cycle evidence to a board whose own edges are pre-repair (P2 review on PR #274)", async () => {
     // `work`'s own read still carries a `blocks` edge — the cycle's other half sits on some other
     // bead this test doesn't need — that a concurrent repair removes in the gap before `bd dep

@@ -108,17 +108,22 @@ export interface LoadIssuesOptions {
   /**
    * Skip the `sameBlocksEdges` consistency recheck below even when `work` carries a `blocks` edge.
    *
-   * The recheck exists for exactly one consumer: `orderTickets` (execute-epic-board.ts), which
-   * sorts `board`'s raw edges directly and can hit a pair that `bd dep cycles` already resolved
-   * but this snapshot's `dependencies` still encode, falling back to unvalidated input order for
-   * the tickets it touches. A caller whose own use of cycle evidence goes ONLY through
-   * `cycleEvidenceFor(board)` — every `structureGaps`/`makeApprovalGate` consumer, including
-   * `approveAndClaim`'s locked guard — already gets the right answer from `cycles` alone: an empty
-   * result means the graph is clean AS OF THIS CALL, which is the only thing a blocking verdict
-   * needs, however stale `board`'s own edges are. Paying for a second `bd list` there buys nothing
-   * and, in a repo with an established `blocks` edge anywhere (the common case once it's more than
-   * a few days old, not the rare one), turns every approve into three reads instead of two —
-   * exactly the cost anton-hwkx trimmed away.
+   * The recheck exists for `orderTickets` (execute-epic-board.ts), which sorts `board`'s raw edges
+   * directly and can hit a pair that `bd dep cycles` already resolved but this snapshot's
+   * `dependencies` still encode, falling back to unvalidated input order for the tickets it
+   * touches.
+   *
+   * NOT a safe opt-out for a `structureGaps`/`makeApprovalGate` consumer (PR #274 review,
+   * round 17 — corrects the previous version of this doc, which claimed `approveAndClaim`'s
+   * locked guard could skip it): those gates read `cycleEvidenceFor(board)` for the cycle rule
+   * only, but `structureGaps` also walks `board`'s raw `blocks` edges DIRECTLY for the dangling
+   * blocker, self-block and duplicates-parent rules — the same stale edges `sameBlocksEdges`
+   * exists to catch. Skipping the recheck there lets an edge that changed between the `work` read
+   * and the `bd dep cycles` read (another writer landing on a shared-server board) go unnoticed by
+   * BOTH the cycle check (which only ever sees the fresher `cycles` result) and these structural
+   * rules (which are stuck on the older `work` snapshot) — approving or claiming a target whose
+   * structure just changed. Only a caller whose guard consumes cycle evidence and NOTHING else off
+   * `board`'s edges may set this.
    */
   skipCycleConsistencyRecheck?: boolean;
 }
@@ -430,14 +435,32 @@ export async function refreshAllIssues(
   // evidence would still never see a fresh token for the one recovery that happens to land through
   // this exact race.
   if (opts.withCycles && cycleEvidenceFor(board) === undefined) {
-    // Keyed and guarded by `boardGeneration`, not a fresh `issueSnapshotGeneration(cwd)` read here
-    // (PR #274 review, round 15): the snapshot can move again while this fetch is in flight, and a
-    // fresh read at either point would key the shared fetch to — or stamp its result onto `board`
-    // under — a generation that no longer describes the graph `cycles` was actually fetched for.
-    const cycles = await fetchCyclesShared(cwd, boardGeneration);
-    if (issueSnapshotGeneration(cwd) === boardGeneration) {
-      attachCycleEvidence(board, cycles);
-      markCycleEvidenceRecovered(cwd);
+    // Best-effort, like every other cycles path in this file (`attachCyclesBestEffort`,
+    // `probeCycleEvidence`) — NOT let a failed `bd dep cycles` reject this call (PR #274 review,
+    // round 17): the comment above promises a caller "never loses the requested evidence", which
+    // reads as the same degrade-gracefully contract those siblings give, but an uncaught rejection
+    // here previously failed the WHOLE forced refresh over an auxiliary enrichment query — taking
+    // down a caller's ordinary bead listing along with it. No production caller passes
+    // `withCycles: true` today, so this was latent, but the next one to add it would inherit a
+    // refresh that 500s on a slow or unreadable `bd dep cycles` instead of returning a board with
+    // no cycle evidence attached, same as a cold read degrades.
+    try {
+      // Keyed and guarded by `boardGeneration`, not a fresh `issueSnapshotGeneration(cwd)` read
+      // here (PR #274 review, round 15): the snapshot can move again while this fetch is in
+      // flight, and a fresh read at either point would key the shared fetch to — or stamp its
+      // result onto `board` under — a generation that no longer describes the graph `cycles` was
+      // actually fetched for.
+      const cycles = await fetchCyclesShared(cwd, boardGeneration);
+      if (issueSnapshotGeneration(cwd) === boardGeneration) {
+        attachCycleEvidence(board, cycles);
+        markCycleEvidenceRecovered(cwd);
+      }
+    } catch (e) {
+      console.warn(
+        `[beads.issues] ${cwd}: dep cycles read failed during refresh — board stays readable ` +
+          `without cycle evidence; startability projections fail closed until the next successful read: ` +
+          (e instanceof Error ? e.message : String(e)),
+      );
     }
   }
   // Same race, for gates (PR #274 review): `refreshIssueSnapshot`'s single-flight is loader-blind, so

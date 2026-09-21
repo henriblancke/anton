@@ -144,17 +144,20 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     // pure, non-enqueuing take-over) must not have this read reject over a `bd dep cycles` that
     // timed out or came back unreadable — see {@link ApproveClaimInput.needsCycles}.
     //
-    // `skipCycleConsistencyRecheck`: every `guard` this module has ever been handed (the approve
-    // route's, the picker's `startGuard`) reads cycle evidence ONLY through `cycleEvidenceFor(board)`
-    // feeding `structureGaps`/`makeApprovalGate` — never `board`'s raw edges for ordering, which is
-    // the one thing the recheck protects (see its doc on `LoadIssuesOptions`). A resolved-but-stale
-    // edge in this snapshot can't make either gate answer wrong, so paying for the extra `bd list`
-    // here would only cost approve's read-economy invariant (anton-hwkx: at most two calls) for no
-    // correctness gain.
+    // The `sameBlocksEdges` consistency recheck stays ON here (PR #274 review, round 17): both this
+    // module's callers (the approve route's guard, the picker's `startGuard`) compose
+    // `structureGaps`/`makeApprovalGate`, which reads `cycleEvidenceFor(board)` for the cycle rule
+    // but walks `board`'s raw `blocks` edges DIRECTLY for the dangling-blocker, self-block and
+    // duplicates-parent rules — exactly the stale-edge case the recheck exists to catch. A previous
+    // version of this call skipped it on the theory that these guards only ever consumed cycle
+    // evidence; they don't, so skipping let an edge that changed between the `work` read and the
+    // `bd dep cycles` read (another writer landing on a shared-server board) go unnoticed by both
+    // the cycle check and these structural rules, letting this locked read approve or claim a
+    // target whose external blocker or structural edge had just changed. See the doc on
+    // `LoadIssuesOptions.skipCycleConsistencyRecheck` for the general rule this call now follows.
     const board = await loadAllIssues(repoPath, {
       withCycles: input.needsCycles ?? true,
       strictGates: true,
-      skipCycleConsistencyRecheck: true,
     });
     const locked = board.find((b) => b.id === beadId);
     if (!locked) return { vanished: true };
