@@ -110,7 +110,7 @@ import {
 } from "./review-fix-context";
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
-import { finalizeMergedEpic } from "./review-fix-finalize";
+import { finalizeMergedEpic, stampConfirmedClosures } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -206,6 +206,38 @@ export function inReviewEpics(
 }
 
 /**
+ * Closed epics stranded at `stage:in-review` by a fence write that failed during merge finalization
+ * (`closeFinalized`/`stampConfirmedClosures`, review-fix-finalize.ts): the batch close committed, but
+ * the closure-fence backfill on the epic or one of its children did not, and `inReviewEpics` excludes
+ * every closed bead unconditionally — so once an epic lands here, that function will never see it
+ * again. This is the one place left that still looks: a plain filter over the board this dispatcher
+ * already read, narrowed to `epicBeadId` exactly like `inReviewEpics` on a targeted run.
+ */
+function closedUnfencedEpics(all: Bead[], epicBeadId?: string): Bead[] {
+  return all.filter(
+    (b) =>
+      b.status === "closed" &&
+      (b.labels?.includes(IN_REVIEW) ?? false) &&
+      (epicBeadId === undefined || b.id === epicBeadId),
+  );
+}
+
+/**
+ * Retry the fence backfill `closeFinalized` could not complete before ending: rebuild the same
+ * `[...children, epic]` set it would have closed, this time from the board (`runTickets`) rather than
+ * from that call's own snapshot, and re-run {@link stampConfirmedClosures} against it. Idempotent —
+ * a bead already fenced is filtered out inside that function — so a repeat pass over a stuck epic
+ * costs nothing beyond the read. Only once every bead in the set is confirmed fenced does the label
+ * drop, exactly like `closeFinalized`'s own gate.
+ */
+async function recoverUnfencedClosure(repo: string, epic: Bead, all: Bead[]): Promise<boolean> {
+  const closedNow = [...runTickets(all, epic.id), epic];
+  if (!(await stampConfirmedClosures(repo, closedNow))) return false;
+  await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  return true;
+}
+
+/**
  * Who this job is, as the worktree claim records it. The same name goes to `createWorktree`, which
  * refuses to hand a claimed checkout to anyone but its holder.
  *
@@ -256,7 +288,25 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // before dispatching a merged target by id (anton-k0kj).
   const operator = await resolveOperator();
   const targets = inReviewEpics(all, { operator, epicBeadId });
-  if (targets.length === 0) return { changed: false, note: "nothing in review" };
+
+  // Closed epics a merge finalization stranded (see closedUnfencedEpics) — checked every pass,
+  // targets or not, since this is the only place left that ever looks at them again.
+  let recovered = 0;
+  for (const stuck of closedUnfencedEpics(all, epicBeadId)) {
+    await ctx.heartbeat();
+    try {
+      if (await recoverUnfencedClosure(repo, stuck, all)) recovered += 1;
+    } catch (e) {
+      // One unfenceable epic must not cost the others their recovery attempt.
+      consoleLog.error(`epic ${stuck.id}: unfenced-closure recovery failed`, e);
+    }
+  }
+
+  if (targets.length === 0) {
+    return recovered > 0
+      ? { changed: true, note: `fenced ${recovered} previously-stranded closure(s)` }
+      : { changed: false, note: "nothing in review" };
+  }
 
   let dispatched = 0;
   let lastError: unknown;
@@ -283,8 +333,10 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
   // nothing, and the two counts together are what an operator checks the poll against.
   return {
-    changed: dispatched > 0,
-    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}`,
+    changed: dispatched > 0 || recovered > 0,
+    note:
+      `examined ${targets.length} PR(s) in review, dispatched ${dispatched}` +
+      (recovered > 0 ? `, fenced ${recovered} stranded closure(s)` : ""),
   };
 }
 

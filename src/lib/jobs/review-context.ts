@@ -875,8 +875,19 @@ function confirmedBeadSummary(id: string, bead: Bead | "deleted" | undefined): s
     contentMetadata(bead)
       .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
       .join(", ") || "(none)";
-  const field = (label: string, value: string | undefined): string =>
-    `  ${label}=${value?.trim() ? truncate(value.trim(), MAX_BEAD_FIELD_CHARS) : "(none)"}`;
+  // A server-backed reviewer has no `bd` of its own (see the caller's serverMode branch) — this
+  // rendering IS the only field value it will ever see. A field cut at MAX_BEAD_FIELD_CHARS can hide
+  // an acceptance-relevant edit past the cutoff with nothing here to say so, so a cut is never silent
+  // (PR #284 review, "Preserve the complete server-board field snapshot"): every truncated label is
+  // collected and the caller is told, in terms it can't miss, to treat that field as unconfirmed
+  // rather than judge only the visible prefix.
+  const truncatedFields: string[] = [];
+  const field = (label: string, value: string | undefined): string => {
+    const trimmed = value?.trim();
+    if (!trimmed) return `  ${label}=(none)`;
+    if (trimmed.length > MAX_BEAD_FIELD_CHARS) truncatedFields.push(label);
+    return `  ${label}=${truncate(trimmed, MAX_BEAD_FIELD_CHARS)}`;
+  };
   return [
     `- ${id}: status=${bead.status}, type=${bead.issue_type ?? "(none)"}, title="${bead.title}"`,
     `  labels=[${labels}], parent=${beads.parentOf(bead) ?? "(none)"}, assignee=${bead.assignee ?? "(none)"}`,
@@ -885,6 +896,13 @@ function confirmedBeadSummary(id: string, bead: Bead | "deleted" | undefined): s
     field("description", bead.description),
     field("acceptance_criteria", bead.acceptance_criteria),
     field("design", bead.design),
+    ...(truncatedFields.length > 0
+      ? [
+          `  ⚠ ${id}: ${truncatedFields.join(", ")} exceeded ${MAX_BEAD_FIELD_CHARS} chars and was cut —`,
+          `  anything past the cut is UNCONFIRMED. Treat Acceptance against ${truncatedFields.length > 1 ? "these fields" : "this field"}`,
+          `  as unverifiable and say so in your rationale rather than judging the visible prefix alone.`,
+        ]
+      : []),
     ``,
   ];
 }

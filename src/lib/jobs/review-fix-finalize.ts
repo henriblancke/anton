@@ -462,10 +462,15 @@ async function finalizeRunRow(
  * first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
  * half-closed unit no reader can interpret. Only drop the in-review stage once that transaction
  * lands AND every confirmed board-evidence bead in the subtree has its closure fence stamped
- * ({@link stampConfirmedClosures}) — a transient failure in either (the batch, swallowed by `safe`,
- * or the fence backfill) must leave the label in place so the next review-fix sweep re-selects the
- * epic (inReviewEpics) and retries, rather than orphaning a still-open ticket/epic behind a run
- * already marked done, or an unfenced confirmation behind one marked fully settled.
+ * ({@link stampConfirmedClosures}) — a transient failure in the fence backfill must leave the label
+ * in place, because it is the ONLY remaining signal that this closed epic still owes a fence: once
+ * the batch close lands, `inReviewEpics` (review-fix.ts) excludes the epic unconditionally, so it can
+ * never be re-selected as an in-review target again. What actually retries it is
+ * `recoverUnfencedClosure` (review-fix.ts), which the dispatcher runs every pass specifically over
+ * closed-but-still-labelled epics — a separate, narrower read than `inReviewEpics` that is the one
+ * place left that still looks at them. A failure in the batch itself (swallowed by `safe`) is the
+ * other case this label guards: that one IS retried by `inReviewEpics`, because the epic never closed
+ * at all.
  *
  * LAST on purpose, after every other finalization write (PR #199 review). It is the CLOSE, not the
  * label, that makes this epic undiscoverable: inReviewEpics drops a closed run target whatever
@@ -560,11 +565,17 @@ async function closeFinalized(
  * "Require closure stamps before completing finalization") — an exhausted
  * {@link mustReadClosureVersion}/{@link mustPersist} retry no longer disappears silently. The batch
  * close itself already committed, durably, and cannot be undone from here, but the caller now holds
- * `stage:in-review` open on a `false` result instead of treating the close as fully settled, so the
- * next sweep's fresh `closedNow` set (computed from ALL non-preserved beads, not just the ones this
- * pass closed) gives a failed stamp another attempt rather than none at all.
+ * `stage:in-review` open on a `false` result instead of treating the close as fully settled.
+ *
+ * Exported because a `false` here is retried from TWO different places, depending on whether the
+ * enclosing batch close itself landed: a batch-close failure leaves the epic open, so `inReviewEpics`
+ * re-selects it and the next `closeFinalized` call recomputes `closedNow` fresh. A fence failure
+ * AFTER the batch close landed is different — the epic is closed now, `inReviewEpics` can never see
+ * it again — so that retry is `recoverUnfencedClosure` (review-fix.ts), called directly against this
+ * function with a `closedNow` it rebuilds from the board (`runTickets` + the epic), not from a second
+ * `closeFinalized` pass.
  */
-async function stampConfirmedClosures(repo: string, closedBeads: readonly Bead[]): Promise<boolean> {
+export async function stampConfirmedClosures(repo: string, closedBeads: readonly Bead[]): Promise<boolean> {
   const unfenced = closedBeads.filter(
     (b) => beads.boardEvidenceConfirmed(b) && beads.confirmedBoardEvidenceClosure(b) === undefined,
   );
