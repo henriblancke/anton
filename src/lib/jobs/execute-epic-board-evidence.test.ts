@@ -93,6 +93,11 @@ clearBoardEvidenceConfirmedMock.mockResolvedValue("");
 // No closed history by default — every existing test's fixture bead is `status: "open"`, which
 // never reaches the closure read at all; the tests that DO care about it set their own fixture.
 historyMock.mockResolvedValue([]);
+// `clearBoardEvidencePending`'s live status re-read (chatgpt-codex-connector, PR #284 review,
+// "Re-read status before allowing an unfenced confirmation") defaults to the same "open" status
+// every fixture bead already carries by default — the few tests that need a live CLOSED read queue
+// their own `showMock.mockResolvedValueOnce` for that id.
+showMock.mockImplementation(async (_repo: string, id: string) => bead(id));
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -440,6 +445,9 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       expect(showMock).toHaveBeenCalledTimes(10);
       expect(maxInFlight).toBeLessThan(10);
       showMock.mockReset();
+      // Restore the default live-status implementation this reset just cleared — every test after
+      // this one relies on it for `clearBoardEvidencePending`'s status re-read.
+      showMock.mockImplementation(async (_repo: string, id: string) => bead(id));
     },
   );
 
@@ -1401,6 +1409,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "left standing",
     async () => {
       pushMock.mockResolvedValueOnce("synced");
+      showMock.mockResolvedValueOnce(bead("t-closed-confirm", { status: "closed" }));
       historyMock.mockResolvedValueOnce([
         { hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
       ]);
@@ -1415,6 +1424,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "every retry, rather than falling through to an unfenced write a later reopen-and-reclose " +
       "could pass as this cycle's own evidence with no new work",
     async () => {
+      showMock.mockResolvedValueOnce(bead("t-closed-history-fails", { status: "closed" }));
       historyMock.mockRejectedValueOnce(new Error("dolt offline"));
       historyMock.mockRejectedValueOnce(new Error("dolt offline"));
       historyMock.mockRejectedValueOnce(new Error("dolt offline"));
@@ -1438,6 +1448,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       "rather than persisting an unfenced confirmation a later reopen-and-reclose could reuse as this " +
       "cycle's evidence with no new board delta",
     async () => {
+      showMock.mockResolvedValueOnce(bead("t-closed-history-empty", { status: "closed" }));
       historyMock.mockResolvedValueOnce([]);
       const ticket = bead("t-closed-history-empty", { status: "closed" });
       await expect(clearBoardEvidencePending("/repo", ticket, ["a"])).rejects.toThrow(
@@ -1446,6 +1457,49 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalledWith(
         "/repo",
         "t-closed-history-empty",
+        expect.anything(),
+        expect.anything(),
+      );
+    },
+  );
+
+  it(
+    "requires the closure fence off a LIVE re-read even when the passed-in `ticket` snapshot still " +
+      "says open (chatgpt-codex-connector, PR #284 review, 'Re-read status before allowing an " +
+      "unfenced confirmation') — the snapshot is taken before this ticket's work starts, and another " +
+      "board writer can close it before this call runs; trusting the stale snapshot would skip the " +
+      "fence for a bead that IS closed by the time confirmation persists",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      showMock.mockResolvedValueOnce(bead("t-race-closed", { status: "closed" }));
+      historyMock.mockResolvedValueOnce([
+        { hash: "race-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+      const staleTicket = bead("t-race-closed", { status: "open" });
+      await clearBoardEvidencePending("/repo", staleTicket, ["a"]);
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-race-closed",
+        ["a"],
+        "race-close-sha",
+      );
+    },
+  );
+
+  it(
+    "refuses to persist a confirmation when the live status re-read itself is unreadable after every " +
+      "retry, rather than deciding whether a closure fence applies off the stale `ticket` snapshot",
+    async () => {
+      showMock.mockRejectedValueOnce(new Error("dolt offline"));
+      showMock.mockRejectedValueOnce(new Error("dolt offline"));
+      showMock.mockRejectedValueOnce(new Error("dolt offline"));
+      const ticket = bead("t-live-status-unreadable");
+      await expect(clearBoardEvidencePending("/repo", ticket, ["a"])).rejects.toThrow(
+        /t-live-status-unreadable/,
+      );
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalledWith(
+        "/repo",
+        "t-live-status-unreadable",
         expect.anything(),
         expect.anything(),
       );

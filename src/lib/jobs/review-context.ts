@@ -323,11 +323,13 @@ export async function buildReviewPrompt(args: {
 }
 
 /**
- * Bounded concurrency for {@link fetchConfirmedBoardEvidenceBeads}'s host-side reads — mirrors
- * `execute-epic-board-evidence.ts`'s `DESCRIPTION_HYDRATION_CONCURRENCY` for the same reason: each
- * batch is its own `bd list --id ...` SUBPROCESS with its own retries, and firing them all at once
- * would contend the same Dolt server this review is trying to read safely, on a run confirming many
- * ids at once.
+ * Batch size for {@link fetchConfirmedBoardEvidenceBeads}'s host-side reads — unlike
+ * `execute-epic-board-evidence.ts`'s `DESCRIPTION_HYDRATION_CONCURRENCY`, which fires up to 4
+ * single-id `bd show` calls concurrently via `Promise.all`, this is a batch size for one combined
+ * `bd list --id a,b,c,d` SUBPROCESS per batch, and each batch is `await`ed before the next starts —
+ * no concurrency at all. Kept sequential rather than fired in parallel because a run confirming
+ * many ids at once would otherwise contend the same Dolt server this review is trying to read
+ * safely; batching still caps how many ids land in a single `bd list --id ...` invocation.
  */
 const CONFIRMED_BEAD_READ_CONCURRENCY = 4;
 

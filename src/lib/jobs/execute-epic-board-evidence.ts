@@ -1122,17 +1122,39 @@ export async function clearBoardEvidencePending(
   // `ensureBoardBaselinePersisted`'s own reopen-reset only fires when this run redispatches the
   // ticket; a ticket reopened and closed again by anything else before that ever happens skips it
   // entirely, so the closure identity is the one signal that still catches it. Skipped for a ticket
-  // not closed (a standalone target parked at `stage:in-review` has no closure episode to name).
+  // not closed on a LIVE read (a standalone target parked at `stage:in-review` has no closure
+  // episode to name).
+  //
+  // Gated on a fresh `mustRead`, never on the `ticket` parameter's own `status` (chatgpt-codex-connector,
+  // PR #284 review, "Re-read status before allowing an unfenced confirmation") — `ticket` is a
+  // snapshot taken before this ticket's work started, and on a shared-server board a concurrent
+  // writer can close the bead before this call runs. Deciding off that stale snapshot would skip the
+  // closure fence for a bead that IS closed by the time `setBoardEvidenceConfirmed` below lands,
+  // persisting an unfenced `{ ids }` for an already-closed bead exactly like the swallowed-read case
+  // this fence otherwise guards against — and `confirmedForThisCycle` (execute-epic-dispatch.ts)
+  // trusts a missing closure as "cannot verify, pass anyway", so a later reopen-and-reclose could
+  // settle against this cycle's evidence with no new work. Re-reading live immediately before this
+  // decision does not close the window entirely (a close landing between this read and the write
+  // below is still possible), but narrows it from the ticket's whole dispatch to one read-then-write.
+  //
   // NOT best-effort on a read failure (chatgpt-codex-connector review, "Require the closure read
-  // before confirming a closed ticket") — a swallowed `bd history` failure would land an unfenced
-  // `{ ids }` confirmation for a ticket that IS closed, and `confirmedForThisCycle`
+  // before confirming a closed ticket") — a swallowed `bd show`/`bd history` failure would land an
+  // unfenced `{ ids }` confirmation for a ticket that IS closed, and `confirmedForThisCycle`
   // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass anyway" — the same
   // tolerance meant for a confirmation written before this fence existed — so a later
   // reopen-and-reclose could settle against this cycle's evidence with no new work. Retried like
   // every other guarded read in this module; still unreadable after retries fails the whole cleanup
   // below rather than persist a fenceless confirmation.
   let closure: string | undefined;
-  if (ticket.status === "closed") {
+  const live = await mustRead(repo, ticketId);
+  if (!live) {
+    throw new PoisonEpic(
+      `${ticketId}'s live status could not be read from \`bd show\` (after retries), immediately ` +
+        `before persisting board-evidence confirmation — the run stopped rather than decide whether ` +
+        `a closure fence is required off a stale snapshot. Check the beads DB, then resume the run.`,
+    );
+  }
+  if (live.status === "closed") {
     const read = await mustReadClosureVersion(repo, ticketId);
     if (!read.read || read.closure === undefined) {
       throw new PoisonEpic(
