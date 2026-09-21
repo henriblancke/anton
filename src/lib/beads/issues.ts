@@ -306,11 +306,21 @@ export async function allIssues(
   return board;
 }
 
+/**
+ * Bound on the "board moved during enrichment" retry below (mirrors `MAX_CYCLE_CONSISTENCY_RETRIES`
+ * for `loadAllIssues`). Each retry re-runs the full snapshot read plus a `bd dep cycles` spawn, so
+ * sustained shaping or a busy shared-server board can otherwise keep a caller (a board poll, an
+ * approval read) inside this function indefinitely. Fail closed once the graph outraces this many
+ * attempts rather than pairing evidence with a board it may no longer describe.
+ */
+const MAX_ENRICHMENT_RETRIES = 3;
+
 /** Beads plus the snapshot version they carry, read atomically — for callers that stamp a response
  * with the version (the board freshness token) and must not desync data from version. */
 export async function readAllIssues(
   cwd: string,
   opts?: SnapshotReadOptions & { withCycles?: boolean },
+  attempt = 0,
 ): Promise<SnapshotRead> {
   const snapshot = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
   // Keep evidence attached to the cached array itself: `SnapshotRead` is a wrapper and copying the
@@ -332,7 +342,13 @@ export async function readAllIssues(
     // cycle evidence. Retry unconditionally on a mismatch so the caller always gets a consistent,
     // current (board, version) pair rather than one the write already left behind.
     if (issueSnapshotGeneration(cwd) !== generation) {
-      return readAllIssues(cwd, opts);
+      if (attempt >= MAX_ENRICHMENT_RETRIES) {
+        throw new Error(
+          `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_ENRICHMENT_RETRIES + 1} ` +
+            "cycle-enrichment reads — giving up rather than pairing evidence with a board it may not describe",
+        );
+      }
+      return readAllIssues(cwd, opts, attempt + 1);
     }
     // No move: only re-read the version if THIS array actually got enriched. When it did,
     // `markCycleEvidenceRecovered` bumped the version for it specifically (PR #274 review, round 4),

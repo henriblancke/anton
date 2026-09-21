@@ -410,6 +410,39 @@ describe("loadAllIssues", () => {
     expect(cycleEvidenceFor(result.beads)).toEqual([]);
   });
 
+  it("fails closed instead of retrying forever when the board keeps moving during cycle enrichment (P2 review on PR #274)", async () => {
+    // Every enrichment attempt observes another move, just like the `loadAllIssues` consistency
+    // retry above — simulating sustained shaping/concurrent writers on a shared-server board.
+    // Without a retry cap, `readAllIssues` recurses on the mismatch indefinitely. Each simulated
+    // move must actually change content (a fresh id), not just re-bump generation, since
+    // `refreshIssueSnapshot` only advances the generation when the loaded content differs.
+    //
+    // Queued via `mockImplementationOnce` (not a persistent `mockImplementation`), one per attempt
+    // the retry cap allows plus the one that trips it — a persistent override would keep forcing
+    // moves on every OTHER test's reads too, since this mock isn't reset between tests.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+
+    const forceMove = (call: number) => async (...args: unknown[]) => {
+      const snapshot = await (
+        await vi.importActual<typeof import("./snapshot")>("./snapshot")
+      ).readIssueSnapshot(
+        ...(args as Parameters<typeof import("./snapshot").readIssueSnapshot>),
+      );
+      await refreshIssueSnapshot(REPO, async () => [
+        { ...target, id: `moved-${call}`, dependencies: [] },
+      ]);
+      return snapshot;
+    };
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      readIssueSnapshotMock.mockImplementationOnce(forceMove(attempt));
+    }
+
+    await expect(readAllIssues(REPO, { withCycles: true })).rejects.toThrow(
+      /dependency graph kept moving/,
+    );
+  });
+
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {
     // Two gate edges, one of whose gates the ordinary listing already carries: the other still
     // dangles, so the second read fires and hands back both.
