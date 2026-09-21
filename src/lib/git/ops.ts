@@ -1290,7 +1290,7 @@ async function expandSymlinkedFileAtRev(
   const rel = path.slice(prefix.length);
   const resolved = await resolveSymlinkChainAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
   if (!resolved) return [];
-  if (resolved.kind === "blob") return [{ rel, path }];
+  if (resolved.kind === "blob") return [{ rel, path: resolved.path }];
   const nested = await listFilesAtRev(worktreePath, rev, resolved.path, stack);
   return nested.map((entry) => ({ rel: `${rel}/${entry.rel}`, path: entry.path }));
 }

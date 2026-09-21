@@ -3662,10 +3662,13 @@ suite("listFilesAtRev (real git)", () => {
     }
   });
 
-  it("still resolves a leaf symlink to a file, same as before", async () => {
+  it("still resolves a leaf symlink to a file, keyed on the symlink's own name", async () => {
+    // `path` is the fully-resolved blob path (`SKILL.md`, not `README.md`) so a leaf symlink
+    // reached through a symlinked ancestor directory is readable too (anton-z33ia review, PR
+    // #313) — `rel` stays keyed on the symlink's own name for the digest.
     const files = await listFilesAtRev(repo, "main", "skill");
     const readme = files.find((f) => f.rel === "README.md");
-    expect(readme?.path).toBe("skill/README.md");
+    expect(readme?.path).toBe("skill/SKILL.md");
     expect((await readFileBytesAtRev(repo, "main", readme!.path))?.toString("utf8")).toBe("the skill\n");
   });
 
