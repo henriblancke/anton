@@ -838,6 +838,7 @@ describe("settings route — self-review settings (anton-of1m)", () => {
       baseBranch: "main",
       baseRef: "origin/main",
       baseForkSha: "f0f0f0forkcommit",
+      alreadyShippedBase: "f0f0f0forkcommit",
       target: { id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" },
       tickets: [{ id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" }],
       settings,
@@ -886,6 +887,7 @@ describe("settings route — self-review settings (anton-of1m)", () => {
       baseBranch: "main",
       baseRef: "origin/main",
       baseForkSha: "f0f0f0forkcommit",
+      alreadyShippedBase: "f0f0f0forkcommit",
       target: { id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" },
       tickets: [{ id: "anton-settings", title: "Settings round trip", status: "in_progress", issue_type: "feature" }],
       settings,
@@ -1686,5 +1688,94 @@ describe("settings route — model routing table (anton-uu7r)", () => {
       expect((await res.json()).error).toMatch(/modelRoutes/);
     }
     expect(persisted().modelRoutes).toEqual(stored);
+  });
+});
+
+/**
+ * Per-project worktree warming (anton-z5li2): the pinned setup command and its on/off flag. The
+ * two defaults are what keep existing projects unchanged — absent `warmEnabled` is ON, and a
+ * cleared `warmCommand` falls back to the env var / lockfile table rather than skipping the warm.
+ */
+describe("settings route — worktree warming (anton-z5li2)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("persists neither key for a fresh project, so warming stays ON with lockfile detection", async () => {
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    const { settings } = await get.json();
+    expect(settings.warmCommand).toBeUndefined();
+    expect(settings.warmEnabled).toBeUndefined();
+    expect("warmCommand" in persisted()).toBe(false);
+    expect("warmEnabled" in persisted()).toBe(false);
+  });
+
+  it("PATCH persists warmCommand + warmEnabled, and GET restores both", async () => {
+    const res = await PATCH(
+      patchReq({ warmCommand: "make setup", warmEnabled: false }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    const { settings } = await res.json();
+    expect(settings.warmCommand).toBe("make setup");
+    expect(settings.warmEnabled).toBe(false);
+    expect(persisted()).toMatchObject({ warmCommand: "make setup", warmEnabled: false });
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    const back = await get.json();
+    expect(back.settings.warmCommand).toBe("make setup");
+    expect(back.settings.warmEnabled).toBe(false);
+  });
+
+  it('"" / null clears warmCommand back to the fall-back absence', async () => {
+    await PATCH(patchReq({ warmCommand: "make setup" }), ctx("tmp"));
+    for (const clear of ["", null]) {
+      await PATCH(patchReq({ warmCommand: "make setup" }), ctx("tmp"));
+      const res = await PATCH(patchReq({ warmCommand: clear }), ctx("tmp"));
+      expect(res.status).toBe(200);
+      expect((await res.json()).settings.warmCommand).toBeUndefined();
+      expect("warmCommand" in persisted()).toBe(false);
+    }
+  });
+
+  it('"" / null clears warmEnabled back to the default-ON absence', async () => {
+    for (const clear of ["", null]) {
+      await PATCH(patchReq({ warmEnabled: false }), ctx("tmp"));
+      const res = await PATCH(patchReq({ warmEnabled: clear }), ctx("tmp"));
+      expect(res.status).toBe(200);
+      expect((await res.json()).settings.warmEnabled).toBeUndefined();
+      expect("warmEnabled" in persisted()).toBe(false);
+    }
+  });
+
+  it("rejects a non-string and an over-long warmCommand, leaving the stored one untouched", async () => {
+    await PATCH(patchReq({ warmCommand: "make setup" }), ctx("tmp"));
+    for (const bad of [42, ["make setup"], {}, "x".repeat(1001)]) {
+      const res = await PATCH(patchReq({ warmCommand: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/warmCommand/);
+    }
+    expect(persisted().warmCommand).toBe("make setup");
+  });
+
+  it("accepts a warmCommand exactly at the 1000-char bound", async () => {
+    const res = await PATCH(patchReq({ warmCommand: "x".repeat(1000) }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect(persisted().warmCommand).toBe("x".repeat(1000));
+  });
+
+  it("rejects a non-boolean warmEnabled", async () => {
+    for (const bad of ["yes", 1, {}, []]) {
+      const res = await PATCH(patchReq({ warmEnabled: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/warmEnabled/);
+    }
+    expect("warmEnabled" in persisted()).toBe(false);
   });
 });

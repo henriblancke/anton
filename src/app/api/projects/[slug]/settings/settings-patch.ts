@@ -162,6 +162,12 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("typecheckCommand", boundedString(MAX_COMMAND)),
     settingsField("buildCommand", boundedString(MAX_COMMAND)),
 
+    // Per-project worktree warming (anton-z5li2). Cleared, warmCommand falls back to
+    // ANTON_WARM_COMMAND and then lockfile detection — it never means "skip the warm"; that is
+    // warmEnabled:false, whose absence leaves warming ON for every existing project.
+    settingsField("warmCommand", boundedString(MAX_COMMAND)),
+    settingsField("warmEnabled", booleanValue),
+
     settingsField("model", oneOf(ALLOWED_MODELS)),
 
     // Gateway routing (anton-n16m). The base URL is validated as http(s); the token env var as a

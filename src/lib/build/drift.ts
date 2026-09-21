@@ -136,8 +136,13 @@ function appRoot(): string | null {
  * This install's anton.db path — resolved exactly as `getDb` resolves it, so the record lands beside
  * it. Null only when the cwd was already gone before this module ever loaded and no `ANTON_DB` names
  * the state dir; there is nothing left to read a record from in that case.
+ *
+ * Exported because the schema half of the freshness verdict (jobs/self-freshness) must ask about the
+ * SAME database the running process uses (anton-sm1l). Resolving it there independently is how the
+ * two drift: this one survives an `anton update` that deleted the cwd out from under the process,
+ * which a bare `process.cwd()` does not.
  */
-function dbPath(): string | null {
+export function antonDbPath(): string | null {
   if (process.env.ANTON_DB) return process.env.ANTON_DB;
   const root = appRoot();
   return root ? join(root, "anton.db") : null;
@@ -189,7 +194,12 @@ function booted(): Boot | null {
  */
 const GENERATION_KEY = Symbol.for("anton.build.cacheGeneration");
 
-function cacheGeneration(): number {
+/**
+ * Exported so a caller with its OWN cache keyed to "has the checkout moved" — the job runner's
+ * stale-checkout verdict (anton-kqst review) — can retire it on the same signal this module retires
+ * its own reads by, rather than drifting from it behind a second invalidation path.
+ */
+export function cacheGeneration(): number {
   return (globalThis as unknown as Record<symbol, number | undefined>)[GENERATION_KEY] ?? 0;
 }
 
@@ -290,7 +300,7 @@ export function recordServerBuild({
 }): void {
   const identity = bootIdentity();
   (globalThis as unknown as Record<symbol, Boot>)[BOOT_KEY] = { identity, runner, dependencies };
-  const db = dbPath();
+  const db = antonDbPath();
   if (!db) return;
   writeBuildRecord(buildRecordPath(db), identity, { appRoot: appRoot(), runner, dependencies });
   pruneBuildRecords(db);
@@ -416,7 +426,7 @@ function bootedAtOf(record: { bootedAt?: unknown } | null | undefined): number |
 }
 
 export function serverBuildDrift({ fresh = false }: { fresh?: boolean } = {}): BuildDrift | null {
-  const db = dbPath();
+  const db = antonDbPath();
   const record = db ? (readBuildRecord(buildRecordPath(db)) as (BuildIdentity & { bootedAt?: unknown }) | null) : null;
   const running = record ?? booted()?.identity ?? null;
   if (!running) return null;
@@ -526,6 +536,41 @@ export function selfBootDependencies(): string | null {
 }
 
 /**
+ * What THIS process is running, as one ledger stamp (anton-234ja): `0.5.1 (25ec011)`, or
+ * `0.5.1 (25ec011, uncommitted 71092ab)` where the checkout carries work HEAD does not.
+ *
+ * The spend ledger's version dimension. It answers the question no other stamp can — whether a
+ * cohort shift is the prompt that changed or the anton UNDER it — and the two are otherwise
+ * indistinguishable, since a release lands under a prompt nobody touched.
+ *
+ * Read from the BOOT identity, never the checkout: `bootIdentity` is what the running process
+ * actually executes, and in production that is the compiled artifact rather than whatever a later
+ * pull left on disk. A row stamped with the checkout would attribute the invocation to code that
+ * never ran it — which is the same lie {@link serverBuildDrift} exists to report.
+ *
+ * Resolved once per process and held, save for the on-disk fallback below reopening on the same
+ * generation counter `onDiskCache`/`driftsCache` answer to (PR #313 review): a BOOTED process is
+ * genuinely inert to this (a new build is a new process), but a process with no boot identity — a
+ * CLI, a script, a test — resolves from the checkout, and a caller that pulled mid-life expects
+ * `invalidateCaches()` to reach this cache exactly as it reaches theirs. `readBuildIdentity` spawns
+ * git synchronously — six reads on a cold path — which no dispatch may pay per invocation, so the
+ * cache still stands within one generation.
+ *
+ * Null only when nothing can name a version at all. An absence is recorded as an absence — the
+ * ledger's standing rule — never as a guess.
+ */
+let selfVersionCache: { version: string | null; generation: number } | null = null;
+
+export function selfBuildVersion(): string | null {
+  const generation = cacheGeneration();
+  if (selfVersionCache && selfVersionCache.generation === generation) return selfVersionCache.version;
+  const identity = booted()?.identity ?? (appRoot() ? onDiskIdentity() : null);
+  const version = identity?.version ? describeBuildIdentity(identity) : null;
+  selfVersionCache = { version, generation };
+  return version;
+}
+
+/**
  * The dependency digest the process that RUNS the scheduled jobs booted with, or null when nothing
  * establishes one (PR #257 review).
  *
@@ -539,7 +584,7 @@ export function selfBootDependencies(): string | null {
  * the runner could not establish one: an absence is not evidence, so the reader claims nothing.
  */
 export async function runnerBootDependencies(): Promise<string | null> {
-  const db = dbPath();
+  const db = antonDbPath();
   const root = appRoot();
   const records: BuildRecord[] =
     db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
@@ -552,7 +597,7 @@ export async function runnerBootDependencies(): Promise<string | null> {
 }
 
 async function readServerDrifts(): Promise<ServerDrift[]> {
-  const db = dbPath();
+  const db = antonDbPath();
   const root = appRoot();
   const records: BuildRecord[] =
     db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
@@ -621,4 +666,4 @@ function runsJobs(record: BuildRecord): boolean | undefined {
   return typeof record.runner === "boolean" ? record.runner : undefined;
 }
 
-export { describeBuildDrift, describeBuildIdentity };
+export { describeBuildDrift, describeBuildIdentity, isBundleInstall };

@@ -11,7 +11,8 @@ import { join } from "node:path";
 
 import { labelValueOf, type CookedStep } from "../../beads/bd";
 import { loadAgentPrompt, stripFrontmatter } from "../../claude/agent-prompt";
-import { loadSkill } from "../../claude/prompt";
+import { loadSkill, skillDir } from "../../claude/prompt";
+import { skillDigest, textDigest } from "../../claude/skill-stamp.mjs";
 import { PoisonEpic } from "../errors";
 import type { StepContext } from "./context";
 import type { StepDefinition } from "./result";
@@ -76,6 +77,32 @@ function assertOneReasoningLabel(labels: string[] | undefined, subject: string):
 }
 
 /**
+ * What a `step:claude` resolved to: the instruction text, and WHICH instruction produced it.
+ *
+ * The identity travels with the text because both are gone by the time anyone asks. `promptId` and
+ * `skillId` are mutually exclusive — {@link loadStepReasoning} dispatches exactly one — and
+ * `skillDigest` versions the skill that answered, since `loadProjectSkill` prefers the project's own
+ * copy: the same `skill:review` is different text in another repo, and different text in this one
+ * after an edit.
+ */
+export interface StepReasoning {
+  /** The instruction the agent is dispatched with. */
+  text: string;
+  /** The `prompt:<id>` that resolved, XOR {@link skillId}. */
+  promptId?: string;
+  /**
+   * Content digest of the resolved PROMPT body, the sibling of {@link skillDigest} — a `prompt:<id>`
+   * resolves a project-local `.claude/agents/<id>.md` first, then the operator's global copy, then
+   * anton's bundled one, and every one of those is edited in place. Recording the id alone would pool
+   * two cohorts that ran different text under one key, exactly as an unversioned `skillId` would.
+   */
+  promptBodyDigest?: string;
+  skillId?: string;
+  /** Content digest of the skill directory that answered. Absent when it could not be taken. */
+  skillDigest?: string;
+}
+
+/**
  * The reasoning contract a `step:claude` runs with, named by the formula step's own labels:
  * `prompt:<id>` resolves like an agent tag (project `.claude/agents` first, then the operator's
  * global copy, anton's bundled prompts, and installed plugins), `skill:<id>` reads the project's
@@ -86,12 +113,15 @@ function assertOneReasoningLabel(labels: string[] | undefined, subject: string):
  * start by {@link resolveStepIn}; the assertion stays here as the backstop for a caller invoking the
  * handler directly.
  */
-export async function loadStepReasoning(ctx: StepContext, stepId: string): Promise<string> {
+export async function loadStepReasoning(ctx: StepContext, stepId: string): Promise<StepReasoning> {
   assertOneReasoningLabel(ctx.step?.labels, `formula step "${stepId}"`);
   const promptId = labelValueOf(ctx.step?.labels, "prompt");
   if (promptId) {
     const body = await loadAgentPrompt(promptId, { projectDir: ctx.worktreePath });
-    if (body?.trim()) return body.trim();
+    if (body?.trim()) {
+      const text = body.trim();
+      return { text, promptId, promptBodyDigest: textDigest(text) };
+    }
     throw new PoisonEpic(
       `formula step "${stepId}" names \`prompt:${promptId}\`, which resolves to no prompt file — ` +
         `add \`.claude/agents/${promptId}.md\` to the project, or correct the label`,
@@ -99,8 +129,8 @@ export async function loadStepReasoning(ctx: StepContext, stepId: string): Promi
   }
   const skillId = labelValueOf(ctx.step?.labels, "skill");
   if (skillId) {
-    const body = await loadProjectSkill(ctx.worktreePath, skillId);
-    if (body) return body;
+    const skill = await loadProjectSkill(ctx.worktreePath, skillId);
+    if (skill) return { text: skill.text, skillId, skillDigest: digestOf(skill.dir) };
     throw new PoisonEpic(
       `formula step "${stepId}" names \`skill:${skillId}\`, which resolves to no skill — add ` +
         `\`.claude/skills/${skillId}/SKILL.md\` to the project, or correct the label`,
@@ -109,13 +139,34 @@ export async function loadStepReasoning(ctx: StepContext, stepId: string): Promi
   throw new PoisonEpic(`formula step "${stepId}" ${NAMES_NO_REASONING}`);
 }
 
-/** The project's own skill, else anton's vendored one of the same name. Undefined when neither exists. */
-async function loadProjectSkill(worktreePath: string, id: string): Promise<string | undefined> {
-  const path = join(worktreePath, ".claude", "skills", id, "SKILL.md");
-  const local = await readFile(path, "utf8").then(stripFrontmatter, () => undefined);
-  if (local?.trim()) return local.trim();
+/**
+ * The project's own skill, else anton's vendored one of the same name. Undefined when neither
+ * exists. The DIRECTORY that answered rides out beside the body: which copy won is the difference
+ * between two repos whose `skill:review` means different text, and it is knowable only here.
+ */
+async function loadProjectSkill(
+  worktreePath: string,
+  id: string,
+): Promise<{ text: string; dir: string } | undefined> {
+  const dir = join(worktreePath, ".claude", "skills", id);
+  const local = await readFile(join(dir, "SKILL.md"), "utf8").then(stripFrontmatter, () => undefined);
+  if (local?.trim()) return { text: local.trim(), dir };
   const bundled = await loadSkill(id).catch(() => undefined);
-  return bundled?.trim() || undefined;
+  return bundled?.trim() ? { text: bundled.trim(), dir: skillDir(id) } : undefined;
+}
+
+/**
+ * A skill directory's content digest, or undefined when it cannot be taken. Swallowed rather than
+ * raised: the digest is a LEDGER dimension, and the ledger's standing rule is that recording never
+ * fails a run — an unreadable directory costs the cohort key, never the dispatch that was about to
+ * run from text already in hand.
+ */
+function digestOf(dir: string): string | undefined {
+  try {
+    return skillDigest(dir) || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

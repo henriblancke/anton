@@ -4,9 +4,16 @@
  * The end-to-end flow is covered by review-fix.integration.test.ts.
  */
 import { describe, expect, it } from "vitest";
-import { CLUSTERED_FINDINGS_THRESHOLD, labelValue, parseThreadReport, reviewFixContext } from "./review-fix-context";
+import {
+  buildReviewFixPrompt,
+  CLUSTERED_FINDINGS_THRESHOLD,
+  labelValue,
+  parseThreadReport,
+  reviewFixContext,
+} from "./review-fix-context";
 import type { PrReview, ReviewThread } from "../git/pr";
 import type { Bead } from "../beads/bd";
+import type { ProjectSettings } from "../projects";
 
 const epic = { id: "anton-x1", title: "Ship X" } as Bead;
 
@@ -25,6 +32,49 @@ function makePr(overrides: Partial<PrReview> = {}): PrReview {
     ...overrides,
   } as PrReview;
 }
+
+describe("buildReviewFixPrompt — reasoning attribution", () => {
+  const pr = makePr();
+  const settings = {} as ProjectSettings;
+
+  it("names the shipped review-fix skill when no operator override is configured", async () => {
+    const { attribution } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["failing checks"],
+      conflicts: [],
+      settings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+    });
+    expect(attribution).toMatchObject({ skillId: "review-fix" });
+    expect(attribution.skillDigest).toMatch(/^[0-9a-f]{12}$/);
+    expect(attribution.promptBodyDigest).toBeUndefined();
+  });
+
+  it("digests the operator's own reviewFixPrompt text instead, when one is set", async () => {
+    const override = { ...settings, reviewFixPrompt: "Resolve it MY way." } as ProjectSettings;
+    const { attribution } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["failing checks"],
+      conflicts: [],
+      settings: override,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+    });
+    expect(attribution.skillId).toBeUndefined();
+    expect(attribution.promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
+    // A different override text digests to a different stamp — the whole point of recording one.
+    const { attribution: other } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["failing checks"],
+      conflicts: [],
+      settings: { ...settings, reviewFixPrompt: "Resolve it a THIRD way." } as ProjectSettings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+    });
+    expect(other.promptBodyDigest).not.toBe(attribution.promptBodyDigest);
+  });
+});
 
 describe("labelValue", () => {
   it("returns the value after the prefix", () => {

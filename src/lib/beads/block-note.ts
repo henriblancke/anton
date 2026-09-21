@@ -41,7 +41,14 @@ export function blockNoteEvidence(args: {
   if (!committed) return `session ${sessionId}, nothing committed on ${branch}`;
   // `@ unknown` rather than a bare "committed on <branch>", so the reader below tells a sha it never
   // got from one it failed to parse, and the operator sees which half of the evidence is missing.
-  return `session ${sessionId}, committed on ${branch} @ ${head ? head.slice(0, 7) : "unknown"}`;
+  //
+  // Full sha, never a truncated prefix (PR #279 review): this clause is the only copy of the sha
+  // this note carries — unlike a satisfied note's, which shows a short form in its prose but still
+  // embeds the full sha in this same trailing bracket. A caller reusing it as a preservation pin
+  // (execute-epic-claim's `preserveShas`) needs it to resolve unambiguously in a growing repo; a
+  // short prefix that goes ambiguous there reads as absent, silently dropping the protection this
+  // evidence exists to provide.
+  return `session ${sessionId}, committed on ${branch} @ ${head ?? "unknown"}`;
 }
 
 /**
@@ -60,7 +67,7 @@ const COMMITTED = /, committed on (\S+) @ ([0-9a-f]{7,40})$/;
 const COMMITTED_UNKNOWN_SHA = /, committed on (\S+) @ unknown$/;
 const NOTHING_COMMITTED = /, nothing committed on (\S+)$/;
 
-/** Read one machine note's evidence back: the branch it ran on, and the short sha when work landed. */
+/** Read one machine note's evidence back: the branch it ran on, and the full sha when work landed. */
 export function blockNoteCommit(note: string): BlockNoteCommit | undefined {
   const clause = EVIDENCE_CLAUSE.exec(note.trimEnd())?.[1];
   if (!clause) return undefined;

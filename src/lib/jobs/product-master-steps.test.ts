@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
+import type { ReasoningAttribution } from "../claude-invocations";
 import type { PmBoardInput, PmClaim } from "../pm/context";
 import type { ProjectSettings } from "../projects";
 import { fakeScope } from "./pass.fixture";
@@ -122,6 +123,43 @@ describe("judgeBoard", () => {
     });
 
     expect(scope.logged.join("")).toContain("with the operator's prompt");
+  });
+
+  it("tells the caller's meter the shipped skill's identity, since the dispatch sets no system prompt of its own", async () => {
+    const { claude } = session(report(`{"proposals":[]}`));
+    let attribution: ReasoningAttribution | undefined;
+
+    await judgeBoard(fakeScope(REPO), {
+      settings,
+      boardInput: boardInput([bead("anton-a")]),
+      claude,
+      onEvent: undefined,
+      setAttribution: (a) => {
+        attribution = a;
+      },
+    });
+
+    expect(attribution).toMatchObject({ skillId: "product-master" });
+    expect(attribution?.skillDigest).toMatch(/^[0-9a-f]{12}$/);
+    expect(attribution?.promptBodyDigest).toBeUndefined();
+  });
+
+  it("digests the operator's own productMasterPrompt instead, when one is set", async () => {
+    const { claude } = session(report(`{"proposals":[]}`));
+    let attribution: ReasoningAttribution | undefined;
+
+    await judgeBoard(fakeScope(REPO), {
+      settings: { productMasterPrompt: "Judge it my way." } as ProjectSettings,
+      boardInput: boardInput([bead("anton-a")]),
+      claude,
+      onEvent: undefined,
+      setAttribution: (a) => {
+        attribution = a;
+      },
+    });
+
+    expect(attribution?.skillId).toBeUndefined();
+    expect(attribution?.promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
   });
 
   it("throws on a session that errored rather than calling its silence an empty board", async () => {

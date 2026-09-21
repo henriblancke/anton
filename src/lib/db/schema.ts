@@ -58,6 +58,58 @@ export const runs = sqliteTable("runs", {
   // resumes (a reused worktree's HEAD has moved on, so recomputing then is wrong). Null on rows
   // written before this column existed, which fall back to recomputing.
   baseForkSha: text("base_fork_sha"),
+  // What refreshOntoBase (worktree.ts) did to a REUSED checkout at this attempt's warm, before the
+  // agent was dispatched (anton-s55u) — noop | fast_forwarded | rebased | merged | skipped_dirty |
+  // pending | branch_recreated. pending is PENDING_REFRESH_OUTCOME (runs.ts) — a write-ahead marker
+  // execute-epic-claim.ts's `beforeMutate` writes immediately before the mutating merge/rebase/
+  // fast-forward call, so a process killed mid-mutation still leaves a crash-recovery trace.
+  // branch_recreated is warmRunWorktree's own tombstone, BRANCH_RECREATED_REFRESH_TOMBSTONE in
+  // runs.ts, written when createWorktree recreated the branch rather than reusing it — never
+  // refreshOntoBase's own return value. skipped_dirty is a parked run's uncommitted work left in
+  // place, not a failure. Without this, a stale-tree resume left no evidence anywhere queryable: the
+  // outcome only ever reached a console.log the job runner doesn't persist. Null when the checkout
+  // was freshly created (nothing to refresh) or the caller didn't opt into refresh (e.g. review-fix's
+  // PR branches).
+  baseRefreshOutcome: text("base_refresh_outcome"),
+  // The base commit the checkout was refreshed onto, paired with baseRefreshOutcome above — lets a
+  // human confirm which base a resumed run actually implemented against, hours later, without
+  // re-deriving it from a diff.
+  baseRefreshSha: text("base_refresh_sha"),
+  // The branch's own tip the instant BEFORE the pending mutation above was attempted (anton-s55u, PR
+  // #279 review, P1) — written alongside baseRefreshOutcome=pending, read back only to reconcile a
+  // still-pending row into a trustworthy `--onto` boundary. Ancestry alone can't tell "the mutation
+  // landed" from "baseRefreshSha was already an ancestor of this branch before the mutation ever ran"
+  // (e.g. a rewound base whose new, older target already sits behind the branch's existing history) —
+  // that reachability is identical either way. Comparing against the branch's PRE-mutation tip breaks
+  // the tie: if baseRefreshSha was already an ancestor of THIS sha, the current-branch check is
+  // inconclusive and the pending sha is not trusted; only when it wasn't, and is now, has the branch
+  // actually moved. See findPendingRefreshShaForBranch's reconciliation caller in execute-epic-claim.ts.
+  pendingRefreshFromSha: text("pending_refresh_from_sha"),
+  // The SPECIFIC git operation the pending mutation above is (fast_forwarded | merged | rebased) —
+  // written alongside pendingRefreshFromSha (PR #279 review, P1, seventh round). Ancestry of
+  // baseRefreshSha from the branch's current tip alone can't confirm the mutation actually landed:
+  // that reachability is identical whether the mutation ran OR baseRefreshSha was already an ancestor
+  // of the branch before anything touched it (e.g. an authoritative rewind) and something UNRELATED —
+  // a `pre-rebase` hook committing as a side effect before rejecting the rebase — moved the branch off
+  // pendingRefreshFromSha instead. The confirmation this column enables is specific to each operation:
+  // a fast-forward lands on EXACTLY baseRefreshSha; a merge's tip is a commit whose parents are
+  // exactly pendingRefreshFromSha and baseRefreshSha; a rebase always replays onto brand-new commit
+  // objects, so a genuinely landed one leaves pendingRefreshFromSha unreachable from the new tip —
+  // which the hook side-effect shape above does not. See execute-epic-claim.ts's reconciliation.
+  pendingRefreshKind: text("pending_refresh_kind"),
+  // This row's own last EFFECTIVE (non-pending, non-skipped_dirty) refresh boundary, snapshotted onto
+  // a SEPARATE column the instant baseRefreshOutcome/baseRefreshSha above are overwritten with the
+  // pending marker (PR #279 review, P1) — a resumed run (parked, then picked back up) calls
+  // warmRunWorktree again on this SAME row, and a plain overwrite would discard the row's own prior,
+  // already-confirmed boundary the moment it starts a NEW refresh. Without this, a crash between that
+  // overwrite and the finalize write leaves nothing on this row (or any other) recording the boundary
+  // that prior refresh actually landed on: findRunBaseRefreshShaForBranch's branch-wide walk skips
+  // this row (now pending) and falls through to an older row or `baseForkSha`, both further back than
+  // the checkout's own confirmed history — a later `--onto` rebase can then replay commits that
+  // earlier refresh already carried forward as if they were still-unapplied base history.
+  // Read back only while baseRefreshOutcome = pending (see findRunBaseRefreshShaForBranch); inert and
+  // never cleared once a real outcome resettles the row, since nothing reads it in that state.
+  priorBaseRefreshSha: text("prior_base_refresh_sha"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports
@@ -841,6 +893,54 @@ export const claudeInvocations = sqliteTable(
      * to the risk of a credential landing in one.
      */
     endpointHost: text("endpoint_host"),
+    /**
+     * 12-hex digest of the COMPOSED system prompt (base + agent + seed) this invocation ran with.
+     * The prompt is the behavior of every producer, and it is edited in place — by the time anyone
+     * asks whether a prompt change helped, the text that ran is gone. Recorded, never derived.
+     */
+    promptDigest: text("prompt_digest"),
+    /**
+     * 12-hex content digest of the COOKED formula. `runs.formula` is a path, and a path says
+     * nothing about a pipeline edited between two runs that both point at it.
+     */
+    formulaDigest: text("formula_digest"),
+    /**
+     * The anton release + git revision that ran it. Separates "my prompt improved" from "I upgraded
+     * anton" — two explanations for the same cohort shift that are indistinguishable without it.
+     */
+    antonVersion: text("anton_version"),
+    /**
+     * The resolved `stepName(step)` — the HANDLER, not the author's step id already in `step`. A
+     * project formula names its steps freely, so the id matches no phase predicate, and the id →
+     * handler mapping is itself editable: the classification cannot be reconstructed later.
+     */
+    stepHandler: text("step_handler"),
+    /**
+     * The `agent:<tag>` the TICKET resolved to, null when it named none. Duplicates `runs.agent_tag`
+     * deliberately: that one is per-RUN, while `agent:` is a per-ticket label, so a run whose three
+     * tickets used three specialists records one of them and loses the mix.
+     */
+    agentTag: text("agent_tag"),
+    /**
+     * The `skill:<id>` a `step:claude` resolved, and the digest of the text it resolved TO. A skill
+     * resolves project-local-first and is edited in place, so the same id is different text in
+     * another repo and different text in this one next week — the id alone would pool two cohorts
+     * that ran different instructions.
+     */
+    skillId: text("skill_id"),
+    skillDigest: text("skill_digest"),
+    /**
+     * The `prompt:<id>` a `step:claude` resolved — the sibling of `skill_id`, and mutually exclusive
+     * with it by construction, since `loadStepReasoning` dispatches exactly one.
+     */
+    promptId: text("prompt_id"),
+    /**
+     * The digest of the resolved PROMPT body that ran — the sibling of `skill_digest`. `prompt_id`
+     * resolves project-local-first and is edited in place, so the id alone would pool two cohorts
+     * that ran different text under one key. Distinct from `prompt_digest` above, which digests the
+     * composed SYSTEM prompt rather than this step's own instruction text.
+     */
+    promptBodyDigest: text("prompt_body_digest"),
     inputTokens: integer("input_tokens"),
     outputTokens: integer("output_tokens"),
     thinkingTokens: integer("thinking_tokens"),

@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 9c732e69d011
+version: 9598d4960b10
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's
@@ -67,8 +67,53 @@ Copy both files from `${CLAUDE_SKILL_DIR}/templates/.beads/formulas/` to
 - `anton-bead.formula.json` — the bead SKELETON.
 - `anton-run.formula.toml` — the run PIPELINE.
 
-**No-clobber — if a file already exists, leave it alone and report it as skipped**: a project that
-has tuned its own bead skeleton or pipeline keeps it.
+**Compare, then replace — matching `ensureFormula` in `src/lib/beads/config.mjs`, which is what
+`anton setup` and `anton init` run:**
+
+**First, check the DIRECTORIES you are about to write into.** Run `ls -ld .beads .beads/formulas`.
+If either is a symlink (or exists and is not a directory), **stop — write nothing and report it**.
+A symlinked `formulas/` sends the copy to the link's target, outside the repo, and checking only
+the filename does not catch it: inspecting the final component resolves every directory above it,
+so the contents of the link's target look like ordinary files and the check passes.
+
+Then, per file:
+
+- The file is absent → copy it, report `installed`.
+- It exists and is byte-identical to the template → leave it, report `already`.
+- It exists and DIFFERS → save the previous contents beside it as `<filename>.bak` **first**, then
+  write the template over it, report `replaced`, and say so plainly. The backup is a precondition,
+  not a courtesy: **if it cannot be written, leave the formula alone and report that instead.** Git
+  cannot recover tuning that was never committed, which is exactly what the backup is protecting —
+  a stale formula is fixable on the next run, destroyed local work is not.
+  Apply the SAME checks to the `.bak` path that you applied to the formula: if it is already a
+  symlink or a hard link, `cp` writes through it into whatever it points at, which may be outside
+  the repo. Check it with `ls -l` before writing, and write-then-`mv` rather than `cp` over it.
+- It exists and is a SYMLINK (`ls -l` shows an arrow) → do NOT write. Copying follows the link and
+  overwrites its target somewhere outside the repo. Report it and move on.
+- It exists and has a LINK COUNT above 1 (`ls -l` column 2, or `stat -f %l` on macOS / `stat -c %h`
+  on Linux) → it is a hard link sharing its bytes with another file, which `cp` would overwrite
+  too. Write a new file and `mv` it into place rather than `cp`-ing over the existing one, so only
+  this directory entry changes.
+
+Existence alone must not decide this. A project holding a verbatim copy of an OLDER template is
+indistinguishable from one that tuned its pipeline if you only check whether the file is there —
+which is how `step:describe` came to be missing from every project anton had already set up, while
+each re-run reported the formula as present and fine.
+
+**If you wrote any `.bak`, make sure it is ignored.** `.beads/` is git-tracked, so a backup left
+beside a formula is staged by the next `git add -A` and a stale pipeline gets committed and shipped
+to every clone. Append `formulas/*.bak` to `.beads/.gitignore` (creating the file if absent, and
+leaving any existing lines alone) before you create the backup. `anton init` adds this entry through
+`ensureBeadsGitignore` for the same reason.
+
+**Check `.beads/.gitignore` for links first, exactly as you did the formula and its `.bak`.** An
+established repo already carries the other entries, so this one line is the only thing you would
+write — and appending to a `.gitignore` that is a SYMLINK follows it and edits a file outside the
+repository. `ls -l .beads/.gitignore` and `ls -ld .beads`: if either is a symlink (an arrow), do NOT
+write — report it and leave the formula alone too, since its `.bak` would then be committable. If
+the file's LINK COUNT is above 1 it shares its bytes with another file, so append into a new file
+and `mv` it into place rather than `>>`-ing the existing one, which writes through to the peer.
+`ensureBeadsGitignore` makes all three of these checks (PR #307 review).
 
 The bead formula is the skeleton `/shape` and anton's Add-work UI pour every bead from (one step per
 tier, the contract sections pre-stubbed), so the conformant shape is structural instead of a prompt

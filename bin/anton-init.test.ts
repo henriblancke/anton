@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { ensureBeadsGitignore, parseInitArgs, registerProject, REQUIRED_SKILLS } from "./anton.mjs";
@@ -20,6 +20,7 @@ import {
   // The single Dolt-sync path (anton-8qx): one configureBeadsDoltSync shared by `anton setup`
   // (bin/anton.mjs) and `anton init` (via configureBeadsForRepo). normalizeRemoteUrl is its URL
   // equality helper.
+  BEADS_GITIGNORE_ENTRIES,
   configureBeadsDoltSync,
   configYamlValue,
   detectHooksManager,
@@ -69,11 +70,12 @@ describe("ensureBeadsGitignore (anton init)", () => {
     writeFileSync(join(beadsDir, ".gitignore"), "dolt/\nembeddeddolt/\n");
 
     const first = ensureBeadsGitignore(beadsDir);
-    expect(first.added).toEqual(["issues.jsonl", "interactions.jsonl"]);
+    // Everything the constant requires EXCEPT the two the file already carried.
+    const preexisting = ["dolt/", "embeddeddolt/"];
+    expect(first.added).toEqual(BEADS_GITIGNORE_ENTRIES.filter((e) => !preexisting.includes(e)));
     const after = await readFile(join(beadsDir, ".gitignore"), "utf8");
     expect(after).toContain("dolt/"); // pre-existing content preserved
-    expect(after).toContain("issues.jsonl");
-    expect(after).toContain("interactions.jsonl");
+    for (const entry of BEADS_GITIGNORE_ENTRIES) expect(after).toContain(entry);
 
     // Re-run: everything present → no additions, file byte-identical.
     const second = ensureBeadsGitignore(beadsDir);
@@ -87,11 +89,81 @@ describe("ensureBeadsGitignore (anton init)", () => {
     mkdirSync(beadsDir, { recursive: true });
 
     const r = ensureBeadsGitignore(beadsDir);
-    expect(r.added).toEqual(["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]);
+    expect(r.added).toEqual([...BEADS_GITIGNORE_ENTRIES]);
     const text = await readFile(join(beadsDir, ".gitignore"), "utf8");
-    for (const e of ["issues.jsonl", "interactions.jsonl", "dolt/", "embeddeddolt/"]) {
-      expect(text).toContain(e);
-    }
+    for (const e of BEADS_GITIGNORE_ENTRIES) expect(text).toContain(e);
+    // The formula backup a replace-on-drift install leaves behind lands in a git-TRACKED directory,
+    // so the ignore is what keeps a stale pipeline copy out of the next `git add -A`.
+    expect(text).toContain("formulas/*.bak");
+  });
+
+  // PR #307 review, P1. Adding `formulas/*.bak` is what made these paths reachable with something
+  // to write: a repo carrying the four older entries used to take the no-op return and never touch
+  // the file, so a linked `.gitignore` was never followed. With a fifth entry it writes — and
+  // `writeFileSync` follows a symlink out of the repository entirely.
+  describe("refuses to write through a link", () => {
+    /** The four pre-`formulas/*.bak` entries: enough that ONLY the new one is missing. */
+    const legacyEntries = "issues.jsonl\ninteractions.jsonl\ndolt/\nembeddeddolt/\n";
+
+    it("refuses a symlinked .gitignore and leaves the link's target untouched", async () => {
+      dir = await tempDir("anton-gi-");
+      const beadsDir = join(dir, ".beads");
+      mkdirSync(beadsDir, { recursive: true });
+      const outside = join(dir, "outside.txt");
+      writeFileSync(outside, legacyEntries);
+      symlinkSync(outside, join(beadsDir, ".gitignore"));
+
+      const r = ensureBeadsGitignore(beadsDir);
+      expect(r.added).toEqual([]);
+      expect(r.refused).toMatch(/SYMLINK/);
+      // The escape this closes: the write landing outside the repository.
+      expect(await readFile(outside, "utf8")).toBe(legacyEntries);
+      // And the link is still a link — refusing must not quietly replace it either.
+      expect(lstatSync(join(beadsDir, ".gitignore")).isSymbolicLink()).toBe(true);
+    });
+
+    it("refuses when .beads itself is a symlink", async () => {
+      dir = await tempDir("anton-gi-");
+      const real = join(dir, "elsewhere");
+      mkdirSync(real, { recursive: true });
+      writeFileSync(join(real, ".gitignore"), legacyEntries);
+      const beadsDir = join(dir, ".beads");
+      symlinkSync(real, beadsDir);
+
+      const r = ensureBeadsGitignore(beadsDir);
+      expect(r.added).toEqual([]);
+      expect(r.refused).toMatch(/SYMLINK/);
+      expect(await readFile(join(real, ".gitignore"), "utf8")).toBe(legacyEntries);
+    });
+
+    // A hard link is an ordinary regular file to `lstat`, so no check can refuse it. The write is
+    // safe anyway because it renames a new file into place instead of truncating the shared inode.
+    it("updates a hard-linked .gitignore without writing through to its peer", async () => {
+      dir = await tempDir("anton-gi-");
+      const beadsDir = join(dir, ".beads");
+      mkdirSync(beadsDir, { recursive: true });
+      const peer = join(dir, "peer.txt");
+      writeFileSync(peer, legacyEntries);
+      linkSync(peer, join(beadsDir, ".gitignore"));
+
+      const r = ensureBeadsGitignore(beadsDir);
+      expect(r.refused).toBeUndefined();
+      expect(r.added).toEqual(["formulas/*.bak"]);
+      // Only the name inside `.beads/` took the new bytes.
+      expect(await readFile(join(beadsDir, ".gitignore"), "utf8")).toContain("formulas/*.bak");
+      expect(await readFile(peer, "utf8")).toBe(legacyEntries);
+    });
+
+    it("still creates the file when it is simply absent", async () => {
+      dir = await tempDir("anton-gi-");
+      const beadsDir = join(dir, ".beads");
+      mkdirSync(beadsDir, { recursive: true });
+
+      // Absent is the ordinary create case, NOT a refusal — the `missingIsSafe` reading.
+      const r = ensureBeadsGitignore(beadsDir);
+      expect(r.refused).toBeUndefined();
+      expect(r.added).toEqual([...BEADS_GITIGNORE_ENTRIES]);
+    });
   });
 });
 

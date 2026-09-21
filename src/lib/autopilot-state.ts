@@ -12,6 +12,7 @@
  *      would tell an operator "nothing for you to do" about a policy frozen until they act.
  */
 import { currentDisarm } from "./autopilot-disarm";
+import { isBundleInstall } from "./build/drift";
 import { currentWipHold } from "./jobs/picker-wip-hold";
 import { checkSelfFreshness, RUNNER, selfRepoRoot } from "./jobs/self-freshness";
 import { BREAKER_POLL_MS, staleBreaker, type AutopilotBreaker } from "./autopilot-breaker";
@@ -32,6 +33,7 @@ export async function currentBreaker(project: Project): Promise<AutopilotBreaker
   // filesystem reads shared by both processes, so only those two need the runner named.
   const stale = staleBreaker(
     await checkSelfFreshness(selfRepoRoot(), RUNNER, { maxAgeMs: BREAKER_POLL_MS }),
+    { isBundle: isBundleInstall(selfRepoRoot()) },
   );
   if (stale) return stale;
   // Sequential on purpose: a disarmed project needs no PR read to explain itself, and the hold's

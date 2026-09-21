@@ -84,7 +84,15 @@ export async function refreshCheckout(
   }
   const at = { head: state.head };
 
-  if (!(await hasRemote(repoPath))) {
+  let remotePresent: boolean;
+  try {
+    remotePresent = await hasRemote(repoPath);
+  } catch (e) {
+    // An operational probe failure, not a confirmed "no such remote" — worth retrying, same as an
+    // unreadable checkout above, rather than reported as the (unconfirmed) no-remote drift below.
+    return { ...at, drift: `probing ${repoPath} for an "origin" remote failed (${reason(e)})`, transient: true };
+  }
+  if (!remotePresent) {
     return { ...at, drift: `no "origin" remote — nothing here names the tree that shipped` };
   }
 

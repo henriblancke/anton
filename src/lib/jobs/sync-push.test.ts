@@ -13,6 +13,7 @@ import { enqueueSyncPushDeduped, getJob, type Clock } from "./queue";
 import { JobRunner, type JobContext, type RunnerConfig } from "./runner";
 import { DEFAULT_CONFIG } from "./runner";
 import { makeSyncPushHandler } from "./sync-push";
+import { FRESH_CHECKOUT } from "@/lib/testing/jobs";
 import { makeProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
@@ -98,7 +99,7 @@ describe("sync-push durability (runner + real coalescer)", () => {
     const push = async () => {
       throw new Error("remote unreachable");
     };
-    const runner = new JobRunner({ db: t.db, clock, config: CONFIG });
+    const runner = new JobRunner({ db: t.db, clock, config: CONFIG, readSelfCheckoutRefusal: FRESH_CHECKOUT });
     runner.registerHandler("sync-push", makeSyncPushHandler({ db: t.db, push }));
 
     const id = enqueueSyncPushDeduped(t.db, clock, "p1");
@@ -145,7 +146,7 @@ describe("sync-push durability (runner + real coalescer)", () => {
       return "";
     });
 
-    const runner = new JobRunner({ db: t.db, clock, config: CONFIG });
+    const runner = new JobRunner({ db: t.db, clock, config: CONFIG, readSelfCheckoutRefusal: FRESH_CHECKOUT });
     runner.registerHandler(
       "sync-push",
       makeSyncPushHandler({ db: t.db, push: (cwd) => coalescer(cwd, "push") }),
@@ -188,7 +189,7 @@ describe("sync-push durability (runner + real coalescer)", () => {
     // Reconcile the repo once (a full pass) so the state registry is caught up before the job runs.
     await coalescer("/tmp/p1", "full");
 
-    const runner = new JobRunner({ db: t.db, clock, config: CONFIG });
+    const runner = new JobRunner({ db: t.db, clock, config: CONFIG, readSelfCheckoutRefusal: FRESH_CHECKOUT });
     runner.registerHandler(
       "sync-push",
       makeSyncPushHandler({ db: t.db, push: (cwd) => coalescer(cwd, "push") }),

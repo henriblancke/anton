@@ -200,10 +200,12 @@ process.exit(0);`),
     expect(isAncestor).toBe(true);
   });
 
-  it("does not rebase an existing worktree onto a newer base on resume (anton-x3o)", async () => {
-    // AC3: resume reuses the existing worktree as-is. Even if origin/main advances between the
-    // park and the resume, createWorktree short-circuits to the existing worktree and its base is
-    // NOT moved mid-run — the run's branch must not pick up the post-park commit.
+  it("fast-forwards a parked run's stale worktree onto the newer base on resume, and records the refresh (anton-s55u)", async () => {
+    // anton-s55u: a resumed run must implement against the tree it will merge into, not whatever
+    // base a parked attempt cut the branch from. Origin/main advances AFTER the worktree is
+    // created (while the run sits parked on a usage limit) — resume must fold that fresh base in
+    // before dispatching the agent again, and the outcome must land on the run row: the only
+    // record, hours later, of whether this attempt worked against a stale tree.
     const epic7 = await beads.create(repo, {
       title: "Feature ResumeStable",
       type: "epic",
@@ -214,11 +216,16 @@ process.exit(0);`),
     const t7 = createTicket(repo, { title: "Stable ticket", parent: epic7 });
 
     const resetSec = Math.floor(clock.now() / 1000) + 3600;
+    // The "have I been invoked before" sentinel lives OUTSIDE the worktree (in `sandbox`, like
+    // `invLog` elsewhere in this file) — inside it, an untracked file left behind by the first,
+    // usage-limited invocation would make refreshOntoBase see a dirty checkout and refuse to
+    // touch it (by design — AC3), parking the resume instead of exercising the fast-forward.
+    const sentinel = join(sandbox, ".quota-hit-stable");
     const quotaClaude = writeBin(
       binDir,
       "claude-quota-stable",
       `const fs=require('fs');const path=require('path');
-const sentinel=path.join(process.cwd(),'.quota-hit-stable');
+const sentinel=${JSON.stringify(sentinel)};
 const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
 if(!fs.existsSync(sentinel)){
   fs.writeFileSync(sentinel,'1');
@@ -238,13 +245,15 @@ process.exit(0);`,
     try {
       const jobId = await enqueueEpicJob(runner, { projectId, epicBeadId: epic7 });
 
-      // First tick → usage limit → run parked, worktree created off whatever origin/main was.
+      // First tick → usage limit → run parked, worktree created off whatever origin/main was, no
+      // commits of its own yet.
       await tickToIdle(runner);
       const run7 = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic7)!;
       expect(run7.status).toBe("parked");
       expect(existsSync(run7.worktreePath!)).toBe(true);
+      expect(run7.baseRefreshOutcome).toBeNull();
 
-      // Origin/main advances AFTER the worktree exists — resume must not fold this into the run.
+      // Origin/main advances AFTER the worktree exists — resume must fold this in.
       const postParkSha = pushFreshBaseCommit(sandbox, bare, "POST_PARK");
 
       // Advance past the reset window → resume completes on the SAME worktree.
@@ -253,7 +262,9 @@ process.exit(0);`,
       expect((await getJob(tdb.db, jobId))?.status).toBe("done");
       expect((await beads.show(repo, t7)).status).toBe("closed");
 
-      // The post-park commit is NOT an ancestor of the run branch — the worktree wasn't rebased.
+      // The post-park commit IS now an ancestor of the run branch — the reused, unique-commit-free
+      // worktree was fast-forwarded onto the fresh base before the agent's second turn ran, so its
+      // cwd sat at the new base.
       execFileSync("git", ["-C", repo, "fetch", "-q", "origin"], { stdio: "ignore" });
       const foldedIn = (() => {
         try {
@@ -267,7 +278,13 @@ process.exit(0);`,
           return false;
         }
       })();
-      expect(foldedIn).toBe(false);
+      expect(foldedIn).toBe(true);
+
+      // The refresh outcome is recorded on the run row — queryable evidence the tree was stale and
+      // got fixed, rather than something only ever visible in that attempt's stdout.
+      const resumedRun = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === epic7)!;
+      expect(resumedRun.baseRefreshOutcome).toBe("fast_forwarded");
+      expect(resumedRun.baseRefreshSha).toBe(postParkSha);
     } finally {
       process.env.ANTON_CLAUDE_BIN = successClaude;
     }

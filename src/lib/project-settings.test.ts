@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mergeSettings, type ProjectSettings } from "./project-settings";
+import { mergeSettings, resolveWarmConfig, type ProjectSettings } from "./project-settings";
 
 /**
  * Direct unit tests for `mergeSettings`'s per-key merge precedence (anton-33h0) — the pure function
@@ -81,5 +81,29 @@ describe("mergeSettings", () => {
     const current: ProjectSettings = { budgetPolicy: { daytimeReservePct: 25 } };
     const next = mergeSettings(current, { budgetPolicy: undefined });
     expect(next.budgetPolicy).toBeUndefined();
+  });
+});
+
+/** The settings half of the warm ladder (anton-z5li2): what absence means on each field. */
+describe("resolveWarmConfig", () => {
+  it("leaves warming ON for a project that predates the setting", () => {
+    expect(resolveWarmConfig({})).toEqual({ command: undefined, enabled: true });
+  });
+
+  it("carries a pinned command through", () => {
+    expect(resolveWarmConfig({ warmCommand: "make setup" })).toEqual({
+      command: "make setup",
+      enabled: true,
+    });
+  });
+
+  // A cleared command is a fall-through to the env var / lockfile table, never a skip.
+  it("reads an empty command as absent rather than as an empty shell command", () => {
+    expect(resolveWarmConfig({ warmCommand: "" }).command).toBeUndefined();
+  });
+
+  it("turns warming off only on an explicit false", () => {
+    expect(resolveWarmConfig({ warmEnabled: false }).enabled).toBe(false);
+    expect(resolveWarmConfig({ warmEnabled: true }).enabled).toBe(true);
   });
 });

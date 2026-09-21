@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 11db9bdf0f93
+version: 75bb1d55231f
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -149,6 +149,13 @@ Don't retype that shape from memory — **cook it from the project's bead formul
 tier and the sections come with it, so your job is filling them, not remembering them. Its `{{var}}`
 defaults are prompts: a bead that ships with a `TODO —` line in it is not shaped. **All five
 sections ride in the description** — never `--acceptance`, never `--context`.
+
+**Work that spends tokens, occupies the queue, or needs a human is instrumented as part of itself**
+— ADR-0001 (`docs/adr/0001-every-feature-is-instrumented.md`). A new Claude dispatch, job type,
+pipeline step, or stop path carries its ledger row, its phase, and its friction class in the same
+PR. Shape that as a ticket under the feature; when the work genuinely has nothing to meter, say so
+in `## Out of scope` and why. Silence is not a decision — the reviewer reads the bead, not your
+intent. Pure refactors, docs, and UI over existing data are outside the ADR and need neither.
 
 Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the `bd` skill's conventions, plus one
 `area:` on the epic. Set dependency edges: `parent-child` from ticket to feature and from feature

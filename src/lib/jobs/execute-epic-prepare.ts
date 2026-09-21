@@ -129,7 +129,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   assertAgentsEnabled(run, gates);
   assertBeadContract(run, gates);
   await assertTicketsClaimable(run, gates);
-  const { ticketSteps, runSteps } = await resolveRunPipeline(run);
+  const { ticketSteps, runSteps, formulaDigest } = await resolveRunPipeline(run);
   gates.children = await takeRunLease(run, preCheckTrusted, gates.children, confirmSelectionUnderLease);
   // Re-asked after EVERY board this run adopts past the read-only gates (PR #227 review). Step 1c
   // swaps in the children the lease confirmed, and the arm below swaps in the ones ITS own refresh
@@ -144,7 +144,7 @@ export async function prepareEpicRun(run: EpicRun): Promise<RunPreparation> {
   run.lease.startRefresh();
   await armHumanTicketWaits(run, gates);
   await assertTicketsClaimable(run, gates);
-  const { worktree, runStep } = await warmRunWorktree(run);
+  const { worktree, runStep } = await warmRunWorktree(run, formulaDigest);
   await assertPreservedWorkFitsShape(run, worktree);
   await claimRunTarget(run);
   await cascadeChildClaims(run);

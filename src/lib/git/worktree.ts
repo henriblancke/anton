@@ -9,11 +9,18 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { extraBinDirs, findOnPath, isExecutableFile } from "../bin";
+import {
+  exitedWith,
+  hasCommonHistory,
+  isAncestor,
+  needsHooksPathOverrideForMerge,
+  resolveHooksPathOverrideForMerge,
+} from "./ops";
 
 const execFileAsync = promisify(execFile);
 
@@ -39,11 +46,43 @@ export interface Worktree {
   createdBranch: boolean;
   /** The main repo the worktree belongs to. */
   repoPath: string;
+  /**
+   * What {@link refreshOntoBase} did to a REUSED checkout, when `refresh: true` was passed
+   * (anton-s55u) — undefined for a freshly-created checkout (nothing to refresh) or when the caller
+   * didn't opt in. Callers that need this queryable later than the process's own stdout (a resumed
+   * run's staleness, hours on) persist it onto their own record — see execute-epic-claim.ts.
+   */
+  refreshOutcome?: RefreshOutcome;
 }
 
-/** Run a git command in `repoPath`, returning trimmed stdout. */
-async function git(repoPath: string, args: string[]): Promise<string> {
-  const { stdout } = await execFileAsync("git", ["-C", repoPath, ...args], {
+/** The shapes {@link refreshOntoBase} can leave a reused checkout in. */
+export interface RefreshOutcome {
+  outcome: "noop" | "fast_forwarded" | "rebased" | "merged" | "skipped_dirty";
+  /**
+   * The base commit the checkout was (or already was) brought up to — or, for `skipped_dirty`, the
+   * fresh base it was NOT brought up to, so a human reading the row can see how far behind it sat.
+   */
+  baseSha: string;
+}
+
+/**
+ * The three outcomes of {@link RefreshOutcome} that actually mutate `branch` — the only ones
+ * `beforeMutate` ever fires for. Passed to it so a caller recording a write-ahead marker (anton-s55u,
+ * PR #279 review) can later tell WHICH git operation it must reconcile against: a landed fast-forward,
+ * merge, and rebase each leave a different, specific trace on the branch, and ancestry of the target
+ * base alone can't tell any of them apart from an unrelated commit that moved the branch off its
+ * pre-mutation tip for some other reason (see execute-epic-claim.ts's reconciliation).
+ */
+export type MutatingRefreshOutcome = "fast_forwarded" | "merged" | "rebased";
+
+/**
+ * Run a git command in `repoPath`, returning trimmed stdout. `hooksPath`, when given, is passed as
+ * `-c core.hooksPath=<value>` — see {@link refreshOntoBase}'s use of it for why a reset/rebase onto
+ * a fresh base needs the same override review-fix's premerge already resolves for its own merges.
+ */
+async function git(repoPath: string, args: string[], hooksPath?: string): Promise<string> {
+  const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+  const { stdout } = await execFileAsync("git", [...configArgs, "-C", repoPath, ...args], {
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
   });
@@ -473,7 +512,10 @@ function conflictingClaim(
 /**
  * Create (or reuse) an isolated worktree + branch off `baseBranch` (default: the repo's current
  * HEAD branch). Idempotent: if a worktree for `branch` already exists it is returned as-is
- * (supports crash recovery / resumable runs). `warm: true` runs project setup (deps install — see
+ * (supports crash recovery / resumable runs) — or, with `refresh: true` (anton-s55u), brought up to
+ * `baseBranch` first (see {@link refreshOntoBase}) rather than handed back holding whatever base it
+ * happened to be cut from, which a resumed run would otherwise silently implement, test, and
+ * self-review against. `warm: true` runs project setup (deps install — see
  * {@link resolveWarmCommand}), and is a no-op when nothing is needed.
  *
  * Reuse is refused while ANOTHER job holds the checkout (see {@link withWorktreeClaim}). Handing
@@ -497,15 +539,737 @@ async function readForkAtCreation(worktreePath: string): Promise<string> {
 }
 
 /**
+ * Every path `git status --porcelain` reports as dirty, tracked or not. Deliberately NOT routed
+ * through {@link git}: its whole-output `.trim()` eats the leading status-code space of the FIRST
+ * line only (e.g. " M README.md" → "M README.md"), shifting the fixed 3-character offset below and
+ * truncating that one path's first letter — trailing newlines alone are safe to drop.
+ */
+async function dirtyPaths(worktreePath: string): Promise<string[]> {
+  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain"], {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  return stdout
+    .replace(/\n+$/, "")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.slice(3).trim());
+}
+
+/**
+ * Whether `worktreePath` has a rebase or merge left mid-flight by a process that died before its own
+ * catch block could run `--abort` (a kill between the `git rebase`/`git merge` call above and the
+ * `catch` that aborts it, or an anton process itself being killed there). `--path-format=absolute`
+ * matters: plain `--git-path` prints relative to the CALLER's cwd, not `-C worktreePath` (the same
+ * gotcha `worktree.test.ts` already works around for `info/exclude`), so a relative read here would
+ * resolve against the wrong directory entirely.
+ */
+async function unfinishedGitOperation(worktreePath: string): Promise<"rebase" | "merge" | undefined> {
+  const [rebaseMerge, rebaseApply, mergeHead] = await Promise.all(
+    ["rebase-merge", "rebase-apply", "MERGE_HEAD"].map((gitPath) =>
+      git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-path", gitPath]),
+    ),
+  );
+  if (existsSync(rebaseMerge) || existsSync(rebaseApply)) return "rebase";
+  if (existsSync(mergeHead)) return "merge";
+  return undefined;
+}
+
+/**
+ * Where {@link refreshOntoBase} records that IT — not an agent working in this checkout — started
+ * the rebase/merge currently in progress (PR #279 review, P1). A parked agent can leave its own
+ * conflicted merge or rebase mid-resolution on purpose (it resolves some conflicts, then hits a
+ * usage limit); on disk that is indistinguishable from a refresh interrupted mid-operation, since
+ * both leave the same `rebase-merge`/`rebase-apply`/`MERGE_HEAD` state. Written immediately before
+ * the merge/rebase call that can leave conflicts, and removed once that call resolves (cleanly or
+ * via its own `--abort`) — present only for the window where it would actually be this function's
+ * operation left unfinished. `--path-format=absolute --git-path` for the same reason
+ * {@link unfinishedGitOperation} needs it: scoped to THIS worktree's private git-dir, not the
+ * caller's cwd.
+ */
+async function refreshMarkerPath(worktreePath: string): Promise<string> {
+  return git(worktreePath, ["rev-parse", "--path-format=absolute", "--git-path", "ANTON_REFRESH_IN_PROGRESS"]);
+}
+
+/**
+ * Clears the ownership marker once its merge/rebase actually SUCCEEDED — fails loud instead of
+ * swallowing the removal error (PR #279 review, P2). A marker left behind after a SUCCESSFUL
+ * operation is stale in a way nothing else ever checks for: the next resume's `unfinishedGitOperation`
+ * guard above only asks whether the marker exists, not whether it's current, so a stale marker would
+ * make it misread an agent's own later, deliberately parked conflict on this same checkout as this
+ * refresh's own interrupted operation — and abort it, discarding partial resolution work parking
+ * exists to preserve. Deliberately NOT reused for the abort-recovery paths elsewhere in this function:
+ * those already clear the marker only once `--abort` itself succeeds, and swallow a stale-marker
+ * removal on the "nothing to abort" branch — both by design (see their own comments).
+ */
+async function clearRefreshMarkerOrThrow(markerPath: string, describeSuccess: string): Promise<void> {
+  try {
+    await rm(markerPath, { force: true });
+  } catch (err) {
+    throw new Error(
+      `[worktree] ${describeSuccess}, but could not clear the refresh ownership marker at ${markerPath} ` +
+        `(${gitError(err)}) — leaving it in place would make a later resume misread an agent's own ` +
+        `parked conflict on this checkout as this refresh's interrupted operation and discard it. Remove ` +
+        `the marker manually, then resume the run.`,
+    );
+  }
+}
+
+/**
+ * Writes the ownership marker before a merge/rebase that can leave conflicts in progress — fails
+ * loud instead of swallowing the write error (PR #279 review, P2). If this write failed silently and
+ * the merge/rebase below proceeded anyway, a process killed while it's in progress would leave
+ * `MERGE_HEAD`/`rebase-merge` on disk with nothing recording that THIS refresh (not an agent) started
+ * it — the next resume's `unfinishedGitOperation` guard would then misread the interrupted operation
+ * as an agent's own deliberately parked conflict and refuse to recover it, stranding the run until
+ * manual intervention. Refusing to start the git operation at all when the marker itself can't be
+ * written keeps that guarantee intact.
+ */
+async function writeRefreshMarkerOrThrow(markerPath: string, describeOperation: string): Promise<void> {
+  try {
+    await writeFile(markerPath, "", "utf8");
+  } catch (err) {
+    throw new Error(
+      `[worktree] could not write the refresh ownership marker at ${markerPath} before ${describeOperation} ` +
+        `(${gitError(err)}) — without it, a process killed mid-operation would leave a later resume unable ` +
+        `to tell this refresh's own interrupted operation apart from an agent's deliberately parked ` +
+        `conflict, and recovery would refuse to touch it. Refusing to start the operation. Inspect ` +
+        `${markerPath} and retry.`,
+    );
+  }
+}
+
+/**
+ * Bring a REUSED checkout's branch up to `baseBranch` before anything is dispatched against it
+ * (anton-s55u). Without this, a worktree/branch picked back up from a parked or failed run keeps
+ * whatever base it was cut from — a resumed run can silently implement, test, and self-review
+ * against a tree many commits behind main.
+ *
+ * Outcomes, in order of how much the checkout may safely move:
+ * - An unfinished rebase or merge from a process that died mid-operation (before its own catch
+ *   could abort it): `--path-format=absolute --git-path rebase-merge`/`rebase-apply`/`MERGE_HEAD`
+ *   still exist on disk. `status --porcelain` alone can't tell this apart from ordinary parked
+ *   edits — a conflicted rebase reports its conflict paths the same way a dirty tree does — but HEAD
+ *   is DETACHED here while `branch` still points at its pre-rebase tip, so dispatching into it would
+ *   let an agent commit onto detached history while the PR step pushes the unchanged named branch,
+ *   silently losing every commit the resumed session makes. Aborted (restoring `branch` and its
+ *   working tree to the pre-refresh state, the same recovery `git rebase -h` names as the control
+ *   for this exact state) and failed loud — never dispatched into.
+ * - Already at `baseBranch`: no-op.
+ * - No unique commits (the branch is an ancestor of the fresh base, or equal to it): fast-forwarded
+ *   with `reset --hard` — nothing of the run's is on this branch yet, so there's nothing to lose.
+ * - Unique commits, none of them pushed to `origin/<branch>` yet: rebased onto the base so they land
+ *   on top of the fresh tree.
+ * - Unique commits that ARE already on `origin/<branch>` (this checkout's own tip matches its remote-
+ *   tracking ref): MERGED instead of rebased. A prior attempt can push the branch via
+ *   `openPullRequest`'s `pushBranch` and then fail before `gh pr create` completes — a case the
+ *   run's retry path explicitly resumes from — so by the time this refresh runs again, those commits
+ *   are already public. Rebasing them here would rewrite that published history, and the later
+ *   retry's own `pushBranch` runs a plain, deliberately non-forcing `git push -u origin <branch>`
+ *   that then rejects the rewritten branch as non-fast-forward on every subsequent attempt (PR #279
+ *   review). Merging preserves what's already pushed while still bringing the checkout current.
+ * - A rebase or merge that cannot apply cleanly is ABORTED, never forced — the run fails loud naming
+ *   the divergence rather than discarding work or leaving the checkout mid-operation.
+ * - Dirty (anything `git status --porcelain` reports, tracked or not): SKIPPED, never touched.
+ *   Resetting, rebasing, or merging over uncommitted state would discard it, but a dirty reused
+ *   checkout is exactly what a run parked on a usage limit or a `needs-human` ask leaves behind on
+ *   purpose (execute-epic-ticket-settle.ts keeps it precisely so the resume can continue from it) —
+ *   refusing the refresh outright would strand that resume forever, since every later attempt reuses
+ *   the same worktree and hits the same dirty tree (PR #279 review). So the checkout dispatches
+ *   against whatever base it already has instead; only a CLEAN reused checkout is worth the trip
+ *   forward. Still preserved, but NOT dispatched, when a pinned `forkSha` shows the resolved base
+ *   diverged from it (a force-push or recreation behind the checkout's own fork point) — continuing
+ *   would let those parked edits get committed onto stale history and, once pushed, silently
+ *   reintroduce whatever the rewrite dropped (PR #279 review, P1).
+ *
+ * `baseBranch` is resolved to `baseSha` ONCE, up front, and every ancestry check, rebase/merge
+ * target, and diagnostic log below uses that pinned sha rather than rereading the mutable branch
+ * name — a concurrent run's fetch can advance `origin/<baseBranch>` between this resolution and the
+ * git calls that act on it, and rereading the ref name would then act on a base that moved out from
+ * under the sha this function returns and its caller persists (PR #279 review).
+ */
+async function refreshOntoBase(opts: {
+  repoPath: string;
+  worktreePath: string;
+  branch: string;
+  baseBranch: string;
+  /**
+   * Commits a bead's satisfied-note already cites as evidence (anton-8h4b) — e.g. `formatSatisfiedNote`'s
+   * `by.commit`, resolved by the caller from this run's tickets. A rebase would rewrite any of these
+   * still on the branch to a new sha, leaving that board record pointing at an object the branch no
+   * longer carries (PR #279 review) — so if one is present, this refresh merges instead, the same
+   * accommodation already made for a commit that's been pushed to origin.
+   */
+  preserveShas?: string[];
+  /**
+   * The commit `branch` was ORIGINALLY cut from — the caller's pinned `baseForkSha`, when one is
+   * already on record for it (PR #279 review). A plain `git rebase <base>` replays everything after
+   * `merge-base(base, branch)`, not everything after the branch's own fork point; once `baseBranch`
+   * has been force-pushed or recreated past an older shared ancestor, that merge-base lands BEFORE
+   * the real fork and the plain form resurrects commits that were part of the ORIGINAL base — never
+   * touched by this run — as if they were the branch's own work. Passed, it becomes `--onto`'s
+   * upstream boundary instead, so only what's actually unique to `branch` gets replayed.
+   */
+  forkSha?: string;
+  /**
+   * Whether `baseSha` is authoritative truth rather than a possibly-stale reading (anton-nyz1v, PR
+   * #279 review, fifth and sixth rounds) — true for a CONFIRMED fetch of `origin/<baseBranch>`
+   * (`resolveFreshBase`'s success path) AND for a repo with no `origin` remote at all (there is
+   * nothing else for the local branch to be stale relative to). False only for `resolveFreshBase`'s
+   * remaining fallback shape: a repo that HAS an origin but whose fetch just failed. The two shapes
+   * below that leave a checkout untouched when `baseSha` sits BEHIND `branch`'s own fork point are
+   * safe ONLY for that failed-fetch case: there, `baseSha` being behind the fork just means this
+   * repo's last successful fetch predates a NEWER commit `branch` already forked from, and origin
+   * genuinely still has both — nothing to reconcile. An authoritative `baseSha` landing behind the
+   * fork means the opposite: the true base's tip was force-pushed or recreated BACKWARD past that
+   * commit (on origin, or — with no remote — locally), so it's the fork point that's now stale, not
+   * this reading of the base — `baseSha` is the authoritative truth, and leaving `branch` untouched
+   * would let its eventual PR silently reintroduce whatever the rewind just dropped. Defaults to
+   * `false` (the conservative, no-op-preferring reading) so a caller that never resolves this stays
+   * exactly as safe as before this parameter existed.
+   */
+  baseIsAuthoritative?: boolean;
+  /**
+   * Invoked exactly once, immediately before the fast-forward, merge, or rebase call that actually
+   * mutates `branch` — never for the noop/skipped-dirty outcomes above, which return before ever
+   * reaching here and need no crash-recovery story of their own. Fast-forward moves the branch just
+   * as much as a merge or rebase does (PR #279 review, P1) — a process killed right after it, before
+   * this function even returns, leaves the caller's row with nothing recording that the branch
+   * already moved. This function has no DB of its own to persist intent to (anton-s55u, PR #279
+   * review, P1) — that lives in the run row execute-epic-claim.ts owns, and only ITS caller can
+   * write there before handing off to a call that can leave the branch mutated with nothing durable
+   * recording it, should the process die before this call returns and its caller's own finalize
+   * write runs. Awaited before the mutation proceeds, so a caller that means this as a durable
+   * write-ahead record has it on disk (or knows it failed) before anything moves.
+   *
+   * Passed both the base sha the mutation is about to apply AND the branch's own tip at this exact
+   * instant, before anything touches it (PR #279 review, P1) — a resume reconciling a pending write
+   * this leaves behind cannot tell "the mutation landed" from "the base sha was already reachable
+   * from the branch before the mutation ever ran" from reachability against the CURRENT branch alone
+   * (a rewound base can already be an ancestor of the branch's pre-mutation history). Recording the
+   * pre-mutation tip lets that reconciliation ask the question reachability alone can't answer: did
+   * the branch actually move past where it already was.
+   */
+  beforeMutate?: (baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>;
+}): Promise<RefreshOutcome> {
+  const { repoPath, worktreePath, branch, baseBranch, preserveShas, forkSha, baseIsAuthoritative, beforeMutate } =
+    opts;
+
+  let baseSha: string;
+  try {
+    baseSha = await git(repoPath, ["rev-parse", "--verify", `${baseBranch}^{commit}`]);
+  } catch (err) {
+    throw new Error(
+      `[worktree] could not resolve base ${baseBranch} to refresh ${branch}: ${gitError(err)}`,
+    );
+  }
+  // Resolved up front (not just in the clean path below) so the dirty-tree escape can run the same
+  // divergence check on it (PR #279 review, P1).
+  const branchSha = await git(repoPath, ["rev-parse", "--verify", `refs/heads/${branch}^{commit}`]);
+
+  const markerPath = await refreshMarkerPath(worktreePath);
+
+  // Checked BEFORE the dirty-tree escape below: an interrupted rebase/merge reports its conflict
+  // paths through `status --porcelain` exactly like ordinary parked edits, so without this check
+  // that escape would read it as "leave it alone" and dispatch straight into a checkout with HEAD
+  // detached mid-operation and `branch` still at its stale pre-refresh tip.
+  const unfinished = await unfinishedGitOperation(worktreePath);
+  if (unfinished) {
+    // Only abort an operation THIS function started (the marker, written right before its own
+    // merge/rebase call below) — never one an agent left mid-resolution on purpose (PR #279 review,
+    // P1). `git merge -h`/`git rebase -h` name `--abort` as the recovery for an interrupted refresh,
+    // but the same on-disk state is exactly what a parked agent's own conflicted merge or rebase
+    // leaves behind deliberately, and aborting THAT would discard partial resolution work parking
+    // exists to preserve.
+    if (!existsSync(markerPath)) {
+      throw new Error(
+        `[worktree] ${worktreePath} has an unfinished git ${unfinished} in progress on ${branch} that ` +
+          `this refresh did not start — it may be an agent's own conflict resolution left mid-flight on ` +
+          `purpose. Refusing to abort it and discard that work. Inspect ${worktreePath} and resume the ` +
+          `run once it is confirmed clean, or the conflict is resolved.`,
+      );
+    }
+    // The marker is removed only once the abort actually succeeds (PR #279 re-review, P2): a failed
+    // `--abort` (e.g. a transient index lock) leaves the operation genuinely in progress, and
+    // deleting the marker anyway would make the NEXT resume misread it as an agent's own deliberate
+    // conflict — refusing to touch it — while this attempt falsely reports having cleared it.
+    try {
+      await git(worktreePath, [unfinished, "--abort"]);
+    } catch (err) {
+      throw new Error(
+        `[worktree] ${worktreePath} had an unfinished git ${unfinished} in progress on ${branch} and ` +
+          `the recovery abort failed (${gitError(err)}) — leaving the ownership marker in place so a ` +
+          `later resume still treats this as its own interrupted operation rather than an agent's. ` +
+          `Inspect ${worktreePath} and resolve the ${unfinished} manually, then resume the run.`,
+      );
+    }
+    await rm(markerPath, { force: true }).catch(() => undefined);
+    throw new Error(
+      `[worktree] ${worktreePath} had an unfinished git ${unfinished} in progress on ${branch} — a ` +
+        `prior process likely died before it could abort its own ${unfinished === "rebase" ? "rebase" : "merge"} ` +
+        `onto ${baseBranch}. Aborted it to restore ${branch} and its working tree to their pre-refresh ` +
+        `state. Inspect ${worktreePath} and resume the run once it is confirmed clean.`,
+    );
+  }
+  // No unfinished operation — any marker left here is stale (an operation the marker recorded that
+  // has since concluded some other way, e.g. a resume that found the checkout already clean). Failing
+  // loud on removal (PR #279 review, P2) rather than swallowing it: if this refresh goes on to return
+  // through the noop/skipped-dirty/fast-forward outcomes below with the stale marker still present, an
+  // agent later parking mid-conflict on this same checkout would have its own deliberate rebase/merge
+  // misread by the NEXT refresh as this one's interrupted operation and aborted, discarding whatever
+  // partial resolution parking exists to preserve.
+  await clearRefreshMarkerOrThrow(
+    markerPath,
+    `no unfinished git operation was found on ${branch}`,
+  );
+
+  const dirty = await dirtyPaths(worktreePath);
+  if (dirty.length > 0) {
+    // Preserve the edits, but don't dispatch against them blind (PR #279 review, P1): this escape
+    // sits BEFORE the fork-descendancy checks the clean path runs below, so without a guard here it
+    // would skip straight past a base that was force-pushed or recreated behind the checkout's real
+    // fork point — the parked edits get committed atop stale history, and the eventual PR against
+    // the rewritten base silently reintroduces whatever commit(s) that rewrite dropped. With a pin
+    // that's still reachable on `branch`, the check is precise (only trips when `baseSha` is neither
+    // a descendant of `forkSha`, the ordinary safe case, nor an ancestor of it, the merely-stale-base
+    // case); without one, a two-way divergence fails closed on the coarser check below instead of
+    // guessing (PR #279 review, P1 re-review).
+    //
+    // `isAncestor`, not `branchContainsCommit` (PR #279 review, P1): the latter folds every git
+    // error, operational failures included, to `false` — an unrelated repo, a killed process, and a
+    // genuinely untrustworthy pin all read identically as "no trustworthy pin", which drops this
+    // guard onto the coarser divergence check below instead of leaving the pinned one in force.
+    // `isAncestor` answers the same reachability question but rethrows anything that isn't git's own
+    // "not an ancestor", so only genuine absence clears the pin.
+    const trustedForkSha =
+      forkSha && (await isAncestor(repoPath, forkSha, branch)) ? forkSha : undefined;
+    if (trustedForkSha) {
+      // Safe to leave untouched when the fork point descends from `baseSha` (the ordinary case), OR
+      // when `baseSha` descends from the fork point but that reading is only a stale LOCAL fallback
+      // (anton-nyz1v, PR #279 review, fifth round) — never when it's a CONFIRMED fetch, which makes
+      // `baseSha` authoritative and a `baseSha` behind the fork point a genuine rewind, not staleness
+      // (see `baseIsAuthoritative`'s own doc comment).
+      const forkDescendsFromBase = await isAncestor(worktreePath, trustedForkSha, baseSha);
+      const baseIsMerelyStaleFallback =
+        !baseIsAuthoritative && (await isAncestor(worktreePath, baseSha, trustedForkSha));
+      if (!forkDescendsFromBase && !baseIsMerelyStaleFallback) {
+        throw new Error(
+          `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${baseBranch} ` +
+            `(${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork point ${trustedForkSha.slice(0, 12)} — ` +
+            `${baseBranch} looks like it was force-pushed or recreated behind that commit. Committing and ` +
+            `dispatching against the checkout's stale history would silently reintroduce whatever ` +
+            `${baseBranch} dropped once those commits are pushed. Leaving the uncommitted changes in ` +
+            `${worktreePath} untouched — resolve manually and retry.`,
+        );
+      }
+    } else {
+      // No trustworthy pin at all (a legacy reused checkout, or a stale one) — PR #279 review (P1,
+      // re-review). That can't be told apart from the force-push-behind-fork shape above without the
+      // pin, so a genuine two-way divergence (neither ref is an ancestor of the other) must fail
+      // closed here too, the same way the clean path's `trustedForkSha` guard below refuses a plain
+      // rebase without one. An ordinary one-way advance with `branchSha` still an ancestor of
+      // `baseSha` (base is at/ahead of branch) is unaffected — nothing could have been dropped there.
+      //
+      // The OTHER one-way direction — `baseSha` an ancestor of `branchSha` (branch is at/ahead of
+      // base) — is NOT unconditionally safe (PR #279 review, P1, third re-review): once
+      // `baseIsAuthoritative` is true, that shape is exactly what an authoritative rewind from `A-B`
+      // back to `A` looks like (`A` stays an ancestor of a branch cut at `A-B-W`), and without a pin
+      // there is no way to tell it apart from the ordinary, harmless case of a branch that's simply
+      // advanced past a base that never moved — so it fails closed too. A stale LOCAL fallback
+      // reading the same shape is left alone, same as the pinned case above (see
+      // `baseIsAuthoritative`'s own doc comment) — there, nothing could have been rewound.
+      const baseAtOrAheadOfBranch = await isAncestor(worktreePath, branchSha, baseSha);
+      const branchAtOrAheadOfBase = await isAncestor(worktreePath, baseSha, branchSha);
+      const divergent = !baseAtOrAheadOfBranch && !branchAtOrAheadOfBase;
+      const unpinnedAuthoritativeRewind =
+        baseIsAuthoritative && branchAtOrAheadOfBase && !baseAtOrAheadOfBranch;
+      if (divergent || unpinnedAuthoritativeRewind) {
+        throw new Error(
+          `[worktree] ${worktreePath} has uncommitted changes (${dirty.join(", ")}) and ${branch} ` +
+            `diverges from ${baseBranch} (${baseSha.slice(0, 12)}) with no trustworthy fork-point pin — ` +
+            `committing and dispatching against the checkout's stale history could silently reintroduce ` +
+            `commits ${baseBranch} dropped if it was force-pushed or recreated past ${branch}'s real fork ` +
+            `point. Leaving the uncommitted changes in ${worktreePath} untouched — resolve manually and retry.`,
+        );
+      }
+    }
+    console.log(
+      `[worktree] skipping refresh of ${branch} onto ${baseBranch}: ${worktreePath} has uncommitted ` +
+        `changes (${dirty.join(", ")}) — dispatching against its existing base instead of discarding them`,
+    );
+    return { outcome: "skipped_dirty", baseSha };
+  }
+
+  if (baseSha === branchSha) return { outcome: "noop", baseSha }; // already current
+
+  // Resolved once against the pinned `baseSha` (not `baseBranch`) so the reset/rebase/merge below
+  // fire the SAME `post-checkout`/`pre-rebase`/`post-merge` hook this base's tree actually carries —
+  // the identical reasoning review-fix's premerge already applies to its own fast-forward and
+  // conflict-resolution merges (needsHooksPathOverrideForMerge's own doc comment).
+  const hooksPath = (await needsHooksPathOverrideForMerge(repoPath, worktreePath, baseSha))
+    ? await resolveHooksPathOverrideForMerge(repoPath, worktreePath, baseSha)
+    : undefined;
+
+  if (await isAncestor(worktreePath, branch, baseSha)) {
+    // The branch carries nothing the base doesn't already have — safe to fast-forward in place.
+    // `merge --ff-only` rather than `reset --hard`: the latter moves HEAD/index/worktree without
+    // firing `post-merge` or `post-checkout`, so repos relying on those hooks for generated state
+    // would resume stale after a fast-forward (PR #279 review).
+    //
+    // The caller's own write-ahead record, same as the merge/rebase paths below (PR #279 review,
+    // P1) — a fast-forward moves the branch just as durably as either of them, and a process killed
+    // right after this call returns leaves the caller's row exactly as unrecorded without it.
+    await beforeMutate?.(baseSha, branchSha, "fast_forwarded");
+    await git(worktreePath, ["merge", "--ff-only", baseSha], hooksPath);
+    console.log(
+      `[worktree] fast-forwarded ${branch} to ${baseBranch} (${baseSha.slice(0, 12)}) — no unique commits`,
+    );
+    return { outcome: "fast_forwarded", baseSha };
+  }
+
+  // A checkout's own remote-tracking ref only moves when THIS repo pushes `branch` itself (a claim
+  // holds the checkout for the run's whole lifetime, so no other worker pushes it meanwhile) — if
+  // its tip is still reachable from this branch's tip, those commits are public and rebasing would
+  // rewrite them. Ancestry, not equality: a retry can merge a newer base into an already-pushed
+  // branch and then fail before pushing that merge, leaving `origin/<branch>` an ancestor of the
+  // local tip rather than equal to it (PR #279 review) — exact equality would misclassify that as
+  // unpublished, rebase it, and turn the later non-forcing `pushBranch` into a rejected non-fast-
+  // forward push.
+  //
+  // The blanket `.catch(() => undefined)` this used to have folded an OPERATIONAL failure (a killed
+  // process, a broken object store) into the same outcome as "no such ref" (PR #279 review, round 2)
+  // — `--verify --quiet` answers "absent" with a clean exit 1 and no output, so only THAT is read as
+  // unpublished; anything else propagates rather than silently clearing the way to rebase over commits
+  // this probe simply failed to see.
+  const remoteSha = await git(
+    repoPath,
+    ["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${branch}`],
+  ).catch((e) => {
+    if (exitedWith(e, 1)) return undefined;
+    throw e;
+  });
+  const remotelyPublished =
+    remoteSha !== undefined && (await isAncestor(worktreePath, remoteSha, branchSha));
+
+  // A commit already cited as evidence on a bead (a satisfied-note's `by.commit`) is just as
+  // unsafe to rewrite as a pushed one — the board's record of it would otherwise survive the
+  // rebase while the object it names doesn't (PR #279 review).
+  //
+  // `isAncestor`, not `branchContainsCommit` (PR #279 review, round 2): the latter folds EVERY git
+  // error to `false` by design (its own doc comment) — right for a caller whose safe answer is "treat
+  // as absent" either way, wrong here, where "absent" is what licenses rewriting history a bead cites
+  // as evidence. `isAncestor` answers the identical ancestry question but rethrows anything that isn't
+  // git's own "not an ancestor" (exit 1), so a transient failure stops the refresh instead of quietly
+  // reporting the protected sha as unreachable.
+  let preservedSha: string | undefined;
+  if (!remotelyPublished && preserveShas && preserveShas.length > 0) {
+    for (const sha of preserveShas) {
+      if (await isAncestor(worktreePath, sha, branch)) {
+        preservedSha = sha;
+        break;
+      }
+    }
+  }
+
+  // Checked BEFORE either the merge or the rebase path below, not just the rebase one: git refuses
+  // both `merge` and `rebase` onto a base with no common ancestor, but its `merge` refusal ("refusing
+  // to merge unrelated histories") would otherwise surface first for a branch that's published or
+  // cited on a bead, landing in the merge path's own catch block and misattributing the failure to a
+  // content conflict rather than the unrelated-history cause named here (PR #279 review). Checking
+  // once, up front, gives both paths the same accurate diagnostic — and still protects the rebase
+  // path from git's own permissiveness there: `rebase <base>` accepts an unrelated base by replaying
+  // the branch's ENTIRE history, root commit included, on top of a tree that has nothing to do with
+  // it, rather than rejecting it. That's exactly what a force-pushed or recreated `origin/<baseBranch>`
+  // looks like from here.
+  if (!(await hasCommonHistory(worktreePath, branch, baseSha))) {
+    throw new Error(
+      `[worktree] ${branch} and ${baseBranch} (${baseSha.slice(0, 12)}) share no common history — ` +
+        `refusing to merge or rebase onto an unrelated base (this can happen when ${baseBranch} was ` +
+        `force-pushed or recreated). Resolve manually in ${worktreePath} and retry.`,
+    );
+  }
+
+  // `baseSha` itself can be STALE rather than moved (PR #279 review): `resolveFreshBase`'s caller
+  // falls back to the LOCAL `<base>` branch when its fetch fails, and that local ref can already sit
+  // BEHIND the commit this checkout's own branch was forked from by an earlier, successful fetch — a
+  // clean branch cut from `A-B` while local `main` still sits at `A`. That is a different shape from
+  // the force-push-behind-fork case the guard below exists for: there, `baseSha` shares no straight
+  // line back to `forkSha` at all (it was rewritten PAST it); here, `baseSha` (`A`) IS an ancestor of
+  // `forkSha` (`B`) — genuinely older, not rewritten, and leaving `branch` untouched is always safe
+  // regardless of whether it's published or cited on a bead: nothing needs to move. Checked BEFORE
+  // that guard, not folded into its `remotelyPublished || preservedSha` gate (PR #279 review) — a
+  // published or preserved branch reaching this same stale-base shape must ALSO fall through to this
+  // no-op rather than trip the force-push guard below, which only demands `!isAncestor(forkSha,
+  // baseSha)` and is true for the stale case too (an older `baseSha` is no more an ancestor of
+  // `forkSha` than a rewritten one is). Checking this first, unconditionally, lets both the
+  // published/preserved and the ordinary path share the same safe answer for a merely-stale base.
+  //
+  // Gated on `!baseIsAuthoritative` (anton-nyz1v, PR #279 review, fifth round): the shape above —
+  // `baseSha` behind `forkSha` — is genuinely ambiguous on its own. A stale LOCAL fallback reads it
+  // exactly like a CONFIRMED fetch of an `origin/<baseBranch>` that was force-pushed or recreated
+  // backward past the fork point does: both leave `baseSha` an ancestor of `forkSha`. Only the former
+  // is safe to no-op; the latter means origin authoritatively dropped `forkSha` (and everything after
+  // it up to the old tip), and `branch` — cut from `forkSha` — still carries that dropped history as
+  // its own ancestry. Leaving it untouched would let its eventual PR against the rewound `baseSha`
+  // silently reintroduce exactly what the rewind was meant to drop. An authoritative rewind instead
+  // falls through to the checks below, which rebase (or, for a published/preserved branch, refuse and
+  // ask for manual resolution) using `baseSha` as the real, current truth.
+  //
+  // `isAncestor`, not `branchContainsCommit` (PR #279 review, P1): the latter folds every git error,
+  // operational failures included, to `false`, so a transient failure here reads exactly like
+  // `forkSha` genuinely being absent from `branch` — this check fails to trip, and the function falls
+  // through to the pinned-rewrite guard below with a stale `baseSha` a later, recovered git call would
+  // have rejected. `isAncestor` answers the same reachability question but rethrows anything that
+  // isn't git's own "not an ancestor", so only genuine absence skips this no-op.
+  if (
+    !baseIsAuthoritative &&
+    forkSha &&
+    (await isAncestor(repoPath, forkSha, branch)) &&
+    (await isAncestor(worktreePath, baseSha, forkSha))
+  ) {
+    console.log(
+      `[worktree] resolved base for ${branch} (${baseSha.slice(0, 12)}) is behind its own fork ` +
+        `point ${forkSha.slice(0, 12)} — leaving ${branch} where it is instead of rebasing backward`,
+    );
+    return { outcome: "noop", baseSha: forkSha };
+  }
+
+  // `--onto <baseSha> <forkSha> <branch>` transplants exactly `forkSha..branch` (branch's own
+  // commits since it actually forked) onto `baseSha`, with no requirement that `baseSha` still
+  // descend from `forkSha` — so it stays correct even for a `baseBranch` that was force-pushed or
+  // recreated past the real fork point. A fork point that isn't actually on `branch` (a stale or
+  // mismatched pin) is ignored, same as no pin at all. Resolved here, ahead of the published/
+  // preserved/merge-commit checks below, because the merge-commit one needs it too.
+  //
+  // `isAncestor`, not `branchContainsCommit` (PR #279 review, P1): the latter folds every git error,
+  // operational failures included, to `false`. That reads a killed process the same as a genuinely
+  // untrustworthy pin — a published or preserved branch would then lose `trustedForkSha`, skip the
+  // pinned rewrite guard below, and fall into the merge path, which silently restores whatever the
+  // base rewrite was meant to drop. `isAncestor` answers the same reachability question but rethrows
+  // anything that isn't git's own "not an ancestor", so only genuine absence clears the pin.
+  const trustedForkSha =
+    forkSha && (await isAncestor(repoPath, forkSha, branch)) ? forkSha : undefined;
+
+  // `git rebase --rebase-merges` does not replay a merge commit's recorded TREE — it reconstructs
+  // the merge by re-merging its parents from scratch. Anything that tree recorded beyond a clean
+  // auto-merge of those parents (a conflict resolved differently than the auto-merge would, or a
+  // file added while resolving) is silently dropped: the reconstructed merge has no conflicts of its
+  // own, so the rebase reports success even though it isn't the same tree the original merge commit
+  // recorded (P1, PR #279 review, sixth round — reproduced against git 2.43; `git rebase -h` only
+  // promises to "try to rebase merges instead of skipping them", never to preserve their content).
+  // There is no git flag that replays the ORIGINAL tree instead, so a range containing a merge
+  // commit is never rewritten by rebase here: it takes the same non-rewriting merge path below
+  // already used for published/preserved branches, which leaves every existing commit's tree — merge
+  // commits included — untouched. Scoped to `trustedForkSha..branch`, the same range `--onto` would
+  // otherwise replay; left `false` without a trusted pin to scope it, since that shape already fails
+  // closed at the "no trustworthy fork-point pin" throw below regardless of merge commits.
+  const hasMergeCommit =
+    trustedForkSha !== undefined &&
+    (
+      await git(worktreePath, ["log", "--merges", "--oneline", `${trustedForkSha}..${branch}`])
+    ).length > 0;
+
+  // `hasCommonHistory` above only demands SOME shared ancestor, not that `baseSha` still descends
+  // from the branch's own pinned fork point — a base that was force-pushed BEHIND that fork but still
+  // shares an OLDER ancestor with it passes that check regardless. The merge below is unsafe in
+  // exactly that case: `branch` still carries the removed base-side commits as its own ancestry (it
+  // forked from them), so merging a base that dropped them in a rewrite reaches right back through
+  // `branch`'s side of the merge and reintroduces them into the result — e.g. a branch cut at `A-B`
+  // merged into a base rewritten to `A-E` leaves `B` in `E..HEAD` (PR #279 review). `--onto` rebases
+  // sidestep this by construction (see the `forkSha` doc above), so this guard covers every path
+  // below that merges instead of rebasing — published, preserved, and (PR #279 review, sixth round)
+  // a branch carrying a merge commit, which now merges too rather than risk `--rebase-merges`
+  // silently dropping its content.
+  //
+  // A branch with NO trustworthy pin at all is not universally unsafe to merge — an ordinary
+  // divergence (the ONLY shape `remotelyPublished`/`preservedSha`/`hasMergeCommit` exist to protect
+  // in the common case, e.g. a branch's own pushed commit alongside a base that separately advanced)
+  // merges its real content and is exactly what this path is for, pin or no pin. What a missing pin
+  // CANNOT rule out is an AUTHORITATIVE base rewrite. A one-way rewind from `A-B` to `A` leaves `A`
+  // already reachable from a branch cut at `A-B-W`; a two-way rewrite to `A-E` makes the two refs
+  // diverge. Both leave the new base NOT descended from the branch, and `git merge` preserves `B`
+  // through the branch side of its result. Without a pin, ordinary independent divergence has the
+  // same shape, so fail closed rather than silently reintroduce what the rewrite dropped. A stale
+  // LOCAL fallback reading the same shape is left alone — nothing was authoritatively rewritten.
+  const unpinnedAuthoritativeBaseRewrite =
+    !trustedForkSha &&
+    baseIsAuthoritative &&
+    !(await isAncestor(worktreePath, branchSha, baseSha));
+  if ((remotelyPublished || preservedSha || hasMergeCommit) && unpinnedAuthoritativeBaseRewrite) {
+    throw new Error(
+      `[worktree] ${branch} has no trustworthy fork-point pin and ${baseBranch} ` +
+        `(${baseSha.slice(0, 12)}) does not descend from it — an authoritative rewind or rewrite ` +
+        `could make merging silently retain whatever commits ${baseBranch} dropped. Resolve manually ` +
+        `in ${worktreePath} and retry.`,
+    );
+  }
+
+  // With a trusted pin, the check is precise: only trips when `baseSha` no longer descends from it
+  // (the stale-base shape is already ruled out by the no-op above, so a `!isAncestor(trustedForkSha,
+  // baseSha)` reaching here is always the genuine force-push-past-fork case).
+  if (
+    (remotelyPublished || preservedSha || hasMergeCommit) &&
+    trustedForkSha &&
+    !(await isAncestor(worktreePath, trustedForkSha, baseSha))
+  ) {
+    throw new Error(
+      `[worktree] ${baseBranch} (${baseSha.slice(0, 12)}) no longer descends from ${branch}'s fork ` +
+        `point ${trustedForkSha.slice(0, 12)} — ${baseBranch} looks like it was force-pushed or recreated ` +
+        `behind that commit. Merging would still reach ${branch}'s own copy of whatever ${baseBranch} ` +
+        `dropped, silently reintroducing it. Resolve manually in ${worktreePath} and retry.`,
+    );
+  }
+
+  if (remotelyPublished || preservedSha || hasMergeCommit) {
+    const mergeReason = remotelyPublished
+      ? `its commits are already on origin, so rebasing would have rewritten published history`
+      : preservedSha
+        ? `commit ${preservedSha.slice(0, 12)} is already cited on a bead, so rebasing would have ` +
+            `made that reference unreachable`
+        : `it carries a merge commit, and --rebase-merges can silently drop content its tree ` +
+            `recorded beyond a clean re-merge of its parents`;
+    const rebaseRefusalReason = remotelyPublished
+      ? "its commits are already published"
+      : preservedSha
+        ? "its commits are already cited on a bead"
+        : "it carries a merge commit --rebase-merges could silently corrupt";
+    // Written just before the call that can leave a conflicted merge in progress, so a later
+    // resume's `unfinishedGitOperation` check can tell THIS merge apart from an agent's own
+    // (see `refreshMarkerPath`'s doc comment). Must succeed before the merge starts (PR #279
+    // review, P2) — see `writeRefreshMarkerOrThrow`'s own doc comment.
+    await writeRefreshMarkerOrThrow(markerPath, `merging ${baseBranch} into ${branch}`);
+    // The caller's own write-ahead record, if any — awaited so it lands before the mutation it
+    // describes (see `beforeMutate`'s own doc comment).
+    await beforeMutate?.(baseSha, branchSha, "merged");
+    try {
+      await git(worktreePath, ["merge", "--no-edit", baseSha], hooksPath);
+    } catch (err) {
+      // Marker removed only once the abort actually succeeds — same discipline as the
+      // unfinished-operation recovery above: a failed `--abort` (e.g. a transient index lock)
+      // leaves the merge genuinely in progress, and deleting the marker anyway would make the
+      // NEXT resume misread it as an agent's own deliberate conflict rather than this one's (PR
+      // #279 review, P2).
+      try {
+        await git(worktreePath, ["merge", "--abort"]);
+      } catch (abortErr) {
+        throw new Error(
+          `[worktree] ${branch} diverges from ${baseBranch} and could not be merged onto it cleanly ` +
+            `(${gitError(err)}), and the recovery \`git merge --abort\` also failed ` +
+            `(${gitError(abortErr)}) — leaving the ownership marker in place so a later resume still ` +
+            `treats this as its own interrupted merge. Inspect ${worktreePath} and resolve the merge ` +
+            `manually, then resume the run.`,
+        );
+      }
+      await rm(markerPath, { force: true }).catch(() => undefined);
+      const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
+        () => "(could not list them)",
+      );
+      throw new Error(
+        `[worktree] ${branch} diverges from ${baseBranch} and could not be merged onto it cleanly ` +
+          `(refusing to rebase since ${rebaseRefusalReason}) — refusing to discard or rewrite its ` +
+          `commits. Unique commits:\n${unique}\nResolve the conflict in ${worktreePath} and retry ` +
+          `(${gitError(err)})`,
+      );
+    }
+    // Cleared OUTSIDE the merge's own try/catch above (PR #279 review, P2): a removal failure here
+    // has nothing to do with the merge itself, which already succeeded — reporting it through the
+    // merge-conflict catch above would wrongly attempt `git merge --abort` on a merge that isn't
+    // in progress anymore, and misreport a marker-cleanup failure as a merge conflict.
+    await clearRefreshMarkerOrThrow(
+      markerPath,
+      `merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch}`,
+    );
+    console.log(`[worktree] merged ${baseBranch} (${baseSha.slice(0, 12)}) into ${branch} — ${mergeReason}`);
+    return { outcome: "merged", baseSha };
+  }
+
+  // Without a trustworthy pin there is no safe fallback (PR #279 review, P1): the plain one-argument
+  // `git rebase <base>` replays `merge-base(baseSha, branch)..branch` — the branch's own fork point
+  // only while `baseBranch` still contains it. A legacy reused checkout with no recorded
+  // `baseForkSha` reaches here with `forkSha` undefined; once `baseBranch` has been rewritten past
+  // the branch's real fork point, that merge-base lands before it and the plain form would replay
+  // ORIGINAL base commits alongside the branch's own work, silently resurrecting them into the
+  // rebased branch. There is no way to tell that shape apart from an ordinary, unrewritten
+  // divergence without the pin, so a divergent reused branch lacking one fails closed here instead
+  // of guessing.
+  if (!trustedForkSha) {
+    throw new Error(
+      `[worktree] ${branch} diverges from ${baseBranch} (${baseSha.slice(0, 12)}) and has no ` +
+        `trustworthy fork-point pin to rebase --onto — a plain rebase could silently resurrect ` +
+        `commits ${baseBranch} dropped if it was force-pushed or recreated past ${branch}'s real ` +
+        `fork point. Resolve manually in ${worktreePath} and retry.`,
+    );
+  }
+  // Merge commits in `trustedForkSha..branch` are diverted to the merge path above, so a plain
+  // `--onto` (which linearizes by replaying only the first-parent line) is always safe to reach here.
+  const rebaseArgs = ["rebase", "--onto", baseSha, trustedForkSha, branch];
+
+  // Same marker discipline as the merge above: written right before the call that can leave a
+  // conflicted rebase in progress, so a later resume can tell this rebase apart from an agent's own.
+  // Must succeed before the rebase starts (PR #279 review, P2) — see `writeRefreshMarkerOrThrow`'s
+  // own doc comment.
+  await writeRefreshMarkerOrThrow(markerPath, `rebasing ${branch} onto ${baseBranch}`);
+  // Same write-ahead record as the merge path above.
+  await beforeMutate?.(baseSha, branchSha, "rebased");
+  try {
+    await git(worktreePath, rebaseArgs, hooksPath);
+  } catch (err) {
+    // A `pre-rebase` hook (or any other failure before git writes rebase state) leaves nothing for
+    // `--abort` to abort — it would fail with "No rebase in progress", which is not a recovery
+    // failure and must not be reported as one (PR #279 review, P2). Check what's actually on disk
+    // first: only run `--abort` when a rebase genuinely started.
+    if ((await unfinishedGitOperation(worktreePath)) !== "rebase") {
+      await rm(markerPath, { force: true }).catch(() => undefined);
+      throw new Error(
+        `[worktree] ${branch} could not be rebased onto ${baseBranch} — the rebase never started ` +
+          `(${gitError(err)}). Resolve in ${worktreePath} and retry.`,
+      );
+    }
+    // Same abort-failure discipline as the merge path above: only clear the marker once `--abort`
+    // actually succeeds, so a failed abort (e.g. a transient index lock) still leaves the rebase
+    // recognizable as this function's own on the next resume (PR #279 review, P2).
+    try {
+      await git(worktreePath, ["rebase", "--abort"]);
+    } catch (abortErr) {
+      throw new Error(
+        `[worktree] ${branch} diverges from ${baseBranch} and could not be rebased onto it cleanly ` +
+          `(${gitError(err)}), and the recovery \`git rebase --abort\` also failed ` +
+          `(${gitError(abortErr)}) — leaving the ownership marker in place so a later resume still ` +
+          `treats this as its own interrupted rebase. Inspect ${worktreePath} and resolve the rebase ` +
+          `manually, then resume the run.`,
+      );
+    }
+    await rm(markerPath, { force: true }).catch(() => undefined);
+    const unique = await git(worktreePath, ["log", "--oneline", `${baseSha}..${branch}`]).catch(
+      () => "(could not list them)",
+    );
+    throw new Error(
+      `[worktree] ${branch} diverges from ${baseBranch} and could not be rebased onto it cleanly — ` +
+        `refusing to discard its commits. Unique commits:\n${unique}\nResolve the conflict in ` +
+        `${worktreePath} and retry (${gitError(err)})`,
+    );
+  }
+  // Cleared OUTSIDE the rebase's own try/catch above, for the same reason as the merge path (PR #279
+  // review, P2): a removal failure here has nothing to do with the rebase itself, which already
+  // succeeded.
+  await clearRefreshMarkerOrThrow(markerPath, `rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
+  console.log(`[worktree] rebased ${branch} onto ${baseBranch} (${baseSha.slice(0, 12)})`);
+  return { outcome: "rebased", baseSha };
+}
+
+/**
  * What createWorktree may do about the branch before it materializes anything: who holds its claim
- * (if anyone), and the checkout git already has registered for it (if any). Throws the same refusal
- * {@link createWorktree} always has when another job holds the checkout.
+ * (if anyone), the checkout git already has registered for it (if any), and the base branch to
+ * create or refresh it against — resolved here (not left to each caller) since a REUSED checkout
+ * needs a real base to refresh onto, not just its own branch name (anton-s55u). Throws the same
+ * refusal {@link createWorktree} always has when another job holds the checkout.
  */
 async function resolveClaimForCreate(
   repoPath: string,
   branch: string,
+  baseBranchOpt: string | undefined,
   claimedBy: string | undefined,
-): Promise<{ claimed: string | undefined; existing: Worktree | null }> {
+): Promise<{ claimed: string | undefined; existing: Worktree | null; baseBranch: string }> {
   // A claim can be held before the checkout exists (review-fix claims, then materializes), and the
   // git lock that makes it visible to another anton process can only be taken once it does.
   const holders = worktreeClaims.get(branchKey(repoPath, branch)) ?? [];
@@ -514,10 +1278,11 @@ async function resolveClaimForCreate(
   if (conflict) {
     throw new Error(`[worktree] refusing to hand ${branch}'s checkout to a second job: ${conflict}`);
   }
+  const baseBranch = baseBranchOpt ?? (await currentBranch(repoPath));
   const existing: Worktree | null = record
-    ? { path: record.path, branch, baseBranch: branch, createdBranch: false, repoPath }
+    ? { path: record.path, branch, baseBranch, createdBranch: false, repoPath }
     : null;
-  return { claimed: holders[0], existing };
+  return { claimed: holders[0], existing, baseBranch };
 }
 
 /**
@@ -637,33 +1402,90 @@ async function recoverFailedCreateBranch(repoPath: string, branch: string, error
  * be gone (anton-2wvb). Reusing such a path hands a non-existent cwd to `spawn`, which fails as
  * ENOENT naming the *executable* — an error that reads as a missing `claude` binary and sends
  * debugging in entirely the wrong direction. Verify on disk.
+ *
+ * `refresh`/`preserveShas` bring this REUSED checkout's branch up to `baseBranch` before it's handed
+ * back (anton-s55u) — see {@link refreshOntoBase}. Opt-in only: see {@link createWorktree}'s own doc
+ * on `refresh` for why a caller like review-fix must never pass it.
  */
 async function reuseIfPresent(
   repoPath: string,
   branch: string,
+  baseBranch: string,
   claimed: string | undefined,
   existing: Worktree | null,
+  refresh: boolean | undefined,
+  preserveShas: string[] | undefined,
+  forkSha: string | undefined,
+  baseIsAuthoritative: boolean | undefined,
+  beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
 ): Promise<Worktree | undefined> {
   if (!existing || !existsSync(existing.path)) return undefined;
   if (claimed) await lockClaimedWorktree(repoPath, branch, claimed);
-  return existing;
+  if (!refresh) return existing;
+  const refreshOutcome = await refreshOntoBase({
+    repoPath,
+    worktreePath: existing.path,
+    branch,
+    baseBranch,
+    preserveShas,
+    forkSha,
+    baseIsAuthoritative,
+    beforeMutate,
+  });
+  return { ...existing, refreshOutcome };
 }
 
 /** The no-existing-checkout half of {@link materializeClaimedWorktree}: add the worktree from scratch. */
 async function materializeFreshWorktree(
   repoPath: string,
   branch: string,
-  baseBranchOpt: string | undefined,
+  baseBranch: string,
   claimed: string | undefined,
+  refresh: boolean | undefined,
+  preserveShas: string[] | undefined,
+  knownForkSha: string | undefined,
+  baseIsAuthoritative: boolean | undefined,
+  beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
+  beforeCreate: ((createdBranch: boolean) => Promise<void>) | undefined,
 ): Promise<Worktree> {
-  const baseBranch = baseBranchOpt ?? (await currentBranch(repoPath));
   const path = worktreePathFor(repoPath, branch);
   await mkdir(dirname(path), { recursive: true });
 
   const branchAlreadyExisted = await branchExists(repoPath, branch);
   await assertForkableBranch(repoPath, branch, branchAlreadyExisted);
   const createdBranch = !branchAlreadyExisted;
+  // Fired under the same branch lock, BEFORE `git worktree add -b` below ever runs (anton-s55u, PR
+  // #279 review, P1 re-review): a caller recording branch-recreation evidence (e.g. the
+  // `BRANCH_RECREATED_REFRESH_TOMBSTONE` write in execute-epic-claim.ts) must land before the new
+  // branch can exist to survive a crash. Persisting it only after creation left a window where a
+  // process killed between the branch actually landing on disk and that later write meant a resume
+  // found the branch already present (so `createdBranch` reads false next time) with the tombstone
+  // never written — silently resurrecting the deleted branch's stale refresh boundary. Not
+  // best-effort, matching `beforeMutate`: a rejection here must stop the branch from ever being cut.
+  await beforeCreate?.(createdBranch);
   const { forkSha, resolved } = await addAndCaptureFork(repoPath, branch, baseBranch, path, claimed, createdBranch);
+
+  // A pre-existing branch materialized onto a FRESH worktree directory is still a reuse
+  // (anton-s55u) — its checkout is new, but its branch may be sitting on a base many commits
+  // behind. Bring it up to date (opt-in only, see `refresh` on {@link createWorktree}) and re-read
+  // the fork commit so it reflects where the checkout actually ends up, not its pre-refresh tip. A
+  // freshly-CREATED branch (the `-b` case above) needs none of this: it was just cut from
+  // `baseBranch` itself.
+  if (!createdBranch && refresh) {
+    const refreshOutcome = await refreshOntoBase({
+      repoPath,
+      worktreePath: path,
+      branch,
+      baseBranch,
+      preserveShas,
+      forkSha: knownForkSha,
+      baseIsAuthoritative,
+      beforeMutate,
+    });
+    const refreshedForkSha = await readForkAtCreation(path);
+    return { path: resolved, branch, baseBranch, forkSha: refreshedForkSha, createdBranch, repoPath, refreshOutcome };
+  }
+
   return { path: resolved, branch, baseBranch, forkSha, createdBranch, repoPath };
 }
 
@@ -673,13 +1495,41 @@ async function materializeClaimedWorktree(
   branch: string,
   baseBranchOpt: string | undefined,
   claimedBy: string | undefined,
+  refresh: boolean | undefined,
+  preserveShas: string[] | undefined,
+  forkSha: string | undefined,
+  baseIsAuthoritative: boolean | undefined,
+  beforeMutate: ((baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>) | undefined,
+  beforeCreate: ((createdBranch: boolean) => Promise<void>) | undefined,
 ): Promise<Worktree> {
-  const { claimed, existing } = await resolveClaimForCreate(repoPath, branch, claimedBy);
-  const reused = await reuseIfPresent(repoPath, branch, claimed, existing);
+  const { claimed, existing, baseBranch } = await resolveClaimForCreate(repoPath, branch, baseBranchOpt, claimedBy);
+  const reused = await reuseIfPresent(
+    repoPath,
+    branch,
+    baseBranch,
+    claimed,
+    existing,
+    refresh,
+    preserveShas,
+    forkSha,
+    baseIsAuthoritative,
+    beforeMutate,
+  );
   if (reused) return reused;
   // Drop the stale record so `git worktree add` below isn't rejected as "already registered".
   if (existing) await forgetStaleWorktree(repoPath, existing.path);
-  return materializeFreshWorktree(repoPath, branch, baseBranchOpt, claimed);
+  return materializeFreshWorktree(
+    repoPath,
+    branch,
+    baseBranch,
+    claimed,
+    refresh,
+    preserveShas,
+    forkSha,
+    baseIsAuthoritative,
+    beforeMutate,
+    beforeCreate,
+  );
 }
 
 export async function createWorktree(opts: {
@@ -695,6 +1545,36 @@ export async function createWorktree(opts: {
   claimedBy?: string;
   /** Abort an in-flight install so an operator's kill doesn't hold the run's slot for the full warm timeout. */
   signal?: AbortSignal;
+  /**
+   * Bring a REUSED checkout's branch up to `baseBranch` (anton-s55u) — see {@link refreshOntoBase}.
+   * Opt-in, not the default: an execute run's branch is meant to track its base and wants exactly
+   * this, but review-fix's branch is an already-pushed PR whose commits diverging from base is the
+   * NORMAL case, not staleness — rebasing it here would rewrite already-pushed history out from
+   * under review-fix's own, deliberately merge-based (never rebase) reconciliation with its base.
+   */
+  refresh?: boolean;
+  /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
+  preserveShas?: string[];
+  /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its `forkSha` doc comment. */
+  forkSha?: string;
+  /**
+   * Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. The
+   * caller resolves this, not `createWorktree` itself: only the caller knows whether `baseBranch`
+   * came from a confirmed fetch (e.g. `resolveFreshBase`'s success path) or a best-effort fallback.
+   */
+  baseIsAuthoritative?: boolean;
+  /** Passed through to {@link refreshOntoBase} when `refresh` is set — see its own doc comment. */
+  beforeMutate?: (baseSha: string, branchSha: string, kind: MutatingRefreshOutcome) => Promise<void>;
+  /**
+   * Fires under the branch lock when there is no existing checkout to reuse, before `git worktree
+   * add` runs — `true` when it is about to cut a brand-new branch, `false` when it is materializing a
+   * fresh checkout for a branch that already exists. A caller that can tell a genuine
+   * deletion-and-recreation apart from this branch's first-ever creation (only it holds that older
+   * evidence) uses this to persist that durably before the branch can exist to survive a crash — see
+   * `materializeFreshWorktree`'s own doc comment. Not best-effort: a rejection propagates and the
+   * branch is never cut.
+   */
+  beforeCreate?: (createdBranch: boolean) => Promise<void>;
 }): Promise<Worktree> {
   const { repoPath, branch, warm, signal } = opts;
 
@@ -702,26 +1582,57 @@ export async function createWorktree(opts: {
   // outside it. A cold install runs for minutes, and by the time it starts the checkout exists and
   // the run row already names the branch, which is what the sweep re-reads before deleting anything.
   const wt = await withBranchLock(repoPath, branch, () =>
-    materializeClaimedWorktree(repoPath, branch, opts.baseBranch, opts.claimedBy),
+    materializeClaimedWorktree(
+      repoPath,
+      branch,
+      opts.baseBranch,
+      opts.claimedBy,
+      opts.refresh,
+      opts.preserveShas,
+      opts.forkSha,
+      opts.baseIsAuthoritative,
+      opts.beforeMutate,
+      opts.beforeCreate,
+    ),
   );
 
-  if (warm) {
-    try {
-      await warmWorktree(wt, signal);
-    } catch (err) {
-      // The fork was captured before warming; an unexpected setup failure must not discard it before
-      // the run row can persist it for a later resume.
-      console.warn(
-        `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
-          `${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
-  }
+  // The fork was captured before warming; an unexpected setup failure must not discard it before
+  // the run row can persist it for a later resume.
+  if (warm) await warmWorktreeBestEffort(wt, signal);
   // No hooks bridge to materialize here: every git command anton runs against this worktree passes
   // `-c core.hooksPath=<resolved from repoPath>` itself (see resolveHooksPathOverride in ops.ts) —
   // hooks fire from the base repo's own directory with no symlink, no info/exclude entry, and no
   // dependence on whether warming happened to regenerate anything.
   return wt;
+}
+
+/**
+ * {@link warmWorktree}, logged and swallowed rather than thrown — warming is an accelerator, never
+ * a gate. Exported (not just `createWorktree`'s own inline `warm: true`) for a caller that must
+ * persist a refresh boundary before warming starts (anton-s55u, PR #279 review, P1): warming can
+ * run for minutes, and a process killed during it would otherwise leave a rebased/merged branch
+ * with no persisted record of the boundary it was mutated onto, so a resume after the crash
+ * re-derives one against a base that may have moved again — risking the very resurrected-commit bug
+ * the pin exists to prevent. Such a caller materializes with `warm: false`, persists once the
+ * checkout settles, then calls this directly.
+ *
+ * @param warm the project's own warming decision (anton-z5li2) — see {@link resolveWarmCommand}'s
+ *   precedence ladder. Optional: a caller with no project in hand (createWorktree's inline
+ *   `warm: true`) falls through to the env/lockfile rungs exactly as before.
+ */
+export async function warmWorktreeBestEffort(
+  wt: Worktree,
+  signal?: AbortSignal,
+  warm?: WarmConfig,
+): Promise<void> {
+  try {
+    await warmWorktree(wt, signal, warm);
+  } catch (err) {
+    console.warn(
+      `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
+        `${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 /**
@@ -848,23 +1759,26 @@ export interface WarmCommand {
 }
 
 /**
- * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
- * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
- * install already newer than the lockfile (a resumed run reusing its worktree), or no package
- * manager on the search path. Exported as the single testable seam — the shell-out itself is a
- * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
- * real toolchain.
+ * A project's warming decision, narrowed to what {@link resolveWarmCommand} needs. Declared here
+ * rather than alongside the settings it comes from so the git layer owns its own seam and takes no
+ * dependency on the settings module; `resolveWarmConfig` in ../project-settings builds one.
  */
+export interface WarmConfig {
+  /** The operator's pinned setup command, or undefined to fall through to env/lockfile detection. */
+  command?: string;
+  /** False only when the operator explicitly turned warming off; absent stays ON. */
+  enabled: boolean;
+}
+
 /** The `off` spellings {@link WARM_ENV} recognizes. */
 function warmDisabledByEnv(env: Record<string, string | undefined>): boolean {
   const off = env[WARM_ENV]?.trim().toLowerCase();
   return off === "0" || off === "off" || off === "false" || off === "no";
 }
 
-/** An operator- or test-pinned warm command, overriding detection entirely. */
-function pinnedWarmCommand(env: Record<string, string | undefined>): WarmCommand | undefined {
-  const pinned = env[WARM_COMMAND_ENV]?.trim();
-  return pinned ? { file: "sh", args: ["-c", pinned], label: pinned } : undefined;
+/** A pinned command runs through a shell, so an operator can write a pipeline or an `&&` chain. */
+function shellWarmCommand(command: string): WarmCommand {
+  return { file: "sh", args: ["-c", command], label: command };
 }
 
 /** The lockfile-matched install `worktreePath` still needs, or undefined when none applies. */
@@ -896,24 +1810,41 @@ function resolveInstallCommand(
   return { file, args: [...install.args], label: `${install.bin} ${install.args.join(" ")}` };
 }
 
-/** The checks that short-circuit before any lockfile detection: off, pinned, or running under vitest. */
-function warmOverride(env: Record<string, string | undefined>): { command: WarmCommand | null } | undefined {
-  if (warmDisabledByEnv(env)) return { command: null };
-  const pinned = pinnedWarmCommand(env);
-  if (pinned) return { command: pinned };
-  // Structural guard, mirroring the claude driver: never shell out to a real package manager under
-  // vitest. A test that wants the warm path pins WARM_COMMAND_ENV at a fake above.
-  if (env.VITEST) return { command: null };
-  return undefined;
-}
-
+/**
+ * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
+ * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
+ * install already newer than the lockfile (a resumed run reusing its worktree), or no package
+ * manager on the search path. Exported as the single testable seam — the shell-out itself is a
+ * one-liner; `env` and `isExec` are injectable so the decision can be tested without a machine's
+ * real toolchain.
+ *
+ * ── THE PRECEDENCE LADDER (anton-z5li2), highest rung first ──
+ * 1. `ANTON_WARM_WORKTREE` off  → null. Machine-wide opt-out, above every project setting: it is
+ *                                 set on a machine that cannot install at all, which no per-project
+ *                                 command can fix.
+ * 2. `warm.enabled === false`   → null. The project's own opt-out.
+ * 3. `warm.command`             → that command, through a shell. The operator's pinned setup.
+ * 4. `ANTON_WARM_COMMAND`       → that command, through a shell. The machine-wide pin, kept as the
+ *                                 fallback below the project's — and how tests inject a fake.
+ * 5. `VITEST`                   → null. Structural guard, mirroring the claude driver: no unit test
+ *                                 may reach a real package manager. Deliberately BELOW both pins,
+ *                                 so a test that wants the warm path pins a fake at rung 3 or 4.
+ * 6. lockfile table             → the frozen install {@link INSTALL_BY_LOCKFILE} matches, else null.
+ *
+ * `warm` is last and optional so every caller that has no project config — and there is one until
+ * anton-743gk threads it in — keeps behaving exactly as it did before rungs 2 and 3 existed.
+ */
 export function resolveWarmCommand(
   worktreePath: string,
   env: Record<string, string | undefined> = process.env,
   isExec: (p: string) => boolean = isExecutableFile,
+  warm?: WarmConfig,
 ): WarmCommand | null {
-  const override = warmOverride(env);
-  if (override) return override.command;
+  if (warmDisabledByEnv(env)) return null;
+  if (warm?.enabled === false) return null;
+  const pinned = warm?.command?.trim() || env[WARM_COMMAND_ENV]?.trim();
+  if (pinned) return shellWarmCommand(pinned);
+  if (env.VITEST) return null;
   const install = detectedInstall(worktreePath);
   return install ? (resolveInstallCommand(install, worktreePath, env, isExec) ?? null) : null;
 }
@@ -925,19 +1856,57 @@ export function resolveWarmCommand(
 const WARM_STAMP = ".anton-warm";
 
 /**
- * True unless a COMPLETED install is on record newer than the lockfile. The stamp, not `node_modules`
- * itself, is the witness: an install killed partway (OOM, SIGKILL, dropped network) has already
- * written into `node_modules`, so its mtime is newer than the lockfile and a directory-mtime check
- * would call the half-populated tree current — surfacing later as `Cannot find module` inside a
- * supposedly pre-warmed worktree, with no further warming attempt.
+ * Bump whenever what the stamp vouches for changes, so an already-written stamp from before the
+ * change stops being trusted. Bumped past its unversioned origin (anton-db82f/anton-ph94g): a
+ * `NODE_ENV=production`-launched anton used to warm every worktree with devDependencies skipped, so
+ * a stamp written by that install vouches for a tree that is missing them even though the lockfile
+ * hasn't changed since — {@link installNeeded} must not treat that stamp as current.
+ */
+const WARM_STAMP_VERSION = 2;
+
+/**
+ * True unless a COMPLETED, current-version install is on record newer than the lockfile. The stamp,
+ * not `node_modules` itself, is the witness: an install killed partway (OOM, SIGKILL, dropped
+ * network) has already written into `node_modules`, so its mtime is newer than the lockfile and a
+ * directory-mtime check would call the half-populated tree current — surfacing later as `Cannot find
+ * module` inside a supposedly pre-warmed worktree, with no further warming attempt. A stamp from an
+ * older {@link WARM_STAMP_VERSION} is treated the same as no stamp at all (see above).
  */
 function installNeeded(worktreePath: string, lockfile: string): boolean {
   try {
-    const warmed = statSync(join(worktreePath, "node_modules", WARM_STAMP)).mtimeMs;
+    const stampPath = join(worktreePath, "node_modules", WARM_STAMP);
+    const stamp = readFileSync(stampPath, "utf8");
+    if (!stamp.startsWith(`${WARM_STAMP_VERSION}\n`)) return true;
+    const warmed = statSync(stampPath).mtimeMs;
     return warmed < statSync(join(worktreePath, lockfile)).mtimeMs;
   } catch {
     return true; // no stamp (fresh worktree, partial install, pre-stamp worktree) → install
   }
+}
+
+/**
+ * The environment the install runs under. `NODE_ENV` is dropped rather than inherited: `anton start`
+ * launches the daemon with `NODE_ENV=production` (bin/anton.mjs), and every package manager reads
+ * that as "skip devDependencies" — so a production-launched anton warmed each worktree into a tree
+ * missing vitest, typescript and the rest, and the run's first verify gate failed on modules the
+ * lockfile does list. Unset lets each manager apply its own default (install everything).
+ *
+ * @param parent the environment to derive from; injectable so the rule can be tested without
+ *   mutating the real process env.
+ */
+export function warmChildEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: Record<string, string | undefined> = {
+    ...parent,
+    // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
+    // package manager was resolved against, not the daemon's minimal one.
+    PATH: [parent.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter),
+  };
+  // Dropped rather than set to a value: there is no "install everything" spelling every manager
+  // agrees on, and an absent NODE_ENV is exactly what a developer's own shell hands `bun install`.
+  delete env.NODE_ENV;
+  // Next augments ProcessEnv with a REQUIRED, readonly NODE_ENV (its own TODO calls that wrong), so
+  // the type cannot express the env this function exists to build. Asserted once, here.
+  return env as NodeJS.ProcessEnv;
 }
 
 /**
@@ -951,8 +1920,8 @@ function installNeeded(worktreePath: string, lockfile: string): boolean {
  * required, and an install anton can't complete (private registry, no network) must not be able to
  * lose an otherwise-good run.
  */
-async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
-  const cmd = resolveWarmCommand(wt.path);
+async function warmWorktree(wt: Worktree, signal?: AbortSignal, warm?: WarmConfig): Promise<void> {
+  const cmd = resolveWarmCommand(wt.path, process.env, isExecutableFile, warm);
   if (!cmd) return;
 
   try {
@@ -960,9 +1929,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
       cwd: wt.path,
       timeout: WARM_TIMEOUT_MS,
       maxBuffer: 16 * 1024 * 1024,
-      // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
-      // package manager was resolved against, not the daemon's minimal one.
-      env: { ...process.env, PATH: [process.env.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter) },
+      env: warmChildEnv(),
       // An operator's kill must not be stuck behind a 10-minute install; aborting degrades into the
       // logged, non-fatal path below, exactly like a registry timeout.
       signal,
@@ -985,7 +1952,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
  */
 async function stampWarmed(worktreePath: string, label: string): Promise<void> {
   try {
-    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${label}\n`);
+    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${WARM_STAMP_VERSION}\n${label}\n`);
   } catch {
     // no node_modules / read-only tree → next warm re-runs the install
   }

@@ -16,7 +16,9 @@
  *     `start-guards.ts`) over the shape they share (`guard.ts`), and `claim-detection.ts` — what
  *     an accepted claim becomes.
  */
-import { loadSkill } from "../claude/prompt";
+import { bundledSkillDigest, loadSkill } from "../claude/prompt";
+import { textDigest } from "../claude/skill-stamp.mjs";
+import type { ReasoningAttribution } from "../claude-invocations";
 import { resolveProductMasterConfig, type ProjectSettings } from "../projects";
 import { formatPmBoardContext, type PmBoardInput } from "./board-context";
 import { pmReportFormatSection } from "./report";
@@ -67,14 +69,22 @@ export interface PmReasoningSource {
  * The board section and the report protocol are anton's either way — an operator prompt is free to
  * restyle the judgment, and must not be able to change what the pass is judging or how anton reads
  * its answer.
+ *
+ * `attribution` carries this resolution's {@link ReasoningAttribution} for the ledger (PR #313
+ * review): the pass's dispatch sets no `appendSystemPrompt` at all, so `metered` has nothing of its
+ * own to digest — without this, an edited `productMasterPrompt` or a rewritten `product-master`
+ * skill pools silently into the same cohort as before the edit.
  */
 export async function buildProductMasterPrompt(args: {
   settings: ProjectSettings;
   board: PmBoardInput;
-}): Promise<{ prompt: string; reasoningFrom: PmReasoningSource }> {
+}): Promise<{ prompt: string; reasoningFrom: PmReasoningSource; attribution: ReasoningAttribution }> {
   const config = resolveProductMasterConfig(args.settings);
   const reasoning = config.prompt ?? (await loadSkill("product-master"));
   const reasoningFrom: PmReasoningSource = { kind: config.prompt ? "prompt" : "default" };
+  const attribution: ReasoningAttribution = config.prompt
+    ? { promptBodyDigest: textDigest(config.prompt) }
+    : { skillId: "product-master", skillDigest: bundledSkillDigest("product-master") };
   const prompt = [
     reasoning,
     ``,
@@ -84,5 +94,5 @@ export async function buildProductMasterPrompt(args: {
     ``,
     pmReportFormatSection(),
   ].join("\n");
-  return { prompt, reasoningFrom };
+  return { prompt, reasoningFrom, attribution };
 }

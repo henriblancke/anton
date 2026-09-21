@@ -14,6 +14,7 @@ function freshness(o: Partial<SelfFreshness> = {}): SelfFreshness {
     checkout: { state: "current" },
     dependencies: { state: "match" },
     build: { state: "current" },
+    schema: { state: "current" },
     ...o,
   };
 }
@@ -83,6 +84,51 @@ describe("staleBreaker", () => {
     // A read that failed is not a stale process: the runner's drift enumerates the machine's
     // sockets, and grounding the board on a check that threw is the line this module never crosses.
     expect(staleBreaker(freshness({ build: { state: "unknown", reason: "lsof missing" } }))).toBeUndefined();
+  });
+
+  // Without this, `staleCheckoutRefusal` (anton-sm1l) defers every non-`execute-epic` job the
+  // instant schema goes pending while this band — the operator's only OTHER signal — stayed empty,
+  // breaking "nothing renders when the checkout is clean": the checkout is not clean, work is
+  // piling up in `queued`, and only each job's own `lastError` said so (PR #281 review).
+  it("names the pending migrations and the command that clears them", () => {
+    const stale = staleBreaker(
+      freshness({ schema: { state: "pending", migrations: ["0038_add_base_fork_sha.sql"] } }),
+    );
+    expect(stale?.kind).toBe("stale");
+    expect(stale?.detail).toContain("1 pending migration");
+    expect(stale?.evidence).toEqual([
+      "anton.db has pending migration (0038_add_base_fork_sha.sql) — run `bun run db:migrate`",
+    ]);
+  });
+
+  // `bun run db:migrate` invokes drizzle-kit, a devDep `scripts/build-bundle.mjs` deliberately never
+  // ships — a release bundle applies its migrations in-process on every `anton start` instead, so its
+  // remedy is the restart the card's other halves already prescribe (PR #281 review).
+  it("names a bundle-compatible remedy for pending migrations when isBundle is set", () => {
+    const stale = staleBreaker(
+      freshness({ schema: { state: "pending", migrations: ["0038_add_base_fork_sha.sql"] } }),
+      { isBundle: true },
+    );
+    expect(stale?.evidence).toEqual([
+      "anton.db has pending migration (0038_add_base_fork_sha.sql) — restart anton " +
+        "(`anton stop` && `anton start`) to apply them",
+    ]);
+  });
+
+  it("clears for every process at once — no restart to wait for, unlike the other latched halves", () => {
+    const stale = staleBreaker(
+      freshness({
+        schema: {
+          state: "pending",
+          migrations: ["0038_add_base_fork_sha.sql", "0039_add_thing.sql"],
+        },
+      }),
+    );
+    expect(stale?.detail).toContain("2 pending migrations");
+    expect(stale?.evidence).toEqual([
+      "anton.db has pending migrations (0038_add_base_fork_sha.sql, 0039_add_thing.sql) — run " +
+        "`bun run db:migrate`",
+    ]);
   });
 
   it("carries one evidence line per stale half when both are behind", () => {

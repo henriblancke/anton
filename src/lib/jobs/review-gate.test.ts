@@ -16,6 +16,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { asc } from "drizzle-orm";
 
+import { selfBuildVersion } from "../build/drift";
+import { systemPromptDigest } from "../claude/system-prompt";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
@@ -1440,5 +1442,115 @@ describe("verify-gate evidence across a commit hook", () => {
     );
     await expect(result).resolves.toMatchObject({ outcome: "clean", score: 9 });
     expect(readFileSync(counter, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+});
+
+/**
+ * The self-review half of the attribution stamps (anton-234ja). This gate is one of the two sites
+ * PR #311 found the original plan would have left unstamped — it dispatches its own driver and never
+ * touches `dispatchClaude` — so "every invocation through `metered(...)` is stamped" is asserted
+ * here, on the rows, rather than assumed from the wrapper.
+ */
+describe("runReviewGate — what produced each invocation", () => {
+  it("stamps the fix round with the target's agent, and the review with none when no reviewAgent is set", async () => {
+    const { run, calls } = fakeClaude([report(4, [BLOCKING]), "fixed it", report(9, [])]);
+    await runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      runId: undefined,
+      target: { ...target, labels: ["agent:nextjs"] },
+      tickets: [ticket],
+      formulaDigest: "9c2e4410ab77",
+      settings: {},
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diff,
+        commit: async () => ({ committed: true }),
+        readState: async () => ({ head: "c0ffee", ref: RUN_REF, status: "" }),
+        restoreState: async () => {},
+      },
+    });
+
+    // By when they were RECORDED — `id` is a random uuid, which orders nothing. The suite's clock
+    // ticks a second per read, so dispatch order and record order are the same here.
+    const rows = await tdb.db
+      .select()
+      .from(schema.claudeInvocations)
+      .orderBy(asc(schema.claudeInvocations.recordedAt));
+    // Three dispatches: review, fix, re-review — each its own invocation, each its own row.
+    expect(rows).toHaveLength(3);
+    // The two kinds of session are metered APART by `step` — a review reads a diff, a fix rewrites
+    // the tree — while both are the same `review` handler, which is what the phase fold reads.
+    expect(rows.map((r) => r.step)).toEqual(["review", "review-fix", "review"]);
+    expect(rows.map((r) => r.stepHandler)).toEqual(["review", "review", "review"]);
+    for (const row of rows) {
+      expect(row).toMatchObject({ beadId: target.id, formulaDigest: "9c2e4410ab77" });
+      // Resolved inside the meter: this gate passes no version and still records one.
+      expect(row.antonVersion).toBe(selfBuildVersion());
+    }
+    // No `reviewAgent` is configured, so the shipped default reviews — no named agent ran it, and
+    // pooling it under the target's tag would mix "who reviewed" with "who implemented" (PR #313
+    // review). The FIX session really is the target's own agent repairing its own work.
+    expect(rows.map((r) => r.agentTag)).toEqual([null, "nextjs", null]);
+    // The FIX session composes a system prompt (the operating contract + the epic's agent layer);
+    // the review deliberately does not, and records the absence rather than a digest of nothing.
+    expect(rows[1].promptDigest).toBe(systemPromptDigest(calls[1].appendSystemPrompt ?? ""));
+    expect(rows[0].promptDigest).toBeNull();
+    // `promptDigest` staying null does NOT mean the review's own reasoning contract went
+    // unattributed (PR #313 review): the shipped `review` skill it ran with is named here instead,
+    // the same way a `step:claude` step names its skill.
+    expect(rows[0]).toMatchObject({ skillId: "review" });
+    expect(rows[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
+    // The fix round runs the target's own agent, whose content already rides the `promptDigest`
+    // asserted above — it carries no separate skill/prompt-body stamp of its own.
+    expect(rows[1]).toMatchObject({ skillId: null, promptBodyDigest: null });
+  });
+
+  it("stamps the review with the configured reviewAgent, distinct from the target's own agent", async () => {
+    const REVIEWER_ID = "anton-security-reviewer";
+    const agentDir = join(dir, ".claude", "agents");
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, `${REVIEWER_ID}.md`), `---\nname: ${REVIEWER_ID}\n---\n\nREVIEW AS SECURITY.\n`);
+    execFileSync("git", ["-C", dir, "add", "-A"], { stdio: "ignore" });
+    execFileSync("git", ["-C", dir, "commit", "-qm", "add reviewer agent"], { stdio: "ignore" });
+
+    const { run } = fakeClaude([report(9, [])]);
+    await runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      runId: undefined,
+      target: { ...target, labels: ["agent:nextjs"] },
+      tickets: [ticket],
+      settings: { reviewAgent: REVIEWER_ID },
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diff,
+        commit: async () => ({ committed: true }),
+        readState: async () => ({ head: "c0ffee", ref: RUN_REF, status: "" }),
+        restoreState: async () => {},
+      },
+    });
+
+    const rows = await tdb.db
+      .select()
+      .from(schema.claudeInvocations)
+      .orderBy(asc(schema.claudeInvocations.recordedAt));
+    expect(rows).toHaveLength(1); // clean on round 1, no fix dispatched
+    // The reviewer that actually ran (`reviewAgent`) is distinct from the target's implementer, and
+    // each column must say which one it is (PR #313 review).
+    expect(rows[0]).toMatchObject({ beadId: target.id, agentTag: REVIEWER_ID });
+    // `agentTag` names WHO reviewed; a content digest of the agent file it read from is what tells
+    // an edit to that same file apart from the text that actually ran (PR #313 review) — the review
+    // driver call sets no `appendSystemPrompt` for `metered` to digest on its own.
+    expect(rows[0].promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
+    expect(rows[0].skillId).toBeNull();
   });
 });

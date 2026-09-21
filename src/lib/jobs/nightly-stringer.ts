@@ -13,7 +13,7 @@
  * window rather than skipping it. The worst case either way is claude re-reading a scan and deduping
  * against the board it already wrote.
  */
-import { metered } from "../claude-invocations";
+import { metered, type InvocationDimensions } from "../claude-invocations";
 import { runClaude } from "../claude/driver";
 import { syncBoard } from "./nightly-stringer-board";
 import { openPass, type NightlyPass } from "./nightly-stringer-pass";
@@ -52,6 +52,18 @@ async function triageScan(
   }
   await pass.log(`[stringer] ${scanned.counts.total} signal(s) → /scan-triage\n`);
 
+  // Built once, before `runTriage` resolves what to attribute it to — the object `setAttribution`
+  // mutates once it does (PR #313 review, mirrors `execute-epic-ticket.ts`'s per-step meter).
+  // `metered` reads `dimensions` at CALL time, so the object built here is the same one that read
+  // picks up.
+  const dimensions: InvocationDimensions = {
+    projectId: pass.project.id,
+    jobType: ctx.type,
+    jobId: ctx.jobId,
+    step: "scan-triage",
+    stepHandler: "scan-triage",
+    modelRequested: pass.settings.model,
+  };
   const triage = await runTriage({
     project: pass.project,
     settings: pass.settings,
@@ -62,13 +74,8 @@ async function triageScan(
     onEvent: pass.onEvent,
     // Metered like every other invocation (anton-77l9). The pass writes no run row, so the ledger's
     // run and step columns are what separate this spend from a ticket's.
-    claude: metered(db, clock, {
-      projectId: pass.project.id,
-      jobType: ctx.type,
-      jobId: ctx.jobId,
-      step: "scan-triage",
-      modelRequested: pass.settings.model,
-    }, runClaude),
+    claude: metered(db, clock, dimensions, runClaude),
+    setAttribution: (attribution) => Object.assign(dimensions, attribution),
   });
   // Triage read the signals; from here the consumed --delta window is legitimately spent.
   pass.markTriaged();

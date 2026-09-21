@@ -32,6 +32,7 @@ import {
   parseRunFormulaSource,
   projectRunFormulaPath,
   resolveRunFormulaPath,
+  runFormulaDigest,
   selectRunFormula,
   unknownFormulaKeys,
   validateRunFormula,
@@ -668,5 +669,160 @@ describe("validateRunFormula — a resumed run keeps the pipeline it recorded (a
       cook: walkable,
     });
     expect(formula.recorded).toBe(PINNED);
+  });
+});
+
+// `runs.formula` is a PATH, and a path answers neither question the ledger asks: a project edits
+// its pipeline in place (same path, different steps), and a project that copied anton's default
+// records a different path from one that never ran the installer (different path, same steps). The
+// digest is what separates those two cohorts correctly.
+describe("runFormulaDigest — what the run actually walked (anton-jpmdw)", () => {
+  const pipeline = (steps: CookedFormula["steps"], rest: Partial<CookedFormula> = {}): CookedFormula => ({
+    formula: "anton-run",
+    steps,
+    ...rest,
+  });
+
+  const DEFAULT = pipeline([
+    { id: "implement", type: "task", labels: ["step:implement"] },
+    { id: "commit", type: "task", labels: ["step:commit"], needs: ["implement"] },
+    { id: "pr", type: "task", labels: ["step:pr"], needs: ["commit"] },
+  ]);
+
+  it("digests to a stable 12-hex value — same pipeline, same key, every call", () => {
+    const digest = runFormulaDigest(DEFAULT);
+    expect(digest).toMatch(/^[0-9a-f]{12}$/);
+    expect(runFormulaDigest(DEFAULT)).toBe(digest);
+    // A structurally identical pipeline, built independently: the digest is of CONTENT, not identity.
+    expect(runFormulaDigest(pipeline(DEFAULT.steps.map((s) => ({ ...s }))))).toBe(digest);
+  });
+
+  it("changes when a step's labels change — a step's handler is its labels", () => {
+    const retargeted = pipeline([
+      { ...DEFAULT.steps[0], labels: ["step:claude", "skill:implement"] },
+      ...DEFAULT.steps.slice(1),
+    ]);
+    expect(runFormulaDigest(retargeted)).not.toBe(runFormulaDigest(DEFAULT));
+  });
+
+  it("changes when a label is added, removed, or reordered within one step", () => {
+    const base = runFormulaDigest(DEFAULT);
+    const added = pipeline([
+      { ...DEFAULT.steps[0], labels: ["step:implement", "agent:nextjs"] },
+      ...DEFAULT.steps.slice(1),
+    ]);
+    const dropped = pipeline([{ ...DEFAULT.steps[0], labels: [] }, ...DEFAULT.steps.slice(1)]);
+    const swapped = pipeline([
+      { ...DEFAULT.steps[0], labels: ["agent:nextjs", "step:implement"] },
+      ...DEFAULT.steps.slice(1),
+    ]);
+    expect(runFormulaDigest(added)).not.toBe(base);
+    expect(runFormulaDigest(dropped)).not.toBe(base);
+    expect(runFormulaDigest(swapped)).not.toBe(runFormulaDigest(added));
+  });
+
+  it("changes when the steps are REORDERED — a step moved is a different pipeline", () => {
+    const [implement, commit, pr] = DEFAULT.steps;
+    expect(runFormulaDigest(pipeline([commit, implement, pr]))).not.toBe(runFormulaDigest(DEFAULT));
+  });
+
+  it("changes when a step is added or removed", () => {
+    const base = runFormulaDigest(DEFAULT);
+    const extra = { id: "verify", type: "task", labels: ["step:verify"], needs: ["implement"] };
+    expect(runFormulaDigest(pipeline([...DEFAULT.steps, extra]))).not.toBe(base);
+    expect(runFormulaDigest(pipeline(DEFAULT.steps.slice(1)))).not.toBe(base);
+  });
+
+  it("changes when a step's `needs` change — the DAG is part of the pipeline", () => {
+    const rewired = pipeline([
+      DEFAULT.steps[0],
+      DEFAULT.steps[1],
+      { ...DEFAULT.steps[2], needs: ["implement"] },
+    ]);
+    expect(runFormulaDigest(rewired)).not.toBe(runFormulaDigest(DEFAULT));
+  });
+
+  // The cohort key must not be poisoned by per-run prose. bd substitutes `{{target}}` into a step's
+  // title in runtime mode, so a digest that read titles would give every run its own key — a cohort
+  // of one, which answers nothing this ledger asks.
+  it("ignores the prose bd substitutes per run — titles, descriptions, the formula's own name", () => {
+    const base = runFormulaDigest(DEFAULT);
+    const titled = pipeline(
+      DEFAULT.steps.map((s) => ({ ...s, title: `Implement anton-${s.id}` })),
+      { description: "a run over anton-jpmdw", formula: "heavy" },
+    );
+    expect(runFormulaDigest(titled)).toBe(base);
+  });
+
+  // The whole reason the digest hashes CONTENT rather than the file: a project that copied anton's
+  // default and one that never ran the installer walk the same pipeline, and pooling them under one
+  // key is the correct answer.
+  it("gives anton's bundled default and an identical project-local copy the SAME digest", () => {
+    const bundled = pipeline(DEFAULT.steps, { source: bundledRunFormulaPath() });
+    const local = pipeline(DEFAULT.steps, { source: "/repo/.beads/formulas/anton-run.formula.toml" });
+    expect(runFormulaDigest(local)).toBe(runFormulaDigest(bundled));
+  });
+
+  it("cannot be forged by rearranging content across fields", () => {
+    const split = pipeline([{ id: "implement", type: "task", labels: ["step:implement", "a"] }]);
+    const joined = pipeline([{ id: "implement", type: "task", labels: ["step:implement\u0000a"] }]);
+    expect(runFormulaDigest(split)).not.toBe(runFormulaDigest(joined));
+  });
+});
+
+describe("validateRunFormula — the digest rides alongside the recorded source (anton-jpmdw)", () => {
+  const steps = [
+    { id: "implement", labels: ["step:implement"] },
+    { id: "commit", labels: ["step:commit"], needs: ["implement"] },
+    { id: "pr", labels: ["step:pr"], needs: ["commit"] },
+  ];
+  // A real `bd cook` reports the path it cooked FROM, so the fake does too: that field must not
+  // reach the digest, or the bundled-vs-local equality below would be vacuous.
+  const cookFrom = (path: string) => async (): Promise<CookedFormula> => ({
+    formula: "anton-run",
+    source: path,
+    steps,
+  });
+
+  it("returns a 12-hex digest next to `recorded`, not instead of it", async () => {
+    const formula = await validateRunFormula("/repo", {
+      pinned: { source: "/repo/.beads/formulas/anton-run.formula.toml" },
+      read: async () => VALID,
+      cook: cookFrom("/repo/.beads/formulas/anton-run.formula.toml"),
+    });
+    expect(formula.digest).toMatch(/^[0-9a-f]{12}$/);
+    expect(formula.recorded).toBe("/repo/.beads/formulas/anton-run.formula.toml");
+  });
+
+  it("digests anton's bundled default and an identical project-local copy the same", async () => {
+    const bundled = await validateRunFormula("/no-such-repo", {
+      read: async () => VALID,
+      cook: cookFrom(bundledRunFormulaPath()),
+    });
+    const local = await validateRunFormula("/repo", {
+      pinned: { source: "/repo/.beads/formulas/anton-run.formula.toml" },
+      read: async () => VALID,
+      cook: cookFrom("/repo/.beads/formulas/anton-run.formula.toml"),
+    });
+    expect(local.digest).toBe(bundled.digest);
+    // The digest pools them; `recorded` still tells the two copies apart.
+    expect(local.recorded).not.toBe(bundled.recorded);
+  });
+
+  // The digest is taken from the ORDERED pipeline, so a formula that expressed its shape through
+  // `needs` digests the same as one that wrote the same shape out in declaration order — they are
+  // the same pipeline, and the walker runs both identically.
+  it("digests by EXECUTION order, so `needs` and declaration order express one pipeline", async () => {
+    const declared = await validateRunFormula("/repo", {
+      pinned: { source: "/repo/f.toml" },
+      read: async () => VALID,
+      cook: cookFrom("/repo/f.toml"),
+    });
+    const wired = await validateRunFormula("/repo", {
+      pinned: { source: "/repo/f.toml" },
+      read: async () => VALID,
+      cook: async () => ({ formula: "anton-run", steps: [steps[2], steps[1], steps[0]] }),
+    });
+    expect(wired.digest).toBe(declared.digest);
   });
 });
