@@ -538,17 +538,39 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       // behavior this replaces instead of throwing. `merged.get(t.id) ?? []` always passes the FULL
       // known set, never just `fix.boardEvidenceIds` alone: `setBoardEvidenceConfirmed` is not
       // idempotent on its `ids` argument (see that function's own docstring), so a narrower write
-      // here would overwrite already-durable evidence with less. Best-effort like every other
-      // opportunistic sync in this loop — a failure here leaves exactly the pre-existing behavior
-      // (in-memory only, lost on crash) rather than a new hard failure this round must halt on.
+      // here would overwrite already-durable evidence with less. NOT best-effort (chatgpt-codex-
+      // connector, PR #284 review, "Fail when board-fix evidence cannot be persisted"): every
+      // `mustPersist` result is checked and the confirming push must report `synced`/`shared-server`
+      // like every other board-evidence write in this codebase — a discarded failure here would
+      // leave this round's confirmed IDs living only in the in-memory `merged` map, so a process
+      // death before the next round (or the PR step) reads back only the stale
+      // `boardEvidenceConfirmed` metadata and can no longer tell the reviewer which beads THIS
+      // round's fix touched, defeating the crash-recovery purpose documented above.
       const repo = args.repoPath;
       if (repo) {
-        await Promise.all(
+        const persisted = await Promise.all(
           boardOnlyUnits.map((t) =>
             mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [])),
           ),
         );
-        await beads.push(repo).catch(() => false);
+        const synced = await beads
+          .push(repo)
+          .then((outcome) => outcome === "synced" || outcome === "shared-server")
+          .catch(() => false);
+        if (persisted.some((ok) => !ok) || !synced) {
+          const allPersisted = persisted.every(Boolean);
+          throw new PoisonError(
+            `${target.id}'s board-fix evidence from review round ${round} could not be durably ` +
+              `confirmed: ${
+                allPersisted
+                  ? "every ticket's write landed locally, but the confirming push could not verify " +
+                    "it reached the remote"
+                  : "bd refused the write for at least one board-only ticket (after retries)"
+              } — the run stopped rather than let a resumed attempt rebuild this round's evidence ` +
+              `from stale metadata with no record of which beads this fix changed. Check the beads ` +
+              `DB${allPersisted ? " and the sync channel" : ""}, then resume the run.`,
+          );
+        }
       }
     }
 

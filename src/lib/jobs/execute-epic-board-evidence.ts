@@ -1221,6 +1221,7 @@ export async function clearBoardEvidencePending(
           .then((outcome) => outcome === "synced" || outcome === "shared-server")
           .catch(() => false)
       : false;
+    let obligationRestored = true;
     if (obligationCleared && !obligationSynced) {
       // The clear landed locally but the confirming push could not verify it reached the remote
       // (chatgpt-codex-connector, PR #284 review, "Re-persist the obligation when its clear cannot
@@ -1230,7 +1231,25 @@ export async function clearBoardEvidencePending(
       // rediscover and union its ids into an unrelated reopened delivery. Re-persisting it locally
       // (mirrors `clearBoardEvidencePending`'s own `!cleared || !synced` branch above) keeps a
       // same-machine resume retrying the sync until it actually lands.
-      await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids));
+      //
+      // The result is checked, not discarded (chatgpt-codex-connector, PR #284 review, "Verify the
+      // restored cleanup obligation actually persisted"): if THIS restore also exhausts its
+      // retries, the local db is left with no obligation at all while the remote may still carry
+      // one — a same-machine resume would then see the obligation as cleared and skip retrying,
+      // the exact stale-evidence resurrection this obligation exists to prevent. Poisoned
+      // immediately below rather than falling through to the generic message, which assumes the
+      // local marker survived.
+      obligationRestored = await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids));
+    }
+    if (obligationCleared && !obligationSynced && !obligationRestored) {
+      throw new PoisonEpic(
+        `${ticketId} delivered and closed, and its cleanup-sync retry obligation was cleared ` +
+          `locally, but the confirming push could not verify the clear reached the remote AND ` +
+          `restoring the obligation marker locally then also failed (after retries) — local and ` +
+          `remote state have diverged with no obligation marker left anywhere in this worktree to ` +
+          `drive a retry, so a same-machine resume would wrongly see this cleanup as settled. Check ` +
+          `the beads DB and the sync channel directly, then resume the run.`,
+      );
     }
     if (!obligationCleared || !obligationSynced) {
       throw new PoisonEpic(
