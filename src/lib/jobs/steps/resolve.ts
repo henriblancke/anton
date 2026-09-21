@@ -6,14 +6,13 @@
  * id, the label, and the formula file. A silent skip would let a project formula quietly define a
  * run that never opens a PR, which is the failure this seam exists to make impossible.
  */
-import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { labelValueOf, type CookedStep } from "../../beads/bd";
 import { loadAgentPrompt, stripFrontmatter } from "../../claude/agent-prompt";
 import { loadSkill, skillDir } from "../../claude/prompt";
-import { skillDigest, STAMP_LENGTH } from "../../claude/skill-stamp.mjs";
+import { skillDigest, textDigest } from "../../claude/skill-stamp.mjs";
 import { PoisonEpic } from "../errors";
 import type { StepContext } from "./context";
 import type { StepDefinition } from "./result";
@@ -121,7 +120,7 @@ export async function loadStepReasoning(ctx: StepContext, stepId: string): Promi
     const body = await loadAgentPrompt(promptId, { projectDir: ctx.worktreePath });
     if (body?.trim()) {
       const text = body.trim();
-      return { text, promptId, promptBodyDigest: promptDigestOf(text) };
+      return { text, promptId, promptBodyDigest: textDigest(text) };
     }
     throw new PoisonEpic(
       `formula step "${stepId}" names \`prompt:${promptId}\`, which resolves to no prompt file — ` +
@@ -168,15 +167,6 @@ function digestOf(dir: string): string | undefined {
   } catch {
     return undefined;
   }
-}
-
-/**
- * 12-hex content digest of a resolved PROMPT body — the `promptId` sibling of {@link digestOf}. The
- * text is already in hand (no filesystem read), so unlike the skill digest there is nothing here to
- * swallow a failure from.
- */
-function promptDigestOf(text: string): string {
-  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, STAMP_LENGTH);
 }
 
 /**

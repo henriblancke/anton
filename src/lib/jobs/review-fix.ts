@@ -665,7 +665,7 @@ async function runFixSession(args: {
       `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
     );
 
-    const { prompt, appendSystemPrompt } = await buildReviewFixPrompt({
+    const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
       epic,
       pr,
       reasons: verdict.reasons,
@@ -690,6 +690,9 @@ async function runFixSession(args: {
       // The specialist the epic named — `buildReviewFixPrompt` above composed this session's system
       // prompt from that same tag, and `metered` digests that composed text from the spawn options.
       agentTag: labelValueOf(epic.labels, "agent"),
+      // The review-fix REASONING contract's own identity (PR #313 review) — see
+      // `buildReviewFixPrompt`'s doc: it rides in `prompt`, which `metered` never digests.
+      ...attribution,
     }, runClaude)({
       cwd: worktree.path,
       prompt,

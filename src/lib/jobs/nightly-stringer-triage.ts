@@ -11,7 +11,8 @@ import {
   type ClaudeResult,
   type RunClaudeOptions,
 } from "../claude/driver";
-import { loadSkill } from "../claude/prompt";
+import { bundledSkillDigest, loadSkill } from "../claude/prompt";
+import type { ReasoningAttribution } from "../claude-invocations";
 import { quotaMeterKey } from "../quota-meter";
 import { resolveScanSeverity, type ProjectSettings } from "../projects";
 import { parseTriageOutcome, type TriageOutcome } from "../scan-health";
@@ -80,6 +81,15 @@ export async function runTriage(opts: {
    * smaller than it is. Defaults to the bare driver for a caller invoking triage directly.
    */
   claude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /**
+   * Told the `/scan-triage` skill's {@link ReasoningAttribution} before the dispatch, so the
+   * caller's meter — already built around `claude` before this runs — can stamp it (PR #313
+   * review, mirrors `dispatchClaude`'s `setAttribution`). This dispatch sets no `appendSystemPrompt`
+   * at all, so without this a rewritten `skills/scan-triage/SKILL.md` pools silently into the same
+   * cohort as before the edit. There is no per-project override to branch on here (unlike review /
+   * review-fix / product-master) — every triage session runs anton's own bundled skill.
+   */
+  setAttribution?: (attribution: ReasoningAttribution) => void;
 }): Promise<TriageOutcome | undefined> {
   const { project, settings } = opts;
   const boardSection = await readBoardContext(project.repoPath, opts.logPath, project.slug);
@@ -88,6 +98,7 @@ export async function runTriage(opts: {
     settings,
     boardSection,
   });
+  opts.setAttribution?.({ skillId: "scan-triage", skillDigest: bundledSkillDigest("scan-triage") });
 
   const routing = claudeRouting(settings);
   await opts.claudeReached(quotaMeterKey(settings));

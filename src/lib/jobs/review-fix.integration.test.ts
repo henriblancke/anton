@@ -276,6 +276,12 @@ process.exit(0);`,
     // Digested from the system prompt this fix actually ran with — the one asserted above to carry
     // the operating contract. Recorded because that text is gone the moment a layer is edited.
     expect(ledger[0].promptDigest).toMatch(/^[0-9a-f]{12}$/);
+    // That's the EXECUTION contract (agent + seed), not the review-fix REASONING contract itself —
+    // that text rides in the user prompt asserted above ("review feedback"/"Reporting format"),
+    // which `metered` never sees. No `reviewFixPrompt` override is configured, so the shipped
+    // `review-fix` skill ran, and its own identity is what names it (PR #313 review).
+    expect(ledger[0]).toMatchObject({ skillId: "review-fix", promptBodyDigest: null });
+    expect(ledger[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
     // Resolved inside the meter from process state, so the job passes no version and still records one.
     expect(ledger[0].antonVersion).toBe(selfBuildVersion());
 

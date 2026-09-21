@@ -4,7 +4,8 @@
  * a claude session: everything the agent must not have to re-derive is in the text, or it isn't.
  */
 import { expect, it, vi } from "vitest";
-import type { RunClaudeOptions } from "../claude/driver";
+import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
+import type { ReasoningAttribution } from "../claude-invocations";
 import { buildTriagePrompt, runTriage } from "./nightly-stringer-triage";
 
 const BOARD = "## Board context — as read\n- feat-1 · attach:child · epic:epic-1";
@@ -53,4 +54,34 @@ it("routes its pipeline-free nightly-stringer session", async () => {
     claude,
   });
   expect(seen?.model).toBe("triage-model");
+});
+
+it("tells the caller's meter the /scan-triage skill's identity, since the dispatch sets no system prompt of its own", async () => {
+  const claude = vi.fn(async () => ({ ok: true, text: "", modelUsage: [] }) as ClaudeResult);
+  let attribution: ReasoningAttribution | undefined;
+
+  await runTriage({
+    project: {
+      id: "p",
+      slug: "p",
+      name: "Project",
+      repoPath: "/tmp",
+      defaultBranch: "main",
+      hasBeads: true,
+      createdAt: Date.now(),
+    },
+    settings: {},
+    scanFile: "/tmp/scan.json",
+    logPath: "/tmp/scan.log",
+    signal: new AbortController().signal,
+    claudeReached: async () => {},
+    onEvent: () => {},
+    claude,
+    setAttribution: (a) => {
+      attribution = a;
+    },
+  });
+
+  expect(attribution).toMatchObject({ skillId: "scan-triage" });
+  expect(attribution?.skillDigest).toMatch(/^[0-9a-f]{12}$/);
 });

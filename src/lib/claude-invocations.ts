@@ -118,6 +118,21 @@ export interface InvocationDimensions {
 }
 
 /**
+ * The identity of a resolved reasoning contract that rides in `options.prompt` rather than
+ * `appendSystemPrompt` — self-review, PR-fix, product-master, scan-triage (anton-z33ia, PR #313
+ * review). `metered` only digests the composed SYSTEM prompt; a pass whose editable contract (an
+ * operator's override text, or one of anton's shipped skills) instead sits in the USER prompt beside
+ * mutable run context (a diff, a board, a scan) would otherwise leave every such row un-attributed
+ * to what it actually ran under — a rewritten skill or a changed operator prompt pools silently into
+ * the same cohort as before.
+ *
+ * A skill id/digest pair identifies a NAMED, versioned source (mirrors `StepReasoning`); a bare
+ * `promptBodyDigest` covers free-form operator text with no id of its own. The two are mutually
+ * exclusive by construction — a resolver returns one or the other, never both.
+ */
+export type ReasoningAttribution = Pick<InvocationDimensions, "promptBodyDigest" | "skillId" | "skillDigest">;
+
+/**
  * A base URL → its host, or undefined when there is none or it does not parse. Deliberately lossy:
  * the dimension worth grouping spend by is WHICH endpoint served it, and the host answers that
  * without storing anything a URL's path or query might carry.
@@ -359,8 +374,16 @@ export function metered(
       antonVersion: dimensions.antonVersion ?? stampOf(() => selfBuildVersion() ?? undefined),
       // Digested from the text this invocation is SPAWNED with, for the same reason `modelRequested`
       // is taken from the options: that string is what claude actually received. Resolving it here
-      // rather than per site is what stamps the sites no shared dispatch covers — self-review,
-      // PR-fix, and every resumed ticket attempt (PR #311 review).
+      // rather than per site is what stamps the sites no shared dispatch covers — every resumed
+      // ticket attempt among them (PR #311 review).
+      //
+      // This covers only `appendSystemPrompt` (the composed base+agent+seed layer). A pass whose
+      // OWN editable reasoning contract rides in `options.prompt` instead — self-review, PR-fix,
+      // product-master, scan-triage — is not reachable from here at all: that string also carries
+      // the run's diff/board/scan context, so digesting the whole thing would mint a fresh cohort
+      // per invocation rather than identify the contract. Those callers resolve their own
+      // {@link ReasoningAttribution} (`promptBodyDigest`/`skillId`/`skillDigest`) and pass it in
+      // `dimensions` before this wrapper ever sees the call (PR #313 review).
       promptDigest:
         dimensions.promptDigest ??
         stampOf(() =>

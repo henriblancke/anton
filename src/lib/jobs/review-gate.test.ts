@@ -1500,6 +1500,14 @@ describe("runReviewGate — what produced each invocation", () => {
     // the review deliberately does not, and records the absence rather than a digest of nothing.
     expect(rows[1].promptDigest).toBe(systemPromptDigest(calls[1].appendSystemPrompt ?? ""));
     expect(rows[0].promptDigest).toBeNull();
+    // `promptDigest` staying null does NOT mean the review's own reasoning contract went
+    // unattributed (PR #313 review): the shipped `review` skill it ran with is named here instead,
+    // the same way a `step:claude` step names its skill.
+    expect(rows[0]).toMatchObject({ skillId: "review" });
+    expect(rows[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
+    // The fix round runs the target's own agent, whose content already rides the `promptDigest`
+    // asserted above — it carries no separate skill/prompt-body stamp of its own.
+    expect(rows[1]).toMatchObject({ skillId: null, promptBodyDigest: null });
   });
 
   it("stamps the review with the configured reviewAgent, distinct from the target's own agent", async () => {
@@ -1539,5 +1547,10 @@ describe("runReviewGate — what produced each invocation", () => {
     // The reviewer that actually ran (`reviewAgent`) is distinct from the target's implementer, and
     // each column must say which one it is (PR #313 review).
     expect(rows[0]).toMatchObject({ beadId: target.id, agentTag: REVIEWER_ID });
+    // `agentTag` names WHO reviewed; a content digest of the agent file it read from is what tells
+    // an edit to that same file apart from the text that actually ran (PR #313 review) — the review
+    // driver call sets no `appendSystemPrompt` for `metered` to digest on its own.
+    expect(rows[0].promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
+    expect(rows[0].skillId).toBeNull();
   });
 });

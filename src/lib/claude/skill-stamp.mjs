@@ -111,6 +111,16 @@ export function skillDigest(dir) {
 }
 
 /**
+ * Content digest of a single resolved TEXT string, truncated to {@link STAMP_LENGTH} — the same
+ * algorithm every content stamp anton takes reuses (the composed system prompt, a `prompt:<id>`
+ * step's resolved body, a run formula's own digest), so two stamps are never told apart by their
+ * shape or computed by two slightly different hashes that could one day disagree.
+ */
+export function textDigest(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, STAMP_LENGTH);
+}
+
+/**
  * Classify an installed skill copy against the bundled source. Returns
  * `{ state, bundled, installed, drifted, extra }` where `drifted` lists the bundled files (relative
  * paths) whose bytes differ — the exact set a refresh must rewrite, and the whole bundle when

@@ -12,6 +12,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { stripFrontmatter } from "./agent-prompt";
+import { skillDigest } from "./skill-stamp.mjs";
 
 /** Directory holding the vendored skill assets, relative to anton's repo root (process.cwd()). */
 export const SKILLS_DIR = "skills";
@@ -63,4 +64,17 @@ export async function loadSkill(name: string): Promise<string> {
   const body = stripFrontmatter(raw).trim();
   if (!body) throw new Error(`skill is empty: ${path}`);
   return body;
+}
+
+/**
+ * Content digest of one of anton's own bundled skills (`loadSkill`'s directory), or undefined when
+ * it cannot be read. Swallowed rather than thrown: a digest is a ledger attribution dimension, never
+ * a precondition for the session it describes (mirrors `claude-invocations.ts`'s `stampOf`).
+ */
+export function bundledSkillDigest(name: string): string | undefined {
+  try {
+    return skillDigest(skillDir(name)) || undefined;
+  } catch {
+    return undefined;
+  }
 }

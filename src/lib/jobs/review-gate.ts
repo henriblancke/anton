@@ -14,7 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { labelValueOf, type Bead } from "../beads/bd";
-import { metered } from "../claude-invocations";
+import { metered, type ReasoningAttribution } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import { quotaMeterKey } from "../quota-meter";
@@ -316,13 +316,17 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // `config` and `baseRev` are both fixed for the whole gate, so this answers identically whichever
   // round asks. `buildReviewPrompt` re-resolves it per round for its own prompt text — a second read
   // of the same fixed inputs, not a second answer.
-  const { reviewer: initialReviewer } = await resolveReviewerContract(settings, worktreePath, baseRev);
+  const { reviewer: initialReviewer, attribution: reviewAttribution } = await resolveReviewerContract(
+    settings,
+    worktreePath,
+    baseRev,
+  );
 
   // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
   // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
   // the gates — and a ledger that filed both under one step could not tell which half of a run's
   // review budget went where.
-  const meter = (step: string, agentTag: string | undefined) =>
+  const meter = (step: string, agentTag: string | undefined, attribution?: ReasoningAttribution) =>
     metered(db, clock, {
       projectId,
       jobType: ctx.type,
@@ -337,14 +341,22 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       modelRequested: settings.model,
       agentTag,
       formulaDigest: args.formulaDigest,
+      ...attribution,
     }, driver);
   // The REVIEW session is metered under the specialist that actually reviewed — a configured
   // `reviewAgent` is a different reasoning contract than the target's implementer, and stamping it
   // with the target's tag pools two incompatible cohorts (PR #313 review). No named agent (an
   // operator prompt or the shipped default) records no agent tag, same as a target with none. The
+  // reviewer's own attribution rides beside it (`reviewAttribution`) — the REVIEW driver call sets
+  // no `appendSystemPrompt`, so `metered`'s own digest never reaches this text (PR #313 review). The
   // FIX session really does run as the target's own agent repairing its own work, so it keeps that
-  // tag.
-  const claude = meter("review", initialReviewer.kind === "agent" ? initialReviewer.id : undefined);
+  // tag, and its own reasoning is already covered — `buildFindingsFixPrompt` composes the target's
+  // execution system prompt, which `metered` digests unaided.
+  const claude = meter(
+    "review",
+    initialReviewer.kind === "agent" ? initialReviewer.id : undefined,
+    reviewAttribution,
+  );
   const fixClaude = meter("review-fix", labelValueOf(target.labels, "agent"));
 
   let reviewer: ReviewerSource = initialReviewer;
