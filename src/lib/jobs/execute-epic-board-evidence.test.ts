@@ -1953,6 +1953,7 @@ describe(
         setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
         pushMock.mockResolvedValueOnce("synced");
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v3" })]);
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
@@ -1978,6 +1979,7 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
         pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
@@ -2002,6 +2004,7 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // lock's own stability re-read: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write, lands locally
         pushMock.mockResolvedValueOnce("not-wired"); // but its own confirming push never syncs
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
@@ -2009,6 +2012,42 @@ describe(
         // Never handed back for dispatch on an unconfirmed verified marker — and the stray locked
         // value this call itself just wrote is cleared rather than left for a later attempt to trust.
         expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+      },
+    );
+
+    it(
+      "pushes the clear, not just writing it locally, when the VERIFIED marker's own confirming " +
+        "push already landed on the remote and only the POST-verify re-read then fails " +
+        "(chatgpt-codex-connector, PR #284 review, \"Confirm abandoned lock removal before " +
+        "retrying\") — a local-only clear here would leave the remote still holding the stale " +
+        "verified/locked value for a same-machine resume's next pull to reintroduce, or a " +
+        "fresh-machine resume to read directly, either crediting later board drift to a no-op agent",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's tentative persist
+        pushMock.mockResolvedValueOnce("synced"); // lock round 0's confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // lock's own stability re-read: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write, lands locally
+        pushMock.mockResolvedValueOnce("synced"); // and its own confirming push DOES sync — the verified marker is now live on the remote
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable")); // the post-verify re-read exhausts its retries
+        }
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push, now required to succeed
+        const pushCallsBefore = pushMock.mock.calls.length;
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).resolves.toBeNull();
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+        // Initial confirming push, the lock's own confirming push, the verified-marking write's own
+        // confirming push, plus the clear's own push once the post-verify re-read fails — the clear
+        // itself is pushed, not left local-only, since the remote already carries the verified marker
+        // this call is trying to invalidate.
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 4);
+        expect(pushMock).toHaveBeenLastCalledWith("/repo");
       },
     );
 
@@ -2026,6 +2065,7 @@ describe(
         for (let attempt = 0; attempt < 3; attempt += 1) {
           loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable"));
         }
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
@@ -2052,6 +2092,51 @@ describe(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
         ).resolves.toBeNull();
         expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(clearCallsBefore);
+      },
+    );
+
+    it(
+      "throws rather than silently returning null when abandoning a stale locked baseline exhausts " +
+        "every retry on the clear itself (chatgpt-codex-connector, PR #284 review, \"Confirm " +
+        "abandoned lock removal before retrying\" — round 2) — a swallowed failure here leaves the " +
+        "possibly-verified candidate this round already knows is stale locked on the board for a " +
+        "later resume to trust unchecked",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
+        pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+        clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+        clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).rejects.toThrow(/t-fresh/);
+      },
+    );
+
+    it(
+      "throws rather than silently returning null when the abandon clear lands locally but its own " +
+        "confirming push cannot verify it reached the remote (chatgpt-codex-connector, PR #284 " +
+        "review, \"Confirm abandoned lock removal before retrying\" — round 2) — a same-machine " +
+        "resume's next pull-first push would otherwise PULL the stale remote lock straight back in, " +
+        "undoing the local clear before the resume ever looks at it",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
+        pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        pushMock.mockResolvedValueOnce("not-wired"); // abandonDispatchBaseline's own confirming clear-push never syncs either
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).rejects.toThrow(/t-fresh/);
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
       },
     );
   },

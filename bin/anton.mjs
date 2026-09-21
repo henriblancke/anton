@@ -1816,29 +1816,74 @@ async function cmdSetup(args = []) {
   await provisionAgentsSkills(args);
 
   // anton's formulas: the bead skeleton every bead anton creates is rendered from (anton-8mnr) and
-  // the run pipeline anton walks (anton-hrql). Both live in the repo's `.beads/`, so a project-local
-  // copy always wins and a re-run never clobbers it.
+  // the run pipeline anton walks (anton-hrql). Both live in the repo's `.beads/`; a copy that
+  // differs from the shipped asset is REPLACED (see ensureFormula), and the replacement is reported
+  // rather than passed off as "already present".
   // Only lands when the package root already IS a beads workspace (anton's own dev checkout) — a
   // release bundle has none, and the installers refuse to fabricate one there (the Dolt-sync step
   // below reads a bare `.beads/` as a workspace and would abort setup for having no git origin).
   // Registered projects get their formulas from configureBeadsForRepo (`anton init` / addProject),
-  // which is the path shaping and the run pipeline actually read.
+  // which is the path shaping and the run pipeline actually read — so `anton setup` alone never
+  // refreshes a registered project's pipeline, and `anton init <repo>` is what does.
+  // BEFORE the installs, because a replacement writes a `.bak` beside the formula and that lands in
+  // a git-tracked directory (PR #307 review). `configureBeadsForRepo` reaches the ignore through its
+  // own step; this path never called it, so a backup made here would be staged by the next
+  // `git add -A` and a stale pipeline committed. Idempotent and additive — it only appends entries
+  // the file lacks.
+  // Wrapped, like every other step in this command: `ensureBeadsGitignore` writes a file and can
+  // throw on a read-only checkout or a `.gitignore` that is a directory, and an uncaught throw here
+  // would abort `anton setup` before the installers below ever run their own best-effort reporting
+  // (PR #307 review). A missing ignore entry is a warning — the `.bak` might get committed — not a
+  // reason to fail setup.
+  if (existsSync(join(APP_ROOT, ".beads"))) {
+    try {
+      // A link the installer refuses to write through returns instead of throwing, so the warning
+      // has to cover BOTH shapes — otherwise a refusal is the one failure mode that prints nothing
+      // while the `.bak` below stays committable (PR #307 review).
+      const gi = ensureBeadsGitignore(join(APP_ROOT, ".beads"));
+      if (gi.refused) throw new Error(gi.refused);
+    } catch (e) {
+      console.log(
+        c.yellow(`\n! could not update .beads/.gitignore: ${e?.message ?? e}`) +
+          c.dim("\n  A formula backup (.bak) written below would not be ignored — do not commit it."),
+      );
+    }
+  }
   for (const asset of [
     { label: "Bead formula", filename: BEAD_FORMULA_FILENAME, install: ensureBeadFormula },
     { label: "Run formula", filename: RUN_FORMULA_FILENAME, install: ensureRunFormula },
   ]) {
     const formula = asset.install(join(APP_ROOT, ".beads"));
     if (formula.status === "missing-asset") {
-      console.log(c.yellow(`\n! ${asset.label.toLowerCase()} missing from this install — skipping ${asset.filename}.`));
+      // `detail` distinguishes an asset that is ABSENT from one that exists and could not be read.
+      console.log(
+        c.yellow(
+          `\n! ${asset.label.toLowerCase()} missing from this install — skipping ${asset.filename}.` +
+            `${formula.detail ? ` (${formula.detail})` : ""}`,
+        ),
+      );
+    } else if (formula.status === "unsafe-dest") {
+      // Not a skip to shrug at: the file anton walks is not the file anton ships, and it stays that
+      // way until a human clears the path.
+      console.log(c.yellow(`\n! refused to install the ${asset.label.toLowerCase()}: ${formula.detail}`));
     } else if (formula.status === "failed") {
       // Best-effort, like the missing asset above: setup carries on and anton falls back to its
       // packaged copy, so an unwritable `.beads/formulas/` is a warning, not a failed setup.
       console.log(c.yellow(`\n! could not install the ${asset.label.toLowerCase()}: ${formula.detail}`));
+    } else if (formula.status === "replaced") {
+      // The only status that overwrote something. Yellow and detailed — it names the backup, so an
+      // operator who had tuned this file learns where its contents went at the moment it happened.
+      console.log(
+        c.bold(`\n${asset.label}:`) +
+          ` .beads/formulas/${asset.filename} ` +
+          c.yellow("replaced") +
+          c.dim(` — ${formula.detail}`),
+      );
     } else if (formula.status !== "no-workspace") {
       console.log(
         c.bold(`\n${asset.label}:`) +
           ` .beads/formulas/${asset.filename} ` +
-          (formula.status === "installed" ? c.green("installed") : c.dim("already present")),
+          (formula.status === "installed" ? c.green("installed") : c.dim("already current")),
       );
     }
   }

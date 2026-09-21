@@ -147,19 +147,26 @@ export async function dispatchRunTickets(
   // READS NOW: review-fix can merge a newer base into this branch, placing its commits beyond the
   // pinned fork even though the PR does not contain them. Both bounds are required to answer what
   // THIS branch delivers, not what a later base merge introduced.
+  //
+  // `alreadyShippedBase`, not the raw `baseRef` (PR #279 review): `baseRef` is a movable ref name
+  // that a failed fetch falls back to resolving LOCALLY, which can read behind the base a REUSED
+  // checkout's refresh already committed the branch onto. `alreadyShippedBase` is the effective base
+  // that refresh actually left the checkout sitting on (`worktree.refreshOntoBase`'s own doc comment),
+  // so excluding against it — not a ref name that can resolve to something staler — is what keeps this
+  // scan from reading a commit the checkout inherited from its own refreshed base as this run's delta.
   const forkPoint = prep.runStep.baseForkSha;
-  const baseRef = prep.runStep.baseRef;
+  const excludeBase = prep.runStep.alreadyShippedBase;
   const { live, held, dispatchable } = await partitionTickets(run, prep, prep.gated, async (id) => {
     try {
       return await worktreeHasCommitFor(prep.worktree.path, id, {
         base: forkPoint,
-        excludeBase: baseRef,
+        excludeBase,
         strict: true,
       });
     } catch (e) {
       throw new PoisonEpic(
         `${id} is superseded on the board, and anton could not read the commits ` +
-          `\`${prep.worktree.branch}\` carries beyond ${prep.runStep.baseRef} in ${prep.worktree.path} ` +
+          `\`${prep.worktree.branch}\` carries beyond ${excludeBase} in ${prep.worktree.path} ` +
           `to tell whether this branch holds its work (${e instanceof Error ? e.message : String(e)}). ` +
           `Refusing to retire it on an unreadable branch — if its commit IS here, the pull request ` +
           `would ship it unlisted. Repair the worktree, then resume the run`,
@@ -345,9 +352,10 @@ async function partitionTickets(
     const delivery = await branchDelivery(
       {
         hasCommitFor,
-        satisfiedBy: (id) => branchSatisfiesTicket(prep.worktree.path, id),
+        satisfiedBy: (id) =>
+          branchSatisfiesTicket(prep.worktree.path, id, { excludeBase: prep.runStep.alreadyShippedBase }),
         notedSatisfiedBy: (candidate) => notedSatisfaction(prep.runStep, candidate),
-        branchAdded: (sha) => branchAddedCommit(run.repo, run.branch, prep.runStep.baseRef, sha),
+        branchAdded: (sha) => branchAddedCommit(run.repo, run.branch, prep.runStep.alreadyShippedBase, sha),
       },
       ticket,
     );
@@ -982,13 +990,23 @@ export interface BranchDeliveryReads {
  */
 function worktreeReads(
   worktreePath: string,
-  run: Pick<StepContext, "repoPath" | "branch" | "baseRef">,
+  run: Pick<StepContext, "repoPath" | "branch" | "alreadyShippedBase">,
 ): BranchDeliveryReads {
   return {
+    // UNBOUNDED (PR #279 review, round 2) — deliberately not `excludeBase`. This function answers
+    // "is the ticket's work already in the checkout", the question `dispatchTicket` uses to decide
+    // whether to SKIP re-running it; excluding the base conflated that with a different question —
+    // "is the work in THIS PR's diff" — which belongs to the delivery SET (`deliveredOrPark`'s own
+    // bounded scan), not to this presence check. Bounded, a refresh that folds an already-closed
+    // child's commit into the base made this read "no commit" even though the checkout carries the
+    // work, so `dispatchTicket` took the regeneration path: reopening the closed bead and rerunning
+    // its agent against work already in the tree. `branchAdded` below still answers the diff question
+    // correctly — a base-only commit reads `inherited: true`, which keeps it out of the pull request's
+    // attribution — so widening presence here costs nothing on that side.
     hasCommitFor: (id) => worktreeHasCommitFor(worktreePath, id),
     satisfiedBy: (id) => branchSatisfiesTicket(worktreePath, id),
-    notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket),
-    branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.baseRef, sha),
+    notedSatisfiedBy: (ticket) => notedSatisfaction(run, ticket, { presenceOnly: true }),
+    branchAdded: (sha) => branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, sha),
   };
 }
 
@@ -1008,16 +1026,30 @@ function worktreeReads(
  * unrelated branch is no proof this one carries the work. So a note naming a commit this branch
  * never got still regenerates, which is what keeps the cross-machine reasoning intact.
  *
+ * `presenceOnly` picks which question the cited commit must answer (PR #279 review, round 2).
+ * `dispatchTicket`'s resume-skip check (via {@link worktreeReads}) asks "is the work in the checkout
+ * at all" — a base-only commit still proves the ticket needs no regeneration, so `presenceOnly` tests
+ * with {@link branchContainsCommit}, unbounded. `partitionTickets`'s superseded-ticket check asks a
+ * narrower question — "did `run.branch` itself ADD this, as opposed to inheriting it from a refreshed
+ * base" — so it keeps the default, {@link branchAddedCommit}. Conflating the two was the bug: gating
+ * the presence check on "branch added" made a legacy note citing a commit a base refresh has since
+ * folded into the base read as absent, even though the checkout carries the work, and sent a resume
+ * down the regeneration path over a ticket that needed none.
+ *
  * Fails closed to `undefined` on every read that cannot answer, for the reason the branch reads do:
  * re-running work is the safe error, skipping it is not.
  */
 async function notedSatisfaction(
-  run: Pick<StepContext, "repoPath" | "branch">,
+  run: Pick<StepContext, "repoPath" | "branch" | "alreadyShippedBase">,
   ticket: Bead,
+  options: { presenceOnly?: boolean } = {},
 ): Promise<SatisfiedClaim | undefined> {
   const record = latestSatisfiedRecord(ticket.notes);
   if (!record || record.branch !== run.branch) return undefined;
-  if (!(await branchContainsCommit(run.repoPath, run.branch, record.commit))) return undefined;
+  const cited = options.presenceOnly
+    ? await branchContainsCommit(run.repoPath, run.branch, record.commit)
+    : await branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, record.commit);
+  if (!cited) return undefined;
   // The full sha and subject, so the pull request cites the work rather than the note's abbreviation
   // — and so a note pointing at the attribution MARKER of an earlier settlement is followed to the
   // commit that did the work, the same hop `ticketSettlement` takes.
@@ -1558,7 +1590,7 @@ async function deliveredOrPark(
 ): Promise<{ delivered: Bead[]; targetRetired: boolean }> {
   const { targetId: epicBeadId, timedOut } = run;
   const { skipped } = ledger;
-  const { worktree } = prep;
+  const { worktree, runStep } = prep;
   // What the RUN phase then speaks for (anton-lnkt): its steps read this run's whole diff and put
   //     these ids in the PR body, so the set has to be the work actually on the branch.
   //     `live`, not `tickets`: an abandoned ticket contributed no commit, so listing it would
@@ -1591,10 +1623,18 @@ async function deliveredOrPark(
   const retired = new Set(run.retired.map((r) => r.id));
   //     A human ticket a SIBLING's commit satisfied stays too (PR #258 review): the ledger proved
   //     the work is on this branch under another name, so the branch question above cannot see it.
+  //     `excludeBase: runStep.alreadyShippedBase` (PR #279 review): a refresh can bring in a commit
+  //     for a ticket already closed on the board, and an unbounded scan would then count that
+  //     INHERITED base commit as work THIS branch delivered — a nonempty ledger built entirely from
+  //     base history would bypass the empty-delivery park below and open a PR with an empty diff, or
+  //     (with other branch work) falsely attribute the inherited ticket to it. `alreadyShippedBase`,
+  //     not the movable `baseRef`: a failed fetch resolves `baseRef` LOCALLY, which can read behind
+  //     the base a reused checkout's own refresh already committed the branch onto, undercounting the
+  //     exclusion and letting exactly that inherited commit through as this run's own delivery.
   const delivered = await deliveredTickets(
     live.filter((t) => !skipped.has(t.id) && !retired.has(t.id)),
     stoppedShort,
-    (id) => worktreeHasCommitFor(worktree.path, id),
+    (id) => worktreeHasCommitFor(worktree.path, id, { excludeBase: runStep.alreadyShippedBase }),
     new Set(ledger.satisfied.keys()),
   );
 

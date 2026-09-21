@@ -282,7 +282,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
       branch: "anton/anton-e1",
-      head: "0123456",
+      head: "0123456789abcdef0123456789abcdef01234567",
     });
   });
 
@@ -310,7 +310,10 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     });
     const [ticket] = humanHeldTickets([held("t-1", "blocked", long)]);
     expect(ticket.note!.endsWith("…")).toBe(true);
-    expect(ticket.committed).toEqual({ branch: "anton/anton-e1", head: "0123456" });
+    expect(ticket.committed).toEqual({
+      branch: "anton/anton-e1",
+      head: "0123456789abcdef0123456789abcdef01234567",
+    });
   });
 
   it("reads the trailing clause, not a failure message that quotes it (PR #227 review)", () => {
@@ -327,7 +330,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
       branch: "anton/anton-e1",
-      head: "0123456",
+      head: "0123456789abcdef0123456789abcdef01234567",
     });
   });
 
@@ -342,7 +345,7 @@ describe("humanHeldTickets — the children only a person can release (anton-fud
     });
     expect(humanHeldTickets([held("t-1", "blocked", note)])[0].committed).toEqual({
       branch: "anton/anton-e1",
-      head: "0123456",
+      head: "0123456789abcdef0123456789abcdef01234567",
     });
   });
 
@@ -2307,8 +2310,8 @@ describe("ticketBlockNote (anton-vqql)", () => {
     expect(out).toContain("self-reported ANTON-RESULT: blocked");
   });
 
-  it("names its evidence — session, and the branch + short sha of the committed work", () => {
-    expect(note()).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+  it("names its evidence — session, and the branch + full sha of the committed work", () => {
+    expect(note()).toContain(`[session sess-1, committed on anton/anton-e1 @ ${HEAD}]`);
   });
 
   it("says nothing was committed when the tree was empty", () => {
@@ -2375,7 +2378,7 @@ describe("ticketBlockNote (anton-vqql)", () => {
     const out = note({ selfReport: { outcome: "blocked", reason: "x".repeat(5_000) } });
     expect(out.length).toBeLessThan(900);
     expect(out).toContain("…");
-    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+    expect(out).toContain(`[session sess-1, committed on anton/anton-e1 @ ${HEAD}]`);
     expect(parsed(out)).toHaveLength(1);
   });
 
@@ -2420,11 +2423,11 @@ describe("timedOutTicketNote (anton-t1mo)", () => {
     const out = timedOut();
     expect(out).toContain("outlived its budget");
     expect(out).toContain("Its work IS committed on the branch");
-    expect(out).toContain("[session sess-1, committed on anton/anton-e1 @ 0123456]");
+    expect(out).toContain(`[session sess-1, committed on anton/anton-e1 @ ${HEAD}]`);
     expect(latestBlockNoteCommit([out])).toEqual({
       committed: true,
       branch: "anton/anton-e1",
-      head: "0123456",
+      head: HEAD,
     });
   });
 
@@ -2450,7 +2453,7 @@ describe("timedOutTicketNote (anton-t1mo)", () => {
     expect(latestBlockNoteCommit([out])).toEqual({
       committed: true,
       branch: "anton/anton-e1",
-      head: "0123456",
+      head: HEAD,
     });
   });
 
@@ -2462,7 +2465,7 @@ describe("timedOutTicketNote (anton-t1mo)", () => {
     expect(latestBlockNoteCommit([out])).toEqual({
       committed: true,
       branch: "anton/anton-e1",
-      head: "0123456",
+      head: HEAD,
     });
   });
 

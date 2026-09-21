@@ -5,7 +5,19 @@
  * init` would read the nested form as unset and re-set every key on every run (anton-qhoz).
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -369,9 +381,10 @@ describe("bd version gate (anton-qwsq)", () => {
 });
 
 /**
- * The setup half of anton-8mnr: the bead formula must LAND in a fresh `.beads/`, and must never
- * overwrite a project-local copy — a team that tuned its own bead skeleton keeps it across every
- * `anton setup` / `anton init` / addProject re-run.
+ * The setup half of anton-8mnr: the bead formula must LAND in a fresh `.beads/`, and a project-local
+ * copy that DIFFERS from the shipped asset must be replaced across every `anton setup` /
+ * `anton init` / addProject re-run. The original no-clobber-on-existence rule is what stranded
+ * `step:describe` in every registered project; see `ensureFormula`.
  */
 describe("ensureBeadFormula (anton-8mnr)", () => {
   const dirs: string[] = [];
@@ -401,19 +414,239 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(JSON.parse(readFileSync(dest(dir), "utf8")).formula).toBe("anton-bead");
   });
 
-  it("never clobbers an existing project-local copy", () => {
+  it("leaves a byte-identical copy alone, and says so", () => {
+    const dir = beadsDir();
+    expect(ensureBeadFormula(dir).status).toBe("installed");
+    // The common case: a second run over an up-to-date project writes nothing and reports nothing.
+    expect(ensureBeadFormula(dir).status).toBe("already");
+    expect(existsSync(`${dest(dir)}.bak`)).toBe(false);
+  });
+
+  it("replaces a project-local copy that differs, backing up what was there", () => {
     const dir = beadsDir();
     ensureBeadFormula(dir);
     writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
 
-    expect(ensureBeadFormula(dir).status).toBe("already");
-    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    expect(result.detail).toContain(`${BEAD_FORMULA_FILENAME}.bak`);
+    // The shipped asset won…
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBeUndefined();
+    // …and the previous contents are recoverable without reaching for git.
+    expect(JSON.parse(readFileSync(`${dest(dir)}.bak`, "utf8")).mine).toBe(true);
   });
 
   it("reports a missing asset instead of throwing", () => {
     expect(ensureBeadFormula(beadsDir(), join(tmpdir(), "no-such-formula.json")).status).toBe(
       "missing-asset",
     );
+  });
+
+  /**
+   * A behavior change from the no-clobber rule, pinned here rather than left incidental (PR #307
+   * review): the old code returned "already" for this combination because existence alone decided
+   * the outcome and `src` was never opened. Comparing content has to read `src`, so a shipped asset
+   * that is absent or unreadable is now a warning — and the project's own file, which nothing was
+   * ever compared against, is left exactly as it was.
+   */
+  it("warns rather than claiming 'already' when the shipped asset is gone but a local copy exists", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
+
+    expect(ensureBeadFormula(dir, join(tmpdir(), "no-such-formula.json")).status).toBe("missing-asset");
+    // Untouched: a warning about anton's install is never a reason to rewrite the project's file.
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+  });
+
+  it("carries the reason when the shipped asset exists but cannot be read", () => {
+    const dir = beadsDir();
+    // A directory where a file is expected: present to existsSync, an EISDIR to readFileSync.
+    const unreadable = join(dir, "..", "unreadable-asset");
+    mkdirSync(unreadable, { recursive: true });
+
+    const result = ensureBeadFormula(dir, unreadable);
+    expect(result.status).toBe("missing-asset");
+    // Without this the operator is told the asset is "missing from this install" while it is right
+    // there — the detail is the only thing separating an absent asset from an unreadable one.
+    expect(result.detail).toBeTruthy();
+  });
+
+  /**
+   * The hazard that arrives WITH the replace behavior (PR #307 review, P1). `copyFileSync` follows
+   * symlinks — it opens the link's target and writes there — so a symlinked destination would have
+   * this installer write anton's asset to any path the link names, outside the repo entirely. The
+   * path reaches here from input: `POST /api/projects` takes a repository path and runs the
+   * installer over it. Under the old rule an existing symlink was never written to at all.
+   */
+  it("refuses to write through a symlinked destination, leaving the link's target intact", () => {
+    const dir = beadsDir();
+    const outside = join(dir, "..", "outside-the-repo.txt");
+    writeFileSync(outside, "NOT ANTON'S TO OVERWRITE");
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    symlinkSync(outside, dest(dir));
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("SYMLINK");
+    // The file the link pointed at is untouched, and the link itself is still a link.
+    expect(readFileSync(outside, "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
+    expect(lstatSync(dest(dir)).isSymbolicLink()).toBe(true);
+  });
+
+  it("refuses a destination that is a directory rather than a formula", () => {
+    const dir = beadsDir();
+    mkdirSync(dest(dir), { recursive: true });
+    expect(ensureBeadFormula(dir).status).toBe("unsafe-dest");
+  });
+
+  /**
+   * The same escape one level UP (PR #307 review, second P1). Checking only the final component is
+   * not enough: `lstat` on it resolves every ancestor, so a symlinked `formulas/` reports its
+   * target's contents as ordinary files and the check passes — and `mkdirSync(recursive)` is
+   * satisfied by a symlink to a directory, creating nothing. The copy then lands outside the repo.
+   */
+  it("refuses a symlinked formulas/ directory, so the copy cannot land outside the repo", () => {
+    const dir = beadsDir();
+    const outside = join(dir, "..", "outside-dir");
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, BEAD_FORMULA_FILENAME), "NOT ANTON'S TO OVERWRITE");
+    symlinkSync(outside, join(dir, "formulas"));
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("SYMLINK");
+    expect(readFileSync(join(outside, BEAD_FORMULA_FILENAME), "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
+  });
+
+  /**
+   * The case no `lstat` can catch (PR #307 review, P1): a hard link IS an ordinary regular file by
+   * every check `unsafeDestDetail` makes. `copyFileSync` would open the destination and truncate
+   * it, writing through the shared inode and clobbering the other name too. Writing a temp file and
+   * renaming replaces the directory entry instead, so the link keeps the old inode and its bytes.
+   */
+  it("replaces a hard-linked destination without touching the file sharing its inode", () => {
+    const dir = beadsDir();
+    const outside = join(dir, "..", "hardlink-target.json");
+    writeFileSync(outside, "NOT ANTON'S TO OVERWRITE");
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    linkSync(outside, dest(dir)); // same inode, two names
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    // The formula landed…
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).formula).toBe("anton-bead");
+    // …and the other name still holds what it always did.
+    expect(readFileSync(outside, "utf8")).toBe("NOT ANTON'S TO OVERWRITE");
+  });
+
+  /**
+   * PR #307 review, P1. The backup must hold the bytes the COMPARISON saw, not a fresh read of the
+   * destination: two installers on one repo (concurrent `anton init`s) both compare the customized
+   * file, the first replaces it, and a second that re-read `dest` at backup time would save the
+   * shipped formula it just found — leaving the operator's customization in neither the file nor
+   * the `.bak`.
+   *
+   * This pins the INVARIANT that makes the race harmless (the backup holds what was compared), not
+   * the interleaving itself: `ensureFormula` is synchronous with no seam between its compare and
+   * its backup, so a true concurrent run cannot be staged from here. What the invariant rules out
+   * is the only way the race could lose data.
+   */
+  it("backs up the bytes it compared, so a concurrent replacement cannot erase them", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    const shipped = readFileSync(dest(dir), "utf8");
+    const customized = '{"formula":"anton-bead","MY-CUSTOMIZATION":true}';
+    writeFileSync(dest(dir), customized);
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("replaced");
+    // The backup holds the customization that was compared — never the shipped bytes just written.
+    expect(readFileSync(`${dest(dir)}.bak`, "utf8")).toBe(customized);
+    expect(readFileSync(dest(dir), "utf8")).toBe(shipped);
+  });
+
+  /**
+   * An UNREADABLE original is refused, not replaced (PR #307 review, P1). It reaches the
+   * replacement by being treated as "differing" — right for deciding this is not a no-op — but
+   * "anton could not read it" says nothing about whether it mattered. A mode-000 formula in a
+   * writable directory is still somebody's file, and replacing it destroys bytes no backup holds
+   * and git may never have seen. An earlier version replaced it and reported no backup was made,
+   * which announced the loss instead of preventing it.
+   */
+  it("refuses to replace a formula it cannot read, rather than destroying contents nothing has a copy of", () => {
+    const dir = beadsDir();
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    writeFileSync(dest(dir), '{"formula":"anton-bead","IRREPLACEABLE":true}');
+    chmodSync(dest(dir), 0o000);
+
+    // Root reads a mode-000 file regardless, so the precondition only holds unprivileged.
+    let readable: boolean;
+    try {
+      readFileSync(dest(dir));
+      readable = true;
+    } catch {
+      readable = false;
+    }
+
+    try {
+      const result = ensureBeadFormula(dir);
+      if (readable) {
+        // Running as root: the file IS readable, so the normal replace-with-backup path applies.
+        expect(result.status).toBe("replaced");
+        return;
+      }
+      expect(result.status).toBe("failed");
+      expect(result.detail).toContain("could not be read");
+      // The bytes are still there, and no `.bak` pretends otherwise.
+      chmodSync(dest(dir), 0o600);
+      expect(readFileSync(dest(dir), "utf8")).toContain("IRREPLACEABLE");
+      expect(existsSync(`${dest(dir)}.bak`)).toBe(false);
+    } finally {
+      chmodSync(dest(dir), 0o600); // so afterEach can clean up
+    }
+  });
+
+  it("leaves no temp file behind after a successful install", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    const leftovers = readdirSync(join(dir, "formulas")).filter((f) => f.includes(".tmp-"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("refuses a symlinked .beads workspace directory for the same reason", () => {
+    const parent = mkdtempSync(join(tmpdir(), "anton-formula-link-"));
+    dirs.push(parent);
+    const real = join(parent, "real-beads");
+    mkdirSync(join(real, "formulas"), { recursive: true });
+    const linked = join(parent, ".beads");
+    symlinkSync(real, linked);
+
+    expect(ensureBeadFormula(linked).status).toBe("unsafe-dest");
+    expect(existsSync(join(real, "formulas", BEAD_FORMULA_FILENAME))).toBe(false);
+  });
+
+  /**
+   * The backup is a PRECONDITION of the replacement (PR #307 review, P1). An earlier version wrote
+   * the formula anyway and reported "NOT backed up", reasoning that git holds the durable copy —
+   * false for exactly the case the backup protects, uncommitted tuning. Announcing an irreversible
+   * loss is not a substitute for preventing one, so an unwritable `.bak` abandons the replacement.
+   */
+  it("leaves a differing file alone when its .bak path is unsafe, rather than replacing it unbacked", () => {
+    const dir = beadsDir();
+    ensureBeadFormula(dir);
+    writeFileSync(dest(dir), '{"formula":"anton-bead","mine":true}');
+    const outside = join(dir, "..", "bak-target.txt");
+    writeFileSync(outside, "ALSO NOT ANTON'S");
+    symlinkSync(outside, `${dest(dir)}.bak`);
+
+    const result = ensureBeadFormula(dir);
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("uncommitted");
+    // The project's own file survives — that is the whole point.
+    expect(JSON.parse(readFileSync(dest(dir), "utf8")).mine).toBe(true);
+    // And the symlink's target was never written through.
+    expect(readFileSync(outside, "utf8")).toBe("ALSO NOT ANTON'S");
   });
 
   it("refuses to fabricate a .beads workspace where none exists", () => {
@@ -425,17 +658,58 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
-  it("reports a write failure instead of aborting the setup around it", () => {
-    // An unwritable `.beads/` (read-only checkout, no permission, a `formulas` path that isn't a
-    // directory) must not take down project registration — the formula is one best-effort step
-    // among a dozen and anton's renderer falls back to its packaged copy. A throw here aborted
-    // `anton setup` / addProject outright.
+  it("reports a non-directory formulas/ path instead of aborting the setup around it", () => {
+    // An unusable `.beads/formulas` (here: a plain file where the directory belongs) must not take
+    // down project registration — the formula is one best-effort step among a dozen and anton's
+    // renderer falls back to its packaged copy. A throw here aborted `anton setup` / addProject
+    // outright. It reports "unsafe-dest" rather than the "failed" it used to: the directory check
+    // now names the problem up front instead of letting `mkdirSync` throw an ENOTDIR at it.
     const dir = beadsDir();
     writeFileSync(join(dir, "formulas"), "not a directory");
 
     const result = ensureBeadFormula(dir);
-    expect(result.status).toBe("failed");
-    expect(result.detail).toBeTruthy();
+    expect(result.status).toBe("unsafe-dest");
+    expect(result.detail).toContain("not a directory");
+  });
+
+  it("reports a genuine write failure rather than throwing", () => {
+    // The other half of the above, still reachable: `formulas/` passes every safety check but the
+    // write itself fails — a read-only checkout, no permission, transient I/O.
+    //
+    // NOT driven by directory permissions (PR #307 review): mode 0500 does not stop UID 0, so under
+    // root — the norm in CI containers — the write would succeed and this would assert the wrong
+    // thing. A directory sitting where the TEMP FILE must be created fails for everyone: the write
+    // is `writeFileSync(<dest>.tmp-<pid>-<ts>, ..., {flag:"wx"})`, so a directory at that exact path
+    // is an EISDIR no privilege level can write through.
+    const dir = beadsDir();
+    const formulas = join(dir, "formulas");
+    mkdirSync(formulas, { recursive: true });
+    chmodSync(formulas, 0o500); // r-x: no new file may be created here
+
+    // Mode 0500 does NOT stop UID 0, which is the norm in CI containers, so the permission is
+    // probed rather than assumed. Where it is not enforced the precondition simply does not hold,
+    // and the test asserts the install succeeds instead of asserting a failure that cannot happen —
+    // an honest skip of the branch beats a green run on an unexercised path.
+    let enforced: boolean;
+    try {
+      writeFileSync(join(formulas, ".probe"), "x");
+      rmSync(join(formulas, ".probe"), { force: true });
+      enforced = false;
+    } catch {
+      enforced = true;
+    }
+
+    try {
+      const result = ensureBeadFormula(dir);
+      if (!enforced) {
+        expect(result.status).toBe("installed");
+        return;
+      }
+      expect(result.status).toBe("failed");
+      expect(result.detail).toBeTruthy();
+    } finally {
+      chmodSync(formulas, 0o700); // so afterEach can clean up
+    }
   });
 
   it("resolves the bundled asset from the package, not the cwd", () => {
@@ -445,9 +719,9 @@ describe("ensureBeadFormula (anton-8mnr)", () => {
 
 /**
  * The setup half of anton-hrql: the RUN pipeline installs on the same terms as the bead skeleton
- * above — a fresh project gets anton's default, and a project that wrote its own keeps it across
- * every `anton setup` / `anton init` / addProject re-run. Both assets share one installer, so only
- * the run-formula-specific behavior is asserted here.
+ * above — a fresh project gets anton's default, and a stale or edited copy is replaced. Both assets
+ * share one installer, so only the run-formula-specific behavior is asserted here: this is the asset
+ * a newly shipped step has to reach, which is the whole reason the rule changed.
  */
 describe("ensureRunFormula (anton-hrql)", () => {
   const dirs: string[] = [];
@@ -471,13 +745,37 @@ describe("ensureRunFormula (anton-hrql)", () => {
     expect(readFileSync(dest(dir), "utf8")).toContain('formula = "anton-run"');
   });
 
-  it("never clobbers a project's own pipeline", () => {
+  it("replaces a pipeline that differs from the shipped one", () => {
     const dir = beadsDir();
     ensureRunFormula(dir);
     writeFileSync(dest(dir), 'formula = "anton-run"\n# ours\n');
 
-    expect(ensureRunFormula(dir).status).toBe("already");
-    expect(readFileSync(dest(dir), "utf8")).toContain("# ours");
+    expect(ensureRunFormula(dir).status).toBe("replaced");
+    expect(readFileSync(dest(dir), "utf8")).not.toContain("# ours");
+    expect(readFileSync(`${dest(dir)}.bak`, "utf8")).toContain("# ours");
+  });
+
+  /**
+   * The regression this whole change exists for. A project whose pipeline is a verbatim copy of an
+   * OLDER shipped template — not tuned, just stale — is exactly what `existsSync` could not tell
+   * apart from a deliberate edit, so a step anton had started shipping reached no registered
+   * project and every re-run reported "already present". Pinned with `step:describe` because that
+   * is the step it actually happened to (anton-gzyjd).
+   */
+  it("carries a newly shipped step into a project holding a stale default", () => {
+    const dir = beadsDir();
+    // The step block itself, not the word: the file's header comment lists every step anton knows,
+    // so a bare "step:describe" search matches prose in a formula that does not run the step.
+    const stepBlock = /\n\[\[steps\]\]\nid = "describe"[\s\S]*?labels = \["step:describe"\]\n/;
+    const shipped = readFileSync(bundledRunFormulaPath(), "utf8");
+    expect(shipped).toMatch(stepBlock);
+    // The pre-describe template: same file, that one step cut out of it.
+    mkdirSync(join(dir, "formulas"), { recursive: true });
+    writeFileSync(dest(dir), shipped.replace(stepBlock, "\n"));
+    expect(readFileSync(dest(dir), "utf8")).not.toMatch(stepBlock);
+
+    expect(ensureRunFormula(dir).status).toBe("replaced");
+    expect(readFileSync(dest(dir), "utf8")).toMatch(stepBlock);
   });
 
   it("lands beside the bead formula rather than replacing it", () => {

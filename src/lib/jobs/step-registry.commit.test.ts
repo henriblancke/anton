@@ -90,6 +90,7 @@ suite("commitStep (real git)", () => {
       // stands in for the remote-tracking ref real runs diff against.
       baseRef: "main",
       baseForkSha: forkSha,
+      alreadyShippedBase: forkSha,
       target: ticket,
       tickets: [ticket],
       settings: {} satisfies ProjectSettings,

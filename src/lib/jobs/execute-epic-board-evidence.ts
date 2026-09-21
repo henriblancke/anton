@@ -434,9 +434,9 @@ export async function ensureBoardBaselinePersisted(
 const LOCK_STABILITY_ROUNDS = 3;
 
 /**
- * Best-effort: drop the (possibly stray) locked baseline {@link lockDispatchBaseline} itself just
- * wrote, so a round that fails AFTER claiming the lock never leaves it behind for a LATER attempt to
- * trust blindly (chatgpt-codex-connector, PR #284 review, "Refresh locks left by failed pre-dispatch
+ * Drop the (possibly stray) locked baseline {@link lockDispatchBaseline} itself just wrote, so a
+ * round that fails AFTER claiming the lock never leaves it behind for a LATER attempt to trust
+ * blindly (chatgpt-codex-connector, PR #284 review, "Refresh locks left by failed pre-dispatch
  * attempts"). Every persist in that function's loop writes `locked: true` BEFORE that round's own
  * push and re-read have confirmed the value is actually stable — that ordering is what survives a
  * crash mid-round, but it also means a round that then fails (an unconfirmed push, an unreadable
@@ -450,14 +450,50 @@ const LOCK_STABILITY_ROUNDS = 3;
  * the next attempt recomputes and re-verifies a fresh one from scratch instead of trusting a value
  * this call could not itself confirm.
  *
- * Local-only and never throws: this runs on a path that is already refusing to dispatch (`null`), so
- * there is no delivery to protect by insisting the clear also reaches the remote — a same-machine
- * resume (the common case; the run-lease actor that will retry this ticket) sees it immediately
- * either way. An unconfirmed or refused clear still leaves the caller returning `null`, the same
- * closed-fail path a healthy round would have taken anyway.
+ * The clear must reach the remote too, not just land locally (chatgpt-codex-connector, PR #284
+ * review, "Confirm abandoned lock removal before retrying"): several of the call sites above reach
+ * this function AFTER their own confirming push already landed a LOCKED (sometimes VERIFIED)
+ * candidate on the remote — the round's own persist/push succeeded, and it is a LATER step (the next
+ * round's re-read, or its own unset-verified persist) that then fails. A local-only clear in that
+ * shape leaves the remote still holding the stale locked/verified value: a same-machine resume's next
+ * `beads.push` is a pull-first pass (see {@link LOCK_STABILITY_ROUNDS}'s own docstring), so it would
+ * PULL that stale remote value straight back in, undoing the local clear before the resume ever gets
+ * to look at it — and a fresh-machine resume never sees the clear at all. Either one would then trust
+ * a "verified" baseline nothing has actually reverified since, and any board drift pulled in after it
+ * was published gets credited to a no-op agent as this ticket's own delivery.
+ *
+ * No longer best-effort (chatgpt-codex-connector, PR #284 review, "Confirm abandoned lock removal
+ * before retrying" — round 2): a single unguarded attempt whose result the caller discarded left
+ * exactly the gap above open on the very first contended write or unreachable remote, which is the
+ * common case this function exists to handle, not the exception. The clear is now retried like every
+ * other write in this module ({@link mustPersist}), and its confirming push is checked for the same
+ * `synced`/`shared-server` outcome every other push in this file requires — never merely awaited and
+ * discarded. A clear that cannot be confirmed BOTH persisted and synced (after retries) throws
+ * {@link PoisonEpic} rather than quietly returning `null`: this function only ever runs when a stale
+ * locked/verified candidate may already be live on the remote, so silently carrying on would leave
+ * that exact false-success shape for the next resume — on this machine or a fresh one — to inherit
+ * with no record anything is still wrong.
  */
 async function abandonDispatchBaseline(repo: string, ticket: Bead): Promise<null> {
-  await beads.clearBoardEvidenceBaseline(repo, ticket.id).catch(() => {});
+  const cleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticket.id));
+  const synced = cleared
+    ? await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false)
+    : false;
+  if (!cleared || !synced) {
+    throw new PoisonEpic(
+      `${ticket.id}'s pre-dispatch board-evidence lock could not be safely abandoned after a ` +
+        `lock-stability round refused to trust it: the clear ${
+          cleared
+            ? "landed locally, but the confirming push could not verify it reached the remote"
+            : "could not be persisted locally (after retries)"
+        } — leaving a possibly locked/verified baseline this attempt already knows is stale for a ` +
+        `later resume to trust unchecked risks crediting a no-op agent with board drift it never ` +
+        `produced. Check the beads DB${cleared ? " and the sync channel" : ""}, then resume the run.`,
+    );
+  }
   return null;
 }
 

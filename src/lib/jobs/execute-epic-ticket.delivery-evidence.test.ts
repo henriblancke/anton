@@ -254,6 +254,9 @@ function run(
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: FORK,
+    // No refresh applied in this fixture, so the already-shipped check falls back to the pinned fork
+    // (see `alreadyShippedBase`'s doc comment on StepContext).
+    alreadyShippedBase: FORK,
     target: { id: EPIC_ID, title: "The epic", status: "in_progress", issue_type: "epic" } as Bead,
     settings: { repairAutonomy: { "already-shipped": autonomy } },
   } as unknown as Omit<StepContext, "tickets">;

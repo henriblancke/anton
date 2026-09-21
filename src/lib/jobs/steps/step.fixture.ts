@@ -104,6 +104,7 @@ export async function openSandbox(
     baseBranch: "main",
     baseRef: "origin/main",
     baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
     target,
     tickets: [target],
     settings: {},

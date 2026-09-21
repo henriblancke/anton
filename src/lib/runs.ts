@@ -202,6 +202,15 @@ export type RunPatch = Partial<{
   formulaVariant: string | null;
   /** The commit this run's branch forked from, pinned at worktree creation (anton-5bpd) — see schema. */
   baseForkSha: string | null;
+  /** What refreshOntoBase did to a reused checkout at warm, and the base it settled on (anton-s55u) — see schema. */
+  baseRefreshOutcome: string | null;
+  baseRefreshSha: string | null;
+  /** The branch's tip just before a still-pending refresh above was attempted (anton-s55u) — see schema. */
+  pendingRefreshFromSha: string | null;
+  /** The specific git operation a still-pending refresh above is mutating with (anton-s55u) — see schema. */
+  pendingRefreshKind: string | null;
+  /** This row's own last effective refresh boundary, snapshotted before it goes pending (anton-s55u) — see schema. */
+  priorBaseRefreshSha: string | null;
   attempts: number;
   error: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
@@ -286,6 +295,196 @@ export async function findRunBaseForkShaForBranch(
     .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt))
     .limit(1);
   return rows[0]?.baseForkSha ?? undefined;
+}
+
+/**
+ * Written onto a row's `baseRefreshOutcome` in place of a plain null when its checkout's branch was
+ * DELETED and RECREATED (anton-nyz1v, PR #279 review, fifth round) — `execute-epic-claim.ts` writes
+ * this whenever `createWorktree` reports `createdBranch: true`, instead of leaving the column at its
+ * default null. A plain null cannot serve as that marker: it's also what the CURRENT attempt's own
+ * row carries before ITS refresh has run (every row is inserted, and is therefore already the
+ * newest row for its branch, well before `warmRunWorktree` gets far enough to populate this column),
+ * so a query that just took "the newest null row" as a stop signal would stop on its own
+ * not-yet-written row on every single call and never see a real boundary at all. This sentinel is
+ * unambiguous: only a deliberate recreation writes it, never an unwritten column.
+ */
+export const BRANCH_RECREATED_REFRESH_TOMBSTONE = "branch_recreated";
+
+/**
+ * The base sha the most recent EFFECTIVE (non-`skipped_dirty`) refresh on this epic's BRANCH
+ * settled on, from whichever row recorded it, whatever became of that row (PR #279 review) — the
+ * refresh half of {@link findRunBaseForkShaForBranch}, needed for the same reason: an ordinary
+ * handler failure settles its row `failed`, and the retry opens a FRESH row while reusing the same
+ * branch and worktree, so a lookup scoped to that one row alone never sees a refresh an earlier,
+ * now-dead row on this branch already recorded.
+ *
+ * Also doubles as the `--onto` rebase boundary a later refresh should pass as `forkSha`, in
+ * preference to the branch's original fork point: after one successful `--onto` refresh, that
+ * original fork point is no longer reachable on the branch at all (the rebase replayed only what
+ * came after it, onto the new base), so `refreshOntoBase` would silently fall back to the plain,
+ * unsafe form of `rebase` on a later refresh. The most recently applied base IS still on the branch
+ * — it's what everything got rebased onto — and describes the same boundary a second `--onto` needs.
+ *
+ * Walked in recency order rather than filtered to one row in SQL (anton-nyz1v, PR #279 review, fifth
+ * round): a row recording an OLDER effective refresh can outlive the branch it describes — a later
+ * attempt deletes and recreates the branch, records {@link BRANCH_RECREATED_REFRESH_TOMBSTONE} on
+ * its own row, and dies before ever running its own refresh. Filtering straight to
+ * `isNotNull(baseRefreshSha)` skips that tombstone row (its `baseRefreshSha` stays null) and returns
+ * the older row's boundary as if the recreation never happened — replaying whatever the deletion
+ * dropped back onto the recreated branch. Walking newest-first and stopping at the first tombstone
+ * makes that row the wall it's meant to be; a `skipped_dirty` row in between is skipped, never
+ * mistaken for a wall or a boundary, exactly as the old `ne(...)` filter treated it.
+ */
+export async function findRunBaseRefreshShaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<string | undefined> {
+  const rows = await db
+    .select({
+      baseRefreshOutcome: schema.runs.baseRefreshOutcome,
+      baseRefreshSha: schema.runs.baseRefreshSha,
+      priorBaseRefreshSha: schema.runs.priorBaseRefreshSha,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.baseRefreshOutcome),
+      ),
+    )
+    // Ordered exactly as findRunBaseForkShaForBranch is, and for its reason: `updatedAt` is
+    // second-granular, so `writeSeq` breaks a tie by which attempt settled last.
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt));
+  for (const row of rows) {
+    if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
+    if (row.baseRefreshOutcome === "skipped_dirty") {
+      // A dirty attempt is a barrier only for pending-mutation reconciliation: its branch may have
+      // advanced through ordinary agent work. Its own snapshotted prior boundary, however, remains
+      // a confirmed refresh and is safe to recover for a later `--onto` refresh.
+      if (row.priorBaseRefreshSha) return row.priorBaseRefreshSha;
+      continue;
+    }
+    // A still-PENDING row (see PENDING_REFRESH_OUTCOME below) records what a dead attempt INTENDED,
+    // not a confirmed outcome — trusting its sha here as if it were a settled boundary would recreate
+    // exactly the unsafe blind trust this whole mechanism exists to avoid, just via a new sentinel
+    // instead of stale data. Its OWN `priorBaseRefreshSha`, when recorded, is different: it's this
+    // same row's last EFFECTIVE boundary, snapshotted the instant this pending write overwrote it (PR
+    // #279 review, P1) — trusting that is not a new blind trust, it's recovering what this row itself
+    // already confirmed before starting a refresh a crash then left unresolved. Only when neither is
+    // available (a legacy pending row, or one written before this attempt ever had a boundary of its
+    // own) does the walk fall through to an OLDER row's genuinely confirmed boundary, same as before.
+    if (row.baseRefreshOutcome === PENDING_REFRESH_OUTCOME) {
+      if (row.priorBaseRefreshSha) return row.priorBaseRefreshSha;
+      continue;
+    }
+    if (row.baseRefreshSha) return row.baseRefreshSha;
+  }
+  return undefined;
+}
+
+/**
+ * Written onto a row's `baseRefreshOutcome`, in place of a real outcome, the instant
+ * execute-epic-claim.ts is about to hand a reused checkout's branch to a mutating merge/rebase
+ * (anton-s55u, PR #279 review, P1) — BEFORE that git call runs, not after. Without it, a process
+ * killed between the mutation actually landing and the normal finalize write (`refreshFields`)
+ * leaves nothing durable behind: the catch-based best-effort retry that recovers from a thrown
+ * exception never runs for a hard kill, so a later resume would derive its `--onto` boundary from
+ * the older, now-stale `findRunBaseRefreshShaForBranch` result and could replay commits the
+ * unrecorded mutation already folded into the branch as if they were still-unapplied base history.
+ * This sentinel is what that resume finds instead — see {@link findPendingRefreshShaForBranch} for
+ * how it turns this into a trustworthy boundary.
+ */
+export const PENDING_REFRESH_OUTCOME = "pending";
+
+/** A still-pending refresh's write-ahead record, as {@link findPendingRefreshShaForBranch} recovers it. */
+export interface PendingRefresh {
+  /** The base commit the dead attempt was mutating the branch onto. */
+  sha: string;
+  /**
+   * The branch's own tip the instant before that mutation was attempted — the only evidence that
+   * can tell "the mutation actually landed" apart from "`sha` was already reachable from the branch
+   * before the mutation ever ran" (see the column's own note on schema.ts). Undefined for a pending
+   * row written before this field existed; the caller must then refuse to trust the pending sha
+   * rather than reconcile it against nothing.
+   */
+  fromSha: string | undefined;
+  /**
+   * The specific git operation (`fast_forwarded` | `merged` | `rebased`) the dead attempt was
+   * mutating the branch with — see the column's own note on schema.ts for why reachability of `sha`
+   * alone, even reconciled against `fromSha`, still isn't proof: it needs THIS to know what shape of
+   * evidence would actually confirm it. Undefined for a pending row written before this field
+   * existed, or one whose `beforeMutate` call predates it; the caller must then refuse to trust the
+   * pending sha rather than guess which confirmation shape applies.
+   */
+  kind: string | undefined;
+}
+
+/**
+ * The write-ahead record a still-PENDING refresh (see {@link PENDING_REFRESH_OUTCOME}) left for this
+ * branch — some attempt began a merge/rebase/fast-forward onto `sha` and never lived to finalize its
+ * row with a real outcome. Undefined once a NEWER row on this branch recorded a real outcome (an
+ * attempt that finished its own refresh cleanly, whether or not it's the same one that went pending)
+ * or the recreation tombstone (the branch the pending sha describes is gone).
+ *
+ * Unlike {@link findRunBaseRefreshShaForBranch}, a NEWER `skipped_dirty` row is a barrier here, not a
+ * row to skip past (anton-s55u, PR #279 review, fourth re-review): that function's boundary stays
+ * true regardless of what a later dirty attempt does, but `skipped_dirty` only means the REFRESH was
+ * skipped — the attempt can still dispatch and commit real work onto the branch, moving its tip for
+ * reasons that have nothing to do with whether an OLDER pending write-ahead record's mutation ever
+ * landed. Walking through to that older row would hand the caller a `fromSha` reconciliation baseline
+ * those intervening commits already invalidated: the branch no longer equals `fromSha` because of the
+ * dirty attempt's own unrelated work, not because the pending mutation ran, so the caller's ancestry
+ * check could mistake a rewind target that was always an ancestor of the branch for a just-landed
+ * rebase and confirm a mutation that never actually happened. Returning undefined here is not itself
+ * proof nothing is pending — it means the newest row that actually settled something (including a
+ * dirty skip) settled it for real, so whatever this function would have found further back is already
+ * superseded or no longer safely reconcilable.
+ *
+ * Neither field this returns is trustworthy on its own: `sha` describes what a dead attempt
+ * INTENDED, not what it necessarily achieved. The caller (execute-epic-claim.ts) is the one with git
+ * access to check whether it actually landed on the branch, reconciled against `fromSha`, before
+ * treating it as a boundary.
+ */
+export async function findPendingRefreshShaForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<PendingRefresh | undefined> {
+  const rows = await db
+    .select({
+      baseRefreshOutcome: schema.runs.baseRefreshOutcome,
+      baseRefreshSha: schema.runs.baseRefreshSha,
+      pendingRefreshFromSha: schema.runs.pendingRefreshFromSha,
+      pendingRefreshKind: schema.runs.pendingRefreshKind,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.baseRefreshOutcome),
+      ),
+    )
+    .orderBy(desc(schema.runs.updatedAt), desc(schema.runs.writeSeq), desc(schema.runs.startedAt));
+  for (const row of rows) {
+    if (row.baseRefreshOutcome === BRANCH_RECREATED_REFRESH_TOMBSTONE) return undefined;
+    if (row.baseRefreshOutcome === "skipped_dirty") return undefined;
+    if (row.baseRefreshOutcome !== PENDING_REFRESH_OUTCOME) return undefined;
+    return row.baseRefreshSha
+      ? {
+          sha: row.baseRefreshSha,
+          fromSha: row.pendingRefreshFromSha ?? undefined,
+          kind: row.pendingRefreshKind ?? undefined,
+        }
+      : undefined;
+  }
+  return undefined;
 }
 
 /** A clean verdict's resume key, as {@link findRunReviewKeyForBranch} recovers it for a fresh row. */

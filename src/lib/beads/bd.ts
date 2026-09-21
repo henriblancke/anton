@@ -1258,6 +1258,24 @@ export const beads = {
     locked = false,
     verified = false,
   ) => {
+    // `--metadata` MERGES into existing custom metadata rather than replacing it (see this
+    // function's own docstring), so a write that isn't itself marking verified must explicitly
+    // unset a stale VERIFIED_KEY left by an earlier round — otherwise a candidate that changed
+    // after being verified would keep reading as verified.
+    //
+    // Run as its OWN `bd update`, never combined with the `--metadata @file` write below: bd
+    // (verified against 1.1.2) refuses that combination outright — "cannot combine --metadata
+    // with --set-metadata or --unset-metadata" — so folding `--unset-metadata` onto the same argv
+    // this function used to build made EVERY non-final-verified write in this module fail every
+    // retry, which is what actually broke `ensureBoardBaselinePersisted` end to end (anton-fc5x
+    // review round 18). Unset FIRST, not after the merge write: a crash between the two calls
+    // then leaves, at worst, a baseline that reads as unverified — the same conservative shape
+    // every other tentative write in this module already risks — never a crash that leaves a
+    // STALE verified flag pointing at whatever candidate the second call was about to replace it
+    // with. Unsetting a key the bead never had is a safe no-op (verified against bd 1.1.2).
+    if (!(locked && verified)) {
+      await bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]);
+    }
     const dir = mkdtempSync(join(tmpdir(), "anton-bd-baseline-"));
     try {
       const file = join(dir, "metadata.json");
@@ -1269,15 +1287,7 @@ export const beads = {
           ...(locked && verified ? { [BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]: "1" } : {}),
         }),
       );
-      const args = ["update", id, "--metadata", `@${file}`];
-      // `--metadata` MERGES into existing custom metadata rather than replacing it (see this
-      // function's own docstring), so a write that isn't itself marking verified must explicitly
-      // unset a stale VERIFIED_KEY left by an earlier round — otherwise a candidate that changed
-      // after being verified would keep reading as verified.
-      if (!(locked && verified)) {
-        args.push("--unset-metadata", BOARD_EVIDENCE_BASELINE_VERIFIED_KEY);
-      }
-      return await bdWrite(cwd, args);
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
