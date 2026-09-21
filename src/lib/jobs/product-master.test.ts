@@ -715,9 +715,12 @@ describe("product-master pass · armed", () => {
     expect(dispatched?.prompt).toContain("anton-late");
   });
 
-  it("judges the board it read when tier 1 wrote nothing — no second read for a quiet tier", async () => {
+  it("judges the board it read when tier 1 wrote nothing — no second load for a quiet tier", async () => {
     // The re-read is bought by a WRITE, not by a tier running: a pass whose tier 1 found nothing
-    // pays for one board read, as it did before anything was armed.
+    // pays for exactly one `loadAllIssues` call, as it did before anything was armed. That one call
+    // itself costs two `bd list` reads — `withCycles` prices in a consistency recheck against a
+    // stable board (issues.ts) — so the baseline here is 2, not 1; the assertion after the pass
+    // finishes is what proves no ADDITIONAL load happened.
     const listCalls = () => listMock.mock.calls.length;
     let atDispatch = 0;
     duringSession = () => {
@@ -729,7 +732,8 @@ describe("product-master pass · armed", () => {
     await expectJobStatus(t.db, await runPass(), "done");
 
     expect(writes).toEqual(["create Product master: defer anton-a"]);
-    expect(atDispatch).toBe(1);
+    expect(atDispatch).toBe(2);
+    expect(listCalls()).toBe(2);
   });
 
   it("keeps the pass green when an apply blows up, and leaves the ask standing", async () => {
