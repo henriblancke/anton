@@ -30,6 +30,9 @@ const clearBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) =
 // delivery ever happened") shells out to `bd update` too — mocked for the same reason the other
 // board-evidence writes above are.
 const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// The reopen-reset (PR #284 review, "Reset stale confirmations before a reopened delivery") shells
+// out to `bd update` too — mocked for the same reason the other board-evidence writes above are.
+const clearBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // `ensureDescription`'s fallback for a bead the LIST read omitted a description for (PR #284
 // review) — mocked so the hydration tests below exercise that fallback, not a live `bd show`
 // against a fake "/repo".
@@ -49,6 +52,7 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
       clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
       setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
+      clearBoardEvidenceConfirmed: clearBoardEvidenceConfirmedMock,
       show: showMock,
     },
   };
@@ -79,6 +83,7 @@ unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
+clearBoardEvidenceConfirmedMock.mockResolvedValue("");
 
 function bead(id: string, over: Partial<Bead> = {}): Bead {
   return { id, title: `title-${id}`, status: "open", description: "desc", ...over } as Bead;
@@ -1534,6 +1539,80 @@ describe(
       // baseline marker before dispatch") — that last one confirms the marker reaches the remote
       // BEFORE dispatch, not left for whatever push happens to follow.
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 3);
+    });
+
+    it("clears a stale boardEvidenceConfirmed left by an earlier, already-completed delivery cycle " +
+      "before establishing a reopened ticket's fresh baseline (PR #284 review, \"Reset stale " +
+      "confirmations before a reopened delivery\") — otherwise a crash before THIS cycle's own " +
+      "evidence check completes would have a resume trust the prior cycle's confirmation for this " +
+      "one's delivery", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const reopenedTicket = bead("t-reopened", {
+        metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+      });
+      const clearCallsBefore = clearBoardEvidenceConfirmedMock.mock.calls.length;
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
+      pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+      pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // that push's own stability re-read: stable
+
+      await expect(
+        ensureBoardBaselinePersisted("/repo", reopenedTicket, baseline),
+      ).resolves.toEqual(baseline);
+
+      expect(clearBoardEvidenceConfirmedMock.mock.calls.length).toBe(clearCallsBefore + 1);
+      expect(clearBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "t-reopened");
+      // The clear runs BEFORE the new baseline is ever persisted — never after.
+      const clearOrder = clearBoardEvidenceConfirmedMock.mock.invocationCallOrder[0]!;
+      const firstBaselineWriteOrder = setBoardEvidenceBaselineMock.mock.invocationCallOrder.find(
+        (order) => order > clearOrder - 1,
+      )!;
+      expect(clearOrder).toBeLessThan(firstBaselineWriteOrder);
+    });
+
+    it("never clears boardEvidenceConfirmed for a ticket that never carried it, and never touches it " +
+      "when a preserved baseline already exists — the flag speaks for a PRIOR, completed cycle, and " +
+      "an in-flight baseline means this cycle already ran that reset", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const clearCallsBefore = clearBoardEvidenceConfirmedMock.mock.calls.length;
+      pushMock.mockResolvedValueOnce("synced");
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
+      pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+      pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // that push's own stability re-read: stable
+      const ticketWithBaseline = bead("t-preserved", {
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "preserved-hash" }) },
+      });
+
+      await expect(
+        ensureBoardBaselinePersisted("/repo", ticketWithBaseline, baseline),
+      ).resolves.toEqual(baseline);
+
+      expect(clearBoardEvidenceConfirmedMock.mock.calls.length).toBe(clearCallsBefore);
+    });
+
+    it("fails closed — never persisting a new baseline — when clearing a stale confirmation for a " +
+      "reopened ticket cannot be persisted after retries", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const reopenedTicket = bead("t-reopen-fails", {
+        metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+      });
+      const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
+      clearBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("bd refused"));
+      clearBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("bd refused"));
+      clearBoardEvidenceConfirmedMock.mockRejectedValueOnce(new Error("bd refused"));
+
+      await expect(ensureBoardBaselinePersisted("/repo", reopenedTicket, baseline)).resolves.toBeNull();
+
+      expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore);
     });
 
     it("skips re-persisting the ORIGINAL baseline when the ticket already carries a preserved one, " +

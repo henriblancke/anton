@@ -339,15 +339,21 @@ const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
 /**
  * Durable proof that a board-only ticket's delivery was confirmed and its cleanup completed (PR
  * #284 review, "no record that this bead's board-only delivery ever happened") — set once, right
- * beside the marker/baseline clear in {@link clearBoardEvidencePending}, and never cleared
- * afterwards. Unlike the pending marker and preserved baseline, which exist only to recover an
- * IN-FLIGHT confirmation and are deliberately wiped once it lands, this key's whole job starts
- * where theirs ends: it is the one thing left on the bead once both are gone, and it lives in the
- * synced board rather than on any one machine's git branch — so it answers "was this ticket ever
- * confirmed delivered" long after the branch that carried its attribution commit is gone (a crash
- * before that branch was pushed, a fresh worktree on another machine) and independently of whether
- * this branch happens to carry that commit. See {@link beads.boardEvidenceConfirmed} /
+ * beside the marker/baseline clear in {@link clearBoardEvidencePending}, and never cleared by that
+ * cycle's own completion. Unlike the pending marker and preserved baseline, which exist only to
+ * recover an IN-FLIGHT confirmation and are deliberately wiped once it lands, this key's whole job
+ * starts where theirs ends: it is the one thing left on the bead once both are gone, and it lives
+ * in the synced board rather than on any one machine's git branch — so it answers "was this ticket
+ * ever confirmed delivered" long after the branch that carried its attribution commit is gone (a
+ * crash before that branch was pushed, a fresh worktree on another machine) and independently of
+ * whether this branch happens to carry that commit. See {@link beads.boardEvidenceConfirmed} /
  * {@link beads.setBoardEvidenceConfirmed}.
+ *
+ * The one exception (PR #284 review, "Reset stale confirmations before a reopened delivery"): a
+ * REOPEN starts a new delivery cycle this flag was never meant to speak for, so
+ * {@link execute-epic-board-evidence.ts!ensureBoardBaselinePersisted} clears it — via
+ * {@link beads.clearBoardEvidenceConfirmed} — the moment it establishes that new cycle's own
+ * never-dispatched baseline, before any new evidence exists to confuse it with.
  *
  * Carries the confirmed evidence ids themselves (JSON array), not just a boolean (PR #284 review,
  * "track which beads a durably-confirmed board-only delivery touched") — a dispatch resume that
@@ -1415,6 +1421,20 @@ export const beads = {
       rmSync(dir, { recursive: true, force: true });
     }
   },
+
+  /**
+   * Unset a confirmation left over from an EARLIER, already-completed delivery cycle (PR #284
+   * review, "Reset stale confirmations before a reopened delivery") — the one exception to
+   * {@link BOARD_EVIDENCE_CONFIRMED_KEY}'s own "never cleared afterwards", scoped to the one caller
+   * that can prove the prior cycle is over: {@link execute-epic-board-evidence.ts!ensureBoardBaselinePersisted}
+   * establishing a brand-new pre-dispatch baseline. A ticket only reaches that call with a stale
+   * `confirmed` flag still set by being reopened after a completed cycle — `dispatchTicket`'s
+   * confirmed fast path returns before ever dispatching again while the ticket stays closed/in-review
+   * — so clearing it there, before the new cycle's own evidence exists, cannot discard a confirmation
+   * that still describes live, undelivered work.
+   */
+  clearBoardEvidenceConfirmed: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_CONFIRMED_KEY]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,

@@ -375,6 +375,21 @@ export async function ensureBoardBaselinePersisted(
   const locked = hadBaseline && beads.boardEvidenceBaselineLocked(ticket);
   const recoveryBaseline = locked && beads.boardEvidenceBaselineVerified(ticket);
   if (!hadBaseline) {
+    // A ticket reaches a never-dispatched baseline with a STALE `boardEvidenceConfirmed` only by
+    // being reopened after a delivery cycle that already completed and cleared its own baseline
+    // (chatgpt-codex-connector, PR #284 review, "Reset stale confirmations before a reopened
+    // delivery") — `dispatchTicket`'s confirmed fast path (execute-epic-dispatch.ts) returns before
+    // ever reaching here while the ticket stays closed/in-review, so this is the one call site that
+    // can tell a genuinely new cycle is starting. Left standing, a crash between THIS cycle's own
+    // close and its own `clearBoardEvidencePending` would have a resume treat the PRIOR cycle's
+    // confirmation as proof of this one, skipping the re-diff that would otherwise catch it. Cleared
+    // before the new baseline is even written, and fail-closed on the clear itself (mirroring the
+    // baseline persist below) — leaving it standing risks exactly the false confirmation this reset
+    // exists to prevent.
+    if (beads.boardEvidenceConfirmed(ticket)) {
+      const cleared = await mustPersist(() => beads.clearBoardEvidenceConfirmed(repo, ticket.id));
+      if (!cleared) return null;
+    }
     const persisted = await mustPersist(() =>
       beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
     );
