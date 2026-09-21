@@ -43,6 +43,15 @@ export interface ApprovalGap {
   rule: ApprovalRule;
   /** One line, `<id> → what is wrong`, ready to stand as evidence on a proposal or in a refusal. */
   message: string;
+  /**
+   * This gap is not a confirmed violation — it says evidence to judge the target is UNAVAILABLE, not
+   * that the target failed the check. `approve` is right to fail closed on it (no evidence, no
+   * grant). `unapprove` is not: interpreting "unknown" as "degraded" would strip a sound approval on
+   * nothing but a flaky `bd dep cycles` call. Callers that WITHDRAW rather than grant must check this
+   * before treating a nonempty gap list as license to write (see apply-plan.ts `unapproveSubject`,
+   * apply-steps.ts `assertStillDegraded`).
+   */
+  evidenceMissing?: true;
 }
 
 /** The gate, bound to one board snapshot — see {@link makeApprovalGate}. */
@@ -98,12 +107,23 @@ function missingCycleEvidenceGap(): ApprovalGap {
     rule: "structure",
     message:
       "board → authoritative `bd dep cycles` evidence is unavailable — cannot confirm this run is cycle-free, so it cannot be approved or started",
+    evidenceMissing: true,
   };
 }
 
 /** One target's gaps against a board read, for a caller with no snapshot to reuse (apply.ts). */
 export function approvalGaps(target: Bead, board: Bead[]): ApprovalGap[] {
   return makeApprovalGate(board).gapsFor(target);
+}
+
+/**
+ * Every gap in this (nonempty) list is "we could not check", never "we checked and it failed" — the
+ * one case where a caller that WITHDRAWS on gaps (unapprove) must refuse instead of writing. A caller
+ * that GRANTS on gaps (approve) has no matching use: it already refuses on any nonempty list, evidence
+ * gap or not, so it never needs to tell the two apart.
+ */
+export function onlyMissingEvidence(gaps: ApprovalGap[]): boolean {
+  return gaps.length > 0 && gaps.every((gap) => gap.evidenceMissing);
 }
 
 /** Gaps as one line — a proposal's summary, or the note a withdrawn approval leaves on the bead. */

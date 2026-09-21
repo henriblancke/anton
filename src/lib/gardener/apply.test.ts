@@ -12,7 +12,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { parseGardenerPlan, proposalFingerprint, REASK_AFTER_DAYS } from "./detections";
 import {
@@ -937,6 +937,24 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/the board could not be re-read before withdrawing the approval/);
       expect(err.message).toContain("database is locked");
       // The ask stays open and the label stays on: a board anton cannot see whole authorises nothing.
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // PR #274 review (P1): `approvalGaps` fails an `unapprove` re-check closed on a `bd dep cycles`
+    // outage exactly as it does an `approve` — a nonempty gap list either way. But "no evidence" is
+    // not "still degraded", and withdrawing on it would strip a sound approval on nothing but a flaky
+    // auxiliary CLI read, contrary to the settling test above (repair preserves the label). Missing
+    // evidence must refuse instead, leaving the label untouched for a retry against fresh evidence.
+    it("refuses rather than strips a sound approval when cycle evidence is unavailable", async () => {
+      vi.spyOn(beads, "depCycles").mockRejectedValueOnce(new Error("bd dep cycles timed out"));
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), [
+        startable({ labels: [LABELS.approved] }),
+      ]).catch((e) => e)) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
   });

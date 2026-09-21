@@ -241,6 +241,7 @@ describe("authoritative cycle evidence", () => {
         rule: "structure",
         message:
           "board → authoritative `bd dep cycles` evidence is unavailable — cannot confirm this run is cycle-free, so it cannot be approved or started",
+        evidenceMissing: true,
       },
     ]);
   });

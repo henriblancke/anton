@@ -9,7 +9,7 @@
  * through apply-plan.ts's own helper, so the write cannot hold a bead to a laxer bar than the
  * decision held the snapshot to.
  */
-import { approvalGaps, type ApprovalGap } from "../approval-gate";
+import { approvalGaps, formatApprovalGaps, onlyMissingEvidence, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf as claimHolder, swapUnderLock, type SwapResult } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
@@ -636,6 +636,16 @@ function assertStillDegraded(id: string, board: BoardIndex): ApprovalGap[] {
   if (gaps.length === 0) {
     throw new SubjectMovedError(
       `${id} meets the approve gate again — the gaps this proposal names were repaired since it was decided, so withdrawing the approval would take sound work out of the queue`,
+    );
+  }
+  // Same rule as the decide-time check (apply-plan.ts `unapproveSubject`): a gap list that is ONLY
+  // missing evidence says "we don't know", not "still degraded" — often this very read's own
+  // `degradeCyclesOnFailure` turning a `bd dep cycles` timeout into that gap. Writing off it would
+  // strip a sound approval on an auxiliary CLI read failing, under the write lock where nothing is
+  // left to catch it.
+  if (onlyMissingEvidence(gaps)) {
+    throw new SubjectMovedError(
+      `cannot confirm ${id}'s approval is still degraded under its own write lock — ${formatApprovalGaps(gaps)} — nothing was written`,
     );
   }
   return gaps;
