@@ -1204,33 +1204,112 @@ export async function listDirBlobsAtRev(
 }
 
 /**
- * Every FILE under `dir` at `rev`, recursively, as paths relative to `dir` — the at-rev sibling of
- * {@link listFiles} in skill-stamp.mjs, which walks the same shape off disk. Exists so a directory
- * digest (a `skill:<id>` step's content stamp) can be taken from a COMMITTED tree rather than the
- * working copy, the same reason {@link readFileAtRev} exists: a run's own diff must not be able to
- * pick the instruction it is judged or described against.
+ * Every FILE under `dir` at `rev`, recursively — the at-rev sibling of {@link listFiles} in
+ * skill-stamp.mjs, which walks the same shape off disk. Exists so a directory digest (a
+ * `skill:<id>` step's content stamp) can be taken from a COMMITTED tree rather than the working
+ * copy, the same reason {@link readFileAtRev} exists: a run's own diff must not be able to pick the
+ * instruction it is judged or described against.
  *
- * `-r` recurses through subtrees itself, so this covers a skill's nested assets (`templates/…`), not
- * just its top-level files — matching {@link listFiles}'s own recursive walk.
+ * `-r` recurses through REAL subtrees, but `git ls-tree` never resolves a symlink — a symlinked
+ * asset directory surfaces as a single `120000` blob with none of its children, where `listFiles`'s
+ * disk-side walk (`readdirSync` + `statSync`, which the OS resolves transparently) sees straight
+ * through it. So a symlink entry found here is expanded: read, resolved, and — when it names a
+ * directory at `rev` — recursed into, matching {@link listFiles} shape-for-shape (anton-z33ia
+ * review, PR #313).
+ *
+ * Returns `{ rel, path }` pairs, not plain relative paths: `rel` is relative to `dir` and keyed on
+ * the SYMLINK's own name, so a digest taken here lands on the same entries as one taken from disk;
+ * `path` is the real repo path the bytes live at, which for anything reached through an expanded
+ * symlink is NOT `dir` joined with `rel` — that concatenation never names a real tree entry — so a
+ * caller must read from `path`, never reconstruct one.
+ *
+ * `stack` carries the REAL directories already on this descent, so a symlink cycle
+ * (`assets -> ../assets`) terminates instead of recursing forever — the git-side twin of
+ * {@link listFiles}'s own cycle guard.
  *
  * FAILS CLOSED like {@link listDirBlobsAtRev}: empty output means `dir` has no files at `rev`, never
  * that the read failed. Anything that rejects propagates rather than reading as "no files".
  */
-export async function listFilesAtRev(worktreePath: string, rev: string, dir: string): Promise<string[]> {
-  const prefix = `${dir.replace(/\/+$/, "")}/`;
-  // `:(literal)`, same reason as {@link listDirBlobsAtRev}: `dir` can be operator-supplied.
-  const out = await git(worktreePath, ["ls-tree", "-r", "-z", rev, "--", `:(literal)${prefix}`]);
-  if (!out) return [];
-  return out
-    .split("\0")
-    .map((line) => {
+export async function listFilesAtRev(
+  worktreePath: string,
+  rev: string,
+  dir: string,
+  stack: Set<string> = new Set(),
+): Promise<Array<{ rel: string; path: string }>> {
+  const cleanDir = dir.replace(/\/+$/, "");
+  if (stack.has(cleanDir)) return [];
+  stack.add(cleanDir);
+  try {
+    const prefix = `${cleanDir}/`;
+    // `:(literal)`, same reason as {@link listDirBlobsAtRev}: `dir` can be operator-supplied.
+    const out = await git(worktreePath, ["ls-tree", "-r", "-z", rev, "--", `:(literal)${prefix}`]);
+    if (!out) return [];
+
+    const files: Array<{ rel: string; path: string }> = [];
+    const symlinks: string[] = [];
+    for (const line of out.split("\0")) {
       const tab = line.indexOf("\t");
-      if (tab < 0) return undefined;
+      if (tab < 0) continue;
+      const [mode, type] = line.slice(0, tab).split(" ");
+      if (type !== "blob") continue;
       const path = line.slice(tab + 1);
-      return line.slice(0, tab).split(" ")[1] === "blob" ? path.slice(prefix.length) : undefined;
-    })
-    .filter((path): path is string => path !== undefined)
-    .sort();
+      if (mode === SYMLINK_MODE) symlinks.push(path);
+      else files.push({ rel: path.slice(prefix.length), path });
+    }
+
+    const expanded = await Promise.all(
+      symlinks.map((path) => expandSymlinkedFileAtRev(worktreePath, rev, path, prefix, stack)),
+    );
+    return [...files, ...expanded.flat()].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  } finally {
+    // Removed on exit, not left in the stack, so two sibling symlinks that legitimately share one
+    // target directory — not a cycle, just reused content — are both still walked (mirrors
+    // `listFiles`'s own stack.delete after its descent).
+    stack.delete(cleanDir);
+  }
+}
+
+/**
+ * One symlink entry found while walking {@link listFilesAtRev}, expanded to the files it actually
+ * names: itself, when its target is a file at `rev` (the leaf-symlink case {@link readFileBytesAtRev}
+ * already follows one hop of on its own); its target directory's files, recursively, when the target
+ * is a directory (the shape `ls-tree -r` cannot see through at all); or nothing, for a link that is
+ * broken or leaves the repository — same as {@link resolveRepoPath}'s undefined.
+ */
+async function expandSymlinkedFileAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  prefix: string,
+  stack: Set<string>,
+): Promise<Array<{ rel: string; path: string }>> {
+  const rel = path.slice(prefix.length);
+  const text = await git(worktreePath, ["show", `${rev}:${path}`, "--"]);
+  const target = resolveRepoPath(path, text);
+  if (!target) return [];
+  const kind = await treeEntryKindAtRev(worktreePath, rev, target);
+  if (kind === "blob") return [{ rel, path }];
+  if (kind !== "tree") return [];
+  const nested = await listFilesAtRev(worktreePath, rev, target, stack);
+  return nested.map((entry) => ({ rel: `${rel}/${entry.rel}`, path: entry.path }));
+}
+
+/**
+ * Whether `path` names a file, a directory, or neither at `rev` — {@link blobModeAtRev} widened to
+ * report "tree" instead of collapsing it to undefined, which is exactly the distinction a symlink's
+ * target needs before {@link listFilesAtRev} can decide whether to read it or recurse into it.
+ */
+async function treeEntryKindAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<"blob" | "tree" | undefined> {
+  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", `:(literal)${path}`]);
+  const entry = out.split("\0")[0];
+  const tab = entry?.indexOf("\t") ?? -1;
+  if (!entry || tab < 0) return undefined;
+  const type = entry.slice(0, tab).split(" ")[1];
+  return type === "blob" || type === "tree" ? type : undefined;
 }
 
 /**

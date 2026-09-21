@@ -33,6 +33,7 @@ import {
   findOpenPullRequest,
   gitCommonDir,
   listDirBlobsAtRev,
+  listFilesAtRev,
   lookupOpenPullRequest,
   markPullRequestDraft,
   needsHooksPathOverrideForMerge,
@@ -3585,6 +3586,103 @@ suite("readFileBytesAtRev (real git)", () => {
 
   it("throws on a rev that does not resolve, instead of reporting the file absent", async () => {
     await expect(readFileBytesAtRev(repo, "origin/nope", "SKILL.md")).rejects.toThrow();
+  });
+});
+
+suite("listFilesAtRev (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const write = (rel: string, body: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  };
+  const link = (rel: string, target: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    symlinkSync(target, join(repo, rel));
+  };
+  const rels = (entries: Array<{ rel: string; path: string }>) => entries.map((e) => e.rel).sort();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-listfilesrev-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    write("skill/SKILL.md", "the skill\n");
+    write("skill/templates/one.md", "template one\n");
+    // The reported shape: a skill whose asset directory is a symlink to real content living
+    // elsewhere in the repo, plus a plain leaf-symlinked file for comparison.
+    write("shared/branding/logo.svg", "<svg/>\n");
+    write("shared/branding/nested/mark.svg", "<svg nested/>\n");
+    link("skill/assets", "../shared/branding");
+    link("skill/README.md", "SKILL.md");
+    // A directory symlink whose target contains a symlink back to that SAME directory — the shape
+    // that would recurse forever without the `stack` guard, since each hop resolves to a real `tree`
+    // (unlike a leaf symlink cycle, which `readFileBytesAtRev`'s own hop limit already handles).
+    write("shared/loopdir/marker.txt", "x\n");
+    link("shared/loopdir/self", ".");
+    link("skill/cycle", "../shared/loopdir");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("lists a skill's own files, relative to dir", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    expect(rels(files)).toEqual([
+      "README.md",
+      "SKILL.md",
+      "assets/logo.svg",
+      "assets/nested/mark.svg",
+      "cycle/marker.txt",
+      "templates/one.md",
+    ]);
+  });
+
+  it("expands a symlinked directory recursively, keyed on the symlink's own name", async () => {
+    // `ls-tree -r` alone would report `assets` as one opaque 120000 blob with no children (the
+    // finding this test guards against) — the fix must walk through it like `listFiles` does on disk.
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const asset = files.find((f) => f.rel === "assets/logo.svg");
+    const nested = files.find((f) => f.rel === "assets/nested/mark.svg");
+    expect(asset?.path).toBe("shared/branding/logo.svg");
+    expect(nested?.path).toBe("shared/branding/nested/mark.svg");
+  });
+
+  it("gives each entry a real repo path readFileBytesAtRev can read directly", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    for (const { path } of files) {
+      expect(await readFileBytesAtRev(repo, "main", path)).toBeDefined();
+    }
+  });
+
+  it("still resolves a leaf symlink to a file, same as before", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const readme = files.find((f) => f.rel === "README.md");
+    expect(readme?.path).toBe("skill/README.md");
+    expect((await readFileBytesAtRev(repo, "main", readme!.path))?.toString("utf8")).toBe("the skill\n");
+  });
+
+  it("gives up on a directory symlink cycle instead of recursing forever", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    // `cycle/self` points back at the directory it's already inside of — the loop terminates
+    // without ever expanding into `cycle/self/self/...`, and the directory's real file still lists.
+    expect(files.some((f) => f.rel.startsWith("cycle/self"))).toBe(false);
+    expect(rels(files)).toContain("cycle/marker.txt");
+  });
+
+  it("returns nothing for a directory with no files at rev", async () => {
+    expect(await listFilesAtRev(repo, "main", "skill/templates/nope")).toEqual([]);
+  });
+
+  it("throws on a rev that does not resolve, instead of reporting no files", async () => {
+    await expect(listFilesAtRev(repo, "origin/nope", "skill")).rejects.toThrow();
   });
 });
 

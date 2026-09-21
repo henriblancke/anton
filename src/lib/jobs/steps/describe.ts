@@ -350,13 +350,17 @@ async function loadBaseProjectSkill(
  * Swallowed to `undefined` on any failure, like `digestOf` in resolve.ts: the digest is a ledger
  * dimension, and losing it costs only the cohort key, never the narrative this step is already
  * committed to producing from the text in hand.
+ *
+ * `listFilesAtRev` returns each file's real `path` alongside its digest `rel` key precisely so a
+ * symlinked asset directory can be read here: `dir` joined with `rel` is not a real tree entry for
+ * anything reached through an expanded symlink, only `path` is (anton-z33ia review, PR #313).
  */
 async function skillDigestAtRev(worktreePath: string, rev: string, dir: string): Promise<string | undefined> {
   try {
     const files = await listFilesAtRev(worktreePath, rev, dir);
     const entries = await Promise.all(
-      files.map(async (rel) => {
-        const raw = await readFileBytesAtRev(worktreePath, rev, `${dir}/${rel}`);
+      files.map(async ({ rel, path }) => {
+        const raw = await readFileBytesAtRev(worktreePath, rev, path);
         return raw === undefined ? undefined : ([rel, raw] as const);
       }),
     );
