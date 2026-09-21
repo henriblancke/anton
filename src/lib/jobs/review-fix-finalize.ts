@@ -583,8 +583,17 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
     unfenced.map(async (b) => {
       const read = await mustReadClosureVersion(repo, b.id);
       if (!read.read || read.closure === undefined) return false;
+      // Re-read live rather than writing off `b` (chatgpt-codex-connector, PR #284 review, "Refresh
+      // confirmation metadata before stamping closures"): `b` is `closedBeads`'s snapshot, taken
+      // before this async fan-out started, and another review-fix pass can extend this bead's
+      // confirmed ids in the meantime. Persisting `confirmedBoardEvidenceIds(b)` would overwrite that
+      // newer, wider id set with the stale one this snapshot carried, losing evidence a later reviewer
+      // or the resume ledger needs. An unreadable bead fails this one bead's fence rather than
+      // guessing off the stale snapshot.
+      const live = await tryShow(repo, b.id);
+      if (!live) return false;
       return mustPersist(() =>
-        beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(b), read.closure),
+        beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(live), read.closure),
       );
     }),
   );

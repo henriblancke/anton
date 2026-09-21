@@ -1097,6 +1097,13 @@ export function ticketBlockNote(args: {
   // category text rather than trailing an empty quote or a dangling dash.
   const selfReport = args.selfReport && { ...args.selfReport, reason: reason || undefined };
   const failure = blockNoteDetail(errorText(args.error));
+  // Every `NoDeliveryError` a board-only ticket can fail with already states its own "left open (not
+  // blocked)..." framing (see `boardOnlyNoDeliveryMessage`/`assertBoardOnlyDelivered` in
+  // execute-epic-ticket.ts) — normally hidden because the combined message exceeds `blockNoteDetail`'s
+  // 400-char cap and that tail is what gets truncated. A short one (e.g. the no-self-report fallback,
+  // ~382 chars + the ticket id) survives the cap intact, so appending the clause again here produced a
+  // garbled, duplicated tail (PR #284 review). Checked instead of appended unconditionally.
+  const failureAlreadyLeavesOpen = /left open \(not blocked\)/i.test(failure);
 
   const body =
     kind === "no-delivery"
@@ -1108,8 +1115,10 @@ export function ticketBlockNote(args: {
           `declared the ticket incomplete${reason ? `: "${reason}"` : ` (no reason given)`}; needs ` +
           `a human to finish or re-scope it, then resume the run.`
         : kind === "board-only-no-evidence"
-          ? `${failure || "board-only ticket found no evidence of delivery"} — left open (not ` +
-            `blocked) so a resumed run can reclaim and retry it without a manual status edit.`
+          ? failureAlreadyLeavesOpen
+            ? failure
+            : `${failure || "board-only ticket found no evidence of delivery"} — left open (not ` +
+              `blocked) so a resumed run can reclaim and retry it without a manual status edit.`
           : `run failed after committing work — needs review.` +
             (failure ? ` It failed with: ${failure}` : "");
 

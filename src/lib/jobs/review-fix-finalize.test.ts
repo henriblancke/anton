@@ -45,6 +45,9 @@ const parents = new Map<string, string | undefined>();
 const boardLabels = new Map<string, string[]>();
 /** id → creation time, which is how two racing processes agree on which follow-up survives. */
 const createdAt = new Map<string, string>();
+/** id → current metadata, so the closure-fence backfill's live re-read sees the board's confirmed
+ * evidence ids, not whatever the caller's now-stale snapshot happened to carry. */
+const metadataById = new Map<string, Bead["metadata"]>();
 
 vi.mock("../beads/bd", async () => {
   const actual =
@@ -153,6 +156,7 @@ describe("finalizeMergedEpic", () => {
     parents.clear();
     boardLabels.clear();
     createdAt.clear();
+    metadataById.clear();
     unassignMock
       .mockReset()
       .mockImplementation(async (_repo: string, id: string) => {
@@ -174,6 +178,7 @@ describe("finalizeMergedEpic", () => {
           assignee: assignees.get(id),
           parent: parents.get(id),
           created_at: createdAt.get(id),
+          metadata: metadataById.get(id),
         }) as Bead,
     );
   });
@@ -210,6 +215,7 @@ describe("finalizeMergedEpic", () => {
         ...bead("target-1"),
         metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
       } as Bead;
+      metadataById.set("target-1", target.metadata);
       historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
 
       await finalize(target, []);
@@ -294,6 +300,7 @@ describe("finalizeMergedEpic", () => {
         ...bead("target-1", "closed"),
         metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
       } as Bead;
+      metadataById.set("target-1", target.metadata);
       historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
 
       await finalize(target, []);

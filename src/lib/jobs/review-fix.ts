@@ -108,7 +108,7 @@ import {
   parseThreadReport,
   type ThreadOutcome,
 } from "./review-fix-context";
-import { IN_REVIEW } from "./review-fix-board";
+import { IN_REVIEW, tryList } from "./review-fix-board";
 import { safe } from "./safe";
 import { finalizeMergedEpic, stampConfirmedClosures } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
@@ -255,14 +255,23 @@ type RecoveryResult = "recovered" | "attempted" | "skipped";
 async function recoverUnfencedClosure(
   repo: string,
   epic: Bead,
-  all: Bead[],
   signal: AbortSignal,
 ): Promise<RecoveryResult> {
   const number = prNumberFromRef(beads.getPrRef(epic));
   if (number === undefined) return "skipped"; // no PR to confirm a merge against
   const pr = await getPrReview(repo, number, signal);
   if (pr.state !== "MERGED") return "skipped"; // closed by hand, not by finalization — leave it
-  const closedNow = [...runTickets(all, epic.id), epic];
+  // Rebuilt from a FRESH read, never the dispatcher's board snapshot (chatgpt-codex-connector, PR
+  // #284 review, "Re-read the subtree before clearing finalization"): `closedUnfencedEpics` already
+  // selected `epic` off that snapshot, so a status recheck built from the same snapshot is comparing
+  // it against itself and can never see a child reopened in the meantime. That reopen would still
+  // read `closed` here, and the fence/untag below would strand the reopened child beneath a target
+  // this call wrongly treats as fully settled.
+  const live = await tryList(repo);
+  if (!live) return "attempted"; // board unreadable — try again next sweep rather than guess off a stale snapshot
+  const liveEpic = live.find((b) => b.id === epic.id);
+  if (!liveEpic) return "attempted"; // epic vanished from a live read — try again next sweep
+  const closedNow = [...runTickets(live, epic.id), liveEpic];
   if (closedNow.some((b) => b.status !== "closed")) return "skipped"; // a child was reopened — not actually finalized
   if (!(await stampConfirmedClosures(repo, closedNow))) return "attempted";
   await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
@@ -335,7 +344,7 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   for (const stuck of closedUnfencedEpics(all, epicBeadId)) {
     await ctx.heartbeat();
     try {
-      const result = await recoverUnfencedClosure(repo, stuck, all, ctx.signal);
+      const result = await recoverUnfencedClosure(repo, stuck, ctx.signal);
       if (result !== "skipped") wroteToBoard = true;
       if (result === "recovered") recovered += 1;
     } catch (e) {

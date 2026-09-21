@@ -55,7 +55,7 @@ import {
   TicketRetiredError,
   TicketTimeoutError,
 } from "./execute-epic-errors";
-import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard, mustReadClosureVersion } from "./execute-epic-persist";
 import { safe } from "./safe";
 import { runTargetAbove } from "./gate-targets";
 import type { RunPreparation } from "./execute-epic-prepare";
@@ -1238,11 +1238,23 @@ async function dispatchTicket(
     const staleConfirmedIds = beads.confirmedBoardEvidenceIds(ticket);
     const confirmedClosure =
       ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
+    // Routed through `mustReadClosureVersion` rather than a bare `readCurrentClosureVersion(...)
+    // .catch(() => undefined)` (PR #284 review, "Retry the closure read before trusting it"): unlike
+    // the symmetric check further down (`confirmedForThisCycle`), where an unreadable closure only
+    // costs a redundant redispatch, an unreadable closure HERE can leave `idsToConfirm` empty with no
+    // preserved baseline to re-diff, and `reDiffPreservedBaseline` fails that with a hard `PoisonEpic`
+    // — a single transient `bd history` hiccup should not be able to halt an already-fully-confirmed,
+    // fully-cleaned-up ticket. Retried like every other guarded read in this file before falling back
+    // to the same fail-closed answer.
+    const closureCheck =
+      staleConfirmedIds.length > 0 && ticket.status === "closed" && confirmedClosure !== undefined
+        ? await mustReadClosureVersion(repo, ticket.id)
+        : undefined;
     const confirmedIdsTrusted =
       staleConfirmedIds.length === 0 ||
       ticket.status !== "closed" ||
       confirmedClosure === undefined ||
-      confirmedClosure === (await readCurrentClosureVersion(repo, ticket.id).catch(() => undefined));
+      (closureCheck !== undefined && closureCheck.read && confirmedClosure === closureCheck.closure);
     // The ids to (re)confirm are the UNION of the still-pending marker, whatever a prior cleanup
     // obligation already carried, and whatever is already durably confirmed for THIS closure (PR
     // #284 review, "Preserve confirmed evidence IDs during cleanup retries") — never bare
