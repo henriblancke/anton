@@ -316,6 +316,24 @@ const BOARD_EVIDENCE_BASELINE_LOCKED_KEY = "boardEvidenceBaselineLocked";
 const BOARD_EVIDENCE_BASELINE_VERIFIED_KEY = "boardEvidenceBaselineVerified";
 
 /**
+ * Metadata key marking that dispatch actually BEGAN against the currently locked baseline above
+ * (chatgpt-codex-connector, PR #284 review, "Distinguish pre-dispatch locks from recovery
+ * baselines"). `BOARD_EVIDENCE_BASELINE_VERIFIED_KEY` is set the instant `lockDispatchBaseline`'s
+ * stability round proves a PRE-dispatch candidate stable — before the caller has dispatched
+ * anything — so a process death right after that (before the agent session ever starts) leaves a
+ * locked-and-verified baseline indistinguishable from one `readBoardEvidence` preserves AFTER a
+ * dispatch attempt genuinely ran. Without this key, `ensureBoardBaselinePersisted`'s
+ * `recoveryBaseline` fast path cannot tell the two apart and would trust the never-dispatched
+ * snapshot untouched — skipping the refresh that would otherwise fold in a board change made during
+ * that downtime, and crediting a no-op agent with drift it never produced. Set once, by the caller
+ * (`runTicket`), right before the agent session starts and never before — see
+ * {@link execute-epic-board-evidence.ts!markDispatchStarted}. Absent is read as "dispatch never
+ * started against this locked baseline", which routes `ensureBoardBaselinePersisted` back through
+ * `lockDispatchBaseline`'s own re-verification loop instead of trusting it blind.
+ */
+const BOARD_EVIDENCE_DISPATCH_STARTED_KEY = "boardEvidenceDispatchStarted";
+
+/**
  * Metadata key marking that a board-evidence cleanup ({@link beads.setBoardEvidencePending} /
  * {@link beads.clearBoardEvidenceBaseline} clearing to empty) wrote successfully to the LOCAL bd
  * DB but its confirming push failed (PR #284 review, "retain a retry obligation after cleanup
@@ -377,6 +395,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   BOARD_EVIDENCE_BASELINE_KEY,
   BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
   BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
+  BOARD_EVIDENCE_DISPATCH_STARTED_KEY,
   BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
   BOARD_EVIDENCE_CONFIRMED_KEY,
 ];
@@ -1234,6 +1253,19 @@ export const beads = {
   boardEvidenceBaselineVerified: (b: Bead): boolean =>
     b.metadata?.[BOARD_EVIDENCE_BASELINE_VERIFIED_KEY] !== undefined,
 
+  /** Whether dispatch actually began against the currently locked baseline — the one signal that
+   * tells a genuine post-dispatch recovery lock apart from a pre-dispatch lock a crash caught
+   * before dispatch ever started. See {@link BOARD_EVIDENCE_DISPATCH_STARTED_KEY}. */
+  boardEvidenceDispatchStarted: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_DISPATCH_STARTED_KEY] !== undefined,
+
+  /** Durably mark that dispatch has begun against `id`'s currently locked baseline. Called once,
+   * by the caller, right before the agent session starts and never before — see
+   * {@link BOARD_EVIDENCE_DISPATCH_STARTED_KEY}. A single flag, so a plain `--set-metadata` is safe
+   * (unlike the fingerprint writes above, this never risks the argv `E2BIG` ceiling). */
+  setBoardEvidenceDispatchStarted: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_DISPATCH_STARTED_KEY}=1`]),
+
   /**
    * Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
    * pre-dispatch baseline. `locked` (default false) marks it a RECOVERY baseline — set by callers
@@ -1311,6 +1343,8 @@ export const beads = {
       BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
       "--unset-metadata",
       BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
+      "--unset-metadata",
+      BOARD_EVIDENCE_DISPATCH_STARTED_KEY,
     ]),
 
   /**

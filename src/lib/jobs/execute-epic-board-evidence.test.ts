@@ -21,6 +21,10 @@ const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promi
 // baselines before clearing them") shells out to `bd update` too — mocked for the same reason the
 // other baseline writes above are.
 const unverifyBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// `markDispatchStarted`'s own write (chatgpt-codex-connector, PR #284 review, "Distinguish
+// pre-dispatch locks from recovery baselines") shells out to `bd update` too — mocked for the same
+// reason the other board-evidence writes above are.
+const setBoardEvidenceDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // The cleanup-push retry obligation (PR #284 review, "retain a retry obligation after cleanup
 // push failure") shells out to `bd update` too — mocked for the same reason the baseline writes
 // above are.
@@ -54,6 +58,7 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidenceBaseline: setBoardEvidenceBaselineMock,
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
       unverifyBoardEvidenceBaseline: unverifyBoardEvidenceBaselineMock,
+      setBoardEvidenceDispatchStarted: setBoardEvidenceDispatchStartedMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
       clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
       setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
@@ -75,6 +80,7 @@ const {
   ensureBoardBaselinePersisted,
   fingerprintBoard,
   isBoardOnlyRun,
+  markDispatchStarted,
   readBoardBaseline,
   readBoardEvidence,
 } = await import("./execute-epic-board-evidence");
@@ -86,6 +92,7 @@ setBoardEvidencePendingMock.mockResolvedValue("");
 setBoardEvidenceBaselineMock.mockResolvedValue("");
 clearBoardEvidenceBaselineMock.mockResolvedValue("");
 unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
+setBoardEvidenceDispatchStartedMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
@@ -1970,6 +1977,11 @@ describe(
             boardEvidenceBaseline: JSON.stringify(Object.fromEntries(baseline.beads)),
             boardEvidenceBaselineLocked: "1",
             boardEvidenceBaselineVerified: "1",
+            // Dispatch genuinely began against this baseline (PR #284 review, "Distinguish
+            // pre-dispatch locks from recovery baselines") — without this, a locked-and-verified
+            // baseline where dispatch never started is a DIFFERENT, unsafe case covered by its own
+            // test below.
+            boardEvidenceDispatchStarted: "1",
           },
         });
         pushMock.mockResolvedValueOnce("synced");
@@ -2017,15 +2029,17 @@ describe(
         const attempt1 = await ensureBoardBaselinePersisted("/repo", bead("t-crash"), baseline);
         expect(attempt1).toEqual(baseline);
 
-        // The process dies here, mid-agent-session — after the fixer's own writes land on the board,
-        // before this ticket ever reaches `readBoardEvidence`. A resumed attempt reads the LOCKED AND
-        // VERIFIED baseline this call just persisted (never a fresh read that would already absorb
-        // those writes), and its confirming pull would otherwise pull them straight in.
+        // The process dies here, mid-agent-session — after `markDispatchStarted` durably recorded
+        // dispatch beginning and the fixer's own writes land on the board, before this ticket ever
+        // reaches `readBoardEvidence`. A resumed attempt reads the LOCKED AND VERIFIED baseline this
+        // call just persisted (never a fresh read that would already absorb those writes), and its
+        // confirming pull would otherwise pull them straight in.
         const resumedTicket = bead("t-crash", {
           metadata: {
             boardEvidenceBaseline: JSON.stringify(Object.fromEntries(baseline.beads)),
             boardEvidenceBaselineLocked: "1",
             boardEvidenceBaselineVerified: "1",
+            boardEvidenceDispatchStarted: "1",
           },
         });
         pushMock.mockResolvedValueOnce("synced"); // attempt 2's reconfirm push
@@ -2037,6 +2051,64 @@ describe(
         // already changed, which is exactly what an unlocked baseline would have folded in.
         expect(attempt2).toEqual(baseline);
         expect(loadAllIssuesMock.mock.calls.length).toBe(loadCallsBefore);
+      },
+    );
+
+    it(
+      "treats a LOCKED-AND-VERIFIED baseline as refreshable, never as a settled recovery baseline, " +
+        "when dispatch never actually started against it (chatgpt-codex-connector, PR #284 review, " +
+        "\"Distinguish pre-dispatch locks from recovery baselines\") — `lockDispatchBaseline`'s " +
+        "stability round marks a candidate verified the instant it proves it stable, BEFORE the " +
+        "caller ever dispatches anything. A process death right after that (before `markDispatchStarted` " +
+        "lands) leaves exactly this shape: locked and verified, but with no durable record dispatch " +
+        "began. Trusting it via the `recoveryBaseline` fast path would skip re-reading the board " +
+        "entirely, crediting a no-op agent with any board write made during that downtime — the same " +
+        "false-success shape the tentative-lock case below exists to prevent, just reached through a " +
+        "fully verified lock instead of an interrupted one",
+      async () => {
+        const staleCandidate = fingerprintBoard([bead("a", { description: "v0" })]);
+        const neverDispatchedTicket = bead("t-never-dispatched", {
+          metadata: {
+            boardEvidenceBaseline: JSON.stringify(Object.fromEntries(staleCandidate.beads)),
+            boardEvidenceBaselineLocked: "1",
+            boardEvidenceBaselineVerified: "1",
+            // Deliberately no `boardEvidenceDispatchStarted` — the crash landed between
+            // `lockDispatchBaseline` returning and dispatch ever actually starting.
+          },
+        });
+        pushMock.mockResolvedValueOnce("synced"); // ensureBoardBaselinePersisted's own confirming push
+        // The stale VERIFIED flag is downgraded first, confirmed synced (chatgpt-codex-connector, PR
+        // #284 review, "Distinguish pre-dispatch locks from recovery baselines") — otherwise
+        // `lockDispatchBaseline`'s own final verify-marking write would see this ticket's (stale,
+        // in-memory) snapshot still reporting verified and wrongly no-op even after finding real drift.
+        unverifyBoardEvidenceBaselineMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // the downgrade's own confirming push
+        // `lockDispatchBaseline` is re-entered directly (never the free-refresh loop, which would
+        // leave a stale `locked` flag behind) and re-verifies the candidate from scratch: its OWN
+        // confirming push pulls in a write that landed during the crash window, made by something
+        // else with board access while nothing was actually dispatched.
+        pushMock.mockResolvedValueOnce("synced"); // round 0's lock-confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1 — landed during the crash window" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 1's re-persisted lock, now onto v1
+        pushMock.mockResolvedValueOnce("synced"); // round 1's lock-confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1 — landed during the crash window" })]); // stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // round 1's verified-marking write
+        pushMock.mockResolvedValueOnce("synced"); // round 1's verified-marking write's own confirming push
+        // That confirming push's own post-push stability re-read finds nothing further either.
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v1 — landed during the crash window" })]);
+
+        const result = await ensureBoardBaselinePersisted("/repo", neverDispatchedTicket, staleCandidate);
+
+        // Never the stale pre-crash value — the concurrent write is folded in, not silently trusted
+        // away, so a no-op agent dispatched against this baseline can never be credited with it.
+        expect(result).toEqual(fingerprintBoard([bead("a", { description: "v1 — landed during the crash window" })]));
+        expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-never-dispatched",
+          Object.fromEntries(result!.beads),
+          true,
+          true,
+        );
       },
     );
 
@@ -2425,6 +2497,40 @@ describe(
         expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(clearCallsBefore);
       },
     );
+  },
+);
+
+describe(
+  "markDispatchStarted — durably records that dispatch began (chatgpt-codex-connector, PR #284 " +
+    "review, \"Distinguish pre-dispatch locks from recovery baselines\")",
+  () => {
+    it("persists and confirms synced", async () => {
+      setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+
+      await expect(markDispatchStarted("/repo", bead("t-dispatching"))).resolves.toBe(true);
+
+      expect(setBoardEvidenceDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
+    });
+
+    it("returns false, never throwing, when the write cannot be persisted after every retry", async () => {
+      setBoardEvidenceDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setBoardEvidenceDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(markDispatchStarted("/repo", bead("t-dispatch-unpersisted"))).resolves.toBe(false);
+
+      // Never reaches the confirming push at all — nothing landed locally to confirm.
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+
+    it("returns false when the write lands locally but the confirming push never syncs", async () => {
+      setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired");
+
+      await expect(markDispatchStarted("/repo", bead("t-dispatch-unconfirmed"))).resolves.toBe(false);
+    });
   },
 );
 

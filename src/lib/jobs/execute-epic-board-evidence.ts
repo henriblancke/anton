@@ -387,7 +387,19 @@ export async function ensureBoardBaselinePersisted(
 ): Promise<BoardFingerprint | null> {
   const hadBaseline = Boolean(beads.boardEvidenceBaseline(ticket));
   const locked = hadBaseline && beads.boardEvidenceBaselineLocked(ticket);
-  const recoveryBaseline = locked && beads.boardEvidenceBaselineVerified(ticket);
+  // Gated on `boardEvidenceDispatchStarted` too (chatgpt-codex-connector, PR #284 review,
+  // "Distinguish pre-dispatch locks from recovery baselines") — `boardEvidenceBaselineVerified`
+  // alone only proves `lockDispatchBaseline`'s OWN stability round found this candidate stable
+  // BEFORE dispatch, not that dispatch itself ever began. A process death right after that (before
+  // `markDispatchStarted` ever lands) leaves a locked-and-verified baseline that looks exactly like
+  // one `readBoardEvidence` preserves AFTER a genuine dispatch attempt, but nothing has dispatched
+  // against it yet — any board change during that downtime is still purely external drift, not this
+  // attempt's own delivery, and belongs in a refreshed baseline rather than preserved untouched. A
+  // ticket that fails this check because dispatch never started still falls through to `locked`
+  // below, which re-enters `lockDispatchBaseline` and folds any such drift in exactly as a tentative,
+  // unverified lock already does.
+  const recoveryBaseline =
+    locked && beads.boardEvidenceBaselineVerified(ticket) && beads.boardEvidenceDispatchStarted(ticket);
   if (!hadBaseline) {
     // A ticket reaches a never-dispatched baseline with a STALE `boardEvidenceConfirmed` only by
     // being reopened after a delivery cycle that already completed and cleared its own baseline
@@ -423,7 +435,39 @@ export async function ensureBoardBaselinePersisted(
   // `lockDispatchBaseline` directly instead — it already knows how to re-verify (or move past) a
   // candidate it may have locked tentatively itself, on a PRIOR attempt that crashed before ever
   // confirming it stable.
-  if (locked) return lockDispatchBaseline(repo, ticket, baseline);
+  if (locked) {
+    // A lock already VERIFIED, but with dispatch never durably marked as begun (the `recoveryBaseline`
+    // check above already refused to trust it as-is), must be downgraded to tentative BEFORE
+    // `lockDispatchBaseline` re-verifies it (chatgpt-codex-connector, PR #284 review, "Distinguish
+    // pre-dispatch locks from recovery baselines"). Without this, a round that finds real drift and
+    // moves `candidate` on to a genuinely different value would still reach `lockDispatchBaseline`'s
+    // OWN final verify-marking write with `ticket` — this same, stale, in-memory snapshot — still
+    // reporting `boardEvidenceBaselineVerified`, which makes {@link preserveRecoveryBaseline}'s no-op
+    // check trust it blind and skip that write entirely, leaving the REMOTE's verified baseline
+    // pointing at the pre-crash candidate instead of the refreshed one this call is about to prove
+    // stable. Downgrading first — confirmed synced, exactly like {@link abandonDispatchBaseline}'s own
+    // downgrade — reduces this to the tentative-lock shape `lockDispatchBaseline` already handles
+    // correctly, and the ticket passed to it is patched to match: `lockDispatchBaseline` never re-reads
+    // `ticket` itself, so a caller that downgraded the REMOTE without also patching this in-memory
+    // copy would have every metadata read for the rest of this call keep trusting the stale flag.
+    const wasVerified = beads.boardEvidenceBaselineVerified(ticket);
+    if (wasVerified) {
+      const downgraded = await mustPersist(() => beads.unverifyBoardEvidenceBaseline(repo, ticket.id));
+      if (!downgraded) return null;
+      const downgradeSynced = await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false);
+      if (!downgradeSynced) return null;
+    }
+    return lockDispatchBaseline(
+      repo,
+      wasVerified
+        ? { ...ticket, metadata: { ...ticket.metadata, boardEvidenceBaselineVerified: undefined } }
+        : ticket,
+      baseline,
+    );
+  }
 
   let confirmed = baseline;
   for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
@@ -675,6 +719,29 @@ async function lockDispatchBaseline(
   // hand back a locked baseline that may still omit a change landing right now, and clear the stray
   // locked value this loop itself left behind rather than leave it for the next attempt to trust.
   return abandonDispatchBaseline(repo, ticket);
+}
+
+/**
+ * Durably mark that dispatch has actually begun against the baseline `ensureBoardBaselinePersisted`
+ * just handed back (chatgpt-codex-connector, PR #284 review, "Distinguish pre-dispatch locks from
+ * recovery baselines") — the caller (`runTicket`) calls this once, right before the agent session
+ * starts and never before. See {@link beads.setBoardEvidenceDispatchStarted}'s own docstring for why
+ * `boardEvidenceBaselineVerified` alone cannot stand in for it: that flag only proves
+ * `lockDispatchBaseline`'s stability round found the PRE-dispatch candidate stable, which happens
+ * before this call and says nothing about whether dispatch itself ever started.
+ *
+ * Retried and push-confirmed like every other write in this module — a failure here must refuse
+ * dispatch (the caller throws rather than proceeding), since dispatching anyway would leave a
+ * locked-and-verified baseline with no durable record dispatch began, indistinguishable on a resume
+ * from one a crash caught before dispatch ever started.
+ */
+export async function markDispatchStarted(repo: string, ticket: Bead): Promise<boolean> {
+  const persisted = await mustPersist(() => beads.setBoardEvidenceDispatchStarted(repo, ticket.id));
+  if (!persisted) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
 }
 
 /**

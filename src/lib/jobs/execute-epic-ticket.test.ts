@@ -21,6 +21,7 @@ const readBoardEvidenceMock = vi.fn();
 const clearBoardEvidencePendingMock = vi.fn();
 const ensureBoardBaselinePersistedMock = vi.fn();
 const abandonDispatchBaselineMock = vi.fn();
+const markDispatchStartedMock = vi.fn();
 const mustReadMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
@@ -59,6 +60,7 @@ vi.mock("./execute-epic-board-evidence", async () => {
     clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
     ensureBoardBaselinePersisted: (...args: unknown[]) => ensureBoardBaselinePersistedMock(...args),
     abandonDispatchBaseline: (...args: unknown[]) => abandonDispatchBaselineMock(...args),
+    markDispatchStarted: (...args: unknown[]) => markDispatchStartedMock(...args),
   };
 });
 
@@ -256,6 +258,7 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x1"], synced: true });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
+    markDispatchStartedMock.mockResolvedValue(true);
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -354,6 +357,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
     vi.resetAllMocks();
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
+    markDispatchStartedMock.mockResolvedValue(true);
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -530,6 +534,7 @@ describe(
       vi.resetAllMocks();
       dispatchMock.mockReset();
       readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
+      markDispatchStartedMock.mockResolvedValue(true);
       // A benign "nothing changed" default for tests below that DO reach dispatch and exercise the
       // catch-side audit (`auditBoardOnFailedTicket`) after a real step failure.
       readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
@@ -567,6 +572,36 @@ describe(
         expect(settled.e.message).toMatch(/was not dispatched/);
         expect(settled.e.message).toMatch(/could not be durably persisted/);
         expect(settled.e.message).not.toMatch(/could not be read/);
+      },
+    );
+
+    it(
+      "fails closed before the agent ever dispatches when the baseline was persisted fine but " +
+        "dispatch could not be durably marked as begun (chatgpt-codex-connector, PR #284 review, " +
+        "\"Distinguish pre-dispatch locks from recovery baselines\") — dispatching anyway would " +
+        "leave a locked baseline a resume cannot tell apart from one preserved after a dispatch " +
+        "that genuinely ran",
+      async () => {
+        ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
+        markDispatchStartedMock.mockResolvedValue(false);
+
+        await expect(
+          runTicket({
+            run: run(),
+            steps: [neverDispatchedStep()],
+            ticket: boardTicket,
+            runTicketIds: [boardTicket.id],
+            timeoutMs: 5_000,
+          }),
+        ).rejects.toThrow("settled as a failure");
+
+        // The step handler never runs — dispatch is refused before `walkTicketSteps` is ever called.
+        expect(dispatchMock).not.toHaveBeenCalled();
+        expect(readBoardEvidenceMock).not.toHaveBeenCalled();
+        expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+        const settled = settleFailedTicketMock.mock.calls[0]![0] as { e: Error };
+        expect(settled.e.message).toMatch(/was not dispatched/);
+        expect(settled.e.message).toMatch(/could not durably record that dispatch itself was about to begin/);
       },
     );
 

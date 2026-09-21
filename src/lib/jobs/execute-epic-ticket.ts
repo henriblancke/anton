@@ -20,6 +20,7 @@ import {
   clearBoardEvidencePending,
   ensureBoardBaselinePersisted,
   isBoardOnlyRun,
+  markDispatchStarted,
   readBoardBaseline,
   readBoardEvidence,
   type BoardEvidenceResult,
@@ -181,6 +182,18 @@ export async function runTicket(args: {
     // unreadable case above so the message never claims a read failure that did not happen.
     if (boardBaselinePersistFailed) {
       throw new NoDeliveryError(boardOnlyBaselineNotPersistedMessage(ticket));
+    }
+    // The last write before the agent ever runs (chatgpt-codex-connector, PR #284 review,
+    // "Distinguish pre-dispatch locks from recovery baselines"): `boardBaseline`'s locked+verified
+    // flags alone only prove `lockDispatchBaseline`'s stability round found it stable BEFORE
+    // dispatch — a crash right after that, before this lands, would leave a resumed attempt's
+    // `ensureBoardBaselinePersisted` with nothing to tell that shape apart from a baseline genuinely
+    // preserved after a dispatch attempt ran. Failing closed here, before `walkTicketSteps` ever
+    // starts, keeps the ambiguity from ever reaching the board: dispatching without a durable record
+    // that dispatch began would let a later resume trust this baseline untouched over board drift
+    // that happened while nothing was actually running.
+    if (boardOnly && boardBaseline && !(await markDispatchStarted(run.repoPath, ticket))) {
+      throw new NoDeliveryError(boardOnlyDispatchNotMarkedMessage(ticket));
     }
     dispatchStarted = true;
     await walkTicketSteps({
@@ -776,6 +789,24 @@ function boardOnlyBaselineNotPersistedMessage(ticket: Bead): string {
     `retry would then diff as no evidence at all, permanently. Halting before dispatch instead: check ` +
     `the beads DB and the sync channel, then resume the run — the ticket is left open (not blocked) so ` +
     `that resume can reclaim it directly.`
+  );
+}
+
+/**
+ * Why a board-only ticket was never dispatched at all (PR #284 review, "Distinguish pre-dispatch
+ * locks from recovery baselines") — the pre-dispatch baseline was read AND anchored, but this
+ * attempt could not durably record that dispatch itself was about to begin.
+ */
+function boardOnlyDispatchNotMarkedMessage(ticket: Bead): string {
+  return (
+    `${ticket.id} was not dispatched: this ticket is marked \`delivery:board\`, whose deliverable is bd ` +
+    `writes to the board, not the git tree — the pre-dispatch baseline was anchored, but this attempt ` +
+    `could not durably record that dispatch itself was about to begin (after retries). Dispatching ` +
+    `anyway would leave a locked baseline indistinguishable, on a resumed attempt, from one preserved ` +
+    `after a dispatch that genuinely ran — skipping the refresh that would otherwise fold in board ` +
+    `drift from this exact downtime, and crediting a no-op agent with writes it never produced. ` +
+    `Halting before dispatch instead: check the beads DB and the sync channel, then resume the run — ` +
+    `the ticket is left open (not blocked) so that resume can reclaim it directly.`
   );
 }
 
