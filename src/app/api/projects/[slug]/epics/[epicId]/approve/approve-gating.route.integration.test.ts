@@ -599,13 +599,33 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
   // around the single write — a forced list + board build before it, an ownership `show`, then a
   // second forced list + board build after it — with every one of them queued behind the Dolt lock on
   // the operator's critical path. The trimmed path reads once and answers off state it already holds.
-  it("spends at most two bd reads on a normal approve", async () => {
+  //
+  // PR #274 raised the floor from two to four, in two independent places, neither of them safe to
+  // skip:
+  //
+  //  1. `getBoard` (route.ts:239) now always asks `readAllIssues` for authoritative `bd dep cycles`
+  //     evidence, because the picker ranking it derives inline (anton-r0ew) runs every candidate
+  //     through `makeApprovalGate` (picker-targets.ts), which fails every target closed with
+  //     `missingCycleEvidenceGap()` when the board carries none (approval-gate.ts) — an empty Up Next
+  //     lane and no provenance badges on every card, not just this one. Pairing that evidence with a
+  //     consistent board costs its own `sameBlocksEdges` recheck (`attachCyclesBestEffort` in
+  //     issues.ts) whenever the repo carries a `blocks` edge ANYWHERE — a second `bd list` this read
+  //     alone did not need before.
+  //  2. The under-lock re-read (`approveAndClaim`) opts into the same evidence for
+  //     `needsCycles`/`willEnqueue` targets, and pays the identical `sameBlocksEdges` recheck for the
+  //     identical reason: `structureGaps` walks the LOCKED board's raw `blocks` edges directly for
+  //     the dangling-blocker/self-block/duplicates rules, so an edge that moved between its `bd list`
+  //     and its `bd dep cycles` calls has to be caught here too, not just for the cycle rule (see
+  //     `LoadIssuesOptions.skipCycleConsistencyRecheck`'s doc, PR #274 review round 17 — skipping it
+  //     on this call is explicitly called out as unsafe).
+  it("spends at most four bd reads on a normal approve", async () => {
     // A target the operator already owns (the UI's Force run / re-approve): the CAS finds the
-    // assignee already where it wants it, so the whole request is one forced `bd list` for the
-    // readiness gate plus one under-lock re-read — no board refresh after the write, no ownership
-    // `show`. The under-lock read is a `bd list` rather than a `bd show` because it re-judges the
-    // board SHAPE (has a feature child landed under this target?), not just the assignee — and the
-    // CAS reuses it, so re-validating the shape costs no extra spawn.
+    // assignee already where it wants it, so the whole request is the readiness gate's forced `bd
+    // list`, the board build's own cycle-evidence fetch-and-recheck (two more `bd list` calls), and
+    // one under-lock re-read (a further two `bd list` calls) — no board refresh after the write, no
+    // ownership `show`. The under-lock read re-judges the board SHAPE (has a feature child landed
+    // under this target?), not just the assignee — and the CAS reuses it, so re-validating the shape
+    // costs no extra spawn beyond its own cycle-consistency recheck.
     actAs("anton-test");
     const epic = await beads.create(repo, { title: "Read-economy epic", type: "epic", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Read-economy epic child", type: "task", acceptance: "- [ ] it works" });
@@ -627,10 +647,11 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     try {
       const res = await approve(epic);
       expect(res.status).toBe(200);
-      expect(readsAtWrite).toBeLessThanOrEqual(2);
-      // The readiness gate + the under-lock re-check; the board build reuses the first, and the CAS
-      // reuses the second, so re-validating the shape adds no `bd show` before the write.
-      expect(listSpy).toHaveBeenCalledTimes(2);
+      expect(readsAtWrite).toBeLessThanOrEqual(4);
+      // The readiness gate (one `bd list`), the board build's cycle-evidence fetch-and-recheck (two
+      // more), and the under-lock re-check (two more); the CAS reuses the locked read, so
+      // re-validating the shape adds no `bd show` before the write.
+      expect(listSpy).toHaveBeenCalledTimes(4);
     } finally {
       tagSpy.mockRestore();
       listSpy.mockRestore();
@@ -778,8 +799,10 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     // read), which is the claim guard and stays. What must NOT come back is a second forced `bd list`
     // for the RESPONSE: the write flags the snapshot pendingWrite, so the client's next poll blocks
     // on a fresh read anyway — and the 200 body still carries the just-written approval + assignee.
-    // The two lists both sit BEFORE the write: the readiness gate, then the under-lock shape
-    // re-check the approval's correctness rests on.
+    // All four lists sit BEFORE the write: the readiness gate, the board build's own cycle-evidence
+    // fetch-and-recheck, then the under-lock shape re-check the approval's correctness rests on —
+    // itself paying the same cycle-evidence fetch-and-recheck once the repo carries a `blocks` edge
+    // anywhere (see the "spends at most four bd reads" test above).
     actAs("anton-test");
     const epic = await beads.create(repo, { title: "Read-economy unclaimed", type: "epic", acceptance: "- [ ] it works" });
     const child = await beads.create(repo, { title: "Read-economy unclaimed child", type: "task", acceptance: "- [ ] it works" });
@@ -793,7 +816,7 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
       const { item } = await res.json();
       expect(item.approved).toBe(true);
       expect(item.assignee).toBe("anton-test");
-      expect(listSpy).toHaveBeenCalledTimes(2);
+      expect(listSpy).toHaveBeenCalledTimes(4);
     } finally {
       listSpy.mockRestore();
       syncSpy.mockRestore();
