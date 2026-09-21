@@ -1274,10 +1274,11 @@ export async function listFilesAtRev(
 
 /**
  * One symlink entry found while walking {@link listFilesAtRev}, expanded to the files it actually
- * names: itself, when its target is a file at `rev` (the leaf-symlink case {@link readFileBytesAtRev}
- * already follows one hop of on its own); its target directory's files, recursively, when the target
- * is a directory (the shape `ls-tree -r` cannot see through at all); or nothing, for a link that is
- * broken or leaves the repository — same as {@link resolveRepoPath}'s undefined.
+ * names: itself, when the chain it starts ultimately lands on a file at `rev` (the leaf-symlink case
+ * {@link readFileBytesAtRev} follows on its own when the content is actually read); its target
+ * directory's files, recursively, when the chain lands on a directory (the shape `ls-tree -r` cannot
+ * see through at all); or nothing, for a chain that is broken, leaves the repository, or runs past
+ * {@link MAX_SYMLINK_HOPS} — same as {@link resolveRepoPath}'s undefined.
  */
 async function expandSymlinkedFileAtRev(
   worktreePath: string,
@@ -1287,14 +1288,35 @@ async function expandSymlinkedFileAtRev(
   stack: Set<string>,
 ): Promise<Array<{ rel: string; path: string }>> {
   const rel = path.slice(prefix.length);
+  const resolved = await resolveSymlinkChainAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+  if (!resolved) return [];
+  if (resolved.kind === "blob") return [{ rel, path }];
+  const nested = await listFilesAtRev(worktreePath, rev, resolved.path, stack);
+  return nested.map((entry) => ({ rel: `${rel}/${entry.rel}`, path: entry.path }));
+}
+
+/**
+ * Follows a chain of symlinks starting at `path` to its final blob or tree entry at `rev`, the same
+ * hop-bounded way {@link readBlobAtRev} follows one for file content. Needed here too: `ls-tree`
+ * reports a symlink-to-symlink as `blob`, same as a real leaf file, so classifying off one hop alone
+ * misreads a chain like `assets -> shared-link -> real-dir` as `assets` naming a file instead of
+ * recursing into `real-dir` (anton-z33ia review, PR #313).
+ */
+async function resolveSymlinkChainAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<{ kind: "blob" | "tree"; path: string } | undefined> {
+  const kind = await treeEntryKindAtRev(worktreePath, rev, path);
+  if (kind === "tree") return { kind, path };
+  if (kind !== "blob") return undefined;
+  const mode = await blobModeAtRev(worktreePath, rev, path);
+  if (mode !== SYMLINK_MODE) return { kind: "blob", path };
+  if (hops <= 0) return undefined;
   const text = await git(worktreePath, ["show", `${rev}:${path}`, "--"]);
   const target = resolveRepoPath(path, text);
-  if (!target) return [];
-  const kind = await treeEntryKindAtRev(worktreePath, rev, target);
-  if (kind === "blob") return [{ rel, path }];
-  if (kind !== "tree") return [];
-  const nested = await listFilesAtRev(worktreePath, rev, target, stack);
-  return nested.map((entry) => ({ rel: `${rel}/${entry.rel}`, path: entry.path }));
+  return target ? resolveSymlinkChainAtRev(worktreePath, rev, target, hops - 1) : undefined;
 }
 
 /**

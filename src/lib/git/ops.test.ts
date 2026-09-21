@@ -3698,6 +3698,22 @@ suite("listFilesAtRev (real git)", () => {
     );
   });
 
+  it("follows a symlink chain through an intermediate symlink to the real directory", async () => {
+    // `assets -> shared-link -> real-dir`: `shared-link` is itself a symlink, so `ls-tree` reports it
+    // as a blob, same as a real leaf file. Classifying `chained` off that one hop alone would misfile
+    // it as a file instead of recursing into `shared/branding` (anton-z33ia review, PR #313).
+    link("shared/relay", "branding");
+    link("skill/chained", "../shared/relay");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "add chained symlink onto a symlink"]);
+
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const asset = files.find((f) => f.rel === "chained/logo.svg");
+    const nested = files.find((f) => f.rel === "chained/nested/mark.svg");
+    expect(asset?.path).toBe("shared/branding/logo.svg");
+    expect(nested?.path).toBe("shared/branding/nested/mark.svg");
+  });
+
   it("returns nothing for a directory with no files at rev", async () => {
     expect(await listFilesAtRev(repo, "main", "skill/templates/nope")).toEqual([]);
   });
