@@ -1021,10 +1021,13 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
     expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
   });
 
+  // anton-fc5x review, "Re-diff baseline-only resumes despite an old commit": a ticket's OWN
+  // commit being on this branch (`hasCommitMock` true) is no substitute for the same re-diff the
+  // no-commit recovery path below already applies — the baseline surviving alone still just means
+  // no evidence check ever completed, whether or not this branch happens to carry a commit for it.
   it(
-    "retries the cleanup for a surviving preserved baseline alone, even with no pending marker " +
-      "(PR #284 review) — a prior halt can clear the marker and then exhaust its retries on just " +
-      "the baseline, so the resume must still reach it",
+    "re-diffs a surviving preserved baseline alone instead of confirming it empty, even with this " +
+      "ticket's own commit already on the branch",
     () => {
       const child = bead("anton-a", {
         status: "closed",
@@ -1032,10 +1035,39 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
         metadata: { boardEvidenceBaseline: JSON.stringify({ a: "hash" }) },
       });
       hasCommitMock.mockResolvedValue(true);
+      readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-eb1"], synced: true });
 
       return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
         expect(runTicketMock).not.toHaveBeenCalled();
-        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", child, [], true, false);
+        expect(readBoardBaselineMock).toHaveBeenCalledWith("/tmp/anton-repo", child);
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+          "/tmp/anton-repo",
+          child,
+          ["anton-eb1"],
+          true,
+          false,
+        );
+      });
+    },
+  );
+
+  it(
+    "halts instead of confirming a baseline-alone resume the re-diff finds no evidence for, even " +
+      "with this ticket's own commit already on the branch",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(true);
+      readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+
+      return expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
       });
     },
   );

@@ -1093,6 +1093,57 @@ export async function branchDelivery(
   return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
 }
 
+/**
+ * Re-diffs a preserved baseline against the live board when it is the ONLY board-evidence
+ * survivor for a done, board-only ticket — the baseline's mere presence never proves a bd write
+ * happened, since `lockDispatchBaseline`/`ensureBoardBaselinePersisted` write it unconditionally
+ * before every board-only dispatch, whether or not the agent (or `readBoardEvidence`) ever ran (PR
+ * #284 review, "Do not confirm baseline-only resumes as delivered"). Shared by both resume shapes
+ * that can land on a baseline-only survivor: the no-commit recovery path below, and the
+ * `if (delivery)` fast path above — a reopened ticket can carry an OLD attribution commit from a
+ * PRIOR delivery cycle while `ensureBoardBaselinePersisted` reset confirmation for a NEW one
+ * (anton-fc5x review, "Re-diff baseline-only resumes despite an old commit"), so an old commit
+ * being present on this branch is no substitute for this re-diff either.
+ */
+async function reDiffPreservedBaseline(repo: string, ticket: Bead): Promise<{ ids: string[]; ticket: Bead }> {
+  const baseline = await readBoardBaseline(repo, ticket);
+  const result = baseline ? await readBoardEvidence(repo, baseline, ticket) : undefined;
+  if (!result?.found) {
+    throw new PoisonEpic(
+      `${ticket.id} is done on the board (closed, or moved to review) and this run is marked ` +
+        `\`delivery:board\`, whose deliverable is bd writes to the board — but only a ` +
+        `pre-dispatch baseline survives from a prior attempt whose evidence check never ` +
+        `completed, and re-diffing that baseline against the board just now found ` +
+        `${result ? "no bd write since the baseline was taken" : "the board unreadable"}. ` +
+        `Accepting this ticket as delivered on the baseline's presence alone would be a false ` +
+        `success. Check the beads DB and the sync channel, then resume the run once the board ` +
+        `read is healthy — or, if ${ticket.id}'s board delivery genuinely happened outside this ` +
+        `evidence check, resolve it by hand before reclaiming the epic.`,
+    );
+  }
+  // Re-read before clearing, mirroring `runTicket`'s own success path in execute-epic-ticket.ts
+  // (chatgpt-codex-connector, PR #284 review, "Re-read the ticket before clearing re-diffed
+  // evidence"): `readBoardEvidence` just above may have added a fresh
+  // `board-evidence-pending:*` label to the LIVE bead, but the caller's `ticket` snapshot predates
+  // this resume and carries none of it. `clearBoardEvidencePending` derives which label to remove
+  // from the bead it is passed, so handing it the stale snapshot leaves that new label stranded on
+  // the board for a later reopen to union into a fresh evidence check and misread as current
+  // evidence. A failed re-read must not fall back to the stale snapshot — poison instead, since
+  // this ticket is already done on the board and silently mislabeling the cleanup risks a
+  // false-evidence strand no later attempt would know to look for.
+  const freshTicket = await mustRead(repo, ticket.id);
+  if (!freshTicket) {
+    throw new PoisonEpic(
+      `${ticket.id}'s board evidence was just re-diffed and found, but the ticket could not be ` +
+        `re-read to find its live board-evidence-pending label before cleanup — clearing it ` +
+        `from the stale pre-dispatch snapshot risks leaving that label on the board, which a ` +
+        `later reopen could misread as current evidence for no new work. Check the beads DB, ` +
+        `then resume the run.`,
+    );
+  }
+  return { ids: result.ids, ticket: freshTicket };
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -1183,13 +1234,27 @@ async function dispatchTicket(
     // `clearBoardEvidencePending` would overwrite the durable confirmation with an empty array
     // instead of retrying it with the real ids — `setBoardEvidenceConfirmed` is not idempotent on
     // its `ids` argument (see that function's own docstring).
-    const idsToConfirm = [
+    let idsToConfirm = [
       ...new Set([
         ...stalePending,
         ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
         ...beads.confirmedBoardEvidenceIds(ticket),
       ]),
     ].toSorted();
+    // A reopened board-only ticket can still carry an OLD attribution commit from a PRIOR delivery
+    // cycle — `branchDelivery`'s scan is unbounded, so `delivery` is truthy here even though
+    // `ensureBoardBaselinePersisted` reset confirmation for THIS cycle when the ticket reopened
+    // (anton-fc5x review, "Re-diff baseline-only resumes despite an old commit"). If the only
+    // survivor is the fresh pre-dispatch baseline this new cycle wrote, an empty `idsToConfirm`
+    // here is not proof nothing changed — it just means this cycle's own evidence check never
+    // completed. Re-diffing before clearing (mirroring the no-commit recovery path below) keeps a
+    // process death right after this new attempt closes the ticket from being confirmed as
+    // delivered with zero evidence.
+    if (idsToConfirm.length === 0 && hasPreservedBaseline) {
+      const rediffed = await reDiffPreservedBaseline(repo, ticket);
+      idsToConfirm = rediffed.ids;
+      ticket = rediffed.ticket;
+    }
     // Recorded into the ledger BEFORE the clear, mirroring the fresh-run path below (PR #284
     // review): these ids are exactly the confirmed evidence the reviewer's board-only section
     // cross-checks, and `deliveredTickets` carries this ticket into `ReviewRun.tickets`
@@ -1316,44 +1381,9 @@ async function dispatchTicket(
     // baseline against the board now, the same comparison the original evidence check would have
     // made, before trusting this as a delivery.
     if (recoveredIds.length === 0) {
-      const baseline = await readBoardBaseline(repo, ticket);
-      const result = baseline ? await readBoardEvidence(repo, baseline, ticket) : undefined;
-      if (!result?.found) {
-        throw new PoisonEpic(
-          `${ticket.id} is done on the board (closed, or moved to review) and this run is marked ` +
-            `\`delivery:board\`, whose deliverable is bd writes to the board — but only a ` +
-            `pre-dispatch baseline survives from a prior attempt whose evidence check never ` +
-            `completed, and re-diffing that baseline against the board just now found ` +
-            `${result ? "no bd write since the baseline was taken" : "the board unreadable"}. ` +
-            `Accepting this ticket as delivered on the baseline's presence alone would be a false ` +
-            `success. Check the beads DB and the sync channel, then resume the run once the board ` +
-            `read is healthy — or, if ${ticket.id}'s board delivery genuinely happened outside this ` +
-            `evidence check, resolve it by hand before reclaiming the epic.`,
-        );
-      }
-      recoveredIds = result.ids;
-      // Re-read before clearing, mirroring `runTicket`'s own success path in execute-epic-ticket.ts
-      // (chatgpt-codex-connector, PR #284 review, "Re-read the ticket before clearing re-diffed
-      // evidence"): `readBoardEvidence` just above may have added a fresh
-      // `board-evidence-pending:*` label to the LIVE bead, but `ticket` here is still the snapshot
-      // read before this resume began and carries none of it. `clearBoardEvidencePending` derives
-      // which label to remove from the bead it is passed, so handing it the stale snapshot leaves
-      // that new label stranded on the board for a later reopen to union into a fresh evidence
-      // check and misread as current evidence. A failed re-read must not fall back to the stale
-      // `ticket` (same reasoning as the mirrored path) — poison instead, since this ticket is
-      // already done on the board and silently mislabeling the cleanup risks a false-evidence
-      // strand no later attempt would know to look for.
-      const freshTicket = await mustRead(repo, ticket.id);
-      if (!freshTicket) {
-        throw new PoisonEpic(
-          `${ticket.id}'s board evidence was just re-diffed and found, but the ticket could not be ` +
-            `re-read to find its live board-evidence-pending label before cleanup — clearing it ` +
-            `from the stale pre-dispatch snapshot risks leaving that label on the board, which a ` +
-            `later reopen could misread as current evidence for no new work. Check the beads DB, ` +
-            `then resume the run.`,
-        );
-      }
-      ticket = freshTicket;
+      const rediffed = await reDiffPreservedBaseline(repo, ticket);
+      recoveredIds = rediffed.ids;
+      ticket = rediffed.ticket;
     }
     await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
     if (recoveredIds.length > 0) {
