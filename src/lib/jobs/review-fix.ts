@@ -241,6 +241,16 @@ type RecoveryResult = "recovered" | "attempted" | "skipped";
  * monitoring resume if it were reopened. So recovery only proceeds once the PR itself confirms a
  * merge landed (chatgpt-codex-connector, PR #284 review, "Restrict recovery to actual unfenced
  * finalizations"); anything else — no PR ref, or a PR that never merged — is left exactly as is.
+ *
+ * `runTickets` is status-blind by construction (it filters on shape, not state), so `closedNow` can
+ * carry a child someone reopened after `closeFinalized`'s own batch close landed but before this
+ * retry ran. `stampConfirmedClosures` only ever looks at confirmation metadata, never status — a
+ * reopened child with no unfenced board-evidence confirmation of its own is silently excluded from
+ * its `unfenced` set, so the call can return `true` vacuously over a subtree that is not actually
+ * all closed. Requiring every member of `closedNow` to still read `closed` here is what
+ * `closeFinalized`'s own fresh-read loop already guards for the batch close itself (chatgpt-codex-
+ * connector, PR #284 review, "Recheck reopened children before clearing finalization") — this is
+ * the same guard for the fence retry.
  */
 async function recoverUnfencedClosure(
   repo: string,
@@ -253,6 +263,7 @@ async function recoverUnfencedClosure(
   const pr = await getPrReview(repo, number, signal);
   if (pr.state !== "MERGED") return "skipped"; // closed by hand, not by finalization — leave it
   const closedNow = [...runTickets(all, epic.id), epic];
+  if (closedNow.some((b) => b.status !== "closed")) return "skipped"; // a child was reopened — not actually finalized
   if (!(await stampConfirmedClosures(repo, closedNow))) return "attempted";
   await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
   return "recovered";
@@ -332,20 +343,32 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
       consoleLog.error(`epic ${stuck.id}: unfenced-closure recovery failed`, e);
     }
   }
+  // Rejected, not swallowed (chatgpt-codex-connector, PR #284 review, "Propagate closure-recovery
+  // sync failures"): `beads.sync` rejects on a real push failure, and a `.catch`-and-log here would
+  // report this pass as a clean recovery while the fence/untag it just committed sits unpushed —
+  // `closedUnfencedEpics` already excludes the epic locally, so no same-machine retry would ever
+  // notice. Thrown below alongside `lastError`, so the job itself is the retry signal instead.
+  let syncError: unknown;
   if (wroteToBoard) {
-    await beads
-      .sync(repo)
-      .catch((e) => consoleLog.error("beads dolt sync failed after closure-fence recovery", e));
+    try {
+      await beads.sync(repo);
+    } catch (e) {
+      syncError = e;
+      consoleLog.error("beads dolt sync failed after closure-fence recovery", e);
+    }
   }
 
   if (targets.length === 0) {
+    if (syncError !== undefined) {
+      throw syncError instanceof Error ? syncError : new Error(String(syncError));
+    }
     return recovered > 0
       ? { changed: true, note: `fenced ${recovered} previously-stranded closure(s)` }
       : { changed: false, note: "nothing in review" };
   }
 
   let dispatched = 0;
-  let lastError: unknown;
+  let lastError: unknown = syncError;
   for (const target of targets) {
     await ctx.heartbeat();
     try {
@@ -355,7 +378,9 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
       if (ctx.enqueueReviewFixPr(projectId, target.id)) dispatched += 1;
     } catch (e) {
       // One unreadable PR must not cost the others their dispatch; the failure is surfaced below.
-      lastError = e;
+      // A prior sync failure is not overwritten — both are already logged, and either is enough to
+      // fail the pass.
+      lastError ??= e;
       consoleLog.error(`epic ${target.id}: triage failed; continuing fan-out`, e);
     }
   }
