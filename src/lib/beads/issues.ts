@@ -158,7 +158,15 @@ export async function loadAllIssues(
   // make it MORE wrong. Re-listing and comparing edges catches the empty case: if the graph moved
   // between the two reads, retry against whatever is current instead of pairing evidence with a
   // board it no longer describes.
-  if (cycles.length === 0 && !sameBlocksEdges(work, await loadWorkIssues(cwd))) {
+  //
+  // Also gated on `work` actually carrying a `blocks` edge (anton-gh4a9 review, PR #274): the race
+  // this guards against is a repair removing one edge of a cycle `work` already captured, so a board
+  // with zero `blocks` edges has no cyclic pair that could be stale — the second `bd list` this
+  // recheck costs would buy nothing. This is what keeps approve's read-economy invariant (at most
+  // two `bd list` calls) true for the overwhelmingly common blocks-edge-free target, while a board
+  // that does carry `blocks` edges still pays for the recheck.
+  const workHasBlocksEdge = beads.edgesOf(work).some((e) => e.type === "blocks");
+  if (cycles.length === 0 && workHasBlocksEdge && !sameBlocksEdges(work, await loadWorkIssues(cwd))) {
     if (attempt >= MAX_CYCLE_CONSISTENCY_RETRIES) {
       throw new Error(
         `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_CYCLE_CONSISTENCY_RETRIES + 1} ` +

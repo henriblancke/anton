@@ -181,15 +181,15 @@ describe("loadAllIssues", () => {
     listMock
       .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
       .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
-      .mockImplementationOnce(async () => [repaired, other]) // retry's work read
-      .mockImplementationOnce(async () => [repaired, other]); // retry's recheck — now consistent
+      .mockImplementationOnce(async () => [repaired, other]); // retry's work read — no blocks edge left,
+    // so the retry's own recheck is skipped (nothing cyclic in this snapshot could be stale)
     cyclesMock.mockResolvedValue([]);
 
     const board = await loadAllIssues(REPO, { withCycles: true });
 
     expect(board).toEqual([repaired, other]);
     expect(cycleEvidenceFor(board)).toEqual([]);
-    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(listMock).toHaveBeenCalledTimes(3);
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
