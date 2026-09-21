@@ -248,10 +248,12 @@ describe("validateBoardStructure", () => {
       ]);
     });
 
-    it("blocks at board scope a cycle made entirely of pipeline artifacts (gates/molecules)", () => {
+    it("blocks each member of a cycle made entirely of pipeline artifacts (gates/molecules)", () => {
       // isJudged excludes gate/molecule beads, so the per-bead loop above never reaches either of
-      // these ids' cycle-membership check — without the board-level fallback, a loop wired entirely
-      // out of ad-hoc gates would report as a clean board despite bd's own detector finding it.
+      // these ids' cycle-membership check — without this fallback, a loop wired entirely out of
+      // ad-hoc gates would report as a clean board despite bd's own detector finding it. Faulted at
+      // each member's own id (not a synthetic "board" id) so `structureGaps` subtree-scopes it like
+      // any other mapped cycle, rather than gating every run target on the board.
       const board = [
         bead("g1", "gate", { dependencies: [blocks("g1", "g2")] }),
         bead("g2", "molecule", { dependencies: [blocks("g2", "g1")] }),
@@ -259,8 +261,9 @@ describe("validateBoardStructure", () => {
       const violations = validateBoardStructure(board, {
         cycles: [{ ids: ["g1", "g2"], raw: { cycle: ["g1", "g2"] } }],
       });
-      expect(violations).toEqual([
-        expect.objectContaining({ id: "board", rule: "blocks-cycle", severity: "blocking" }),
+      expect(violations.map((v) => [v.id, v.rule, v.severity])).toEqual([
+        ["g1", "blocks-cycle", "blocking"],
+        ["g2", "blocks-cycle", "blocking"],
       ]);
       expect(violations[0].message).toContain("g1");
       expect(violations[0].message).toContain("g2");
@@ -459,11 +462,26 @@ describe("structureGaps", () => {
 
   it("blocks every target, not just one whose subtree holds the cycle, on an unreadable bd cycle record (review finding)", () => {
     // The `blocks-cycle` fault bd's report couldn't be fully mapped to board ids lands on the
-    // synthetic "board" id, deliberately bypassing subtree scoping (tiers.mjs:346) — there is no
+    // synthetic "board" id, deliberately bypassing subtree scoping (tiers.mjs:360) — there is no
     // subtree to scope it to, since anton cannot name the cycle's members. `f2` has no relationship
     // to any bead bd might have meant, yet it still refuses: fail-safe over availability.
     const gaps = structureGaps("f2", BOARD, { cycles: [{ ids: [], raw: { unexpected: true } }] });
     expect(gaps.blocking.map((v) => v.id)).toEqual(["board"]);
+  });
+
+  it("scopes a fully-mapped pipeline cycle to the run target that owns it (review finding)", () => {
+    // Unlike the unreadable-record case above, a cycle of gates/molecules IS fully mapped to real
+    // board ids — so it must gate only the run target whose subtree contains those ids, not every
+    // target on the board. Approving f2 must not fail over a cycle that lives entirely under f1.
+    const board = [
+      ...BOARD,
+      bead("g1", "gate", { parent: "f1", dependencies: [blocks("g1", "g2")] }),
+      bead("g2", "molecule", { parent: "f1", dependencies: [blocks("g2", "g1")] }),
+    ];
+    const cycles = [{ ids: ["g1", "g2"], raw: { cycle: ["g1", "g2"] } }];
+
+    expect(structureGaps("f2", board, { cycles }).blocking).toEqual([]);
+    expect(structureGaps("f1", board, { cycles }).blocking.map((v) => v.id).sort()).toEqual(["g1", "g2"]);
   });
 });
 

@@ -418,7 +418,7 @@ export async function readIssueSnapshot(
   // read here would instead pick up whatever an invalidation bumped it to in the meantime — pairing
   // pre-write beads with a post-write generation a caller like `readAllIssues` trusts as current.
   const read = await refreshIssueSnapshotRead(cwd, loader, now);
-  return { beads: read.beads, version: entry.version, generation: read.generation };
+  return { beads: read.beads, version: read.version, generation: read.generation };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */

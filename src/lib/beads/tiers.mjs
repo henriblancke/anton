@@ -328,20 +328,28 @@ export function validateBoardStructure(board, { cycles } = {}) {
   // loop built entirely out of ad-hoc gates/molecules produced no violation despite bd's own detector
   // reporting it. Complete cycles only — an incomplete one is already covered by the unreadable-cycle
   // fallback below, and double-reporting it would fault the same bd record twice.
+  //
+  // Faulted at EACH member's own id, not the synthetic "board" id: every member here is a mapped,
+  // known bead (that is what "complete" means), so — unlike the unreadable-cycle fallback below,
+  // which has no members to name — `structureGaps`'s subtree scoping can and should apply. Faulting
+  // "board" would put this in every target's gap set via the `v.id === "board"` branch, failing an
+  // unrelated run B that shares no subtree with the cycle simply because run A's gates/molecules loop.
   for (const evidence of allCycles) {
     if (!evidence.complete) continue;
     const hasJudgedMember = [...evidence.members].some((id) => isJudged(byId.get(id)));
     if (hasJudgedMember) continue;
-    fault(
-      "board",
-      "blocks-cycle",
-      "blocking",
-      `bd dep cycles reported a blocks cycle with no judged member (${[...evidence.members].join(", ")}) ` +
-        "— every id is closed, abandoned, or a pipeline gate/molecule, so no bead on it ever reaches " +
-        "the per-bead check, yet the loop still deadlocks whatever depends on it. Break one edge on it " +
-        "(`bd dep remove <blocked> <blocker>`), then restore the intended order " +
-        "(`bd dep add <blocked> <blocker>`).",
-    );
+    for (const id of evidence.members) {
+      fault(
+        id,
+        "blocks-cycle",
+        "blocking",
+        `bd dep cycles reported a blocks cycle with no judged member (${[...evidence.members].join(", ")}) ` +
+          "— every id is closed, abandoned, or a pipeline gate/molecule, so no bead on it ever reaches " +
+          "the per-bead check, yet the loop still deadlocks whatever depends on it. Break one edge on it " +
+          "(`bd dep remove <blocked> <blocker>`), then restore the intended order " +
+          "(`bd dep add <blocked> <blocker>`).",
+      );
+    }
   }
 
   // `bd dep cycles` may report a real graph cycle in an encoding whose bead ids this version of
