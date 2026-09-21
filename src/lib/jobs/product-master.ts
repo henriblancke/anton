@@ -32,7 +32,7 @@
  */
 import { loadAllIssues } from "../beads/issues";
 import { nudgeSync, type NudgeTarget } from "../beads/sync-nudge";
-import { metered } from "../claude-invocations";
+import { metered, type InvocationDimensions } from "../claude-invocations";
 import { runClaude } from "../claude/driver";
 import { claudeRouting } from "../claude/driver-routing";
 import { getProjectSettings, resolveAutonomyPolicy } from "../projects";
@@ -168,19 +168,28 @@ export function makeProductMasterHandler(deps: ProductMasterDeps): JobHandler {
       });
       await ctx.heartbeat();
 
+      // Built once, before `judgeBoard` resolves what to attribute it to — the object
+      // `setAttribution` mutates once it does (PR #313 review, mirrors `execute-epic-ticket.ts`'s
+      // per-step meter). `metered` reads `dimensions` at CALL time, once `judgeBoard` has actually
+      // resolved the reasoning contract, so the object built here is the same one that read picks up.
+      const dimensions: InvocationDimensions = {
+        projectId: project.id,
+        jobType: ctx.type,
+        jobId: ctx.jobId,
+        step: "product-master",
+        stepHandler: "product-master",
+        modelRequested: settings.model,
+      };
       const claims = await judgeBoard(scope, {
         settings,
         boardInput,
         // Metered like every other invocation (anton-77l9). The pass writes no run row; `step` and
-        // `job_type` are what separate a board judgment's spend from a ticket's.
-        claude: metered(db, clock, {
-          projectId: project.id,
-          jobType: ctx.type,
-          jobId: ctx.jobId,
-          step: "product-master",
-          modelRequested: settings.model,
-        }, claude),
+        // `job_type` are what separate a board judgment's spend from a ticket's. No formula, no
+        // ticket and no composed system prompt, so `dimensions` above plus the reasoning attribution
+        // `judgeBoard` resolves are the whole stamp.
+        claude: metered(db, clock, dimensions, claude),
         onEvent: session.onEvent,
+        setAttribution: (attribution) => Object.assign(dimensions, attribution),
       });
 
       const accepted = await file(

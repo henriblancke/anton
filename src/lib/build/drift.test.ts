@@ -448,6 +448,32 @@ describe("recordServerBuild / serverBuildDrift", () => {
   });
 });
 
+describe("selfBuildVersion", () => {
+  // The on-disk fallback (a process with no boot identity — a CLI, a script, a test) is resolved
+  // once and held, same as `onDiskCache`, so it must clear on the same generation counter (PR #313
+  // review): a process that resolves the fallback and then pulls mid-life must not keep stamping the
+  // ledger with the pre-pull version forever.
+  it("re-reads the on-disk identity when a caller says this checkout just moved", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+    const { checkoutMoved, selfBuildVersion } = await import("./drift");
+
+    expect(selfBuildVersion()).toContain("0.4.0");
+
+    onDisk = { version: "0.4.1", revision: null };
+    expect(selfBuildVersion()).toContain("0.4.0"); // still the held read
+
+    checkoutMoved(`${app}/`);
+
+    expect(selfBuildVersion()).toContain("0.4.1");
+  });
+});
+
 /**
  * The aggregate every operator-facing surface reads (PR #217 review). One install routinely runs two
  * servers — a UI-only `ANTON_RUNNER=off` one serving the pages, a second executing the scheduled jobs

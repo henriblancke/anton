@@ -20,24 +20,61 @@
  * Pure Node, no deps: bin/anton.mjs (the launcher, which runs before any build) imports this.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, join } from "node:path";
 
-/** Digest length. 12 hex chars (48 bits) — collision-proof for a handful of files, readable in a warning. */
-const STAMP_LENGTH = 12;
+/**
+ * Digest length. 12 hex chars (48 bits) — collision-proof for a handful of files, readable in a
+ * warning. Exported because every other content stamp anton takes (the run formula's, anton-jpmdw)
+ * reuses it: one length, so two stamps are never told apart by their shape.
+ */
+export const STAMP_LENGTH = 12;
 
 /** Editor/OS droppings that must not decide whether a skill copy counts as pristine. */
 const IGNORED_FILES = new Set([".DS_Store", "Thumbs.db"]);
 
-/** Recursively list every file under `dir` as paths relative to `dir` (files only, sorted). */
-export function listFiles(dir, base = dir) {
+/**
+ * Recursively list every file under `dir` as paths relative to `dir` (files only, sorted).
+ *
+ * A symlinked entry (e.g. `SKILL.md` pointing at a file shared outside the skill directory) reports
+ * `false` from both `Dirent.isFile()` and `isDirectory()` — those describe the link itself, not its
+ * target — so it is resolved via `statSync` instead. A broken link stats neither true and is skipped,
+ * same as it not existing.
+ *
+ * `stack` tracks the REAL paths on the current descent (anton-z33ia review): a directory symlink
+ * back to itself or an ancestor (`.claude/skills/foo/loop -> ..`) would otherwise recurse forever
+ * and crash the CLI instead of being classified. Checked against the descent stack rather than
+ * every path ever visited, so two sibling symlinks that legitimately share one target directory —
+ * not a cycle, just reused content — are both still walked.
+ */
+export function listFiles(dir, base = dir, stack = new Set()) {
   if (!existsSync(dir)) return [];
+  let real;
+  try {
+    real = realpathSync(dir);
+  } catch {
+    return [];
+  }
+  if (stack.has(real)) return [];
+  stack.add(real);
   const out = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const abs = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...listFiles(abs, base));
-    else if (entry.isFile()) out.push(abs.slice(base.length + 1));
+    let isDir = entry.isDirectory();
+    let isFile = entry.isFile();
+    if (entry.isSymbolicLink()) {
+      try {
+        const stat = statSync(abs);
+        isDir = stat.isDirectory();
+        isFile = stat.isFile();
+      } catch {
+        continue;
+      }
+    }
+    if (isDir) out.push(...listFiles(abs, base, stack));
+    else if (isFile) out.push(abs.slice(base.length + 1));
   }
+  stack.delete(real);
   return out.sort();
 }
 
@@ -89,21 +126,44 @@ export function withoutStamp(md) {
 }
 
 /**
- * Content digest of a whole skill DIRECTORY — SKILL.md plus every bundled asset (setup's
- * `templates/`), so a template edit bumps the stamp exactly like a prose edit. Path names are part
- * of the input, so adding or renaming a file changes the digest too.
+ * Content digest of a skill directory's files, given as `[relativePath, bytes]` pairs rather than
+ * read from disk — the shared hashing core {@link skillDigest} and a caller reading the same shape
+ * from elsewhere (a git revision, for one — anton-z33ia review) both reduce to this, so two sources
+ * of the same content are guaranteed to land on the same digest rather than two hand-rolled hashes
+ * that could quietly drift apart.
+ *
+ * `SKILL.md`'s own declared stamp is stripped before hashing (see {@link withoutStamp}) — the stamp
+ * digests the file that carries it, so it has to be excluded from its own input. Every other path is
+ * hashed as-is. Path names are part of the input, so adding or renaming a file changes the digest.
  */
-export function skillDigest(dir) {
+export function digestFiles(entries) {
   const h = createHash("sha256");
-  for (const rel of listFiles(dir)) {
+  for (const [rel, raw] of entries) {
     if (IGNORED_FILES.has(basename(rel))) continue;
-    const raw = readFileSync(join(dir, rel));
     h.update(rel);
     h.update("\0");
     h.update(rel === "SKILL.md" ? Buffer.from(withoutStamp(raw.toString("utf8")), "utf8") : raw);
     h.update("\0");
   }
   return h.digest("hex").slice(0, STAMP_LENGTH);
+}
+
+/**
+ * Content digest of a whole skill DIRECTORY on disk — SKILL.md plus every bundled asset (setup's
+ * `templates/`), so a template edit bumps the stamp exactly like a prose edit.
+ */
+export function skillDigest(dir) {
+  return digestFiles(listFiles(dir).map((rel) => [rel, readFileSync(join(dir, rel))]));
+}
+
+/**
+ * Content digest of a single resolved TEXT string, truncated to {@link STAMP_LENGTH} — the same
+ * algorithm every content stamp anton takes reuses (the composed system prompt, a `prompt:<id>`
+ * step's resolved body, a run formula's own digest), so two stamps are never told apart by their
+ * shape or computed by two slightly different hashes that could one day disagree.
+ */
+export function textDigest(text) {
+  return createHash("sha256").update(text, "utf8").digest("hex").slice(0, STAMP_LENGTH);
 }
 
 /**

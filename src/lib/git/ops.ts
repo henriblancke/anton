@@ -1060,6 +1060,47 @@ async function readBlobAtRev(
 }
 
 /**
+ * The RAW bytes of a blob at `rev`, for a caller that hashes it — `readFileAtRev` decodes through
+ * `git()`'s `utf8` + `stdout.trim()`, which is right for a rules file read as text but wrong for a
+ * digest input: it drops leading/trailing whitespace `skillDigest` (skill-stamp.mjs) hashes as-is
+ * from disk, and it corrupts a non-UTF-8 asset (a binary template) before the digest ever sees its
+ * bytes. Same symlink-following as `readFileAtRev` (anton-z33ia review) so a skill directory that
+ * shares a file via a symlink digests the same content either way.
+ */
+export async function readFileBytesAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<Buffer | undefined> {
+  return readBlobBytesAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+}
+
+async function readBlobBytesAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<Buffer | undefined> {
+  const mode = await blobModeAtRev(worktreePath, rev, path);
+  if (mode === undefined) return undefined;
+  // Deliberately uncaught, same as `readBlobAtRev`: the tree above just reported a blob here, so a
+  // failing `show` is a read failure, not absence.
+  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "show", `${rev}:${path}`, "--"], {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+    encoding: "buffer",
+  });
+  const bytes = stdout as unknown as Buffer;
+  if (mode !== SYMLINK_MODE) return bytes;
+
+  if (hops <= 0) return undefined;
+  // A symlink's blob content IS its target pathname — text, never binary — so decoding it to resolve
+  // the next hop loses nothing the way decoding a regular file's bytes would.
+  const target = resolveRepoPath(path, bytes.toString("utf8").trim());
+  return target ? readBlobBytesAtRev(worktreePath, rev, target, hops - 1) : undefined;
+}
+
+/**
  * The tree mode of `path` at `rev`, or undefined when it is not a file there (missing, or a
  * directory). The mode is the only thing that tells a regular file from a symlink — both are blobs,
  * and `git show` reads them identically.
@@ -1160,6 +1201,201 @@ export async function listDirBlobsAtRev(
       })
       .filter((path): path is string => path !== undefined),
   );
+}
+
+/**
+ * Every FILE under `dir` at `rev`, recursively — the at-rev sibling of {@link listFiles} in
+ * skill-stamp.mjs, which walks the same shape off disk. Exists so a directory digest (a
+ * `skill:<id>` step's content stamp) can be taken from a COMMITTED tree rather than the working
+ * copy, the same reason {@link readFileAtRev} exists: a run's own diff must not be able to pick the
+ * instruction it is judged or described against.
+ *
+ * `-r` recurses through REAL subtrees, but `git ls-tree` never resolves a symlink — a symlinked
+ * asset directory surfaces as a single `120000` blob with none of its children, where `listFiles`'s
+ * disk-side walk (`readdirSync` + `statSync`, which the OS resolves transparently) sees straight
+ * through it. So a symlink entry found here is expanded: read, resolved, and — when it names a
+ * directory at `rev` — recursed into, matching {@link listFiles} shape-for-shape (anton-z33ia
+ * review, PR #313).
+ *
+ * Returns `{ rel, path }` pairs, not plain relative paths: `rel` is relative to `dir` and keyed on
+ * the SYMLINK's own name, so a digest taken here lands on the same entries as one taken from disk;
+ * `path` is the real repo path the bytes live at, which for anything reached through an expanded
+ * symlink is NOT `dir` joined with `rel` — that concatenation never names a real tree entry — so a
+ * caller must read from `path`, never reconstruct one.
+ *
+ * `stack` carries the REAL directories already on this descent, so a symlink cycle
+ * (`assets -> ../assets`) terminates instead of recursing forever — the git-side twin of
+ * {@link listFiles}'s own cycle guard.
+ *
+ * FAILS CLOSED like {@link listDirBlobsAtRev}: empty output means `dir` has no files at `rev`, never
+ * that the read failed. Anything that rejects propagates rather than reading as "no files".
+ */
+export async function listFilesAtRev(
+  worktreePath: string,
+  rev: string,
+  dir: string,
+  stack: Set<string> = new Set(),
+): Promise<Array<{ rel: string; path: string }>> {
+  const cleanDir = dir.replace(/\/+$/, "");
+  if (stack.has(cleanDir)) return [];
+  stack.add(cleanDir);
+  try {
+    const prefix = `${cleanDir}/`;
+    // `:(literal)`, same reason as {@link listDirBlobsAtRev}: `dir` can be operator-supplied.
+    const out = await git(worktreePath, ["ls-tree", "-r", "-z", rev, "--", `:(literal)${prefix}`]);
+    if (!out) return [];
+
+    const files: Array<{ rel: string; path: string }> = [];
+    const symlinks: string[] = [];
+    for (const line of out.split("\0")) {
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const [mode, type] = line.slice(0, tab).split(" ");
+      if (type !== "blob") continue;
+      const path = line.slice(tab + 1);
+      if (mode === SYMLINK_MODE) symlinks.push(path);
+      else files.push({ rel: path.slice(prefix.length), path });
+    }
+
+    // Each branch gets its OWN copy of the ancestor stack rather than the shared object: the
+    // branches run concurrently and `git()` awaits internally, so two sibling symlinks pointing at
+    // the same target would otherwise interleave — the first adds the target and yields before its
+    // `finally` removes it, so the second (still mid-flight, not actually a cycle) would see a false
+    // positive and silently drop that alias. A clone per branch keeps real-cycle detection along each
+    // branch's own descent path while letting legitimately-shared siblings both walk through.
+    const expanded = await Promise.all(
+      symlinks.map((path) => expandSymlinkedFileAtRev(worktreePath, rev, path, prefix, new Set(stack))),
+    );
+    return [...files, ...expanded.flat()].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  } finally {
+    stack.delete(cleanDir);
+  }
+}
+
+/**
+ * One symlink entry found while walking {@link listFilesAtRev}, expanded to the files it actually
+ * names: itself, when the chain it starts ultimately lands on a file at `rev` (the leaf-symlink case
+ * {@link readFileBytesAtRev} follows on its own when the content is actually read); its target
+ * directory's files, recursively, when the chain lands on a directory (the shape `ls-tree -r` cannot
+ * see through at all); or nothing, for a chain that is broken, leaves the repository, or runs past
+ * {@link MAX_SYMLINK_HOPS} — same as {@link resolveRepoPath}'s undefined.
+ */
+async function expandSymlinkedFileAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  prefix: string,
+  stack: Set<string>,
+): Promise<Array<{ rel: string; path: string }>> {
+  const rel = path.slice(prefix.length);
+  const resolved = await resolveSymlinkChainAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+  if (!resolved) return [];
+  if (resolved.kind === "blob") return [{ rel, path: resolved.path }];
+  const nested = await listFilesAtRev(worktreePath, rev, resolved.path, stack);
+  return nested.map((entry) => ({ rel: `${rel}/${entry.rel}`, path: entry.path }));
+}
+
+/**
+ * Follows a chain of symlinks starting at `path` to its final blob or tree entry at `rev`, the same
+ * hop-bounded way {@link readBlobAtRev} follows one for file content. Needed here too: `ls-tree`
+ * reports a symlink-to-symlink as `blob`, same as a real leaf file, so classifying off one hop alone
+ * misreads a chain like `assets -> shared-link -> real-dir` as `assets` naming a file instead of
+ * recursing into `real-dir` (anton-z33ia review, PR #313).
+ *
+ * Resolves `path`'s ANCESTORS first, via {@link resolveAncestorSymlinksAtRev}: a target like
+ * `assets -> ../../shared-link/templates`, where `shared-link` is itself a symlinked directory, names
+ * a path `ls-tree`/`show` can't look up at all — they walk each component as a literal tree entry and
+ * never traverse a symlink blob sitting partway through, so the raw path reads as "not there" and the
+ * asset silently drops (anton-z33ia review, PR #313, thread on this function).
+ */
+async function resolveSymlinkChainAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<{ kind: "blob" | "tree"; path: string } | undefined> {
+  const ancestors = await resolveAncestorSymlinksAtRev(worktreePath, rev, path, hops);
+  if (!ancestors) return undefined;
+  const { path: resolvedPath, hops: remainingHops } = ancestors;
+
+  const kind = await treeEntryKindAtRev(worktreePath, rev, resolvedPath);
+  if (kind === "tree") return { kind, path: resolvedPath };
+  if (kind !== "blob") return undefined;
+  const mode = await blobModeAtRev(worktreePath, rev, resolvedPath);
+  if (mode !== SYMLINK_MODE) return { kind: "blob", path: resolvedPath };
+  if (remainingHops <= 0) return undefined;
+  const text = await git(worktreePath, ["show", `${rev}:${resolvedPath}`, "--"]);
+  const target = resolveRepoPath(resolvedPath, text);
+  return target ? resolveSymlinkChainAtRev(worktreePath, rev, target, remainingHops - 1) : undefined;
+}
+
+/**
+ * Resolves `path`'s PARENT directory chain to its real tree path, hop-bounded, and rebuilds `path` on
+ * top of it — the leaf itself is left unclassified, since a plain (non-symlink) leaf blob is a normal
+ * answer here and only {@link resolveSymlinkChainAtRev} knows how to classify it. Delegates the actual
+ * per-directory resolution to {@link resolveDirAtRev}.
+ */
+async function resolveAncestorSymlinksAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<{ path: string; hops: number } | undefined> {
+  const idx = path.lastIndexOf("/");
+  if (idx < 0) return { path, hops };
+
+  const parent = await resolveDirAtRev(worktreePath, rev, path.slice(0, idx), hops);
+  if (!parent) return undefined;
+  return { path: `${parent.path}/${path.slice(idx + 1)}`, hops: parent.hops };
+}
+
+/**
+ * Resolves `dirPath` — which must ultimately name a TREE — to its real path at `rev`, hop-bounded,
+ * recursing on its own parent first and then following a symlink chain if `dirPath`'s own last
+ * component turns out to be one. This is what makes a target like `../../shared-link/templates`
+ * work: `ls-tree`/`show` walk a path as literal tree entries and never traverse a symlink blob sitting
+ * at an intermediate component, so `shared-link` must be resolved to its real directory BEFORE
+ * `templates` is looked up beneath it, not after (anton-z33ia review, PR #313).
+ */
+async function resolveDirAtRev(
+  worktreePath: string,
+  rev: string,
+  dirPath: string,
+  hops: number,
+): Promise<{ path: string; hops: number } | undefined> {
+  const idx = dirPath.lastIndexOf("/");
+  const parent = idx < 0 ? { path: "", hops } : await resolveDirAtRev(worktreePath, rev, dirPath.slice(0, idx), hops);
+  if (!parent) return undefined;
+  const name = idx < 0 ? dirPath : dirPath.slice(idx + 1);
+  const candidate = parent.path ? `${parent.path}/${name}` : name;
+
+  const kind = await treeEntryKindAtRev(worktreePath, rev, candidate);
+  if (kind === "tree") return { path: candidate, hops: parent.hops };
+  if (kind !== "blob") return undefined;
+  const mode = await blobModeAtRev(worktreePath, rev, candidate);
+  if (mode !== SYMLINK_MODE) return undefined;
+  if (parent.hops <= 0) return undefined;
+  const text = await git(worktreePath, ["show", `${rev}:${candidate}`, "--"]);
+  const target = resolveRepoPath(candidate, text);
+  return target ? resolveDirAtRev(worktreePath, rev, target, parent.hops - 1) : undefined;
+}
+
+/**
+ * Whether `path` names a file, a directory, or neither at `rev` — {@link blobModeAtRev} widened to
+ * report "tree" instead of collapsing it to undefined, which is exactly the distinction a symlink's
+ * target needs before {@link listFilesAtRev} can decide whether to read it or recurse into it.
+ */
+async function treeEntryKindAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<"blob" | "tree" | undefined> {
+  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", `:(literal)${path}`]);
+  const entry = out.split("\0")[0];
+  const tab = entry?.indexOf("\t") ?? -1;
+  if (!entry || tab < 0) return undefined;
+  const type = entry.slice(0, tab).split(" ")[1];
+  return type === "blob" || type === "tree" ? type : undefined;
 }
 
 /**
@@ -1641,6 +1877,175 @@ function pushTimedOut(args: string[], timeoutMs: number, stderr: string): Error 
 }
 
 /**
+ * SSH keepalives for the push, because git opens the connection BEFORE `pre-push` runs.
+ *
+ * A project whose pre-push gate is slow (fati's runs the full app + voice suites, ~9-11 minutes)
+ * leaves that connection idle with nothing transferred for the whole gate, and the server hangs it
+ * up: `Connection to github.com closed by remote host.` The tests PASSED — the push is simply lost,
+ * and because nothing was sent there is no `Done` line, so {@link classifyPushFailure} reads the
+ * exit-1 as a declined local hook and never retries. Seven consecutive fati runs died this way on
+ * 2026-09-19/20 (fati-uhya), each after paying the full gate.
+ *
+ * `ServerAliveInterval=30` with `ServerAliveCountMax=30` holds the channel open through a ~15-minute
+ * gate while still giving up on a genuinely dead link. Pushing with these set landed fati-uhya on
+ * the first try after those seven failures.
+ *
+ * NEVER silently replaces an operator's SSH command (PR #306 review). `GIT_SSH_COMMAND` outranks
+ * `core.sshCommand` — git's own documentation says the config "is overridden when the environment
+ * variable is set" — so setting this variable on a repo configured with a deploy key or a jump host
+ * would drop that configuration and fail every push it was there to make work. `core.sshCommand` is
+ * read from the repo (`configuredSshCommand`) and the keepalives are APPENDED to it, so the
+ * identity survives and the channel still stays open. An existing `GIT_SSH_COMMAND` is extended the
+ * same way.
+ *
+ * Five cases are left strictly alone:
+ *   - `GIT_SSH` with no `GIT_SSH_COMMAND`/`core.sshCommand`. That variable names a helper BINARY,
+ *     and git documents it for programs that do not accept extra command-line arguments (plink and
+ *     friends) — which is why `GIT_SSH_COMMAND` exists at all. Appending `-o` to one would break it,
+ *     and setting `GIT_SSH_COMMAND` at all would override it. No keepalives there.
+ *   - A command whose program is not `ssh`. Git applies the same basename test before assuming
+ *     OpenSSH options are understood; a wrapper script may reject `-o` outright.
+ *   - A `GIT_SSH_VARIANT` / `ssh.variant` naming anything but `auto`/`ssh`. Git documents these as
+ *     OVERRIDING its basename detection, so an operator running plink through a binary that happens
+ *     to be called `ssh` is taken at their word rather than by the filename.
+ *   - A command that already sets `ServerAliveInterval` or `ServerAliveCountMax`. The operator has
+ *     an opinion about this mechanism; it wins.
+ *   - A probe that came back `unknown` — see {@link SshCommandProbe}. Not knowing whether
+ *     `core.sshCommand` is set is not the same as knowing it is not, and installing a plain
+ *     `GIT_SSH_COMMAND` on a guess would override a config anton failed to read.
+ *
+ * Harmless for an HTTPS remote, which never reads any of this.
+ */
+export function pushEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+  configured: SshCommandProbe | string = { state: "unset" },
+): NodeJS.ProcessEnv {
+  const next = { ...env } as NodeJS.ProcessEnv;
+  const probe: SshCommandProbe = typeof configured === "string" ? { state: "set", command: configured } : configured;
+  // An operator who has NAMED a non-OpenSSH client is taken at their word, whatever the executable
+  // is called (PR #306 review round 5). Git's own basename detection is overridden by these two, so
+  // a custom binary named `ssh` that is really plink would pass `isOpenSshCommand` below and be
+  // handed `-o` flags it may reject, breaking every push. `ssh.variant` is read from the same probe
+  // family as `core.sshCommand`; only `auto`/`ssh` mean "OpenSSH options are fine".
+  const variant = (next.GIT_SSH_VARIANT || probe.variant || "").trim().toLowerCase();
+  if (variant && variant !== "auto" && variant !== "ssh") return next;
+  // The command git would actually run, in the precedence git itself applies.
+  const effective = next.GIT_SSH_COMMAND?.trim() || (probe.state === "set" ? probe.command.trim() : "");
+  if (!effective) {
+    // The probe could not say whether `core.sshCommand` is set. Installing a plain `ssh` here would
+    // OVERRIDE whatever it is — git documents the env var as outranking that config — so a repo
+    // relying on a deploy key or jump host would lose it and every push would fail. Keepalives are
+    // an optimization; the operator's transport is not. Add nothing.
+    if (probe.state === "unknown") return next;
+    // A bare GIT_SSH helper is the other case with nothing safe to add — see above.
+    if (next.GIT_SSH) return next;
+    next.GIT_SSH_COMMAND = `ssh ${SSH_KEEPALIVE_OPTS}`;
+    return next;
+  }
+  // EITHER keepalive option means the operator has an opinion about this mechanism, so anton adds
+  // nothing (PR #306 review). Appending would not actually override them — OpenSSH takes the FIRST
+  // value for a parameter, not the last ("unless noted otherwise, for each parameter, the first
+  // obtained value will be used"), verified with `ssh -G`: an operator's `-o ServerAliveCountMax=3`
+  // still wins with our `=30` appended after it. The reason to skip is honesty, not correctness —
+  // appending options that provably do nothing makes the effective command misreport what is in
+  // force, and leaves a later reader to rediscover the precedence rule to make sense of it.
+  if (/ServerAlive(?:Interval|CountMax)/i.test(effective)) return next;
+  if (!isOpenSshCommand(effective)) return next;
+  // Appending rather than replacing is what preserves an identity or jump host. When `effective`
+  // came from `core.sshCommand`, the value written here CONTAINS that command, so the env var
+  // outranking the config no longer loses it.
+  next.GIT_SSH_COMMAND = `${effective} ${SSH_KEEPALIVE_OPTS}`;
+  return next;
+}
+
+/** The keepalives themselves: a probe every 30s, up to 30 unanswered — about 15 minutes of gate. */
+const SSH_KEEPALIVE_OPTS = "-o ServerAliveInterval=30 -o ServerAliveCountMax=30";
+
+/**
+ * `core.sshCommand` as it resolves for `cwd` (repo config, then global, then system), or undefined
+ * when unset — what {@link pushEnv} must preserve rather than override.
+ *
+ * ASYNCHRONOUS on purpose (PR #306 review). A `spawnSync` here would be the only blocking subprocess
+ * call in this file, and everything else in it — detached process groups, bounded stdout/stderr,
+ * abort signals — exists precisely to avoid blocking. `pushBranch` runs inside the in-process job
+ * runner, which drives up to `ANTON_MAX_CONCURRENT` jobs and this server's HTTP handlers on a single
+ * event loop, so a wedged `git config` (contended `.git/config.lock`, a slow or NFS-mounted repo)
+ * would stall every other in-flight job and request, not just this push — the same class of stall
+ * this change sets out to fix for pre-push gates, one layer down.
+ *
+ * Best-effort: every failure — no git, not a repo, the key simply unset (exit 1) — yields undefined,
+ * which is also the common case, so nothing here can fail a push. The timeout bounds a wedged git.
+ */
+export async function readSshCommand(cwd: string, signal?: AbortSignal): Promise<SshCommandProbe> {
+  // CONCURRENT, not sequential (PR #306 review round 5). The two keys are independent — `ssh.variant`
+  // is not derived from `core.sshCommand` — so awaiting one before starting the other would double
+  // the worst case this function exists to bound: on the wedged-git repo its docstring is about,
+  // the second probe would not even start until the first one's 5s timeout fired.
+  //
+  // `ssh.variant` decides whether OpenSSH flags may be added at all, but its failure is not fatal
+  // the way the command's is: not knowing the variant only costs the basename guess anton already
+  // made before, whereas not knowing the COMMAND risks overriding it. So it stays best-effort and
+  // an unreadable one simply leaves `variant` unset.
+  //
+  // The push's own signal rides on both, so a cancellation landing DURING them kills them instead
+  // of waiting out a wedged git (round 4). An abort makes the command probe `unknown`, which
+  // suppresses the keepalives — right for a cancelled push, and `gitPush` re-checks
+  // `signal.aborted` immediately after and rejects with the caller's reason, so cancellation is
+  // reported by that check rather than by this probe.
+  const [variant, command] = await Promise.all([
+    readGitConfigValue(cwd, "ssh.variant", signal),
+    // Settled, not thrown, so `Promise.all` cannot reject and lose the variant alongside it.
+    execFileAsync("git", ["-C", cwd, "config", "--get", "core.sshCommand"], { timeout: 5_000, signal }).then(
+      ({ stdout }) => ({ ok: true as const, value: stdout.trim() }),
+      (e: unknown) => ({ ok: false as const, code: (e as { code?: unknown } | null)?.code }),
+    ),
+  ]);
+  if (command.ok) return command.value ? { state: "set", command: command.value, variant } : { state: "unset", variant };
+  // Exit 1 is git's "no such key" — the COMMON case, and a definite answer: nothing is configured,
+  // so there is nothing to preserve. Anything else (128 not-a-repo, 129 bad usage, a timeout, a
+  // kill, no git on PATH) means the probe could not determine the answer, which is NOT the same
+  // thing. Collapsing the two would let a wedged probe on a repo that DOES set `core.sshCommand`
+  // install a plain `GIT_SSH_COMMAND` — which overrides that config — and drop the deploy key or
+  // jump host the push needs, failing every push on the one machine slow enough to time out.
+  return command.code === 1 ? { state: "unset", variant } : { state: "unknown", variant };
+}
+
+/** One `git config --get <key>`, or undefined when unset or unreadable. Best-effort by design. */
+async function readGitConfigValue(cwd: string, key: string, signal?: AbortSignal): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("git", ["-C", cwd, "config", "--get", key], { timeout: 5_000, signal });
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What {@link readSshCommand} could establish about `core.sshCommand`:
+ *
+ *   - `set`     — the repo configures one; {@link pushEnv} appends keepalives to it.
+ *   - `unset`   — git said there is no such key; safe to install a plain `ssh` command.
+ *   - `unknown` — the probe failed. There may or may not be a command; anton must not install one,
+ *                 because doing so would override whatever is actually configured.
+ */
+export type SshCommandProbe = ({ state: "set"; command: string } | { state: "unset" } | { state: "unknown" }) & {
+  /** `ssh.variant`, when the repo sets one — the config half of `GIT_SSH_VARIANT`. */
+  variant?: string;
+};
+
+/**
+ * Whether `command`'s program is OpenSSH's `ssh`, so `-o` options are understood. Mirrors git's own
+ * basename test (git-config, `core.sshCommand`: an unrecognized basename makes git probe with `-G`
+ * before assuming OpenSSH options). Anything else — plink, a wrapper script — is left untouched
+ * rather than handed flags it may not accept.
+ */
+function isOpenSshCommand(command: string): boolean {
+  const program = command.trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, "") ?? "";
+  const base = program.split(/[/\\]/).pop() ?? "";
+  return base === "ssh" || base === "ssh.exe";
+}
+
+/**
  * Run a `git push` and return only once it — and any `pre-push` hook it spawned — is GONE, the push
  * counterpart to {@link gitCommit} (PR #228 review, extended by anton-o74nf). `pre-push` is project
  * code exactly like `pre-commit`: free to outlive a plain `execFile` timeout, and a caller told the
@@ -1651,14 +2056,25 @@ function pushTimedOut(args: string[], timeoutMs: number, stderr: string): Error 
  * Does NOT go through the shared {@link git} helper: that helper's fixed `execFile` timeout is the
  * exact mechanism this works around.
  */
-function gitPush(
+async function gitPush(
   cwd: string,
   args: string[],
   hooksPath?: string,
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
+  // FIRST, ahead of the async gap below — every other guarded spot in this file checks `aborted`
+  // with nothing awaited in front of it, and moving the config read up here broke that (PR #306
+  // review round 2). An already-cancelled push would otherwise wait out `readSshCommand` before
+  // noticing, up to its full 5s on the wedged-git case the read was made async to tolerate, and
+  // would spend a subprocess on a push that is not going to happen.
+  if (signal?.aborted) throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+  // Awaited OUTSIDE the executor, so nothing blocks the event loop: this runs inside the in-process
+  // job runner, which drives up to ANTON_MAX_CONCURRENT jobs and the Next.js HTTP handlers on one
+  // loop (PR #306 review). See {@link readSshCommand}.
+  const sshCommand = await readSshCommand(cwd, signal);
   return new Promise((resolvePromise, reject) => {
+    // Re-checked: the await above is a real window, and the signal may have fired during it.
     if (signal?.aborted) {
       reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
       return;
@@ -1671,6 +2087,9 @@ function gitPush(
     const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
+      // The repo's own `core.sshCommand`, read above, so the keepalives extend it instead of
+      // overriding it — setting GIT_SSH_COMMAND outranks that config (PR #306 review).
+      env: pushEnv(process.env, sshCommand),
     });
     const stderr = boundedStderr(child);
     const stdout = boundedStdout(child);
@@ -1814,6 +2233,22 @@ export interface PushRetryShape {
 const SIGNAL_KILL_RETRY: PushRetryShape = { maxAttempts: 2, backoffMs: 30_000 };
 
 /**
+ * The retry a dropped transport gets (PR #306 review), for the same "bound an ambiguous guess"
+ * reason as {@link SIGNAL_KILL_RETRY} above, though the ambiguity is a different one.
+ *
+ * - **Two attempts, not three.** The evidence cannot separate a server that hung up from a local
+ *   `pre-push` hook whose own nested git printed the identical diagnostic before failing — the
+ *   hook's stderr IS the push's stderr. Each attempt re-runs the project's whole gate (minutes),
+ *   so a wrong guess is expensive. One retry buys back the genuine transport drop, which is the
+ *   case that killed seven consecutive runs; a third would mostly buy another gate on a hook that
+ *   is going to fail again anyway.
+ * - **1 second.** Unlike an OOM kill, there is no pressure to wait out: the keepalives from
+ *   {@link pushEnv} are what prevent a recurrence, not elapsed time, so this keeps the transport
+ *   default's gap rather than inventing a longer one.
+ */
+const TRANSPORT_DROP_RETRY: PushRetryShape = { maxAttempts: 2, backoffMs: 1_000 };
+
+/**
  * A porcelain non-fast-forward rejection's ref-status line, shared by {@link classifyPushFailure}'s
  * `code === 1` and `code === null` branches: a proven rejection reads the same way regardless of
  * whether `git` went on to exit cleanly or was killed right after writing it.
@@ -1832,6 +2267,35 @@ const PORCELAIN_HOOK_REJECTED = /\[remote rejected\]\s*\(.*hook declined.*\)/;
  * seen" from "genuinely accepted", where the two specific patterns alone would tell neither.
  */
 const PORCELAIN_ANY_REJECTED = /^!\t.*$/m;
+
+/**
+ * The remote hung up the transport before anything was transferred — the shape a slow `pre-push`
+ * gate produces when it outlasts the server's idle timeout (see {@link pushEnv}).
+ *
+ * Matched in BOTH exit-code branches, because git reports the same hangup either way depending on
+ * how far it got (PR #306 review): as `1` when the push itself fails, and as `128` when the
+ * transport dies before the push begins. They differ in what the verdict can claim, not in the
+ * evidence — see each call site. Exit 1 is the ambiguous one, since a `pre-push` hook's own nested
+ * git can print these diagnostics into the very same stderr; exit 128 is not, since git never got
+ * far enough for a hook verdict to exist.
+ *
+ * At exit 1, tested ONLY when porcelain has no `Done` line, never ahead of a per-ref verdict.
+ * The incident this exists for never had one — nothing was transferred, so the remote never answered
+ * — which means scoping it there costs the fix nothing. Testing it earlier would let stderr text
+ * override porcelain's structural answer: a push the remote genuinely REJECTED, whose stderr happens
+ * to also carry a transport diagnostic (a server that hangs up right after answering, a verbose or
+ * jump-host ssh printing `client_loop: send disconnect` during teardown), would be called transient
+ * and retried three times — each retry paying the full slow gate this change exists to protect, on a
+ * push that can never succeed. That inverts the rule the whole classifier is built on: read
+ * porcelain's structure first, fall back to stderr text only where porcelain is silent.
+ *
+ * Deliberately narrow: every alternative is a TRANSPORT diagnostic that only ssh or git itself
+ * writes, so a project hook printing the word "connection" in its own failure cannot mimic one.
+ * `Connection reset` is absent on purpose — the exit-128 branch already owns it, and a hook's stderr
+ * is quoted into this branch's text.
+ */
+const SSH_CONNECTION_DROPPED =
+  /(?:Connection (?:to .* )?closed by remote host|banner exchange: Connection to .* closed|kex_exchange_identification|client_loop: send disconnect|The remote end hung up unexpectedly)/i;
 
 /**
  * Caps {@link SIGNAL_KILL_RETRY}'s gap, same CAP-never-an-override contract as {@link PUSH_TIMEOUT_ENV}
@@ -1938,7 +2402,48 @@ export function classifyPushFailure(result: {
   }
 
   if (code === 1) {
-    if (!/^Done\s*$/m.test(stdout)) {
+    // NO `Done` and NO ref-status line — git never got far enough for the remote to answer, so
+    // porcelain has nothing structural to say and stderr text is all there is. Both readings of
+    // that shape live here, so neither can outrank a porcelain verdict (PR #306 review): a remote
+    // that answered is decided by its own answer, whatever else appears in stderr.
+    //
+    // `Done` alone is NOT the right gate for that (review round 4). Porcelain writes each ref's
+    // status as it learns it and `Done` only as a footer, so a transport that dies in between
+    // leaves a proven `!` rejection with no `Done` — which the `Done`-only gate sent straight into
+    // the stderr heuristic below and retried, on a rejection no retry can fix. `PORCELAIN_ANY_REJECTED`
+    // is the generic backstop for exactly this (`!` is "rejected or failed to push", whatever the
+    // reason text), and the `code === null` branch above already pairs the two the same way.
+    if (!/^Done\s*$/m.test(stdout) && !PORCELAIN_ANY_REJECTED.test(stdout)) {
+      // A connection the server hung up on produces exactly this shape — git opens the SSH channel
+      // before `pre-push` runs, so a slow gate leaves it idle until the server drops it, and nothing
+      // is ever transferred — but the hook had nothing to do with it and usually PASSED. Read as a
+      // declined hook it is permanent, so the run dies having paid the full gate; read as what it
+      // is, the retry costs another gate but can actually succeed. {@link pushEnv} makes this rare
+      // rather than routine; this makes it survivable when it still happens.
+      //
+      // A local hook that FAILED can print the very same diagnostic — a hook running its own nested
+      // git or ssh, whose stderr is shared with the outer push (PR #306 review, reproduced: a hook
+      // echoing `fatal: the remote end hung up unexpectedly` and exiting 1 gives exit 1, empty
+      // stdout, that text on stderr). Nothing in the output distinguishes the two: the hook's
+      // stderr IS the push's stderr, and there is no marker saying which process wrote a line.
+      //
+      // So this does not claim to know, it bounds what being wrong costs. The verdict names both
+      // readings, and `TRANSPORT_DROP_RETRY` gives ONE retry instead of the transport default's
+      // three. Guessing "transient" and being wrong now costs one extra gate rather than two; the
+      // opposite guess costs a whole run, which is the failure that prompted this change. A hook
+      // that genuinely fails, fails again on the retry and ends the run permanently.
+      if (SSH_CONNECTION_DROPPED.test(stderr)) {
+        return {
+          transient: true,
+          retry: TRANSPORT_DROP_RETRY,
+          reason:
+            `the connection to the remote closed before the push transferred anything — git opens it ` +
+            `before pre-push runs, so a slow gate can outlast the server's idle timeout. A pre-push ` +
+            `hook running its own git/ssh can print the same diagnostic, and the two are not ` +
+            `distinguishable from the output, so this gets ONE retry rather than the usual three: ` +
+            `${stderr}`,
+        };
+      }
       return {
         transient: false,
         reason: `a local pre-push hook declined the push: ${stderr || "(hook printed nothing to stderr)"}`,
@@ -1964,6 +2469,20 @@ export function classifyPushFailure(result: {
   }
 
   if (code === 128) {
+    // The PERMANENT local causes come first, ahead of every transport pattern (PR #306 review
+    // round 2, caught by this file's own gpg test). A local failure aborts the push mid-transport,
+    // so git prints its own `fatal: the remote end hung up unexpectedly` on top of the real
+    // reason — `gpg failed to sign the push certificate` followed by exactly that line. Matching
+    // the hangup first would reclassify a misconfigured signing key, a missing credential, or a
+    // stuck index.lock as a transient transport fault and retry all three forever. The local
+    // diagnostic is the specific evidence; the hangup is the generic consequence.
+    if (
+      /could not read Username/i.test(stderr) ||
+      /Unable to create .*index\.lock/i.test(stderr) ||
+      /gpg failed to sign/i.test(stderr)
+    ) {
+      return { transient: false, reason: `a permanent local failure, not a transport fault: ${stderr}` };
+    }
     if (
       /Could not resolve host/i.test(stderr) ||
       /Connection reset/i.test(stderr) ||
@@ -1971,16 +2490,19 @@ export function classifyPushFailure(result: {
       // Git's own diagnostic for an HTTP remote that answers with a 5xx: confirmed against a real
       // 503 with `git push -h`'s porcelain mode — "The requested URL returned error: 503" — which
       // the `HTTP 5\d\d` form above never matches, so a transient 5xx was misclassified permanent.
-      /returned error: 5\d\d/.test(stderr)
+      /returned error: 5\d\d/.test(stderr) ||
+      // The SAME hangup the `code === 1` branch above recognizes: git reports a pre-transfer SSH
+      // failure as 128 whenever the transport dies before the push begins, rather than as 1, so
+      // matching it only there left an ordinary connection loss classified permanent and never
+      // retried (PR #306 review). Verified locally: a push to an unreachable SSH remote exits 128
+      // with empty porcelain output.
+      SSH_CONNECTION_DROPPED.test(stderr)
     ) {
+      // No `retry` shape here, unlike the `code === 1` case. Exit 128 means git never reached the
+      // remote at all, and a `pre-push` decline is exit 1 — so the hook-vs-transport ambiguity that
+      // bounds that branch to one retry does not exist here, and the normal transport budget
+      // applies. Nothing ran the project's gate, so a retry is cheap.
       return { transient: true, reason: `a transient transport failure reaching the remote: ${stderr}` };
-    }
-    if (
-      /could not read Username/i.test(stderr) ||
-      /Unable to create .*index\.lock/i.test(stderr) ||
-      /gpg failed to sign/i.test(stderr)
-    ) {
-      return { transient: false, reason: `a permanent local failure, not a transport fault: ${stderr}` };
     }
     return {
       transient: false,

@@ -32,6 +32,7 @@ import { ReviewSection } from "@/components/settings/sections/review-section";
 import { ValueSection } from "@/components/settings/sections/value-section";
 import { ModelRoutingSection } from "@/components/settings/sections/model-routing-section";
 import { VariantsSection } from "@/components/settings/sections/variants-section";
+import { WarmSection } from "@/components/settings/sections/warm-section";
 import { SettingsNav } from "@/components/settings/settings-nav";
 import { SettingsSaveBar } from "@/components/settings/settings-save-bar";
 import type { EarnedKind } from "@/components/settings/settings-autonomy";
@@ -163,6 +164,7 @@ export function SettingsView({
     general: <GeneralSection project={project} form={form} />,
     gateway: <GatewaySection form={form} />,
     agents: <AgentsSection form={form} bundledAgents={bundledAgents} userAgents={userAgents} />,
+    warm: <WarmSection form={form} />,
     prompt: <PromptSection form={form} basePrompt={basePrompt} />,
     variants: <VariantsSection form={form} />,
     "model-routing": <ModelRoutingSection form={form} projectSlug={project.slug} />,

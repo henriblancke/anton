@@ -9,8 +9,10 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { checkoutMoved } from "../build/drift";
 import * as schema from "../db/schema";
-import { enqueue, getJob } from "./queue";
+import { enqueue, getJob, type JobType } from "./queue";
+import { selfRepoRoot } from "./self-freshness";
 import type { JobHandler, JobPolicy, JobPolicyResolver, JobRunner, RunnerConfig } from "./runner";
 import { CONFIG, useRunnerHarness, waitUntil } from "./runner.fixture";
 
@@ -837,6 +839,188 @@ describe("JobRunner dispatch (live, in-memory db)", () => {
       await enqueuePrFixes(r, 2);
       await r.quiesceProject("A");
       expect(await r.tickOnce()).toBe(0);
+    });
+  });
+  /**
+   * The staleness gate at the dispatch seam (anton-kqst). It used to live inside `execute-epic`
+   * alone, which left the other nine types dispatching on a process behind its own code — and
+   * `unstick` is the one that actually broke on 2026-09-10, in two projects.
+   */
+  describe("stale-checkout dispatch gate (anton-kqst)", () => {
+    const REFUSAL =
+      "anton is running behind its own latest code, so it will not start new work: " +
+      "its checkout is 2 commit(s) behind origin/main — run `git pull`";
+
+    /** A runner whose process is stale, over the one type the case names. */
+    function staleRunner(
+      type: JobType,
+      handler: JobHandler,
+      readSelfCheckoutRefusal = async () => REFUSAL as string | undefined,
+    ) {
+      return h.makeRunner({ handlers: { [type]: handler }, readSelfCheckoutRefusal });
+    }
+
+    it("defers a non-execute-epic job, refunding the attempt and keeping the reason on the row", async () => {
+      // `unstick` stands in for the nine types that had no gate at all. The deferral must leave the
+      // row re-leasable by the restarted process: queued, attempts rewound, and carrying the refusal
+      // as its only durable record of why.
+      let ran = false;
+      const r = staleRunner("unstick", async () => {
+        ran = true;
+      });
+      const jobId = await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+
+      expect(ran).toBe(false); // the handler never got to run on stale code
+      const job = await getJob(h.db, jobId);
+      expect(job?.status).toBe("queued");
+      expect(job?.attempts).toBe(0); // leased once, refunded — never counts toward a park
+      expect(job?.lastError).toContain("behind its own latest code");
+      expect(job?.lastError).toContain("2 commit(s) behind origin/main");
+      // Rescheduled on the slow cadence, not retried immediately: only an operator restart clears it.
+      expect(job?.runAt?.getTime()).toBe(h.clock.now() + CONFIG.staleCheckoutRetryMs);
+    });
+
+    it("never parks, however many times it defers", async () => {
+      // The condition is process-wide and self-clears on restart, so burning attempts toward a park
+      // would strand the job for a manual resume even after the fix landed.
+      const r = staleRunner("gate-check", async () => {});
+      const jobId = await r.enqueue({ type: "gate-check" });
+      for (let i = 0; i < CONFIG.maxAttempts + 2; i++) {
+        expect(await r.tickOnce()).toBe(1);
+        await r.whenIdle();
+        h.clock.advance(CONFIG.staleCheckoutRetryMs);
+      }
+      const job = await getJob(h.db, jobId);
+      expect(job?.status).toBe("queued");
+      expect(job?.attempts).toBe(0);
+    });
+
+    it("dispatches normally on a clean verdict", async () => {
+      let ran = 0;
+      const r = staleRunner("unstick", async () => {
+        ran += 1;
+      }, async () => undefined);
+      const jobId = await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(ran).toBe(1);
+      expect((await getJob(h.db, jobId))?.status).toBe("done");
+    });
+
+    it("does not recompute the verdict per job within its cache window", async () => {
+      // The gate moved from once per RUN to once per JOB, and `gate-check` alone dispatches on the
+      // order of twelve thousand times — each read is a `git fetch`. One read per window, shared by
+      // every job in it, is what makes the seam affordable.
+      let reads = 0;
+      const r = h.makeRunner({
+        handlers: { "gate-check": async () => {} },
+        config: { maxConcurrent: 8 },
+        readSelfCheckoutRefusal: async () => {
+          reads += 1;
+          return undefined;
+        },
+      });
+      for (let i = 0; i < 8; i++) await r.enqueue({ type: "gate-check", payload: { n: i } });
+      expect(await r.tickOnce()).toBe(8);
+      await r.whenIdle();
+      // Eight concurrent dispatches, one read: the in-flight pass is joined, not restarted per job.
+      expect(reads).toBe(1);
+
+      // Still inside the window — reused rather than re-read.
+      h.clock.advance(CONFIG.staleCheckoutVerdictMs - 1);
+      for (let i = 0; i < 4; i++) await r.enqueue({ type: "gate-check", payload: { m: i } });
+      expect(await r.tickOnce()).toBe(4);
+      await r.whenIdle();
+      expect(reads).toBe(1);
+
+      // Past it — re-read, so a restart-worthy change is picked up within one window.
+      h.clock.advance(1);
+      await r.enqueue({ type: "gate-check", payload: { last: true } });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(reads).toBe(2);
+    });
+
+    it("retires a cached clean verdict early when the checkout moves, even inside the window", async () => {
+      // A clean verdict answered before a pull says nothing about what the pull changed — e.g. the
+      // migration a schema-pending pull just added (PR #281 review). `checkoutMoved` — fired by
+      // whatever fast-forwarded anton's own checkout — bumps `build/drift`'s cache generation, and
+      // the gate must retire its cached verdict on that signal rather than trust the TTL alone.
+      let reads = 0;
+      let refusal: string | undefined = undefined;
+      const r = h.makeRunner({
+        handlers: { unstick: async () => {} },
+        readSelfCheckoutRefusal: async () => {
+          reads += 1;
+          return refusal;
+        },
+      });
+      await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(reads).toBe(1); // the clean verdict is cached
+
+      // The checkout moves under the cached verdict, well inside the TTL, and the next read would
+      // now answer stale. `selfRepoRoot()` — not `process.cwd()` — is what `checkoutMoved` compares
+      // against: the two only coincide when `ANTON_APP_ROOT` is unset, and the box running this test
+      // may already have it pointed elsewhere.
+      checkoutMoved(selfRepoRoot());
+      refusal = REFUSAL;
+      h.clock.advance(CONFIG.staleCheckoutVerdictMs - 1);
+
+      const jobId = await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(reads).toBe(2); // re-read despite being inside the window — the generation changed
+      const job = await getJob(h.db, jobId);
+      expect(job?.status).toBe("queued"); // deferred on the now-current, no-longer-clean verdict
+      expect(job?.lastError).toContain("behind its own latest code");
+    });
+
+    it("leaves execute-epic to its own in-place gate — no double evaluation", async () => {
+      // `prepareEpicRun` places its gate AFTER the completion short-circuit on purpose: a target
+      // already carried to its pull request has to settle idempotently rather than be grounded by a
+      // staleness with nothing left to run. A gate here would defer exactly that settlement, so the
+      // seam must not ask the question for this type at all.
+      let reads = 0;
+      let ran = false;
+      const r = h.makeRunner({
+        handlers: {
+          "execute-epic": async () => {
+            ran = true;
+          },
+        },
+        readSelfCheckoutRefusal: async () => {
+          reads += 1;
+          return REFUSAL;
+        },
+      });
+      const jobId = await r.enqueue({ type: "execute-epic" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+
+      expect(reads).toBe(0);
+      expect(ran).toBe(true);
+      expect((await getJob(h.db, jobId))?.status).toBe("done");
+    });
+
+    it("dispatches when the freshness read itself fails", async () => {
+      // Fail OPEN, the rule `staleCheckoutRefusal` already follows for every indeterminate verdict:
+      // an offline runner is not a stale one, and a gate that grounded every job type on its own
+      // failed read would be a worse outage than the one it guards against.
+      let ran = false;
+      const r = staleRunner("unstick", async () => {
+        ran = true;
+      }, async () => {
+        throw new Error("no route to host");
+      });
+      const jobId = await r.enqueue({ type: "unstick" });
+      expect(await r.tickOnce()).toBe(1);
+      await r.whenIdle();
+      expect(ran).toBe(true);
+      expect((await getJob(h.db, jobId))?.status).toBe("done");
     });
   });
 });

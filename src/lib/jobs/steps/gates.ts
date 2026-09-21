@@ -72,6 +72,7 @@ export async function reviewStep(ctx: StepContext): Promise<StepResultWith<"revi
     tickets: ctx.tickets,
     boardEvidenceByTicket: ctx.boardEvidenceByTicket,
     repoPath: ctx.repoPath,
+    formulaDigest: ctx.formulaDigest,
     settings: ctx.settings,
     worktreePath: ctx.worktreePath,
     baseBranch: ctx.baseRef,

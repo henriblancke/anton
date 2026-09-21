@@ -48,7 +48,7 @@
  * in-review (never finalized twice).
  */
 import { existsSync } from "node:fs";
-import { beads, type Bead } from "../beads/bd";
+import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
 import { claudeRouting, runClaude } from "../claude/driver";
 import { quotaMeterKey } from "../quota-meter";
@@ -787,7 +787,7 @@ async function runFixSession(args: {
       `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
     );
 
-    const { prompt, appendSystemPrompt } = await buildReviewFixPrompt({
+    const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
       epic,
       pr,
       reasons: verdict.reasons,
@@ -803,9 +803,18 @@ async function runFixSession(args: {
       jobType: ctx.type,
       jobId: ctx.jobId,
       step: "review-fix",
+      // This job IS the pr-fix phase; the handler names it for the fold the same way an in-formula
+      // step does, so both correction paths classify alike (anton-234ja).
+      stepHandler: "review-fix",
       runId: run?.id,
       beadId: epic.id,
       modelRequested: settings.model,
+      // The specialist the epic named — `buildReviewFixPrompt` above composed this session's system
+      // prompt from that same tag, and `metered` digests that composed text from the spawn options.
+      agentTag: labelValueOf(epic.labels, "agent"),
+      // The review-fix REASONING contract's own identity (PR #313 review) — see
+      // `buildReviewFixPrompt`'s doc: it rides in `prompt`, which `metered` never digests.
+      ...attribution,
     }, runClaude)({
       cwd: worktree.path,
       prompt,

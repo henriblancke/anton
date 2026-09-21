@@ -25,6 +25,7 @@ const FRESH: SelfFreshness = {
   checkout: { state: "current" },
   dependencies: { state: "match" },
   build: { state: "current" },
+  schema: { state: "current" },
 };
 
 const { currentBreaker } = await import("./autopilot-state");
@@ -58,6 +59,7 @@ describe("currentBreaker", () => {
       checkout: { state: "behind", behind: 2, upstream: "origin/main" },
       dependencies: { state: "match" },
       build: { state: "current" },
+      schema: { state: "current" },
     } satisfies SelfFreshness);
     currentDisarm.mockResolvedValue(disarm);
     currentWipHold.mockResolvedValue(hold);

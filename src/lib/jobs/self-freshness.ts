@@ -1,9 +1,9 @@
 /**
- * One honest answer to "is this process running its own latest code" (anton-vzhf), covering both
- * halves of what a start actually executes: the CHECKOUT (is HEAD behind the tree its remote carries)
- * and the INSTALLED DEPENDENCIES (does node_modules still match the lockfile). anton pulls before it
- * starts, but a fix merged after the last pull, or a lockfile bump nobody reinstalled, both leave the
- * running process a step behind its own repairs.
+ * One honest answer to "is this process running its own latest code" (anton-vzhf), starting from the
+ * two halves of what a start actually executes: the CHECKOUT (is HEAD behind the tree its remote
+ * carries) and the INSTALLED DEPENDENCIES (does node_modules still match the lockfile). anton pulls
+ * before it starts, but a fix merged after the last pull, or a lockfile bump nobody reinstalled, both
+ * leave the running process a step behind its own repairs.
  *
  * It only REPORTS — reacting to the verdict (refusing a start, surfacing it) is the sibling tickets'
  * job. So every failure is its own verdict, never dressed up as "behind": a remote it cannot reach,
@@ -18,12 +18,18 @@
  * describe the process rather than the disk: the build it booted from, and the packages it imported
  * ({@link readBootDependencies}). Without them the very `git pull` / `bun install` this gate
  * prescribes would clear it while the process went on executing the old code (PR #257 review).
+ *
+ * A fourth half describes neither the disk nor the process but the DATABASE (anton-sm1l): whether
+ * `anton.db` has applied the migrations the checkout carries. A pull moves the code and the
+ * migration files together, so the other three can all read current while the schema the process
+ * queries is one that code has already outgrown — the gap the observed failures fell through.
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  antonDbPath,
   runnerBootDependencies,
   runnerBuildDrift,
   selfBootDependencies,
@@ -31,6 +37,7 @@ import {
   type BuildDrift,
   type BuildDriftState,
 } from "../build/drift";
+import { pendingMigrations } from "../db/pending-migrations";
 import { distanceBehindUpstream } from "../git/ops";
 
 /** Where the checkout stands against its upstream — plus `unknown` for a check that could not run. */
@@ -76,10 +83,33 @@ export type BuildFreshness =
   | { state: "drifted"; drift: BuildDriftState }
   | { state: "unknown"; reason: string };
 
+/**
+ * Whether the DATABASE has applied every migration the checkout carries (anton-sm1l) — the half the
+ * other three cannot see.
+ *
+ * A pull moves the code and the migration files in one step, so all three other halves can read
+ * current while the schema the process queries is one the code on disk has already outgrown: the
+ * build identity says nothing about `anton.db`, which is state rather than source, and neither the
+ * checkout distance nor the lockfile touches it at all. That gap is exactly where the two observed
+ * failures fell through.
+ *
+ * The remedy lands in the DATABASE rather than in a process, so unlike the build and dependency
+ * halves this needs no latch: applying the migrations clears it for every process at once, with no
+ * restart to wait for.
+ *
+ * `unknown` keeps a failed read apart from a clean one, the rule every half here follows — a
+ * database this check could not open is not a database proven current.
+ */
+export type SchemaFreshness =
+  | { state: "current" }
+  | { state: "pending"; migrations: string[] }
+  | { state: "unknown"; reason: string };
+
 export interface SelfFreshness {
   checkout: CheckoutFreshness;
   dependencies: DependencyFreshness;
   build: BuildFreshness;
+  schema: SchemaFreshness;
 }
 
 function reason(e: unknown): string {
@@ -138,11 +168,11 @@ export const RUNNER: RunningProcess = {
 };
 
 /**
- * All three halves of the freshness answer for anton's own checkout at `repoPath`. The checkout half
- * and the lockfile comparison read the filesystem, shared by every process of the install; the build
- * half and the dependency LATCH are process-specific, so the caller says WHOSE it wants
- * ({@link RunningProcess}). The two filesystem reads run together and the process comparison follows
- * them, so a pull landing mid-pass cannot leave the halves describing different disks
+ * All four halves of the freshness answer for anton's own checkout at `repoPath`. The checkout half,
+ * the lockfile comparison and the schema read describe state shared by every process of the install;
+ * the build half and the dependency LATCH are process-specific, so the caller says WHOSE it wants
+ * ({@link RunningProcess}). The two async filesystem reads run together and the process comparison
+ * follows them, so a pull landing mid-pass cannot leave the halves describing different disks
  * ({@link checkFreshnessUncached}). It defaults to {@link SELF} — right for the runner's start gate,
  * which asks about itself — while the board injects {@link RUNNER}, since it renders in a process
  * that may not be the runner. Both pass {@link selfRepoRoot} for the filesystem halves, the root
@@ -182,8 +212,8 @@ export async function checkSelfFreshness(
   try {
     return await verdict;
   } catch (e) {
-    // A rejection is not an answer, so it must never be served to a later caller. (Each of the three
-    // halves catches its own failure, so this only fires on a genuine bug in one of them.)
+    // A rejection is not an answer, so it must never be served to a later caller. (Each half
+    // catches its own failure, so this only fires on a genuine bug in one of them.)
     if (cache.get(key) === entry) cache.delete(key);
     throw e;
   } finally {
@@ -195,7 +225,7 @@ export async function checkSelfFreshness(
 }
 
 /**
- * The two filesystem halves run in parallel; the PROCESS comparison is read LAST (PR #257 review).
+ * The filesystem halves run in parallel; the PROCESS comparison is read LAST (PR #257 review).
  *
  * Read concurrently, the build half could compare the running process against the PRE-pull disk and
  * answer `current`, while the checkout half — whose network fetch takes far longer — counted its
@@ -208,17 +238,26 @@ export async function checkSelfFreshness(
  * the running process against the post-pull tree and answers `drifted`. A pull that lands entirely
  * after the pass is not this function's problem — no half could have seen it, and the start gate
  * takes `maxAgeMs: 0` precisely so the next start reads it fresh.
+ *
+ * The schema half is read FIRST and synchronously (anton-sm1l) — better-sqlite3 is a synchronous
+ * driver, as every other database read in this app is, and two small bookkeeping tables cost far
+ * less than the git reads the build half already blocks on. Being the earliest read is safe where
+ * the build half's would not be: a pull landing mid-pass adds migration files without applying them,
+ * so an early read can only UNDER-report pending work, never call a stale schema current. The tear
+ * the sequencing below exists to prevent needs a half that reads `current` off pre-pull state, and
+ * pending migrations are the opposite — the pull is what creates them.
  */
 async function checkFreshnessUncached(
   repoPath: string,
   running: RunningProcess,
 ): Promise<SelfFreshness> {
+  const schema = schemaFreshness(repoPath);
   const [checkout, dependencies] = await Promise.all([
     checkoutFreshness(repoPath),
     dependencyFreshness(repoPath, running.bootDependencies),
   ]);
   const build = await buildFreshness(running.buildDrift);
-  return { checkout, dependencies, build };
+  return { checkout, dependencies, build, schema };
 }
 
 interface FreshnessEntry {
@@ -271,6 +310,37 @@ async function buildFreshness(buildDrift: RunningProcess["buildDrift"]): Promise
     return drift ? { state: "drifted", drift: drift.state } : { state: "current" };
   } catch (e) {
     return { state: "unknown", reason: reason(e) };
+  }
+}
+
+/**
+ * Whether `anton.db` has applied every migration the checkout carries (anton-sm1l).
+ *
+ * The database is resolved through `build/drift`'s own {@link antonDbPath} rather than off
+ * `repoPath`, because the two are genuinely different things: a bundle install keeps its state
+ * outside the replaceable runtime dir, and `ANTON_DB` may point either at a database shared with
+ * another checkout or somewhere else entirely. The MIGRATIONS, by contrast, are source — they ship
+ * with the checkout — so they are read from `repoPath`, which is what lets a test point the pair at
+ * a sandbox and what makes the comparison "this code against the schema this process queries".
+ *
+ * Every failure is `unknown` rather than either answer, the rule the other three halves follow: a
+ * database that is not there yet (a first-run install before `anton setup`), a checkout with no
+ * `drizzle/` directory, an unreadable file. Refusing a start on a schema check that never ran is the
+ * same false stop an unreachable remote would be.
+ *
+ * Exported so `execute-epic-freshness.ts` can ask this half ALONE, synchronously, before
+ * `beginEpicRun` touches the `runs` table (PR #281 review) — the other three halves stay behind the
+ * full {@link checkSelfFreshness} pass, which this one skips a network fetch and a lockfile read to
+ * avoid paying twice for.
+ */
+export function schemaFreshness(repoPath: string): SchemaFreshness {
+  const dbPath = antonDbPath();
+  if (!dbPath) return { state: "unknown", reason: "anton.db could not be located" };
+  try {
+    const migrations = pendingMigrations({ dbPath, migrationsDir: join(repoPath, "drizzle") });
+    return migrations.length > 0 ? { state: "pending", migrations } : { state: "current" };
+  } catch (e) {
+    return { state: "unknown", reason: `pending migrations could not be read (${reason(e)})` };
   }
 }
 

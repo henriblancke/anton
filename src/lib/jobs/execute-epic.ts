@@ -20,7 +20,10 @@
  * out.
  */
 import { dispatchRunTickets } from "./execute-epic-dispatch";
-import { assertPreStartPoisonIsFresh } from "./execute-epic-freshness";
+import {
+  assertPreStartPoisonIsFresh,
+  assertSchemaFreshBeforeEpicStart,
+} from "./execute-epic-freshness";
 import { prepareEpicRun } from "./execute-epic-prepare";
 import { walkRunPhase } from "./execute-epic-run-phase";
 import { concludeRunAttempt, settleStoppedRun } from "./execute-epic-settle";
@@ -38,6 +41,12 @@ export interface ExecuteEpicDeps {
 /** Build the runner handler bound to a db/clock. Register it as the "execute-epic" handler. */
 export function makeExecuteEpicHandler(deps: ExecuteEpicDeps): JobHandler {
   return async function executeEpic(ctx: JobContext): Promise<void> {
+    // Schema is checked here, ahead of everything else `execute-epic` is exempt from (PR #281
+    // review): `beginEpicRun`'s first board step reads the `runs` row with every column the CURRENT
+    // schema names, so a pending migration fails that read before this attempt has taken anything —
+    // not just before a new run starts, which is as far as the rest of this gate's exemption reaches.
+    // See {@link assertSchemaFreshBeforeEpicStart} for the full contract.
+    assertSchemaFreshBeforeEpicStart();
     // A pre-start gate's PERMANENT verdict is only trusted from a process running its own latest
     // code (PR #257 review). `beginEpicRun`'s gates park for a human and nothing un-parks a job but
     // a person, so a stale process deciding one on superseded rules would outlive the restart that

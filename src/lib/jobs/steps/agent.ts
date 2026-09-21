@@ -46,6 +46,9 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
       beadId: ticket.id,
       prompt: ticketPrompt(dispatched, preserved),
       appendSystemPrompt,
+      // The tag resolved a few lines up, handed to the ledger rather than re-read from the bead:
+      // which specialist ran is a per-ticket fact that `runs.agent_tag` records once for the run.
+      attribution: { agentTag },
       failure: (text) => `claude reported an error for ${ticket.id}: ${text ?? "unknown"}`,
     });
     sessionIds.push(...(last.facts?.sessionIds ?? []));
@@ -83,7 +86,7 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
   const result = await dispatchClaude(ctx, {
     beadId: ctx.target.id,
     prompt: [
-      reasoning,
+      reasoning.text,
       "",
       "---",
       "",
@@ -94,6 +97,15 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
       boardOnly: ctx.boardOnly,
       repoPath: ctx.repoPath,
     }),
+    // The instruction this dispatch actually resolved, at the version it resolved to — carried from
+    // the resolution above, never re-resolved: an edit between the two would attribute the run to
+    // text that never ran.
+    attribution: {
+      promptId: reasoning.promptId,
+      promptBodyDigest: reasoning.promptBodyDigest,
+      skillId: reasoning.skillId,
+      skillDigest: reasoning.skillDigest,
+    },
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });
   // A generic step can report `already-shipped`, so its report carries the contract it received.

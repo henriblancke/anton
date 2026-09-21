@@ -24,6 +24,7 @@ import {
   type Worktree,
 } from "../git/worktree";
 import type { PendingRefresh } from "../runs";
+import { resolveWarmConfig } from "../projects";
 import { resolveOperator } from "../operator";
 import {
   BRANCH_RECREATED_REFRESH_TOMBSTONE,
@@ -159,6 +160,8 @@ async function resolveComparableBase(
 /** Step 2. Warm (or reuse) the run's checkout and build the context every step is narrowed from. */
 export async function warmRunWorktree(
   run: EpicRun,
+  /** The cooked pipeline's content digest, stamped on every invocation this run's walk produces. */
+  formulaDigest?: string,
 ): Promise<{ worktree: Worktree; runStep: Omit<StepContext, "tickets"> }> {
   const {
     db,
@@ -546,7 +549,10 @@ export async function warmRunWorktree(
   // it may have just rebased/merged the branch onto is safely on the run row (anton-s55u, PR #279
   // review, P1) — this call is the only thing left that can run for minutes, and its own signal lets
   // an operator's kill interrupt it without holding the run's concurrency slot for the full timeout.
-  await warmWorktreeBestEffort(worktree, ctx.signal);
+  // The project's own warm setting rides along (anton-z5li2): this is the one call site a real run
+  // reaches, so it is what makes a pinned command — or a project that turned warming off — take
+  // effect instead of the machine-wide env var and lockfile detection alone.
+  await warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings));
   await ctx.heartbeat();
 
   // What an `already-shipped` claim is checked against (PR #279 review). `baseForkSha` above is
@@ -625,6 +631,7 @@ export async function warmRunWorktree(
     alreadyShippedBase,
     target,
     settings,
+    formulaDigest,
     assertLeaseHeld: lease.assertHeld,
   };
   return { worktree, runStep };

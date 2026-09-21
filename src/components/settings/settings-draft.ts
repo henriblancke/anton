@@ -65,6 +65,9 @@ export interface SettingsDraft {
   lintCommand: string;
   typecheckCommand: string;
   buildCommand: string;
+  /** The pinned warm command (anton-z5li2). "" clears the pin — it never means "skip the warm". */
+  warmCommand: string;
+  warmEnabled: boolean;
   concurrency: number;
   jobTimeoutMinutes: number;
   ticketTimeoutMinutes: number;
@@ -138,6 +141,9 @@ export function draftFromSettings(
     lintCommand: settings.lintCommand ?? "",
     typecheckCommand: settings.typecheckCommand ?? "",
     buildCommand: settings.buildCommand ?? "",
+    warmCommand: settings.warmCommand ?? "",
+    // Absent → ON: every project already warms, and only an explicit `false` opts out (anton-z5li2).
+    warmEnabled: settings.warmEnabled ?? true,
     concurrency: settings.concurrency ?? DEFAULT_CONCURRENCY,
     jobTimeoutMinutes: settings.jobTimeoutMinutes ?? DEFAULT_JOB_TIMEOUT_MINUTES,
     ticketTimeoutMinutes: settings.ticketTimeoutMinutes ?? DEFAULT_TICKET_TIMEOUT_MINUTES,
@@ -212,6 +218,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
   budget: ["budgetAware", "daytimeReservePct", "weeklyTargetPct"],
   quotaShare: ["quotaSharePct", "reserveQuotaShare"],
   gates: ["testCommand", "lintCommand", "typecheckCommand", "buildCommand"],
+  warm: ["warmCommand", "warmEnabled"],
   review: [
     "reviewEnabled",
     "reviewAgent",
@@ -318,6 +325,11 @@ export function settingsPatchBody(
     lintCommand: orNull(draft.lintCommand),
     typecheckCommand: orNull(draft.typecheckCommand),
     buildCommand: orNull(draft.buildCommand),
+    // Worktree warming (anton-z5li2). "" clears the PIN — warming falls back to ANTON_WARM_COMMAND
+    // and then lockfile detection. Skipping is `warmEnabled: false`, which rides along so a project
+    // that turns warming back on keeps the command it had pinned.
+    warmCommand: orNull(draft.warmCommand),
+    warmEnabled: draft.warmEnabled,
     // The model routing table (anton-uu7r), in the order shown — that order is the evaluation
     // order. A row naming no model is scaffolding, not a rule, so it's dropped rather than 400ing
     // the whole save; [] clears the table (every job back to the default model).

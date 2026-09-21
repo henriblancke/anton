@@ -11,7 +11,7 @@
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
 import type { Bead } from "../beads/bd";
-import { metered } from "../claude-invocations";
+import { metered, type InvocationDimensions } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
 import { branchAddedCommit } from "../git/ops";
@@ -48,8 +48,7 @@ import {
 } from "./execute-epic-ticket-settle";
 import type { ResolvedStep } from "./run-formula";
 import { appendSessionLog } from "../sessions";
-import { recordBoardOnlyAttribution } from "./step-registry";
-import type { StepContext, StepFacts } from "./step-registry";
+import { recordBoardOnlyAttribution, stepName, type StepContext, type StepFacts } from "./step-registry";
 
 /**
  * How a finished ticket settled, plus whether its close actually landed (PR #253 review). The close
@@ -455,6 +454,23 @@ async function walkTicketSteps(args: {
   for (const { step: cooked, definition } of args.steps) {
     // Every step boundary is a lease checkpoint, exactly as every ticket boundary is.
     run.assertLeaseHeld?.();
+    // Built once per step, before the handler below resolves what to attribute it to — the object
+    // `setAttribution` mutates once it does (PR #313 review).
+    const dimensions: InvocationDimensions = {
+      projectId: ticketCtx.projectId,
+      jobType: ticketCtx.ctx.type,
+      jobId: ticketCtx.ctx.jobId,
+      step: cooked.id,
+      // The handler beside the author's step id (anton-234ja) — same reason `dispatchClaude`
+      // records it: a project formula's own step id classifies nothing.
+      stepHandler: stepName(cooked),
+      runId: ticketCtx.runId,
+      beadId: ticket.id,
+      modelRequested: ticketCtx.settings?.model,
+      // Same for the pipeline digest; the prompt digest `metered` takes from the spawn options,
+      // which a resumed attempt carries unchanged.
+      formulaDigest: ticketCtx.formulaDigest,
+    };
     const result = await definition.handler({
       ...ticketCtx,
       step: cooked,
@@ -472,17 +488,19 @@ async function walkTicketSteps(args: {
           stepId: cooked.id,
           // Meter the bare driver inside the resilience loop: every interrupted call and its
           // resumed successor are distinct paid attempts, even when the wrapper returns one result.
-          driver: metered(db, ticketCtx.clock, {
-            projectId: ticketCtx.projectId,
-            jobType: ticketCtx.ctx.type,
-            jobId: ticketCtx.ctx.jobId,
-            step: cooked.id,
-            runId: ticketCtx.runId,
-            beadId: ticket.id,
-            modelRequested: ticketCtx.settings?.model,
-          }, runClaude),
+          // `dimensions` is mutated in place by `setAttribution` below rather than rebuilt, because
+          // `metered` reads it at CALL time (once the handler below has actually dispatched) — the
+          // object built here, before the handler runs, is the same one that read picks up.
+          driver: metered(db, ticketCtx.clock, dimensions, runClaude),
         }),
         recordsEachAttempt: true,
+        // This driver meters its own attempts, so `dispatchClaude` adds no outer row and — unlike
+        // the shared dispatch boundary's own meter — its resolved attribution never reaches this one
+        // on its own (PR #313 review). `dispatchClaude` calls this right before dispatching with
+        // whatever it resolved: `implementStep`'s ticket `agent:` tag, or `claudeStep`'s
+        // `promptId`/`skillId` + digest — never both, and never the ticket's own agent for the
+        // latter, which does not run it.
+        setAttribution: (attribution) => Object.assign(dimensions, attribution),
       },
     });
     recordStepReport(progress, result.facts);

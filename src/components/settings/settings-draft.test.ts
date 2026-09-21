@@ -70,6 +70,8 @@ describe("dirtyFields", () => {
     expect(dirty({ reviewMinScore: 8 }).review).toBe(true);
     expect(dirty({ describePrompt: "summarize outcomes" }).describePrompt).toBe(true);
     expect(dirty({ weeklyTargetPct: 50 }).budget).toBe(true);
+    expect(dirty({ warmCommand: "make setup" }).warm).toBe(true);
+    expect(dirty({ warmEnabled: false }).warm).toBe(true);
   });
 
   it("reads an edited commit timeout as dirty, and resolves an absent one to the default", () => {
