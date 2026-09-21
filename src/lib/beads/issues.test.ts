@@ -44,13 +44,14 @@ vi.mock("./snapshot", async () => {
 
 const {
   allIssues,
+  ensureCycleEvidence,
   loadAllIssues,
   probeCycleEvidence,
   readAllIssues,
   refreshAllIssues,
   resetCycleProbes,
 } = await import("./issues");
-const { cycleEvidenceFor } = await import("./cycle-evidence");
+const { attachCycleEvidence, cycleEvidenceFor } = await import("./cycle-evidence");
 const { invalidateIssueSnapshot, issueSnapshotVersion, refreshIssueSnapshot, resetIssueSnapshots } =
   await import("./snapshot");
 
@@ -766,6 +767,89 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
 
     const board = await allIssues(REPO);
     expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+});
+
+describe("ensureCycleEvidence (codex review, PR #274)", () => {
+  it("attaches evidence and bumps the version when the board's own edges are still current", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    const returned = await ensureCycleEvidence(REPO, board);
+
+    expect(returned).toBe(board);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("is a no-op when the board already carries evidence", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    attachCycleEvidence(board, []);
+
+    await ensureCycleEvidence(REPO, board);
+
+    expect(cyclesMock).not.toHaveBeenCalled();
+  });
+
+  it("skips the re-list/compare when the board carries no blocks edge at all", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    cyclesMock.mockResolvedValue([]);
+
+    await ensureCycleEvidence(REPO, board);
+
+    expect(listMock).not.toHaveBeenCalled();
+    expect(cycleEvidenceFor(board)).toEqual([]);
+  });
+
+  it("declines to attach empty cycle evidence to a board whose own edges are pre-repair (P2 badge review, thread on issues.ts:381)", async () => {
+    // `board` is the caller's own cached snapshot array (the approve route's pre-lock `allBeads`),
+    // still carrying a `blocks` edge from before a concurrent writer repaired it on a shared-server
+    // board. Without the re-list/compare, the empty `cycles` result below would land on this stale,
+    // still-cyclic-looking board as if it described the same revision — a spurious block for a
+    // board that has, in fact, already been repaired.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const board = [
+      { ...target, dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" as const }] },
+      other,
+    ];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }, other]); // the repair already landed
+    cyclesMock.mockResolvedValue([]);
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("declines to attach a non-empty cycles result that doesn't cover a stale blocks edge in the board (P2 badge review, thread on issues.ts:381)", async () => {
+    // Same race, but `cycles` comes back NON-empty — reporting an unrelated cycle (t-9) elsewhere —
+    // while `board`'s own t-1/t-2 edge was repaired by a concurrent writer before `bd dep cycles`
+    // settled. Skipping the re-list/compare on a non-empty result would stamp this stale board as
+    // covered by evidence that only speaks to t-9.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const board = [
+      { ...target, dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" as const }] },
+      other,
+    ];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }, other]); // the repair already landed
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("still lets a failed depCycles call reject, unlike the best-effort paths", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    await expect(ensureCycleEvidence(REPO, board)).rejects.toThrow("bd: dep cycles timed out");
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
 });

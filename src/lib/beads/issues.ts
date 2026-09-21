@@ -374,11 +374,33 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
  *
  * A no-op when the board already carries evidence, so a caller may call it defensively without ever
  * risking a redundant `bd dep cycles` spawn.
+ *
+ * Neither an empty NOR a non-empty `cycles` result proves `board`'s OWN `blocks` edges still
+ * describe the graph `cycles` was just computed against: on a shared-server board another writer can
+ * repair or introduce a cycle in the gap between the caller's read and this fetch settling (codex
+ * review, PR #274). `board` is typically the caller's own cached snapshot array (not a defensive
+ * copy), so blindly attaching here would both pair a stale board with fresher evidence — the
+ * pre-lock caller's own gate could then 422 a since-repaired board, or wave through a since-broken
+ * one — AND publish that mismatched pairing to every other reader sharing the snapshot. Always
+ * re-list and compare, same as `attachCyclesBestEffort`/`probeCycleEvidence`; gated on `board`
+ * actually carrying a `blocks` edge, same as those siblings' own guard, since an edge-free board has
+ * no cyclic pair that could be stale. An inconsistent board is left without evidence rather than
+ * retried here — every consumer of `cycleEvidenceFor` already fails closed on `undefined`
+ * (`missingCycleEvidenceGap`), and a caller that must not proceed on a stale pairing gets exactly
+ * that by falling through to the same closed failure a genuinely missing read produces.
  */
 export async function ensureCycleEvidence(cwd: string, board: Bead[]): Promise<Bead[]> {
   if (cycleEvidenceFor(board) === undefined) {
-    attachCycleEvidence(board, await beads.depCycles(cwd));
-    markCycleEvidenceRecovered(cwd);
+    const cycles = await beads.depCycles(cwd);
+    const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
+    const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(cwd));
+    // Recheck evidence AFTER the `sameBlocksEdges` await, not just before it, mirroring
+    // `attachCyclesBestEffort`: a concurrent enrichment path sharing this same `board` array (evidence
+    // is keyed by array identity) may have already attached it while the re-list above was in flight.
+    if (consistent && cycleEvidenceFor(board) === undefined) {
+      attachCycleEvidence(board, cycles);
+      markCycleEvidenceRecovered(cwd);
+    }
   }
   return board;
 }
