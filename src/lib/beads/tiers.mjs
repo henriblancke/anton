@@ -114,7 +114,11 @@ function isJudged(bead) {
 export function validateBoardStructure(board, { cycles } = {}) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
-  const { memberships: cycleMemberships, unreadable: unreadableCycles } = cycleMembers(byId, cycles);
+  const {
+    memberships: cycleMemberships,
+    unreadable: unreadableCycles,
+    all: allCycles,
+  } = cycleMembers(byId, cycles);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -318,6 +322,28 @@ export function validateBoardStructure(board, { cycles } = {}) {
     }
   }
 
+  // A cycle whose every mapped member fails `isJudged` (closed, abandoned, or pipeline-typed —
+  // `gate`/`molecule`) never has its `blocks-cycle` fault raised above: the per-bead loop `continue`s
+  // past every one of those ids before it ever reaches the cycle-membership check at their `id`, so a
+  // loop built entirely out of ad-hoc gates/molecules produced no violation despite bd's own detector
+  // reporting it. Complete cycles only — an incomplete one is already covered by the unreadable-cycle
+  // fallback below, and double-reporting it would fault the same bd record twice.
+  for (const evidence of allCycles) {
+    if (!evidence.complete) continue;
+    const hasJudgedMember = [...evidence.members].some((id) => isJudged(byId.get(id)));
+    if (hasJudgedMember) continue;
+    fault(
+      "board",
+      "blocks-cycle",
+      "blocking",
+      `bd dep cycles reported a blocks cycle with no judged member (${[...evidence.members].join(", ")}) ` +
+        "— every id is closed, abandoned, or a pipeline gate/molecule, so no bead on it ever reaches " +
+        "the per-bead check, yet the loop still deadlocks whatever depends on it. Break one edge on it " +
+        "(`bd dep remove <blocked> <blocker>`), then restore the intended order " +
+        "(`bd dep add <blocked> <blocker>`).",
+    );
+  }
+
   // `bd dep cycles` may report a real graph cycle in an encoding whose bead ids this version of
   // anton cannot read. That is still blocking evidence, not an empty answer: put it on a stable
   // board-level id so the CLI refuses instead of silently calling the board healthy.
@@ -376,6 +402,7 @@ export function structureGaps(targetId, board, options) {
 function cycleMembers(byId, cycles) {
   const memberships = new Map();
   const unreadable = [];
+  const all = [];
   for (const cycle of cycles ?? []) {
     const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
     const mapped = ids.filter((id) => byId.has(id));
@@ -394,6 +421,7 @@ function cycleMembers(byId, cycles) {
     // this isn't an artifact of the current DFS implementation that a future bd could drop.
     const next = new Map(ids.map((id, i) => [id, ids[(i + 1) % ids.length]]));
     const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length };
+    all.push(evidence);
     for (const id of mapped) {
       const memberCycles = memberships.get(id);
       if (memberCycles) memberCycles.push(evidence);
@@ -403,7 +431,7 @@ function cycleMembers(byId, cycles) {
     // edge, each mapped member must block; only the missing members need a board-level fallback.
     if (!evidence.complete) unreadable.push(cycle?.raw ?? cycle);
   }
-  return { memberships, unreadable };
+  return { memberships, unreadable, all };
 }
 
 /** Keep unfamiliar authoritative metadata diagnosable without letting an unexpected value throw. */

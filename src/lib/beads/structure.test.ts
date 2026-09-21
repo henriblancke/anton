@@ -248,6 +248,35 @@ describe("validateBoardStructure", () => {
       ]);
     });
 
+    it("blocks at board scope a cycle made entirely of pipeline artifacts (gates/molecules)", () => {
+      // isJudged excludes gate/molecule beads, so the per-bead loop above never reaches either of
+      // these ids' cycle-membership check — without the board-level fallback, a loop wired entirely
+      // out of ad-hoc gates would report as a clean board despite bd's own detector finding it.
+      const board = [
+        bead("g1", "gate", { dependencies: [blocks("g1", "g2")] }),
+        bead("g2", "molecule", { dependencies: [blocks("g2", "g1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["g1", "g2"], raw: { cycle: ["g1", "g2"] } }],
+      });
+      expect(violations).toEqual([
+        expect.objectContaining({ id: "board", rule: "blocks-cycle", severity: "blocking" }),
+      ]);
+      expect(violations[0].message).toContain("g1");
+      expect(violations[0].message).toContain("g2");
+    });
+
+    it("still faults the judged member, not the board, when only one side of the cycle is a gate", () => {
+      const board = [
+        task("t1", undefined, { dependencies: [blocks("t1", "g1")] }),
+        bead("g1", "gate", { dependencies: [blocks("g1", "t1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["t1", "g1"], raw: { cycle: ["t1", "g1"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([["t1", "blocks-cycle"]]);
+    });
+
     it("blocks mapped cycle members even when a raced board snapshot no longer carries their edges", () => {
       const board = [task("a"), task("b")];
       const violations = validateBoardStructure(board, {
