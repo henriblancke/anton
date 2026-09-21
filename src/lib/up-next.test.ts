@@ -198,26 +198,31 @@ describe("upNextAbsence", () => {
     expect(upNextAbsence({ ...armed, scheduled: false }, true, undefined)).toBe("disarmed");
   });
 
-  it("names unavailable cycle evidence ahead of the policy and the level, since neither ran", () => {
+  it("names unavailable cycle evidence once a ranking could actually be offered", () => {
     // `bd dep cycles` failing is a board-read failure, not a verdict about the board — it fails every
-    // target's approval gate closed regardless of what the picker settings say.
+    // target's approval gate closed regardless of what the picker settings say, but only once the
+    // policy and level have already cleared: a level that never offers picks stays empty whichever
+    // way the graph read goes.
     expect(upNextAbsence(armed, false, undefined)).toBe("cycles-unavailable");
-    expect(upNextAbsence({ ...armed, policyKnown: false }, false, undefined)).toBe(
-      "cycles-unavailable",
-    );
   });
 
-  it("names the level when the pass runs but promises nothing offered", () => {
+  it("names the level ahead of cycle evidence, since a propose-only level offers nothing regardless", () => {
+    // Blaming cycle evidence here (PR #274 review) would tell the operator this clears on its own once
+    // the graph read recovers, when a propose-only level never offers a ranking either way.
     expect(upNextAbsence({ ...armed, levelOffers: false }, true, undefined)).toBe("proposes-only");
+    expect(upNextAbsence({ ...armed, levelOffers: false }, false, undefined)).toBe("proposes-only");
   });
 
-  it("names an unreadable policy ahead of the level, which came from the same failed read", () => {
+  it("names an unreadable policy ahead of the level and cycle evidence, which came from the same failed read", () => {
     // "It offers" is fail-soft guesswork once the settings read threw; what is actually true is that
     // anton cannot see the policy, and that is what the lane must say (PR #226 review).
     expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: true }, true, undefined)).toBe(
       "policy-unreadable",
     );
     expect(upNextAbsence({ ...armed, policyKnown: false, levelOffers: false }, true, undefined)).toBe(
+      "policy-unreadable",
+    );
+    expect(upNextAbsence({ ...armed, policyKnown: false }, false, undefined)).toBe(
       "policy-unreadable",
     );
   });
