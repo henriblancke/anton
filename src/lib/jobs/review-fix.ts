@@ -222,6 +222,9 @@ function closedUnfencedEpics(all: Bead[], epicBeadId?: string): Bead[] {
   );
 }
 
+/** What one stranded-epic recovery attempt did (`recoverUnfencedClosure`). */
+type RecoveryResult = "recovered" | "attempted" | "skipped";
+
 /**
  * Retry the fence backfill `closeFinalized` could not complete before ending: rebuild the same
  * `[...children, epic]` set it would have closed, this time from the board (`runTickets`) rather than
@@ -229,12 +232,30 @@ function closedUnfencedEpics(all: Bead[], epicBeadId?: string): Bead[] {
  * a bead already fenced is filtered out inside that function — so a repeat pass over a stuck epic
  * costs nothing beyond the read. Only once every bead in the set is confirmed fenced does the label
  * drop, exactly like `closeFinalized`'s own gate.
+ *
+ * `closedUnfencedEpics` selects on shape alone (closed + still `stage:in-review`), which a target
+ * can also reach by a route this recovery must NOT touch: an operator closing the bead directly
+ * while its PR is still open (or closed unmerged). Nothing there was ever fenced, so
+ * `stampConfirmedClosures` over an empty unfenced set returns `true` vacuously — stripping the label
+ * off a target that was never actually finalized, and losing the one signal that would let PR
+ * monitoring resume if it were reopened. So recovery only proceeds once the PR itself confirms a
+ * merge landed (chatgpt-codex-connector, PR #284 review, "Restrict recovery to actual unfenced
+ * finalizations"); anything else — no PR ref, or a PR that never merged — is left exactly as is.
  */
-async function recoverUnfencedClosure(repo: string, epic: Bead, all: Bead[]): Promise<boolean> {
+async function recoverUnfencedClosure(
+  repo: string,
+  epic: Bead,
+  all: Bead[],
+  signal: AbortSignal,
+): Promise<RecoveryResult> {
+  const number = prNumberFromRef(beads.getPrRef(epic));
+  if (number === undefined) return "skipped"; // no PR to confirm a merge against
+  const pr = await getPrReview(repo, number, signal);
+  if (pr.state !== "MERGED") return "skipped"; // closed by hand, not by finalization — leave it
   const closedNow = [...runTickets(all, epic.id), epic];
-  if (!(await stampConfirmedClosures(repo, closedNow))) return false;
+  if (!(await stampConfirmedClosures(repo, closedNow))) return "attempted";
   await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
-  return true;
+  return "recovered";
 }
 
 /**
@@ -292,14 +313,29 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // Closed epics a merge finalization stranded (see closedUnfencedEpics) — checked every pass,
   // targets or not, since this is the only place left that ever looks at them again.
   let recovered = 0;
+  // A fence stamp or a label untag is a local dolt write — this dispatcher returns straight to the
+  // scheduler afterward, unlike the per-PR handler which pushes from its `finally` (fixOnePr, above).
+  // Left unsynced, a recovered fence or a dropped `stage:in-review` sits only in this machine's local
+  // DB: another operator's board (or this one's after a restart) still reads the epic as unfenced/
+  // stranded, and a same-machine retry that already dropped the label locally would never see its own
+  // write reflected back either (chatgpt-codex-connector, PR #284 review, "Sync recovered closure
+  // fences before declaring success").
+  let wroteToBoard = false;
   for (const stuck of closedUnfencedEpics(all, epicBeadId)) {
     await ctx.heartbeat();
     try {
-      if (await recoverUnfencedClosure(repo, stuck, all)) recovered += 1;
+      const result = await recoverUnfencedClosure(repo, stuck, all, ctx.signal);
+      if (result !== "skipped") wroteToBoard = true;
+      if (result === "recovered") recovered += 1;
     } catch (e) {
       // One unfenceable epic must not cost the others their recovery attempt.
       consoleLog.error(`epic ${stuck.id}: unfenced-closure recovery failed`, e);
     }
+  }
+  if (wroteToBoard) {
+    await beads
+      .sync(repo)
+      .catch((e) => consoleLog.error("beads dolt sync failed after closure-fence recovery", e));
   }
 
   if (targets.length === 0) {
