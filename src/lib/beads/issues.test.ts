@@ -240,13 +240,39 @@ describe("loadAllIssues", () => {
     expect(listMock.mock.calls.length).toBeLessThan(20);
   });
 
-  it("skips the recheck entirely when cycles come back non-empty — already the fail-safe answer", async () => {
+  it("skips the recheck when `work` carries no `blocks` edge at all, regardless of the cycles result", async () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
 
     await loadAllIssues(REPO, { withCycles: true });
 
     expect(listMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("still retries on a non-empty cycles result when it doesn't cover a stale blocks edge in the earlier board (P2 review round 18 on PR #274)", async () => {
+    // A non-empty `cycles` result is only the fail-safe answer for the cycle(s) it actually names.
+    // Here it reports an unrelated cycle elsewhere (t-9) while `work`'s own t-1/t-2 edge was repaired
+    // by a concurrent writer in the gap before `bd dep cycles` ran — exactly the case `structureGaps`
+    // would miss because it scopes reported membership to a target's own subtree, never seeing t-1's
+    // now-stale cycle in evidence that only speaks to t-9.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock
+      .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
+      .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
+      .mockImplementationOnce(async () => [repaired, other]); // retry's work read — no blocks edge left
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([repaired, other]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+    expect(listMock).toHaveBeenCalledTimes(3);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
   it("bumps the version when a concurrent non-cycled refresh wins the shared loader race", async () => {

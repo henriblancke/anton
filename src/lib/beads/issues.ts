@@ -167,18 +167,22 @@ export async function loadAllIssues(
   // the board it's attached to, never older.
   if (!opts.withCycles) return board;
   const cycles = await beads.depCycles(cwd);
-  // "Never older" is not "consistent": an empty `cycles` result only proves the graph is clean AS OF
-  // this call, not that `work`'s own edges (snapshotted before it) still describe that same graph.
-  // A repair landing in the gap between the two reads can remove one edge of a cycle `work` already
-  // captured, so `cycles` comes back empty while `board`'s edges still encode the now-resolved
-  // cycle. `structureGaps` would wave that through on the empty evidence, but `orderTickets`
-  // (execute-epic-board.ts) sorts `board`'s raw edges directly, hits the still-cyclic pair, and
-  // falls back to input order for tickets the stale cycle touches — dispatching by an ordering
-  // nobody validated. Only worth checking when `cycles` is empty: a non-empty result is already the
-  // fail-safe (blocking) answer this file leans on elsewhere, so this particular mismatch cannot
-  // make it MORE wrong. Re-listing and comparing edges catches the empty case: if the graph moved
-  // between the two reads, retry against whatever is current instead of pairing evidence with a
-  // board it no longer describes.
+  // "Never older" is not "consistent": a `cycles` result only proves the graph's cycle set is
+  // accurate AS OF this call, not that `work`'s own edges (snapshotted before it) still describe
+  // that same graph. A repair landing in the gap between the two reads can remove one edge of a
+  // cycle `work` already captured, so `cycles` comes back empty (or non-empty but missing that
+  // cycle) while `board`'s edges still encode the now-resolved cycle. `structureGaps` scopes
+  // reported cycle membership to the approval/claim target's own subtree (PR #274 review, round
+  // 17): a non-empty `cycles` result is the fail-safe answer only for the cycle(s) it actually
+  // names — a board can hold cycle A inside the target and an unrelated cycle B elsewhere, and a
+  // concurrent writer repairing A between the two reads leaves `cycles` non-empty (still reporting
+  // B) while `board`'s raw edges still encode the resolved A. `structureGaps` never sees A (it isn't
+  // in the evidence and isn't B's target) and declares the target clean, while `orderTickets`
+  // (execute-epic-board.ts), which sorts `board`'s raw edges directly, hits the still-cyclic A pair
+  // and falls back to input order for the tickets it touches — dispatching by an ordering nobody
+  // validated. So this must run for a non-empty `cycles` too, not only when it's empty: re-listing
+  // and comparing edges catches either case — if the graph moved between the two reads, retry
+  // against whatever is current instead of pairing evidence with a board it no longer describes.
   //
   // Also gated on `work` actually carrying a `blocks` edge: a board with zero `blocks` edges has no
   // cyclic pair that could be stale, so the second `bd list` this recheck costs would buy nothing.
@@ -190,7 +194,6 @@ export async function loadAllIssues(
   // that.
   const workHasBlocksEdge = beads.edgesOf(work).some((e) => e.type === "blocks");
   if (
-    cycles.length === 0 &&
     workHasBlocksEdge &&
     !opts.skipCycleConsistencyRecheck &&
     !sameBlocksEdges(work, await loadWorkIssues(cwd))
