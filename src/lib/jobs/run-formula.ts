@@ -40,6 +40,7 @@
  * default. See {@link selectRunFormula} for the precedence — and {@link RunFormulaOptions.pinned} for
  * why a RESUMED run re-reads the pipeline it already recorded instead of selecting again.
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -51,6 +52,7 @@ import {
   RUN_FORMULA_FILENAME,
   bundledRunFormulaPath as bundledRunFormulaUnder,
 } from "../beads/config.mjs";
+import { STAMP_LENGTH } from "../claude/skill-stamp.mjs";
 import { PoisonEpic } from "./errors";
 import { resolveStep, type StepDefinition } from "./step-registry";
 
@@ -73,6 +75,11 @@ export interface RunFormula extends FormulaChoice {
    * whose absolute path belongs to the install rather than the project.
    */
   recorded: string;
+  /**
+   * 12-hex content digest of the cooked pipeline — {@link runFormulaDigest}. Rides ALONGSIDE
+   * `recorded`, never instead of it: the path says which file, the digest says what was in it.
+   */
+  digest: string;
   /** The cooked pipeline, its `steps` already in {@link orderFormulaSteps execution order}. */
   cooked: CookedFormula;
   /** Every step in execution order, each with its resolved handler. */
@@ -202,6 +209,52 @@ export function runFormulaPathOf(source: string): string {
 /** The durable identity of a loaded pipeline — see {@link BUNDLED_FORMULA_SOURCE}. */
 export function recordedFormulaSource(path: string): string {
   return path === bundledRunFormulaPath() ? BUNDLED_FORMULA_SOURCE : path;
+}
+
+/**
+ * 12-hex content digest of a COOKED pipeline (anton-jpmdw) — what a run actually walked, as opposed
+ * to where it read that from.
+ *
+ * {@link recordedFormulaSource} already says WHICH file, and this rides alongside it rather than
+ * replacing it, because a path answers neither question the ledger asks. A project edits its
+ * pipeline in place, so two runs recording the same absolute path may have walked different steps —
+ * pooling them under one key compares cohorts that ran different work. And a project that copied
+ * anton's default verbatim records a different path from a project that never ran the installer,
+ * splitting one cohort in two: identical pipelines, so they digest the SAME here, which is why the
+ * input is the cooked content and never the source path or the file's bytes.
+ *
+ * What goes in is what anton DISPATCHES ON: each step's id, its handler-bearing `labels` in
+ * declaration order, its `type`, and its resolved `needs`. Steps are hashed in the order given —
+ * {@link orderFormulaSteps execution order} at every call site — so reordering the pipeline changes
+ * the digest, which is the point: a step moved is a different pipeline.
+ *
+ * What stays OUT is anything per-run or cosmetic: `title`, `description` and the formula's own name
+ * are prose bd substitutes `{{var}}` into, so including them would make every run of a pipeline
+ * digest differently by the target bead's id — a cohort of one, which answers nothing. `source` is
+ * out for the same reason the path is.
+ *
+ * Fields are `\0`-delimited and each list length-prefixed, so no rearrangement of content can forge
+ * another pipeline's digest (`labels: ["a", "b"]` and `labels: ["a\0b"]` hash differently).
+ */
+export function runFormulaDigest(cooked: CookedFormula): string {
+  const h = createHash("sha256");
+  const field = (v: string) => {
+    h.update(v);
+    h.update("\0");
+  };
+  const list = (values: readonly string[]) => {
+    field(String(values.length));
+    for (const v of values) field(v);
+  };
+
+  field(String(cooked.steps.length));
+  for (const step of cooked.steps) {
+    field(step.id);
+    field(step.type ?? "");
+    list(step.labels ?? []);
+    list(step.needs ?? []);
+  }
+  return h.digest("hex").slice(0, STAMP_LENGTH);
 }
 
 /**
@@ -562,11 +615,16 @@ export async function validateRunFormula(
   // Resolution is the whole point of validating early: an unmapped `step:` label parks HERE, before a
   // worktree exists, instead of three steps into a run that has already dispatched an agent.
   const steps = ordered.map((step) => ({ step, definition: resolveStep(step, source) }));
+  const pipeline = { ...cooked, steps: ordered };
   return {
     source,
     recorded: recordedFormulaSource(source),
+    // Digested from the ORDERED pipeline, which is the one the walker runs — a formula that
+    // expressed its order through `needs` rather than declaration digests the same as one that
+    // wrote the same shape out in order, because they are the same pipeline.
+    digest: runFormulaDigest(pipeline),
     variant,
-    cooked: { ...cooked, steps: ordered },
+    cooked: pipeline,
     steps,
   };
 }

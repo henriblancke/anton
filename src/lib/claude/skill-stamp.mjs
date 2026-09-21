@@ -23,8 +23,12 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 
-/** Digest length. 12 hex chars (48 bits) — collision-proof for a handful of files, readable in a warning. */
-const STAMP_LENGTH = 12;
+/**
+ * Digest length. 12 hex chars (48 bits) — collision-proof for a handful of files, readable in a
+ * warning. Exported because every other content stamp anton takes (the run formula's, anton-jpmdw)
+ * reuses it: one length, so two stamps are never told apart by their shape.
+ */
+export const STAMP_LENGTH = 12;
 
 /** Editor/OS droppings that must not decide whether a skill copy counts as pristine. */
 const IGNORED_FILES = new Set([".DS_Store", "Thumbs.db"]);
