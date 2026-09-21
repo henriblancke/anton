@@ -212,6 +212,15 @@ export type RunPatch = Partial<{
   pendingRefreshKind: string | null;
   /** This row's own last effective refresh boundary, snapshotted before it goes pending (anton-s55u) — see schema. */
   priorBaseRefreshSha: string | null;
+  /**
+   * What warming did to this run's checkout, and — on a failure — which command failed and the tail
+   * of what it said (anton-jyrhf). Written once, right after warming returns, so the cause is
+   * queryable at the moment it occurs rather than inferred from a later symptom. See the columns'
+   * own notes for the vocabulary; nulls are meaningful (never attempted) and are never backfilled.
+   */
+  warmOutcome: string | null;
+  warmCommand: string | null;
+  warmError: string | null;
   attempts: number;
   error: string | null;
   /** Anton's own account of why the run stopped, held apart from `error` above (anton-4kvp) — see schema. */
