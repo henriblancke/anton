@@ -344,6 +344,32 @@ describe("loadAllIssues", () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
+  it("declines to attach empty cycle evidence to a retained board whose own edges are pre-repair (P2 review on PR #274)", async () => {
+    // The retained snapshot warms with a genuinely cyclic edge. By the time the best-effort enrichment's
+    // `bd dep cycles` call settles, every later `bd list` (simulating another machine's repair landing on
+    // a shared-server board, with no local refresh yet noticing) reports the cycle already resolved.
+    // Without the recheck, that empty result would land on this still-cyclic-looking retained board as
+    // if it described the same revision.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([]);
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    // The retained board itself is untouched — only the evidence attachment is gated — so the caller
+    // still sees the stale, pre-repair content, but without a cycle-free stamp on it.
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
   it("coalesces concurrent best-effort enrichments into one dep-cycles call and one version bump (PR #274 review, round 6)", async () => {
     // Warm the snapshot with no evidence first, matching several cold page renders sharing one load.
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);

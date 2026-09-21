@@ -296,8 +296,19 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
     // this generation's board no longer represents. Leave evidence unattached rather than stamp a
     // stale-graph result as current — the next probe or read retries against the new generation.
     if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
-      attachCycleEvidence(board, cycles);
-      markCycleEvidenceRecovered(cwd);
+      // An empty `cycles` result only proves the graph is clean AS OF this call, not that `board`'s
+      // OWN `blocks` edges (captured earlier, possibly by another process's snapshot load) still
+      // describe that same graph. On a shared-server board another machine can repair a cycle in the
+      // gap between this fetch starting and settling: the generation guard above only catches THIS
+      // process replacing its own snapshot, not the underlying repo moving without a local refresh
+      // noticing yet. Re-list before stamping an empty result onto a possibly-stale `board` — the
+      // same gap `loadAllIssues`'s `sameBlocksEdges` retry closes for its own path (PR #274 review,
+      // round 18). Compared against a fresh `loadAllIssues`, not `loadWorkIssues`, so a board that
+      // merged in gate beads is compared like-for-like instead of always mismatching on their edges.
+      if (cycles.length > 0 || sameBlocksEdges(board, await loadAllIssues(cwd))) {
+        attachCycleEvidence(board, cycles);
+        markCycleEvidenceRecovered(cwd);
+      }
     }
   } catch (e) {
     console.warn(
