@@ -85,6 +85,16 @@ describe("required skill assets", () => {
     }
   });
 
+  // ADR-0001 binds work that spends tokens to ship its own instrumentation. Shaping is the only
+  // moment that obligation can be written onto the board cheaply, so the skill must name the ADR
+  // and the escape hatch — otherwise the policy rests on a reviewer remembering it (anton-67p0t).
+  it("shape surfaces ADR-0001 and its explicit out-of-scope escape", () => {
+    const shape = readFileSync(skillPath("shape"), "utf8");
+    expect(shape).toMatch(/docs\/adr\/0001-every-feature-is-instrumented\.md/);
+    expect(shape).toMatch(/spends tokens, occupies the queue, or needs a human/);
+    expect(shape).toMatch(/`## Out of scope`/);
+  });
+
   it("shape and scan-triage warn about missing .product/ and point at /setup", () => {
     // If .product/ is absent, these skills must not shape/triage against a vacuum — they warn
     // explicitly and direct the user at the now-bundled /setup (anton-olh).

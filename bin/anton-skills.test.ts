@@ -8,7 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { readFile, rm } from "node:fs/promises";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -276,6 +276,94 @@ describe("installSkillDir", () => {
     expect(installSkillDir(src, dest)).toBe("stale");
     expect(installSkillDir(src, dest, { force: true })).toBe("updated");
     expect(existsSync(join(dest, "templates.md"))).toBe(true);
+  });
+
+  // A refresh copies with copyFileSync, which follows a destination symlink and writes through it
+  // — so a pristine copy whose SKILL.md happens to be a symlink to something outside the skill dir
+  // must have that link replaced, never overwritten in place (anton-z33ia review).
+  it("replaces a destination symlink instead of writing through it into an external file", async () => {
+    installSkillDir(src, dest);
+    const externalDir = await tempDir("anton-skill-external-");
+    try {
+      const externalFile = join(externalDir, "external-SKILL.md");
+      writeFileSync(externalFile, "placeholder\n");
+      rmSync(join(dest, "SKILL.md"));
+      symlinkSync(externalFile, join(dest, "SKILL.md"));
+      // Writes through the symlink into externalFile, stamped so `dest` reads as pristine.
+      seedOtherRelease(dest, "an older release\n");
+
+      writeFileSync(join(src, "SKILL.md"), "v3\n");
+      expect(installSkillDir(src, dest)).toBe("refreshed");
+
+      expect(lstatSync(join(dest, "SKILL.md")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, "SKILL.md"), "utf8")).toBe("v3\n");
+      expect(readFileSync(externalFile, "utf8")).not.toBe("v3\n");
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
+  });
+
+  // Same hazard one path component up: a bundled subdirectory (`templates/`) swapped for a symlink
+  // to an external directory must have that link replaced too — otherwise both the drifted-file
+  // copy and the extra-file cleanup resolve through it into the external directory (anton-z33ia review).
+  it("replaces a symlinked destination subdirectory instead of writing/deleting through it into an external dir", async () => {
+    mkdirSync(join(src, "templates"), { recursive: true });
+    writeFileSync(join(src, "templates", "file.md"), "bundled v2\n");
+    installSkillDir(src, dest);
+
+    const externalDir = await tempDir("anton-skill-external-");
+    try {
+      const externalFile = join(externalDir, "file.md");
+      const leftoverFile = join(externalDir, "leftover.md");
+      writeFileSync(externalFile, "external placeholder\n");
+      writeFileSync(leftoverFile, "external leftover\n");
+      rmSync(join(dest, "templates"), { recursive: true, force: true });
+      symlinkSync(externalDir, join(dest, "templates"));
+      // Digested through the symlink, so dest reads as pristine and "outdated".
+      seedOtherRelease(dest, "an older release\n");
+
+      writeFileSync(join(src, "templates", "file.md"), "bundled v3\n");
+      expect(installSkillDir(src, dest)).toBe("refreshed");
+
+      expect(lstatSync(join(dest, "templates")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, "templates", "file.md"), "utf8")).toBe("bundled v3\n");
+      expect(readFileSync(externalFile, "utf8")).toBe("external placeholder\n");
+      expect(existsSync(leftoverFile)).toBe(true);
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
+  });
+
+  // Materializing a symlinked directory must not drop the bundled siblings the caller wasn't
+  // already about to recopy: only `templates/a.md` drifts here, but the symlinked `templates/`
+  // also carries a byte-identical `templates/b.md` reachable solely through the link. Replacing
+  // the link with an empty real directory and recopying just the drifted file would silently
+  // delete `b.md` (anton-z33ia review, PR #313 follow-up).
+  it("preserves a byte-identical sibling when refreshing a symlinked directory with only one drifted file", async () => {
+    mkdirSync(join(src, "templates"), { recursive: true });
+    writeFileSync(join(src, "templates", "a.md"), "a v1\n");
+    writeFileSync(join(src, "templates", "b.md"), "b v1\n");
+    installSkillDir(src, dest);
+
+    const externalDir = await tempDir("anton-skill-external-");
+    try {
+      writeFileSync(join(externalDir, "a.md"), "a v1\n");
+      writeFileSync(join(externalDir, "b.md"), "b v1\n");
+      rmSync(join(dest, "templates"), { recursive: true, force: true });
+      symlinkSync(externalDir, join(dest, "templates"));
+      // Digested through the symlink, so dest reads as pristine and "outdated".
+      seedOtherRelease(dest, "an older release\n");
+
+      // Only a.md changes upstream — b.md stays byte-identical, so it's absent from `drifted`.
+      writeFileSync(join(src, "templates", "a.md"), "a v2\n");
+      expect(installSkillDir(src, dest)).toBe("refreshed");
+
+      expect(lstatSync(join(dest, "templates")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, "templates", "a.md"), "utf8")).toBe("a v2\n");
+      expect(readFileSync(join(dest, "templates", "b.md"), "utf8")).toBe("b v1\n");
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
   });
 });
 

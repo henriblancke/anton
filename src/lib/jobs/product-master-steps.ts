@@ -11,6 +11,7 @@
 import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { claudeRouting } from "../claude/driver";
+import type { ReasoningAttribution } from "../claude-invocations";
 import { quotaMeterKey } from "../quota-meter";
 import type { RunClaudeOptions, runClaude } from "../claude/driver";
 import { resolveModel } from "./model-routing";
@@ -226,6 +227,14 @@ export interface JudgeInput {
   boardInput: PmBoardInput;
   claude: typeof runClaude;
   onEvent: RunClaudeOptions["onEvent"];
+  /**
+   * Told the resolved reasoning contract's {@link ReasoningAttribution} once `buildProductMasterPrompt`
+   * answers, so the caller's METER — already built around `claude` before this runs — can stamp it
+   * (PR #313 review, mirrors `dispatchClaude`'s `setAttribution`). The pass's own dispatch sets no
+   * `appendSystemPrompt`, so without this the ledger cannot tell an edited `productMasterPrompt` or
+   * a rewritten `product-master` skill from the text that ran before the edit.
+   */
+  setAttribution?: (attribution: ReasoningAttribution) => void;
 }
 
 /**
@@ -237,9 +246,10 @@ export interface JudgeInput {
  * pass never reached, which is the one failure that looks exactly like success.
  */
 export async function judgeBoard(scope: PassScope, input: JudgeInput): Promise<PmClaim[]> {
-  const { settings, boardInput, claude, onEvent } = input;
+  const { settings, boardInput, claude, onEvent, setAttribution } = input;
 
-  const { prompt, reasoningFrom } = await buildProductMasterPrompt({ settings, board: boardInput });
+  const { prompt, reasoningFrom, attribution } = await buildProductMasterPrompt({ settings, board: boardInput });
+  setAttribution?.(attribution);
   await scope.log(
     `[product-master] judging ${boardInput.board.length} bead(s) with the ${reasoningFrom.kind === "prompt" ? "operator's prompt" : "shipped contract"}\n`,
   );

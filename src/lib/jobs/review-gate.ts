@@ -13,8 +13,8 @@
  * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
  * wiring is what makes it unit-testable against a fake driver.
  */
-import { type Bead } from "../beads/bd";
-import { metered } from "../claude-invocations";
+import { labelValueOf, type Bead } from "../beads/bd";
+import { metered, type ReasoningAttribution } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
 import { quotaMeterKey } from "../quota-meter";
@@ -39,6 +39,7 @@ import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
   parseReviewFindings,
+  resolveReviewerContract,
   type ReviewFinding,
   type ReviewProtocolViolation,
   type ReviewReportResult,
@@ -158,6 +159,11 @@ export interface ReviewGateArgs {
   target: Bead;
   /** Every ticket the run implemented, in execution order. */
   tickets: Bead[];
+  /**
+   * The cooked pipeline's content digest, stamped on the gate's invocations (anton-jpmdw). Absent
+   * for a caller driving the gate directly, which records it as the absence it is.
+   */
+  formulaDigest?: string;
   settings: ProjectSettings;
   /** The run's worktree: where the diff is read and the fixes land. */
   worktreePath: string;
@@ -281,22 +287,6 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
   const driver = args.deps?.runClaude ?? runClaude;
-  // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
-  // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
-  // the gates — and a ledger that filed both under one step could not tell which half of a run's
-  // review budget went where.
-  const meter = (step: string) =>
-    metered(db, clock, {
-      projectId,
-      jobType: ctx.type,
-      jobId: ctx.jobId,
-      step,
-      runId,
-      beadId: target.id,
-      modelRequested: settings.model,
-    }, driver);
-  const claude = meter("review");
-  const fixClaude = meter("review-fix");
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
   const commit =
@@ -322,7 +312,56 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
   const baseRev = await mergeBase(worktreePath, baseBranch);
 
-  let reviewer: ReviewerSource = { kind: "default" };
+  // Resolved once, up front, to stamp the REVIEW meter with who actually reviews (PR #313 review),
+  // and handed to every round's `buildReviewPrompt` below instead of letting it re-resolve: `config`
+  // and `baseRev` are fixed for the whole gate, but `resolveReviewerContract` still reads LIVE
+  // sources for the reasoning text itself (a project-local agent prompt, the operator's saved review
+  // prompt, anton's own bundled `review` skill on disk) that can change between rounds — a
+  // multi-round gate can run long enough for an edited reviewer or a redeployed skill to land
+  // mid-gate. Re-resolving per round would then dispatch different reasoning text than the meter
+  // (built once, below) was stamped with, misattributing that round's cost/quality to the wrong
+  // producer. One resolution, reused everywhere, keeps the ledger and the actual prompt in lockstep.
+  const reviewerContract = await resolveReviewerContract(settings, worktreePath, baseRev);
+  const { reviewer: initialReviewer, attribution: reviewAttribution } = reviewerContract;
+
+  // The gate's two kinds of session are metered apart (anton-77l9). They are dispatched from one
+  // driver but spend very differently — a review reads a diff, a fix rewrites the tree and re-runs
+  // the gates — and a ledger that filed both under one step could not tell which half of a run's
+  // review budget went where.
+  const meter = (step: string, agentTag: string | undefined, attribution?: ReasoningAttribution) =>
+    metered(db, clock, {
+      projectId,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step,
+      // The gate IS the `review` handler however a project's formula spelled the step that called
+      // it, so the handler is the constant here rather than a lookup: the fix dispatch is this same
+      // handler's own correction round, which the phase fold reads by `step` (anton-234ja).
+      stepHandler: "review",
+      runId,
+      beadId: target.id,
+      modelRequested: settings.model,
+      agentTag,
+      formulaDigest: args.formulaDigest,
+      ...attribution,
+    }, driver);
+  // The REVIEW session is metered under the specialist that actually reviewed — a configured
+  // `reviewAgent` is a different reasoning contract than the target's implementer, and stamping it
+  // with the target's tag pools two incompatible cohorts (PR #313 review). No named agent (an
+  // operator prompt or the shipped default) records no agent tag, same as a target with none. The
+  // reviewer's own attribution rides beside it (`reviewAttribution`) — the REVIEW driver call sets
+  // no `appendSystemPrompt`, so `metered`'s own digest never reaches this text (PR #313 review). The
+  // FIX session really does run as the target's own agent repairing its own work, so it keeps that
+  // tag, and its own reasoning is already covered — `buildFindingsFixPrompt` composes the target's
+  // execution system prompt, which `metered` digests unaided.
+  const claude = meter(
+    "review",
+    initialReviewer.kind === "agent" ? initialReviewer.id : undefined,
+    reviewAttribution,
+  );
+  const fixClaude = meter("review-fix", labelValueOf(target.labels, "agent"));
+
+  let reviewer: ReviewerSource = initialReviewer;
   /**
    * Advisories still open from earlier rounds — shown to the next review, which settles them. Seeded
    * from an earlier `step:review`'s open set when the formula runs more than one gate, so round 1
@@ -362,6 +401,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       round,
       maxRounds: config.maxRounds,
       claude,
+      reviewerContract,
       sandbox,
       readState,
       restoreState,
@@ -507,6 +547,12 @@ async function runReviewSession(args: {
   round: number;
   maxRounds: number;
   claude: (options: RunClaudeOptions) => Promise<ClaudeResult>;
+  /**
+   * The reviewer contract `runReviewGate` resolved once and stamped its meter with — threaded
+   * through to `buildReviewPrompt` so every round dispatches exactly the reasoning text the ledger
+   * recorded, even if the underlying agent prompt or bundled skill changes on disk mid-gate.
+   */
+  reviewerContract: { reasoning: string; reviewer: ReviewerSource; attribution: ReasoningAttribution };
   /** OS-level filesystem containment for this session — resolved once per gate (anton-t6tu). */
   sandbox: ReviewSandboxSettings;
   readState: (worktreePath: string) => Promise<WorktreeState>;
@@ -625,6 +671,7 @@ async function runReviewSession(args: {
         previousBlocking: args.previousBlocking,
         verified,
         gatesDiscarded,
+        reviewerContract: args.reviewerContract,
       });
       await appendSessionLog(
         logPath,

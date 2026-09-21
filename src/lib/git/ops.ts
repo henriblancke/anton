@@ -1060,6 +1060,47 @@ async function readBlobAtRev(
 }
 
 /**
+ * The RAW bytes of a blob at `rev`, for a caller that hashes it — `readFileAtRev` decodes through
+ * `git()`'s `utf8` + `stdout.trim()`, which is right for a rules file read as text but wrong for a
+ * digest input: it drops leading/trailing whitespace `skillDigest` (skill-stamp.mjs) hashes as-is
+ * from disk, and it corrupts a non-UTF-8 asset (a binary template) before the digest ever sees its
+ * bytes. Same symlink-following as `readFileAtRev` (anton-z33ia review) so a skill directory that
+ * shares a file via a symlink digests the same content either way.
+ */
+export async function readFileBytesAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<Buffer | undefined> {
+  return readBlobBytesAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+}
+
+async function readBlobBytesAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<Buffer | undefined> {
+  const mode = await blobModeAtRev(worktreePath, rev, path);
+  if (mode === undefined) return undefined;
+  // Deliberately uncaught, same as `readBlobAtRev`: the tree above just reported a blob here, so a
+  // failing `show` is a read failure, not absence.
+  const { stdout } = await execFileAsync("git", ["-C", worktreePath, "show", `${rev}:${path}`, "--"], {
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+    encoding: "buffer",
+  });
+  const bytes = stdout as unknown as Buffer;
+  if (mode !== SYMLINK_MODE) return bytes;
+
+  if (hops <= 0) return undefined;
+  // A symlink's blob content IS its target pathname — text, never binary — so decoding it to resolve
+  // the next hop loses nothing the way decoding a regular file's bytes would.
+  const target = resolveRepoPath(path, bytes.toString("utf8").trim());
+  return target ? readBlobBytesAtRev(worktreePath, rev, target, hops - 1) : undefined;
+}
+
+/**
  * The tree mode of `path` at `rev`, or undefined when it is not a file there (missing, or a
  * directory). The mode is the only thing that tells a regular file from a symlink — both are blobs,
  * and `git show` reads them identically.
@@ -1160,6 +1201,201 @@ export async function listDirBlobsAtRev(
       })
       .filter((path): path is string => path !== undefined),
   );
+}
+
+/**
+ * Every FILE under `dir` at `rev`, recursively — the at-rev sibling of {@link listFiles} in
+ * skill-stamp.mjs, which walks the same shape off disk. Exists so a directory digest (a
+ * `skill:<id>` step's content stamp) can be taken from a COMMITTED tree rather than the working
+ * copy, the same reason {@link readFileAtRev} exists: a run's own diff must not be able to pick the
+ * instruction it is judged or described against.
+ *
+ * `-r` recurses through REAL subtrees, but `git ls-tree` never resolves a symlink — a symlinked
+ * asset directory surfaces as a single `120000` blob with none of its children, where `listFiles`'s
+ * disk-side walk (`readdirSync` + `statSync`, which the OS resolves transparently) sees straight
+ * through it. So a symlink entry found here is expanded: read, resolved, and — when it names a
+ * directory at `rev` — recursed into, matching {@link listFiles} shape-for-shape (anton-z33ia
+ * review, PR #313).
+ *
+ * Returns `{ rel, path }` pairs, not plain relative paths: `rel` is relative to `dir` and keyed on
+ * the SYMLINK's own name, so a digest taken here lands on the same entries as one taken from disk;
+ * `path` is the real repo path the bytes live at, which for anything reached through an expanded
+ * symlink is NOT `dir` joined with `rel` — that concatenation never names a real tree entry — so a
+ * caller must read from `path`, never reconstruct one.
+ *
+ * `stack` carries the REAL directories already on this descent, so a symlink cycle
+ * (`assets -> ../assets`) terminates instead of recursing forever — the git-side twin of
+ * {@link listFiles}'s own cycle guard.
+ *
+ * FAILS CLOSED like {@link listDirBlobsAtRev}: empty output means `dir` has no files at `rev`, never
+ * that the read failed. Anything that rejects propagates rather than reading as "no files".
+ */
+export async function listFilesAtRev(
+  worktreePath: string,
+  rev: string,
+  dir: string,
+  stack: Set<string> = new Set(),
+): Promise<Array<{ rel: string; path: string }>> {
+  const cleanDir = dir.replace(/\/+$/, "");
+  if (stack.has(cleanDir)) return [];
+  stack.add(cleanDir);
+  try {
+    const prefix = `${cleanDir}/`;
+    // `:(literal)`, same reason as {@link listDirBlobsAtRev}: `dir` can be operator-supplied.
+    const out = await git(worktreePath, ["ls-tree", "-r", "-z", rev, "--", `:(literal)${prefix}`]);
+    if (!out) return [];
+
+    const files: Array<{ rel: string; path: string }> = [];
+    const symlinks: string[] = [];
+    for (const line of out.split("\0")) {
+      const tab = line.indexOf("\t");
+      if (tab < 0) continue;
+      const [mode, type] = line.slice(0, tab).split(" ");
+      if (type !== "blob") continue;
+      const path = line.slice(tab + 1);
+      if (mode === SYMLINK_MODE) symlinks.push(path);
+      else files.push({ rel: path.slice(prefix.length), path });
+    }
+
+    // Each branch gets its OWN copy of the ancestor stack rather than the shared object: the
+    // branches run concurrently and `git()` awaits internally, so two sibling symlinks pointing at
+    // the same target would otherwise interleave — the first adds the target and yields before its
+    // `finally` removes it, so the second (still mid-flight, not actually a cycle) would see a false
+    // positive and silently drop that alias. A clone per branch keeps real-cycle detection along each
+    // branch's own descent path while letting legitimately-shared siblings both walk through.
+    const expanded = await Promise.all(
+      symlinks.map((path) => expandSymlinkedFileAtRev(worktreePath, rev, path, prefix, new Set(stack))),
+    );
+    return [...files, ...expanded.flat()].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
+  } finally {
+    stack.delete(cleanDir);
+  }
+}
+
+/**
+ * One symlink entry found while walking {@link listFilesAtRev}, expanded to the files it actually
+ * names: itself, when the chain it starts ultimately lands on a file at `rev` (the leaf-symlink case
+ * {@link readFileBytesAtRev} follows on its own when the content is actually read); its target
+ * directory's files, recursively, when the chain lands on a directory (the shape `ls-tree -r` cannot
+ * see through at all); or nothing, for a chain that is broken, leaves the repository, or runs past
+ * {@link MAX_SYMLINK_HOPS} — same as {@link resolveRepoPath}'s undefined.
+ */
+async function expandSymlinkedFileAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  prefix: string,
+  stack: Set<string>,
+): Promise<Array<{ rel: string; path: string }>> {
+  const rel = path.slice(prefix.length);
+  const resolved = await resolveSymlinkChainAtRev(worktreePath, rev, path, MAX_SYMLINK_HOPS);
+  if (!resolved) return [];
+  if (resolved.kind === "blob") return [{ rel, path: resolved.path }];
+  const nested = await listFilesAtRev(worktreePath, rev, resolved.path, stack);
+  return nested.map((entry) => ({ rel: `${rel}/${entry.rel}`, path: entry.path }));
+}
+
+/**
+ * Follows a chain of symlinks starting at `path` to its final blob or tree entry at `rev`, the same
+ * hop-bounded way {@link readBlobAtRev} follows one for file content. Needed here too: `ls-tree`
+ * reports a symlink-to-symlink as `blob`, same as a real leaf file, so classifying off one hop alone
+ * misreads a chain like `assets -> shared-link -> real-dir` as `assets` naming a file instead of
+ * recursing into `real-dir` (anton-z33ia review, PR #313).
+ *
+ * Resolves `path`'s ANCESTORS first, via {@link resolveAncestorSymlinksAtRev}: a target like
+ * `assets -> ../../shared-link/templates`, where `shared-link` is itself a symlinked directory, names
+ * a path `ls-tree`/`show` can't look up at all — they walk each component as a literal tree entry and
+ * never traverse a symlink blob sitting partway through, so the raw path reads as "not there" and the
+ * asset silently drops (anton-z33ia review, PR #313, thread on this function).
+ */
+async function resolveSymlinkChainAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<{ kind: "blob" | "tree"; path: string } | undefined> {
+  const ancestors = await resolveAncestorSymlinksAtRev(worktreePath, rev, path, hops);
+  if (!ancestors) return undefined;
+  const { path: resolvedPath, hops: remainingHops } = ancestors;
+
+  const kind = await treeEntryKindAtRev(worktreePath, rev, resolvedPath);
+  if (kind === "tree") return { kind, path: resolvedPath };
+  if (kind !== "blob") return undefined;
+  const mode = await blobModeAtRev(worktreePath, rev, resolvedPath);
+  if (mode !== SYMLINK_MODE) return { kind: "blob", path: resolvedPath };
+  if (remainingHops <= 0) return undefined;
+  const text = await git(worktreePath, ["show", `${rev}:${resolvedPath}`, "--"]);
+  const target = resolveRepoPath(resolvedPath, text);
+  return target ? resolveSymlinkChainAtRev(worktreePath, rev, target, remainingHops - 1) : undefined;
+}
+
+/**
+ * Resolves `path`'s PARENT directory chain to its real tree path, hop-bounded, and rebuilds `path` on
+ * top of it — the leaf itself is left unclassified, since a plain (non-symlink) leaf blob is a normal
+ * answer here and only {@link resolveSymlinkChainAtRev} knows how to classify it. Delegates the actual
+ * per-directory resolution to {@link resolveDirAtRev}.
+ */
+async function resolveAncestorSymlinksAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+  hops: number,
+): Promise<{ path: string; hops: number } | undefined> {
+  const idx = path.lastIndexOf("/");
+  if (idx < 0) return { path, hops };
+
+  const parent = await resolveDirAtRev(worktreePath, rev, path.slice(0, idx), hops);
+  if (!parent) return undefined;
+  return { path: `${parent.path}/${path.slice(idx + 1)}`, hops: parent.hops };
+}
+
+/**
+ * Resolves `dirPath` — which must ultimately name a TREE — to its real path at `rev`, hop-bounded,
+ * recursing on its own parent first and then following a symlink chain if `dirPath`'s own last
+ * component turns out to be one. This is what makes a target like `../../shared-link/templates`
+ * work: `ls-tree`/`show` walk a path as literal tree entries and never traverse a symlink blob sitting
+ * at an intermediate component, so `shared-link` must be resolved to its real directory BEFORE
+ * `templates` is looked up beneath it, not after (anton-z33ia review, PR #313).
+ */
+async function resolveDirAtRev(
+  worktreePath: string,
+  rev: string,
+  dirPath: string,
+  hops: number,
+): Promise<{ path: string; hops: number } | undefined> {
+  const idx = dirPath.lastIndexOf("/");
+  const parent = idx < 0 ? { path: "", hops } : await resolveDirAtRev(worktreePath, rev, dirPath.slice(0, idx), hops);
+  if (!parent) return undefined;
+  const name = idx < 0 ? dirPath : dirPath.slice(idx + 1);
+  const candidate = parent.path ? `${parent.path}/${name}` : name;
+
+  const kind = await treeEntryKindAtRev(worktreePath, rev, candidate);
+  if (kind === "tree") return { path: candidate, hops: parent.hops };
+  if (kind !== "blob") return undefined;
+  const mode = await blobModeAtRev(worktreePath, rev, candidate);
+  if (mode !== SYMLINK_MODE) return undefined;
+  if (parent.hops <= 0) return undefined;
+  const text = await git(worktreePath, ["show", `${rev}:${candidate}`, "--"]);
+  const target = resolveRepoPath(candidate, text);
+  return target ? resolveDirAtRev(worktreePath, rev, target, parent.hops - 1) : undefined;
+}
+
+/**
+ * Whether `path` names a file, a directory, or neither at `rev` — {@link blobModeAtRev} widened to
+ * report "tree" instead of collapsing it to undefined, which is exactly the distinction a symlink's
+ * target needs before {@link listFilesAtRev} can decide whether to read it or recurse into it.
+ */
+async function treeEntryKindAtRev(
+  worktreePath: string,
+  rev: string,
+  path: string,
+): Promise<"blob" | "tree" | undefined> {
+  const out = await git(worktreePath, ["ls-tree", "-z", rev, "--", `:(literal)${path}`]);
+  const entry = out.split("\0")[0];
+  const tab = entry?.indexOf("\t") ?? -1;
+  if (!entry || tab < 0) return undefined;
+  const type = entry.slice(0, tab).split(" ")[1];
+  return type === "blob" || type === "tree" ? type : undefined;
 }
 
 /**

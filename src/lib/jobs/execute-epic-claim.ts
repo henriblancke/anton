@@ -160,6 +160,8 @@ async function resolveComparableBase(
 /** Step 2. Warm (or reuse) the run's checkout and build the context every step is narrowed from. */
 export async function warmRunWorktree(
   run: EpicRun,
+  /** The cooked pipeline's content digest, stamped on every invocation this run's walk produces. */
+  formulaDigest?: string,
 ): Promise<{ worktree: Worktree; runStep: Omit<StepContext, "tickets"> }> {
   const {
     db,
@@ -629,6 +631,7 @@ export async function warmRunWorktree(
     alreadyShippedBase,
     target,
     settings,
+    formulaDigest,
     assertLeaseHeld: lease.assertHeld,
   };
   return { worktree, runStep };

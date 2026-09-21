@@ -27,6 +27,7 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
@@ -659,6 +660,49 @@ function pruneEmptyDirs(root) {
  * than the user's. Leaving them would keep the refreshed copy's own digest off the stamp it just
  * received, so it would read as hand-edited from then on and never auto-refresh again.
  */
+/**
+ * Neutralize any symlinked directory component from `destDir` itself down through `destDir/rel`,
+ * top-down. A bundled subdir (e.g. `templates/`) swapped for a symlink to an external directory
+ * would otherwise make every write/delete under it resolve through the link — `copyFileSync`
+ * writes into whatever the link targets, and `rmSync` deletes through it too (anton-z33ia
+ * review). `destDir` itself is included: an installed skill root that is a symlink to a shared,
+ * pristine copy elsewhere would otherwise leak refresh writes into that other installation
+ * instead of replacing the link (anton-z33ia review, PR #313). Removes the link itself, never
+ * its target (unlink semantics), so the caller's own mkdirSync/rmSync only ever touch real paths
+ * rooted under destDir. `destDir` is checked first, before any subdir, so a later `cur` is always
+ * resolved through the freshly-real destDir rather than through the stale link.
+ *
+ * Swapping the link for a real, empty directory would silently drop every sibling that used to
+ * be reachable through it: the caller only recopies files it already knows drifted, so a
+ * byte-identical sibling (e.g. `templates/b.md` when only `templates/a.md` changed) would vanish
+ * instead of surviving the refresh (anton-z33ia review, PR #313 follow-up). So each materialized
+ * directory is immediately repopulated from `srcDir` with every bundled file it ships — the
+ * caller's own copy of `rel` (and of any other drifted file under it) lands on top afterward with
+ * identical bytes, which is redundant but harmless.
+ */
+function realizeDestDirs(srcDir, destDir, rel) {
+  const segments = [];
+  for (let d = dirname(rel); d !== "." && d !== ""; d = dirname(d)) segments.unshift(d);
+  segments.unshift("");
+  for (const seg of segments) {
+    const cur = join(destDir, seg);
+    try {
+      if (!lstatSync(cur).isSymbolicLink()) continue;
+    } catch {
+      continue;
+    }
+    const srcSeg = join(srcDir, seg);
+    const bundled = seg === "" ? listFiles(srcDir) : listFiles(srcSeg).map((f) => join(seg, f));
+    rmSync(cur, { force: true });
+    mkdirSync(cur, { recursive: true });
+    for (const bundledRel of bundled) {
+      const dest = join(destDir, bundledRel);
+      mkdirSync(dirname(dest), { recursive: true });
+      copyFileSync(join(srcDir, bundledRel), dest);
+    }
+  }
+}
+
 function installSkillDir(srcDir, destDir, { force = false } = {}) {
   const { state, drifted, extra } = skillState(srcDir, destDir);
   if (state === "missing") {
@@ -669,11 +713,20 @@ function installSkillDir(srcDir, destDir, { force = false } = {}) {
   if (state !== "outdated" && !force) return "stale";
   for (const rel of drifted) {
     const dest = join(destDir, rel);
+    realizeDestDirs(srcDir, destDir, rel);
     mkdirSync(dirname(dest), { recursive: true });
+    // copyFileSync follows a destination symlink and writes through it into whatever it points
+    // at — unlink first so a refresh replaces the link itself, never a file outside the skill dir.
+    try {
+      if (lstatSync(dest).isSymbolicLink()) unlinkSync(dest);
+    } catch {}
     copyFileSync(join(srcDir, rel), dest);
   }
   if (state === "outdated") {
-    for (const rel of extra) rmSync(join(destDir, rel), { force: true });
+    for (const rel of extra) {
+      realizeDestDirs(srcDir, destDir, rel);
+      rmSync(join(destDir, rel), { force: true });
+    }
     pruneEmptyDirs(destDir);
   }
   return state === "outdated" ? "refreshed" : "updated";

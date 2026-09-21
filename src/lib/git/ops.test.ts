@@ -33,6 +33,7 @@ import {
   findOpenPullRequest,
   gitCommonDir,
   listDirBlobsAtRev,
+  listFilesAtRev,
   lookupOpenPullRequest,
   markPullRequestDraft,
   needsHooksPathOverrideForMerge,
@@ -40,6 +41,7 @@ import {
   pullRequestState,
   pushBranch,
   readFileAtRev,
+  readFileBytesAtRev,
   readPullRequestMerge,
   readPullRequestCommits,
   newestPullRequestCommit,
@@ -3519,6 +3521,228 @@ suite("readFileAtRev (real git)", () => {
     rmSync(join(repo, ".git/objects", blob.slice(0, 2), blob.slice(2)), { force: true });
 
     await expect(readFileAtRev(repo, "main", "AGENTS.md")).rejects.toThrow();
+  });
+});
+
+suite("readFileBytesAtRev (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const write = (rel: string, body: Buffer | string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  };
+  const link = (rel: string, target: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    symlinkSync(target, join(repo, rel));
+  };
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-readrevbytes-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    // Trailing whitespace `readFileAtRev`'s `stdout.trim()` would drop, and non-UTF-8 bytes a
+    // `utf8`-decoded read would corrupt — the two things a digest input must preserve
+    // (anton-z33ia review).
+    write("SKILL.md", "body\n\n");
+    write("asset.bin", Buffer.from([0x00, 0xff, 0xfe, 0x10, 0xc3, 0x28]));
+    link("linked.bin", "asset.bin");
+    link("loop-a.bin", "loop-b.bin");
+    link("loop-b.bin", "loop-a.bin");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("preserves trailing whitespace that `readFileAtRev`'s trim() would drop", async () => {
+    const bytes = await readFileBytesAtRev(repo, "main", "SKILL.md");
+    expect(bytes?.toString("utf8")).toBe("body\n\n");
+  });
+
+  it("preserves raw non-UTF-8 bytes instead of corrupting them through text decoding", async () => {
+    const bytes = await readFileBytesAtRev(repo, "main", "asset.bin");
+    expect(bytes).toEqual(Buffer.from([0x00, 0xff, 0xfe, 0x10, 0xc3, 0x28]));
+  });
+
+  it("follows a symlink to its target's raw bytes", async () => {
+    const bytes = await readFileBytesAtRev(repo, "main", "linked.bin");
+    expect(bytes).toEqual(Buffer.from([0x00, 0xff, 0xfe, 0x10, 0xc3, 0x28]));
+  });
+
+  it("gives up on a symlink cycle instead of looping", async () => {
+    expect(await readFileBytesAtRev(repo, "main", "loop-a.bin")).toBeUndefined();
+  });
+
+  it("returns undefined for a missing path and for a directory", async () => {
+    expect(await readFileBytesAtRev(repo, "main", "nope.bin")).toBeUndefined();
+  });
+
+  it("throws on a rev that does not resolve, instead of reporting the file absent", async () => {
+    await expect(readFileBytesAtRev(repo, "origin/nope", "SKILL.md")).rejects.toThrow();
+  });
+});
+
+suite("listFilesAtRev (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const write = (rel: string, body: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    writeFileSync(join(repo, rel), body);
+  };
+  const link = (rel: string, target: string) => {
+    mkdirSync(join(repo, rel, ".."), { recursive: true });
+    symlinkSync(target, join(repo, rel));
+  };
+  const rels = (entries: Array<{ rel: string; path: string }>) => entries.map((e) => e.rel).sort();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-listfilesrev-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    write("skill/SKILL.md", "the skill\n");
+    write("skill/templates/one.md", "template one\n");
+    // The reported shape: a skill whose asset directory is a symlink to real content living
+    // elsewhere in the repo, plus a plain leaf-symlinked file for comparison.
+    write("shared/branding/logo.svg", "<svg/>\n");
+    write("shared/branding/nested/mark.svg", "<svg nested/>\n");
+    link("skill/assets", "../shared/branding");
+    link("skill/README.md", "SKILL.md");
+    // A directory symlink whose target contains a symlink back to that SAME directory — the shape
+    // that would recurse forever without the `stack` guard, since each hop resolves to a real `tree`
+    // (unlike a leaf symlink cycle, which `readFileBytesAtRev`'s own hop limit already handles).
+    write("shared/loopdir/marker.txt", "x\n");
+    link("shared/loopdir/self", ".");
+    link("skill/cycle", "../shared/loopdir");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("lists a skill's own files, relative to dir", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    expect(rels(files)).toEqual([
+      "README.md",
+      "SKILL.md",
+      "assets/logo.svg",
+      "assets/nested/mark.svg",
+      "cycle/marker.txt",
+      "templates/one.md",
+    ]);
+  });
+
+  it("expands a symlinked directory recursively, keyed on the symlink's own name", async () => {
+    // `ls-tree -r` alone would report `assets` as one opaque 120000 blob with no children (the
+    // finding this test guards against) — the fix must walk through it like `listFiles` does on disk.
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const asset = files.find((f) => f.rel === "assets/logo.svg");
+    const nested = files.find((f) => f.rel === "assets/nested/mark.svg");
+    expect(asset?.path).toBe("shared/branding/logo.svg");
+    expect(nested?.path).toBe("shared/branding/nested/mark.svg");
+  });
+
+  it("gives each entry a real repo path readFileBytesAtRev can read directly", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    for (const { path } of files) {
+      expect(await readFileBytesAtRev(repo, "main", path)).toBeDefined();
+    }
+  });
+
+  it("still resolves a leaf symlink to a file, keyed on the symlink's own name", async () => {
+    // `path` is the fully-resolved blob path (`SKILL.md`, not `README.md`) so a leaf symlink
+    // reached through a symlinked ancestor directory is readable too (anton-z33ia review, PR
+    // #313) — `rel` stays keyed on the symlink's own name for the digest.
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const readme = files.find((f) => f.rel === "README.md");
+    expect(readme?.path).toBe("skill/SKILL.md");
+    expect((await readFileBytesAtRev(repo, "main", readme!.path))?.toString("utf8")).toBe("the skill\n");
+  });
+
+  it("gives up on a directory symlink cycle instead of recursing forever", async () => {
+    const files = await listFilesAtRev(repo, "main", "skill");
+    // `cycle/self` points back at the directory it's already inside of — the loop terminates
+    // without ever expanding into `cycle/self/self/...`, and the directory's real file still lists.
+    expect(files.some((f) => f.rel.startsWith("cycle/self"))).toBe(false);
+    expect(rels(files)).toContain("cycle/marker.txt");
+  });
+
+  it("walks both sibling symlinks when they point at the same target directory, not just one", async () => {
+    // Two MORE symlinks onto the same `shared/branding` target `skill/assets` already uses. Their
+    // expansions run concurrently (Promise.all) and would previously share one mutable cycle-guard
+    // stack: whichever branch's `git show` resolved first added the target and hadn't removed it yet
+    // when the other branch checked, so that branch saw a false cycle and silently dropped its alias.
+    link("skill/copy-a", "../shared/branding");
+    link("skill/copy-b", "../shared/branding");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "add sibling symlinks onto the same target"]);
+
+    const files = await listFilesAtRev(repo, "main", "skill");
+    expect(rels(files)).toEqual(
+      expect.arrayContaining([
+        "copy-a/logo.svg",
+        "copy-a/nested/mark.svg",
+        "copy-b/logo.svg",
+        "copy-b/nested/mark.svg",
+      ]),
+    );
+  });
+
+  it("follows a symlink chain through an intermediate symlink to the real directory", async () => {
+    // `assets -> shared-link -> real-dir`: `shared-link` is itself a symlink, so `ls-tree` reports it
+    // as a blob, same as a real leaf file. Classifying `chained` off that one hop alone would misfile
+    // it as a file instead of recursing into `shared/branding` (anton-z33ia review, PR #313).
+    link("shared/relay", "branding");
+    link("skill/chained", "../shared/relay");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "add chained symlink onto a symlink"]);
+
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const asset = files.find((f) => f.rel === "chained/logo.svg");
+    const nested = files.find((f) => f.rel === "chained/nested/mark.svg");
+    expect(asset?.path).toBe("shared/branding/logo.svg");
+    expect(nested?.path).toBe("shared/branding/nested/mark.svg");
+  });
+
+  it("resolves a target whose path has a symlinked directory in the MIDDLE, not just at the end", async () => {
+    // `indirect -> ../shared2/link-to-real/sub`, where `shared2/link-to-real` (an ancestor COMPONENT
+    // of the target, sitting BEFORE its final segment `sub`) is itself a symlink. `ls-tree`/`show` walk
+    // `shared2/link-to-real/sub` as one literal path and never traverse the symlink blob sitting at
+    // `link-to-real`, so the naive lookup reads the whole path as absent and drops the asset instead of
+    // going through `link-to-real` first (anton-z33ia review, PR #313, thread on this fix).
+    write("shared2/real/sub/logo.svg", "<svg/>\n");
+    write("shared2/real/sub/nested/mark.svg", "<svg nested/>\n");
+    link("shared2/link-to-real", "real");
+    link("skill/indirect", "../shared2/link-to-real/sub");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "add symlink whose target has a symlinked ancestor component"]);
+
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const asset = files.find((f) => f.rel === "indirect/logo.svg");
+    const nested = files.find((f) => f.rel === "indirect/nested/mark.svg");
+    expect(asset?.path).toBe("shared2/real/sub/logo.svg");
+    expect(nested?.path).toBe("shared2/real/sub/nested/mark.svg");
+  });
+
+  it("returns nothing for a directory with no files at rev", async () => {
+    expect(await listFilesAtRev(repo, "main", "skill/templates/nope")).toEqual([]);
+  });
+
+  it("throws on a rev that does not resolve, instead of reporting no files", async () => {
+    await expect(listFilesAtRev(repo, "origin/nope", "skill")).rejects.toThrow();
   });
 });
 
