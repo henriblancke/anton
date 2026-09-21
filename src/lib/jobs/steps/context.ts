@@ -6,6 +6,7 @@
  */
 import type { Bead, CookedStep } from "../../beads/bd";
 import type { SatisfiedBy } from "../../beads/satisfied-note";
+import type { InvocationDimensions } from "../../claude-invocations";
 import type { ClaudeResult, RunClaudeOptions } from "../../claude/driver";
 import type { WorktreeState } from "../../git/ops";
 import type { ProjectSettings } from "../../projects";
@@ -58,6 +59,20 @@ export interface StepDeps {
   runClaude?: (options: RunClaudeOptions) => Promise<ClaudeResult>;
   /** True when `runClaude` meters each internal retry, so dispatch must not add an outer row. */
   recordsEachAttempt?: boolean;
+  /**
+   * Where dispatchClaude hands its resolved `attribution` (agentTag, or promptId/skillId + their
+   * digests) when {@link recordsEachAttempt} is set (PR #313 review). The ticket walk builds its
+   * per-attempt meter's dimensions before the handler resolves what to attribute them to, so a
+   * caller of dispatchClaude cannot pass attribution into a meter already closed over — this is the
+   * seam that lets the resolution reach it anyway: the walk hands a setter that mutates the same
+   * dimensions object the meter reads at call time, and dispatchClaude calls it right before firing.
+   */
+  setAttribution?: (
+    attribution: Pick<
+      InvocationDimensions,
+      "agentTag" | "promptId" | "promptBodyDigest" | "skillId" | "skillDigest"
+    >,
+  ) => void;
   /**
    * The worktree fingerprint a read-only step guards with (`step:describe`), and the restore it puts
    * the tree back with. Production passes neither; the seam exists so a test can drive the failure

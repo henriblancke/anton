@@ -314,6 +314,33 @@ describe("dispatchClaude", () => {
     expect(row.antonVersion).toBe(selfBuildVersion());
   });
 
+  /**
+   * The ticket walk's per-attempt meter closes over its dimensions before this dispatch resolves
+   * what to attribute them to, so it leaves a setter for exactly this (PR #313 review): without it,
+   * a `recordsEachAttempt` dispatch's resolved agentTag/promptId/skillId never reached a ledger row.
+   */
+  it("hands its resolved attribution to the per-attempt meter when the caller records each attempt itself", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+    const received: Array<Record<string, unknown>> = [];
+    const ctx = sandbox.context({
+      deps: {
+        runClaude: claude.run,
+        recordsEachAttempt: true,
+        setAttribution: (attribution) => received.push(attribution),
+      },
+    });
+
+    await dispatchClaude(ctx, {
+      ...args(),
+      attribution: { promptId: "audit", promptBodyDigest: "abc123abc123" },
+    });
+
+    expect(received).toEqual([{ promptId: "audit", promptBodyDigest: "abc123abc123" }]);
+    // `recordsEachAttempt` means this dispatch adds no meter of its own — the caller's already did.
+    const rows = await sandbox.tdb.db.select().from(schema.claudeInvocations);
+    expect(rows).toHaveLength(0);
+  });
+
   it("records NULL stamps for a direct handler call that resolved none", async () => {
     const claude = fakeClaude("ANTON-RESULT: delivered");
     // No formula step and no attribution — a caller invoking the handler directly.

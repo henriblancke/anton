@@ -96,6 +96,13 @@ export async function dispatchClaude(
     formulaDigest: ctx.formulaDigest,
     ...args.attribution,
   };
+  if (ctx.deps?.recordsEachAttempt) {
+    // The per-attempt meter the ticket walk built around `ctx.deps.runClaude` closed over its
+    // dimensions before THIS dispatch resolved what to attribute them to (PR #313 review) — hand
+    // the resolution to the setter it left for exactly this, so the driver already wrapped around
+    // it stamps the same agentTag/promptId/skillId its own meter would have.
+    ctx.deps.setAttribution?.(args.attribution ?? {});
+  }
   const claude = ctx.deps?.recordsEachAttempt
     ? (ctx.deps.runClaude ?? runClaude)
     : metered(ctx.db, ctx.clock, dimensions, ctx.deps?.runClaude ?? runClaude);
