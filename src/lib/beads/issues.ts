@@ -362,7 +362,20 @@ export async function readAllIssues(
   return snapshot;
 }
 
-export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}): Promise<Bead[]> {
+/**
+ * Bound on the "board moved during strict-gate hydration" retry below (mirrors
+ * `MAX_ENRICHMENT_RETRIES`). Each retry re-runs the full snapshot read plus a strict
+ * `loadGateIssues` spawn, so sustained writes against a dangling-gate board could otherwise keep a
+ * caller (an approval request) recursing indefinitely. Fail closed once the graph outraces this
+ * many attempts rather than serve gate evidence that may not describe the current board.
+ */
+const MAX_STRICT_GATE_RETRIES = 3;
+
+export async function refreshAllIssues(
+  cwd: string,
+  opts: LoadIssuesOptions = {},
+  attempt = 0,
+): Promise<Bead[]> {
   // Read via `refreshIssueSnapshotRead`, not `refreshIssueSnapshot` + a separate
   // `issueSnapshotGeneration(cwd)` call, so `boardGeneration` is the generation `board` was
   // actually retained under (PR #274 review, round 16): this promise is single-flight, and another
@@ -421,7 +434,13 @@ export async function refreshAllIssues(cwd: string, opts: LoadIssuesOptions = {}
       // review, thread on this line). Retry against the current board instead of serving stale
       // gate evidence.
       if (issueSnapshotGeneration(cwd) !== boardGeneration) {
-        return refreshAllIssues(cwd, opts);
+        if (attempt >= MAX_STRICT_GATE_RETRIES) {
+          throw new Error(
+            `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_STRICT_GATE_RETRIES + 1} ` +
+              "strict-gate hydration reads — giving up rather than pairing gate evidence with a board it may not describe",
+          );
+        }
+        return refreshAllIssues(cwd, opts, attempt + 1);
       }
       // `dedupeById` allocates a new array, and the cycle sidecar is WeakMap-keyed on array identity
       // (cycle-evidence.ts) — so a caller combining `withCycles` and `strictGates` would otherwise
