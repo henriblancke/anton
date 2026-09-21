@@ -252,30 +252,37 @@ export interface ReviewGateArgs {
  * writing subcommands: an enumeration rots into a gap the next git release opens, and the reviewer
  * needs none of it — anton hands it the diff, the file list, and the beads.
  *
- * `Bash` itself stays, because the review contract asks the reviewer to run the project's own
+ * `Bash` itself stays here, because the review contract asks the reviewer to run the project's own
  * read-only checks — and a shell writes bytes with none of the tools above, so this list is only
  * half the guard. The other half is not a tool filter at all: the session runs under Claude Code's
  * Bash sandbox with the repository's ref store denied at the OS level (anton-t6tu, see
- * jobs/review-sandbox).
+ * jobs/review-sandbox). {@link reviewDeniedTools} widens this base list to drop `Bash` too on a
+ * server-backed board, where that OS-level sandbox cannot reach the board at all — see there for why.
  */
 export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"];
 
 /**
- * `REVIEW_DENIED_TOOLS`, widened to deny `bd` outright when the project's board is `dolt_mode:
- * server` (PR #284 review, "Block server-backed board writes during review").
+ * `REVIEW_DENIED_TOOLS`, widened to deny `Bash` OUTRIGHT when the project's board is `dolt_mode:
+ * server` (PR #284 review, "Block server-backed board writes during review"; hardened per PR #284
+ * review round 18, "Deny Bash instead of only the bd command prefix").
  *
  * The OS-level sandbox (`jobs/review-sandbox`) pins the ref store AND `<repoPath>/.beads` shut, but
  * that only contains a FILESYSTEM-backed board — a server-backed one is mutated over a connection
- * string, invisible to a filesystem deny rule by construction. `boardEvidenceSection`
- * (review-context.ts) otherwise teaches this same session the live `bd -C <repoPath> show <id>`
- * syntax so it can check confirmed evidence, and the session keeps general Bash — a stray `bd -C
- * <repoPath> update ...` typed in place of `show` would mutate the canonical board directly, with no
- * tool-name filter or OS sandbox in the way. Denying `bd` here closes that regardless of typo or
- * intent, and costs nothing legitimate: `boardEvidenceSection` stops teaching the live-read command in
- * server mode for the same reason (see there), so this session never needed `bd` to do its job.
+ * string, invisible to a filesystem deny rule by construction. This used to deny only the `Bash(bd:*)`
+ * TOOL, on the theory that `boardEvidenceSection` (review-context.ts) is the only thing that teaches
+ * this session the `bd` invocation syntax. That denial is a PREFIX rule on the literal command string
+ * Claude Code hands to Bash, not a parse of what the shell actually runs — `cd /tmp && bd -C <repo>
+ * update ...`, a wrapper script, an alias, or any other command that doesn't itself start with `bd`
+ * sails straight past it, and the session keeps unrestricted Bash under `bypassPermissions` to run it
+ * with. No enumeration of prefixes closes that: a shell can invoke the same binary in unboundedly many
+ * shapes. Denying `Bash` itself removes the shell entirely, which is the only rule a shell cannot route
+ * around. The cost is real — the reviewer can no longer run the project's own checks itself on a
+ * server-mode-board project — and is paid deliberately: `readOnlySection` (review-context.ts) tells the
+ * reviewer explicitly it has no shell here and to judge from anton's own already-run gate results (or
+ * their absence) instead of trying to reach for one.
  */
 export function reviewDeniedTools(repoPath: string | undefined): string[] {
-  return repoPath && isServerMode(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash(bd:*)"] : REVIEW_DENIED_TOOLS;
+  return repoPath && isServerMode(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
 }
 
 /**

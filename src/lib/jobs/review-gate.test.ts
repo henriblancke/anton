@@ -1400,13 +1400,16 @@ describe("runReviewGate — sessions", () => {
   });
 
   it(
-    "also denies `bd` outright when the board is server-backed (PR #284 review, \"Block " +
-      "server-backed board writes during review\") — the OS sandbox only pins a filesystem-backed " +
-      "board shut, so a shared-server one gets a tool-level deny instead",
+    "also denies `Bash` outright when the board is server-backed (PR #284 review, \"Block " +
+      "server-backed board writes during review\", hardened round 18 \"Deny Bash instead of only " +
+      "the bd command prefix\") — the OS sandbox only pins a filesystem-backed board shut, and a " +
+      "`Bash(bd:*)` command-prefix rule only matches a command that itself starts with `bd`, which " +
+      "a shell can route around (`cd` first, a wrapper script, an alias) — so a shared-server board " +
+      "gets the whole tool denied instead",
     () => {
       try {
         pinBoardMode("/repos/server-board", { mode: "server" });
-        expect(reviewDeniedTools("/repos/server-board")).toEqual([...REVIEW_DENIED_TOOLS, "Bash(bd:*)"]);
+        expect(reviewDeniedTools("/repos/server-board")).toEqual([...REVIEW_DENIED_TOOLS, "Bash"]);
         // Unaffected for an embedded board, or when no live board path is in play at all.
         expect(reviewDeniedTools("/repos/anton")).toEqual(REVIEW_DENIED_TOOLS);
         expect(reviewDeniedTools(undefined)).toEqual(REVIEW_DENIED_TOOLS);

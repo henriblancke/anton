@@ -440,7 +440,7 @@ describe("reviewContext", () => {
     "withholds the live `bd -C <repoPath>` read instruction for a server-backed board (PR #284 " +
       "review, \"Block server-backed board writes during review\") — that path is write-capable and " +
       "a shared server has no filesystem sandbox to contain it, so the reviewer is pointed at the " +
-      "already-confirmed ids instead",
+      "already-confirmed ids' field values instead",
     () => {
       pinBoardMode("/repos/server-board", { mode: "server" });
       try {
@@ -455,7 +455,66 @@ describe("reviewContext", () => {
         expect(out).toContain("- anton-x1.1: anton-y9");
         expect(out).not.toContain("bd -C");
         expect(out).toContain("shared server");
-        expect(out).toContain("already read and confirmed them");
+        expect(out).toContain("anton read the current field values of every id above");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
+  it(
+    "renders the CURRENT field values of a confirmed id on a server-backed board (PR #284 review " +
+      "round 18, \"Supply field values to server-backed reviewers\") — a confirmed id alone proves " +
+      "only that SOME field changed, not which one",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const confirmed: Bead = {
+          id: "anton-y9",
+          title: "Reparent the orphaned ticket",
+          status: "closed",
+          issue_type: "task",
+          labels: ["domain:eng"],
+          parent: "anton-fc5x",
+          assignee: "anton",
+          dependencies: [{ issue_id: "anton-y9", depends_on_id: "anton-fc5x", type: "parent-child" }],
+        };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+          confirmedBoardEvidenceBeads: new Map([["anton-y9", confirmed]]),
+        });
+        expect(out).toContain("- anton-y9: status=closed, type=task, title=\"Reparent the orphaned ticket\"");
+        expect(out).toContain("labels=[domain:eng], parent=anton-fc5x, assignee=anton");
+        expect(out).toContain("dependencies=[parent-child:anton-fc5x]");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
+  it(
+    "tells the reviewer a confirmed id's current values could not be read, rather than silently " +
+      "omitting it, when the host-side read failed",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+          confirmedBoardEvidenceBeads: new Map([["anton-y9", undefined]]),
+        });
+        expect(out).toContain("current field values could not be read from the live board");
+        expect(out).toContain("treat");
+        expect(out).toContain("unconfirmed");
       } finally {
         resetBoardModeCache();
       }

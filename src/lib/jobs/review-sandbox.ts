@@ -98,10 +98,13 @@ export function assertReviewSandboxSupported(platform: NodeJS.Platform = process
  * radius. This closes only the filesystem-backed case (a local or file-based Dolt checkout); a
  * shared-server Dolt board writes over a connection string rather than local files, so this sandbox
  * rule cannot reach that case. That case is closed a different way instead (PR #284 review, "Block
- * server-backed board writes during review"): `reviewDeniedTools` (review-gate.ts) denies the `bd`
- * TOOL outright when `readBoardMode(repoPath).mode === "server"`, and `boardEvidenceSection` stops
- * teaching the live-read command in that mode — so a server-backed board never hands this session a
- * write-capable path in the first place, rather than relying on a filesystem rule that cannot reach it.
+ * server-backed board writes during review", hardened round 18 "Deny Bash instead of only the bd
+ * command prefix"): `reviewDeniedTools` (review-gate.ts) denies `Bash` OUTRIGHT when
+ * `readBoardMode(repoPath).mode === "server"` — a tool-name prefix rule like `Bash(bd:*)` matches only
+ * a command string that itself starts with `bd`, and a shell can invoke the same binary in unboundedly
+ * many shapes that don't (`cd` first, a wrapper script, an alias) — so a server-backed board never
+ * hands this session a shell capable of reaching it at all, rather than relying on a filesystem rule
+ * that cannot reach it or a command-prefix rule a shell can route around.
  */
 export function reviewSandboxDenyWrite(
   worktreePath: string,
