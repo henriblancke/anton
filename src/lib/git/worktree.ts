@@ -9,7 +9,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promisify } from "node:util";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { hostname } from "node:os";
 import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -1828,19 +1828,57 @@ export function resolveWarmCommand(
 const WARM_STAMP = ".anton-warm";
 
 /**
- * True unless a COMPLETED install is on record newer than the lockfile. The stamp, not `node_modules`
- * itself, is the witness: an install killed partway (OOM, SIGKILL, dropped network) has already
- * written into `node_modules`, so its mtime is newer than the lockfile and a directory-mtime check
- * would call the half-populated tree current — surfacing later as `Cannot find module` inside a
- * supposedly pre-warmed worktree, with no further warming attempt.
+ * Bump whenever what the stamp vouches for changes, so an already-written stamp from before the
+ * change stops being trusted. Bumped past its unversioned origin (anton-db82f/anton-ph94g): a
+ * `NODE_ENV=production`-launched anton used to warm every worktree with devDependencies skipped, so
+ * a stamp written by that install vouches for a tree that is missing them even though the lockfile
+ * hasn't changed since — {@link installNeeded} must not treat that stamp as current.
+ */
+const WARM_STAMP_VERSION = 2;
+
+/**
+ * True unless a COMPLETED, current-version install is on record newer than the lockfile. The stamp,
+ * not `node_modules` itself, is the witness: an install killed partway (OOM, SIGKILL, dropped
+ * network) has already written into `node_modules`, so its mtime is newer than the lockfile and a
+ * directory-mtime check would call the half-populated tree current — surfacing later as `Cannot find
+ * module` inside a supposedly pre-warmed worktree, with no further warming attempt. A stamp from an
+ * older {@link WARM_STAMP_VERSION} is treated the same as no stamp at all (see above).
  */
 function installNeeded(worktreePath: string, lockfile: string): boolean {
   try {
-    const warmed = statSync(join(worktreePath, "node_modules", WARM_STAMP)).mtimeMs;
+    const stampPath = join(worktreePath, "node_modules", WARM_STAMP);
+    const stamp = readFileSync(stampPath, "utf8");
+    if (!stamp.startsWith(`${WARM_STAMP_VERSION}\n`)) return true;
+    const warmed = statSync(stampPath).mtimeMs;
     return warmed < statSync(join(worktreePath, lockfile)).mtimeMs;
   } catch {
     return true; // no stamp (fresh worktree, partial install, pre-stamp worktree) → install
   }
+}
+
+/**
+ * The environment the install runs under. `NODE_ENV` is dropped rather than inherited: `anton start`
+ * launches the daemon with `NODE_ENV=production` (bin/anton.mjs), and every package manager reads
+ * that as "skip devDependencies" — so a production-launched anton warmed each worktree into a tree
+ * missing vitest, typescript and the rest, and the run's first verify gate failed on modules the
+ * lockfile does list. Unset lets each manager apply its own default (install everything).
+ *
+ * @param parent the environment to derive from; injectable so the rule can be tested without
+ *   mutating the real process env.
+ */
+export function warmChildEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: Record<string, string | undefined> = {
+    ...parent,
+    // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
+    // package manager was resolved against, not the daemon's minimal one.
+    PATH: [parent.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter),
+  };
+  // Dropped rather than set to a value: there is no "install everything" spelling every manager
+  // agrees on, and an absent NODE_ENV is exactly what a developer's own shell hands `bun install`.
+  delete env.NODE_ENV;
+  // Next augments ProcessEnv with a REQUIRED, readonly NODE_ENV (its own TODO calls that wrong), so
+  // the type cannot express the env this function exists to build. Asserted once, here.
+  return env as NodeJS.ProcessEnv;
 }
 
 /**
@@ -1863,9 +1901,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
       cwd: wt.path,
       timeout: WARM_TIMEOUT_MS,
       maxBuffer: 16 * 1024 * 1024,
-      // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
-      // package manager was resolved against, not the daemon's minimal one.
-      env: { ...process.env, PATH: [process.env.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter) },
+      env: warmChildEnv(),
       // An operator's kill must not be stuck behind a 10-minute install; aborting degrades into the
       // logged, non-fatal path below, exactly like a registry timeout.
       signal,
@@ -1888,7 +1924,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
  */
 async function stampWarmed(worktreePath: string, label: string): Promise<void> {
   try {
-    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${label}\n`);
+    await writeFile(join(worktreePath, "node_modules", WARM_STAMP), `${WARM_STAMP_VERSION}\n${label}\n`);
   } catch {
     // no node_modules / read-only tree → next warm re-runs the install
   }
