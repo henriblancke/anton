@@ -531,6 +531,32 @@ describe("reviewContext", () => {
     },
   );
 
+  it(
+    'renders a confirmed id\'s successful deletion as DELETED, not as a read failure ' +
+      '(chatgpt-codex-connector, PR #284 review, "Represent deleted beads as successful absence") ' +
+      "— the live read succeeded and simply found nothing at that id",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+          confirmedBoardEvidenceBeads: new Map([["anton-y9", "deleted"]]),
+        });
+        expect(out).toContain("- anton-y9: no longer exists on the live board");
+        expect(out).toContain("not a");
+        expect(out).toContain("read failure");
+        expect(out).not.toContain("could not be read from the live board");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
   it("gives neither board-evidence section when repoPath and boardEvidenceByTicket are both absent", () => {
     const out = reviewContext({ target: epic, tickets: [ticket], diff });
     expect(out).not.toContain("bd -C");

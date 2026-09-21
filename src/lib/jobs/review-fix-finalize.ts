@@ -461,9 +461,11 @@ async function finalizeRunRow(
  * Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
  * first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
  * half-closed unit no reader can interpret. Only drop the in-review stage once that transaction
- * lands — a transient failure (swallowed by `safe`) must leave the label in place so the next
- * review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than orphaning a
- * still-open ticket/epic behind a run already marked done.
+ * lands AND every confirmed board-evidence bead in the subtree has its closure fence stamped
+ * ({@link stampConfirmedClosures}) — a transient failure in either (the batch, swallowed by `safe`,
+ * or the fence backfill) must leave the label in place so the next review-fix sweep re-selects the
+ * epic (inReviewEpics) and retries, rather than orphaning a still-open ticket/epic behind a run
+ * already marked done, or an unfenced confirmation behind one marked fully settled.
  *
  * LAST on purpose, after every other finalization write (PR #199 review). It is the CLOSE, not the
  * label, that makes this epic undiscoverable: inReviewEpics drops a closed run target whatever
@@ -521,8 +523,22 @@ async function closeFinalized(
         [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
       ),
     ));
-  if (closed) {
-    await stampConfirmedClosures(repo, [...stillOpen.values()]);
+  if (!closed) return;
+  // Every non-preserved bead in this subtree is closed now — the ones `stillOpen` just named, plus
+  // any the snapshot already found closed, which includes a bead an EARLIER, interrupted pass of
+  // this same finalization closed but could not fence (chatgpt-codex-connector, PR #284 review,
+  // "Require closure stamps before completing finalization"). Passing only `stillOpen` gave a failed
+  // stamp no later resumption point at all: the next sweep's snapshot reads that bead as already
+  // closed, so it would never appear in `stillOpen` again and `stampConfirmedClosures` would never be
+  // asked about it a second time. Recomputing the full set here every pass is what makes the fence
+  // retryable rather than a single best-effort attempt tied to the one call that happened to close it.
+  const closedNow = [...children, epic].filter((b) => !skip.has(b.id));
+  const allFenced = await stampConfirmedClosures(repo, closedNow);
+  // `stage:in-review` is what makes this epic reachable to the next sweep at all (inReviewEpics
+  // excludes a closed target). Dropping it before every confirmed-but-unfenced bead is actually
+  // fenced would strand that bead's fence attempt: the close already landed, durably, and cannot be
+  // retried from a state where the epic is no longer selected for finalization.
+  if (allFenced) {
     await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
   }
 }
@@ -540,23 +556,26 @@ async function closeFinalized(
  * confirmation written before this fence existed) and accepts THIS confirmation's stale ids as the
  * new cycle's evidence with no fresh board delta ever checked.
  *
- * Best-effort relative to the close itself: the batch close above already committed, durably, and
- * cannot be undone from here, so an exhausted {@link mustReadClosureVersion}/{@link mustPersist}
- * retry is logged and left rather than thrown — there is no later resumption point that would
- * revisit these already-closed beads, since `stillOpen` (computed before the close, in the caller)
- * is the only place they were ever selected from.
+ * Reports whether every unfenced bead actually got fenced (chatgpt-codex-connector, PR #284 review,
+ * "Require closure stamps before completing finalization") — an exhausted
+ * {@link mustReadClosureVersion}/{@link mustPersist} retry no longer disappears silently. The batch
+ * close itself already committed, durably, and cannot be undone from here, but the caller now holds
+ * `stage:in-review` open on a `false` result instead of treating the close as fully settled, so the
+ * next sweep's fresh `closedNow` set (computed from ALL non-preserved beads, not just the ones this
+ * pass closed) gives a failed stamp another attempt rather than none at all.
  */
-async function stampConfirmedClosures(repo: string, closedBeads: readonly Bead[]): Promise<void> {
+async function stampConfirmedClosures(repo: string, closedBeads: readonly Bead[]): Promise<boolean> {
   const unfenced = closedBeads.filter(
     (b) => beads.boardEvidenceConfirmed(b) && beads.confirmedBoardEvidenceClosure(b) === undefined,
   );
-  await Promise.all(
+  const fenced = await Promise.all(
     unfenced.map(async (b) => {
       const read = await mustReadClosureVersion(repo, b.id);
-      if (!read.read) return;
-      await mustPersist(() =>
+      if (!read.read) return false;
+      return mustPersist(() =>
         beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(b), read.closure),
       );
     }),
   );
+  return fenced.every(Boolean);
 }

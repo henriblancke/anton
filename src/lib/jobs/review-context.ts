@@ -153,7 +153,7 @@ export interface ReviewRun {
    * non-server board, where {@link boardEvidenceSection}'s live `bd -C <repoPath>` instruction already
    * lets the reviewer read current values itself.
    */
-  confirmedBoardEvidenceBeads?: ReadonlyMap<string, Bead | undefined>;
+  confirmedBoardEvidenceBeads?: ReadonlyMap<string, Bead | "deleted" | undefined>;
   /**
    * The live board's repo path ({@link import("./steps/context").StepContext.repoPath}) — the same
    * path a board-only IMPLEMENTER is told to point `bd -C` at (see
@@ -344,20 +344,25 @@ const CONFIRMED_BEAD_READ_CONCURRENCY = 4;
  * `bd show` read would tell the reviewer no edges exist even when the confirmed bead has blocking or
  * related ones, a false current state on exactly the criterion the read exists to settle.
  *
- * `mustReadWithDependencies` already retries and never throws — a read that fails every attempt
- * leaves the id absent from its result map, rendered by {@link confirmedBeadSummary} as an explicit
- * refusal to vouch rather than silently dropped.
+ * `mustReadWithDependencies` already retries and never throws, and its own contract distinguishes
+ * two different absences: `undefined` for a batch where EVERY attempt was refused, and a returned
+ * Map simply missing an id bd's read succeeded on but found nothing for (never existed, or was
+ * deleted). Those are not the same fact for a reviewer, so they are kept apart here too instead of
+ * both collapsing to `undefined` (chatgpt-codex-connector, PR #284 review, "Represent deleted beads
+ * as successful absence") — a `"deleted"` id renders as a confirmed absence by
+ * {@link confirmedBeadSummary}, and only a batch-level read failure renders as an explicit refusal
+ * to vouch.
  */
 async function fetchConfirmedBoardEvidenceBeads(
   repoPath: string,
   boardEvidenceByTicket: ReadonlyMap<string, string[]>,
-): Promise<ReadonlyMap<string, Bead | undefined>> {
+): Promise<ReadonlyMap<string, Bead | "deleted" | undefined>> {
   const ids = [...new Set([...boardEvidenceByTicket.values()].flat())];
-  const result = new Map<string, Bead | undefined>();
+  const result = new Map<string, Bead | "deleted" | undefined>();
   for (let i = 0; i < ids.length; i += CONFIRMED_BEAD_READ_CONCURRENCY) {
     const batch = ids.slice(i, i + CONFIRMED_BEAD_READ_CONCURRENCY);
     const found = await mustReadWithDependencies(repoPath, batch);
-    batch.forEach((id) => result.set(id, found?.get(id)));
+    batch.forEach((id) => result.set(id, found ? found.get(id) ?? "deleted" : undefined));
   }
   return result;
 }
@@ -783,7 +788,7 @@ function boardEvidenceSection(
   boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
   repoPath: string | undefined,
   boardOnly: boolean,
-  confirmedBeads: ReadonlyMap<string, Bead | undefined> | undefined,
+  confirmedBeads: ReadonlyMap<string, Bead | "deleted" | undefined> | undefined,
 ): string[] {
   const lines = tickets
     .map((t) => ({ ticket: t, ids: boardEvidenceByTicket?.get(t.id) }))
@@ -834,12 +839,25 @@ function boardEvidenceSection(
  * `labels`/`metadata` reuse that module's own `contentLabels`/`contentMetadata` rather than
  * reimplementing the bookkeeping-key filter, so the two can never drift apart again.
  *
- * `undefined` (the host-side `bd show` exhausted its retries) is rendered as an explicit refusal to
+ * `undefined` (the host-side read exhausted its retries) is rendered as an explicit refusal to
  * vouch, never silently skipped: a reviewer that never sees this id again would read its absence as
  * "nothing to check" rather than "this run could not confirm what changed here", which is a false
  * pass on exactly the criterion the read was meant to settle.
+ *
+ * `"deleted"` is a DIFFERENT, successful outcome (chatgpt-codex-connector, PR #284 review,
+ * "Represent deleted beads as successful absence") — the live read succeeded and simply found no
+ * bead at that id, which for a board-only ticket whose evidence names it is what a deletion looks
+ * like. Folding it into the same "could not be read" message as an actual failure tells the
+ * reviewer a valid deletion is unconfirmed board state, when the board confirmed it as absent.
  */
-function confirmedBeadSummary(id: string, bead: Bead | undefined): string[] {
+function confirmedBeadSummary(id: string, bead: Bead | "deleted" | undefined): string[] {
+  if (bead === "deleted") {
+    return [
+      `- ${id}: no longer exists on the live board — the read succeeded and found it deleted, not a`,
+      `  read failure. If Acceptance called for deleting it, this confirms that happened.`,
+      ``,
+    ];
+  }
   if (!bead) {
     return [
       `- ${id}: current field values could not be read from the live board (after retries) — treat`,
@@ -877,7 +895,7 @@ function diffSection(
   tickets: Bead[],
   boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
   repoPath: string | undefined,
-  confirmedBeads: ReadonlyMap<string, Bead | undefined> | undefined,
+  confirmedBeads: ReadonlyMap<string, Bead | "deleted" | undefined> | undefined,
 ): string[] {
   if (diff.files.length === 0) {
     if (boardOnlyDelivery) {
