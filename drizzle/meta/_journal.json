@@ -337,6 +337,13 @@
       "when": 1789938463113,
       "tag": "0047_spotty_tarot",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "6",
+      "when": 1789959418054,
+      "tag": "0048_sad_star_brand",
+      "breakpoints": true
     }
   ]
 }
