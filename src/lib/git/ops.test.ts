@@ -3677,6 +3677,27 @@ suite("listFilesAtRev (real git)", () => {
     expect(rels(files)).toContain("cycle/marker.txt");
   });
 
+  it("walks both sibling symlinks when they point at the same target directory, not just one", async () => {
+    // Two MORE symlinks onto the same `shared/branding` target `skill/assets` already uses. Their
+    // expansions run concurrently (Promise.all) and would previously share one mutable cycle-guard
+    // stack: whichever branch's `git show` resolved first added the target and hadn't removed it yet
+    // when the other branch checked, so that branch saw a false cycle and silently dropped its alias.
+    link("skill/copy-a", "../shared/branding");
+    link("skill/copy-b", "../shared/branding");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "add sibling symlinks onto the same target"]);
+
+    const files = await listFilesAtRev(repo, "main", "skill");
+    expect(rels(files)).toEqual(
+      expect.arrayContaining([
+        "copy-a/logo.svg",
+        "copy-a/nested/mark.svg",
+        "copy-b/logo.svg",
+        "copy-b/nested/mark.svg",
+      ]),
+    );
+  });
+
   it("returns nothing for a directory with no files at rev", async () => {
     expect(await listFilesAtRev(repo, "main", "skill/templates/nope")).toEqual([]);
   });

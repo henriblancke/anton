@@ -1257,14 +1257,17 @@ export async function listFilesAtRev(
       else files.push({ rel: path.slice(prefix.length), path });
     }
 
+    // Each branch gets its OWN copy of the ancestor stack rather than the shared object: the
+    // branches run concurrently and `git()` awaits internally, so two sibling symlinks pointing at
+    // the same target would otherwise interleave — the first adds the target and yields before its
+    // `finally` removes it, so the second (still mid-flight, not actually a cycle) would see a false
+    // positive and silently drop that alias. A clone per branch keeps real-cycle detection along each
+    // branch's own descent path while letting legitimately-shared siblings both walk through.
     const expanded = await Promise.all(
-      symlinks.map((path) => expandSymlinkedFileAtRev(worktreePath, rev, path, prefix, stack)),
+      symlinks.map((path) => expandSymlinkedFileAtRev(worktreePath, rev, path, prefix, new Set(stack))),
     );
     return [...files, ...expanded.flat()].sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0));
   } finally {
-    // Removed on exit, not left in the stack, so two sibling symlinks that legitimately share one
-    // target directory — not a cycle, just reused content — are both still walked (mirrors
-    // `listFiles`'s own stack.delete after its descent).
     stack.delete(cleanDir);
   }
 }
