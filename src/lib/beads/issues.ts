@@ -105,6 +105,22 @@ export interface LoadIssuesOptions {
    * A rejected read is a normal retry instead — the same transient failure, handled where it can be.
    */
   strictGates?: boolean;
+  /**
+   * Skip the `sameBlocksEdges` consistency recheck below even when `work` carries a `blocks` edge.
+   *
+   * The recheck exists for exactly one consumer: `orderTickets` (execute-epic-board.ts), which
+   * sorts `board`'s raw edges directly and can hit a pair that `bd dep cycles` already resolved
+   * but this snapshot's `dependencies` still encode, falling back to unvalidated input order for
+   * the tickets it touches. A caller whose own use of cycle evidence goes ONLY through
+   * `cycleEvidenceFor(board)` — every `structureGaps`/`makeApprovalGate` consumer, including
+   * `approveAndClaim`'s locked guard — already gets the right answer from `cycles` alone: an empty
+   * result means the graph is clean AS OF THIS CALL, which is the only thing a blocking verdict
+   * needs, however stale `board`'s own edges are. Paying for a second `bd list` there buys nothing
+   * and, in a repo with an established `blocks` edge anywhere (the common case once it's more than
+   * a few days old, not the rare one), turns every approve into three reads instead of two —
+   * exactly the cost anton-hwkx trimmed away.
+   */
+  skipCycleConsistencyRecheck?: boolean;
 }
 
 /**
@@ -159,14 +175,21 @@ export async function loadAllIssues(
   // between the two reads, retry against whatever is current instead of pairing evidence with a
   // board it no longer describes.
   //
-  // Also gated on `work` actually carrying a `blocks` edge (anton-gh4a9 review, PR #274): the race
-  // this guards against is a repair removing one edge of a cycle `work` already captured, so a board
-  // with zero `blocks` edges has no cyclic pair that could be stale — the second `bd list` this
-  // recheck costs would buy nothing. This is what keeps approve's read-economy invariant (at most
-  // two `bd list` calls) true for the overwhelmingly common blocks-edge-free target, while a board
-  // that does carry `blocks` edges still pays for the recheck.
+  // Also gated on `work` actually carrying a `blocks` edge: a board with zero `blocks` edges has no
+  // cyclic pair that could be stale, so the second `bd list` this recheck costs would buy nothing.
+  // That alone is not enough to keep approve's read-economy invariant (at most two `bd list` calls)
+  // true, though — any repo with an established `blocks` edge ANYWHERE still pays it on every
+  // `withCycles` read, which is the common case, not the rare one. `skipCycleConsistencyRecheck` is
+  // what actually restores the invariant for the callers that don't need this guarantee (see its
+  // doc above) — this `workHasBlocksEdge` clause only spares the genuinely edge-free board on top of
+  // that.
   const workHasBlocksEdge = beads.edgesOf(work).some((e) => e.type === "blocks");
-  if (cycles.length === 0 && workHasBlocksEdge && !sameBlocksEdges(work, await loadWorkIssues(cwd))) {
+  if (
+    cycles.length === 0 &&
+    workHasBlocksEdge &&
+    !opts.skipCycleConsistencyRecheck &&
+    !sameBlocksEdges(work, await loadWorkIssues(cwd))
+  ) {
     if (attempt >= MAX_CYCLE_CONSISTENCY_RETRIES) {
       throw new Error(
         `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_CYCLE_CONSISTENCY_RETRIES + 1} ` +

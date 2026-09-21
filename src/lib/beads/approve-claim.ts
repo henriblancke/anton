@@ -143,9 +143,18 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     // which every caller needs, a guard that will not consume cycle evidence (the approve route's
     // pure, non-enqueuing take-over) must not have this read reject over a `bd dep cycles` that
     // timed out or came back unreadable — see {@link ApproveClaimInput.needsCycles}.
+    //
+    // `skipCycleConsistencyRecheck`: every `guard` this module has ever been handed (the approve
+    // route's, the picker's `startGuard`) reads cycle evidence ONLY through `cycleEvidenceFor(board)`
+    // feeding `structureGaps`/`makeApprovalGate` — never `board`'s raw edges for ordering, which is
+    // the one thing the recheck protects (see its doc on `LoadIssuesOptions`). A resolved-but-stale
+    // edge in this snapshot can't make either gate answer wrong, so paying for the extra `bd list`
+    // here would only cost approve's read-economy invariant (anton-hwkx: at most two calls) for no
+    // correctness gain.
     const board = await loadAllIssues(repoPath, {
       withCycles: input.needsCycles ?? true,
       strictGates: true,
+      skipCycleConsistencyRecheck: true,
     });
     const locked = board.find((b) => b.id === beadId);
     if (!locked) return { vanished: true };
