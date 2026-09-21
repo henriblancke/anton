@@ -660,9 +660,63 @@ describe("runReviewGate — bounds", () => {
       // Shell-quoted, matching `shellQuotePath` (review-context.ts) — this assertion predated that
       // and never followed the quoting change, failing every run regardless of this PR's own edits.
       expect(calls[1]?.prompt).toContain(`bd -C '/repos/anton' update`);
+      // chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for mixed
+      // runs": this run mixes `boardOnlyTicket` with `plainTicket`, so the SYSTEM prompt must use the
+      // softened mixed-run wording — never the unconditional "editing the tree is neither required
+      // nor expected" carve-out a run where EVERY ticket is board-only can safely state.
+      expect(calls[1]?.appendSystemPrompt).toContain("This run includes a board-only ticket");
+      expect(calls[1]?.appendSystemPrompt).not.toContain("This ticket is board-only");
       expect(out.outcome).toBe("clean");
       expect(out.rounds[0].fixCommitted).toBe(true);
       expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "gives the fix session the UNCONDITIONAL board-only system carve-out when EVERY ticket in the " +
+      "run is board-only (chatgpt-codex-connector, PR #284 review, \"Avoid the board-only system " +
+      "contract for mixed runs\") — only a MIXED run needs the softened wording, since here there is " +
+      "no ordinary ticket a blanket 'editing the tree is neither required nor expected' could " +
+      "wrongly excuse",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true,
+        },
+      });
+
+      expect(calls[1]?.appendSystemPrompt).toContain("This ticket is board-only");
+      expect(calls[1]?.appendSystemPrompt).not.toContain("This run includes a board-only ticket");
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
     },
   );
 

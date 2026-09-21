@@ -1150,6 +1150,32 @@ describe("buildFindingsFixPrompt", () => {
     },
   );
 
+  it(
+    "softens the system-prompt carve-out for a MIXED run (chatgpt-codex-connector, PR #284 review, " +
+      "\"Avoid the board-only system contract for mixed runs\") — `mixedBoardOnly` must route to the " +
+      "run-level wording, never the single-ticket 'editing the tree is neither required nor expected' " +
+      "carve-out a fully board-only run can safely state",
+    async () => {
+      const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
+        target: epic,
+        findings: [{ severity: "blocking", location: "src/a.ts:1", note: "drops the error path" }],
+        settings: {},
+        projectDir,
+        round: 1,
+        maxRounds: 2,
+        boardOnly: true,
+        mixedBoardOnly: true,
+        repoPath: "/repos/anton",
+      });
+
+      // The human-turn prompt already disambiguates per finding — unaffected by this flag.
+      expect(prompt).toContain("This run may deliver via the board");
+      // The system prompt must use the mixed-run wording, not the unconditional single-ticket one.
+      expect(appendSystemPrompt).toContain("## This run includes a board-only ticket");
+      expect(appendSystemPrompt).not.toContain("## This ticket is board-only");
+    },
+  );
+
   it("omits the board-only section entirely for an ordinary (non-board-only) fix", async () => {
     const { prompt } = await buildFindingsFixPrompt({
       target: epic,

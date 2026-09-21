@@ -473,8 +473,40 @@ const LOCK_STABILITY_ROUNDS = 3;
  * locked/verified candidate may already be live on the remote, so silently carrying on would leave
  * that exact false-success shape for the next resume — on this machine or a fresh one — to inherit
  * with no record anything is still wrong.
+ *
+ * Retrying and confirming the clear itself still leaves one window open (chatgpt-codex-connector, PR
+ * #284 review, "Mark abandoned baselines before clearing them"): the clear's local write and its
+ * confirming push are two separate steps, and a crash between them leaves the LOCAL db cleared while
+ * the REMOTE still carries the stale locked-AND-VERIFIED value untouched — a fresh-machine resume
+ * reads that remote value directly and, finding it locked and verified, trusts it via
+ * `ensureBoardBaselinePersisted`'s `recoveryBaseline` fast path without ever re-reading the board. So
+ * before the clear ever runs, this first downgrades the candidate from VERIFIED to merely tentative
+ * ({@link beads.unverifyBoardEvidenceBaseline}) and confirms THAT reaches the remote first: the same
+ * crash window now leaves the remote locked-but-unverified, which routes any resume into
+ * `lockDispatchBaseline`'s own re-verification loop instead of the blind recovery trust. Confirmed
+ * the same way the clear itself is — retried, push-checked, and poisoning the epic rather than
+ * silently returning `null` if it cannot be confirmed either persisted or synced.
  */
 async function abandonDispatchBaseline(repo: string, ticket: Bead): Promise<null> {
+  const downgraded = await mustPersist(() => beads.unverifyBoardEvidenceBaseline(repo, ticket.id));
+  const downgradeSynced = downgraded
+    ? await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false)
+    : false;
+  if (!downgraded || !downgradeSynced) {
+    throw new PoisonEpic(
+      `${ticket.id}'s pre-dispatch board-evidence lock could not be safely downgraded before being ` +
+        `abandoned: the VERIFIED-flag removal ${
+          downgraded
+            ? "landed locally, but the confirming push could not verify it reached the remote"
+            : "could not be persisted locally (after retries)"
+        } — leaving a possibly stale VERIFIED baseline on the remote for a later resume to trust ` +
+        `unchecked risks crediting a no-op agent with board drift it never produced. Check the beads ` +
+        `DB${downgraded ? " and the sync channel" : ""}, then resume the run.`,
+    );
+  }
   const cleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticket.id));
   const synced = cleared
     ? await beads

@@ -104,6 +104,32 @@ describe("composeSystemPrompt", () => {
     const out = composeSystemPrompt({ base, boardOnly: true, repoPath: "/tmp/Repo One" });
     expect(out).toContain("bd -C '/tmp/Repo One' update <id> --status done");
   });
+
+  // chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for mixed runs":
+  // a MIXED run (some tickets git-delivered, one delivery:board) must not tell the whole fix session
+  // "editing the tree is neither required nor expected" — that carve-out is only safe when EVERY
+  // ticket the session might be fixing is board-only.
+  it("softens the carve-out for a MIXED run instead of the unconditional single-ticket wording", () => {
+    const out = composeSystemPrompt({ base, boardOnly: true, mixedBoardOnly: true });
+    expect(out).toContain("This run includes a board-only ticket");
+    expect(out).not.toContain("This ticket is board-only");
+    // Never states the blanket claim a mixed run cannot back: this ticket-scoped phrasing (from the
+    // full carve-out) must not survive into the mixed wording.
+    expect(out).not.toContain("this ticket's work");
+    expect(out.toLowerCase()).toContain("must still make a real code change");
+    expect(out).toContain("ANTON-RESULT: delivered");
+  });
+
+  it("uses the unconditional single-ticket carve-out when boardOnly is set without mixedBoardOnly", () => {
+    const out = composeSystemPrompt({ base, boardOnly: true, mixedBoardOnly: false });
+    expect(out).toContain("This ticket is board-only");
+    expect(out).not.toContain("This run includes a board-only ticket");
+  });
+
+  it("keeps the live-board -C redirect instruction in the mixed-run wording too", () => {
+    const out = composeSystemPrompt({ base, boardOnly: true, mixedBoardOnly: true, repoPath: "/live/repo" });
+    expect(out).toContain("bd -C '/live/repo' update <id> --status done");
+  });
 });
 
 describe("shellQuotePath", () => {

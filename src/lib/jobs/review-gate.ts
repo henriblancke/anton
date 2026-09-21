@@ -46,6 +46,7 @@ import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
   hasBoardOnlyTicket,
+  isBoardOnlyDelivery,
   parseReviewFindings,
   type ReviewFinding,
   type ReviewProtocolViolation,
@@ -1104,6 +1105,14 @@ async function runGateFixSession(args: {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
   const { boardOnly, repoPath } = args;
+  // `boardOnly` above is `hasBoardOnlyTicket`'s "any ticket" read — right for deciding whether this
+  // fix session needs the live-board plumbing at all, wrong for deciding how strongly to word the
+  // carve-out: a MIXED run (some tickets git-delivered, one `delivery:board`) still has findings
+  // against the ordinary ticket(s) that need a real code change, so the system prompt must not tell
+  // the whole session "editing the tree is neither required nor expected" the way a run where EVERY
+  // ticket is board-only ({@link isBoardOnlyDelivery}) safely can (chatgpt-codex-connector, PR #284
+  // review, "Avoid the board-only system contract for mixed runs").
+  const mixedBoardOnly = boardOnly && !isBoardOnlyDelivery({ target, tickets });
 
   const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
     target,
@@ -1113,6 +1122,7 @@ async function runGateFixSession(args: {
     round,
     maxRounds,
     boardOnly,
+    mixedBoardOnly,
     repoPath,
   });
 

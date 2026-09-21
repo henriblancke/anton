@@ -1239,15 +1239,26 @@ export async function buildFindingsFixPrompt(args: {
    * the diff, for this run.
    */
   boardOnly?: boolean;
+  /**
+   * Set when {@link boardOnly} is true because SOME but not all of this run's tickets are
+   * board-only (chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for
+   * mixed runs") — the caller's {@link hasBoardOnlyTicket} vs. {@link isBoardOnlyDelivery} split.
+   * Tells the system prompt to soften its carve-out: a run where every ticket is board-only can
+   * safely tell the whole session "editing the tree is neither required nor expected", but a mixed
+   * run still has findings against an ordinary ticket that need a real code change, and stating the
+   * carve-out unconditionally would let a fixer leave those untouched and read that as compliant.
+   */
+  mixedBoardOnly?: boolean;
   /** See {@link ReviewRun.repoPath} — only meaningful when {@link boardOnly} is set. */
   repoPath?: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string }> {
-  const { target, findings, settings, projectDir, round, maxRounds, boardOnly, repoPath } = args;
+  const { target, findings, settings, projectDir, round, maxRounds, boardOnly, mixedBoardOnly, repoPath } = args;
 
   const appendSystemPrompt = await buildExecutionSystemPrompt({
     agentPrompt: await loadAgentPrompt(labelValue(target.labels, "agent"), { projectDir }),
     seedPrompt: settings.seedPrompt,
     boardOnly,
+    mixedBoardOnly,
     repoPath,
   });
 

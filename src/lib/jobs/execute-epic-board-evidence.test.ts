@@ -17,6 +17,10 @@ const setBoardEvidenceBaselineMock = vi.fn<
   (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
 >();
 const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// The abandon-before-clear downgrade (chatgpt-codex-connector, PR #284 review, "Mark abandoned
+// baselines before clearing them") shells out to `bd update` too — mocked for the same reason the
+// other baseline writes above are.
+const unverifyBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // The cleanup-push retry obligation (PR #284 review, "retain a retry obligation after cleanup
 // push failure") shells out to `bd update` too — mocked for the same reason the baseline writes
 // above are.
@@ -41,6 +45,7 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidencePending: setBoardEvidencePendingMock,
       setBoardEvidenceBaseline: setBoardEvidenceBaselineMock,
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
+      unverifyBoardEvidenceBaseline: unverifyBoardEvidenceBaselineMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
       clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
       setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
@@ -70,6 +75,7 @@ const { LABELS } = await import("../beads/bd");
 setBoardEvidencePendingMock.mockResolvedValue("");
 setBoardEvidenceBaselineMock.mockResolvedValue("");
 clearBoardEvidenceBaselineMock.mockResolvedValue("");
+unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
@@ -1953,6 +1959,7 @@ describe(
         setBoardEvidenceBaselineMock.mockResolvedValueOnce("");
         pushMock.mockResolvedValueOnce("synced");
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v3" })]);
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
@@ -1979,6 +1986,7 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
         pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
@@ -2004,6 +2012,7 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // lock's own stability re-read: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write, lands locally
         pushMock.mockResolvedValueOnce("not-wired"); // but its own confirming push never syncs
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
@@ -2035,6 +2044,7 @@ describe(
         for (let attempt = 0; attempt < 3; attempt += 1) {
           loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable")); // the post-verify re-read exhausts its retries
         }
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push, now required to succeed
         const pushCallsBefore = pushMock.mock.calls.length;
 
@@ -2043,10 +2053,10 @@ describe(
         ).resolves.toBeNull();
         expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
         // Initial confirming push, the lock's own confirming push, the verified-marking write's own
-        // confirming push, plus the clear's own push once the post-verify re-read fails — the clear
-        // itself is pushed, not left local-only, since the remote already carries the verified marker
-        // this call is trying to invalidate.
-        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 4);
+        // confirming push, plus the abandon downgrade's own confirming push and the clear's own push
+        // once the post-verify re-read fails — the clear itself is pushed, not left local-only, since
+        // the remote already carries the verified marker this call is trying to invalidate.
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 5);
         expect(pushMock).toHaveBeenLastCalledWith("/repo");
       },
     );
@@ -2065,6 +2075,7 @@ describe(
         for (let attempt = 0; attempt < 3; attempt += 1) {
           loadAllIssuesMock.mockRejectedValueOnce(new Error("bd unreachable"));
         }
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming clear-push
 
         await expect(
@@ -2108,6 +2119,7 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
         pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
         clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
         clearBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
@@ -2131,12 +2143,63 @@ describe(
         loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
         setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
         pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        pushMock.mockResolvedValueOnce("synced"); // abandonDispatchBaseline's own confirming downgrade-push
         pushMock.mockResolvedValueOnce("not-wired"); // abandonDispatchBaseline's own confirming clear-push never syncs either
 
         await expect(
           ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
         ).rejects.toThrow(/t-fresh/);
         expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-fresh");
+      },
+    );
+
+    it(
+      "throws rather than silently returning null when abandoning a stale locked baseline exhausts " +
+        "every retry on the VERIFIED-downgrade itself (chatgpt-codex-connector, PR #284 review, " +
+        "\"Mark abandoned baselines before clearing them\") — a swallowed failure here would go " +
+        "straight to the clear with the remote still carrying the stale VERIFIED value, so a crash " +
+        "right after that clear's own local write (before ITS confirming push) would leave the remote " +
+        "trusting a candidate this round already knows is stale",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
+        pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        unverifyBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+        unverifyBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+        unverifyBoardEvidenceBaselineMock.mockRejectedValueOnce(new Error("dolt contention"));
+        const clearCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).rejects.toThrow(/t-fresh/);
+        // Never reaches the clear at all — the downgrade that must precede it never landed.
+        expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(clearCallsBefore);
+      },
+    );
+
+    it(
+      "throws rather than silently returning null when the VERIFIED-downgrade lands locally but its " +
+        "own confirming push cannot verify it reached the remote (chatgpt-codex-connector, PR #284 " +
+        "review, \"Mark abandoned baselines before clearing them\") — proceeding to the clear anyway " +
+        "would risk a crash between the clear's local write and ITS confirming push leaving the " +
+        "remote holding the stale locked-AND-VERIFIED value the downgrade exists to rule out",
+      async () => {
+        const baseline = fingerprintBoard([bead("a", { description: "v0" })]);
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // fresh persist
+        pushMock.mockResolvedValueOnce("synced"); // initial confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a", { description: "v0" })]); // refresh loop: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // lock round 0's persist
+        pushMock.mockResolvedValueOnce("not-wired"); // lock round 0's confirming push never syncs
+        pushMock.mockResolvedValueOnce("not-wired"); // abandonDispatchBaseline's own confirming downgrade-push never syncs
+        const clearCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
+
+        await expect(
+          ensureBoardBaselinePersisted("/repo", bead("t-fresh"), baseline),
+        ).rejects.toThrow(/t-fresh/);
+        expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(clearCallsBefore);
       },
     );
   },

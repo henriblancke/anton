@@ -1307,6 +1307,21 @@ export const beads = {
       BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
     ]),
 
+  /**
+   * Downgrade a locked baseline from VERIFIED back to merely tentative, touching neither the
+   * fingerprint nor the lock itself (chatgpt-codex-connector, PR #284 review, "Mark abandoned
+   * baselines before clearing them"). Called by {@link execute-epic-board-evidence.ts!abandonDispatchBaseline}
+   * and confirmed synced BEFORE that function's own clear runs: a crash between the clear's local
+   * write and its confirming push otherwise leaves the remote holding a STALE but still-VERIFIED
+   * baseline, which a fresh-machine resume's `recoveryBaseline` fast path would trust without ever
+   * re-reading the board. Stripping VERIFIED first means that same crash instead leaves the remote
+   * locked-but-unverified, which routes any resume into re-verification instead. Unsetting a key the
+   * bead never had is a safe no-op (verified against bd 1.1.2), so this is safe to call
+   * unconditionally, whether or not this particular candidate was ever actually marked verified.
+   */
+  unverifyBoardEvidenceBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]),
+
   /** Whether a prior attempt's board-evidence cleanup wrote locally but never confirmed reaching
    * the remote — parsed off the bead's own metadata. See {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}.
    * `!== undefined` rather than a value check (PR #284 review, "Recover cleanup-only resumes

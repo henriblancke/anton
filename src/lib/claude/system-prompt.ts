@@ -74,6 +74,16 @@ export interface SystemPromptLayers {
    */
   boardOnly?: boolean;
   /**
+   * Set when {@link boardOnly} is true because this run MIXES a board-only ticket with an ordinary,
+   * git-delivered one (chatgpt-codex-connector, PR #284 review, "Avoid the board-only system
+   * contract for mixed runs") — as opposed to a run where EVERY ticket is board-only. A run where
+   * every ticket is board-only can safely tell the whole session "editing the tree is neither
+   * required nor expected"; a mixed run cannot, because it may also carry findings against the
+   * ordinary ticket that still need a real code change, and an unconditional carve-out would read as
+   * license to leave those untouched too. Meaningless (ignored) when `boardOnly` is false.
+   */
+  mixedBoardOnly?: boolean;
+  /**
    * The live board's repo path ({@link import("../jobs/steps/context").StepContext.repoPath}) — only
    * read when {@link boardOnly} is set. anton's board-evidence check ({@link
    * import("../jobs/execute-epic-board-evidence").readBoardEvidence}) always reads/writes THIS path,
@@ -88,21 +98,46 @@ export interface SystemPromptLayers {
   repoPath?: string;
 }
 
-/** The carve-out from the base's unchanged-tree rule for a ticket anton classified as board-only —
- * a fact about THIS run, so it rides with the contract rather than the customizable layers below
- * it (see {@link SystemPromptLayers.boardOnly}). `repoPath`, when given, adds the explicit `-C`
- * instruction described on {@link SystemPromptLayers.repoPath}. */
-function boardOnlySection(repoPath?: string): string {
+/**
+ * The carve-out from the base's unchanged-tree rule for a ticket anton classified as board-only —
+ * a fact about THIS run, so it rides with the contract rather than the customizable layers below it
+ * (see {@link SystemPromptLayers.boardOnly}). `repoPath`, when given, adds the explicit `-C`
+ * instruction described on {@link SystemPromptLayers.repoPath}.
+ *
+ * `mixed` (see {@link SystemPromptLayers.mixedBoardOnly}) narrows the carve-out to the board-only
+ * ticket specifically, rather than stating it for the whole session (chatgpt-codex-connector, PR
+ * #284 review, "Avoid the board-only system contract for mixed runs"): a run where every ticket is
+ * board-only can safely tell the agent "editing the tree is neither required nor expected", full
+ * stop, but a MIXED run (some tickets git-delivered, one `delivery:board`) may ALSO hand this same
+ * session findings against the ordinary ticket that need a real code change. Stating the
+ * unconditional version there would read as license to leave those untouched too — the system
+ * prompt is a higher-authority layer than the fix prompt's own per-finding routing, so a contradiction
+ * here is not something the prompt body can safely override.
+ */
+function boardOnlySection(repoPath?: string, mixed?: boolean): string {
   return [
-    "## This ticket is board-only",
+    mixed ? "## This run includes a board-only ticket" : "## This ticket is board-only",
     "",
-    "anton classified this ticket's delivery as **board-only** (`delivery:board`): its deliverable",
-    "is `bd` writes to the board, not a git diff. Editing the working tree is neither required nor",
-    "expected, and an unchanged tree is the normal, successful shape of this ticket's work.",
+    ...(mixed
+      ? [
+          "This run's tickets are not uniformly `delivery:board`: at least one delivers via `bd`",
+          "writes to the board with no git diff, but at least one other delivers the ordinary way, via",
+          "a git diff. Editing the working tree is neither required nor expected for the FORMER —",
+          "leave it alone once its `bd` write(s) are made — but IS required for the latter. An",
+          "unchanged tree only counts as this session's own outcome when every finding you were asked",
+          "to resolve was about the board-only ticket; if any finding concerns another ticket, you",
+          "must still make a real code change for it before you finish.",
+        ]
+      : [
+          "anton classified this ticket's delivery as **board-only** (`delivery:board`): its",
+          "deliverable is `bd` writes to the board, not a git diff. Editing the working tree is",
+          "neither required nor expected, and an unchanged tree is the normal, successful shape of",
+          "this ticket's work.",
+        ]),
     "",
-    "This carves out the base contract's \"Never report `delivered` on an unchanged tree\" rule",
-    "above, for this ticket only: once you have made the bd write(s) this ticket's acceptance",
-    "calls for, report",
+    `This carves out the base contract's "Never report \`delivered\` on an unchanged tree" rule` +
+      ` above, for ${mixed ? "the board-only ticket" : "this ticket"} only: once you have made the` +
+      " bd write(s) its acceptance calls for, report",
     "",
     "```",
     "ANTON-RESULT: delivered",
@@ -144,7 +179,7 @@ export function composeSystemPrompt(layers: SystemPromptLayers): string {
 
   // The board-only carve-out rides with the contract, ahead of the agent/seed layers, since it is
   // part of what the base itself means for THIS ticket rather than a customization of it.
-  if (layers.boardOnly) sections.push(boardOnlySection(layers.repoPath));
+  if (layers.boardOnly) sections.push(boardOnlySection(layers.repoPath, layers.mixedBoardOnly));
 
   const agent = layers.agentPrompt?.trim();
   if (agent) {
@@ -179,6 +214,7 @@ export async function buildExecutionSystemPrompt(opts: {
   agentPrompt?: string;
   seedPrompt?: string;
   boardOnly?: boolean;
+  mixedBoardOnly?: boolean;
   repoPath?: string;
 }): Promise<string> {
   const base = await loadBaseSystemPrompt();
@@ -187,6 +223,7 @@ export async function buildExecutionSystemPrompt(opts: {
     agentPrompt: opts.agentPrompt,
     seedPrompt: opts.seedPrompt,
     boardOnly: opts.boardOnly,
+    mixedBoardOnly: opts.mixedBoardOnly,
     repoPath: opts.repoPath,
   });
 }
