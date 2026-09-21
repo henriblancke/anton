@@ -57,10 +57,15 @@ vi.mock("../beads/bd", async () => {
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
 boardPushMock.mockResolvedValue("synced");
 boardShowMock.mockImplementation(async (_repo, id) => ({ id, status: "closed", title: "", issue_type: "task" }));
-// No closure episode by default — every fixture ticket above is already closed, but none of these
-// tests assert on the closure VALUE, only that the persist succeeds; `readCurrentClosureVersion`
-// reads this as "closed, no closure episode found" rather than a failure.
-boardHistoryMock.mockResolvedValue([]);
+// A single closed version by default — every fixture ticket above is already closed, and this is
+// what real `bd history` returns for an ordinary bead that went through open → closed once: at
+// least one version with `status: "closed"`, which `readCurrentClosureVersion` folds to that
+// version's hash. `[]` (bd answering with NO history at all — an imported/legacy bead) is reserved
+// for the dedicated test below (chatgpt-codex-connector, PR #284 review, "Reject empty closure
+// histories before confirming fixes"): every OTHER board-only fix test needs a real closure fence
+// to persist, or the fail-closed guard that finding added would poison them all on this shared
+// default instead of exercising the behavior each of them actually tests.
+boardHistoryMock.mockResolvedValue([{ hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" }]);
 import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";
@@ -748,7 +753,69 @@ describe("runReviewGate — bounds", () => {
         // Never reached the write it would have needed a closure fence for.
         expect(setBoardEvidenceConfirmedMock.mock.calls.length).toBe(callsBefore);
       } finally {
-        boardHistoryMock.mockResolvedValue([]);
+        boardHistoryMock.mockResolvedValue([
+          { hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" },
+        ]);
+      }
+    },
+  );
+
+  it(
+    "fails closed rather than persist an unfenced board-fix confirmation when `bd history` answers " +
+      "with NO closed version at all (chatgpt-codex-connector, PR #284 review, \"Reject empty " +
+      "closure histories before confirming fixes\") — an imported/legacy closed bead whose history " +
+      "is genuinely empty must not be treated as a successful-but-fenceless read, or a later " +
+      "reopen-and-reclose could reuse this round's ids with no new work",
+    async () => {
+      boardHistoryMock.mockResolvedValue([]);
+      const callsBefore = setBoardEvidenceConfirmedMock.mock.calls.length;
+      try {
+        const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const worktree = fakeWorktree();
+        let reads = 0;
+        const readBoardFingerprint = async () => {
+          reads += 1;
+          return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+        };
+        const { run } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+        const result = runReviewGate({
+          db: tdb.db,
+          clock,
+          ctx,
+          projectId,
+          target: boardOnlyTarget,
+          tickets: [boardOnlyTicket],
+          settings: { reviewMaxRounds: 2 },
+          worktreePath: dir,
+          baseBranch: "main",
+          repoPath: "/repos/anton",
+          deps: {
+            runClaude: async (options) => {
+              worktree.onDispatch();
+              return run(options);
+            },
+            diff: async () => ({ files: [], patch: "", truncated: false }),
+            commit: async () => ({ committed: false }),
+            readState: worktree.readState,
+            restoreState: worktree.restoreState,
+            readBoardFingerprint,
+            syncBoard: async () => true,
+          },
+        });
+
+        const error = await result.then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(isPoisonError(error)).toBe(true);
+        expect((error as Error).message).toContain("board-fix evidence");
+        // Never reached the write it would have needed a closure fence for.
+        expect(setBoardEvidenceConfirmedMock.mock.calls.length).toBe(callsBefore);
+      } finally {
+        boardHistoryMock.mockResolvedValue([
+          { hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" },
+        ]);
       }
     },
   );

@@ -609,7 +609,18 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
             let closure = storedClosure;
             if (storedClosure === undefined && live.status === "closed") {
               const read = await mustReadClosureVersion(repo, t.id);
-              if (!read.read) return false;
+              // `read.read` alone is not enough (chatgpt-codex-connector, PR #284 review, "Reject
+              // empty closure histories before confirming fixes"): `bd history` can answer
+              // successfully with no closed version at all — an imported/legacy closed bead with
+              // empty history — leaving `read.closure` `undefined` even though the read itself
+              // succeeded. Persisting that as `{ ids }` with no closure would land exactly the
+              // unfenced confirmation this whole block exists to prevent: `confirmedForThisCycle`
+              // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass
+              // anyway", so a later reopen-and-reclose could reuse this round's ids as the new
+              // cycle's evidence with no further board delta ever checked. Mirrors the same guard
+              // in `clearBoardEvidencePending` (execute-epic-board-evidence.ts) and
+              // `stampConfirmedClosures` (review-fix-finalize.ts).
+              if (!read.read || read.closure === undefined) return false;
               closure = read.closure;
             }
             return mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure));

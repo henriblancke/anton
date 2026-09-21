@@ -135,6 +135,17 @@ ordinary code tickets underneath needs those tickets split out or the container 
 child that fails to produce a diff by mistake is misread as valid board-only delivery instead of a
 genuine zero-diff failure.
 
+Never shape a `delivery:board` ticket whose sole deliverable is a `bd update <id> --notes` call.
+`--notes` is a normal, supported flag (§ Core rules in `.beads/PRIME.md`), but anton's board-evidence
+check deliberately excludes notes from what it diffs: notes are one append-only blob with no
+key/prefix structure, and anton's own bookkeeping (claim/settlement/repair/escalation accounts)
+appends to beads across the whole board constantly while a run is live — unlike a label or metadata
+key, there is no way to tell a real notes-only deliverable apart from that routine churn. A ticket
+shaped this way will look like it delivered nothing and get rejected forever. If notes are the only
+thing that needs to change, pair the note with a real content field this check does track (status,
+a label, metadata, a dependency edge, `--acceptance`/`--design`/`--type`/`--external-ref`), or drop
+`delivery:board` and let the git diff (even an empty commit noting why) cover it instead.
+
 ### `agent:human` — work no agent can finish
 
 One question decides it, and shaping can answer it from the bead alone:

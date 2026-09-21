@@ -109,8 +109,22 @@ export function contentMetadata(b: Bead): [string, unknown][] {
  * acceptance criteria, design, priority, every non-bookkeeping label, every non-bookkeeping
  * metadata key, parentage, dependency edges, and (on every bead except the one this run is
  * dispatching) assignee.
- * Notes stay excluded on every bead — anton's heartbeat appends to them regardless of what the agent
- * did, and no supported board-only write uses notes as its sole deliverable. Parent and
+ * Notes stay excluded on every bead — deliberately, not an oversight (chatgpt-codex-connector, PR
+ * #284 review, "Fingerprint note-only board deliveries"). `bd update <id> --notes` IS a real,
+ * documented write (`.beads/PRIME.md`'s Core rules), same as `--design`/`--acceptance` above — the
+ * difference is notes have no key/prefix structure to filter by. Every OTHER field here is excluded
+ * from anton's own writes by a narrow, enumerable set of prefixes/keys ({@link
+ * BOOKKEEPING_LABEL_PREFIXES}, {@link ANTON_METADATA_KEYS}), so a real board-only write on that
+ * field still fingerprints as changed. Notes are one append-only blob with no such structure: anton
+ * itself appends to beads across the WHOLE board constantly while a run is live (a claim notice, a
+ * settlement/repair/escalation account, a stall or park explanation — see the many `beads.note(...)`
+ * call sites in this codebase), all in the same unheadered shape a raw `bd update --notes` write
+ * would produce, so there is no reliable way to tell a genuine notes-only deliverable apart from
+ * that routine churn without either false-crediting unrelated bookkeeping as evidence or
+ * false-rejecting real notes work. Given that choice, this module fails closed: notes are never
+ * evidence, and `skills/bd/SKILL.md`'s `delivery:board` section tells shaping never to make a notes
+ * update the SOLE deliverable of a board-only ticket — pair it with a field this check does track,
+ * or drop `delivery:board` so the git diff covers it instead. Parent and
  * dependencies are included (anton-fc5x review round 2) because a reparent or a `bd dep
  * add`/`bd supersede` — both canonical board-only deliverables per this module's own docstring —
  * touch only those edges, never status/title/description/labels, and would otherwise fingerprint
