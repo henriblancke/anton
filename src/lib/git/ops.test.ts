@@ -3714,6 +3714,26 @@ suite("listFilesAtRev (real git)", () => {
     expect(nested?.path).toBe("shared/branding/nested/mark.svg");
   });
 
+  it("resolves a target whose path has a symlinked directory in the MIDDLE, not just at the end", async () => {
+    // `indirect -> ../shared2/link-to-real/sub`, where `shared2/link-to-real` (an ancestor COMPONENT
+    // of the target, sitting BEFORE its final segment `sub`) is itself a symlink. `ls-tree`/`show` walk
+    // `shared2/link-to-real/sub` as one literal path and never traverse the symlink blob sitting at
+    // `link-to-real`, so the naive lookup reads the whole path as absent and drops the asset instead of
+    // going through `link-to-real` first (anton-z33ia review, PR #313, thread on this fix).
+    write("shared2/real/sub/logo.svg", "<svg/>\n");
+    write("shared2/real/sub/nested/mark.svg", "<svg nested/>\n");
+    link("shared2/link-to-real", "real");
+    link("skill/indirect", "../shared2/link-to-real/sub");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "add symlink whose target has a symlinked ancestor component"]);
+
+    const files = await listFilesAtRev(repo, "main", "skill");
+    const asset = files.find((f) => f.rel === "indirect/logo.svg");
+    const nested = files.find((f) => f.rel === "indirect/nested/mark.svg");
+    expect(asset?.path).toBe("shared2/real/sub/logo.svg");
+    expect(nested?.path).toBe("shared2/real/sub/nested/mark.svg");
+  });
+
   it("returns nothing for a directory with no files at rev", async () => {
     expect(await listFilesAtRev(repo, "main", "skill/templates/nope")).toEqual([]);
   });
