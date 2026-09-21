@@ -19,7 +19,7 @@ import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } fr
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { contentLabels, contentMetadata } from "./execute-epic-board-evidence";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
-import { mustRead } from "./execute-epic-persist";
+import { mustReadWithDependencies } from "./execute-epic-persist";
 import { labelValue } from "./review-fix-context";
 import type { VerifyGateOutcome } from "./shell";
 
@@ -324,8 +324,8 @@ export async function buildReviewPrompt(args: {
 
 /**
  * Bounded concurrency for {@link fetchConfirmedBoardEvidenceBeads}'s host-side reads — mirrors
- * `execute-epic-board-evidence.ts`'s `DESCRIPTION_HYDRATION_CONCURRENCY` for the same reason: each id
- * needing a read is its own `bd show` SUBPROCESS with its own retries, and firing them all at once
+ * `execute-epic-board-evidence.ts`'s `DESCRIPTION_HYDRATION_CONCURRENCY` for the same reason: each
+ * batch is its own `bd list --id ...` SUBPROCESS with its own retries, and firing them all at once
  * would contend the same Dolt server this review is trying to read safely, on a run confirming many
  * ids at once.
  */
@@ -337,9 +337,16 @@ const CONFIRMED_BEAD_READ_CONCURRENCY = 4;
  * {@link ReviewRun.confirmedBoardEvidenceBeads} for why a confirmed id alone is not enough evidence
  * for a reviewer with no `bd` of its own on a server-backed board.
  *
- * `mustRead` already retries and never throws — a read that fails every attempt comes back
- * `undefined`, rendered by {@link confirmedBeadSummary} as an explicit refusal to vouch rather than
- * silently dropped.
+ * Goes through {@link mustReadWithDependencies}, never {@link mustRead}: a reviewer checking a
+ * dependency-only acceptance criterion (a `bd dep add`/`bd supersede` board-only delivery) needs the
+ * `dependencies` field this snapshot renders, and `mustRead` (`bd show`) never carries it — only `bd
+ * list --json` inlines edges (`src/lib/ticket-view.test.ts`). Rendering `dependencies=[(none)]` off a
+ * `bd show` read would tell the reviewer no edges exist even when the confirmed bead has blocking or
+ * related ones, a false current state on exactly the criterion the read exists to settle.
+ *
+ * `mustReadWithDependencies` already retries and never throws — a read that fails every attempt
+ * leaves the id absent from its result map, rendered by {@link confirmedBeadSummary} as an explicit
+ * refusal to vouch rather than silently dropped.
  */
 async function fetchConfirmedBoardEvidenceBeads(
   repoPath: string,
@@ -349,8 +356,8 @@ async function fetchConfirmedBoardEvidenceBeads(
   const result = new Map<string, Bead | undefined>();
   for (let i = 0; i < ids.length; i += CONFIRMED_BEAD_READ_CONCURRENCY) {
     const batch = ids.slice(i, i + CONFIRMED_BEAD_READ_CONCURRENCY);
-    const reads = await Promise.all(batch.map((id) => mustRead(repoPath, id)));
-    batch.forEach((id, j) => result.set(id, reads[j]));
+    const found = await mustReadWithDependencies(repoPath, batch);
+    batch.forEach((id) => result.set(id, found?.get(id)));
   }
   return result;
 }

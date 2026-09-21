@@ -66,6 +66,38 @@ export async function mustRead(
 }
 
 /**
+ * Like {@link mustRead}, but for a caller that needs `dependencies` too — {@link beads.show} is
+ * deliberately count-only (see its own docstring) and never carries them, while `bd list --json`
+ * inlines them for every issue it returns. Takes the whole batch of ids in ONE `bd list --id
+ * a,b,c --json` call rather than one `bd show` subprocess per id, which is both cheaper and the
+ * only way to get edges without a second round trip. `--all` so a CLOSED bead (e.g. a standalone
+ * board-only target closed at merge) still resolves instead of silently dropping out of the
+ * result — `bd list` filters to open issues by default.
+ *
+ * Answers `undefined` only once bd has refused every attempt, exactly like {@link mustRead}; an id
+ * bd's read genuinely has nothing for (never existed, or filtered out by something other than
+ * status) simply has no entry in the returned map, which the caller must distinguish from a wholly
+ * failed read.
+ */
+export async function mustReadWithDependencies(
+  repo: string,
+  ids: readonly string[],
+  attempts = 3,
+): Promise<Map<string, Bead> | undefined> {
+  if (ids.length === 0) return new Map();
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const found = await beads.list(repo, ["--id", ids.join(","), "--all"]);
+      return new Map(found.map((b) => [b.id, b]));
+    } catch (e) {
+      console.error(`[execute-epic] bd list (by id) read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
+    }
+  }
+  return undefined;
+}
+
+/**
  * {@link readCurrentClosureVersion}, retried like every other guarded read here. Distinguishes "bd
  * history refused every attempt" (`read: false`) from "bd history answered and this ticket has no
  * closure episode" (`read: true, closure: undefined`) — a bare `.catch(() => undefined)` folds both

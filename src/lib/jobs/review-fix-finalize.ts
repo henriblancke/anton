@@ -21,6 +21,7 @@ import {
   type Worktree,
 } from "../git/worktree";
 import { findOpenRunForEpic, updateRun } from "../runs";
+import { mustPersist, mustReadClosureVersion } from "./execute-epic-persist";
 import { IN_REVIEW, tryShow } from "./review-fix-board";
 import { safe } from "./safe";
 import { safeToRerunAtMerge, undeliveredAtMerge } from "./review-fix-delivery";
@@ -520,5 +521,42 @@ async function closeFinalized(
         [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
       ),
     ));
-  if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  if (closed) {
+    await stampConfirmedClosures(repo, [...stillOpen.values()]);
+    await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  }
+}
+
+/**
+ * Backfill the closure fence ({@link beads.confirmedBoardEvidenceClosure}) on every bead this close
+ * just settled that carries a board-evidence confirmation recorded with NONE (chatgpt-codex-
+ * connector, PR #284 review, "Fence standalone confirmations when merge closes the target"). A
+ * standalone board-only run target is confirmed while still open — intentionally left at
+ * `stage:in-review` rather than closed (`clearBoardEvidencePending`,
+ * execute-epic-board-evidence.ts) — so its confirmation carries no closure episode until a close
+ * like this one finally gives it one. Left unstamped, a later reopen-and-reclose of that SAME bead —
+ * before anton ever redispatches it again — reads the still-`undefined` stored closure as "cannot
+ * verify, pass anyway" (`confirmedForThisCycle`, execute-epic-dispatch.ts — the tolerance meant for a
+ * confirmation written before this fence existed) and accepts THIS confirmation's stale ids as the
+ * new cycle's evidence with no fresh board delta ever checked.
+ *
+ * Best-effort relative to the close itself: the batch close above already committed, durably, and
+ * cannot be undone from here, so an exhausted {@link mustReadClosureVersion}/{@link mustPersist}
+ * retry is logged and left rather than thrown — there is no later resumption point that would
+ * revisit these already-closed beads, since `stillOpen` (computed before the close, in the caller)
+ * is the only place they were ever selected from.
+ */
+async function stampConfirmedClosures(repo: string, closedBeads: readonly Bead[]): Promise<void> {
+  const unfenced = closedBeads.filter(
+    (b) => beads.boardEvidenceConfirmed(b) && beads.confirmedBoardEvidenceClosure(b) === undefined,
+  );
+  await Promise.all(
+    unfenced.map(async (b) => {
+      const read = await mustReadClosureVersion(repo, b.id);
+      if (!read.read) return;
+      await mustPersist(() =>
+        beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(b), read.closure),
+      );
+    }),
+  );
 }

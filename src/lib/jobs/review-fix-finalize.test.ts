@@ -29,6 +29,12 @@ const setStatusMock = vi.fn();
 const showMock = vi.fn();
 /** The board read the rehome takes when the sweep's snapshot names no follow-up candidate. */
 const listMock = vi.fn();
+/** `bd history`, read by the closure-fence backfill this close now stamps on a confirmed-but-open
+ * bead — versions newest first, matching `currentClosureVersion`'s own contract. */
+const historyMock = vi.fn();
+/** The closure-fence write itself (`bd update --metadata`), mocked so the backfill tests assert the
+ * ids/closure it persists without shelling to a live `bd`. */
+const setBoardEvidenceConfirmedMock = vi.fn();
 /** id → current assignee, so the claim guard's CAS (show → unassign → show) reads a live board. */
 const assignees = new Map<string, string>();
 /** id → current status, so the re-read before a status write sees the board, not the snapshot. */
@@ -57,6 +63,8 @@ vi.mock("../beads/bd", async () => {
       setStatus: (...args: unknown[]) => setStatusMock(...args),
       show: (...args: unknown[]) => showMock(...args),
       list: (...args: unknown[]) => listMock(...args),
+      history: (...args: unknown[]) => historyMock(...args),
+      setBoardEvidenceConfirmed: (...args: unknown[]) => setBoardEvidenceConfirmedMock(...args),
     },
   };
 });
@@ -152,6 +160,8 @@ describe("finalizeMergedEpic", () => {
       });
     setStatusMock.mockReset().mockResolvedValue(undefined);
     listMock.mockReset().mockResolvedValue([]);
+    historyMock.mockReset().mockResolvedValue([]);
+    setBoardEvidenceConfirmedMock.mockReset().mockResolvedValue("");
     findOpenRunMock.mockReset().mockResolvedValue(null);
     updateRunMock.mockReset().mockResolvedValue(undefined);
     showMock.mockReset().mockImplementation(
@@ -185,6 +195,65 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
       "stage:in-review",
     ]);
+  });
+
+  it(
+    "stamps the closure fence on a standalone target confirmed while still open (chatgpt-codex-" +
+      'connector, PR #284 review, "Fence standalone confirmations when merge closes the target")',
+    async () => {
+      // A standalone board-only run target is IS its own ticket (no children) and is confirmed
+      // while intentionally left open at `stage:in-review` — its `boardEvidenceConfirmed` metadata
+      // therefore carries `ids` but no `closure` yet. This close is the first time it ever closes,
+      // so the fence has to be stamped here or a later reopen-and-reclose can pass the stale
+      // confirmation off as new-cycle evidence with nothing new ever checked.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "target-1", ["anton-eb1"], "close-sha");
+    },
+  );
+
+  it("does not re-stamp a closure fence a confirmation already carries", async () => {
+    const target = {
+      ...bead("target-1"),
+      metadata: {
+        boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "earlier-close-sha" }),
+      },
+    } as Bead;
+
+    await finalize(target, []);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+    expect(historyMock).not.toHaveBeenCalled();
+    expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+  });
+
+  it("does not stamp a closure fence on a ticket with no board-evidence confirmation", async () => {
+    await finalize(bead("epic-1"), [bead("t1")]);
+
+    expect(historyMock).not.toHaveBeenCalled();
+    expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+  });
+
+  it("completes finalization even when the closure fence read fails — best-effort, not blocking", async () => {
+    const target = {
+      ...bead("target-1"),
+      metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+    } as Bead;
+    historyMock.mockRejectedValue(new Error("bd history: DB locked"));
+
+    await finalize(target, []);
+
+    expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+    // The close itself already landed, so finalization still completes rather than leaving
+    // `stage:in-review` behind — there is no later resumption point that would revisit this bead.
+    expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
   });
 
   it("leaves an already-closed target out of the batch but still clears the stage", async () => {
