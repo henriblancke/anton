@@ -1844,6 +1844,31 @@ function installNeeded(worktreePath: string, lockfile: string): boolean {
 }
 
 /**
+ * The environment the install runs under. `NODE_ENV` is dropped rather than inherited: `anton start`
+ * launches the daemon with `NODE_ENV=production` (bin/anton.mjs), and every package manager reads
+ * that as "skip devDependencies" — so a production-launched anton warmed each worktree into a tree
+ * missing vitest, typescript and the rest, and the run's first verify gate failed on modules the
+ * lockfile does list. Unset lets each manager apply its own default (install everything).
+ *
+ * @param parent the environment to derive from; injectable so the rule can be tested without
+ *   mutating the real process env.
+ */
+export function warmChildEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: Record<string, string | undefined> = {
+    ...parent,
+    // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
+    // package manager was resolved against, not the daemon's minimal one.
+    PATH: [parent.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter),
+  };
+  // Dropped rather than set to a value: there is no "install everything" spelling every manager
+  // agrees on, and an absent NODE_ENV is exactly what a developer's own shell hands `bun install`.
+  delete env.NODE_ENV;
+  // Next augments ProcessEnv with a REQUIRED, readonly NODE_ENV (its own TODO calls that wrong), so
+  // the type cannot express the env this function exists to build. Asserted once, here.
+  return env as NodeJS.ProcessEnv;
+}
+
+/**
  * Run project setup in the worktree so a run's first step doesn't pay cold-start cost (anton-8i5).
  * `node_modules` is gitignored, so a fresh worktree has none and the first verify gate fails as
  * `Cannot find module 'vitest/config'` — an error that reads as a broken test config rather than as
@@ -1863,9 +1888,7 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal): Promise<void> {
       cwd: wt.path,
       timeout: WARM_TIMEOUT_MS,
       maxBuffer: 16 * 1024 * 1024,
-      // Postinstall scripts shell out to node/git themselves; hand them the same augmented path the
-      // package manager was resolved against, not the daemon's minimal one.
-      env: { ...process.env, PATH: [process.env.PATH ?? "", ...extraBinDirs()].filter(Boolean).join(delimiter) },
+      env: warmChildEnv(),
       // An operator's kill must not be stuck behind a 10-minute install; aborting degrades into the
       // logged, non-fatal path below, exactly like a registry timeout.
       signal,
