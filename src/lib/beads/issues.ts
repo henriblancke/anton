@@ -299,16 +299,19 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
     // this generation's board no longer represents. Leave evidence unattached rather than stamp a
     // stale-graph result as current — the next probe or read retries against the new generation.
     if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
-      // An empty `cycles` result only proves the graph is clean AS OF this call, not that `board`'s
-      // OWN `blocks` edges (captured earlier, possibly by another process's snapshot load) still
-      // describe that same graph. On a shared-server board another machine can repair a cycle in the
-      // gap between this fetch starting and settling: the generation guard above only catches THIS
-      // process replacing its own snapshot, not the underlying repo moving without a local refresh
-      // noticing yet. Re-list before stamping an empty result onto a possibly-stale `board` — the
-      // same gap `loadAllIssues`'s `sameBlocksEdges` retry closes for its own path (PR #274 review,
-      // round 18). Compared against a fresh `loadAllIssues`, not `loadWorkIssues`, so a board that
-      // merged in gate beads is compared like-for-like instead of always mismatching on their edges.
-      const consistent = cycles.length > 0 || sameBlocksEdges(board, await loadAllIssues(cwd));
+      // Neither an empty NOR a non-empty `cycles` result proves `board`'s OWN `blocks` edges
+      // (captured earlier, possibly by another process's snapshot load) still describe the graph
+      // `cycles` was just computed against. On a shared-server board another machine can repair one
+      // cycle while leaving an unrelated one in place between this fetch starting and settling: the
+      // generation guard above only catches THIS process replacing its own snapshot, not the
+      // underlying repo moving without a local refresh noticing yet — so a non-empty result can
+      // still be paired with a stale `board` whose edges no longer match what `cycles` describes
+      // (PR #274 review, round 21: the `cycles.length > 0` shortcut here let that stale pairing
+      // through). Always re-list and compare, same as `loadAllIssues`'s `sameBlocksEdges` retry (PR
+      // #274 review, round 18). Compared against a fresh `loadAllIssues`, not `loadWorkIssues`, so a
+      // board that merged in gate beads is compared like-for-like instead of always mismatching on
+      // their edges.
+      const consistent = sameBlocksEdges(board, await loadAllIssues(cwd));
       // Re-check generation and evidence AFTER the `sameBlocksEdges` await, not just before it (PR
       // #274 review, round 19): that inner `loadAllIssues` call can itself take long enough for the
       // snapshot to be invalidated/replaced, or for a concurrent enrichment path to attach evidence to
@@ -599,14 +602,16 @@ export function probeCycleEvidence(cwd: string): void {
         // mid-fetch means `cycles` describes a graph this board no longer represents, so it must
         // not be stamped onto it as current (PR #274 review, round 7).
         if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
-          // An empty `cycles` result only proves the graph is clean AS OF this call, not that
-          // `board`'s OWN `blocks` edges still describe that same graph: on a shared-server board
-          // another machine can repair a cycle in the gap between this fetch starting and settling,
-          // without the local generation moving (generation only bumps on a LOCAL snapshot
-          // replacement). Re-list and compare before attaching, same as `attachCyclesBestEffort`
-          // (PR #274 review, round 20), then recheck generation/evidence again after that await —
-          // the re-list itself can take long enough for another writer to land.
-          const consistent = cycles.length > 0 || sameBlocksEdges(board, await loadAllIssues(cwd));
+          // Neither an empty NOR a non-empty `cycles` result proves `board`'s OWN `blocks` edges
+          // still describe that same graph: on a shared-server board another machine can repair one
+          // cycle while leaving an unrelated one in place in the gap between this fetch starting and
+          // settling, without the local generation moving (generation only bumps on a LOCAL snapshot
+          // replacement) — so a non-empty result can still be paired with a stale `board` (PR #274
+          // review, round 21: the `cycles.length > 0` shortcut here let that stale pairing through).
+          // Always re-list and compare before attaching, same as `attachCyclesBestEffort` (PR #274
+          // review, round 20), then recheck generation/evidence again after that await — the re-list
+          // itself can take long enough for another writer to land.
+          const consistent = sameBlocksEdges(board, await loadAllIssues(cwd));
           if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
             attachCycleEvidence(board, cycles);
             markCycleEvidenceRecovered(cwd);

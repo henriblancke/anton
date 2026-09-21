@@ -396,6 +396,30 @@ describe("loadAllIssues", () => {
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
 
+  it("declines to attach a non-empty cycles result that doesn't cover a stale blocks edge in the retained board (PR #274 review, round 21)", async () => {
+    // Same stale-repair race as the test above, but `cycles` comes back NON-empty — reporting an
+    // unrelated cycle (t-9) elsewhere on the board — while the retained board's own t-1/t-2 edge was
+    // repaired by a concurrent writer before the fetch settled. A non-empty result is only the
+    // fail-safe answer for the cycle(s) it actually names, so it must not skip the re-list/compare
+    // and get stamped onto this now-stale board as if it covered t-1 too.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
   it("coalesces concurrent best-effort enrichments into one dep-cycles call and one version bump (PR #274 review, round 6)", async () => {
     // Warm the snapshot with no evidence first, matching several cold page renders sharing one load.
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
@@ -714,6 +738,33 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
     const board = await allIssues(REPO);
     // The retained board itself is untouched — only the evidence attachment is gated — so the
     // caller still sees the stale, pre-repair content, but without a cycle-free stamp on it.
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("declines to attach a non-empty cycles result that doesn't cover a stale blocks edge in the retained board (PR #274 review, round 21)", async () => {
+    // Same race as the probe test above, but `cycles` comes back NON-empty — reporting an unrelated
+    // cycle (t-9) elsewhere on the board — while the retained board's own t-1/t-2 edge was repaired
+    // by a concurrent writer before the probe's fetch settled. Skipping the re-list/compare on a
+    // non-empty result would stamp this stale board as covered by evidence that only speaks to t-9.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    // Give the probe's internal re-list/compare a tick to settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const board = await allIssues(REPO);
     expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
