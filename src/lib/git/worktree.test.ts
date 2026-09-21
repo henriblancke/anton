@@ -2488,7 +2488,7 @@ describe("resolveWarmCommand", () => {
   /** A worktree whose deps carry a completion stamp, as a finished install leaves behind. */
   function stamped(dir: string): string {
     mkdirSync(join(dir, "node_modules"));
-    writeFileSync(join(dir, "node_modules", ".anton-warm"), "bun install --frozen-lockfile\n");
+    writeFileSync(join(dir, "node_modules", ".anton-warm"), "2\nbun install --frozen-lockfile\n");
     return dir;
   }
 
@@ -2514,6 +2514,19 @@ describe("resolveWarmCommand", () => {
   it("installs again when node_modules is newer but no install ever completed", () => {
     const dir = fixture({ "bun.lock": "{}" });
     mkdirSync(join(dir, "node_modules"));
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(join(dir, "bun.lock"), old, old);
+
+    expect(resolveWarmCommand(dir, env, isExec)?.file).toBe(`${BIN}/bun`);
+  });
+
+  // anton-ph94g/anton-db82f: a stamp written before NODE_ENV was dropped from the install env may
+  // vouch for a production-only install missing devDependencies. Such a resumed worktree must
+  // reinstall even though its (unversioned) stamp is newer than the lockfile.
+  it("installs again when the completed install predates the stamp's version bump", () => {
+    const dir = fixture({ "bun.lock": "{}" });
+    mkdirSync(join(dir, "node_modules"));
+    writeFileSync(join(dir, "node_modules", ".anton-warm"), "bun install --frozen-lockfile\n");
     const old = new Date(Date.now() - 60_000);
     utimesSync(join(dir, "bun.lock"), old, old);
 
