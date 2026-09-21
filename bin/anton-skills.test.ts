@@ -333,6 +333,38 @@ describe("installSkillDir", () => {
       await rm(externalDir, { recursive: true, force: true });
     }
   });
+
+  // Materializing a symlinked directory must not drop the bundled siblings the caller wasn't
+  // already about to recopy: only `templates/a.md` drifts here, but the symlinked `templates/`
+  // also carries a byte-identical `templates/b.md` reachable solely through the link. Replacing
+  // the link with an empty real directory and recopying just the drifted file would silently
+  // delete `b.md` (anton-z33ia review, PR #313 follow-up).
+  it("preserves a byte-identical sibling when refreshing a symlinked directory with only one drifted file", async () => {
+    mkdirSync(join(src, "templates"), { recursive: true });
+    writeFileSync(join(src, "templates", "a.md"), "a v1\n");
+    writeFileSync(join(src, "templates", "b.md"), "b v1\n");
+    installSkillDir(src, dest);
+
+    const externalDir = await tempDir("anton-skill-external-");
+    try {
+      writeFileSync(join(externalDir, "a.md"), "a v1\n");
+      writeFileSync(join(externalDir, "b.md"), "b v1\n");
+      rmSync(join(dest, "templates"), { recursive: true, force: true });
+      symlinkSync(externalDir, join(dest, "templates"));
+      // Digested through the symlink, so dest reads as pristine and "outdated".
+      seedOtherRelease(dest, "an older release\n");
+
+      // Only a.md changes upstream — b.md stays byte-identical, so it's absent from `drifted`.
+      writeFileSync(join(src, "templates", "a.md"), "a v2\n");
+      expect(installSkillDir(src, dest)).toBe("refreshed");
+
+      expect(lstatSync(join(dest, "templates")).isSymbolicLink()).toBe(false);
+      expect(readFileSync(join(dest, "templates", "a.md"), "utf8")).toBe("a v2\n");
+      expect(readFileSync(join(dest, "templates", "b.md"), "utf8")).toBe("b v1\n");
+    } finally {
+      await rm(externalDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("staleSkills", () => {
