@@ -65,6 +65,7 @@ function run(id: string, o: Partial<RunRow> = {}): RunRow {
     attempts: 1,
     leaseExpiresAt: null,
     error: null,
+    structuralError: null,
     startedAt: secDate(NOW - 4 * HOUR),
     attemptStartedAt: secDate(NOW - 4 * HOUR),
     endedAt: null,

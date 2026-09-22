@@ -29,6 +29,15 @@ export interface RunOutcome {
   /** The run row's error. The failure point the streak is compared on; absent on a clean exit. */
   error?: string;
   /**
+   * Anton's own account of why the run stopped (`RunFailureParts.structural`, jobs/execute-epic-
+   * errors.ts), held apart from an agent self-report `error` may fold in. Two zero-diff blocks on the
+   * same ticket compose an identical `structuralError` even when the agent's own words differ attempt
+   * to attempt — {@link signatureOf} signs on this when it is present, so the streak still recognises
+   * them as one break. Absent on a row with no such split (or one written before it existed), which is
+   * exactly when the fallback to `error` applies.
+   */
+  structuralError?: string;
+  /**
    * An operator force-stopped the job behind this run (`cancelled` in jobs/queue.ts). Terminal and
    * human-initiated, which is exactly why it is not evidence — see {@link verdictOf}.
    */
@@ -175,10 +184,15 @@ export function detectFailureStreak(
  */
 const FAILURE_POINT_CHARS = 140;
 
+/** The whole first non-empty line of `text` — where it stopped, without the stack. */
+function firstLine(text: string | undefined): string {
+  const line = text?.split("\n").find((l) => l.trim().length > 0) ?? "";
+  return line.trim();
+}
+
 /** The whole first non-empty line of the run's error — where it stopped, without the stack. */
 function failurePoint(run: RunOutcome): string {
-  const line = run.error?.split("\n").find((l) => l.trim().length > 0) ?? "";
-  return line.trim();
+  return firstLine(run.error);
 }
 
 /** A failure point cut to what an operator's header can hold. */
@@ -280,10 +294,18 @@ function maskQuantities(point: string): string {
  * above — the durations and ports no row can name — each matched as a complete quantity rather than
  * as a token carrying a digit (anton-4mql); the argument for keeping exactly those two, and for
  * dropping the rest of the old heuristic, is with them.
+ *
+ * What gets signed is decided before either rule runs (anton-ocm4): `run.structuralError`, when the
+ * run carries one, is anton's own account of the stop rather than the rendered `point`, which may
+ * fold in an agent self-report quoted verbatim — two attempts blocked for the same structural reason
+ * can self-report in completely different words, and signing the quote would score them as two
+ * breaks instead of one. A run with no structural half (never split, or written before the split
+ * existed) signs on `point`, exactly as before.
  */
 function signatureOf(run: RunOutcome, point: string): string {
+  const text = firstLine(run.structuralError) || point;
   const ids = knownBeadIds(run).map((id) => id.toLowerCase());
-  return maskQuantities(maskBeadIds(point.toLowerCase(), ids))
+  return maskQuantities(maskBeadIds(text.toLowerCase(), ids))
     .replace(/\s+/g, " ")
     .trim();
 }

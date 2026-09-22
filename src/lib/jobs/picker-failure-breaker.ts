@@ -273,6 +273,10 @@ async function readRunOutcomes(
         settledAt: run.endedAt ?? run.updatedAt,
         status: run.status,
         error: run.error,
+        // Anton's own account of the stop, when this row carries one (anton-4kvp) — what
+        // `signatureOf` signs on in preference to `error` above (anton-ocm4). Absent on a row
+        // written before the split existed, or whose failure never carried one.
+        structuralError: run.structuralError,
         // A newer row that somehow starts no later than this one is not a later attempt, so it
         // bounds nothing — `updatedAt` orders the read, and it can tie with `startedAt`.
         cancelled: wasCancelled(

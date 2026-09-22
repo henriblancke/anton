@@ -145,6 +145,14 @@ export const runs = sqliteTable("runs", {
   attempts: integer("attempts").notNull().default(0),
   leaseExpiresAt: ts("lease_expires_at"),
   error: text("error"),
+  // Anton's own account of why the run stopped (`RunFailureParts.structural`, execute-epic-errors.ts
+  // `runFailureParts`), held apart from `error` above — which may fold in a quoted agent self-report
+  // verbatim (anton-4kvp). The consecutive-failure breaker signs on this when present so two attempts
+  // blocked for the same structural reason compose one signature even when the agent's own words
+  // differ (anton-ocm4, autopilot-failure-streak.ts `signatureOf`). Null on rows written before this
+  // column existed, or whose failure never carried a `RunFailureParts` split — `runFailureParts`
+  // degrades those to their whole message, so nothing here is a gap the reader must special-case.
+  structuralError: text("structural_error"),
   startedAt: ts("started_at"),
   // When the CURRENT attempt on this row began (anton-tebf) — equal to `started_at` on a fresh run,
   // rewritten every time a resume picks a parked row back up. A row is not one attempt: a parked run
