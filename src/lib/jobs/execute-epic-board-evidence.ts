@@ -1233,6 +1233,18 @@ export async function clearBoardEvidencePending(
       );
     }
     closure = read.closure;
+    // Stamp the still-present marker with THIS closure before attempting to clear it below
+    // (chatgpt-codex-connector, PR #284 review, "Fence pending evidence by closure cycle") —
+    // best-effort, and deliberately not gated on: if the clear below succeeds the marker (and this
+    // stamp) are gone a few lines from now regardless, and if the clear fails, an unstamped survivor
+    // is exactly what `dispatchTicket`'s resume fast path already treats as untrusted for an
+    // already-closed ticket rather than passed through — so a failed stamp here can never strand a
+    // false confirmation, only cost a redundant re-diff on resume. Skipped when there is no marker to
+    // stamp (`stale` empty): nothing for a later resume to misread either way.
+    const closureToStamp = closure;
+    if (stale.length > 0) {
+      await mustPersist(() => beads.stampPendingBoardEvidenceClosure(repo, ticketId, closureToStamp));
+    }
   }
   const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure));
   // Gated on `confirmedSet` (chatgpt-codex-connector, PR #284 review, "Retain recovery evidence
@@ -1302,7 +1314,7 @@ export async function clearBoardEvidencePending(
     // worktree with no attribution commit of its own, to recover which ids still need confirming.
     const obligationWritten = cleared || !idsRecoverableElsewhere;
     const obligationPersisted = obligationWritten
-      ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids))
+      ? await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids, closure))
       : true;
     // Confirmed synced too, not just persisted (PR #284 review, "confirm the cleanup-retry
     // obligation reaches the remote before throwing"): this obligation is the ONLY remaining trace
@@ -1401,7 +1413,9 @@ export async function clearBoardEvidencePending(
       // the exact stale-evidence resurrection this obligation exists to prevent. Poisoned
       // immediately below rather than falling through to the generic message, which assumes the
       // local marker survived.
-      obligationRestored = await mustPersist(() => beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids));
+      obligationRestored = await mustPersist(() =>
+        beads.setBoardEvidenceCleanupUnsynced(repo, ticketId, ids, closure),
+      );
     }
     if (obligationCleared && !obligationSynced && !obligationRestored) {
       throw new PoisonEpic(

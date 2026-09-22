@@ -1145,6 +1145,33 @@ async function reDiffPreservedBaseline(repo: string, ticket: Bead): Promise<{ id
   return { ids: result.ids, ticket: freshTicket };
 }
 
+/**
+ * Whether a closure-stamped board-evidence survivor (confirmed ids, a pending marker, or a
+ * cleanup-unsynced obligation) still names the CURRENT closure episode (chatgpt-codex-connector, PR
+ * #284 review, "Fence pending evidence by closure cycle") — the one trust rule shared by every such
+ * survivor a resume can find on a closed ticket, so `stalePending`/`cleanupUnsyncedIds` get exactly
+ * the same fence `confirmedIdsTrusted` already applied to confirmed evidence. Not fenced (trusted
+ * unconditionally) for an ids-empty survivor (nothing to mistrust), a ticket that isn't closed (a
+ * standalone target at `stage:in-review` has no closure episode to compare), or a stamp that is
+ * `undefined` — written before this fence existed, or (for the pending marker specifically) never
+ * reached by a `clearBoardEvidencePending` retry that would have stamped it. `current` is the
+ * shared `bd history` read every survivor on the same ticket compares against, so callers take it
+ * once rather than re-reading per survivor.
+ */
+function survivorTrustedForClosure(
+  ids: readonly string[],
+  storedClosure: string | undefined,
+  ticketClosed: boolean,
+  current: { read: boolean; closure?: string } | undefined,
+): boolean {
+  return (
+    ids.length === 0 ||
+    !ticketClosed ||
+    storedClosure === undefined ||
+    (current !== undefined && current.read && storedClosure === current.closure)
+  );
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -1226,18 +1253,21 @@ async function dispatchTicket(
     const stalePending = beads.pendingBoardEvidence(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
     const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
-    // The durably-confirmed ids are only trustworthy for THIS closure episode (PR #284 review,
-    // "Fence the branch-delivery fast path by closure cycle"): a board-only ticket reopened and
-    // closed again — by this run or anything else — before this fast path ever redispatches it
-    // leaves `ensureBoardBaselinePersisted`'s reopen-reset unreached (that reset only fires on an
-    // actual redispatch), so `confirmedBoardEvidenceIds` can still name a PRIOR cycle's evidence.
-    // Unlike the pending/cleanup-unsynced ids below (which describe THIS resume's unfinished
-    // obligation), a stale confirmation says nothing about whether the reopen's new board delta was
-    // ever checked — mirroring the closure fence `confirmedForThisCycle` applies further down, which
-    // this earlier return bypasses entirely by skipping straight to `clearBoardEvidencePending`.
+    const cleanupUnsyncedIds = beads.cleanupUnsyncedBoardEvidenceIds(ticket);
+    // Every recovery survivor here is only trustworthy for THIS closure episode (PR #284 review,
+    // "Fence pending evidence by closure cycle"): a board-only ticket reopened and closed again — by
+    // this run or anything else — before this fast path ever redispatches it leaves
+    // `ensureBoardBaselinePersisted`'s reopen-reset unreached (that reset only fires on an actual
+    // redispatch), so `confirmedBoardEvidenceIds`, the pending marker, and a surviving cleanup
+    // obligation can each still name a PRIOR cycle's evidence — mirroring the closure fence
+    // `confirmedForThisCycle` applies further down, which this earlier return bypasses entirely by
+    // skipping straight to `clearBoardEvidencePending`.
     const staleConfirmedIds = beads.confirmedBoardEvidenceIds(ticket);
     const confirmedClosure =
       ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
+    const pendingClosure = ticket.status === "closed" ? beads.pendingBoardEvidenceClosure(ticket) : undefined;
+    const cleanupClosure =
+      ticket.status === "closed" ? beads.cleanupUnsyncedBoardEvidenceClosure(ticket) : undefined;
     // Routed through `mustReadClosureVersion` rather than a bare `readCurrentClosureVersion(...)
     // .catch(() => undefined)` (PR #284 review, "Retry the closure read before trusting it"): unlike
     // the symmetric check further down (`confirmedForThisCycle`), where an unreadable closure only
@@ -1245,16 +1275,33 @@ async function dispatchTicket(
     // preserved baseline to re-diff, and `reDiffPreservedBaseline` fails that with a hard `PoisonEpic`
     // — a single transient `bd history` hiccup should not be able to halt an already-fully-confirmed,
     // fully-cleaned-up ticket. Retried like every other guarded read in this file before falling back
-    // to the same fail-closed answer.
+    // to the same fail-closed answer. Read ONCE and shared across every survivor's trust check below
+    // (`survivorTrustedForClosure`), since they all compare against the same live closure.
     const closureCheck =
-      staleConfirmedIds.length > 0 && ticket.status === "closed" && confirmedClosure !== undefined
+      ticket.status === "closed" &&
+      ((staleConfirmedIds.length > 0 && confirmedClosure !== undefined) ||
+        (stalePending.length > 0 && pendingClosure !== undefined) ||
+        (cleanupUnsyncedIds.length > 0 && cleanupClosure !== undefined))
         ? await mustReadClosureVersion(repo, ticket.id)
         : undefined;
-    const confirmedIdsTrusted =
-      staleConfirmedIds.length === 0 ||
-      ticket.status !== "closed" ||
-      confirmedClosure === undefined ||
-      (closureCheck !== undefined && closureCheck.read && confirmedClosure === closureCheck.closure);
+    const confirmedIdsTrusted = survivorTrustedForClosure(
+      staleConfirmedIds,
+      confirmedClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    const pendingTrusted = survivorTrustedForClosure(
+      stalePending,
+      pendingClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    const cleanupTrusted = survivorTrustedForClosure(
+      cleanupUnsyncedIds,
+      cleanupClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
     // The ids to (re)confirm are the UNION of the still-pending marker, whatever a prior cleanup
     // obligation already carried, and whatever is already durably confirmed for THIS closure (PR
     // #284 review, "Preserve confirmed evidence IDs during cleanup retries") — never bare
@@ -1263,11 +1310,14 @@ async function dispatchTicket(
     // `stalePending` reads empty on exactly the resume this retry exists for. Passing it alone into
     // `clearBoardEvidencePending` would overwrite the durable confirmation with an empty array
     // instead of retrying it with the real ids — `setBoardEvidenceConfirmed` is not idempotent on
-    // its `ids` argument (see that function's own docstring).
+    // its `ids` argument (see that function's own docstring). Each source is excluded when untrusted
+    // for THIS closure (PR #284 review, "Fence pending evidence by closure cycle") — otherwise a
+    // stale pending/cleanup-unsynced survivor from an earlier cycle would keep `idsToConfirm`
+    // non-empty and mask the very closure mismatch the re-diff below exists to catch.
     let idsToConfirm = [
       ...new Set([
-        ...stalePending,
-        ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
+        ...(pendingTrusted ? stalePending : []),
+        ...(cleanupTrusted ? cleanupUnsyncedIds : []),
         ...(confirmedIdsTrusted ? staleConfirmedIds : []),
       ]),
     ].toSorted();
@@ -1280,11 +1330,15 @@ async function dispatchTicket(
     // completed. Re-diffing before clearing (mirroring the no-commit recovery path below) keeps a
     // process death right after this new attempt closes the ticket from being confirmed as
     // delivered with zero evidence. Also forced when the closure fence just excluded a stale
-    // confirmation and left nothing else to trust: `reDiffPreservedBaseline` fails loud with a
-    // `PoisonEpic` when no baseline survives either, which is the right outcome here — a reopened,
-    // reclosed ticket with no fresh baseline and no valid confirmation has no evidence this cycle
-    // ever checked the board, and fabricating a delivery from the stale ids would be a false success.
-    if (idsToConfirm.length === 0 && (hasPreservedBaseline || !confirmedIdsTrusted)) {
+    // confirmation, pending marker, or cleanup obligation and left nothing else to trust:
+    // `reDiffPreservedBaseline` fails loud with a `PoisonEpic` when no baseline survives either,
+    // which is the right outcome here — a reopened, reclosed ticket with no fresh baseline and no
+    // valid survivor has no evidence this cycle ever checked the board, and fabricating a delivery
+    // from the stale ids would be a false success.
+    if (
+      idsToConfirm.length === 0 &&
+      (hasPreservedBaseline || !confirmedIdsTrusted || !pendingTrusted || !cleanupTrusted)
+    ) {
       const rediffed = await reDiffPreservedBaseline(repo, ticket);
       idsToConfirm = rediffed.ids;
       ticket = rediffed.ticket;
@@ -1393,18 +1447,47 @@ async function dispatchTicket(
   ) {
     const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
     const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    const cleanupUnsyncedIds = beads.cleanupUnsyncedBoardEvidenceIds(ticket);
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    // Fenced by closure cycle exactly like the `if (delivery)` fast path above's `idsToConfirm`
+    // union (PR #284 review, "Fence pending evidence by closure cycle") — this resume shape can
+    // land on the same stale pending marker or cleanup-unsynced obligation left behind by an
+    // earlier, already-superseded closure episode that a reopen-and-reclose never redispatched.
+    const cleanupClosure =
+      ticket.status === "closed" ? beads.cleanupUnsyncedBoardEvidenceClosure(ticket) : undefined;
+    const pendingClosure = ticket.status === "closed" ? beads.pendingBoardEvidenceClosure(ticket) : undefined;
+    const closureCheck =
+      ticket.status === "closed" &&
+      ((cleanupUnsyncedIds.length > 0 && cleanupClosure !== undefined) ||
+        (stalePending.length > 0 && pendingClosure !== undefined))
+        ? await mustReadClosureVersion(repo, ticket.id)
+        : undefined;
+    const cleanupTrusted = survivorTrustedForClosure(
+      cleanupUnsyncedIds,
+      cleanupClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    const pendingTrusted = survivorTrustedForClosure(
+      stalePending,
+      pendingClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
     let recoveredIds = [
       ...new Set([
-        ...beads.cleanupUnsyncedBoardEvidenceIds(ticket),
-        ...beads.pendingBoardEvidence(ticket),
+        ...(cleanupTrusted ? cleanupUnsyncedIds : []),
+        ...(pendingTrusted ? stalePending : []),
         ...beads.confirmedBoardEvidenceIds(ticket),
       ]),
     ].toSorted();
-    // An empty `recoveredIds` here means the ONLY reason this block was entered is the OR
+    // An empty `recoveredIds` here means either the ONLY reason this block was entered is the OR
     // condition's third branch, `hasPreservedBaseline` alone (chatgpt-codex-connector, PR #284
     // review, "Do not confirm baseline-only resumes as delivered") — the other two branches each
     // union real ids into `recoveredIds` above, so a nonempty `stalePending` or
-    // `hasCleanupUnsynced` can never leave it empty. That baseline is written by
+    // `hasCleanupUnsynced` normally can't leave it empty — OR the closure fence just excluded a
+    // stale pending/cleanup-unsynced survivor and left nothing else to trust (PR #284 review,
+    // "Fence pending evidence by closure cycle"). That baseline is written by
     // `lockDispatchBaseline`/`ensureBoardBaselinePersisted` BEFORE every board-only dispatch,
     // unconditionally — its mere presence says nothing about whether the agent ever ran, let
     // alone whether `readBoardEvidence` ever confirmed a board delta. Reaching `doneOnBoard` with

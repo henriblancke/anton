@@ -355,6 +355,26 @@ const BOARD_EVIDENCE_DISPATCH_STARTED_KEY = "boardEvidenceDispatchStarted";
 const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
 
 /**
+ * Metadata key naming the closure episode a still-present `board-evidence-pending:*` marker was
+ * last confirmed against (chatgpt-codex-connector, PR #284 review, "Fence pending evidence by
+ * closure cycle") — the same fencing {@link BOARD_EVIDENCE_CONFIRMED_KEY}'s `closure` field
+ * applies to confirmed evidence, extended to the marker `clearBoardEvidencePending` could not
+ * clear. Without it, a marker (or {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY} obligation) a failed
+ * cleanup left behind survives untouched across a reopen-and-reclose that never redispatches this
+ * ticket — `ensureBoardBaselinePersisted`'s own reopen-reset only fires on an actual redispatch —
+ * and a later resume's `dispatchTicket` fast path would trust it unconditionally as THIS cycle's
+ * evidence, skipping the re-diff that would otherwise catch a closure with no new work checked.
+ * Stamped by {@link execute-epic-board-evidence.ts!clearBoardEvidencePending} right after it reads
+ * the closure a closed ticket is confirming against — the same read that feeds
+ * {@link beads.setBoardEvidenceConfirmed}'s `closure` — and cleared whenever the marker itself
+ * clears. Absent is read as "written before this fence existed (or before the ticket ever closed)",
+ * which a caller treats as untrusted for an ALREADY-closed ticket rather than blindly passed
+ * through, since (unlike the confirmed-evidence fence) there is no pre-existing production state to
+ * stay backward-compatible with. See {@link beads.pendingBoardEvidenceClosure}.
+ */
+const BOARD_EVIDENCE_PENDING_CLOSURE_KEY = "boardEvidencePendingClosure";
+
+/**
  * Durable proof that a board-only ticket's delivery was confirmed and its cleanup completed (PR
  * #284 review, "no record that this bead's board-only delivery ever happened") — set once, right
  * beside the marker/baseline clear in {@link clearBoardEvidencePending}, and never cleared by that
@@ -398,6 +418,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   BOARD_EVIDENCE_DISPATCH_STARTED_KEY,
   BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
   BOARD_EVIDENCE_CONFIRMED_KEY,
+  BOARD_EVIDENCE_PENDING_CLOSURE_KEY,
 ];
 
 /**
@@ -1194,6 +1215,23 @@ export const beads = {
     return [...new Set(ids)];
   },
 
+  /** The closure episode a still-present pending marker was last confirmed against, if any — see
+   * {@link BOARD_EVIDENCE_PENDING_CLOSURE_KEY}. `undefined` when never stamped (a marker written
+   * pre-close and never survived to a `clearBoardEvidencePending` retry, or one written before this
+   * fence existed). */
+  pendingBoardEvidenceClosure: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_PENDING_CLOSURE_KEY];
+    return typeof raw === "string" && raw ? raw : undefined;
+  },
+
+  /** Stamp a still-present pending marker with the closure episode it was just confirmed against
+   * (chatgpt-codex-connector, PR #284 review, "Fence pending evidence by closure cycle") — called by
+   * {@link execute-epic-board-evidence.ts!clearBoardEvidencePending} right after it reads a closed
+   * ticket's closure, BEFORE attempting to clear the marker, so a marker that survives a failed clear
+   * still carries the closure it belongs to. See {@link beads.pendingBoardEvidenceClosure}. */
+  stampPendingBoardEvidenceClosure: (cwd: string, id: string, closure: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_PENDING_CLOSURE_KEY}=${closure}`]),
+
   /**
    * The exact `board-evidence-pending:*` label SET {@link beads.setBoardEvidencePending} would
    * write for `ids` (PR #284 review) — exposed so a caller can compare it against a bead's current
@@ -1221,6 +1259,12 @@ export const beads = {
     ];
     for (const group of chunkLabelFlags(flags, BOARD_EVIDENCE_UPDATE_ARGV_BUDGET)) {
       await bdWrite(cwd, ["update", id, ...group.flat()]);
+    }
+    // The marker is gone (or was never chunked to begin with) — drop the closure fence stamp with
+    // it (PR #284 review, "Fence pending evidence by closure cycle"), so it never outlives the label
+    // it describes and gets read back against a LATER marker this same key would otherwise misname.
+    if (ids.length === 0) {
+      await bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_PENDING_CLOSURE_KEY]);
     }
   },
 
@@ -1373,16 +1417,37 @@ export const beads = {
   /** The evidence ids an unsynced cleanup still owes confirmation, parsed back off the same
    * metadata {@link beads.hasBoardEvidenceCleanupUnsynced} checks — empty when the stored value
    * predates this field, carries no ids, or is unreadable, matching
-   * {@link beads.confirmedBoardEvidenceIds}'s tolerance for a malformed value. See
+   * {@link beads.confirmedBoardEvidenceIds}'s tolerance for a malformed value. Reads both the legacy
+   * bare-array shape and the current `{ ids, closure }` shape (PR #284 review, "Fence pending
+   * evidence by closure cycle") — see {@link beads.cleanupUnsyncedBoardEvidenceClosure}. See
    * {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}. */
   cleanupUnsyncedBoardEvidenceIds: (b: Bead): string[] => {
     const raw = b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY];
     if (typeof raw !== "string" || !raw) return [];
     try {
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [];
+      const parsed: unknown = JSON.parse(raw);
+      const ids = Array.isArray(parsed) ? parsed : (parsed as { ids?: unknown } | null)?.ids;
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
     } catch {
       return [];
+    }
+  },
+
+  /** The closure episode this cleanup obligation was recorded against, if any (PR #284 review,
+   * "Fence pending evidence by closure cycle") — `undefined` for an obligation written before this
+   * fence existed, or for one recorded while the ticket stayed open. Mirrors
+   * {@link beads.confirmedBoardEvidenceClosure}, just for the cleanup-unsynced survivor instead of
+   * the confirmed one; `dispatchTicket`'s resume fast paths (execute-epic-dispatch.ts) compare this
+   * against the ticket's CURRENT closure before trusting it as this cycle's evidence. */
+  cleanupUnsyncedBoardEvidenceClosure: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const closure = (parsed as { closure?: unknown } | null)?.closure;
+      return typeof closure === "string" ? closure : undefined;
+    } catch {
+      return undefined;
     }
   },
 
@@ -1396,12 +1461,24 @@ export const beads = {
    * board-only batch's whole confirmed-id set, so a large enough batch pushes this single argv
    * argument past the ~128KiB single-argument ceiling and fails `E2BIG`, poisoning an
    * already-transitioned ticket that can never persist its cross-machine recovery obligation. See
-   * {@link beads.setBoardEvidenceBaseline} for the same bound applied to the baseline write. */
-  setBoardEvidenceCleanupUnsynced: async (cwd: string, id: string, ids: readonly string[] = []) => {
+   * {@link beads.setBoardEvidenceBaseline} for the same bound applied to the baseline write.
+   *
+   * Carries `closure` too, mirroring {@link beads.setBoardEvidenceConfirmed} (PR #284 review, "Fence
+   * pending evidence by closure cycle") — the closed ticket's closure episode at the moment this
+   * obligation was recorded, so a later resume can tell this cycle's still-unsynced obligation apart
+   * from one an earlier, already-settled cycle left behind. See
+   * {@link beads.cleanupUnsyncedBoardEvidenceClosure}. */
+  setBoardEvidenceCleanupUnsynced: async (
+    cwd: string,
+    id: string,
+    ids: readonly string[] = [],
+    closure?: string,
+  ) => {
     const dir = mkdtempSync(join(tmpdir(), "anton-bd-cleanup-unsynced-"));
     try {
       const file = join(dir, "metadata.json");
-      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]: JSON.stringify(ids) }));
+      const value = closure === undefined ? { ids } : { ids, closure };
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]: JSON.stringify(value) }));
       return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
