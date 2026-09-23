@@ -57,15 +57,20 @@ jobs:
       # total_cost_usd:0, ~500ms — an init-time crash before any model turn. 2.1.274's
       # changelog fixes exactly this shape of failure ("[Code Review] Fixed rare reviews
       # ending with 'Code review encountered an error' when GitHub or an internal service
-      # failed transiently at launch; they now wait and retry"). If reviews start failing
-      # this way again, re-check the changelog and bump further before assuming it's this
-      # PR's fault — the log's `Running Claude Code via SDK (full output hidden for
-      # security)` line means the real crash detail never reaches this job's log; add
-      # `show_full_output: true` on the action to see it.
+      # failed transiently at launch; they now wait and retry").
+      # Bumped 2.1.274 -> 2.1.281 (2026-09-23): the same is_error:true/0-cost/~400ms init
+      # crash recurred on PR #274 even on the pinned "fixed" version — the 2026-09-17 fix
+      # covers only one trigger of this failure shape. 2.1.281's changelog adds several more
+      # transient-failure fixes in the same area (a crash ending a session mid API-retry;
+      # 5xx/429 retry-loop and backoff fixes), any of which plausibly covers this recurrence.
+      # If reviews start failing this way again, re-check the changelog and bump further
+      # before assuming it's this PR's fault — the log's `Running Claude Code via SDK (full
+      # output hidden for security)` line means the real crash detail never reaches this
+      # job's log; add `show_full_output: true` on the action to see it.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.274'
+          CLAUDE_CODE_VERSION: '2.1.281'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
