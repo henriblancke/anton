@@ -1180,6 +1180,32 @@ function survivorTrustedForClosure(
   return storedClosure !== undefined ? storedClosure === current.closure : !current.reopened;
 }
 
+/**
+ * Whether a confirmation written while the ticket was still open — so it stamped no closure of its
+ * own — still names the ticket's CURRENT closure now that it has one (chatgpt-codex-connector, PR
+ * #284 review, "Validate the origin of unfenced confirmations"). `confirmedForThisCycle`'s caller
+ * used to wave every such confirmation through unconditionally: a standalone target can be closed,
+ * reopened, and closed again externally — by another board writer, or a process outside anton
+ * entirely — after the confirmation was written but before this fence ever ran, and the fresh close
+ * that reaches this fast path can be that LATER, unconfirmed cycle, with zero board delta this run
+ * ever checked for it.
+ *
+ * The confirmation's own stored `confirmedBoardEvidenceOrigin` — its last completed closure at write
+ * time, the same identity {@link lastCompletedClosureVersion} computes for an open bead — is compared
+ * against a fresh {@link mustReadClosureVersion} read's `priorClosure`, the SAME identity read now off
+ * the ticket's CURRENT (post-close) history, immediately behind the closure it currently shows.
+ * Mirrors `stampConfirmedClosures` (review-fix-finalize.ts), which fences the identical shape the
+ * other direction (a closed bead's own stored closure against a fresh read's prior closure). A
+ * mismatch — including an unreadable history, which fails this closed the same way — means a full
+ * extra close/reopen/close cycle landed since the confirmation was written, so the caller falls
+ * through to the regeneration path, which re-diffs the preserved baseline instead of trusting stale
+ * evidence.
+ */
+async function originMatchesPriorClosure(repo: string, ticket: Bead): Promise<boolean> {
+  const read = await mustReadClosureVersion(repo, ticket.id);
+  return read.read && beads.confirmedBoardEvidenceOrigin(ticket) === read.priorClosure;
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -1545,13 +1571,16 @@ async function dispatchTicket(
   // than anton's own (possibly stale) board read, so a reopen this run's read never caught still
   // changes it. Compared only for a ticket THIS read finds closed — a standalone target parked at
   // `stage:in-review` never closes, so it has no episode to compare and keeps trusting the flag as
-  // before — and only when a closure was actually recorded at confirmation time, since a
-  // confirmation written before this fence existed (`confirmedClosure` undefined) cannot be checked
-  // either way; both fall back to the pre-fix behavior rather than block on an unanswerable question.
-  // A mismatch (or an unreadable current closure, which fails closed the same way) is treated as "not
-  // confirmed for this cycle" — this whole block is skipped, and the ticket falls through to the
-  // regeneration path below, which redispatches it and lets `ensureBoardBaselinePersisted` clear the
-  // stale confirmation as it establishes the new cycle's own baseline.
+  // before. A confirmation written before this fence existed, with a closure already recorded at
+  // write time, compares that stored closure directly against the current one. A confirmation
+  // written while the ticket was still open — so it stamped no closure of its own — is not waved
+  // through unconditionally either (chatgpt-codex-connector, PR #284 review, "Validate the origin of
+  // unfenced confirmations"): see {@link originMatchesPriorClosure}, which fences it against its own
+  // stored `confirmedBoardEvidenceOrigin` instead. A mismatch on either check (or an unreadable
+  // closure/history, which fails closed the same way) is treated as "not confirmed for this cycle" —
+  // this whole block is skipped, and the ticket falls through to the regeneration path below, which
+  // redispatches it and lets `ensureBoardBaselinePersisted` clear the stale confirmation as it
+  // establishes the new cycle's own baseline.
   const confirmedClosure =
     doneOnBoard && ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
   const confirmedForThisCycle =
@@ -1559,8 +1588,9 @@ async function dispatchTicket(
     isBoardOnlyRun(run, ticket) &&
     beads.boardEvidenceConfirmed(ticket) &&
     (ticket.status !== "closed" ||
-      confirmedClosure === undefined ||
-      confirmedClosure === (await readCurrentClosureVersion(repo, ticket.id).catch(() => undefined)));
+      (confirmedClosure === undefined
+        ? await originMatchesPriorClosure(repo, ticket)
+        : confirmedClosure === (await readCurrentClosureVersion(repo, ticket.id).catch(() => undefined))));
   if (confirmedForThisCycle) {
     // The pending marker and preserved baseline that would normally carry these ids are the very
     // things `clearBoardEvidencePending` cleared when it set the confirmed flag — `bd.ts` persists

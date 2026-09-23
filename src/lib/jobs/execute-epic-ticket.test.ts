@@ -404,9 +404,10 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
   );
 
   it(
-    "halts instead of settling when the audit's own pending-evidence marker could not be persisted " +
-      "— losing that record would let a resumed attempt's fresh baseline silently absorb the write " +
-      "with no way left to attribute or reject it",
+    "still settles the ticket before halting when the audit's own pending-evidence marker could " +
+      "not be persisted (chatgpt-codex-connector, PR #284 review, 'Settle the ticket when the " +
+      "failure audit throws') — skipping settlement here would leave the ticket assigned/in-" +
+      "progress and unreachable to the resume this poison exists to prompt",
     async () => {
       readBoardEvidenceMock.mockResolvedValue({
         found: true,
@@ -425,14 +426,14 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
         }),
       ).rejects.toThrow(/could not be recorded for a resume/);
 
-      expect(settleFailedTicketMock).not.toHaveBeenCalled();
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
     },
   );
 
   it(
-    "halts instead of settling when a total read failure ALSO could not persist a recovery " +
-      "baseline — `found: false` here means nothing to attribute, not that the recovery write " +
-      "itself succeeded (chatgpt-codex-connector, PR #284 review)",
+    "still settles the ticket before halting when a total read failure ALSO could not persist a " +
+      "recovery baseline — `found: false` here means nothing to attribute, not that the recovery " +
+      "write itself succeeded (chatgpt-codex-connector, PR #284 review)",
     async () => {
       readBoardEvidenceMock.mockResolvedValue({
         found: false,
@@ -452,15 +453,16 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
         }),
       ).rejects.toThrow(/could not be recorded for a resume/);
 
-      expect(settleFailedTicketMock).not.toHaveBeenCalled();
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
     },
   );
 
   it(
-    "halts instead of settling when the audit's own recovery baseline landed locally but could " +
-      "not be confirmed synced — a resume on a DIFFERENT machine never sees a baseline that only " +
-      "landed on this one (chatgpt-codex-connector, PR #284 review, \"Halt when the recovery " +
-      "baseline remains unsynced\")",
+    "still settles the ticket before halting when the audit's own recovery baseline landed " +
+      "locally but could not be confirmed synced — a resume on a DIFFERENT machine never sees a " +
+      "baseline that only landed on this one (chatgpt-codex-connector, PR #284 review, \"Halt when " +
+      "the recovery baseline remains unsynced\" / \"Settle the ticket when the failure audit " +
+      "throws\")",
     async () => {
       readBoardEvidenceMock.mockResolvedValue({
         found: false,
@@ -480,7 +482,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
         }),
       ).rejects.toThrow(/could not be recorded for a resume[\s\S]*resume the run on this same machine/);
 
-      expect(settleFailedTicketMock).not.toHaveBeenCalled();
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
     },
   );
 });

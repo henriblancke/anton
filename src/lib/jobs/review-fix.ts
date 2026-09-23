@@ -837,6 +837,24 @@ async function runFixSession(args: {
         settings,
         ctx.signal,
       );
+      // A board-capable epic can reach this shortcut with a PRIOR session's own board write still
+      // only local (chatgpt-codex-connector, PR #284 review, "Reconfirm board writes on ahead-branch
+      // resumes"): a mixed board/git fixer that self-committed and then failed to confirm its board
+      // push is exactly what makes `alreadyAhead` true on THIS resume, so without this check the
+      // shortcut above would declare success and request re-review while that write sits unpublished
+      // — later silently absorbed into a fresh baseline as though nothing happened. Confirmed the
+      // same way the full dispatch path below confirms its own board writes; `defaultSyncBoard` is a
+      // plain push, so it costs nothing when there is genuinely nothing new to sync.
+      if (boardOnly) {
+        const boardSynced = await defaultSyncBoard(repo);
+        if (!boardSynced) {
+          throw new Error(
+            `the review fix for ${epic.id} resumed PR #${number} with its branch already ahead of ` +
+              `origin, but a board write for this ticket could not be confirmed synced against the ` +
+              `remote`,
+          );
+        }
+      }
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
       await endSession(db, clock, sessionId, "done");
       return pushed;

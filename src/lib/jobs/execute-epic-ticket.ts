@@ -255,23 +255,37 @@ export async function runTicket(args: {
     // persists it as this ticket's pending evidence. A later attempt that actually dispatches could
     // then have its own honest `satisfied`/`delivered` self-report accepted on THOSE stale ids,
     // defeating the delivery gate for work nobody did.
+    const settleThisTicket = () =>
+      settleFailedTicket({
+        run,
+        ticket,
+        runTicketIds: args.runTicketIds,
+        session,
+        ranOutOfTime: budget.ranOutOfTime(),
+        baseline,
+        progress,
+        timeoutMs,
+        standalone,
+        operator: claimedOperator,
+        e,
+      });
     if (boardOnly && boardBaseline && dispatchStarted) {
-      await auditBoardOnFailedTicket(run, ticket, boardBaseline, session.logPath, e);
+      try {
+        await auditBoardOnFailedTicket(run, ticket, boardBaseline, session.logPath, e);
+      } catch (auditFailure) {
+        // The audit's own `PoisonEpic` (or one `abandonDispatchBaseline` throws inside it) must not
+        // bypass settlement (chatgpt-codex-connector, PR #284 review, "Settle the ticket when the
+        // failure audit throws") — skipping straight past it here would leave the ticket
+        // assigned/in-progress with no session end and no released claim, unreachable to the very
+        // resume this poison exists to prompt. Settlement always throws its own error (`e` or a
+        // repair variant), which is swallowed here since the audit failure is the one that must
+        // reach the caller and poison the run.
+        await settleThisTicket().catch(() => {});
+        throw auditFailure;
+      }
     }
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
-    return settleFailedTicket({
-      run,
-      ticket,
-      runTicketIds: args.runTicketIds,
-      session,
-      ranOutOfTime: budget.ranOutOfTime(),
-      baseline,
-      progress,
-      timeoutMs,
-      standalone,
-      operator: claimedOperator,
-      e,
-    });
+    return settleThisTicket();
   } finally {
     budget.stop();
   }
