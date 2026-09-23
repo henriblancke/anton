@@ -42,6 +42,10 @@ node --import tsx scripts/bench-board.mts /tmp/beads.json /tmp/anton-snapshot.db
 
 The benchmark opens the supplied SQLite snapshot read-only, backs it up into another temporary directory, redirects all application reads/writes there, and replaces `beads.list` with the exported JSON. Exported issue data and database copies are not committed.
 
+## Host contention
+
+Read-only process inspection during validation also found **14 orphaned CPU stress loops**, each running for more than four days. One sample showed **563% combined CPU** and a **74 one-minute load average**. These processes belong to another session, outside Anton's request code. They are a separate contributor to local slowness and benchmark noise; termination requires the user's approval. The before/after figures above were collected before any cleanup of those processes.
+
 ## Remaining costs and constraints
 
 1. **Cold remote board reads:** `bd list` took 1.11–1.81 seconds for 3.46 MB. These changes accelerate local derivation; they do not remove that remote round trip. Snapshot freshness and write fencing must remain intact in any further reduction.
