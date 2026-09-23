@@ -25,7 +25,11 @@ function dedupeById(beadList: Bead[]): Bead[] {
 async function loadWorkIssues(cwd: string): Promise<Bead[]> {
   try {
     return await beads.list(cwd, ["--status", "all"]);
-  } catch {
+  } catch (error) {
+    // Only old CLI versions rejecting this status need two listings. Retrying timeouts or
+    // connection failures doubles load precisely when the database is already struggling.
+    const message = error instanceof Error ? error.message : String(error);
+    if (!/(?:invalid|unknown|unsupported) (?:value for |flag: )?(?:issue )?(?:--)?status[: =]*["']?all\b/i.test(message)) throw error;
     const [open, closed] = await Promise.all([
       beads.list(cwd),
       beads.list(cwd, ["--status", "closed"]),

@@ -38,6 +38,17 @@ describe("the self-review history's retry", () => {
     vi.unstubAllGlobals();
   });
 
+  it("uses server detail on the first render and fetches again after a write", async () => {
+    const detail = { epic: { id: "anton-1" }, tickets: [], edges: [] } as unknown as import("@/lib/types").EpicDetail;
+    fetchMock.mockImplementation(async (url: string) => Response.json(url.endsWith("/review") ? { report: { scores: [] } } : { detail }));
+    const { result } = renderHook(() => useEpicDetail({ slug: "tmp", epicId: "anton-1" }, detail));
+    expect(result.current.detail).toBe(detail);
+    await waitFor(() => expect(result.current.review).toBeDefined());
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(["/api/projects/tmp/epics/anton-1/review"]);
+    act(() => result.current.refresh());
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/projects/tmp/epics/anton-1"));
+  });
+
   it("reads as loading, not as failed, while a retry is in flight", async () => {
     // The detail read is not what is under test; keep it permanently pending so only the review
     // read's states move.

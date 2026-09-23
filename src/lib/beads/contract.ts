@@ -33,6 +33,7 @@
  * scanner it judges through (markdown.ts, itself dependency-free) — so the API route, the job
  * runner, and the board can all import it.
  */
+import { BoundedCache } from "../bounded-cache";
 import {
   isHeading,
   renderedLines,
@@ -528,6 +529,28 @@ const acceptanceBodies = (bead: Bead, sections: Map<string, string>, keys: strin
   ...keys.map((k) => sections.get(k) ?? ""),
 ];
 
+// Keys describe the inputs the contract reads, rather than bead identity or updated_at: editing
+// a reused object or repairing a contract within one timestamp must invalidate the answer.
+const contractReads = new BoundedCache<string, { value: string | undefined | ContractViolation[] }>(
+  16 * 1024 * 1024,
+);
+function memoContract<T extends string | undefined | ContractViolation[]>(
+  kind: string, bead: Bead, read: () => T,
+): T {
+  const key = JSON.stringify([
+    kind, tierOf(bead), isContractReadable(bead), bead.description,
+    bead.acceptance_criteria, bead.acceptance, bead.labels,
+  ]);
+  const cached = contractReads.get(key);
+  let value: T;
+  if (cached) value = cached.value as T;
+  else {
+    value = read();
+    contractReads.set(key, { value }, key.length * 2 + JSON.stringify(value ?? null).length * 2 + 128);
+  }
+  return (Array.isArray(value) ? value.map((violation) => ({ ...violation })) : value) as T;
+}
+
 /**
  * The acceptance text a view RENDERS, across every home it can occupy — the reader half of the
  * choice {@link validateBeadContract} makes when it judges the same bead.
@@ -544,6 +567,10 @@ const acceptanceBodies = (bead: Bead, sections: Map<string, string>, keys: strin
  * no rubric yet, and the blocking marker beside it says so.
  */
 export function acceptanceBody(bead: Bead): string | undefined {
+  return memoContract("acceptanceBody", bead, () => acceptanceBodyUncached(bead));
+}
+
+function acceptanceBodyUncached(bead: Bead): string | undefined {
   const description = typeof bead.description === "string" ? bead.description : "";
   const sections = sectionsOf(description, contractKeysOf(tierOf(bead)));
   const bodies = [
@@ -568,6 +595,10 @@ export function acceptanceBody(bead: Bead): string | undefined {
  * marker beside it says so.
  */
 export function goalBody(bead: Bead): string | undefined {
+  return memoContract("goalBody", bead, () => goalBodyUncached(bead));
+}
+
+function goalBodyUncached(bead: Bead): string | undefined {
   const description = typeof bead.description === "string" ? bead.description : "";
   const sections = sectionsOf(description, contractKeysOf(tierOf(bead)));
   const bodies = [
@@ -707,6 +738,10 @@ export function formatContractGaps(gaps: ContractGap[]): string {
  * or not readable. Pure: no bd calls, no IO.
  */
 export function validateBeadContract(bead: Bead): ContractViolation[] {
+  return memoContract("validateBeadContract", bead, () => validateBeadContractUncached(bead));
+}
+
+function validateBeadContractUncached(bead: Bead): ContractViolation[] {
   const tier = tierOf(bead);
   if (tier === "exempt" || !isContractReadable(bead)) return [];
 

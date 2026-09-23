@@ -36,8 +36,11 @@ import {
 } from "./execute-epic-board";
 import {
   askSettleError,
+  BlockedByAgentError,
   NeedsHumanError,
+  NoDeliveryError,
   ParkedAskError,
+  runFailureParts,
 } from "./execute-epic-errors";
 import {
   adoptRefreshedTarget,
@@ -1883,6 +1886,104 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     );
     expect(refused?.message).toBe(expected);
     expect(claimed).toMatchObject({ committed: true, delivered: false });
+  });
+});
+
+/**
+ * anton-4kvp: the part anton authors and the part the agent wrote used to reach the board as one
+ * concatenated sentence. Every composition below now carries the split on the error object itself —
+ * `.structural` for anton's own text, `.selfReport` for the agent's parsed report — so a downstream
+ * reader (the run row, a future streak signature) never has to parse the two back out of the
+ * rendered message. Pinned here: both halves recover correctly, and the rendered `.message` an
+ * operator sees is byte-identical to before the split existed.
+ */
+describe("a run failure exposes anton's text and the agent's self-report as distinct values (anton-4kvp)", () => {
+  const ticket: Bead = {
+    id: "anton-4kvp",
+    title: "split the structural text from the self-report",
+    status: "in_progress",
+    issue_type: "task",
+  };
+  const progress = (selfReport: TicketProgress["selfReport"]): TicketProgress => ({
+    committed: false,
+    delivered: false,
+    selfReport,
+  });
+  const neverAsked = async (): Promise<boolean> => {
+    throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
+  };
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
+  const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
+
+  it("splits a plain zero diff — no self-report, so the structural half is the whole message", async () => {
+    const err = (await failure(gate({ committed: false }, progress(null)))) as NoDeliveryError;
+    expect(err).toBeInstanceOf(NoDeliveryError);
+    expect(err.structural).toBe(err.message);
+    expect(err.selfReport).toBeNull();
+    expect(runFailureParts(err)).toEqual({ structural: err.message, selfReport: null });
+  });
+
+  it("splits a zero diff the agent falsely claimed delivered, message unchanged", async () => {
+    const selfReport = { outcome: "delivered" as const };
+    const err = (await failure(gate({ committed: false }, progress(selfReport)))) as NoDeliveryError;
+    expect(err.message).toBe(
+      `${err.structural} The agent self-reported ANTON-RESULT: delivered — a false success on an ` +
+        "unchanged tree.",
+    );
+    expect(err.structural.startsWith("anton-4kvp produced no delivery")).toBe(true);
+    expect(err.selfReport).toEqual(selfReport);
+    expect(runFailureParts(err)).toEqual({ structural: err.structural, selfReport });
+  });
+
+  it("splits a committed ticket the agent self-reported blocked, message unchanged", async () => {
+    const selfReport = { outcome: "blocked" as const, klass: "other" as const, reason: "the spec is empty" };
+    const err = (await failure(gate({ committed: true }, progress(selfReport)))) as BlockedByAgentError;
+    expect(err).toBeInstanceOf(BlockedByAgentError);
+    expect(err.message).toBe(
+      "anton-4kvp was self-reported blocked by the agent (blocked — the spec is empty) even though " +
+        "it committed changes. Blocking the ticket for operator review and halting the epic — the " +
+        "agent declared the work incomplete, so closing it would be a false success.",
+    );
+    expect(err.structural).toBe(
+      "anton-4kvp was self-reported blocked by the agent even though it committed changes. Blocking " +
+        "the ticket for operator review and halting the epic — the agent declared the work " +
+        "incomplete, so closing it would be a false success.",
+    );
+    expect(err.selfReport).toEqual(selfReport);
+    expect(runFailureParts(err)).toEqual({ structural: err.structural, selfReport });
+  });
+
+  it("splits a preserved-WIP zero diff — its structural text is the whole message", async () => {
+    const err = (await failure(
+      gate({ committed: true, preservedAdoption: true }, progress(null)),
+    )) as NoDeliveryError;
+    expect(err.structural).toBe(err.message);
+    expect(err.selfReport).toBeNull();
+  });
+
+  it("still carries a non-delivered self-report on a preserved-WIP zero diff, though the message never quotes it", async () => {
+    // `satisfied`, not `blocked` — a `blocked` self-report short-circuits into BlockedByAgentError
+    // above regardless of `preservedAdoption`, so this is the one non-`delivered` outcome that still
+    // reaches the preserved-WIP gate with `committed: true`.
+    const selfReport = { outcome: "satisfied" as const, commit: "abc1234", reason: "already covered" };
+    const err = (await failure(
+      gate({ committed: true, preservedAdoption: true }, progress(selfReport)),
+    )) as NoDeliveryError;
+    expect(err.structural).toBe(err.message);
+    expect(err.message).not.toContain("already covered");
+    expect(err.selfReport).toEqual(selfReport);
+  });
+
+  it("still renders an existing single-string error that predates the split", () => {
+    const legacy = new Error("anton-old produced no delivery: claude exited cleanly and left no diff.");
+    expect(runFailureParts(legacy)).toEqual({ structural: legacy.message, selfReport: null });
+
+    // A NoDeliveryError built the old, one-argument way — exactly what a pre-split call site (or an
+    // existing test) still constructs — degrades to the same shape rather than an empty structural.
+    const oneArg = new NoDeliveryError("no diff");
+    expect(oneArg.structural).toBe("no diff");
+    expect(oneArg.selfReport).toBeNull();
+    expect(runFailureParts(oneArg)).toEqual({ structural: "no diff", selfReport: null });
   });
 });
 

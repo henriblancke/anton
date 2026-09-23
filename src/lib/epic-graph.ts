@@ -340,28 +340,7 @@ function computeChildReadiness(
  * prerequisite lands.
  */
 export function standaloneBlockers(all: Bead[], id: string): string[] {
-  const byId = new Map(all.map((b) => [b.id, b]));
-  const runTargetOf = runTargetResolver(all);
-
-  // The bead whose `done` actually satisfies a blocker. A child ticket is closed the moment its code
-  // commits, but that code only lands on the base branch when its RUN TARGET's single PR MERGES —
-  // so gating on the raw child would release this target too early. Mirror computeEpicGraph's
-  // rollup: resolve a child blocker to the unit that ships it (a task under a feature gates on the
-  // feature, not on the epic above it). A unit or an unattributable blocker gates on itself (it
-  // already stays in-review until its own PR merges).
-  const gateOf = (blockerId: string): string => runTargetOf(blockerId) ?? blockerId;
-
-  const open = new Set<string>();
-  for (const e of beads.edgesOf(all)) {
-    // A `blocks` edge is (from = dependent, to = blocker); this bead is blocked by `to`.
-    if (e.type !== "blocks" || e.from !== id) continue;
-    if (isOwnMergeWait(byId.get(e.to))) continue;
-    const gate = gateOf(e.to);
-    const gateBead = byId.get(gate);
-    // An unknown blocker (absent from the list) is treated as still open — fail safe.
-    if (!gateBead || deriveStage(gateBead) !== "done") open.add(gate);
-  }
-  return [...open];
+  return createBlockerIndex(all).standalone(id);
 }
 
 /**
@@ -390,28 +369,42 @@ function isOwnMergeWait(blocker: Bead | undefined): boolean {
  * callers concatenate the two lists without double-counting. Returns open blocker ids, deduped.
  */
 export function epicStandaloneBlockers(all: Bead[], epicId: string): string[] {
-  const byId = new Map(all.map((b) => [b.id, b]));
-  const epicBead = byId.get(epicId);
-  if (!epicBead || !isUnit(epicBead)) return [];
+  return createBlockerIndex(all).epic(epicId);
+}
 
-  const runTargetOf = runTargetResolver(all);
-  // The endpoints whose blocks edges roll up to THIS unit in the graph — the unit itself plus the
-  // beads under it that no nearer unit claims (a feature child owns its own subtree, so its
-  // blockers gate the feature, not the epic above it).
-  const members = new Set(all.filter((b) => runTargetOf(b.id) === epicId).map((b) => b.id));
-
-  const open = new Set<string>();
-  for (const e of beads.edgesOf(all)) {
-    if (e.type !== "blocks" || !members.has(e.from)) continue;
-    if (isOwnMergeWait(byId.get(e.to))) continue; // the unit's own PR, not a prerequisite
-    // Anything the rollup CAN attribute is already an edge in the graph — skip it here or it would
-    // be counted twice. An unknown blocker (absent from the list) is unattributable too, so it is
-    // recovered here and treated as still open (fail safe).
-    if (runTargetOf(e.to) !== undefined) continue;
-    const blocker = byId.get(e.to);
-    if (!blocker || deriveStage(blocker) !== "done") open.add(e.to);
+/** Index all open prerequisites once per snapshot, preserving edge order and fail-safe gates. */
+export function createBlockerIndex(all: Bead[]) {
+  const byId = new Map(all.map((bead) => [bead.id, bead]));
+  const resolve = runTargetResolver(all);
+  const owners = new Map<string, string | undefined>();
+  const ownerOf = (id: string) => {
+    if (!owners.has(id)) owners.set(id, resolve(id));
+    return owners.get(id);
+  };
+  const direct = new Map<string, Set<string>>();
+  const external = new Map<string, Set<string>>();
+  const add = (index: Map<string, Set<string>>, id: string, blocker: string) => {
+    const entries = index.get(id) ?? new Set<string>();
+    entries.add(blocker);
+    index.set(id, entries);
+  };
+  for (const edge of beads.edgesOf(all)) {
+    if (edge.type !== "blocks" || isOwnMergeWait(byId.get(edge.to))) continue;
+    const owner = ownerOf(edge.to);
+    const gate = owner ?? edge.to;
+    const blocker = byId.get(gate);
+    if (blocker && deriveStage(blocker) === "done") continue;
+    add(direct, edge.from, gate);
+    const source = ownerOf(edge.from);
+    // Unknown source endpoints never belonged to a unit's member set.
+    if (owner === undefined && source !== undefined && byId.has(edge.from)) {
+      add(external, source, edge.to);
+    }
   }
-  return [...open];
+  return {
+    standalone: (id: string): string[] => [...(direct.get(id) ?? [])],
+    epic: (id: string): string[] => [...(external.get(id) ?? [])],
+  };
 }
 
 function compareByPriorityThenCreated(a: Bead, b: Bead): number {

@@ -943,3 +943,9 @@ describe("refreshAllIssuesRead", () => {
     expect(generation).toBe(issueSnapshotGeneration(REPO));
   });
 });
+
+ it.each(["database is locked", "connection refused", "command timed out"])("does not fan out a failed board read: %s", async (message) => {
+   listMock.mockRejectedValue(new Error(message));
+   await expect(loadAllIssues(REPO)).rejects.toThrow(message);
+   expect(listMock).toHaveBeenCalledTimes(1);
+ });

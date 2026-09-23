@@ -102,7 +102,7 @@ export const parseGoal = (bead: Bead): string | undefined => goalBody(bead);
 export const parseAcceptance = (bead: Bead): string | undefined => acceptanceBody(bead);
 
 /** Map a bead to the shared Ticket view model (board cards, epic-detail children, etc.). */
-export function toTicket(bead: Bead): Ticket {
+export function toTicket(bead: Bead, opts?: { includeAcceptance?: boolean }): Ticket {
   return {
     id: bead.id,
     title: bead.title,
@@ -111,7 +111,7 @@ export function toTicket(bead: Bead): Ticket {
     agent: labelValue(bead.labels, "agent"),
     risk: labelValue(bead.labels, "risk"),
     size: labelValue(bead.labels, "size"),
-    acceptance: parseAcceptance(bead),
+    acceptance: opts?.includeAcceptance === false ? undefined : parseAcceptance(bead),
     ...createdMeta(bead),
     prRef: beads.getPrRef(bead),
     deferred: beads.isDeferred(bead),

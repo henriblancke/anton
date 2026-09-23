@@ -5,7 +5,45 @@
  * ones — so they live together rather than beside the code that happens to throw them.
  */
 import type { SatisfiedBy } from "../beads/satisfied-note";
+import type { AntonResult } from "../claude/anton-result";
 import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
+
+/**
+ * A run failure whose message folds together two authors — anton's own account of why it stopped,
+ * and (sometimes) the agent's self-report — kept as distinct values on the error itself (anton-4kvp)
+ * rather than left for a downstream reader to parse back out of one concatenated sentence.
+ */
+export interface RunFailureParts {
+  /** The text anton itself composed — its reasoning for the stop, independent of anything the agent
+   * said (even when the rendered message also quotes the agent inline). */
+  readonly structural: string;
+  /** The agent's own self-report this failure was composed against, or null when the composition
+   * folded none in (or none was captured). */
+  readonly selfReport: AntonResult | null;
+}
+
+function hasRunFailureParts(e: unknown): e is RunFailureParts {
+  return (
+    typeof e === "object" &&
+    e !== null &&
+    typeof (e as { structural?: unknown }).structural === "string" &&
+    "selfReport" in e
+  );
+}
+
+/**
+ * Recover anton's text and the agent's self-report as distinct values from a run failure
+ * (anton-4kvp) — the split {@link NoDeliveryError} and {@link BlockedByAgentError} already carry,
+ * read back without parsing their rendered `.message`. Anything else (a plain `Error`, a string read
+ * back off an existing `runs.error` row written before this split existed) has no agent half to
+ * recover: it degrades to its whole text as the structural half and no self-report, which is exactly
+ * how it already rendered — no stored row loses information, it just never had a second value to
+ * carry.
+ */
+export function runFailureParts(e: unknown): RunFailureParts {
+  if (hasRunFailureParts(e)) return { structural: e.structural, selfReport: e.selfReport };
+  return { structural: e instanceof Error ? e.message : String(e), selfReport: null };
+}
 
 /**
  * The run ran every ticket it could and the rest are held by a prerequisite outside it (anton-1two).
@@ -32,10 +70,19 @@ export class WorktreeDirtyError extends PoisonEpic {}
  * result. A distinct subclass so runTicket's catch can tell "delivered nothing" apart from other
  * failures and block (never re-queue open) the ticket accordingly.
  */
-export class NoDeliveryError extends Error {
-  constructor(msg: string) {
+export class NoDeliveryError extends Error implements RunFailureParts {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null;
+  /**
+   * `structural`/`selfReport` default to the whole message and no report, so a caller that never had
+   * a self-report to split out (or a test built before this split existed) still gets a coherent
+   * {@link RunFailureParts} rather than an empty structural half.
+   */
+  constructor(msg: string, structural: string = msg, selfReport: AntonResult | null = null) {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
+    this.selfReport = selfReport;
   }
 }
 
@@ -46,10 +93,14 @@ export class NoDeliveryError extends Error {
  * would reproduce the same block. A distinct subclass so runTicket's catch can surface it (block +
  * agent-specific note) apart from a genuine post-commit failure.
  */
-export class BlockedByAgentError extends Error {
-  constructor(msg: string) {
+export class BlockedByAgentError extends Error implements RunFailureParts {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null;
+  constructor(msg: string, structural: string = msg, selfReport: AntonResult | null = null) {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
+    this.selfReport = selfReport;
   }
 }
 

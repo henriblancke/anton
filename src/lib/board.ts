@@ -6,7 +6,7 @@ import { beads, getSyncStatus, getSyncStatusToken, type Bead } from "./beads/bd"
 import { isPipelineArtifact } from "./beads/contract";
 import { cycleEvidenceFor } from "./beads/cycle-evidence";
 import { readAllIssues } from "./beads/issues";
-import { computeEpicGraph, epicStandaloneBlockers, standaloneBlockers } from "./epic-graph";
+import { computeEpicGraph, createBlockerIndex } from "./epic-graph";
 import {
   hygieneVersion,
   latestHygieneReport,
@@ -55,7 +55,6 @@ import {
   boardCards,
   isRunTicket,
   parentEpicOf,
-  parseAcceptance,
   parseGoal,
   toEpic,
   toStandaloneItem,
@@ -341,6 +340,146 @@ function compareStandalone(a: StandaloneItem, b: StandaloneItem): number {
   return a.id < b.id ? -1 : 1;
 }
 
+/** Project only the requested card for mutations, or every card for a board response. */
+function projectBoardCards(allBeads: Bead[], targetId?: string) {
+  // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
+  // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
+  // renders as a card, a ticket or a chip.
+  const workBeads = allBeads.filter((b) => !isPipelineArtifact(b));
+
+  // Cards key off RUN TARGETS, not epic ids (docs/design/2026-07-26-tier-and-linear-ux.md): a
+  // `feature` is what anton runs, a legacy epic with no feature children still runs as it always
+  // did, and a container epic steps back to being the badge/swimlane key it can't be a card for
+  // (approving it 422s). See isBoardCard.
+  const cards = boardCards(workBeads);
+  const cardBeads = workBeads.filter((b) => cards.ids.has(b.id) && (targetId === undefined || b.id === targetId));
+  // The working layer: everything that is neither a card nor a container epic (a container groups
+  // cards — it is never a ticket riding on one). Same predicate the run uses (see runTickets), so a
+  // card never displays a ticket its run wouldn't execute.
+  const workingBeads = workBeads.filter((b) => isRunTicket(b, cards));
+
+  // Attribute each working-layer bead to its NEAREST card ancestor, from the inline `parent` field
+  // — no per-card bd calls. Walking the chain (rather than joining on a single parent hop) is the
+  // bug fix: a task under a feature matched neither the old epic-child join nor the parentless-chip
+  // rule, so it vanished from the board entirely.
+  const childrenByCard = new Map<string, Bead[]>(cardBeads.map((b) => [b.id, []]));
+  const claimedTaskIds = new Set<string>();
+  for (const bead of workingBeads) {
+    const cardId = cards.cardOf(bead);
+    if (!cardId || !childrenByCard.has(cardId)) continue;
+    childrenByCard.get(cardId)!.push(bead);
+    claimedTaskIds.add(bead.id);
+  }
+
+  const columns: Record<Stage, Epic[]> = {
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+  };
+  const standalone: Record<Stage, StandaloneItem[]> = {
+    backlog: [],
+    implementing: [],
+    "in-review": [],
+    done: [],
+  };
+
+  // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
+  // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
+  //
+  // Over `allBeads`, not the pipeline-stripped `workBeads`: the rollup's per-child readiness reads a
+  // blocker missing from the list as still open (fail-safe), so stripping the gate beads would make
+  // every RESOLVED gate — and every in-review target's own `gh:pr` merge gate, which `isOwnMergeWait`
+  // can only recognise from the bead — read as a permanent open blocker, exactly the state
+  // loadAllIssues reads gates to prevent. It adds no node and no edge: `isUnit` rejects gate/molecule
+  // and the rollup attributes pipeline artifacts to no unit.
+  const blockers = createBlockerIndex(allBeads);
+  const graphNodes = new Map(computeEpicGraph(allBeads).epics.map((n) => [n.id, n]));
+
+  for (const card of cardBeads) {
+    const children = childrenByCard.get(card.id) ?? [];
+    const tickets = children.map((child) => toTicket(child, { includeAcceptance: false }));
+    const node = graphNodes.get(card.id);
+    // The epic-graph rollup DROPS any blocks edge whose blocker is a parentless standalone task/bug
+    // (it has no unit ancestor to attribute to). Fold those back in — the same set the approve route
+    // gates on — so the board's blockedBy/ready match what approval will actually enforce and the
+    // card doesn't show a not-ready run target as approvable.
+    const blockedBy = [...(node?.blockedBy ?? []), ...blockers.epic(card.id)];
+    // ^ allBeads (unfiltered) on purpose: a closed `molecule` or resolved `gate` blocker must
+    //   resolve to done here, not read as a phantom open blocker via the missing-bead fail-safe.
+    const built = toEpic(card, {
+      goal: parseGoal(card),
+      tickets,
+      // The raw children too: the card's contract marker covers the whole run (target + open
+      // tickets), so it can't advertise Approve on a target one unshaped child would 422.
+      children,
+      blockedBy,
+      ready: blockedBy.length === 0,
+      // The finer verdict beside that coarse flag (anton-nywj): which of the run's tickets are
+      // actually held. It needs no standalone fold-back — the rollup gates an unattributable blocker
+      // on the blocker itself, exactly as epicStandaloneBlockers does — so it already answers for
+      // every blocker `blockedBy` above collects, one ticket at a time.
+      childReadiness: node?.childReadiness,
+      readyChildren: node?.readyChildren,
+      blockedChildren: node?.blockedChildren,
+      rank: node?.rank ?? 0,
+      // The product epic above this card — the key the board's epic swimlanes group on.
+      epic: parentEpicOf(card, workBeads),
+    });
+    columns[built.stage].push(built);
+  }
+
+  // Parentless tasks/bugs are standalone run targets (epic-of-one), not fake epics: they land as
+  // typed chips at the foot of their stage column, carrying their real issue_type. Only RUNNABLE
+  // parentless beads become chips (beads.isRunTarget — task/bug only): a parentless `learning`/
+  // `chore`/etc. is not a run target, so a chip for it would advertise `Approve & run` yet the
+  // approve route + runner reject it via the same isRunTarget gate — a permanent 422/park. Gate
+  // here so the board never surfaces an item it can't actually run.
+  const orphanTasks = workingBeads.filter(
+    (t) => (targetId === undefined || t.id === targetId) && !claimedTaskIds.has(t.id) && beads.isRunTarget(t, workBeads),
+  );
+  for (const task of orphanTasks) {
+    // A standalone target never appears in the epic-graph rollup, so derive its blockers from its
+    // own `blocks` edges — the same set the approve route + runner gate on. Feeds the chip's
+    // ready/blockedBy so it can hide Approve & run and show a blocked chip while a prerequisite is open.
+    const item = toStandaloneItem(task, blockers.standalone(task.id));
+    standalone[item.stage].push(item);
+  }
+
+  for (const stage of STAGES) {
+    if (!columns[stage]) columns[stage] = [];
+    if (!standalone[stage]) standalone[stage] = [];
+  }
+
+  return { columns, standalone, cardBeads, orphanTasks };
+}
+
+/** Approval already holds a fresh snapshot. It needs one item, not a new picker decision. */
+export async function getBoardTarget(project: Project, allBeads: Bead[], id: string) {
+  const { columns, standalone } = projectBoardCards(allBeads, id);
+  const epic = STAGES.flatMap((stage) => columns[stage]).find((item) => item.id === id);
+  const item = STAGES.flatMap((stage) => standalone[stage]).find((item) => item.id === id);
+  const base = await githubBaseUrl(project.repoPath);
+  if (epic) {
+    attachPrUrl(epic, base);
+    for (const ticket of epic.tickets) attachPrUrl(ticket, base);
+  }
+  if (item) attachPrUrl(item, base);
+  return { epic, standalone: item };
+}
+
+/** Health needs reports and score history, not cards, contract parsing or a picker generation. */
+export async function getBoardHealth(project: Project): Promise<Pick<Board, "hygiene" | "scanHealth" | "reviewTrajectory">> {
+  const [{ beads: all }, hygiene, scanHealth] = await Promise.all([
+    readAllIssues(project.repoPath), readHygiene(project), readScanHealth(project),
+  ]);
+  const work = all.filter((bead) => !isPipelineArtifact(bead));
+  const cards = boardCards(work);
+  const targets = work.filter((bead) => cards.ids.has(bead.id) ||
+    (isRunTicket(bead, cards) && !cards.cardOf(bead) && beads.isRunTarget(bead, work)));
+  return { hygiene, scanHealth, reviewTrajectory: reviewTrajectory(targets) };
+}
+
 export async function getBoard(project: Project, opts?: SnapshotReadOptions): Promise<Board> {
   // The raw, unfiltered bead list. Keep it around for blocker readiness below: the standalone-blocker
   // helpers treat a blocker missing from the list as still-open (fail-safe), so readiness must be
@@ -377,114 +516,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // of; see the ranking's own gate below.
   const cyclesKnown = cycleEvidenceFor(allBeads) !== undefined;
 
-  // Only work items land on the board. Pipeline plumbing — a poured `molecule` root and the `gate`
-  // beads hanging off it (isPipelineArtifact) — coordinates work without being work, so it never
-  // renders as a card, a ticket or a chip.
-  const workBeads = allBeads.filter((b) => !isPipelineArtifact(b));
-
-  // Cards key off RUN TARGETS, not epic ids (docs/design/2026-07-26-tier-and-linear-ux.md): a
-  // `feature` is what anton runs, a legacy epic with no feature children still runs as it always
-  // did, and a container epic steps back to being the badge/swimlane key it can't be a card for
-  // (approving it 422s). See isBoardCard.
-  const cards = boardCards(workBeads);
-  const cardBeads = workBeads.filter((b) => cards.ids.has(b.id));
-  // The working layer: everything that is neither a card nor a container epic (a container groups
-  // cards — it is never a ticket riding on one). Same predicate the run uses (see runTickets), so a
-  // card never displays a ticket its run wouldn't execute.
-  const workingBeads = workBeads.filter((b) => isRunTicket(b, cards));
-
-  // Attribute each working-layer bead to its NEAREST card ancestor, from the inline `parent` field
-  // — no per-card bd calls. Walking the chain (rather than joining on a single parent hop) is the
-  // bug fix: a task under a feature matched neither the old epic-child join nor the parentless-chip
-  // rule, so it vanished from the board entirely.
-  const childrenByCard = new Map<string, Bead[]>(cardBeads.map((b) => [b.id, []]));
-  const claimedTaskIds = new Set<string>();
-  for (const bead of workingBeads) {
-    const cardId = cards.cardOf(bead);
-    if (!cardId) continue;
-    childrenByCard.get(cardId)!.push(bead);
-    claimedTaskIds.add(bead.id);
-  }
-
-  const columns: Record<Stage, Epic[]> = {
-    backlog: [],
-    implementing: [],
-    "in-review": [],
-    done: [],
-  };
-  const standalone: Record<Stage, StandaloneItem[]> = {
-    backlog: [],
-    implementing: [],
-    "in-review": [],
-    done: [],
-  };
-
-  // Derive epic→epic dependency rollup once (blockedBy/ready/rank), so the board reflects the
-  // readiness the runtime's bd-ready enforces. Degrades to a stable order on a cycle (epic-graph.ts).
-  //
-  // Over `allBeads`, not the pipeline-stripped `workBeads`: the rollup's per-child readiness reads a
-  // blocker missing from the list as still open (fail-safe), so stripping the gate beads would make
-  // every RESOLVED gate — and every in-review target's own `gh:pr` merge gate, which `isOwnMergeWait`
-  // can only recognise from the bead — read as a permanent open blocker, exactly the state
-  // loadAllIssues reads gates to prevent. It adds no node and no edge: `isUnit` rejects gate/molecule
-  // and the rollup attributes pipeline artifacts to no unit.
-  const graphNodes = new Map(computeEpicGraph(allBeads).epics.map((n) => [n.id, n]));
-
-  for (const card of cardBeads) {
-    const children = childrenByCard.get(card.id) ?? [];
-    const tickets = children.map(toTicket);
-    const node = graphNodes.get(card.id);
-    // The epic-graph rollup DROPS any blocks edge whose blocker is a parentless standalone task/bug
-    // (it has no unit ancestor to attribute to). Fold those back in — the same set the approve route
-    // gates on — so the board's blockedBy/ready match what approval will actually enforce and the
-    // card doesn't show a not-ready run target as approvable.
-    const blockedBy = [...(node?.blockedBy ?? []), ...epicStandaloneBlockers(allBeads, card.id)];
-    // ^ allBeads (unfiltered) on purpose: a closed `molecule` or resolved `gate` blocker must
-    //   resolve to done here, not read as a phantom open blocker via the missing-bead fail-safe.
-    const built = toEpic(card, {
-      goal: parseGoal(card),
-      acceptance: parseAcceptance(card),
-      tickets,
-      // The raw children too: the card's contract marker covers the whole run (target + open
-      // tickets), so it can't advertise Approve on a target one unshaped child would 422.
-      children,
-      blockedBy,
-      ready: blockedBy.length === 0,
-      // The finer verdict beside that coarse flag (anton-nywj): which of the run's tickets are
-      // actually held. It needs no standalone fold-back — the rollup gates an unattributable blocker
-      // on the blocker itself, exactly as epicStandaloneBlockers does — so it already answers for
-      // every blocker `blockedBy` above collects, one ticket at a time.
-      childReadiness: node?.childReadiness,
-      readyChildren: node?.readyChildren,
-      blockedChildren: node?.blockedChildren,
-      rank: node?.rank ?? 0,
-      // The product epic above this card — the key the board's epic swimlanes group on.
-      epic: parentEpicOf(card, workBeads),
-    });
-    columns[built.stage].push(built);
-  }
-
-  // Parentless tasks/bugs are standalone run targets (epic-of-one), not fake epics: they land as
-  // typed chips at the foot of their stage column, carrying their real issue_type. Only RUNNABLE
-  // parentless beads become chips (beads.isRunTarget — task/bug only): a parentless `learning`/
-  // `chore`/etc. is not a run target, so a chip for it would advertise `Approve & run` yet the
-  // approve route + runner reject it via the same isRunTarget gate — a permanent 422/park. Gate
-  // here so the board never surfaces an item it can't actually run.
-  const orphanTasks = workingBeads.filter(
-    (t) => !claimedTaskIds.has(t.id) && beads.isRunTarget(t, workBeads),
-  );
-  for (const task of orphanTasks) {
-    // A standalone target never appears in the epic-graph rollup, so derive its blockers from its
-    // own `blocks` edges — the same set the approve route + runner gate on. Feeds the chip's
-    // ready/blockedBy so it can hide Approve & run and show a blocked chip while a prerequisite is open.
-    const item = toStandaloneItem(task, standaloneBlockers(allBeads, task.id));
-    standalone[item.stage].push(item);
-  }
-
-  for (const stage of STAGES) {
-    if (!columns[stage]) columns[stage] = [];
-    if (!standalone[stage]) standalone[stage] = [];
-  }
+  const { columns, standalone, cardBeads, orphanTasks } = projectBoardCards(allBeads);
 
   // The operator's own queue (anton-qfso.1): the approved `agent:human` beads anton refuses to
   // dispatch. Passed `allBeads`, not the pipeline-stripped `workBeads`: operatorQueue needs closed
@@ -525,12 +557,6 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
   // true — `decideBoardPickerPlan` is the pure decision the pass itself makes, and this read already
   // holds every input it takes. So a claim, a new bead or a lapsed hold re-ranks the lane on the next
   // read, where projecting a recorded plan could only blank it until the next pass ran.
-  //
-  // "Cheap" measured, on this repo's own 781-bead board (PR #226 review): ~35ms of CPU per read for
-  // the whole derivation, against ~1.2s for the `bd list` snapshot the read already spends. Most of
-  // it is duplicated — `eligibleTargets` walks the board three times (here, `armedPickerPolicy`,
-  // `boardProvenance`) and it is stamped twice — but ~3% of a read is not worth memoizing across
-  // these call sites, and the poll's 304 path (`getBoardVersion`) derives nothing at all.
   //
   // Gated on OFFERING, unchanged: a disarmed pass — or one at `propose` — puts no picks in front of
   // the operator, and a ranking computed anyway would draw the lane the level promised not to.
@@ -594,7 +620,7 @@ export async function getBoard(project: Project, opts?: SnapshotReadOptions): Pr
     plan !== undefined &&
     isPlanStale(
       plan,
-      stampBoard(allBeads, observedAtMs, picker.policy),
+      ranking?.stamp ?? stampBoard(allBeads, observedAtMs, picker.policy),
       deferrals,
       declined,
       agedOutPicks(plan, allBeads, picker.policy, observedAtMs),

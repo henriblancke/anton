@@ -37,7 +37,7 @@ export function useBoardBreaker(
   const read = useCallback(
     async (signal: AbortSignal) => {
       try {
-        const res = await fetch(`/api/projects/${slug}/autopilot/breaker`);
+        const res = await fetch(`/api/projects/${slug}/autopilot/breaker`, { signal });
         if (!res.ok) return;
         const data = (await res.json()) as { breaker: AutopilotBreaker | null };
         if (!signal.aborted) setPolled({ value: data.breaker ?? undefined });

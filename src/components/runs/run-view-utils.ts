@@ -69,6 +69,13 @@ export interface RunDetail extends RunSummary {
   attemptStartedAt?: number;
   error?: string;
   /**
+   * Anton's own account of why the run stopped (anton-4kvp), held apart from {@link error} above —
+   * which may fold in a quoted agent self-report verbatim. Absent on rows written before this column
+   * existed, or whose failure never carried a structural/self-report split — a reader falls back to
+   * {@link error} in both cases, exactly as `runFailureParts` does at the point this is composed.
+   */
+  structuralError?: string;
+  /**
    * The execute-epic job behind this attempt (anton-rgso) — how the failure breaker tells an
    * operator's cancel from a real failure, whenever that cancel landed. Absent on rows written
    * before the column existed.

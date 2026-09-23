@@ -115,10 +115,26 @@ describe("the generation the operator answered still stands", () => {
     expect(await resolve(planId)).toEqual({ skip: "no recorded plan picks this target" });
   });
 
-  it("skips once the board has moved past the plan that picked the target", async () => {
+  it("re-derives a named pick when the board changed without replacing its generation", async () => {
     const planId = await record([{ beadId: "target", rank: 1, rule: "stale" }], [bead("gone")]);
 
-    expect(await resolve(planId)).toEqual({
+    const verdict = await resolve(planId);
+    const fresh = (await getBoardPickerPlan(test.db, PROJECT))!;
+    expect(fresh.planId).not.toBe(planId);
+    expect(verdict).toEqual({ accept: { planId: fresh.planId, rank: 2, rule: STRUCTURAL_RULE } });
+  });
+
+  it("refuses a stale named pick that the current board no longer ranks", async () => {
+    const planId = await displayedPlan();
+    const verdict = await resolve(planId, [bead("target", { labels: ["agent:human"] })]);
+    expect(verdict).toMatchObject({ refuse: expect.any(String) });
+    expect(await listPickerVerdicts(test.db, PROJECT)).toEqual([]);
+  });
+
+  it("skips a stale pick when the client names no generation", async () => {
+    await record([{ beadId: "target", rank: 1, rule: "stale" }], [bead("gone")]);
+
+    expect(await resolve()).toEqual({
       skip: "the plan that picked it is no longer the decision anton stands behind",
     });
   });

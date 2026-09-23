@@ -404,11 +404,9 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — release (temp a
   });
 
   it("re-derives a plan the board has moved past rather than answering it", async () => {
-    // A client whose copy of the decision is provably behind. The route's own board read re-decides
-    // the ranking from the board it just refreshed (anton-f12y), so what a release finds here is
-    // never the stale generation — and anton-k4qr is what makes the answer land against the one that
-    // replaced it instead of evaporating. The stale-generation SKIP itself is unreachable through
-    // this route and is pinned where it can be staged: `picker-release.test.ts`.
+    // A client whose copy of the decision is provably behind. Approval projects only its target,
+    // so the release resolver must re-derive this named pick from the refreshed board itself.
+    // The accept names the replacement generation rather than disappearing with the old plan.
     actAs("anton-test");
     const epic = await runTarget("Stale pick");
     const stale = await planFor(epic, { observedAtMs: Date.now(), digest: STALE_DIGEST, beadCount: 1 });

@@ -105,6 +105,7 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
     attemptStartedAt: toEpoch(row.attemptStartedAt),
     error: row.error ?? undefined,
+    structuralError: row.structuralError ?? undefined,
     jobId: row.jobId ?? undefined,
     reviewScore: row.reviewScore ?? undefined,
     formula: row.formula ?? undefined,
@@ -213,6 +214,8 @@ export type RunPatch = Partial<{
   priorBaseRefreshSha: string | null;
   attempts: number;
   error: string | null;
+  /** Anton's own account of why the run stopped, held apart from `error` above (anton-4kvp) — see schema. */
+  structuralError: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
   /** A clean verdict's resume key (anton-qmuyt) — see the column's own note. */

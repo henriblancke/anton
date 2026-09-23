@@ -52,6 +52,8 @@ async function run(input: {
   startedMinutes: number;
   attemptMinutes?: number;
   error?: string;
+  /** Anton's own account of the stop (anton-4kvp) — omitted for a row with no such split. */
+  structuralError?: string;
   ticket?: string;
   job?: string;
 }): Promise<void> {
@@ -65,6 +67,7 @@ async function run(input: {
     jobId: input.job,
     status: input.status,
     error: input.error,
+    structuralError: input.structuralError,
     startedAt,
     attemptStartedAt:
       input.attemptMinutes === undefined ? null : new Date(T0 + input.attemptMinutes * MINUTE),
@@ -145,6 +148,42 @@ describe("checkFailureStreak", () => {
       "r2 · anton-b · failed · boom",
       "r3 · anton-c · failed · boom",
     ]);
+  });
+
+  it("reads the structural half off the row, so a shared cause signs one signature", async () => {
+    // Two real rows whose rendered `error` differs only in the agent's own quoted words, but whose
+    // `structuralError` column — anton's own account, written at settle (anton-4kvp) — is
+    // byte-identical. If `readRunOutcomes` dropped that column on the way to `RunOutcome` (as it did
+    // before this test existed), `signatureOf` would fall back to the full rendered message, the two
+    // runs would score as two different breaks, and `commonFailure` would come back undefined — the
+    // exact regression this test pins.
+    project({ autopilotFailureStreak: 2 });
+    const structural = "anton-a produced no delivery: zero diff.";
+    await run({
+      id: "r1",
+      epic: "anton-a",
+      status: "failed",
+      startedMinutes: 0,
+      error: `${structural} The agent self-reported blocked — reasoned about it in words A.`,
+      structuralError: structural,
+    });
+    await run({
+      id: "r2",
+      epic: "anton-a",
+      status: "failed",
+      startedMinutes: 15,
+      error: `${structural} The agent self-reported blocked — reasoned about it in words B.`,
+      structuralError: structural,
+    });
+
+    const outcome = await checkFailureStreak(t.db, clock, { projectId: PROJECT, board: [] });
+    const disarm = await activeDisarm(t.db, PROJECT);
+    expect(outcome?.latched).toBe(true);
+    // The two rendered `error` strings never match (different self-report quotes), so this proves
+    // the shared point on the disarm's own detail — "at the same point" only prints when
+    // `commonFailure` is defined — came from the structural halves, not the raw messages.
+    expect(disarm?.detail).toContain("at the same point");
+    expect(disarm?.detail).toContain(structural);
   });
 
   it("holds at N-1", async () => {

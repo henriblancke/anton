@@ -6,7 +6,6 @@ import {
   resolvePickerApplyOverride,
 } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
-import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { discoverVocabulary } from "@/lib/policy/vocabulary";
 import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
@@ -39,47 +38,36 @@ export default async function ProjectSettingsPage({
   const project = await getProjectBySlug(slug);
   if (!project) notFound();
 
-  const settings = await getProjectSettingsBySlug(slug);
-  // The locked base prompt is shown read-only so operators see what's always applied.
-  const basePrompt = await loadBaseSystemPrompt().catch(() => "");
-  // Real per-project schedule state — cadence, last fire, next fire and enabled — so the Automation
-  // table shows the row that actually fires rather than copy that can drift from it. lastRunAt is
-  // the one fact the old rows dropped, and it is what answers "is this thing working".
-  const schedules = (await listSchedules(project.id)).map((s) => ({
-    type: s.type,
-    enabled: s.enabled,
-    cron: s.cron,
-    nextRunAt: s.nextRunAt,
-    lastRunAt: s.lastRunAt,
-    lastRun: s.lastRun,
-    pendingRun: s.pendingRun,
-  }));
-  // The cadence each automation ships with, so "Reset to default" has one source of truth.
-  const defaultCrons = Object.fromEntries(DEFAULT_SCHEDULES.map((d) => [d.type, d.cron]));
-  // Every agent this project can assign, plus which ids belong to anton's bundled namespace. The
-  // Agents tab splits them: bundled ids are toggleable in the allowlist; the project's own
-  // .claude/agents (ids anton doesn't ship) are shown as always-active, never gated (anton-dvo.1
-  // reversal). We partition by bundled-id membership, not by DiscoveredAgent.source — a user
-  // override of a bundled name reports source "global"/"project" but still lives in anton's slot.
-  // Plus the label vocabulary the board actually uses (anton-prng), so value nominations are picked
-  // from this project's own namespaces rather than from labels anton assumed. Read alongside the
-  // agents (the snapshot is usually warm from the board) and fail-soft: a board anton can't read
-  // leaves the picker empty, where the editor still takes a typed label.
-  const [agents, bundledIds, board] = await Promise.all([
+  // Independent filesystem, board and database reads share one wait. Carry board failure through
+  // to the policy editor, and reuse that same snapshot for the earned-autonomy calculation.
+  // Wait for pending board writes: retained proposal history can misstate eligibility for apply.
+  const [settings, basePrompt, scheduleRows, agents, bundledIds, board, pickerRecord, quotaRows] = await Promise.all([
+    getProjectSettingsBySlug(slug),
+    loadBaseSystemPrompt().catch(() => ""),
+    listSchedules(project.id),
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
     // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
     // no work look identical downstream, and the work policy panel must not let an operator arm a
-    // fallback policy fitted to a read failure. `allIssues` itself only best-effort-attaches cycle
-    // evidence — a `bd dep cycles` timeout is swallowed there and the call still resolves — so `ok`
-    // must also check `cycleEvidenceFor`, not just that the promise didn't reject: without evidence,
-    // every target reads as non-startable (missingCycleEvidenceGap) and `policyCandidates` would
-    // report a misleading zero-candidate board as if it were a real, empty one instead of unavailable.
-    allIssues(project.repoPath, { blockOnPendingWrite: false, withCycles: true }).then(
-      (issues) => ({ issues, ok: cycleEvidenceFor(issues) !== undefined }),
+    // fallback policy fitted to a read failure. `ok` is read-success only — it also gates the
+    // earned-autonomy `record` below, which has nothing to do with cycle evidence, so it must not
+    // flip on a `bd dep cycles` hiccup that leaves the bead read itself intact. `withCycles: true`
+    // still asks for authoritative evidence: `allIssues` best-effort-attaches it (a timeout is
+    // swallowed there and the call still resolves), so `policyCandidates` gets it when available and
+    // otherwise degrades per-candidate (`missingCycleEvidenceGap`, reported via `notStartable`)
+    // rather than the whole page reading as unavailable over a narrower failure.
+    allIssues(project.repoPath, { blockOnPendingWrite: true, withCycles: true }).then(
+      (issues) => ({ issues, ok: true }),
       () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
     ),
+    latestPickerTrackRecord(project.id).catch(() => ({ accepted: 0, declined: 0, settled: 0 })),
+    quotaShareProjects().catch(() => undefined),
   ]);
+  const schedules = scheduleRows.map((s) => ({
+    type: s.type, enabled: s.enabled, cron: s.cron, nextRunAt: s.nextRunAt,
+    lastRunAt: s.lastRunAt, lastRun: s.lastRun, pendingRun: s.pendingRun,
+  }));
+  const defaultCrons = Object.fromEntries(DEFAULT_SCHEDULES.map((d) => [d.type, d.cron]));
   const beads = board.issues;
   const labelVocabulary = boardLabelVocabulary(beads);
   // Which of those namespaces read as a SCALE (anton-g631) — the only ones the policy editor offers a
@@ -105,9 +93,7 @@ export default async function ProjectSettingsPage({
   // form is a client module and the verdict is a fact about the board; it arrives as plain counts
   // and a reason, so a locked control is never an unexplained disabled control. A board anton cannot
   // read yields an empty record, which locks everything — the safe direction.
-  const record = await allIssues(project.repoPath)
-    .then(proposalTrackRecord)
-    .catch(() => emptyTrackRecord());
+  const record = board.ok ? proposalTrackRecord(beads) : emptyTrackRecord();
   const earned = Object.fromEntries(
     GARDENER_DETECTION_KINDS.map((kind) => {
       const { applied, settled, eligible, reason } = earnedAutonomyOfKind(kind, record);
@@ -120,11 +106,6 @@ export default async function ProjectSettingsPage({
   // the board, and handed down as plain counts for the same reason: the control must reach the pass's
   // verdict from the pass's numbers, and a store that will not answer locks `apply` rather than
   // opening it.
-  const pickerRecord = await latestPickerTrackRecord(project.id).catch(() => ({
-    accepted: 0,
-    declined: 0,
-    settled: 0,
-  }));
   // The earned floor and the operator's own override of it, weighed ONCE (anton-d1lk) so the control
   // and the pass can never disagree about which of the two is holding `apply` up. The record's own
   // reason travels even while a signature stands in for it — an operator has to be able to see what
@@ -144,7 +125,7 @@ export default async function ProjectSettingsPage({
   // Fail-soft to THIS project's own row rather than to nothing: an empty list would take the share
   // and reserve controls off the page entirely, so a failed read of everyone else's position would
   // cost the operator the one position they came here to set.
-  const quotaProjects = await quotaShareProjects().catch<QuotaShareProject[]>(() => [
+  const quotaProjects: QuotaShareProject[] = quotaRows ?? [
     {
       id: project.id,
       slug: project.slug,
@@ -161,7 +142,7 @@ export default async function ProjectSettingsPage({
       spentWeeklyPct: null,
       seeded: false,
     },
-  ]);
+  ];
 
   return (
     <SettingsView

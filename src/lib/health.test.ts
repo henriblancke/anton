@@ -197,7 +197,7 @@ describe("build drift on the health page", () => {
 describe("getProjectHealth", () => {
   it("renders without a drift banner when drift detection fails", async () => {
     vi.doMock("./board", () => ({
-      getBoard: vi.fn().mockResolvedValue({ hygiene: hygiene([]), scanHealth: undefined, reviewTrajectory: undefined }),
+      getBoardHealth: vi.fn().mockResolvedValue({ hygiene: hygiene([]), scanHealth: undefined, reviewTrajectory: undefined }),
     }));
     vi.doMock("./escalations", () => ({
       openEscalations: vi.fn().mockResolvedValue([]),

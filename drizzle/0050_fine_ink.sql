@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `structural_error` text;

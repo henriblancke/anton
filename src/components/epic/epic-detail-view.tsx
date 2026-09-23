@@ -1,16 +1,22 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useState } from "react";
+import type { EpicDetail } from "@/lib/types";
 
 import { ErrorState } from "@/components/ui/error-state";
 import { ReworkDialog } from "@/components/epic/rework-dialog";
-import { TicketDialog } from "@/components/ticket/ticket-dialog";
+
 import { EpicContractPanel } from "@/components/epic/epic-contract-panel";
 import { EpicDetailHeader } from "@/components/epic/epic-detail-header";
 import { EpicDetailSkeleton } from "@/components/epic/epic-detail-parts";
 import { summarizeEpicDetail } from "@/components/epic/epic-detail-summary";
 import { EpicGraphPanel } from "@/components/epic/epic-graph-panel";
 import { useEpicDetail } from "@/components/epic/use-epic-detail";
+
+const TicketDialog = dynamic(() =>
+  import("@/components/ticket/ticket-dialog").then((module) => module.TicketDialog),
+);
 
 /**
  * One run target in full: what it promises (the contract column), what it has produced (the
@@ -24,6 +30,7 @@ export function EpicDetailView({
   slug,
   epicId,
   budgetAware = false,
+  initialDetail,
 }: {
   slug: string;
   epicId: string;
@@ -33,8 +40,9 @@ export function EpicDetailView({
    * run button (the governor never runs, so there's nothing to queue for).
    */
   budgetAware?: boolean;
+  initialDetail?: EpicDetail;
 }) {
-  const model = useEpicDetail({ slug, epicId });
+  const model = useEpicDetail({ slug, epicId }, initialDetail);
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
   const [reworkOpen, setReworkOpen] = useState(false);
 
@@ -91,14 +99,16 @@ export function EpicDetailView({
         onReworked={model.refresh}
       />
 
-      <TicketDialog
-        slug={slug}
-        ticketId={openTicketId}
-        open={openTicketId !== null}
-        onClose={() => setOpenTicketId(null)}
-        onSaved={model.refresh}
-        onDeleted={model.refresh}
-      />
+      {openTicketId !== null && (
+        <TicketDialog
+          slug={slug}
+          ticketId={openTicketId}
+          open={openTicketId !== null}
+          onClose={() => setOpenTicketId(null)}
+          onSaved={model.refresh}
+          onDeleted={model.refresh}
+        />
+      )}
     </div>
   );
 }
