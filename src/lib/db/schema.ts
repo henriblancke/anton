@@ -972,5 +972,10 @@ export const claudeInvocations = sqliteTable(
     // Serves "what did this run spend", which is a run detail read and not a scan of the table.
     index("claude_invocations_run_idx").on(table.runId),
     index("claude_invocations_invocation_idx").on(table.invocationId),
+    // The feature ledger's own seek: `bead_id IN (<the scope>)`, one term per bead in the feature's
+    // subtree (`ledgerScope`, feature-scope.ts). Single-column rather than paired with `recorded_at`
+    // because a feature rolls up its WHOLE life — there is no window to leave the seek to, unlike the
+    // project read above.
+    index("claude_invocations_bead_idx").on(table.beadId),
   ],
 );
