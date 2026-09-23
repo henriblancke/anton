@@ -748,14 +748,17 @@ export async function listRecentRunOutcomes(
  * Bounded by the ids handed in — the beads that actually carry a repair stamp, or a ledger's scope —
  * so an unrepaired board costs no query at all.
  *
- * `includeLocalCommits` (default true) gates the `execute`-session arm above. The repair weigher
- * wants it: a child's own commit proves ITS repair regardless of what the run around it does next.
- * The feature ledger (`feature-ledger-read.ts`) must NOT get it: when a run parks or fails before
- * ever pushing, that same local commit is not a feature delivery — nothing shipped — yet counting it
- * would hand the feature a `leadMs` that ends at an unpublished commit and misclassify real review
- * work after the eventual push as "post-delivery" (PR #320 review). The run-row arm above already
- * answers the feature ledger's question on its own: a run's `epicBeadId` is always the run's target,
- * so a completed run's own row already carries the delivery time for anything scoped under it.
+ * `includeLocalCommits` (default true) gates the `execute`-session arm above, but only for a
+ * session whose CONTAINING RUN never delivered — not every local commit. The repair weigher wants
+ * every one of them: a child's own commit proves ITS repair regardless of what the run around it
+ * does next. The feature ledger (`feature-ledger-read.ts`) must exclude the ones whose run parked or
+ * failed before ever pushing — that local commit is not a feature delivery — yet the run-row arm
+ * above is not enough on its own: a grouped run overwrites `ticketBeadId` per child, so a non-final
+ * child later reparented onto a different feature has no run-row evidence of its own (the row still
+ * names the OLD epic and the LAST child, neither of which is in the new feature's scope) — only its
+ * `execute` session is. Gating that session on its run's `status: "done"` AND `delivered` flag,
+ * instead of dropping the whole arm, keeps crediting a child that genuinely published while still
+ * excluding one whose run parked or failed (P2, PR #320 review).
  *
  * The run-row arm is further filtered on `delivered` (PR #320 review): a verified already-shipped
  * retirement settles the row `done` too, but opens no pull request, so a `done` status alone is not
@@ -806,20 +809,30 @@ export async function listDeliveriesByBead(
   }
 
   // `execute` always delivers (its own commit) once settled `done`; `review-fix` settles `done`
-  // whether or not it pushed anything, so it only counts when `pushed` says it did.
-  const kindConditions = [
-    and(eq(schema.sessions.kind, "review-fix"), eq(schema.sessions.pushed, true)),
-    ...(includeLocalCommits ? [eq(schema.sessions.kind, "execute")] : []),
-  ];
+  // whether or not it pushed anything, so it only counts when `pushed` says it did. With
+  // `includeLocalCommits: false`, an execute session only counts when ITS OWN run settled `done`
+  // AND delivered — the same two conditions the run-row arm above applies, read here off the run
+  // the session was opened inside via the left join. `delivered` defaults `true` at row creation and
+  // is only ever written when a run finishes `done` (see the column's own note above), so a run that
+  // parked or failed before pushing still needs the `status: "done"` check — it is never rewritten
+  // to `false` on its own. A session with no matching run is excluded the same way.
+  const executeCondition = includeLocalCommits
+    ? eq(schema.sessions.kind, "execute")
+    : and(
+        eq(schema.sessions.kind, "execute"),
+        eq(schema.runs.status, "done"),
+        eq(schema.runs.delivered, true),
+      );
   const ticketRows = await db
     .select({ beadId: schema.sessions.beadId, endedAt: schema.sessions.endedAt })
     .from(schema.sessions)
+    .leftJoin(schema.runs, eq(schema.sessions.runId, schema.runs.id))
     .where(
       and(
         eq(schema.sessions.projectId, projectId),
         eq(schema.sessions.status, "done"),
         inArray(schema.sessions.beadId, ids),
-        or(...kindConditions),
+        or(and(eq(schema.sessions.kind, "review-fix"), eq(schema.sessions.pushed, true)), executeCondition),
       ),
     );
   for (const row of ticketRows) {

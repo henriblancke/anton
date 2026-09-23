@@ -52,9 +52,11 @@ export async function featureLedger(
   const scope = ledgerScope(board, beadId);
   const [rows, deliveries] = await Promise.all([
     invocationsForBeads(db, projectId, scope.ids),
-    // Local ticket commits are not feature deliveries — a run that parks or fails before pushing
-    // must not hand this feature a `leadMs` ending at an unpublished commit (PR #320 review). The
-    // run-row evidence alone answers this: a completed run's `epicBeadId` IS its target.
+    // A ticket's own local commit is only a feature delivery when the run it committed inside
+    // actually delivered — a run that parks or fails before pushing must not hand this feature a
+    // `leadMs` ending at an unpublished commit (PR #320 review). `listDeliveriesByBead` checks that
+    // per session rather than dropping local commits outright, which still credits a non-final
+    // grouped-run child reparented onto a different feature later (PR #320 review, P2).
     listDeliveriesByBead(db, projectId, scope.ids, { includeLocalCommits: false }),
   ]);
 

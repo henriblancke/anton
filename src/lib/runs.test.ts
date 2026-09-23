@@ -90,10 +90,12 @@ async function seedSession(row: {
   endedAt?: number;
   kind?: string;
   pushed?: boolean;
+  runId?: string;
 }): Promise<void> {
   await t.db.insert(schema.sessions).values({
     id: row.id,
     projectId: PROJECT,
+    runId: row.runId,
     kind: row.kind ?? "execute",
     beadId: row.beadId,
     status: row.status,
@@ -485,6 +487,50 @@ describe("listDeliveriesByBead", () => {
     expect([...(withLocalCommits.get(EPIC) ?? [])].sort()).toEqual(
       [sec(SETTLED), sec(SETTLED + 60_000)].sort(),
     );
+  });
+
+  it("still credits a reparented grouped-run child whose own run delivered (PR #320 review, P2)", async () => {
+    // A grouped run's row keeps only its FINAL child's `ticketBeadId` — a non-final child later
+    // reparented onto a different feature has no run-row evidence in the new scope at all (the row
+    // still names the OLD epic and the LAST child). Its own `execute` session is the only evidence
+    // left, and it must still count once the run it was opened inside actually delivered.
+    await seed({
+      id: "grouped",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-old-epic",
+      ticketBeadId: "anton-final-child",
+    });
+    await seedSession({
+      id: "s1",
+      beadId: EPIC,
+      status: "done",
+      endedAt: SETTLED,
+      runId: "grouped",
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map([[EPIC, [sec(SETTLED)]]]));
+  });
+
+  it("excludes a reparented child's local commit when its own run parked or failed", async () => {
+    // `delivered` defaults `true` at row creation and is only ever rewritten when a run finishes
+    // `status: "done"` — a parked or failed run never gets it flipped to `false`. So excluding this
+    // local commit needs the run's `status`, not just its `delivered` flag.
+    await seed({ id: "parked", status: "parked", updatedAt: SETTLED, endedAt: SETTLED });
+    await seedSession({
+      id: "s1",
+      beadId: EPIC,
+      status: "done",
+      endedAt: SETTLED,
+      runId: "parked",
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map());
   });
 
   it("excludes a review-fix session that settled done without pushing anything", async () => {
