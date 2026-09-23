@@ -666,8 +666,18 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
       // ever checked. Nothing to fence either way is a settled bead, not a failure. The origin is
       // revalidated too, off this same fresh read, for the identical reason the check above exists —
       // the snapshot's origin could be stale even when its confirmed/closure flags are not.
+      if (!beads.boardEvidenceConfirmed(live)) {
+        // The confirmation is only ever cleared by `ensureBoardBaselinePersisted`'s reopen-reset
+        // (chatgpt-codex-connector, PR #284 review, "Reject reopened beads before declaring fences
+        // complete") — a concurrent writer starting a NEW delivery cycle on this exact bead. If that
+        // reopen has not yet reclosed it, this close never actually landed for good and treating it
+        // as settled would drop `stage:in-review` out from under a bead that is open right now, with
+        // nothing left to rediscover it. Settled only once the live bead is closed again — whether by
+        // that new cycle finishing or anything else — since a genuinely fresh, still-open confirmation
+        // for THIS cycle would have left `boardEvidenceConfirmed` true, not cleared.
+        return live.status === "closed";
+      }
       if (
-        !beads.boardEvidenceConfirmed(live) ||
         beads.confirmedBoardEvidenceClosure(live) !== undefined ||
         beads.confirmedBoardEvidenceOrigin(live) !== read.priorClosure
       ) {

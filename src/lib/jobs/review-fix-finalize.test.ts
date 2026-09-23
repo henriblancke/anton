@@ -339,17 +339,21 @@ describe("finalizeMergedEpic", () => {
 
   it(
     "does not durably confirm a reset delivery with zero evidence when a newer cycle cleared the " +
-      'live confirmation before this fence could stamp it (chatgpt-codex-connector, PR #284 review, ' +
-      '"Revalidate confirmation before stamping its closure")',
+      'live confirmation before this fence could stamp it, but still finalizes because the live ' +
+      'bead is genuinely closed again (chatgpt-codex-connector, PR #284 review, "Revalidate ' +
+      'confirmation before stamping its closure")',
     async () => {
       // The snapshot passed into finalization still shows the OLD, unfenced confirmation — taken
       // before another writer reopened this bead, reset its confirmation for a NEW delivery cycle
       // (`ensureBoardBaselinePersisted`'s reopen-reset), and closed it again. `metadataById` is left
-      // unset, so the LIVE re-read this fence takes sees no confirmation at all.
+      // unset, so the LIVE re-read this fence takes sees no confirmation at all — but the live bead
+      // IS closed (the reopen-and-reclose already completed), which is what makes "nothing left to
+      // fence" a settled bead here rather than a still-open one (see the next test).
       const target = {
         ...bead("target-1"),
         metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
       } as Bead;
+      statuses.set("target-1", "closed");
       historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
 
       await finalize(target, []);
@@ -359,6 +363,32 @@ describe("finalizeMergedEpic", () => {
       expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
       // Nothing left to fence is a settled bead, not a failed one: the close still finalizes.
       expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "keeps `stage:in-review` in place, rather than declare the fence complete, when a concurrent " +
+      'writer reopened the live bead and cleared its confirmation but has not reclosed it yet ' +
+      '(chatgpt-codex-connector, PR #284 review, "Reject reopened beads before declaring fences ' +
+      'complete") — unlike the previous test, the live bead is still OPEN, so this close never ' +
+      'actually landed for good and the recovery marker must survive for a later sweep to retry',
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      // The live re-read sees no confirmation (cleared by the concurrent reopen) AND a live status
+      // that is still "open" — `ensureBoardBaselinePersisted`'s reopen-reset landed, but the new
+      // cycle it started has not closed the bead again yet.
+      statuses.set("target-1", "open");
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Treating this as fenced would drop `stage:in-review` while the bead sits open with nothing
+      // left on the board to rediscover it — the marker must stay for the next sweep.
+      expect(untagMock).not.toHaveBeenCalled();
     },
   );
 

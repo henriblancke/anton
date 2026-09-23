@@ -1358,14 +1358,22 @@ export async function clearBoardEvidencePending(
       closureFenceFailed = true;
     } else if (recheck.status === "closed") {
       const read = await mustReadClosureVersion(repo, ticketId);
-      if (read.read && read.closure !== undefined) {
+      // `read.priorClosure` must still match the `origin` captured above (chatgpt-codex-connector,
+      // PR #284 review, "Validate confirmation origin before backfilling the closure") — without
+      // this, a ticket that closes, reopens, and closes AGAIN in the gap between the unfenced write
+      // and this recheck would have `read.closure` name the second close while `read.priorClosure`
+      // names the first, neither of which this confirmation's `ids` were ever checked against; this
+      // write would still stamp `read.closure` onto them, and a later resume would accept those
+      // stale ids because the stored closure now matches the latest cycle.
+      if (read.read && read.closure !== undefined && read.priorClosure === origin) {
         const fenced = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, read.closure));
         closureFenceFailed = !fenced;
       } else {
-        // The recheck found the ticket closed but its closure version is unreadable (after retries)
-        // or its history is empty — the same ambiguity `mustReadClosureVersion`'s caller above
-        // already fails closed on. Falling through here would leave `closureFenceFailed` false and
-        // let the clears below strand an unfenced `{ ids }` confirmation.
+        // The recheck found the ticket closed but its closure version is unreadable (after retries),
+        // its history is empty, or an extra reopen-and-reclose landed between the unfenced write and
+        // this recheck (the `origin` mismatch above) — the same ambiguity `mustReadClosureVersion`'s
+        // caller above already fails closed on. Falling through here would leave `closureFenceFailed`
+        // false and let the clears below strand — or wrongly settle — an unfenced `{ ids }` confirmation.
         closureFenceFailed = true;
       }
     }
