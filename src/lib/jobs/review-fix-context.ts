@@ -50,15 +50,28 @@ export async function buildReviewFixPrompt(args: {
   settings: ProjectSettings;
   /** The worktree the fix runs in (for resolving a project-local agent prompt). */
   projectDir: string;
+  /** See {@link import("../claude/system-prompt").SystemPromptLayers.boardOnly}. */
+  boardOnly?: boolean;
+  /** See {@link import("../claude/system-prompt").SystemPromptLayers.mixedBoardOnly}. */
+  mixedBoardOnly?: boolean;
+  /** See {@link import("../claude/system-prompt").SystemPromptLayers.repoPath}. Only read when {@link boardOnly} is set. */
+  repoPath?: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string; attribution: ReasoningAttribution }> {
-  const { epic, pr, reasons, conflicts, settings, projectDir } = args;
+  const { epic, pr, reasons, conflicts, settings, projectDir, boardOnly, mixedBoardOnly, repoPath } = args;
 
-  // Compose the same layered system prompt used for execution (base + agent + seed). Use the
-  // epic's agent tag if it has one.
+  // Compose the same layered system prompt used for execution (base + agent + seed), including the
+  // board-only carve-out (anton-fc5x): a `delivery:board` ticket's review feedback is still resolved
+  // by a `bd` write, not a git diff, and without this the fixer is directed by the ordinary tree
+  // contract and runs `bd` against THIS worktree's separate, unsynced board copy instead of the live
+  // one at `repoPath` (see `boardOnlySection`, ../claude/system-prompt.ts). Use the epic's agent tag
+  // if it has one.
   const agentTag = labelValue(epic.labels, "agent");
   const appendSystemPrompt = await buildExecutionSystemPrompt({
     agentPrompt: await loadAgentPrompt(agentTag, { projectDir }),
     seedPrompt: settings.seedPrompt,
+    boardOnly,
+    mixedBoardOnly,
+    repoPath,
   });
 
   // The editable reasoning contract (per-project override, else the shipped default) followed by

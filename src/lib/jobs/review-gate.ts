@@ -1216,7 +1216,7 @@ function describeTree(tree: string | undefined): string {
  * this loop would read a genuine repair as a stalled round. A hydration failure folds to `undefined`
  * exactly like an unreadable board — this signal is best-effort, never a reason to fabricate a diff.
  */
-async function defaultReadBoardFingerprint(repoPath: string, ticketId: string): Promise<BoardFingerprint | undefined> {
+export async function defaultReadBoardFingerprint(repoPath: string, ticketId: string): Promise<BoardFingerprint | undefined> {
   const board = await mustReadBoard(repoPath);
   const hydrated = board && (await hydrateDescriptions(repoPath, board));
   return hydrated && fingerprintBoard(hydrated, ticketId);
@@ -1228,7 +1228,7 @@ async function defaultReadBoardFingerprint(repoPath: string, ticketId: string): 
  * before trusting a board-only delivery. `false` on anything short of a confirmed push, including a
  * push that fails outright: an unconfirmed write is not this round's progress, whatever the reason.
  */
-async function defaultSyncBoard(repoPath: string): Promise<boolean> {
+export async function defaultSyncBoard(repoPath: string): Promise<boolean> {
   return beads
     .push(repoPath)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")

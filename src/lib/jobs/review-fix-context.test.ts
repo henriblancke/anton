@@ -76,6 +76,59 @@ describe("buildReviewFixPrompt — reasoning attribution", () => {
   });
 });
 
+/**
+ * The board-only system-prompt carve-out (anton-fc5x, PR #284 review, "Wire board-only handling
+ * into PR review fixes"): a `delivery:board` ticket's review feedback is still a `bd` write to the
+ * LIVE board, not a git diff — without this, the fixer is directed by the ordinary tree contract and
+ * runs `bd` against this worktree's own separate, unsynced board copy instead.
+ */
+describe("buildReviewFixPrompt — board-only wiring", () => {
+  const pr = makePr();
+  const settings = {} as ProjectSettings;
+
+  it("omits the board-only carve-out by default", async () => {
+    const { appendSystemPrompt } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["failing checks"],
+      conflicts: [],
+      settings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+    });
+    expect(appendSystemPrompt).not.toContain("board-only");
+  });
+
+  it("adds the carve-out, with the live board's -C redirect, when boardOnly is set", async () => {
+    const { appendSystemPrompt } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["failing checks"],
+      conflicts: [],
+      settings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+      boardOnly: true,
+      repoPath: "/live/repo",
+    });
+    expect(appendSystemPrompt).toContain("## This ticket is board-only");
+    expect(appendSystemPrompt).toContain("bd -C '/live/repo'");
+  });
+
+  it("uses the mixed-run wording when mixedBoardOnly is set", async () => {
+    const { appendSystemPrompt } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["failing checks"],
+      conflicts: [],
+      settings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+      boardOnly: true,
+      mixedBoardOnly: true,
+      repoPath: "/live/repo",
+    });
+    expect(appendSystemPrompt).toContain("## This run includes a board-only ticket");
+  });
+});
+
 describe("labelValue", () => {
   it("returns the value after the prefix", () => {
     expect(labelValue(["agent:nextjs", "risk:low"], "agent")).toBe("nextjs");
