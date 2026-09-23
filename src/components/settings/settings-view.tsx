@@ -61,6 +61,7 @@ export function SettingsView({
   policyCandidates,
   policyNotStartable,
   boardUnavailable,
+  policyEvidenceUnavailable,
   earned,
   pickerEarned,
   quotaProjects,
@@ -105,6 +106,13 @@ export function SettingsView({
    * fact. The work policy panel refuses to arm off that.
    */
   boardUnavailable: boolean;
+  /**
+   * `bd dep cycles` came back empty on an otherwise-successful board read, so `policyCandidates`
+   * degrades to zero candidates for a reason unrelated to `boardUnavailable`. Kept as its own flag
+   * so the policy panel can say why the match count reads zero without touching earned-autonomy,
+   * which reads off the board read alone.
+   */
+  policyEvidenceUnavailable: boolean;
   /**
    * Each kind's settled-proposal record and whether it has earned `apply` (anton-m29g), keyed by
    * detection kind. Computed on the server off the board this project actually has.
@@ -193,6 +201,7 @@ export function SettingsView({
           candidates={policyCandidates}
           notStartable={policyNotStartable}
           boardUnavailable={boardUnavailable}
+          evidenceUnavailable={policyEvidenceUnavailable}
         />
         {/* The policy is what anton MAY start; this is whether it starts it. Two halves of one
             question, so they sit in one panel rather than in two places an operator has to connect. */}

@@ -6,6 +6,7 @@ import {
   resolvePickerApplyOverride,
 } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
+import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { discoverVocabulary } from "@/lib/policy/vocabulary";
 import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
@@ -87,6 +88,14 @@ export default async function ProjectSettingsPage({
   // of the open run targets arrive as a count the panel explains. Off the same snapshot — no extra
   // board call.
   const { candidates, notStartable } = policyCandidates(beads);
+  // `board.ok` is read-success only (see the comment above) and stays true on a `bd dep cycles`
+  // miss, so it cannot tell the policy panel why `candidates` came back empty. When evidence is
+  // missing, `missingCycleEvidenceGap` fails EVERY target's approval gate, so `policyCandidates`
+  // degrades to zero candidates and `notStartable` covers the whole board — a projection that looks
+  // exactly like "this board has no startable work" unless the panel is told the real cause. Kept
+  // separate from `boardUnavailable` on purpose: earned-autonomy above reads off `board.ok` alone,
+  // and a `bd dep cycles` hiccup that leaves the bead read intact must not lock that too.
+  const policyEvidenceUnavailable = board.ok && cycleEvidenceFor(beads) === undefined;
 
   // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
   // arming needs, and the one no setting lifts. Derived here rather than in the form because the
@@ -160,6 +169,7 @@ export default async function ProjectSettingsPage({
       policyCandidates={candidates}
       policyNotStartable={notStartable}
       boardUnavailable={!board.ok}
+      policyEvidenceUnavailable={policyEvidenceUnavailable}
       earned={earned}
       pickerEarned={pickerEarned}
       quotaProjects={quotaProjects}

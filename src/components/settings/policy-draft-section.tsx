@@ -156,6 +156,7 @@ export function PolicyDraftSection({
   candidates = [],
   notStartable = 0,
   boardUnavailable = false,
+  evidenceUnavailable = false,
 }: {
   project: Project;
   /** What calibration proposes for a project that has never been armed. */
@@ -190,6 +191,14 @@ export function PolicyDraftSection({
    * fitted to a read failure, so acceptance is refused until the board answers again.
    */
   boardUnavailable?: boolean;
+  /**
+   * The board read itself succeeded, but `bd dep cycles` did not — `candidates` is empty and
+   * `notStartable` covers the whole board for a reason that has nothing to do with this project
+   * having no work. Distinct from {@link boardUnavailable}: the vocabulary and the proposed draft
+   * above are still real (they don't depend on cycle evidence), only the match projection is
+   * degraded, so this gates saving and the match panel without also re-seeding the form blind.
+   */
+  evidenceUnavailable?: boolean;
 }) {
   const router = useRouter();
   const { criterion: highlighted, bead: focusBead } = usePolicyDeepLink();
@@ -487,6 +496,21 @@ export function PolicyDraftSection({
         </div>
       )}
 
+      {evidenceUnavailable && (
+        <div
+          className="max-w-2xl rounded-[10px] border border-risk-high/30 bg-risk-high/10 px-3 py-2.5 text-[11.5px] leading-relaxed text-foreground"
+          role="alert"
+        >
+          <p className="font-medium">Cycle evidence is unavailable.</p>
+          <p className="mt-1 text-subtle">
+            `bd dep cycles` did not answer, so no target on this board can be confirmed cycle-free
+            right now — the match count below would read as no startable work rather than a
+            degraded check. The criteria above are still real; saving is disabled until that
+            evidence comes back.
+          </p>
+        </div>
+      )}
+
       {!armed && !boardUnavailable && (
         <div
           className="max-w-2xl rounded-[10px] border border-dashed border-primary/50 bg-primary/5 px-3 py-2.5 text-[11.5px] leading-relaxed text-foreground"
@@ -679,7 +703,7 @@ export function PolicyDraftSection({
         </div>
       </DndContext>
 
-      {!boardUnavailable && (
+      {!boardUnavailable && !evidenceUnavailable && (
         <MatchPanel
           matched={matched}
           excluded={excluded}
@@ -689,7 +713,7 @@ export function PolicyDraftSection({
         />
       )}
 
-      {unconstrained && !boardUnavailable && (
+      {unconstrained && !boardUnavailable && !evidenceUnavailable && (
         <p className="max-w-2xl rounded-[10px] border border-risk-med/28 bg-risk-med/10 px-3 py-2 text-[11.5px] leading-relaxed text-foreground">
           This policy asserts no criteria — it admits every startable run target on this board. Arming
           it places no constraint on what anton starts.
@@ -697,7 +721,7 @@ export function PolicyDraftSection({
       )}
 
       <div className="flex max-w-2xl flex-wrap items-center gap-3">
-        <Button size="sm" onClick={save} disabled={saving || boardUnavailable}>
+        <Button size="sm" onClick={save} disabled={saving || boardUnavailable || evidenceUnavailable}>
           {saving ? "Saving…" : armed ? "Save policy" : "Use this policy"}
         </Button>
         {armed && (
@@ -708,9 +732,11 @@ export function PolicyDraftSection({
         <span className="text-[11px] text-subtle">
           {boardUnavailable
             ? "Nothing can be saved while the board is unreadable."
-            : armed
-              ? "Applies on this machine only. Removing it returns the project to starting nothing on its own."
-              : "Until you accept, this project has no policy and anton starts nothing on its own."}
+            : evidenceUnavailable
+              ? "Nothing can be saved until `bd dep cycles` evidence is available again."
+              : armed
+                ? "Applies on this machine only. Removing it returns the project to starting nothing on its own."
+                : "Until you accept, this project has no policy and anton starts nothing on its own."}
         </span>
       </div>
     </section>
