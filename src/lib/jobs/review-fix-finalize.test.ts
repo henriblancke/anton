@@ -233,6 +233,24 @@ describe("finalizeMergedEpic", () => {
   );
 
   it(
+    "throws when the restore itself fails, rather than returning as if the marker were back " +
+      '(chatgpt-codex-connector, PR #284 review, "Require the recovery-marker restore to succeed")',
+    async () => {
+      // Both the confirming push AND the compensating re-tag fail: the label is now gone locally
+      // with nothing to put it back, so `closedUnfencedEpics` (review-fix.ts) would never select this
+      // epic again. Silently returning here would let the caller believe finalization settled cleanly.
+      pushMock.mockResolvedValue("not-wired");
+      tagMock.mockRejectedValue(new Error("dolt write failed"));
+
+      await expect(finalize(bead("epic-1"), [bead("t1")])).rejects.toThrow(
+        /could not restore stage:in-review/,
+      );
+
+      expect(tagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
     "stamps the closure fence on a standalone target confirmed while still open (chatgpt-codex-" +
       'connector, PR #284 review, "Fence standalone confirmations when merge closes the target")',
     async () => {

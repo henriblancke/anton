@@ -1497,6 +1497,61 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "fences a confirmation written unfenced when the ticket closes in the gap between the live read " +
+      "and the confirmation write itself (chatgpt-codex-connector, anton-fc5x review, 'Recheck " +
+      "closure after writing the confirmation') — the live re-read narrows that race, it does not " +
+      "close it, so a second read-then-write right after the first catches a close that lands in " +
+      "the remaining window",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      // First `mustRead` (before the write) still finds it open — nothing to fence yet.
+      showMock.mockResolvedValueOnce(bead("t-race-after-write", { status: "open" }));
+      // Second `mustRead` (the new post-write recheck) finds it closed by another writer.
+      showMock.mockResolvedValueOnce(bead("t-race-after-write", { status: "closed" }));
+      historyMock.mockResolvedValueOnce([
+        { hash: "after-write-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+      const ticket = bead("t-race-after-write", { status: "open" });
+      await clearBoardEvidencePending("/repo", ticket, ["a"]);
+      // First write lands unfenced, off the live read that still said open...
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-race-after-write",
+        ["a"],
+        undefined,
+      );
+      // ...then the recheck re-persists it fenced, so `confirmedForThisCycle` can tell this cycle's
+      // confirmation apart from a later reopen-and-reclose instead of trusting it unconditionally.
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-race-after-write",
+        ["a"],
+        "after-write-sha",
+      );
+    },
+  );
+
+  it(
+    "leaves an unfenced confirmation as unfenced when the post-write recheck itself can't confirm a " +
+      "close — best-effort, and no worse than before the recheck existed",
+    async () => {
+      pushMock.mockResolvedValueOnce("synced");
+      showMock.mockResolvedValueOnce(bead("t-race-recheck-unreadable", { status: "open" }));
+      showMock.mockRejectedValueOnce(new Error("dolt offline"));
+      showMock.mockRejectedValueOnce(new Error("dolt offline"));
+      showMock.mockRejectedValueOnce(new Error("dolt offline"));
+      const ticket = bead("t-race-recheck-unreadable", { status: "open" });
+      await clearBoardEvidencePending("/repo", ticket, ["a"]);
+      const callsForTicket = setBoardEvidenceConfirmedMock.mock.calls.filter(
+        (c) => c[1] === "t-race-recheck-unreadable",
+      );
+      // Written once, unfenced, off the live read — and never re-persisted with a closure, since the
+      // recheck itself never got a live status to fence against.
+      expect(callsForTicket).toEqual([["/repo", "t-race-recheck-unreadable", ["a"], undefined]]);
+    },
+  );
+
+  it(
     "refuses to persist a confirmation when the live status re-read itself is unreadable after every " +
       "retry, rather than deciding whether a closure fence applies off the stale `ticket` snapshot",
     async () => {

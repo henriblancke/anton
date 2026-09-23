@@ -1247,6 +1247,26 @@ export async function clearBoardEvidencePending(
     }
   }
   const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure));
+  // A concurrent writer can still close the ticket between the live read above and the write just
+  // above — that read narrows the race, it does not close it (chatgpt-codex-connector, anton-fc5x
+  // review, "Recheck closure after writing the confirmation"). Left as `{ ids }` with no closure,
+  // `confirmedForThisCycle` (execute-epic-dispatch.ts) treats `confirmedClosure === undefined` as
+  // "cannot verify, pass anyway" — the SAME tolerance meant for a confirmation written before this
+  // fence existed — so a later reopen-and-reclose of this exact ticket would pass this stale
+  // confirmation off as the new cycle's own evidence with no fresh board delta ever checked. One more
+  // read-then-write right after the first narrows the window further, from the whole dispatch down to
+  // this one write. Best-effort and skipped once `closure` is already known: the write above already
+  // landed and cannot be undone from here, so a transient recheck failure simply leaves the
+  // confirmation exactly as unfenced as it would have been without this recheck — never worse.
+  if (confirmedSet && closure === undefined) {
+    const recheck = await mustRead(repo, ticketId);
+    if (recheck?.status === "closed") {
+      const read = await mustReadClosureVersion(repo, ticketId);
+      if (read.read && read.closure !== undefined) {
+        await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, read.closure));
+      }
+    }
+  }
   // Gated on `confirmedSet` (chatgpt-codex-connector, PR #284 review, "Retain recovery evidence
   // until confirmation succeeds") — an exhausted `setBoardEvidenceConfirmed` retry must NOT be
   // followed by clearing the marker/baseline anyway. Both clears are immediately visible on a

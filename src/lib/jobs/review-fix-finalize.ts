@@ -560,7 +560,22 @@ async function closeFinalized(
         .push(repo)
         .then((outcome) => outcome === "synced" || outcome === "shared-server")
         .catch(() => false);
-      if (!synced) await safe(() => beads.tag(repo, epic.id, [IN_REVIEW]));
+      // A failed restore must not read as a restored one (chatgpt-codex-connector, PR #284 review,
+      // "Require the recovery-marker restore to succeed"): `safe` swallows the write's own error, and
+      // discarding its result here meant this function returned normally either way. With the label
+      // gone locally and never put back, `closedUnfencedEpics` has nothing left to select — the untag
+      // may still be unpublished, and no machine would ever revisit it. Thrown, not logged: this is
+      // the caller's only signal, and the job runner's retry is the one path left to try the restore
+      // again.
+      if (!synced) {
+        const restored = await safe(() => beads.tag(repo, epic.id, [IN_REVIEW]));
+        if (!restored) {
+          throw new Error(
+            `${epic.id}: could not restore stage:in-review after an unconfirmed untag push — ` +
+              "closedUnfencedEpics can no longer find this epic to retry the sync",
+          );
+        }
+      }
     }
   }
 }
