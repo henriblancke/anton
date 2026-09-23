@@ -28,7 +28,9 @@
  *
  * Two figures are derivable from rows anton already writes, and both are reported:
  *
- *  - `activeMs` — what claude actually worked. The sum of each invocation's own `durationMs`.
+ *  - `activeMs` — what claude actually worked. The UNION of each invocation's own `[start, end]`
+ *    span, so overlapping invocations (a scope reparented across concurrent histories can have them)
+ *    are not double-counted.
  *  - `leadMs` — first invocation to last delivery. Includes every overnight quota park in between.
  *
  * `lead − active` is the figure the split was built for: it separates WORKING from WAITING, which is
@@ -242,12 +244,17 @@ export interface LedgerTimingRow extends InvocationDimensionRow {
 /** How long a feature took, in the two senses that are exact. Deliberately carries NO wall time. */
 export interface LedgerTiming {
   /**
-   * What claude worked, summed over INVOCATIONS — never over rows. See {@link activeMs} for why the
+   * What claude worked, folded over INVOCATIONS — never over rows. See {@link activeMs} for why the
    * distinction is load-bearing rather than pedantic.
    *
+   * Unlike the standalone {@link activeMs}, this is the UNION of invocation spans rather than their
+   * sum: two invocations that overlap (a reparented scope can combine them from concurrent histories)
+   * contribute their covered time once, not twice, so `waitingMs` (lead − active) never goes negative
+   * off the back of double-counted overlap.
+   *
    * Excludes an invocation that ENDED after {@link leadMs}'s delivery — that work is real but sits
-   * outside this span, and counting it would let `waitingMs` (lead − active) understate, or falsely
-   * zero, how long the scope actually waited. {@link timedInvocations} still counts it.
+   * outside this span, and counting it would let `waitingMs` understate, or falsely zero, how long
+   * the scope actually waited. {@link timedInvocations} still counts it.
    */
   activeMs: number;
   /** Invocations folded. `0` is an empty scope, which the caller reports as nothing-recorded. */
@@ -401,7 +408,8 @@ export function ledgerTiming(
   deliveredAtMs?: number,
 ): LedgerTiming {
   const facts = groupInvocations(rows);
-  let active = 0;
+  const intervals: Interval[] = [];
+  let untethered = 0;
   let timed = 0;
   for (const fact of facts) {
     const duration = invocationDuration(fact.rows);
@@ -420,16 +428,55 @@ export function ledgerTiming(
     // `waitingMs` exactly the way the strict comparison was meant to prevent. The equal case is this
     // fold's own version of `firstInvocationStartMs`'s `<=`: flooring can hide the true order, so
     // treat it the same as proven-later rather than proven-earlier.
-    if (deliveredAtMs !== undefined && (recordedAtMs(fact.rows) ?? -Infinity) >= deliveredAtMs) continue;
-    active += duration;
+    const endedAt = recordedAtMs(fact.rows);
+    if (deliveredAtMs !== undefined && (endedAt ?? -Infinity) >= deliveredAtMs) continue;
+    // `recordedAt` is a non-nullable column, so `endedAt` is absent only when a row is malformed
+    // beyond what this fold can place on the timeline — fall back to counting its duration outright
+    // rather than dropping it, the same "add it anyway" reading `count()` gives an absent measure.
+    if (endedAt === undefined) {
+      untethered += duration;
+      continue;
+    }
+    intervals.push({ start: endedAt - duration, end: endedAt });
   }
 
   return {
-    activeMs: active,
+    activeMs: untethered + unionMs(intervals),
     invocations: facts.length,
     timedInvocations: timed,
     leadMs: leadMs(firstInvocationStartMs(rows), deliveredAtMs),
   };
+}
+
+interface Interval {
+  start: number;
+  end: number;
+}
+
+/**
+ * The total time covered by a set of possibly-overlapping intervals — the UNION, not the sum.
+ *
+ * Reparenting can retroactively combine invocations from concurrent histories into one scope, so two
+ * invocations' recorded spans can genuinely overlap. Summing their durations in that case double-
+ * counts the overlap and lets `activeMs` outrun the truth: two calls running 0–20 and 10–25 minutes
+ * sum to 35 minutes of "activity" despite covering only 25 real minutes, which would understate — or
+ * zero out — `waitingMs` (lead − active) for exactly the minutes that were genuinely idle.
+ */
+function unionMs(intervals: readonly Interval[]): number {
+  if (intervals.length === 0) return 0;
+  const sorted = [...intervals].sort((a, b) => a.start - b.start);
+  let total = 0;
+  let { start: curStart, end: curEnd } = sorted[0];
+  for (const { start, end } of sorted.slice(1)) {
+    if (start > curEnd) {
+      total += curEnd - curStart;
+      curStart = start;
+      curEnd = end;
+    } else if (end > curEnd) {
+      curEnd = end;
+    }
+  }
+  return total + (curEnd - curStart);
 }
 
 /**

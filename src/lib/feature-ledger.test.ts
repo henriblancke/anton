@@ -169,6 +169,47 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
   });
 });
 
+describe("ledgerTiming with overlapping invocations", () => {
+  // Reparenting can retroactively combine tickets from concurrent histories into one scope, so two
+  // invocations' recorded spans can genuinely overlap: inv-1 runs minute 0–20, inv-2 runs minute
+  // 10–25, delivery lands at minute 30. Summing durations would report 35 minutes active against a
+  // 30 minute lead — more work than time available, and zero waiting despite minutes 25–30 being
+  // genuinely idle. The union of the two spans covers only 0–25 (25 minutes), leaving 5 real minutes
+  // of waiting.
+  const base = Date.parse("2026-09-20T09:00:00Z");
+  const rows = [
+    row({ invocationId: "inv-1", recordedAt: new Date(base + 20 * MINUTE), durationMs: 20 * MINUTE }),
+    row({ invocationId: "inv-2", recordedAt: new Date(base + 25 * MINUTE), durationMs: 15 * MINUTE }),
+  ];
+  const deliveredAt = base + 30 * MINUTE;
+
+  it("unions the overlap instead of summing it", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(25 * MINUTE);
+    expect(timing.leadMs).toBe(30 * MINUTE);
+  });
+
+  it("reports the real idle minutes rather than clamping to zero", () => {
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(5 * MINUTE);
+  });
+
+  it("still sums two invocations that do not overlap at all", () => {
+    const disjoint = [
+      row({ invocationId: "inv-1", recordedAt: new Date(base + 10 * MINUTE), durationMs: 10 * MINUTE }),
+      row({ invocationId: "inv-2", recordedAt: new Date(base + 30 * MINUTE), durationMs: 10 * MINUTE }),
+    ];
+    expect(ledgerTiming(disjoint, base + 40 * MINUTE).activeMs).toBe(20 * MINUTE);
+  });
+
+  it("merges one invocation fully containing another", () => {
+    const nested = [
+      row({ invocationId: "inv-1", recordedAt: new Date(base + 30 * MINUTE), durationMs: 30 * MINUTE }),
+      row({ invocationId: "inv-2", recordedAt: new Date(base + 20 * MINUTE), durationMs: 5 * MINUTE }),
+    ];
+    expect(ledgerTiming(nested, base + 40 * MINUTE).activeMs).toBe(30 * MINUTE);
+  });
+});
+
 describe("firstInvocationStartMs with an unmeasured invocation", () => {
   it("refuses rather than reporting a later invocation's start as the origin", () => {
     // inv-1 crashed before reporting a duration (durationMs: null, the shape
