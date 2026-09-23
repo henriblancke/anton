@@ -653,6 +653,19 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
       if (!beads.boardEvidenceConfirmed(live) || beads.confirmedBoardEvidenceClosure(live) !== undefined) {
         return true;
       }
+      // Revalidated again, right before the write (chatgpt-codex-connector, PR #284 review,
+      // "Revalidate the closure cycle before stamping confirmation" round 2): a reopen-and-reclose
+      // landing between the history read above and this point clears neither
+      // `boardEvidenceConfirmed` nor `confirmedBoardEvidenceClosure` — only a fresh closure-version
+      // read can tell the prior cycle from a brand-new one. `currentClosureVersion` (closure-cycle.ts)
+      // already folds a currently-open bead into `undefined`, so comparing this fresh read against
+      // `read.closure` for an EXACT match — the same compare-and-check `survivorTrustedForClosure`
+      // (execute-epic-dispatch.ts) already applies to this identical shape — catches both a
+      // still-open reopen and a reopen-and-reclose in one check; anything but an exact match means a
+      // newer cycle exists and this bead's fence is left for a later pass rather than stamped onto
+      // stale ids.
+      const recheck = await mustReadClosureVersion(repo, b.id);
+      if (!recheck.read || recheck.closure !== read.closure) return false;
       return mustPersist(() =>
         beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(live), read.closure),
       );

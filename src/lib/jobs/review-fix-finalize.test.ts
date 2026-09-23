@@ -274,6 +274,32 @@ describe("finalizeMergedEpic", () => {
   );
 
   it(
+    "does not stamp a closure fence when a reopen-and-reclose lands between the history read and " +
+      'the write (chatgpt-codex-connector, PR #284 review, "Revalidate the closure cycle before ' +
+      'stamping confirmation")',
+    async () => {
+      // Another writer reopens and recloses `target-1` after `mustReadClosureVersion`'s first read
+      // (which sees no reopen yet) but before this fence's write. Neither `boardEvidenceConfirmed`
+      // nor `confirmedBoardEvidenceClosure` changes underneath that race, so only a closure-version
+      // read taken again right before the write can tell the two cycles apart.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      metadataById.set("target-1", target.metadata);
+      historyMock
+        .mockResolvedValueOnce([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }])
+        .mockResolvedValueOnce([{ hash: "new-close-sha", at: "2026-01-02T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Not fenced — `stage:in-review` has to stay so a later sweep re-selects and retries the fence.
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
     "does not durably confirm a reset delivery with zero evidence when a newer cycle cleared the " +
       'live confirmation before this fence could stamp it (chatgpt-codex-connector, PR #284 review, ' +
       '"Revalidate confirmation before stamping its closure")',
