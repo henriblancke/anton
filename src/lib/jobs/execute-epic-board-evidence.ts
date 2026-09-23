@@ -424,6 +424,37 @@ export async function ensureBoardBaselinePersisted(
       locked = false;
       recoveryBaseline = false;
     }
+    // A `board-evidence-pending:*` label or cleanup-unsynced obligation surviving alongside a still-set
+    // `boardEvidenceConfirmed` (chatgpt-codex-connector, PR #284 review, "Clear stale pending evidence
+    // when starting a new cycle") names the SAME completed prior cycle the confirmed flag just proved
+    // is over — a prior `clearBoardEvidencePending` that persisted the confirmation but failed to clear
+    // one or both of these survivors, or failed to sync that clear. `readBoardEvidence` unions
+    // `pendingBoardEvidence` into every attempt's diff unconditionally, with no closure fence of its
+    // own (only `dispatchTicket`'s already-delivered fast path in execute-epic-dispatch.ts fences
+    // pending/cleanup-unsynced survivors against the ticket's current closure) — and nothing from THIS
+    // brand-new cycle could have written either marker yet, since `readBoardEvidence` only ever runs
+    // AFTER an agent session and this call happens strictly before dispatch. Left uncleared, a no-op
+    // agent dispatched against the fresh baseline above would still have its evidence check union these
+    // old ids in and report a delivery this cycle never produced.
+    const stalePendingLabels = beads.boardEvidencePendingLabels(ticket);
+    const hasStaleCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    if (stalePendingLabels.length > 0) {
+      const pendingCleared = await mustPersist(() =>
+        beads.setBoardEvidencePending(repo, ticket.id, [], stalePendingLabels),
+      );
+      if (!pendingCleared) return null;
+    }
+    if (hasStaleCleanupUnsynced) {
+      const cleanupCleared = await mustPersist(() => beads.clearBoardEvidenceCleanupUnsynced(repo, ticket.id));
+      if (!cleanupCleared) return null;
+    }
+    if (stalePendingLabels.length > 0 || hasStaleCleanupUnsynced) {
+      const staleSynced = await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false);
+      if (!staleSynced) return null;
+    }
   }
   if (!hadBaseline) {
     const persisted = await mustPersist(() =>

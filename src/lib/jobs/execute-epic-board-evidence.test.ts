@@ -1830,6 +1830,41 @@ describe(
       expect(clearOrder).toBeLessThan(firstBaselineWriteOrder);
     });
 
+    it("clears a stale board-evidence-pending label and cleanup-unsynced obligation left by that same " +
+      "completed prior cycle (chatgpt-codex-connector, PR #284 review, \"Clear stale pending evidence " +
+      "when starting a new cycle\") — otherwise readBoardEvidence would union the old cycle's ids into " +
+      "this brand-new cycle's diff and credit a no-op agent with delivery it never produced", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const reopenedTicket = bead("t-reopened-survivors", {
+        labels: [LABELS.boardEvidencePending(["anton-old1"])],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+          boardEvidenceCleanupUnsynced: JSON.stringify({ ids: ["anton-old2"] }),
+        },
+      });
+      const setPendingCallsBefore = setBoardEvidencePendingMock.mock.calls.length;
+      const clearCleanupCallsBefore = clearBoardEvidenceCleanupUnsyncedMock.mock.calls.length;
+      const pushCallsBefore = pushMock.mock.calls.length;
+      pushMock.mockResolvedValue("synced");
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // that push's own stability re-read: stable
+
+      await expect(
+        ensureBoardBaselinePersisted("/repo", reopenedTicket, baseline),
+      ).resolves.toEqual(baseline);
+
+      expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", "t-reopened-survivors", [], [
+        LABELS.boardEvidencePending(["anton-old1"]),
+      ]);
+      expect(setBoardEvidencePendingMock.mock.calls.length).toBe(setPendingCallsBefore + 1);
+      expect(clearBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith("/repo", "t-reopened-survivors");
+      expect(clearBoardEvidenceCleanupUnsyncedMock.mock.calls.length).toBe(clearCleanupCallsBefore + 1);
+      expect(pushMock.mock.calls.length).toBeGreaterThan(pushCallsBefore);
+    });
+
     it("never clears boardEvidenceConfirmed for a ticket that never carried it, and never touches it " +
       "when a preserved baseline already exists — the flag speaks for a PRIOR, completed cycle, and " +
       "an in-flight baseline means this cycle already ran that reset", async () => {
