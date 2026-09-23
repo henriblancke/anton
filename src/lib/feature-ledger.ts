@@ -1,6 +1,30 @@
 /**
- * What a feature cost in TIME (anton-96ga0) — the durations that are exact, and the one that is
- * refused because it is not.
+ * The feature ledger's pure halves: which PHASE a recorded invocation belongs to (anton-6p4kd), and
+ * what a feature cost in TIME (anton-96ga0).
+ *
+ * ## Phases — classified by the HANDLER, never by the author's step id
+ *
+ * A feature's spend splits into `implement` / `self-review` / `describe` / `pr-fix`, beside the
+ * `overhead` of the scheduled passes. The split keys on `claude_invocations.step_handler` — the
+ * resolved `stepName(step)` — and never on `step`, which carries the formula AUTHOR's own id for
+ * that step. On the bundled formula the two coincide; on a project formula whose implement step is
+ * called `code-ticket` they do not, and a fold keyed on the id would miss every predicate and dump a
+ * custom pipeline's whole spend into `unattributed` (PR #311 review).
+ *
+ * The one place `step` is read is the review gate's own correction round — and it is not an author's
+ * id there. The gate passes its OWN literals (`review-gate.ts`: `review` for the review session,
+ * `review-fix` for the fix that follows) whatever the formula called the step that invoked it, so
+ * under `stepHandler = "review"` the step is anton's constant rather than project data. That row's
+ * job type is still `execute-epic`, and counting it as implement spend would hide the cost of
+ * correcting a run inside the cost of doing it.
+ *
+ * A row that classifies to nothing is `undefined` here, never a guess — the caller buckets it as
+ * unattributed (design rule 3: cost is never split proportionally). ADR-0001 clause 3 makes an
+ * unclassified pair a BUILD problem rather than a silent bucket: both tables below are `Record`s
+ * over their union, so a new job type or step id fails typecheck until it declares a phase, and the
+ * exhaustiveness test names any pair anton actually records that maps to nothing.
+ *
+ * ## Timing — the durations that are exact, and the one that is refused because it is not
  *
  * Two figures are derivable from rows anton already writes, and both are reported:
  *
@@ -33,11 +57,145 @@
  * rule as `spend-breakdown`'s unpriced-is-not-zero — nothing here derives a number it cannot stand
  * behind.
  *
- * Pure and dependency-free — no db, no node builtins — so a server component, the fold and any later
- * CLI share one definition instead of three that drift. The DB reads stay with the caller:
- * invocation rows from `claude-invocations`, delivery times from `runs.listDeliveriesByBead`.
+ * Pure and dependency-free — no db, no node builtins, and the two union types below are imported
+ * for their types only — so a server component, the fold and any later CLI share one definition
+ * instead of three that drift. The DB reads stay with the caller: invocation rows from
+ * `claude-invocations`, delivery times from `runs.listDeliveriesByBead`.
  */
+import type { JobType } from "./jobs/queue";
+import type { BuiltinStepId } from "./jobs/step-ids";
 import { groupInvocations, type InvocationDimensionRow } from "./model-divergence";
+
+/** The phases a feature's recorded spend splits into. */
+export const LEDGER_PHASES = ["implement", "self-review", "describe", "pr-fix", "overhead"] as const;
+
+export type LedgerPhase = (typeof LEDGER_PHASES)[number];
+
+/**
+ * Scheduled passes serve the WHOLE board, so their spend is reported against the project and never
+ * divided across features (design §D4) — splitting it would be a fabricated number, and the same
+ * discipline as `spend-breakdown`'s unpriced rule says an unallocated line beats an invented split.
+ * Exported as a predicate rather than left as a comment so a caller can enforce it.
+ */
+export function isProjectLevelPhase(phase: LedgerPhase): boolean {
+  return phase === "overhead";
+}
+
+/**
+ * The phases a FEATURE's own totals may carry. Callers fold over this rather than
+ * {@link LEDGER_PHASES}, so project-level overhead cannot reach a per-feature figure by omission.
+ */
+export const FEATURE_PHASES: readonly LedgerPhase[] = LEDGER_PHASES.filter(
+  (phase) => !isProjectLevelPhase(phase),
+);
+
+/** A job type whose rows are classified by their step's handler, not by the type itself. */
+export const BY_HANDLER = "by-handler";
+
+/**
+ * What a job type declares about its rows: one phase for every row it writes, {@link BY_HANDLER}
+ * when it walks a formula and its steps decide, or `null` to state that it dispatches no claude at
+ * all and therefore writes no ledger row. `null` is a DECLARATION, not a fallthrough — a row that
+ * turns up under one is an anomaly the caller sees as unattributed, which is the point.
+ */
+export type JobTypePhase = LedgerPhase | typeof BY_HANDLER | null;
+
+/**
+ * Every job type's phase. A `Record` over {@link JobType} on purpose: adding a job type fails
+ * typecheck here until it declares one, which is the mechanism ADR-0001 clause 3 relies on to stay
+ * true rather than decay.
+ */
+export const JOB_TYPE_PHASES: Readonly<Record<JobType, JobTypePhase>> = Object.freeze({
+  // The only type that walks a formula (`step-ids.PIPELINE_JOB_TYPE`), so its steps classify it.
+  "execute-epic": BY_HANDLER,
+  // Both PR-fix types are one phase: the cost of a run being corrected after it opened its PR.
+  "review-fix": "pr-fix",
+  "review-fix-pr": "pr-fix",
+  // The scheduled passes that spend against the board rather than any one feature.
+  "nightly-stringer": "overhead",
+  gardener: "overhead",
+  "product-master": "overhead",
+  "board-picker": "overhead",
+  // Mechanical jobs — a board sync, a reaper, a health probe. None dispatches claude, so none writes
+  // a ledger row; stating that is what keeps the next one from being classified by guesswork.
+  "orphan-grooming": null,
+  "sync-push": null,
+  "run-health": null,
+  unstick: null,
+  "gate-check": null,
+  "worktree-reaper": null,
+});
+
+/**
+ * Every builtin step handler's phase. A `Record` over {@link BuiltinStepId} for the same reason as
+ * {@link JOB_TYPE_PHASES}: a new step id cannot ship without declaring where its spend belongs.
+ *
+ * `verify`, `commit` and `pr` dispatch no claude of their own today, so in practice they write no
+ * rows — they are mapped rather than declared spend-nothing because they are part of the same arc
+ * as `implement`: getting THIS run's work made and landed, as opposed to reviewing it, describing
+ * it, or correcting it. A handler that later grows a dispatch therefore lands in the phase a reader
+ * would already expect, instead of appearing as unattributed spend.
+ */
+export const HANDLER_PHASES: Readonly<Record<BuiltinStepId, LedgerPhase>> = Object.freeze({
+  implement: "implement",
+  verify: "implement",
+  commit: "implement",
+  pr: "implement",
+  claude: "implement",
+  review: "self-review",
+  describe: "describe",
+});
+
+/** The handler the review gate stamps on BOTH of its sessions — the review, and the fix after it. */
+const REVIEW_HANDLER: BuiltinStepId = "review";
+
+/**
+ * The `step` the review gate records for its correction round. anton's own literal, not a formula
+ * author's id — see the header for why reading it here does not reintroduce the bug this module
+ * exists to avoid.
+ */
+export const REVIEW_FIX_STEP = "review-fix";
+
+/** The dimensions a phase is read from. Structural, so a ledger row satisfies it without a mapper. */
+export interface LedgerPhaseRow {
+  jobType: string | null | undefined;
+  /** The author's step id — read ONLY to tell the review gate's two sessions apart. */
+  step?: string | null;
+  /** The resolved handler (`step_handler`). Null on rows written before the column existed. */
+  stepHandler?: string | null;
+}
+
+/**
+ * Which phase a recorded invocation belongs to, or `undefined` when anton cannot say.
+ *
+ * `undefined` is returned rather than a default bucket for three real cases, all of which the caller
+ * reports as unattributed: a job type this anton no longer defines, a job type that declared it
+ * spends nothing, and a row whose handler is absent or unknown. The last of those covers every row
+ * written before `step_handler` existed — they carry null forever, and falling back to `step` would
+ * be exactly the author-id guess this module refuses, on the rows least able to survive it.
+ */
+export function ledgerPhase(row: LedgerPhaseRow): LedgerPhase | undefined {
+  const { jobType } = row;
+  if (typeof jobType !== "string" || !Object.hasOwn(JOB_TYPE_PHASES, jobType)) return undefined;
+
+  const declared = JOB_TYPE_PHASES[jobType as JobType];
+  if (declared !== BY_HANDLER) return declared ?? undefined;
+
+  const handler = row.stepHandler;
+  if (typeof handler !== "string") return undefined;
+
+  // The gate's fix round, still under `execute-epic`. Checked before the handler lookup because the
+  // gate stamps `review` on BOTH its sessions today, so the handler alone would file the correction
+  // as self-review. Either spelling counts, and neither can be forged by a formula: `review-fix` is
+  // no builtin step id, so a handler that reads it came from anton; and the `step` clause is gated
+  // on the gate's own handler, so an author who names their implement step `review-fix` is still
+  // classified by what ran rather than by what they called it.
+  if (handler === REVIEW_FIX_STEP || (handler === REVIEW_HANDLER && row.step === REVIEW_FIX_STEP)) {
+    return "pr-fix";
+  }
+
+  return Object.hasOwn(HANDLER_PHASES, handler) ? HANDLER_PHASES[handler as BuiltinStepId] : undefined;
+}
 
 /**
  * The columns a timing fold reads: an invocation's own duration, plus the dimensions that say which
