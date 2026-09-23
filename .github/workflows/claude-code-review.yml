@@ -62,10 +62,19 @@ jobs:
       # PR's fault — the log's `Running Claude Code via SDK (full output hidden for
       # security)` line means the real crash detail never reaches this job's log; add
       # `show_full_output: true` on the action to see it.
+      # Bumped 2.1.274 -> 2.1.281 (2026-09-23): same crash signature came back (is_error:true,
+      # num_turns:1, total_cost_usd:0, ~400ms) across every run on this PR, tracked upstream as
+      # anthropics/claude-code-action#1759 (open, unresolved as of 2026-08-31 — ruled out auth,
+      # action version, model, and config, so it is not this repo's config causing it). 2.1.277's
+      # changelog is the closest fix in range: "Fixed `claude -p` and Agent SDK sessions that
+      # could hang with no result after an internal error; they now report the error and exit
+      # with code 1" — bumping to the latest available pin (2.1.281) picks that up plus every
+      # later reliability fix. If this recurs, it's the upstream bug, not this PR's diff — check
+      # #1759's status before re-bumping blindly.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.274'
+          CLAUDE_CODE_VERSION: '2.1.281'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
