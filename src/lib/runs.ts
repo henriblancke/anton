@@ -229,6 +229,8 @@ export type RunPatch = Partial<{
   /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
   attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
+  /** Whether a `done` settle actually published a pull request — see the column's own note. */
+  delivered: boolean;
 }>;
 
 /** Patch a run row (touches updatedAt). Pass endedAt (ms) to close it out. */
@@ -754,6 +756,11 @@ export async function listRecentRunOutcomes(
  * work after the eventual push as "post-delivery" (PR #320 review). The run-row arm above already
  * answers the feature ledger's question on its own: a run's `epicBeadId` is always the run's target,
  * so a completed run's own row already carries the delivery time for anything scoped under it.
+ *
+ * The run-row arm is further filtered on `delivered` (PR #320 review): a verified already-shipped
+ * retirement settles the row `done` too, but opens no pull request, so a `done` status alone is not
+ * publication evidence — counting it would hand a feature (or a repair) credit for a settle that
+ * shipped nothing.
  */
 export async function listDeliveriesByBead(
   db: AntonDb,
@@ -779,6 +786,11 @@ export async function listDeliveriesByBead(
       and(
         eq(schema.runs.projectId, projectId),
         eq(schema.runs.status, "done"),
+        // A verified already-shipped retirement settles `done` too, but opens no pull request —
+        // `delivered` is false only there (PR #320 review). Excluding it here serves both callers:
+        // neither the ledger's `leadMs` nor the repair weigher's double-weight should read a no-op
+        // settle as proof anything landed.
+        eq(schema.runs.delivered, true),
         or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
       ),
     );

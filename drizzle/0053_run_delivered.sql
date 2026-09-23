@@ -1,0 +1,1 @@
+ALTER TABLE `runs` ADD `delivered` integer DEFAULT true NOT NULL;

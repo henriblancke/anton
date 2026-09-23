@@ -246,9 +246,21 @@ describe("rule 1 — unpriced is tokens-only, never free", () => {
     // `model-pricing`'s rule, and worth pinning here because it is the ordinary case: a null host
     // means the CLI used its default transport, which may be a subscription rather than API billing.
     // The tokens are real either way; inventing a list-rate charge for them would not be.
-    const implement = ledgerTotals([row({ endpointHost: null })]).phases.get("implement");
+    const totals = ledgerTotals([row({ endpointHost: null })]);
+    const implement = totals.phases.get("implement");
     expect(implement?.usd).toBeUndefined();
     expect(implement).toMatchObject({ unpricedRows: 1, tokens: { input: 1_000_000 } });
+    // The default row's model (claude-opus-5) is one anton already prices — the unknown fact here is
+    // the billing mode, not the model's rate, so it must not be reported as a price-table gap
+    // (PR #320 review).
+    expect(totals.unpricedModels).toEqual([]);
+  });
+
+  it("names a model with NO price table entry at all, even over an unrouted transport", () => {
+    // Unlike the case above, a model anton genuinely has no price for is still worth reporting —
+    // the null host does not excuse a real price-table gap (PR #320 review).
+    const totals = ledgerTotals([row({ modelReported: "glm-4.6", endpointHost: null })]);
+    expect(totals.unpricedModels).toEqual(["glm-4.6"]);
   });
 
   it("prices a routed row once the caller supplies that endpoint's rates", () => {

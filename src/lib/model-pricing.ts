@@ -243,6 +243,26 @@ export function isPricedFor(
 }
 
 /**
+ * Whether an unpriced row is a genuine gap in the price table, as opposed to an intentionally
+ * unpriceable transport. A `null` endpointHost means the CLI used its default transport, which
+ * may be a subscription anton never bills at API rates — {@link isPricedFor} correctly calls that
+ * row unpriced, but the model itself can still be one anton already prices (e.g. `claude-opus-5`
+ * over a plain subscription call). Reporting that model as needing a price-table entry would tell
+ * the UI to fix the wrong thing: the unknown fact is the billing mode, not the model's rate
+ * (PR #320 review). Every other unpriced reason — a model with no table entry at all, or a
+ * resolved price missing a component (e.g. cache) the row used — is a real gap and stays reported.
+ */
+export function isMissingPriceEntry(
+  model: string | null | undefined,
+  counts: TokenCounts,
+  endpointHost?: string | null,
+  gatewayPricing?: GatewayPricing,
+): boolean {
+  if (isPricedFor(model, counts, endpointHost, gatewayPricing)) return false;
+  return endpointHost === null ? priceOf(model) === undefined : true;
+}
+
+/**
  * The measured counts one ledger row carries. Structural and all-optional, so it takes a row, a
  * {@link import("./claude/model-usage").ModelUsageEntry}, or a test fixture — and so an absent
  * count is distinguishable from a zero one.

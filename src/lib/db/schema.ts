@@ -173,6 +173,14 @@ export const runs = sqliteTable("runs", {
   // descending `writeSeq` is settlement order by construction. Null on rows written before this
   // column existed, which fall back to that proxy.
   writeSeq: integer("write_seq"),
+  // Whether this settled `done` row actually published something — opened, refreshed, or found a
+  // live pull request — as opposed to a verified already-shipped retirement that opens none
+  // (`finishRun`'s `targetRetired`, `settleRetiredStandalone`'s recovery-idempotent twin). The
+  // feature ledger (`listDeliveriesByBead`) needs this: without it, a no-op retirement settle reads
+  // as delivery evidence and hands the feature a `leadMs` ending at bookkeeping that shipped nothing
+  // (PR #320 review). Defaults true so every row written before this column existed — all of them
+  // genuine deliveries, since the no-op path is what introduced the gap — keeps reading as one.
+  delivered: integer("delivered", { mode: "boolean" }).notNull().default(true),
 }, (table) => [
   // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
   // write an index lookup instead of a table scan.

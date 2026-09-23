@@ -57,6 +57,7 @@ interface SeedRun {
   reviewScore?: number;
   reviewKeyScore?: number;
   narrative?: string;
+  delivered?: boolean;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -77,6 +78,7 @@ async function seed(run: SeedRun): Promise<void> {
     startedAt: new Date(run.startedAt ?? run.updatedAt),
     endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
+    ...(run.delivered === undefined ? {} : { delivered: run.delivered }),
   });
 }
 
@@ -389,6 +391,23 @@ describe("listDeliveriesByBead", () => {
     expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
     // No ids, no query: an unrepaired board asks nothing of the runs table.
     expect(await listDeliveriesByBead(t.db, PROJECT, [])).toEqual(new Map());
+  });
+
+  it("excludes a done run that verified-retired its target rather than publishing anything", async () => {
+    // `finishRun`'s `targetRetired` path (and its recovery twin, `settleRetiredStandalone`) settle
+    // the row `done` with no pull request ever opened — a `status: "done"` row alone is not
+    // publication evidence (PR #320 review).
+    await seed({ id: "retired", status: "done", updatedAt: SETTLED, endedAt: SETTLED, delivered: false });
+    await seed({
+      id: "delivered",
+      status: "done",
+      updatedAt: SETTLED + 60_000,
+      endedAt: SETTLED + 60_000,
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
+      new Map([[EPIC, [sec(SETTLED + 60_000)]]]),
+    );
   });
 
   it("credits a grouped run's EVERY completed child, not only the ticket its row kept", async () => {

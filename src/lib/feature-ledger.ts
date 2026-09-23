@@ -92,7 +92,12 @@ import {
   type InvocationDimensionRow,
   type InvocationFact,
 } from "./model-divergence";
-import { costOf, isPricedFor, type GatewayPricing, type TokenCounts } from "./model-pricing";
+import {
+  costOf,
+  isMissingPriceEntry,
+  type GatewayPricing,
+  type TokenCounts,
+} from "./model-pricing";
 
 /** The phases a feature's recorded spend splits into. */
 export const LEDGER_PHASES = ["implement", "self-review", "describe", "pr-fix", "overhead"] as const;
@@ -612,11 +617,12 @@ function accumulate(
     if (cost === undefined) {
       into.unpricedRows += 1;
       // `costOf` is also undefined when a PRICED model simply measured no counts (a crashed
-      // invocation) — that row genuinely has no price problem, so only a model anton actually has no
-      // price FOR belongs in this list (PR #320 review). Only a NAMED model is worth reporting back —
-      // a row with no model names nothing to add.
+      // invocation), or when a null endpointHost's default transport may be an unbilled
+      // subscription rather than a model anton has no price for (PR #320 review) — only a model
+      // that is a genuine price-table gap belongs in this list. Only a NAMED model is worth
+      // reporting back — a row with no model names nothing to add.
       const model = row.modelReported?.trim();
-      if (model && !isPricedFor(row.modelReported, row, row.endpointHost, gatewayPricing)) {
+      if (model && isMissingPriceEntry(row.modelReported, row, row.endpointHost, gatewayPricing)) {
         unpricedModels.set(model, (unpricedModels.get(model) ?? 0) + 1);
       }
       continue;
