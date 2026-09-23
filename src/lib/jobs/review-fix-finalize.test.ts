@@ -274,6 +274,41 @@ describe("finalizeMergedEpic", () => {
   );
 
   it(
+    "stamps the closure fence on a SECOND delivery cycle's fresh confirmation, despite an earlier " +
+      'closure further back in the same bead\'s history (chatgpt-codex-connector, anton-fc5x review, ' +
+      '"Allow fresh confirmations after earlier closure cycles")',
+    async () => {
+      // target-1 was delivered once already (closed, then reopened for legitimate rework), and
+      // `ensureBoardBaselinePersisted`'s reopen-reset cleared the stale confirmation before this
+      // NEW cycle wrote a fresh one — still unfenced (open) until this close. `read.reopened` is
+      // true here (an earlier closed episode sits behind the current streak), but that must not
+      // block the fence: nothing about this confirmation is stale, it was written fresh during the
+      // cycle that just ended.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb2"] }) },
+      } as Bead;
+      metadataById.set("target-1", target.metadata);
+      historyMock.mockResolvedValue([
+        { hash: "close-sha-2", at: "2026-02-01T00:00:00Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-01-15T00:00:00Z", status: "open" },
+        { hash: "close-sha-1", at: "2026-01-02T00:00:00Z", status: "closed" },
+        { hash: "create-sha", at: "2026-01-01T00:00:00Z", status: "open" },
+      ]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "target-1",
+        ["anton-eb2"],
+        "close-sha-2",
+      );
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
     "does not stamp a closure fence when a reopen-and-reclose lands between the history read and " +
       'the write (chatgpt-codex-connector, PR #284 review, "Revalidate the closure cycle before ' +
       'stamping confirmation")',

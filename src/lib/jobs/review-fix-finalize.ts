@@ -622,18 +622,19 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
       // guessing off the stale snapshot.
       const read = await mustReadClosureVersion(repo, b.id);
       if (!read.read || read.closure === undefined) return false;
-      // An unfenced confirmation is only unambiguous when the bead has closed EXACTLY once
-      // (chatgpt-codex-connector, PR #284 review, "Revalidate the closure cycle before stamping
-      // confirmation") — the same rule `survivorTrustedForClosure` (execute-epic-dispatch.ts) already
-      // applies to this identical shape. A reopen-and-reclose racing between the `closedBeads`
-      // snapshot and this call does not touch `boardEvidenceConfirmed`/`confirmedBoardEvidenceClosure`
-      // at all (only `ensureBoardBaselinePersisted`'s own redispatch reset does), so `live`'s ids below
-      // could still be the PRIOR cycle's evidence while `read.closure` — and `read.reopened`, riding
-      // the same history read — names a NEW closure episode. Stamping them together would durably
-      // confirm the new cycle against evidence nothing about the new cycle ever diffed. With more than
-      // one closure episode to choose from, there is no way to tell which one these unstamped ids
-      // belong to, so this bead's fence is left for a later pass rather than guessed.
-      if (read.reopened) return false;
+      // Unlike `survivorTrustedForClosure` (execute-epic-dispatch.ts), `read.reopened` — whether
+      // this bead closed at all BEFORE its current closed streak, anywhere in its whole history — is
+      // not checked here (chatgpt-codex-connector, anton-fc5x review, "Allow fresh confirmations
+      // after earlier closure cycles"). That function guards a STAMPED-OR-NOT survivor found on an
+      // arbitrary resume, where an unstamped one predating the reset genuinely could belong to either
+      // episode. This filter only ever admits a bead with `boardEvidenceConfirmed` true and
+      // `confirmedBoardEvidenceClosure` still undefined — and the ONLY write that clears a stamped
+      // closure is `ensureBoardBaselinePersisted`'s reopen-reset, which clears the confirmed flag
+      // right alongside it. So an unfenced confirmation reaching this filter was necessarily written
+      // fresh, during the open period that just ended in `read.closure` — an EARLIER closure further
+      // back in history (the normal shape of a legitimate second delivery cycle) says nothing about
+      // whose evidence `live`'s ids below are. The real race — a reopen-and-reclose landing between
+      // this read and the write — is caught by the closure-hash recheck further down instead.
       // Re-read live rather than writing off `b` (chatgpt-codex-connector, PR #284 review, "Refresh
       // confirmation metadata before stamping closures"): `b` is `closedBeads`'s snapshot, taken
       // before this async fan-out started, and another review-fix pass can extend this bead's
