@@ -410,6 +410,47 @@ describe("which proposals a pass shadows", () => {
       "SHADOW could not read cycle evidence — bd dep cycles timed out; approve/unapprove verdicts fail closed",
     );
   });
+
+  // The bug PR #274 review flagged on this file: `cycles` used to be stamped straight onto the
+  // board `loadAllIssues` returned earlier, with no recheck that its `blocks` edges still describe
+  // the graph `bd dep cycles` was just computed against. A writer resolving the blocker in that gap
+  // would leave `board` looking cycle-clean for an `apply` this shadow has no business promising —
+  // the armed path's own locked reread WOULD catch the moved edge and refuse. Mirrors
+  // `attachCyclesBestEffort`'s own `sameBlocksEdges` re-list.
+  it("fails closed on approve when the board's blocks edges move between the board read and the cycle-evidence recheck", async () => {
+    const withheld = makeDetection({
+      kind: "withheld-approval",
+      move: "approve",
+      subjects: ["anton-b"],
+      summary: "anton-b is the board's next target and carries no approval",
+      evidence: ["anton-b ranks first among the run targets", "nothing on the board approves it"],
+    });
+    const initial = [
+      bead("anton-a"),
+      bead("anton-b", {
+        dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+      }),
+    ];
+    // A concurrent writer resolves the blocker in the gap between this board read and `bd dep
+    // cycles` settling — the re-list must catch that the edge `cycles` was computed against is gone.
+    const moved = [bead("anton-a"), bead("anton-b")];
+    loadMock.mockReset();
+    loadMock.mockResolvedValueOnce(initial).mockResolvedValueOnce(moved);
+    served = initial;
+    servedBytes = JSON.stringify(initial);
+
+    const records = await shadow([filed(withheld, "anton-p1")], {
+      policy: resolveProposalAutonomyPolicy({ "withheld-approval": "shadow" }),
+    });
+
+    expect(loadMock).toHaveBeenCalledTimes(2);
+    expect(depCyclesMock).toHaveBeenCalledWith(REPO);
+    expect(records[0].outcome).toBe("refuse");
+    expect(records[0].detail).toContain("authoritative `bd dep cycles` evidence is unavailable");
+    expect(recorded()).toContain(
+      "SHADOW board moved between the board read and cycle evidence — approve/unapprove verdicts fail closed",
+    );
+  });
 });
 
 describe("a shadow that cannot run", () => {

@@ -246,7 +246,7 @@ export async function loadAllIssues(
 }
 
 /** Whether two bead lists agree on every `blocks` edge — the only edge type `bd dep cycles` walks. */
-function sameBlocksEdges(a: Bead[], b: Bead[]): boolean {
+export function sameBlocksEdges(a: Bead[], b: Bead[]): boolean {
   const key = (e: { from: string; to: string; type: string }) => `${e.from}>${e.to}:${e.type}`;
   const toSet = (list: Bead[]) =>
     new Set(beads.edgesOf(list).filter((e) => e.type === "blocks").map(key));

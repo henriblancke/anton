@@ -19,7 +19,7 @@
  */
 import { beads, type Bead } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
-import { loadAllIssues } from "../beads/issues";
+import { loadAllIssues, sameBlocksEdges } from "../beads/issues";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
   autonomyFor,
@@ -136,7 +136,26 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
   // (`missingCycleEvidenceGap`); every other target still shadows normally.
   if (targets.some(({ plan }) => CYCLE_AWARE_MOVES.has(plan.move))) {
     try {
-      attachCycleEvidence(board, await beads.depCycles(input.repo));
+      const cycles = await beads.depCycles(input.repo);
+      // Another writer can land or repair a `blocks` edge on a shared-server board in the gap between
+      // `loadAllIssues` above and this `bd dep cycles` call settling — the same staleness
+      // `loadAllIssues`'s own `sameBlocksEdges` retry and `attachCyclesBestEffort` guard against.
+      // Attaching `cycles` to `board` unchecked would let `decide()` pair a fresh cycle answer with a
+      // board whose edges no longer describe it: an `approve`/`unapprove` verdict could read `apply`
+      // here while the armed path's own locked reread — which DOES recheck — would refuse the same
+      // proposal, recording shadow evidence that overstates how safe the kind is to arm. Re-list and
+      // compare before attaching; a cycle-blind target in this same batch still decides off the
+      // original `board` even when the recheck fails, since it never consults cycle evidence at all.
+      const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
+      const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(input.repo));
+      if (consistent) {
+        attachCycleEvidence(board, cycles);
+      } else {
+        await write(
+          input,
+          "SHADOW board moved between the board read and cycle evidence — approve/unapprove verdicts fail closed",
+        );
+      }
     } catch (e) {
       await write(
         input,
