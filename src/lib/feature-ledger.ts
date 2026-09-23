@@ -616,7 +616,7 @@ function accumulate(
       // price FOR belongs in this list (PR #320 review). Only a NAMED model is worth reporting back —
       // a row with no model names nothing to add.
       const model = row.modelReported?.trim();
-      if (model && !isPricedFor(row.modelReported, row.endpointHost, gatewayPricing)) {
+      if (model && !isPricedFor(row.modelReported, row, row.endpointHost, gatewayPricing)) {
         unpricedModels.set(model, (unpricedModels.get(model) ?? 0) + 1);
       }
       continue;

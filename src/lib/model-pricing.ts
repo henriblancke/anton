@@ -215,16 +215,31 @@ function resolvePrice(
 }
 
 /**
- * Whether anton has a price for this row's model and routing — independent of whether the row
- * measured any counts. Lets a caller tell "no price for this model" apart from "priced, but nothing
- * was measured", which {@link costOf}'s single `undefined` collapses (PR #320 review).
+ * Whether anton has a price for this row's model and routing, GIVEN what it actually used —
+ * independent of whether the row measured any counts. Lets a caller tell "no price for this model"
+ * apart from "priced, but nothing was measured", which {@link costOf}'s single `undefined` collapses
+ * (PR #320 review).
+ *
+ * `counts` matters: a price table entry can cover input/output but omit cache rates, and
+ * {@link costOf} then returns `undefined` for any row that actually used cache tokens (it will not
+ * silently price cache reads/writes at zero). Checking only "does a price entry exist" would call
+ * that row priced and drop its model from the caller's unpriced-model list — an incomplete total
+ * with no actionable name behind it (PR #320 review). This mirrors `costOf`'s own completeness
+ * check so the two never disagree about the same row.
  */
 export function isPricedFor(
   model: string | null | undefined,
+  counts: TokenCounts,
   endpointHost?: string | null,
   gatewayPricing?: GatewayPricing,
 ): boolean {
-  return resolvePrice(model, endpointHost, gatewayPricing) !== undefined;
+  const price = resolvePrice(model, endpointHost, gatewayPricing);
+  if (!price) return false;
+  const cacheRead = count(counts.cacheReadInputTokens);
+  const cacheWrite = count(counts.cacheCreationInputTokens);
+  if (cacheRead > 0 && price.cacheRead === undefined) return false;
+  if (cacheWrite > 0 && price.cacheWrite5m === undefined) return false;
+  return true;
 }
 
 /**

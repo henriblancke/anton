@@ -745,12 +745,23 @@ export async function listRecentRunOutcomes(
  *
  * Bounded by the ids handed in — the beads that actually carry a repair stamp, or a ledger's scope —
  * so an unrepaired board costs no query at all.
+ *
+ * `includeLocalCommits` (default true) gates the `execute`-session arm above. The repair weigher
+ * wants it: a child's own commit proves ITS repair regardless of what the run around it does next.
+ * The feature ledger (`feature-ledger-read.ts`) must NOT get it: when a run parks or fails before
+ * ever pushing, that same local commit is not a feature delivery — nothing shipped — yet counting it
+ * would hand the feature a `leadMs` that ends at an unpublished commit and misclassify real review
+ * work after the eventual push as "post-delivery" (PR #320 review). The run-row arm above already
+ * answers the feature ledger's question on its own: a run's `epicBeadId` is always the run's target,
+ * so a completed run's own row already carries the delivery time for anything scoped under it.
  */
 export async function listDeliveriesByBead(
   db: AntonDb,
   projectId: string,
   beadIds: readonly string[],
+  options?: { includeLocalCommits?: boolean },
 ): Promise<Map<string, number[]>> {
+  const includeLocalCommits = options?.includeLocalCommits ?? true;
   const out = new Map<string, number[]>();
   if (beadIds.length === 0) return out;
   const ids = [...new Set(beadIds)];
@@ -782,6 +793,12 @@ export async function listDeliveriesByBead(
     }
   }
 
+  // `execute` always delivers (its own commit) once settled `done`; `review-fix` settles `done`
+  // whether or not it pushed anything, so it only counts when `pushed` says it did.
+  const kindConditions = [
+    and(eq(schema.sessions.kind, "review-fix"), eq(schema.sessions.pushed, true)),
+    ...(includeLocalCommits ? [eq(schema.sessions.kind, "execute")] : []),
+  ];
   const ticketRows = await db
     .select({ beadId: schema.sessions.beadId, endedAt: schema.sessions.endedAt })
     .from(schema.sessions)
@@ -790,12 +807,7 @@ export async function listDeliveriesByBead(
         eq(schema.sessions.projectId, projectId),
         eq(schema.sessions.status, "done"),
         inArray(schema.sessions.beadId, ids),
-        // `execute` always delivers (its own commit) once settled `done`; `review-fix` settles
-        // `done` whether or not it pushed anything, so it only counts when `pushed` says it did.
-        or(
-          eq(schema.sessions.kind, "execute"),
-          and(eq(schema.sessions.kind, "review-fix"), eq(schema.sessions.pushed, true)),
-        ),
+        or(...kindConditions),
       ),
     );
   for (const row of ticketRows) {

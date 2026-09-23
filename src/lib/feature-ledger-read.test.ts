@@ -110,6 +110,40 @@ describe("featureLedger", () => {
     expect(ledger?.timing.invocations).toBe(0);
   });
 
+  it("does not treat a child's local commit as delivery when the run never pushed", async () => {
+    // A ticket session can settle `done` on its own commit even though the outer run then parks or
+    // fails before ever pushing the branch — that commit is not a feature delivery, and must not
+    // hand the feature a `leadMs` (PR #320 review).
+    fakeBoard(BOARD);
+    await seedInvocation({
+      id: "i1",
+      beadId: "task-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 5 * 60_000,
+    });
+    await t.db.insert(schema.sessions).values({
+      id: "s1",
+      projectId: t.projectId,
+      kind: "execute",
+      beadId: "task-1",
+      status: "done",
+      endedAt: new Date("2026-09-20T09:30:00Z"),
+    });
+    await t.db.insert(schema.runs).values({
+      id: "r1",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "parked",
+      startedAt: new Date("2026-09-20T09:00:00Z"),
+      updatedAt: new Date("2026-09-20T09:30:00Z"),
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.timing.leadMs).toBeUndefined();
+  });
+
   it("leaves a sibling feature's rows out of the scope", async () => {
     fakeBoard([...BOARD, bead({ id: "feat-2", issue_type: "feature" })]);
     await seedInvocation({

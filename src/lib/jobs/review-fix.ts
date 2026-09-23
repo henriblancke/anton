@@ -622,6 +622,12 @@ async function runFixSession(args: {
   // terminal hits the SAME gateway this fix session does, even if settings drift mid-run.
   ctx.report({ sessionId, cwd: worktree.path, routing: claudeRouting(settings) });
 
+  // Once a push's outcome is durably recorded (`endSession` below), the catch at the bottom must
+  // not overwrite it back to `failed` just because a LATER fallible step (thread replies, the
+  // re-review notification) throws — that would erase delivery evidence for a push that already
+  // reached the remote (PR #320 review).
+  let sessionSettled = false;
+
   try {
     // A resume can land here with the fix already committed on the branch — an operator resolving
     // what a red gate named (a migration re-stamp, say) and hitting resume rather than a fresh
@@ -659,6 +665,7 @@ async function runFixSession(args: {
       // remote must count toward lead-time/repair weighting even if notifyReReview never returns
       // (network stall, process kill) (PR #320 review).
       await endSession(db, clock, sessionId, "done", pushed);
+      sessionSettled = true;
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
       return pushed;
     }
@@ -734,6 +741,13 @@ async function runFixSession(args: {
       ctx.signal,
     );
 
+    // Persist the outcome BEFORE the fallible thread/notification work below — a push that reached
+    // the remote must count toward lead-time/repair weighting even if `applyThreadOutcomes` or
+    // `notifyReReview` never returns (network stall, GitHub outage, process kill), and the catch
+    // below must not then downgrade this durable state back to `failed` (PR #320 review).
+    await endSession(db, clock, sessionId, "done", pushed);
+    sessionSettled = true;
+
     await applyThreadOutcomes({
       repo,
       number,
@@ -749,14 +763,9 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      await endSession(db, clock, sessionId, "done", false);
       return false;
     }
 
-    // Persist the push BEFORE the fallible notification below — a delivery that reached the
-    // remote must count toward lead-time/repair weighting even if notifyReReview never returns
-    // (network stall, process kill) (PR #320 review).
-    await endSession(db, clock, sessionId, "done", true);
     await notifyReReview({
       repo,
       number,
@@ -766,7 +775,7 @@ async function runFixSession(args: {
     });
     return true;
   } catch (e) {
-    await endSession(db, clock, sessionId, "failed");
+    if (!sessionSettled) await endSession(db, clock, sessionId, "failed");
     // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say
     // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
     // only a stale badge, not why anton stopped (anton-gvqk3).

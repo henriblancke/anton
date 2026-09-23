@@ -264,6 +264,28 @@ describe("rule 1 — unpriced is tokens-only, never free", () => {
     });
     expect(ledgerTotals(rows, gateway).unpricedModels).toEqual([]);
   });
+
+  it("names a model whose gateway rate is missing the cache component a row actually used", () => {
+    // The gateway prices input/output for this model but never reported a cache rate — `costOf`
+    // correctly refuses to guess and leaves the row unpriced, but a check that only asks "does a
+    // price entry exist" would call it priced and never say why the total is incomplete
+    // (PR #320 review).
+    const gateway: GatewayPricing = {
+      endpointHost: "gw.example.com",
+      prices: { "glm-4.6": { input: 1, output: 2 } },
+    };
+    const rows = [
+      row({
+        modelReported: "glm-4.6",
+        endpointHost: "gw.example.com",
+        cacheReadInputTokens: 1_000_000,
+      }),
+    ];
+    const implement = ledgerTotals(rows, gateway).phases.get("implement");
+    expect(implement?.usd).toBeUndefined();
+    expect(implement).toMatchObject({ pricedRows: 0, unpricedRows: 1 });
+    expect(ledgerTotals(rows, gateway).unpricedModels).toEqual(["glm-4.6"]);
+  });
 });
 
 describe("rule 2 — nothing recorded is empty, not zero", () => {

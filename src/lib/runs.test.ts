@@ -444,6 +444,30 @@ describe("listDeliveriesByBead", () => {
     );
   });
 
+  it("excludes local ticket commits when the caller asks for delivery evidence only", async () => {
+    // The feature ledger's use (PR #320 review): a run that parks or fails before pushing must not
+    // let a child's own local commit count as the feature having delivered. A pushed review-fix
+    // correction still counts — it genuinely reached the remote.
+    await seedSession({ id: "s1", beadId: EPIC, status: "done", endedAt: SETTLED });
+    await seedSession({
+      id: "fix1",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED + 60_000,
+      pushed: true,
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map([[EPIC, [sec(SETTLED + 60_000)]]]));
+    // The default keeps counting the local commit too.
+    const withLocalCommits = await listDeliveriesByBead(t.db, PROJECT, [EPIC]);
+    expect([...(withLocalCommits.get(EPIC) ?? [])].sort()).toEqual(
+      [sec(SETTLED), sec(SETTLED + 60_000)].sort(),
+    );
+  });
+
   it("excludes a review-fix session that settled done without pushing anything", async () => {
     // "answered the review feedback; nothing to push" still settles `status: "done"` — it must not
     // read as a delivery the same way a pushed correction does.
