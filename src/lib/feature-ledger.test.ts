@@ -117,15 +117,35 @@ describe("ledgerTiming on a run that parked overnight", () => {
 });
 
 describe("firstInvocationStartMs with an unmeasured invocation", () => {
-  it("excludes an invocation with no reported duration, even when it is temporally first", () => {
+  it("refuses rather than reporting a later invocation's start as the origin", () => {
     // inv-1 crashed before reporting a duration (durationMs: null, the shape
-    // claude-invocations.ts writes whenever a result never reports one). Reconstructing its start
-    // from `recordedAt - 0` would collapse the start to inv-1's own end time and understate lead.
-    // The genuinely reconstructable start is inv-2's, even though inv-2 ended later.
+    // claude-invocations.ts writes whenever a result never reports one) but ended at 09:10 — before
+    // inv-2, the retry, even STARTED (09:15, reconstructed from its own 09:20 end minus 5min).
+    // That proves a real, earlier invocation happened whose own start cannot be reconstructed:
+    // reading inv-2's start as the origin would silently understate lead and waiting time, so this
+    // must refuse rather than select the later invocation.
     const rows = [
       row({
         invocationId: "inv-1",
         recordedAt: new Date("2026-09-20T09:10:00Z"),
+        durationMs: null,
+      }),
+      row({
+        invocationId: "inv-2",
+        recordedAt: new Date("2026-09-20T09:20:00Z"),
+        durationMs: 5 * MINUTE,
+      }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+  });
+
+  it("excludes an unmeasured invocation that ended AFTER the earliest known start", () => {
+    // inv-1 (unmeasured) ended at 09:25 — after inv-2's reconstructed 09:15 start — so it cannot be
+    // the earlier invocation. The known start still stands.
+    const rows = [
+      row({
+        invocationId: "inv-1",
+        recordedAt: new Date("2026-09-20T09:25:00Z"),
         durationMs: null,
       }),
       row({

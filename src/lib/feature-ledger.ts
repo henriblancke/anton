@@ -315,7 +315,8 @@ export function activeMs(rows: readonly LedgerTimingRow[]): number {
 }
 
 /**
- * When the scope's first invocation BEGAN, in epoch ms, or `undefined` when nothing was recorded.
+ * When the scope's first invocation BEGAN, in epoch ms, or `undefined` when nothing was recorded —
+ * or when an earlier invocation's start cannot be reconstructed (see below).
  *
  * Reconstructed as `recorded_at − duration_ms`, because `recorded_at` is stamped as an invocation
  * ENDS. Taking the stamp itself as the origin would start the span after the first invocation had
@@ -326,18 +327,32 @@ export function activeMs(rows: readonly LedgerTimingRow[]): number {
  * exactly its end minus its own measured duration. `recorded_at` is floored to whole seconds, so the
  * reconstruction can sit up to a second EARLY and never late — it cannot manufacture a lead shorter
  * than the truth.
+ *
+ * `metered` records a failed driver call without a duration before rethrowing, so a retry can be the
+ * first invocation THIS fold can time even when it is not the first invocation that ran. An untimed
+ * invocation that ended before the earliest timed one even started proves a real, earlier invocation
+ * happened — and its own start is unrecoverable, since there is no duration to subtract. Reporting
+ * the retry's start as the origin in that case would silently understate lead and waiting time, so
+ * this refuses instead: it returns `undefined` rather than a start it cannot stand behind.
  */
 export function firstInvocationStartMs(rows: readonly LedgerTimingRow[]): number | undefined {
-  let earliest: number | undefined;
+  let earliestStart: number | undefined;
+  let earliestUntimedEnd: number | undefined;
   for (const fact of groupInvocations(rows)) {
     const endedAt = recordedAtMs(fact.rows);
     if (endedAt === undefined) continue;
     const duration = invocationDuration(fact.rows);
-    if (duration === undefined) continue;
+    if (duration === undefined) {
+      if (earliestUntimedEnd === undefined || endedAt < earliestUntimedEnd) earliestUntimedEnd = endedAt;
+      continue;
+    }
     const startedAt = endedAt - duration;
-    if (earliest === undefined || startedAt < earliest) earliest = startedAt;
+    if (earliestStart === undefined || startedAt < earliestStart) earliestStart = startedAt;
   }
-  return earliest;
+  if (earliestUntimedEnd !== undefined && (earliestStart === undefined || earliestUntimedEnd < earliestStart)) {
+    return undefined;
+  }
+  return earliestStart;
 }
 
 /**
