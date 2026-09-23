@@ -157,6 +157,26 @@ describe("firstInvocationStartMs with an unmeasured invocation", () => {
     expect(firstInvocationStartMs(rows)).toBe(Date.parse("2026-09-20T09:15:00Z"));
   });
 
+  it("refuses when an unmeasured end lands exactly on the reconstructed start", () => {
+    // `recorded_at` floors to whole seconds, so a failed call and its immediate retry can land in
+    // the same second: inv-1 (unmeasured) ends at 09:15:00 and inv-2's reconstructed start is also
+    // 09:15:00. Equal does not mean "no earlier invocation" — flooring can hide a real gap — so this
+    // must refuse exactly as it does when inv-1 ends strictly before inv-2's start.
+    const rows = [
+      row({
+        invocationId: "inv-1",
+        recordedAt: new Date("2026-09-20T09:15:00Z"),
+        durationMs: null,
+      }),
+      row({
+        invocationId: "inv-2",
+        recordedAt: new Date("2026-09-20T09:20:00Z"),
+        durationMs: 5 * MINUTE,
+      }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+  });
+
   it("is undefined when no invocation in scope has a known duration", () => {
     const rows = [
       row({ invocationId: "inv-1", durationMs: null }),

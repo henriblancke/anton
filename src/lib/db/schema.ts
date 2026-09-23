@@ -827,6 +827,11 @@ export const sessions = sqliteTable(
     kind: text("kind").notNull(),
     beadId: text("bead_id"),
     status: text("status").notNull().default("running"),
+    // Whether a `review-fix` session actually committed+pushed a correction to the PR branch —
+    // `listDeliveriesByBead` (runs.ts) needs this to tell that apart from a review-fix session that
+    // only answered feedback with nothing to push, since both settle `status: "done"` the same way.
+    // Null for every other kind, and for a review-fix row written before this column existed.
+    pushed: integer("pushed", { mode: "boolean" }),
     logPath: text("log_path"),
     // Claude's own session id (from the stream-json result / system-init event), persisted so a
     // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).

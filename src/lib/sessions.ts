@@ -99,10 +99,12 @@ export async function endSession(
   clock: Clock,
   id: string,
   status: SessionStatus,
+  /** `review-fix` only — whether this session actually pushed a correction. See schema.ts `sessions.pushed`. */
+  pushed?: boolean,
 ): Promise<void> {
   await db
     .update(schema.sessions)
-    .set({ status, endedAt: secDate(clock.now()) })
+    .set({ status, endedAt: secDate(clock.now()), ...(pushed !== undefined && { pushed }) })
     .where(eq(schema.sessions.id, id));
 }
 

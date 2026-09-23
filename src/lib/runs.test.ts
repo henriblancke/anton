@@ -87,6 +87,7 @@ async function seedSession(row: {
   status: string;
   endedAt?: number;
   kind?: string;
+  pushed?: boolean;
 }): Promise<void> {
   await t.db.insert(schema.sessions).values({
     id: row.id,
@@ -95,6 +96,7 @@ async function seedSession(row: {
     beadId: row.beadId,
     status: row.status,
     endedAt: row.endedAt === undefined ? null : new Date(row.endedAt),
+    pushed: row.pushed,
   });
 }
 
@@ -423,6 +425,45 @@ describe("listDeliveriesByBead", () => {
     expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
       new Map([[EPIC, [sec(SETTLED)]]]),
     );
+  });
+
+  it("credits a review-fix session that actually pushed a correction", async () => {
+    // A PR fixed after it opened is delivered again by that push, not by the run row (which named
+    // only the PR-opening execute session) — see PR #320 review.
+    await seedSession({
+      id: "fix1",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED + 90_000,
+      pushed: true,
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
+      new Map([[EPIC, [sec(SETTLED + 90_000)]]]),
+    );
+  });
+
+  it("excludes a review-fix session that settled done without pushing anything", async () => {
+    // "answered the review feedback; nothing to push" still settles `status: "done"` — it must not
+    // read as a delivery the same way a pushed correction does.
+    await seedSession({
+      id: "fix-answered",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED,
+      pushed: false,
+    });
+    await seedSession({
+      id: "fix-legacy",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED,
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
   });
 });
 

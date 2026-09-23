@@ -330,10 +330,17 @@ export function activeMs(rows: readonly LedgerTimingRow[]): number {
  *
  * `metered` records a failed driver call without a duration before rethrowing, so a retry can be the
  * first invocation THIS fold can time even when it is not the first invocation that ran. An untimed
- * invocation that ended before the earliest timed one even started proves a real, earlier invocation
- * happened — and its own start is unrecoverable, since there is no duration to subtract. Reporting
- * the retry's start as the origin in that case would silently understate lead and waiting time, so
- * this refuses instead: it returns `undefined` rather than a start it cannot stand behind.
+ * invocation that ended before OR AT the earliest timed one's reconstructed start proves a real,
+ * earlier invocation happened — and its own start is unrecoverable, since there is no duration to
+ * subtract. Reporting the retry's start as the origin in that case would silently understate lead
+ * and waiting time, so this refuses instead: it returns `undefined` rather than a start it cannot
+ * stand behind.
+ *
+ * The equal case matters on its own: `recorded_at` floors to whole seconds, so a failed call and its
+ * immediate retry can land in the same second — the failed call's end and the retry's reconstructed
+ * start can come out equal even though the failed call's own (unknown) start was strictly earlier. A
+ * strict `<` would accept the retry as the origin right when the flooring hides that gap, so the
+ * check below is `<=`.
  */
 export function firstInvocationStartMs(rows: readonly LedgerTimingRow[]): number | undefined {
   let earliestStart: number | undefined;
@@ -349,7 +356,10 @@ export function firstInvocationStartMs(rows: readonly LedgerTimingRow[]): number
     const startedAt = endedAt - duration;
     if (earliestStart === undefined || startedAt < earliestStart) earliestStart = startedAt;
   }
-  if (earliestUntimedEnd !== undefined && (earliestStart === undefined || earliestUntimedEnd < earliestStart)) {
+  if (
+    earliestUntimedEnd !== undefined &&
+    (earliestStart === undefined || earliestUntimedEnd <= earliestStart)
+  ) {
     return undefined;
   }
   return earliestStart;

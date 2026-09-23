@@ -656,7 +656,7 @@ async function runFixSession(args: {
         ctx.signal,
       );
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
-      await endSession(db, clock, sessionId, "done");
+      await endSession(db, clock, sessionId, "done", pushed);
       return pushed;
     }
 
@@ -746,7 +746,7 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      await endSession(db, clock, sessionId, "done");
+      await endSession(db, clock, sessionId, "done", false);
       return false;
     }
 
@@ -757,7 +757,7 @@ async function runFixSession(args: {
       reasons: verdict.reasons,
       signal: ctx.signal,
     });
-    await endSession(db, clock, sessionId, "done");
+    await endSession(db, clock, sessionId, "done", true);
     return true;
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");

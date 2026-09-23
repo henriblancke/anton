@@ -721,24 +721,30 @@ export async function listRecentRunOutcomes(
 /**
  * When work carrying each of these beads DELIVERED — in unix SECONDS, unordered.
  *
- * Read for the repair weigher alone (gardener/repair.ts): a repair's double weight lasts only until
- * the repaired bead next delivers, and a delivery that old is behind the streak the breaker walks —
- * it is not in the run window and no board read remembers it.
+ * Read for the repair weigher (gardener/repair.ts) and the feature ledger (feature-ledger-read.ts
+ * `lastDeliveryMs`): a repair's double weight lasts only until the repaired bead next delivers, and
+ * a delivery that old is behind the streak the breaker walks — it is not in the run window and no
+ * board read remembers it; the ledger needs the same evidence to know when a feature's `leadMs` span
+ * actually ends.
  *
- * TWO sources, because the run row cannot name every bead a run delivered (PR #223 review). It
+ * THREE sources, because the run row cannot name every bead a run delivered (PR #223 review). It
  * carries one `ticketBeadId`, and a grouped run OVERWRITES it per child
  * (jobs/execute-epic-ticket-bookends.ts `openTicketSession`) — so on the rows alone a repaired
  * child that succeeded, followed by any other child, leaves no delivery at all, and its stamp goes
  * on weighing later unrelated failures double until the breaker disarms the picker early. So the
- * rows answer for the run's TARGET and its final ticket, and each ticket's own `execute` session —
- * opened per child and settled `done` only once that child's work committed — answers for the rest.
+ * rows answer for the run's TARGET and its final ticket, each ticket's own `execute` session —
+ * opened per child and settled `done` only once that child's work committed — answers for the rest,
+ * and a `review-fix` session that actually pushed a correction (`sessions.pushed`, PR #320 review)
+ * answers for a delivery that lands AFTER the PR opened — a review-fix session settles `done` the
+ * same way whether or not it pushed anything, so an unpushed one (nothing but an answered thread)
+ * must not count.
  *
  * A ticket session settles `done` on its own commit, whatever becomes of the run around it: the
  * repair the child carried was PROVEN by that landing, which is the whole test this evidence exists
  * to apply.
  *
- * Bounded by the ids handed in — the beads that actually carry a repair stamp — so an unrepaired
- * board costs no query at all.
+ * Bounded by the ids handed in — the beads that actually carry a repair stamp, or a ledger's scope —
+ * so an unrepaired board costs no query at all.
  */
 export async function listDeliveriesByBead(
   db: AntonDb,
@@ -782,9 +788,14 @@ export async function listDeliveriesByBead(
     .where(
       and(
         eq(schema.sessions.projectId, projectId),
-        eq(schema.sessions.kind, "execute"),
         eq(schema.sessions.status, "done"),
         inArray(schema.sessions.beadId, ids),
+        // `execute` always delivers (its own commit) once settled `done`; `review-fix` settles
+        // `done` whether or not it pushed anything, so it only counts when `pushed` says it did.
+        or(
+          eq(schema.sessions.kind, "execute"),
+          and(eq(schema.sessions.kind, "review-fix"), eq(schema.sessions.pushed, true)),
+        ),
       ),
     );
   for (const row of ticketRows) {
