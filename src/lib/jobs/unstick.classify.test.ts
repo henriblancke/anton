@@ -83,6 +83,7 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     endedAt: null,
     updatedAt: new Date(NOW - HOUR),
     writeSeq: 1,
+    delivered: true,
     ...o,
   };
 }

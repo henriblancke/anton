@@ -1,0 +1,405 @@
+/**
+ * The feature ledger's timing half (anton-96ga0), tested where it can lie.
+ *
+ * The claims under test are honesty claims rather than arithmetic ones: active counts an invocation
+ * once no matter how many models it reported, lead spans the parks that active deliberately does
+ * not, an undelivered scope has no lead rather than a zero one, and NO wall time exists to be
+ * rendered — the last of those is a compile-time assertion, because a runtime one cannot fail if
+ * the field is never added.
+ */
+import { describe, expect, expectTypeOf, it } from "vitest";
+
+import {
+  activeMs,
+  firstInvocationStartMs,
+  lastDeliveryMs,
+  ledgerTiming,
+  waitingMs,
+  type LedgerTiming,
+  type LedgerTimingRow,
+} from "./feature-ledger";
+
+const HOUR = 3_600_000;
+const MINUTE = 60_000;
+
+/** An invocation's rows share every dimension but the model — the grain the fold must respect. */
+function row(overrides: Partial<LedgerTimingRow> = {}): LedgerTimingRow {
+  return {
+    invocationId: "inv-1",
+    projectId: "p1",
+    jobType: "execute-epic",
+    jobId: "j1",
+    step: "implement",
+    runId: "r1",
+    beadId: "anton-aaa",
+    claudeSessionId: "s1",
+    modelRequested: "claude-opus-5",
+    modelReported: "claude-opus-5",
+    endpointHost: null,
+    outcome: "ok",
+    recordedAt: new Date("2026-09-20T09:00:00Z"),
+    durationMs: 10 * MINUTE,
+    ...overrides,
+  };
+}
+
+describe("activeMs", () => {
+  it("sums each invocation's duration", () => {
+    const rows = [
+      row({ invocationId: "inv-1", durationMs: 4 * MINUTE }),
+      row({ invocationId: "inv-2", durationMs: 6 * MINUTE }),
+      row({ invocationId: "inv-3", durationMs: 90_000 }),
+    ];
+    expect(activeMs(rows)).toBe(11 * MINUTE + 30_000);
+  });
+
+  it("counts an invocation ONCE however many models it reported usage under", () => {
+    // The fact table's grain is (invocation, model) and `duration_ms` is copied onto every row of
+    // one invocation, so a per-row sum would double-count the haiku sidecar that rides along with
+    // essentially every real opus invocation.
+    const sidecar = [
+      row({ invocationId: "inv-1", modelReported: "claude-opus-5", durationMs: 8 * MINUTE }),
+      row({ invocationId: "inv-1", modelReported: "claude-haiku-4-5", durationMs: 8 * MINUTE }),
+    ];
+    expect(activeMs(sidecar)).toBe(8 * MINUTE);
+  });
+
+  it("treats an unreported duration as nothing, not as a hole in the sum", () => {
+    const rows = [
+      row({ invocationId: "inv-1", durationMs: 5 * MINUTE }),
+      row({ invocationId: "inv-2", durationMs: null }),
+    ];
+    expect(activeMs(rows)).toBe(5 * MINUTE);
+  });
+
+  it("is zero on no rows at all", () => {
+    expect(activeMs([])).toBe(0);
+  });
+});
+
+describe("ledgerTiming on a run that parked overnight", () => {
+  // 09:00 — 10min of implement work. Quota park. 07:00 next morning — 5min to finish, delivered at
+  // 07:10. Active is 15 minutes; lead is 22h10m. Both are correct, and neither is the other.
+  const firstStart = Date.parse("2026-09-20T09:00:00Z");
+  const rows = [
+    row({
+      invocationId: "inv-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 10 * MINUTE,
+    }),
+    row({
+      invocationId: "inv-2",
+      step: "review",
+      recordedAt: new Date("2026-09-21T07:05:00Z"),
+      durationMs: 5 * MINUTE,
+    }),
+  ];
+  const deliveredAt = Date.parse("2026-09-21T07:10:00Z");
+
+  it("reports a small active and a large lead, both correct", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(15 * MINUTE);
+    expect(timing.leadMs).toBe(deliveredAt - firstStart);
+    expect(timing.leadMs).toBe(22 * HOUR + 10 * MINUTE);
+  });
+
+  it("separates working from waiting — the figure the split exists for", () => {
+    // The overnight park itself: everything in the lead that was not work.
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(21 * HOUR + 55 * MINUTE);
+  });
+
+  it("starts the lead when the first invocation BEGAN, not when it was recorded", () => {
+    // `recorded_at` is stamped as an invocation ENDS, so reading it as the origin would drop the
+    // first invocation's own work out of the span — and make lead − active negative on a
+    // single-invocation feature.
+    expect(firstInvocationStartMs(rows)).toBe(firstStart);
+  });
+});
+
+describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
+  // A review-fix session that answers PR feedback but lands no new delivery of its own — real work,
+  // but not part of what produced the delivery it followed.
+  const rows = [
+    row({ invocationId: "inv-1", recordedAt: new Date("2026-09-20T09:10:00Z"), durationMs: 10 * MINUTE }),
+    row({
+      invocationId: "inv-2",
+      step: "review-fix",
+      recordedAt: new Date("2026-09-20T10:20:00Z"),
+      durationMs: 20 * MINUTE,
+    }),
+  ];
+  const deliveredAt = Date.parse("2026-09-20T09:30:00Z");
+
+  it("excludes the post-delivery invocation from activeMs, but still counts it as timed", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(10 * MINUTE);
+    expect(timing.timedInvocations).toBe(2);
+    expect(timing.invocations).toBe(2);
+    expect(timing.leadMs).toBe(30 * MINUTE);
+  });
+
+  it("does not let post-delivery work eat into waitingMs", () => {
+    // Without the fix, activeMs would total 30min — equal to leadMs — reporting ZERO waiting and
+    // hiding the 20 real minutes the scope spent parked before delivery.
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(20 * MINUTE);
+  });
+
+  it("flags a same-second tie as ambiguous instead of guessing a direction", () => {
+    // `recorded_at` and the delivery timestamp are both floored to whole seconds, so a tie between
+    // them proves NEITHER order: it is exactly as likely to be the invocation that PRODUCED the
+    // delivery (work ends, the push follows within the same second) as one that followed it with no
+    // result. An earlier fix here resolved every tie as "proven later" — which broke the ordinary
+    // case below (`ledgerTiming with a same-second delivery`) far worse than the bug it was chasing.
+    // The correct answer is to guess neither direction: keep the invocation folded into `active` (the
+    // same treatment as any not-provably-later invocation) and flag the tie so `waitingMs` refuses to
+    // report a split it cannot stand behind.
+    const sameSecondRows = [
+      row({ invocationId: "inv-1", recordedAt: new Date("2026-09-20T09:10:00Z"), durationMs: 10 * MINUTE }),
+      row({
+        invocationId: "inv-2",
+        step: "review-fix",
+        recordedAt: new Date("2026-09-20T09:30:00Z"),
+        durationMs: 20 * MINUTE,
+      }),
+    ];
+    const sameSecondDeliveredAt = Date.parse("2026-09-20T09:30:00Z");
+
+    const timing = ledgerTiming(sameSecondRows, sameSecondDeliveredAt);
+    expect(timing.activeMs).toBe(30 * MINUTE);
+    expect(timing.timedInvocations).toBe(2);
+    expect(timing.splitAmbiguous).toBe(true);
+    expect(waitingMs(timing)).toBeUndefined();
+  });
+});
+
+describe("ledgerTiming with an invocation that spans delivery", () => {
+  // Reparenting can combine concurrent histories, so a single invocation's reconstructed span can
+  // start before the scope's last delivery and end after it — a call active 09:00–09:20 with delivery
+  // at 09:10. Dropping the whole invocation (the post-delivery treatment) would zero out the first ten
+  // minutes of genuine pre-delivery work; the fix clips the interval at the delivery boundary and keeps
+  // the portion that came before it (PR #320 review).
+  const start = Date.parse("2026-09-20T09:00:00Z");
+  const deliveredAt = Date.parse("2026-09-20T09:10:00Z");
+  const rows = [row({ invocationId: "inv-1", recordedAt: new Date(start + 20 * MINUTE), durationMs: 20 * MINUTE })];
+
+  it("keeps the pre-delivery portion instead of discarding the whole invocation", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(10 * MINUTE);
+    expect(timing.timedInvocations).toBe(1);
+    expect(timing.leadMs).toBe(10 * MINUTE);
+  });
+
+  it("does not let the clipped portion outrun leadMs", () => {
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(0);
+  });
+});
+
+describe("ledgerTiming with a same-second delivery", () => {
+  it("does not zero out a normal invocation whose push landed in the same second", () => {
+    // The ordinary case: one 5-minute invocation does the work, and the push that delivers it lands
+    // within the same floored second as the invocation's own recorded end. Treating that tie as
+    // "proven later" (an earlier version of this fix) excluded the ENTIRE invocation from `activeMs`,
+    // reporting 5 minutes of lead, zero active time, and 5 minutes of waiting for a feature that spent
+    // its whole lead working (fresh PR #320 review finding). `activeMs` must still count the work, and
+    // the ambiguity belongs on `waitingMs`, not on burying the invocation's own time.
+    const start = Date.parse("2026-09-20T09:00:00Z");
+    const deliveredAt = Date.parse("2026-09-20T09:05:00Z");
+    const rows = [row({ invocationId: "inv-1", recordedAt: new Date(deliveredAt), durationMs: 5 * MINUTE })];
+
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(5 * MINUTE);
+    expect(timing.leadMs).toBe(deliveredAt - start);
+    expect(timing.splitAmbiguous).toBe(true);
+    expect(waitingMs(timing)).toBeUndefined();
+  });
+});
+
+describe("ledgerTiming with overlapping invocations", () => {
+  // Reparenting can retroactively combine tickets from concurrent histories into one scope, so two
+  // invocations' recorded spans can genuinely overlap: inv-1 runs minute 0–20, inv-2 runs minute
+  // 10–25, delivery lands at minute 30. Summing durations would report 35 minutes active against a
+  // 30 minute lead — more work than time available, and zero waiting despite minutes 25–30 being
+  // genuinely idle. The union of the two spans covers only 0–25 (25 minutes), leaving 5 real minutes
+  // of waiting.
+  const base = Date.parse("2026-09-20T09:00:00Z");
+  const rows = [
+    row({ invocationId: "inv-1", recordedAt: new Date(base + 20 * MINUTE), durationMs: 20 * MINUTE }),
+    row({ invocationId: "inv-2", recordedAt: new Date(base + 25 * MINUTE), durationMs: 15 * MINUTE }),
+  ];
+  const deliveredAt = base + 30 * MINUTE;
+
+  it("unions the overlap instead of summing it", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(25 * MINUTE);
+    expect(timing.leadMs).toBe(30 * MINUTE);
+  });
+
+  it("reports the real idle minutes rather than clamping to zero", () => {
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(5 * MINUTE);
+  });
+
+  it("still sums two invocations that do not overlap at all", () => {
+    const disjoint = [
+      row({ invocationId: "inv-1", recordedAt: new Date(base + 10 * MINUTE), durationMs: 10 * MINUTE }),
+      row({ invocationId: "inv-2", recordedAt: new Date(base + 30 * MINUTE), durationMs: 10 * MINUTE }),
+    ];
+    expect(ledgerTiming(disjoint, base + 40 * MINUTE).activeMs).toBe(20 * MINUTE);
+  });
+
+  it("merges one invocation fully containing another", () => {
+    const nested = [
+      row({ invocationId: "inv-1", recordedAt: new Date(base + 30 * MINUTE), durationMs: 30 * MINUTE }),
+      row({ invocationId: "inv-2", recordedAt: new Date(base + 20 * MINUTE), durationMs: 5 * MINUTE }),
+    ];
+    expect(ledgerTiming(nested, base + 40 * MINUTE).activeMs).toBe(30 * MINUTE);
+  });
+});
+
+describe("firstInvocationStartMs with an unmeasured invocation", () => {
+  it("refuses rather than reporting a later invocation's start as the origin", () => {
+    // inv-1 crashed before reporting a duration (durationMs: null, the shape
+    // claude-invocations.ts writes whenever a result never reports one) but ended at 09:10 — before
+    // inv-2, the retry, even STARTED (09:15, reconstructed from its own 09:20 end minus 5min).
+    // That proves a real, earlier invocation happened whose own start cannot be reconstructed:
+    // reading inv-2's start as the origin would silently understate lead and waiting time, so this
+    // must refuse rather than select the later invocation.
+    const rows = [
+      row({
+        invocationId: "inv-1",
+        recordedAt: new Date("2026-09-20T09:10:00Z"),
+        durationMs: null,
+      }),
+      row({
+        invocationId: "inv-2",
+        recordedAt: new Date("2026-09-20T09:20:00Z"),
+        durationMs: 5 * MINUTE,
+      }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+  });
+
+  it("refuses even when the unmeasured invocation ended AFTER the earliest known start", () => {
+    // inv-1 (unmeasured) ended at 09:25 — after inv-2's reconstructed 09:15 start. Ending later does
+    // not prove inv-1 STARTED later: once a child can be reparented into a scope built from a
+    // different history, these two invocations are not provably sequential, so inv-1 could have begun
+    // before 09:15 and simply ended after it. Its own start is still unrecoverable, so this must
+    // refuse rather than trust the ordering "ended after" used to imply.
+    const rows = [
+      row({
+        invocationId: "inv-1",
+        recordedAt: new Date("2026-09-20T09:25:00Z"),
+        durationMs: null,
+      }),
+      row({
+        invocationId: "inv-2",
+        recordedAt: new Date("2026-09-20T09:20:00Z"),
+        durationMs: 5 * MINUTE,
+      }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+  });
+
+  it("refuses when an unmeasured end lands exactly on the reconstructed start", () => {
+    // `recorded_at` floors to whole seconds, so a failed call and its immediate retry can land in
+    // the same second: inv-1 (unmeasured) ends at 09:15:00 and inv-2's reconstructed start is also
+    // 09:15:00. Equal does not mean "no earlier invocation" — flooring can hide a real gap — so this
+    // must refuse exactly as it does when inv-1 ends strictly before inv-2's start.
+    const rows = [
+      row({
+        invocationId: "inv-1",
+        recordedAt: new Date("2026-09-20T09:15:00Z"),
+        durationMs: null,
+      }),
+      row({
+        invocationId: "inv-2",
+        recordedAt: new Date("2026-09-20T09:20:00Z"),
+        durationMs: 5 * MINUTE,
+      }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+  });
+
+  it("is undefined when no invocation in scope has a known duration", () => {
+    const rows = [
+      row({ invocationId: "inv-1", durationMs: null }),
+      row({ invocationId: "inv-2", durationMs: null }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+    expect(ledgerTiming(rows, Date.parse("2026-09-21T07:10:00Z")).leadMs).toBeUndefined();
+  });
+});
+
+describe("leadMs", () => {
+  it("is absent, not zero, for a scope that has not delivered", () => {
+    expect(ledgerTiming([row()]).leadMs).toBeUndefined();
+    expect(waitingMs(ledgerTiming([row()]))).toBeUndefined();
+  });
+
+  it("is absent for a scope with no invocations recorded, even when a delivery exists", () => {
+    expect(ledgerTiming([], Date.parse("2026-09-21T07:10:00Z")).leadMs).toBeUndefined();
+  });
+
+  it("refuses a negative span rather than clamping it to zero", () => {
+    // A bead reparented into a scope it did not deliver under: the delivery predates every row here,
+    // so there is no honest span between the two.
+    const delivered = Date.parse("2026-09-19T00:00:00Z");
+    expect(ledgerTiming([row()], delivered).leadMs).toBeUndefined();
+  });
+
+  it("spans to the LAST delivery across the feature and its children", () => {
+    const deliveries = new Map([
+      ["anton-aaa", [Date.parse("2026-09-20T10:00:00Z") / 1000]],
+      ["anton-bbb", [Date.parse("2026-09-21T07:10:00Z") / 1000]],
+    ]);
+    const last = lastDeliveryMs(deliveries, ["anton-aaa", "anton-bbb"]);
+    expect(last).toBe(Date.parse("2026-09-21T07:10:00Z"));
+    // A bead outside the scope contributes nothing, and an unknown bead is not an error.
+    expect(lastDeliveryMs(deliveries, ["anton-zzz"])).toBeUndefined();
+    expect(lastDeliveryMs(new Map(), ["anton-aaa"])).toBeUndefined();
+  });
+});
+
+describe("measurement completeness", () => {
+  it("says how many invocations actually reported a duration", () => {
+    const timing = ledgerTiming([
+      row({ invocationId: "inv-1", durationMs: 5 * MINUTE }),
+      row({ invocationId: "inv-2", durationMs: null }),
+    ]);
+    // Below `invocations`, the active figure is a floor rather than a total — the caller can say so
+    // instead of letting a partly-measured span read as complete.
+    expect(timing.invocations).toBe(2);
+    expect(timing.timedInvocations).toBe(1);
+  });
+
+  it("distinguishes nothing recorded from zero recorded", () => {
+    expect(ledgerTiming([]).invocations).toBe(0);
+    expect(ledgerTiming([row({ durationMs: 0 })]).invocations).toBe(1);
+  });
+});
+
+describe("wall time", () => {
+  /**
+   * The acceptance criterion that only a type can enforce: `attemptStartedAt` is rewritten on every
+   * resume, so any wall figure derived today is the LAST attempt's duration wearing wall time's
+   * name. The field does not exist, so no caller can render a wrong number — and this assertion
+   * fails the typecheck the moment someone adds one back without a per-attempt record.
+   */
+  it("is carried by no field on the timing type", () => {
+    expectTypeOf<LedgerTiming>().not.toHaveProperty("wallMs");
+    expectTypeOf<LedgerTiming>().not.toHaveProperty("lastAttemptMs");
+    expectTypeOf<LedgerTiming>().toEqualTypeOf<{
+      activeMs: number;
+      invocations: number;
+      timedInvocations: number;
+      leadMs: number | undefined;
+      splitAmbiguous: boolean;
+    }>();
+    expect(Object.keys(ledgerTiming([row()])).sort()).toEqual([
+      "activeMs",
+      "invocations",
+      "leadMs",
+      "splitAmbiguous",
+      "timedInvocations",
+    ]);
+  });
+});

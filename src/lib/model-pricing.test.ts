@@ -8,7 +8,9 @@
 import { describe, expect, it } from "vitest";
 import {
   costOf,
+  isMissingPriceEntry,
   isPriced,
+  isPricedFor,
   MODEL_PRICES,
   parse9RouterPricing,
   PRICES_AS_OF,
@@ -214,6 +216,91 @@ describe("costOf", () => {
     // reported, because a gateway makes that figure a claim about a model name and nothing more.
     const counts = { ...OPUS_RUN, costUsd: 999 } as never;
     expect(costOf("claude-opus-5", counts)).toBe(costOf("claude-opus-5", OPUS_RUN));
+  });
+});
+
+describe("isPricedFor", () => {
+  it("agrees with costOf: a gateway rate missing the cache component is not a price for a row that used it", () => {
+    // A 9Router entry that reports input/output but not `cached` — costOf then refuses to guess a
+    // cache-read price, so this row is genuinely unpriced, not merely unmeasured (PR #320 review).
+    const gatewayPricing = {
+      endpointHost: "router.example.com",
+      prices: parse9RouterPricing({ cheap: { "shared-model": { input: 1, output: 2 } } }),
+    };
+    const withCacheRead = { cacheReadInputTokens: 1_000_000 };
+
+    expect(
+      costOf("cheap/shared-model", withCacheRead, "router.example.com", gatewayPricing),
+    ).toBeUndefined();
+    expect(
+      isPricedFor("cheap/shared-model", withCacheRead, "router.example.com", gatewayPricing),
+    ).toBe(false);
+  });
+
+  it("still says priced when the row never used the missing cache component", () => {
+    const gatewayPricing = {
+      endpointHost: "router.example.com",
+      prices: parse9RouterPricing({ cheap: { "shared-model": { input: 1, output: 2 } } }),
+    };
+
+    expect(
+      isPricedFor(
+        "cheap/shared-model",
+        { inputTokens: 1_000_000 },
+        "router.example.com",
+        gatewayPricing,
+      ),
+    ).toBe(true);
+  });
+
+  it("says unpriced for a model with no price entry at all, regardless of counts", () => {
+    expect(isPricedFor("glm-4.6", {})).toBe(false);
+  });
+
+  it("says priced for a fully-priced built-in model, cache counts included", () => {
+    expect(
+      isPricedFor("claude-opus-5", {
+        inputTokens: 1_000_000,
+        cacheReadInputTokens: 1_000_000,
+        cacheCreationInputTokens: 1_000_000,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("isMissingPriceEntry", () => {
+  it("is not a price-table gap when a known model's transport is merely unrouted", () => {
+    // A null endpointHost may be an unbilled subscription call — the model itself is one anton
+    // already prices, so the fix belongs nowhere; the unknown fact is the billing mode, not the
+    // rate (PR #320 review).
+    expect(isMissingPriceEntry("claude-opus-5", {}, null)).toBe(false);
+  });
+
+  it("is still a gap when the model has no price entry at all, even unrouted", () => {
+    expect(isMissingPriceEntry("glm-4.6", {}, null)).toBe(true);
+  });
+
+  it("is a gap for a model with no price entry over a real route", () => {
+    expect(isMissingPriceEntry("glm-4.6", {})).toBe(true);
+  });
+
+  it("is a gap when a resolved price is missing a component the row used", () => {
+    const gatewayPricing = {
+      endpointHost: "router.example.com",
+      prices: parse9RouterPricing({ cheap: { "shared-model": { input: 1, output: 2 } } }),
+    };
+    expect(
+      isMissingPriceEntry(
+        "cheap/shared-model",
+        { cacheReadInputTokens: 1_000_000 },
+        "router.example.com",
+        gatewayPricing,
+      ),
+    ).toBe(true);
+  });
+
+  it("is not a gap once the row is actually priced", () => {
+    expect(isMissingPriceEntry("claude-opus-5", { inputTokens: 1_000_000 })).toBe(false);
   });
 });
 

@@ -66,6 +66,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     attemptStartedAt: secDate(NOW - 4 * HOUR),
     endedAt: null,
     updatedAt: secDate(NOW - 4 * HOUR),
+    delivered: true,
     ...o,
   };
 }

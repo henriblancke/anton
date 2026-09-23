@@ -299,6 +299,9 @@ async function finishRun(
   await updateRun(db, clock, runId, {
     status: "done",
     endedAt: clock.now(),
+    // `targetRetired` opens no PR (nothing was committed) — the feature ledger's delivery evidence
+    // must not read this settle as one (PR #320 review). See the column's own note.
+    delivered: !targetRetired,
     error:
       [timeoutNotice, retiredNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") ||
       null,
