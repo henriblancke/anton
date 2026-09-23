@@ -550,13 +550,20 @@ process.exit(0);
     };
   }
 
-  const run = (report: ThreadOutcome[], threads: ReviewThread[], pushed: boolean) =>
+  const run = (
+    report: ThreadOutcome[],
+    threads: ReviewThread[],
+    gitPushed: boolean,
+    opts: { boardChanged?: boolean; mixedBoardOnly?: boolean } = {},
+  ) =>
     applyThreadOutcomes({
       repo: sandbox,
       number: 7,
       pr: pr(threads),
       report,
-      pushed,
+      gitPushed,
+      boardChanged: opts.boardChanged ?? false,
+      mixedBoardOnly: opts.mixedBoardOnly ?? false,
       signal: new AbortController().signal,
       logPath: join(sandbox, "session.log"),
     });
@@ -620,6 +627,28 @@ process.exit(0);
 
     expect(ghCalls()).toEqual([]);
   });
+
+  it("honors a board-only 'fixed' claim in a pure board-only run", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "reassigned via bd" }], [thread()], false, {
+      boardChanged: true,
+    });
+
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
+
+  it(
+    "posts no reaction (and no reply) for a 'fixed' claim backed only by a board change in a " +
+      "MIXED board+git run — an epic with both a delivery:board ticket and an ordinary one, whose " +
+      "board write cannot be told apart from a thread the ordinary ticket still needs a git fix for",
+    async () => {
+      await run([{ id: "RT_1", outcome: "fixed", reply: "reassigned via bd" }], [thread()], false, {
+        boardChanged: true,
+        mixedBoardOnly: true,
+      });
+
+      expect(ghCalls()).toEqual([]);
+    },
+  );
 
   it("a reaction failure is best-effort — the reply still lands and the run stays green", async () => {
     process.env.ANTON_TEST_FAIL_REACTIONS = "1";

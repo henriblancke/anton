@@ -112,7 +112,7 @@ import { IN_REVIEW, tryList } from "./review-fix-board";
 import { safe } from "./safe";
 import { finalizeMergedEpic, stampConfirmedClosures } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
-import { boardEvidence } from "./execute-epic-board-evidence";
+import { boardEvidence, type BoardFingerprint } from "./execute-epic-board-evidence";
 import { defaultReadBoardFingerprint, defaultSyncBoard } from "./review-gate";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -798,6 +798,12 @@ async function runFixSession(args: {
   // terminal hits the SAME gateway this fix session does, even if settings drift mid-run.
   ctx.report({ sessionId, cwd: worktree.path, routing: claudeRouting(settings) });
 
+  // Hoisted out of the try below (mirrors review-gate.ts's self-review path, PR #284 review,
+  // "Preserve board evidence after post-sync failures") so the catch's failure audit can diff
+  // against the SAME baseline the try read, rather than losing it to block scope the moment
+  // anything after the board write throws.
+  let boardBefore: BoardFingerprint | undefined;
+
   try {
     // A resume can land here with the fix already committed on the branch — an operator resolving
     // what a red gate named (a migration re-stamp, say) and hitting resume rather than a fresh
@@ -847,7 +853,7 @@ async function runFixSession(args: {
     // worktree's git state can never show it. Read before dispatch and refused fail-closed when
     // unreadable — dispatching anyway risks the fixer making board writes this session could never
     // tell apart from no progress at all.
-    const boardBefore = boardOnly ? await defaultReadBoardFingerprint(repo, epic.id) : undefined;
+    boardBefore = boardOnly ? await defaultReadBoardFingerprint(repo, epic.id) : undefined;
     if (boardOnly && !boardBefore) {
       throw new PoisonError(
         `the review fix for ${epic.id} could not read a board-only baseline for PR #${number} — ` +
@@ -960,7 +966,9 @@ async function runFixSession(args: {
       number,
       pr,
       report: parseThreadReport(result.text),
-      pushed,
+      gitPushed,
+      boardChanged,
+      mixedBoardOnly,
       signal: ctx.signal,
       logPath,
     });
@@ -992,13 +1000,52 @@ async function runFixSession(args: {
     return true;
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");
+    // Board evidence audit-on-failure (mirrors review-gate.ts's self-review path, PR #284 review,
+    // "Preserve board evidence after post-sync failures"): a board-only fixer writes straight to the
+    // LIVE board, confirmed synced above before anything else runs — so a failure past that point
+    // (the verify gate, the git commit/push) leaves a real, published repair standing on the shared
+    // board with nothing here to say so. A plain retry takes a FRESH baseline that already contains
+    // that write, sees no delta of its own, and neither credits the repair nor resolves its review
+    // thread. Re-diffing against the baseline this session actually read — rather than trusting the
+    // thrown error's own wording — is what tells a genuine board write apart from an ordinary failure
+    // that never touched the board at all; only the former parks.
+    let effective = e;
+    if (boardOnly && boardBefore) {
+      const boardOnFailure = await defaultReadBoardFingerprint(repo, epic.id);
+      // An unreadable failure-audit read is poisoned, never read as proof the board is unchanged —
+      // the same fail-closed rule the pre-fix baseline and post-fix "after" reads already follow
+      // above. Folding a read failure into "no board change" would let a fixer that mutated the
+      // board and then failed escape as an ordinary retryable failure, and a resumed attempt's
+      // fresh baseline would silently absorb the unreviewed write before anyone looked at it.
+      if (!boardOnFailure) {
+        effective = new PoisonError(
+          `the review fix for ${epic.id} FAILED and the post-failure board audit could not be read ` +
+            `for PR #${number} — refusing to treat this as no board change: the fixer may have ` +
+            `written directly to the live board before failing, and without this read that write can ` +
+            `never be told apart from no progress. Inspect and repair the board by hand, then resume. ` +
+            `The fixer itself failed with: ${String(e)}`,
+        );
+      } else {
+        const changedOnFailure = boardEvidence(boardBefore, boardOnFailure);
+        if (changedOnFailure.length > 0) {
+          effective = new PoisonError(
+            `the review fix for ${epic.id} FAILED after writing directly to the board for PR ` +
+              `#${number} — bead(s) ${changedOnFailure.join(", ")} changed and cannot be safely ` +
+              `auto-reverted. Parked instead of retried — a retry could read that state as this ` +
+              `attempt's own unverified fix and count it as progress, or a resumed attempt's fresh ` +
+              `baseline could silently absorb it before anyone reviews it. Inspect and repair the ` +
+              `board by hand, then resume. The fixer itself failed with: ${String(e)}`,
+          );
+        }
+      }
+    }
     // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say
     // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
     // only a stale badge, not why anton stopped (anton-gvqk3).
-    if (isPoisonError(e)) {
-      await notifyGateParked({ repo, number, error: e, conflicts, signal: ctx.signal });
+    if (isPoisonError(effective)) {
+      await notifyGateParked({ repo, number, error: effective, conflicts, signal: ctx.signal });
     }
-    throw e; // propagate so the runner applies quota backoff / retry / park
+    throw effective; // propagate so the runner applies quota backoff / retry / park
   }
 }
 
@@ -1187,7 +1234,9 @@ export async function applyThreadOutcomes(args: {
   number: number;
   pr: PrReview;
   report: ThreadOutcome[];
-  pushed: boolean;
+  gitPushed: boolean;
+  boardChanged: boolean;
+  mixedBoardOnly: boolean;
   signal: AbortSignal;
   logPath: string;
 }): Promise<void> {
@@ -1196,14 +1245,27 @@ export async function applyThreadOutcomes(args: {
     const thread = waiting.find((t) => t.id === item.id);
     const anchor = thread?.comments[0];
     if (!thread || !anchor) continue;
-    if (fabricatedFix(item, args.pushed)) continue;
+    if (fabricatedFix(item, args.gitPushed, args.boardChanged, args.mixedBoardOnly)) continue;
     await recordThreadOutcome(args, thread, anchor.id, item);
   }
 }
 
-/** A "fixed" claim with nothing pushed behind it — left untouched rather than answered. */
-const fabricatedFix = (item: ThreadOutcome, pushed: boolean): boolean =>
-  item.outcome === "fixed" && !pushed;
+/**
+ * A "fixed" claim with nothing pushed behind it — left untouched rather than answered. Git and
+ * board progress are tracked separately (PR #284 review, "Keep board progress separate from Git
+ * progress") because an epic can carry both a `delivery:board` ticket and an ordinary one: a
+ * `boardChanged` write is only proof for the threads that ticket owns, and in a MIXED run there is
+ * no per-thread way to tell those apart from ones an ordinary ticket's fix still needs a real git
+ * change to resolve. So a board-only edit only counts as "pushed" when every thread in the run
+ * could legitimately be its deliverable — i.e. NOT mixed; a mixed run requires `gitPushed` itself
+ * before honoring any "fixed" claim.
+ */
+const fabricatedFix = (
+  item: ThreadOutcome,
+  gitPushed: boolean,
+  boardChanged: boolean,
+  mixedBoardOnly: boolean,
+): boolean => item.outcome === "fixed" && !(gitPushed || (boardChanged && !mixedBoardOnly));
 
 /** Reply on the thread, resolve it when the fix landed, and log what was said. */
 async function recordThreadOutcome(
