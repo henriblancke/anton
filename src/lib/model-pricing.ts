@@ -195,6 +195,39 @@ export function isPriced(model: string | null | undefined): boolean {
 }
 
 /**
+ * The price table entry a row's billing route resolves to — the same branch {@link costOf} uses
+ * internally, pulled out so a caller can ask "is this priced" without also needing counts to ask it.
+ */
+function resolvePrice(
+  model: string | null | undefined,
+  endpointHost: string | null | undefined,
+  gatewayPricing: GatewayPricing | undefined,
+): ModelPrice | undefined {
+  return endpointHost === undefined
+    ? priceOf(model)
+    : endpointHost === null
+      ? undefined
+      : endpointHost === "api.anthropic.com"
+        ? priceOf(model)
+        : gatewayPricing?.endpointHost === endpointHost
+          ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
+          : undefined;
+}
+
+/**
+ * Whether anton has a price for this row's model and routing — independent of whether the row
+ * measured any counts. Lets a caller tell "no price for this model" apart from "priced, but nothing
+ * was measured", which {@link costOf}'s single `undefined` collapses (PR #320 review).
+ */
+export function isPricedFor(
+  model: string | null | undefined,
+  endpointHost?: string | null,
+  gatewayPricing?: GatewayPricing,
+): boolean {
+  return resolvePrice(model, endpointHost, gatewayPricing) !== undefined;
+}
+
+/**
  * The measured counts one ledger row carries. Structural and all-optional, so it takes a row, a
  * {@link import("./claude/model-usage").ModelUsageEntry}, or a test fixture — and so an absent
  * count is distinguishable from a zero one.
@@ -261,15 +294,7 @@ export function costOf(
   // Persisted rows always carry `null` or a host. Null means the CLI used its default transport,
   // whose billing mode (subscription vs API key) is unknown; do not invent a charge. A supplied
   // gateway table is therefore an explicit, caller-owned rate snapshot, never an implicit lookup.
-  const price = endpointHost === undefined
-    ? priceOf(model)
-    : endpointHost === null
-      ? undefined
-      : endpointHost === "api.anthropic.com"
-        ? priceOf(model)
-        : gatewayPricing?.endpointHost === endpointHost
-          ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
-          : undefined;
+  const price = resolvePrice(model, endpointHost, gatewayPricing);
   if (!price || !hasAnyCount(counts)) return undefined;
 
   const input = count(counts.inputTokens);

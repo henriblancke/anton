@@ -220,6 +220,28 @@ describe("rule 1 — unpriced is tokens-only, never free", () => {
     expect(ledgerTotals(rows).unpricedModels).toEqual(["glm-4.6", "kimi-k2"]);
   });
 
+  it("does not name a PRICED model whose row simply measured no counts", () => {
+    // A crashed invocation: opus is a model anton prices just fine, but this row reported no counts
+    // at all, so `costOf` is undefined for a reason that has nothing to do with the price table —
+    // naming opus here would wrongly tell the UI to add a model it already knows how to price.
+    const rows = [
+      row({
+        invocationId: "i1",
+        modelReported: "claude-opus-5",
+        inputTokens: null,
+        outputTokens: null,
+        thinkingTokens: null,
+        cacheReadInputTokens: null,
+        cacheCreationInputTokens: null,
+        durationMs: null,
+        durationApiMs: null,
+        numTurns: null,
+      }),
+      row({ invocationId: "i2", modelReported: "glm-4.6", endpointHost: "gw.example.com" }),
+    ];
+    expect(ledgerTotals(rows).unpricedModels).toEqual(["glm-4.6"]);
+  });
+
   it("leaves an UNROUTED row unpriced — its billing mode is unknown, not free", () => {
     // `model-pricing`'s rule, and worth pinning here because it is the ordinary case: a null host
     // means the CLI used its default transport, which may be a subscription rather than API billing.

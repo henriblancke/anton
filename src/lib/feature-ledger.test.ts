@@ -116,6 +116,35 @@ describe("ledgerTiming on a run that parked overnight", () => {
   });
 });
 
+describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
+  // A review-fix session that answers PR feedback but lands no new delivery of its own — real work,
+  // but not part of what produced the delivery it followed.
+  const rows = [
+    row({ invocationId: "inv-1", recordedAt: new Date("2026-09-20T09:10:00Z"), durationMs: 10 * MINUTE }),
+    row({
+      invocationId: "inv-2",
+      step: "review-fix",
+      recordedAt: new Date("2026-09-20T10:20:00Z"),
+      durationMs: 20 * MINUTE,
+    }),
+  ];
+  const deliveredAt = Date.parse("2026-09-20T09:30:00Z");
+
+  it("excludes the post-delivery invocation from activeMs, but still counts it as timed", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(10 * MINUTE);
+    expect(timing.timedInvocations).toBe(2);
+    expect(timing.invocations).toBe(2);
+    expect(timing.leadMs).toBe(30 * MINUTE);
+  });
+
+  it("does not let post-delivery work eat into waitingMs", () => {
+    // Without the fix, activeMs would total 30min — equal to leadMs — reporting ZERO waiting and
+    // hiding the 20 real minutes the scope spent parked before delivery.
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(20 * MINUTE);
+  });
+});
+
 describe("firstInvocationStartMs with an unmeasured invocation", () => {
   it("refuses rather than reporting a later invocation's start as the origin", () => {
     // inv-1 crashed before reporting a duration (durationMs: null, the shape

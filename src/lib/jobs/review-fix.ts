@@ -655,8 +655,11 @@ async function runFixSession(args: {
         settings,
         ctx.signal,
       );
-      await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
+      // Persist the push BEFORE the fallible notification below — a delivery that reached the
+      // remote must count toward lead-time/repair weighting even if notifyReReview never returns
+      // (network stall, process kill) (PR #320 review).
       await endSession(db, clock, sessionId, "done", pushed);
+      await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
       return pushed;
     }
 
@@ -750,6 +753,10 @@ async function runFixSession(args: {
       return false;
     }
 
+    // Persist the push BEFORE the fallible notification below — a delivery that reached the
+    // remote must count toward lead-time/repair weighting even if notifyReReview never returns
+    // (network stall, process kill) (PR #320 review).
+    await endSession(db, clock, sessionId, "done", true);
     await notifyReReview({
       repo,
       number,
@@ -757,7 +764,6 @@ async function runFixSession(args: {
       reasons: verdict.reasons,
       signal: ctx.signal,
     });
-    await endSession(db, clock, sessionId, "done", true);
     return true;
   } catch (e) {
     await endSession(db, clock, sessionId, "failed");

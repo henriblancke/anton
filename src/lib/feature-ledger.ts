@@ -92,7 +92,7 @@ import {
   type InvocationDimensionRow,
   type InvocationFact,
 } from "./model-divergence";
-import { costOf, type GatewayPricing, type TokenCounts } from "./model-pricing";
+import { costOf, isPricedFor, type GatewayPricing, type TokenCounts } from "./model-pricing";
 
 /** The phases a feature's recorded spend splits into. */
 export const LEDGER_PHASES = ["implement", "self-review", "describe", "pr-fix", "overhead"] as const;
@@ -239,14 +239,19 @@ export interface LedgerTiming {
   /**
    * What claude worked, summed over INVOCATIONS — never over rows. See {@link activeMs} for why the
    * distinction is load-bearing rather than pedantic.
+   *
+   * Excludes an invocation that ENDED after {@link leadMs}'s delivery — that work is real but sits
+   * outside this span, and counting it would let `waitingMs` (lead − active) understate, or falsely
+   * zero, how long the scope actually waited. {@link timedInvocations} still counts it.
    */
   activeMs: number;
   /** Invocations folded. `0` is an empty scope, which the caller reports as nothing-recorded. */
   invocations: number;
   /**
-   * How many of those actually reported a duration. Below {@link invocations} the active figure is
-   * a FLOOR, not a total — the same discipline as `spend-breakdown`'s priced/unpriced counts, so a
-   * partly-measured span can say so instead of quietly reading as complete.
+   * How many of those actually reported a duration — including one excluded from {@link activeMs}
+   * for having ended after delivery. Below {@link invocations} the active figure is a FLOOR, not a
+   * total — the same discipline as `spend-breakdown`'s priced/unpriced counts, so a partly-measured
+   * span can say so instead of quietly reading as complete.
    */
   timedInvocations: number;
   /**
@@ -403,8 +408,15 @@ export function ledgerTiming(
   for (const fact of facts) {
     const duration = invocationDuration(fact.rows);
     if (duration === undefined) continue;
-    active += duration;
     timed += 1;
+    // An invocation that ENDED after the scope's last delivery did not go into producing it — a
+    // review-fix session that answers feedback but lands no new delivery, say. Folding its duration
+    // into `active` would let it outrun `leadMs` below, so `waitingMs` (lead − active) understates —
+    // or falsely zeroes — how long the scope actually waited (PR #320 review). Only PROVEN-later
+    // invocations are excluded: one with no recorded end stays in, same as `firstInvocationStartMs`
+    // refusing to guess in the other direction.
+    if (deliveredAtMs !== undefined && (recordedAtMs(fact.rows) ?? -Infinity) > deliveredAtMs) continue;
+    active += duration;
   }
 
   return {
@@ -599,9 +611,14 @@ function accumulate(
     const cost = costOf(row.modelReported, row, row.endpointHost, gatewayPricing);
     if (cost === undefined) {
       into.unpricedRows += 1;
-      // Only a NAMED model is worth reporting back — a row with no model names nothing to add.
+      // `costOf` is also undefined when a PRICED model simply measured no counts (a crashed
+      // invocation) — that row genuinely has no price problem, so only a model anton actually has no
+      // price FOR belongs in this list (PR #320 review). Only a NAMED model is worth reporting back —
+      // a row with no model names nothing to add.
       const model = row.modelReported?.trim();
-      if (model) unpricedModels.set(model, (unpricedModels.get(model) ?? 0) + 1);
+      if (model && !isPricedFor(row.modelReported, row.endpointHost, gatewayPricing)) {
+        unpricedModels.set(model, (unpricedModels.get(model) ?? 0) + 1);
+      }
       continue;
     }
     into.pricedRows += 1;
