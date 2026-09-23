@@ -178,8 +178,10 @@ export const runs = sqliteTable("runs", {
   // (`finishRun`'s `targetRetired`, `settleRetiredStandalone`'s recovery-idempotent twin). The
   // feature ledger (`listDeliveriesByBead`) needs this: without it, a no-op retirement settle reads
   // as delivery evidence and hands the feature a `leadMs` ending at bookkeeping that shipped nothing
-  // (PR #320 review). Defaults true so every row written before this column existed — all of them
-  // genuine deliveries, since the no-op path is what introduced the gap — keeps reading as one.
+  // (PR #320 review). Defaults true for the common case — a row written before this column existed
+  // is almost always a genuine delivery — but the no-op retirement path predates this column too
+  // (anton-5bpd, #238), so the migration that adds it also backfills the retirement rows it can
+  // still identify back to `false` (see drizzle/0053_run_delivered.sql).
   delivered: integer("delivered", { mode: "boolean" }).notNull().default(true),
 }, (table) => [
   // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
