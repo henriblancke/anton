@@ -74,7 +74,7 @@ export function useBoardPoll(slug: string, initialBoard: Board | null): BoardPol
       let unconditional = force;
       for (;;) {
         const writeSeq = writeSeqRef.current;
-        const read = await readBoard(slug, unconditional ? undefined : versionRef.current);
+        const read = await readBoard(slug, unconditional ? undefined : versionRef.current, signal);
         if (!read.ok) {
           if (!signal?.aborted) setLoadError(read.message);
         } else if (
@@ -229,10 +229,10 @@ type BoardRead = { ok: true; board: Board | undefined } | { ok: false; message: 
  * straight path — no state written from a catch, and none written from a functional updater, which
  * React may replay or discard. Omitting the version forces a full read.
  */
-async function readBoard(slug: string, version: string | undefined): Promise<BoardRead> {
+async function readBoard(slug: string, version: string | undefined, signal?: AbortSignal): Promise<BoardRead> {
   const suffix = version === undefined ? "" : `?version=${encodeURIComponent(version)}`;
   try {
-    const res = await fetch(`/api/projects/${slug}/board${suffix}`);
+    const res = await fetch(`/api/projects/${slug}/board${suffix}`, { signal });
     if (res.status === 304) return { ok: true, board: undefined };
     if (!res.ok) return { ok: false, message: `Failed to load board (${res.status})` };
     const data = (await res.json()) as { board: Board };

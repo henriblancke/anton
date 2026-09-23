@@ -4,7 +4,7 @@
  * findings, the worst review score, the patrol's applied actions, and the codebase scan trend —
  * assembled for the read-only report at `/projects/[slug]/health`.
  *
- * This composes {@link getBoard}'s existing reads and {@link openEscalations} rather than re-deriving
+ * This composes {@link getBoardHealth}'s existing reads and {@link openEscalations} rather than re-deriving
  * anything: bead filtering and the epic/card assembly stay owned by lib/board.ts, severity and order
  * stay owned by {@link rankAttention} (lib/attention.ts), and the trend math stays owned by
  * lib/review-trajectory.ts and lib/scan-health.ts. This module only decides what a page needs out of
@@ -24,7 +24,7 @@
 import { rankAttention, type AttentionItem } from "./attention";
 import { currentBreaker } from "./autopilot-state";
 import type { AutopilotBreaker } from "./autopilot-breaker";
-import { getBoard } from "./board";
+import { getBoardHealth } from "./board";
 import { serverBuildDrifts, type ServerDrift } from "./build/drift";
 import { dismissedEscalations, openEscalations } from "./escalations";
 import { unwatchedParksForProject } from "./unwatched-parks";
@@ -161,9 +161,9 @@ export interface HealthAlerts {
 }
 
 /**
- * UI read path. Goes through {@link getBoard} rather than reading hygiene/scan-health directly, so a
+ * UI read path. Goes through {@link getBoardHealth} rather than reading hygiene/scan-health directly, so a
  * failed anton.db read degrades to "never patrolled"/"never scanned" the same way the board itself
- * does (getBoard logs and returns undefined) instead of taking this page down with it. The board
+ * does (the shared report readers log and return undefined) instead of taking this page down with it. The board
  * read, the escalation read, the build-drift read and the picker's two records are independent, so
  * they run concurrently.
  */
@@ -181,7 +181,7 @@ export async function getProjectHealth(project: Project): Promise<ProjectHealth>
   });
 
   const [board, escalations, dismissed, parks, staleServers, starts, verdicts] = await Promise.all([
-    getBoard(project),
+    getBoardHealth(project),
     openEscalations(project.id),
     dismissedEscalations(project.id),
     unwatchedParksForProject(project.id),

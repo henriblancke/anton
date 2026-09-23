@@ -35,9 +35,11 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     throw new Error(`Epic not found: ${epicId}`);
   }
   // Serve the contract off the snapshot bead; only a description the list dropped costs a `bd show`.
-  const full = await ensureDescription(project.repoPath, lite);
-  const run = await openRunFor(project, epicId);
-  const base = await githubBaseUrl(project.repoPath);
+  const [full, run, base] = await Promise.all([
+    ensureDescription(project.repoPath, lite),
+    openRunFor(project, epicId),
+    githubBaseUrl(project.repoPath),
+  ]);
   const parentEpic = parentEpicOf(lite, all);
 
   // A RUN TARGET reports the whole working-layer subtree it ships (runTickets) rather than one
@@ -70,7 +72,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     return { epic, description: full.description, tickets: [self], edges: [], run, parentEpic };
   }
 
-  const tickets = childBeads.map(toTicket);
+  const tickets = childBeads.map((bead) => toTicket(bead));
 
   // The epic-detail header shows the epic's own agent/risk/size chips (like the board card and the
   // single-ticket pseudo-epic) so an epic with risk:/size: labels doesn't silently drop them. See

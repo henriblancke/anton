@@ -1,5 +1,6 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
@@ -18,7 +19,7 @@ import { ErrorState } from "@/components/ui/error-state";
 import { cn } from "@/lib/utils";
 import { agentDotClass } from "@/components/board/board-utils";
 import { AbandonedChip, RelativeTime } from "@/components/atoms";
-import { TicketDialog } from "@/components/ticket/ticket-dialog";
+
 import { CopyButton } from "@/components/ui/copy-button";
 import { TicketsFilters } from "@/components/tickets/tickets-filters";
 import {
@@ -28,6 +29,10 @@ import {
   ticketsQueryString,
   type TicketSort,
 } from "@/components/tickets/tickets-utils";
+
+const TicketDialog = dynamic(() =>
+  import("@/components/ticket/ticket-dialog").then((module) => module.TicketDialog),
+);
 
 export function TicketsView({
   slug,
@@ -140,14 +145,16 @@ export function TicketsView({
         </>
       )}
 
-      <TicketDialog
-        slug={slug}
-        ticketId={openTicketId}
-        open={openTicketId !== null}
-        onClose={() => setOpenTicketId(null)}
-        onSaved={() => setAttempt((n) => n + 1)}
-        onDeleted={() => setAttempt((n) => n + 1)}
-      />
+      {openTicketId !== null && (
+        <TicketDialog
+          slug={slug}
+          ticketId={openTicketId}
+          open={openTicketId !== null}
+          onClose={() => setOpenTicketId(null)}
+          onSaved={() => setAttempt((n) => n + 1)}
+          onDeleted={() => setAttempt((n) => n + 1)}
+        />
+      )}
     </div>
   );
 }
