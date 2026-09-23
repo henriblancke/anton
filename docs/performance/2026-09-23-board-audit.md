@@ -44,7 +44,7 @@ The benchmark opens the supplied SQLite snapshot read-only, backs it up into ano
 
 ## Host contention
 
-Read-only process inspection during validation also found **14 orphaned CPU stress loops**, each running for more than four days. One sample showed **563% combined CPU** and a **74 one-minute load average**. These processes belong to another session, outside Anton's request code. They are a separate contributor to local slowness and benchmark noise; termination requires the user's approval. The before/after figures above were collected before any cleanup of those processes.
+Read-only process inspection during validation also found **14 orphaned CPU stress loops**, each running for more than four days. One sample showed **563% combined CPU** and a **74 one-minute load average**. These processes belonged to another session, outside Anton's request code. After the user authorized cleanup, their identities were rechecked, all 14 received SIGTERM, and process-table verification confirmed they had exited. The before/after figures above were collected before that cleanup.
 
 ## Remaining costs and constraints
 
