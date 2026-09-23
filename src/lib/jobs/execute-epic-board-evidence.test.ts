@@ -1463,6 +1463,36 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
   );
 
   it(
+    "refuses to persist a confirmation for a still-OPEN standalone ticket when `bd history` is " +
+      "unreadable after every retry, rather than persisting an ambiguous `origin: undefined` " +
+      "(chatgpt-codex-connector, PR #284 review, 'Refuse to confirm when the origin history is " +
+      "unreadable') — a real prior closure that read could not see would otherwise be permanently " +
+      "unfenceable once the ticket closes, since `stampConfirmedClosures` would compare the missing " +
+      "origin against the real one, fail the mismatch forever, and never remove `stage:in-review`",
+    async () => {
+      showMock.mockResolvedValueOnce(bead("t-open-origin-fails", { status: "open" }));
+      historyMock.mockRejectedValueOnce(new Error("dolt offline"));
+      historyMock.mockRejectedValueOnce(new Error("dolt offline"));
+      historyMock.mockRejectedValueOnce(new Error("dolt offline"));
+      // No pending marker/baseline survives to clear on this fixture bead, so `confirmedSet: false`
+      // alone still routes through the retry-obligation write, which gets its own confirming push —
+      // primed here the same as every other test past this point in the file that reaches it.
+      pushMock.mockResolvedValueOnce("not-wired");
+      const ticket = bead("t-open-origin-fails", { status: "open" });
+      await expect(clearBoardEvidencePending("/repo", ticket, ["a"])).rejects.toThrow(
+        /t-open-origin-fails/,
+      );
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalledWith(
+        "/repo",
+        "t-open-origin-fails",
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+    },
+  );
+
+  it(
     "refuses to persist a confirmation for a CLOSED ticket when `bd history` succeeds but returns " +
       "no leading closed version (chatgpt-codex-connector, PR #284 review, 'Refuse fenceless " +
       "confirmation for closed tickets') — e.g. an imported/legacy closed bead with empty history — " +

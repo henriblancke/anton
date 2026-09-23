@@ -663,8 +663,16 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
               if (!read.read || read.closure === undefined) return false;
               closure = read.closure;
             }
+            // Still open (no closure yet): this write extends whatever unfenced confirmation `live`
+            // already carries, so its stored `origin` — the prior closure `stampConfirmedClosures`
+            // (review-fix-finalize.ts) will later compare against — must ride along too (chatgpt-
+            // codex-connector, PR #284 review, "Preserve the confirmation origin when extending
+            // evidence"). Dropping it here would replace `{ ids, origin }` with a bare `{ ids }`,
+            // erasing the identity that fence relies on and leaving a second-lifecycle standalone
+            // target's confirmation permanently unfenceable once it does close.
+            const origin = closure === undefined ? beads.confirmedBoardEvidenceOrigin(live) : undefined;
             const wrote = await mustPersist(() =>
-              beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure),
+              beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure, origin),
             );
             if (!wrote) return false;
             // A concurrent writer can close a still-open standalone unit between the `live` read

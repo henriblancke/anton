@@ -1224,6 +1224,7 @@ export async function clearBoardEvidencePending(
   // below rather than persist a fenceless confirmation.
   let closure: string | undefined;
   let origin: string | undefined;
+  let originUnreadable = false;
   const live = await mustRead(repo, ticketId);
   if (!live) {
     throw new PoisonEpic(
@@ -1262,16 +1263,27 @@ export async function clearBoardEvidencePending(
     // alongside it instead (chatgpt-codex-connector, PR #284 review, "Preserve the originating cycle
     // when stamping confirmations"): the ticket's last COMPLETED closure, if any, right now — the
     // identity `stampConfirmedClosures` (review-fix-finalize.ts) must later find unchanged, read
-    // fresh, immediately behind whatever closure it is about to fence this confirmation with. Best-
-    // effort: an unreadable history here just leaves `origin` unset, which only ever makes that LATER
-    // fence attempt more conservative — a stored `undefined` fails to match a real prior closure
-    // rather than falsely matching one — never less safe than skipping this read entirely.
+    // fresh, immediately behind whatever closure it is about to fence this confirmation with. NOT
+    // best-effort on a read failure (chatgpt-codex-connector, PR #284 review, "Refuse to confirm when
+    // the origin history is unreadable"): a `read.read === false` here is NOT the same signal as "no
+    // prior closure" — the ticket may well have one — so persisting `origin: undefined` after an
+    // exhausted retry would be indistinguishable from a genuinely fresh confirmation. A reopened
+    // ticket with a real prior closure then has that closure permanently unrecoverable: once merge
+    // closes the ticket, `stampConfirmedClosures` compares the stored (missing) origin against the
+    // real prior closure, the mismatch fails the fence forever, and no later pass ever removes
+    // `stage:in-review`. Leaving `originUnreadable` set skips the confirming write below entirely, the
+    // same as an exhausted `setBoardEvidenceConfirmed` retry — the pending marker/baseline survive for
+    // a later resume to retry this read, rather than land an ambiguous confirmation now.
     const read = await mustReadClosureVersion(repo, ticketId);
-    origin = read.read ? read.priorClosure : undefined;
+    if (read.read) {
+      origin = read.priorClosure;
+    } else {
+      originUnreadable = true;
+    }
   }
-  const confirmedSet = await mustPersist(() =>
-    beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure, origin),
-  );
+  const confirmedSet = originUnreadable
+    ? false
+    : await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure, origin));
   // A concurrent writer can still close the ticket between the live read above and the write just
   // above — that read narrows the race, it does not close it (chatgpt-codex-connector, anton-fc5x
   // review, "Recheck closure after writing the confirmation"). Left as `{ ids }` with no closure,

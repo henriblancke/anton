@@ -38,7 +38,10 @@ import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
 // rather than tolerating a failure — unmocked, that would exhaust its retries against a `bd` that can
 // never succeed at this fake path and poison every board-only fix test below. `beads.isBoardOnly` and
 // everything else stays real: only these four calls shell out.
-const setBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string, ids: readonly string[]) => Promise<string>>();
+const setBoardEvidenceConfirmedMock =
+  vi.fn<
+    (repo: string, id: string, ids: readonly string[], closure?: string, origin?: string) => Promise<string>
+  >();
 const boardPushMock = vi.fn<(repo: string) => Promise<string>>();
 const boardShowMock = vi.fn<(repo: string, id: string) => Promise<Bead>>();
 const boardHistoryMock = vi.fn<(repo: string, id: string) => Promise<import("../beads/bd").BeadVersion[]>>();
@@ -48,7 +51,7 @@ vi.mock("../beads/bd", async () => {
     ...actual,
     beads: {
       ...actual.beads,
-      setBoardEvidenceConfirmed: (...args: [string, string, readonly string[]]) =>
+      setBoardEvidenceConfirmed: (...args: [string, string, readonly string[], string?, string?]) =>
         setBoardEvidenceConfirmedMock(...args),
       push: (...args: [string]) => boardPushMock(...args),
       show: (...args: [string, string]) => boardShowMock(...args),
@@ -819,6 +822,64 @@ describe("runReviewGate — bounds", () => {
           { hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" },
         ]);
       }
+    },
+  );
+
+  it(
+    "preserves a still-open standalone ticket's stored confirmation `origin` when extending it with " +
+      "this round's evidence (chatgpt-codex-connector, PR #284 review, \"Preserve the confirmation " +
+      "origin when extending evidence\") — an open ticket in its second delivery lifecycle already " +
+      "carries the previous closure in `origin`; overwriting it with a bare `{ ids }` would erase the " +
+      "identity `stampConfirmedClosures` (review-fix-finalize.ts) later compares against, leaving the " +
+      "eventual merge close permanently unfenceable and the ticket stuck at `stage:in-review`",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      boardShowMock.mockResolvedValueOnce({
+        id: boardOnlyTicket.id,
+        status: "open",
+        title: "",
+        issue_type: "task",
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["prior-id"], origin: "prior-cycle-sha" }) },
+      });
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run } = fakeClaude([report(4, [BLOCKING]), "fixed it", report(9, [])]);
+      await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true,
+        },
+      });
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repos/anton",
+        boardOnlyTicket.id,
+        expect.any(Array),
+        undefined,
+        "prior-cycle-sha",
+      );
     },
   );
 
