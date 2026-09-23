@@ -1909,6 +1909,68 @@ describe(
       expect(setBoardEvidenceBaselineMock.mock.calls.length).toBe(setCallsBefore);
     });
 
+    it(
+      "clears orphaned locked/verified/dispatch-started flags before writing a fresh baseline when " +
+        "the preserved boardEvidenceBaseline itself is missing (chatgpt-codex-connector, PR #284 " +
+        "review, \"Clear orphaned lock flags before replacing a bad baseline\") — otherwise " +
+        "`preserveRecoveryBaseline` would read those stale flags straight off this ticket and no-op " +
+        "both the lock and verify writes for the NEW candidate, leaving the remote looking locked " +
+        "and verified without ever actually proving this candidate stable",
+      async () => {
+        const baseline = fingerprintBoard([bead("a")]);
+        const orphanedTicket = bead("t-orphan-flags", {
+          metadata: {
+            // Deliberately no `boardEvidenceBaseline` — this is the exact "unreadable/missing
+            // baseline with surviving companion flags" shape the fix targets.
+            boardEvidenceBaselineLocked: "1",
+            boardEvidenceBaselineVerified: "1",
+            boardEvidenceDispatchStarted: "1",
+          },
+        });
+        const clearCallsBefore = clearBoardEvidenceBaselineMock.mock.calls.length;
+        const setCallsBefore = setBoardEvidenceBaselineMock.mock.calls.length;
+        pushMock.mockResolvedValueOnce("synced"); // the orphan-clear's confirming push
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the fresh, unlocked persist
+        pushMock.mockResolvedValueOnce("synced"); // that persist's own confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // free-refresh loop's round 0 read: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
+        pushMock.mockResolvedValueOnce("synced"); // the lock's confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+        pushMock.mockResolvedValueOnce("synced"); // the verified-marking write's own confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // that push's own stability re-read: stable
+
+        const result = await ensureBoardBaselinePersisted("/repo", orphanedTicket, baseline);
+
+        expect(result).toEqual(baseline);
+        expect(clearBoardEvidenceBaselineMock.mock.calls.length).toBe(clearCallsBefore + 1);
+        expect(clearBoardEvidenceBaselineMock).toHaveBeenLastCalledWith("/repo", "t-orphan-flags");
+        // The orphan clear runs BEFORE any baseline write — a clear that landed after the fresh
+        // persist would already be too late for `preserveRecoveryBaseline`'s no-op check below.
+        const clearOrder = clearBoardEvidenceBaselineMock.mock.invocationCallOrder[clearCallsBefore]!;
+        const firstBaselineWriteOrder = setBoardEvidenceBaselineMock.mock.invocationCallOrder[setCallsBefore]!;
+        expect(clearOrder).toBeLessThan(firstBaselineWriteOrder);
+        // The fresh persist is unlocked (no `locked`/`verified` args) — the orphaned flags did not
+        // survive to mark it locked from birth.
+        expect(setBoardEvidenceBaselineMock).toHaveBeenNthCalledWith(
+          setCallsBefore + 1,
+          "/repo",
+          "t-orphan-flags",
+          Object.fromEntries(baseline.beads),
+        );
+        // Because the orphaned flags were cleared, `lockDispatchBaseline`'s own lock and verify
+        // writes actually ran instead of no-opping — the final write marks THIS candidate locked
+        // and verified for real.
+        expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-orphan-flags",
+          Object.fromEntries(baseline.beads),
+          true,
+          true,
+        );
+      },
+    );
+
     it("skips re-persisting the ORIGINAL baseline when the ticket already carries a preserved one, " +
       "but still reconfirms sync (chatgpt-codex-connector, PR #284 review, \"Reconfirm a preserved " +
       "baseline before dispatching a retry\") — and still locks it for dispatch, since an unlocked " +

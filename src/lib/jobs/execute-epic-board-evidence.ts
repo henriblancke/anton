@@ -486,6 +486,42 @@ export async function ensureBoardBaselinePersisted(
     const cleared = await mustPersist(() => beads.clearBoardEvidenceConfirmed(repo, ticket.id));
     if (!cleared) return null;
   }
+  // A missing or malformed `boardEvidenceBaseline` (`hadBaseline` false) whose locked/verified/
+  // dispatch-started companions survived it (chatgpt-codex-connector, PR #284 review, "Clear
+  // orphaned lock flags before replacing a bad baseline") is NOT a clean slate: `setBoardEvidenceBaseline`
+  // below only unsets the VERIFIED key it isn't itself setting, and `--metadata` MERGES rather than
+  // replaces, so a fresh unlocked baseline written on top would leave the orphaned LOCKED/DISPATCH_STARTED
+  // keys standing over content that was never locked or dispatched against. `preserveRecoveryBaseline`
+  // reads those keys straight off this same in-memory `ticket` snapshot, not off the content they
+  // describe — so `lockDispatchBaseline`'s own lock and verify writes for the NEW candidate would both
+  // read the orphaned flags as "already done" and no-op, leaving the remote looking locked/verified while
+  // never actually confirming this candidate stable. Clearing (and syncing) all four keys together — the
+  // same all-or-nothing reset {@link abandonDispatchBaseline} already uses — and patching this in-memory
+  // `ticket` to match closes that gap before the fresh baseline below is ever written.
+  const hasOrphanedLockFlags =
+    !hadBaseline &&
+    (beads.boardEvidenceBaselineLocked(ticket) ||
+      beads.boardEvidenceBaselineVerified(ticket) ||
+      beads.boardEvidenceDispatchStarted(ticket));
+  if (hasOrphanedLockFlags) {
+    const orphansCleared = await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticket.id));
+    if (!orphansCleared) return null;
+    const orphansSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!orphansSynced) return null;
+    ticket = {
+      ...ticket,
+      metadata: {
+        ...ticket.metadata,
+        boardEvidenceBaseline: undefined,
+        boardEvidenceBaselineLocked: undefined,
+        boardEvidenceBaselineVerified: undefined,
+        boardEvidenceDispatchStarted: undefined,
+      },
+    };
+  }
   if (!hadBaseline) {
     const persisted = await mustPersist(() =>
       beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(baseline)),
