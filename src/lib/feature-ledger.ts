@@ -57,6 +57,29 @@
  * rule as `spend-breakdown`'s unpriced-is-not-zero — nothing here derives a number it cannot stand
  * behind.
  *
+ * ## Totals — three honesty rules, and what each of them refuses to do
+ *
+ * {@link ledgerTotals} folds the rows into one {@link PhaseTotals} per phase. Two of its rules are
+ * inherited verbatim from `spend-breakdown`, and the third is new here:
+ *
+ *  - An unpriced model is TOKENS-ONLY, never free. A bucket anton could price nothing in reports its
+ *    tokens and `usd: undefined`; a partly-priced one reports the dollars it has beside a non-zero
+ *    `unpricedRows`, so a floor cannot read as a total.
+ *  - Nothing recorded is EMPTY, not zero. An empty scope returns `recorded: false` and NO phases.
+ *    "We measured nothing" and "we measured zero spend" are opposite facts about a feature.
+ *  - **Cost is never split proportionally.** *(new to this module)* Spend that classifies to no
+ *    phase lands whole in {@link LedgerTotals.unattributed}, and a scheduled pass's spend lands
+ *    whole in {@link LedgerTotals.overhead} — outside the feature's bill entirely (design §D4).
+ *    Neither is divided across the phases around it. A split looks precise and is not: it would
+ *    move real money onto phases that did not spend it, and the error is invisible afterwards
+ *    because the figures still add up. An unallocated bucket is a visible gap; a split is a lie
+ *    that survives into every cohort comparison.
+ *
+ * Pricing is per ROW, because the fact table's grain is (invocation, model) and each of those rows
+ * is billed at its own model's rates — an opus invocation's haiku sidecar costs haiku money. The
+ * MEASURES are per invocation (`duration_ms`, `duration_api_ms`, `num_turns`, `outcome` are all
+ * copied onto every row of one invocation), so the fold walks invocations and prices their rows.
+ *
  * Pure and dependency-free — no db, no node builtins, and the two union types below are imported
  * for their types only — so a server component, the fold and any later CLI share one definition
  * instead of three that drift. The DB reads stay with the caller: invocation rows from
@@ -64,7 +87,12 @@
  */
 import type { JobType } from "./jobs/queue";
 import type { BuiltinStepId } from "./jobs/step-ids";
-import { groupInvocations, type InvocationDimensionRow } from "./model-divergence";
+import {
+  groupInvocations,
+  type InvocationDimensionRow,
+  type InvocationFact,
+} from "./model-divergence";
+import { costOf, type GatewayPricing, type TokenCounts } from "./model-pricing";
 
 /** The phases a feature's recorded spend splits into. */
 export const LEDGER_PHASES = ["implement", "self-review", "describe", "pr-fix", "overhead"] as const;
@@ -228,26 +256,38 @@ export interface LedgerTiming {
   leadMs: number | undefined;
 }
 
-/** A duration a result reported, or 0 — absent and unreadable both contribute nothing. */
-function millis(value: number | null | undefined): number {
+/**
+ * A reported non-negative figure, or 0 — absent and unreadable both contribute nothing, the same
+ * reading as `model-pricing` and `spend-breakdown` give a count. Serves durations and token counts
+ * alike: an absent measure adds nothing, and every total below reports the row and invocation counts
+ * that say whether it is complete.
+ */
+function count(value: number | null | undefined): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 }
 
 /**
- * One invocation's duration, taken from whichever of its rows reported one.
+ * One invocation-level measure, taken from whichever of its rows reported one.
  *
- * The fact table's grain is (invocation, model) and `duration_ms` is an INVOCATION-level measure
- * copied onto each of those rows (`claude-invocations.ts` writes it into the shared half), so every
- * row of one invocation carries the same figure. Reading the first that reported one is therefore
- * the value, not a sample of several.
+ * The fact table's grain is (invocation, model) and these are INVOCATION-level measures copied onto
+ * each of those rows (`claude-invocations.ts` writes them into the shared half), so every row of one
+ * invocation carries the same figure. Reading the first that reported one is therefore the value,
+ * not a sample of several — and summing the rows instead would multiply it by the model count.
  */
-function invocationDuration(rows: readonly LedgerTimingRow[]): number | undefined {
+function invocationMeasure<Row extends LedgerTimingRow>(
+  rows: readonly Row[],
+  field: keyof Row & ("durationMs" | "durationApiMs" | "numTurns"),
+): number | undefined {
   for (const row of rows) {
-    if (typeof row.durationMs === "number" && Number.isFinite(row.durationMs) && row.durationMs >= 0) {
-      return row.durationMs;
-    }
+    const value = row[field];
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
   }
   return undefined;
+}
+
+/** One invocation's own duration. {@link invocationMeasure} on the field the timing half reads. */
+function invocationDuration(rows: readonly LedgerTimingRow[]): number | undefined {
+  return invocationMeasure(rows, "durationMs");
 }
 
 /** When an invocation's row was stamped — the moment it ENDED, in epoch ms. */
@@ -270,7 +310,7 @@ function recordedAtMs(rows: readonly LedgerTimingRow[]): number | undefined {
  */
 export function activeMs(rows: readonly LedgerTimingRow[]): number {
   let total = 0;
-  for (const fact of groupInvocations(rows)) total += millis(invocationDuration(fact.rows));
+  for (const fact of groupInvocations(rows)) total += count(invocationDuration(fact.rows));
   return total;
 }
 
@@ -292,7 +332,7 @@ export function firstInvocationStartMs(rows: readonly LedgerTimingRow[]): number
   for (const fact of groupInvocations(rows)) {
     const endedAt = recordedAtMs(fact.rows);
     if (endedAt === undefined) continue;
-    const startedAt = endedAt - millis(invocationDuration(fact.rows));
+    const startedAt = endedAt - count(invocationDuration(fact.rows));
     if (earliest === undefined || startedAt < earliest) earliest = startedAt;
   }
   return earliest;
@@ -369,4 +409,249 @@ function leadMs(startedAtMs: number | undefined, deliveredAtMs: number | undefin
  */
 export function waitingMs(timing: LedgerTiming): number | undefined {
   return timing.leadMs === undefined ? undefined : Math.max(0, timing.leadMs - timing.activeMs);
+}
+
+/**
+ * The counts one bucket's rows reported. Five, as the design names them — summed across ROWS, since
+ * the token counts are the one thing that genuinely varies per (invocation, model).
+ *
+ * There is no `total` field. A single tokens column is a DISPLAY choice (`spend-breakdown`'s
+ * `formatTokens` owns it) and computing one here would invite summing {@link thinking} into it.
+ */
+export interface LedgerTokens {
+  input: number;
+  output: number;
+  /**
+   * Inside {@link output}, never additional to it (see `model-pricing`'s header). Reported for
+   * completeness and NEVER added into anything — doing so double-charges every thinking model.
+   */
+  thinking: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/**
+ * What one bucket of the ledger cost: the money, the tokens behind it, and the measures that say
+ * what produced it.
+ *
+ * Every measure but the tokens is per INVOCATION, because that is the grain the driver measured
+ * them at: `duration_ms`, `duration_api_ms`, `num_turns` and `outcome` are invocation-level figures
+ * copied onto each of an invocation's per-model rows, so summing the rows would multiply each of
+ * them by however many models the invocation reported usage under.
+ */
+export interface PhaseTotals {
+  /**
+   * Invocations in this bucket — the design's name for the count. NOT ledger rows (there is one per
+   * model, so an opus invocation with a haiku sidecar writes two) and NOT `runs` table rows (one run
+   * dispatches many invocations across many phases).
+   */
+  runs: number;
+  tokens: LedgerTokens;
+  /**
+   * USD across the rows anton could price, or **undefined when it could price none of them** — never
+   * 0 for an unpriced bucket. With a non-zero {@link unpricedRows} beside it, this is a FLOOR.
+   */
+  usd: number | undefined;
+  /** Rows that produced no dollar figure: a model with no price, or an invocation that measured nothing. */
+  unpricedRows: number;
+  /** Rows that did produce one. Beside {@link unpricedRows} so a partial figure can say it is partial. */
+  pricedRows: number;
+  /** Ledger rows folded in. `pricedRows + unpricedRows`. */
+  rows: number;
+  /** What claude worked, summed over invocations. A floor when fewer reported a duration than `runs`. */
+  activeMs: number;
+  /** How much of {@link activeMs} the driver reported as API time — the rest is tool and hook time. */
+  apiMs: number;
+  turns: number;
+  /** Invocations claude itself reported as failed. Money spent without a result, kept countable. */
+  errors: number;
+}
+
+/**
+ * One scope's spend, bucketed. Nothing here is ever divided across buckets — see the header's third
+ * rule.
+ *
+ * An empty bucket is ABSENT rather than zeroed, one level down from {@link recorded}: a phase
+ * missing from {@link phases} recorded nothing, which is a different fact from a phase that spent
+ * zero, and a UI that iterates the map renders only what happened.
+ */
+export interface LedgerTotals {
+  /**
+   * Whether the ledger holds ANY row for this scope. `false` is the empty state and must render as
+   * "nothing recorded", never as `$0.00` — see the header's second rule.
+   */
+  recorded: boolean;
+  /** The feature's own phases, keyed by phase. Only phases that recorded something are present. */
+  phases: Map<LedgerPhase, PhaseTotals>;
+  /**
+   * What this scope spent: {@link phases} plus {@link unattributed}, which is money the scope really
+   * spent even though anton cannot say on what. Board-wide {@link overhead} is deliberately NOT in
+   * here (design §D4) — it is not this feature's bill.
+   */
+  totals: PhaseTotals;
+  /**
+   * Spend that classified to no phase, whole and undivided — `undefined` when there was none. A row
+   * lands here when its job type is one this anton no longer defines, when its job type declares it
+   * dispatches no claude, or when it predates `step_handler` and so records no handler to classify
+   * on. The bucket is the point: it is the visible remainder that a proportional split would hide.
+   */
+  unattributed: PhaseTotals | undefined;
+  /**
+   * The scheduled passes' spend, if any row in the scope carried one — reported against the project
+   * and never divided into the feature (design §D4). `undefined` when there was none, which is the
+   * ordinary case: a board-wide pass stamps no bead id.
+   */
+  overhead: PhaseTotals | undefined;
+  /** Ledger rows folded, across every bucket. */
+  rows: number;
+  /**
+   * The distinct model ids anton has no price for, most-seen first — the actionable half of an
+   * incomplete total, as in `spend-breakdown`: it names what to add to the price table.
+   */
+  unpricedModels: string[];
+}
+
+/** The columns the totals fold reads: the timing dimensions, the handler, and the measured counts. */
+export interface LedgerTotalsRow extends LedgerTimingRow, TokenCounts {
+  /** The resolved handler the phase is classified on. See {@link LedgerPhaseRow}. */
+  stepHandler?: string | null;
+  /** A SUBSET of `outputTokens`, so it is reported and never added into a total. */
+  thinkingTokens?: number | null;
+  numTurns?: number | null;
+  durationApiMs?: number | null;
+}
+
+/** A bucket with nothing in it yet. Zeroed on purpose — it is only published once a row lands in it. */
+function emptyTotals(): PhaseTotals {
+  return {
+    runs: 0,
+    tokens: { input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite: 0 },
+    usd: undefined,
+    unpricedRows: 0,
+    pricedRows: 0,
+    rows: 0,
+    activeMs: 0,
+    apiMs: 0,
+    turns: 0,
+    errors: 0,
+  };
+}
+
+/** One row's token counts added into a bucket. Mutates; the caller owns the object. */
+function addTokens(into: LedgerTokens, row: LedgerTotalsRow): void {
+  into.input += count(row.inputTokens);
+  into.output += count(row.outputTokens);
+  into.thinking += count(row.thinkingTokens);
+  into.cacheRead += count(row.cacheReadInputTokens);
+  into.cacheWrite += count(row.cacheCreationInputTokens);
+}
+
+/**
+ * One whole invocation folded into one bucket: its rows' tokens and dollars, its own measures once.
+ *
+ * The bucket is chosen per INVOCATION rather than per row, because the phase is a property of what
+ * anton was doing and every row of one invocation shares those dimensions — while `duration_ms`,
+ * `num_turns` and `outcome` would each be multiplied by the invocation's model count if the fold
+ * walked rows.
+ */
+function accumulate(
+  into: PhaseTotals,
+  fact: InvocationFact<LedgerTotalsRow>,
+  gatewayPricing: GatewayPricing | undefined,
+  unpricedModels: Map<string, number>,
+): void {
+  into.runs += 1;
+  into.activeMs += count(invocationMeasure(fact.rows, "durationMs"));
+  into.apiMs += count(invocationMeasure(fact.rows, "durationApiMs"));
+  into.turns += count(invocationMeasure(fact.rows, "numTurns"));
+  if (fact.outcome === "error") into.errors += 1;
+
+  for (const row of fact.rows) {
+    addTokens(into.tokens, row);
+    into.rows += 1;
+    const cost = costOf(row.modelReported, row, row.endpointHost, gatewayPricing);
+    if (cost === undefined) {
+      into.unpricedRows += 1;
+      // Only a NAMED model is worth reporting back — a row with no model names nothing to add.
+      const model = row.modelReported?.trim();
+      if (model) unpricedModels.set(model, (unpricedModels.get(model) ?? 0) + 1);
+      continue;
+    }
+    into.pricedRows += 1;
+    into.usd = (into.usd ?? 0) + cost;
+  }
+}
+
+/** A bucket's figures added into the scope's total. The only summing done ACROSS buckets. */
+function mergeInto(into: PhaseTotals, from: PhaseTotals): void {
+  into.runs += from.runs;
+  into.tokens.input += from.tokens.input;
+  into.tokens.output += from.tokens.output;
+  into.tokens.thinking += from.tokens.thinking;
+  into.tokens.cacheRead += from.tokens.cacheRead;
+  into.tokens.cacheWrite += from.tokens.cacheWrite;
+  into.unpricedRows += from.unpricedRows;
+  into.pricedRows += from.pricedRows;
+  into.rows += from.rows;
+  into.activeMs += from.activeMs;
+  into.apiMs += from.apiMs;
+  into.turns += from.turns;
+  into.errors += from.errors;
+  // An unpriced bucket must not drag a priced total down to a sum that reads as complete, and it
+  // must not turn an all-unpriced total into 0 either: undefined + undefined stays undefined.
+  if (from.usd !== undefined) into.usd = (into.usd ?? 0) + from.usd;
+}
+
+/**
+ * Fold one scope's ledger rows into per-phase totals, under the header's three rules.
+ *
+ * `rows` is every `claude_invocations` row for the scope's beads (`ledgerScope`, feature-scope.ts).
+ * An empty list returns `recorded: false` with no phases and no buckets — not a set of zeroes.
+ *
+ * `gatewayPricing` is the caller's own rate snapshot for one routed endpoint, passed through to
+ * {@link costOf} unchanged. Without it a routed row is unpriced rather than guessed, which is what
+ * makes `unpricedRows` mean something.
+ */
+export function ledgerTotals(
+  rows: readonly LedgerTotalsRow[],
+  gatewayPricing?: GatewayPricing,
+): LedgerTotals {
+  const phases = new Map<LedgerPhase, PhaseTotals>();
+  const unpricedModels = new Map<string, number>();
+  let unattributed: PhaseTotals | undefined;
+  let overhead: PhaseTotals | undefined;
+
+  for (const fact of groupInvocations(rows)) {
+    // Every row of one invocation carries the same dimensions (they come from one `shared` object in
+    // `claude-invocations.ts`), so the first row classifies the whole invocation.
+    const phase = fact.rows[0] ? ledgerPhase(fact.rows[0]) : undefined;
+    let bucket: PhaseTotals;
+    if (phase === undefined) {
+      bucket = unattributed ??= emptyTotals();
+    } else if (isProjectLevelPhase(phase)) {
+      bucket = overhead ??= emptyTotals();
+    } else {
+      bucket = phases.get(phase) ?? emptyTotals();
+      phases.set(phase, bucket);
+    }
+    accumulate(bucket, fact, gatewayPricing, unpricedModels);
+  }
+
+  // The feature's own bill: its phases plus what could not be placed within them. Overhead stays
+  // out — §D4 — and is reported on its own field instead.
+  const totals = emptyTotals();
+  for (const bucket of phases.values()) mergeInto(totals, bucket);
+  if (unattributed) mergeInto(totals, unattributed);
+
+  return {
+    recorded: rows.length > 0,
+    phases,
+    totals,
+    unattributed,
+    overhead,
+    rows: rows.length,
+    unpricedModels: [...unpricedModels.entries()]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([model]) => model),
+  };
 }
