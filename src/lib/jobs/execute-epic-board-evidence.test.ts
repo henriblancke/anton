@@ -34,7 +34,9 @@ const clearBoardEvidenceCleanupUnsyncedMock = vi.fn<(repo: string, id: string) =
 // delivery ever happened") shells out to `bd update` too — mocked for the same reason the other
 // board-evidence writes above are.
 const setBoardEvidenceConfirmedMock =
-  vi.fn<(repo: string, id: string, ids?: readonly string[], closure?: string) => Promise<string>>();
+  vi.fn<
+    (repo: string, id: string, ids?: readonly string[], closure?: string, origin?: string) => Promise<string>
+  >();
 // The reopen-reset (PR #284 review, "Reset stale confirmations before a reopened delivery") shells
 // out to `bd update` too — mocked for the same reason the other board-evidence writes above are.
 const clearBoardEvidenceConfirmedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
@@ -98,7 +100,9 @@ clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
 clearBoardEvidenceConfirmedMock.mockResolvedValue("");
 // No closed history by default — every existing test's fixture bead is `status: "open"`, which
-// never reaches the closure read at all; the tests that DO care about it set their own fixture.
+// reaches the closure read only to capture an origin for the unfenced confirmation (empty history
+// means no prior cycle, so `origin` comes out `undefined` too); the tests that DO care about real
+// history set their own fixture.
 historyMock.mockResolvedValue([]);
 // `clearBoardEvidencePending`'s live status re-read (chatgpt-codex-connector, PR #284 review,
 // "Re-read status before allowing an unfenced confirmation") defaults to the same "open" status
@@ -1408,6 +1412,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-union-recover",
         ["a", "b", "c"],
         undefined,
+        undefined,
       );
     },
   );
@@ -1425,7 +1430,13 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       ]);
       const ticket = bead("t-closed-confirm", { status: "closed" });
       await clearBoardEvidencePending("/repo", ticket, ["a"]);
-      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "t-closed-confirm", ["a"], "close-sha");
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-closed-confirm",
+        ["a"],
+        "close-sha",
+        undefined,
+      );
     },
   );
 
@@ -1492,6 +1503,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "t-race-closed",
         ["a"],
         "race-close-sha",
+        undefined,
       );
     },
   );
@@ -1508,6 +1520,9 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       showMock.mockResolvedValueOnce(bead("t-race-after-write", { status: "open" }));
       // Second `mustRead` (the new post-write recheck) finds it closed by another writer.
       showMock.mockResolvedValueOnce(bead("t-race-after-write", { status: "closed" }));
+      // First `history` read is the still-open origin capture (no prior cycle); second is the
+      // post-write recheck's own closure lookup, once the race is discovered.
+      historyMock.mockResolvedValueOnce([]);
       historyMock.mockResolvedValueOnce([
         { hash: "after-write-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
       ]);
@@ -1518,6 +1533,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
         "/repo",
         "t-race-after-write",
         ["a"],
+        undefined,
         undefined,
       );
       // ...then the recheck re-persists it fenced, so `confirmedForThisCycle` can tell this cycle's
@@ -1547,7 +1563,7 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
       );
       // Written once, unfenced, off the live read — and never re-persisted with a closure, since the
       // recheck itself never got a live status to fence against.
-      expect(callsForTicket).toEqual([["/repo", "t-race-recheck-unreadable", ["a"], undefined]]);
+      expect(callsForTicket).toEqual([["/repo", "t-race-recheck-unreadable", ["a"], undefined, undefined]]);
     },
   );
 

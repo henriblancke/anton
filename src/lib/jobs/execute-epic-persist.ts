@@ -6,7 +6,7 @@
  * without, {@link mustRead} for the read a guarded write is decided on.
  */
 import { beads, type Bead } from "../beads/bd";
-import { currentClosureVersion, reopenedBeforeCurrentClosure } from "../beads/closure-cycle";
+import { currentClosureVersion, lastCompletedClosureVersion, reopenedBeforeCurrentClosure } from "../beads/closure-cycle";
 import { loadAllIssues } from "../beads/issues";
 import { sleepMs } from "../retry-helpers";
 
@@ -112,12 +112,22 @@ export async function mustReadWithDependencies(
  * dispatch.ts) needs it to tell an unstamped survivor that is genuinely unambiguous (this ticket has
  * never been reopened, so there is only one closure episode it could belong to) apart from one that
  * is stranded evidence from an earlier episode a reopen-and-reclose left behind.
+ *
+ * `priorClosure` rides along too (chatgpt-codex-connector, PR #284 review, "Preserve the originating
+ * cycle when stamping confirmations") — {@link lastCompletedClosureVersion}, read off the same
+ * `versions`. Doubles as the origin a still-open confirmation stamps itself with (its last completed
+ * cycle, if any) and as the value `stampConfirmedClosures` (review-fix-finalize.ts) later compares
+ * that stored origin against, right before fencing a CLOSED ticket's confirmation — a mismatch means
+ * a full extra cycle landed on the ticket in between, unlike `reopened`, which only knows the ticket
+ * was EVER reopened, not whether that happened before or after this confirmation was written.
  */
 export async function mustReadClosureVersion(
   repo: string,
   id: string,
   attempts = 3,
-): Promise<{ read: true; closure: string | undefined; reopened: boolean } | { read: false }> {
+): Promise<
+  { read: true; closure: string | undefined; reopened: boolean; priorClosure: string | undefined } | { read: false }
+> {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const versions = await beads.history(repo, id);
@@ -125,6 +135,7 @@ export async function mustReadClosureVersion(
         read: true,
         closure: currentClosureVersion(versions),
         reopened: reopenedBeforeCurrentClosure(versions),
+        priorClosure: lastCompletedClosureVersion(versions),
       };
     } catch (e) {
       console.error(`[execute-epic] bd history read failed (attempt ${attempt}/${attempts}):`, e);

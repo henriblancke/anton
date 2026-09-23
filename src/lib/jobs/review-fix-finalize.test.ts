@@ -280,13 +280,16 @@ describe("finalizeMergedEpic", () => {
     async () => {
       // target-1 was delivered once already (closed, then reopened for legitimate rework), and
       // `ensureBoardBaselinePersisted`'s reopen-reset cleared the stale confirmation before this
-      // NEW cycle wrote a fresh one — still unfenced (open) until this close. `read.reopened` is
-      // true here (an earlier closed episode sits behind the current streak), but that must not
-      // block the fence: nothing about this confirmation is stale, it was written fresh during the
-      // cycle that just ended.
+      // NEW cycle wrote a fresh one — still unfenced (open) until this close, carrying `origin:
+      // "close-sha-1"` (the cycle it was written against) the way `clearBoardEvidencePending`
+      // (execute-epic-board-evidence.ts) now always stamps a still-open confirmation. `read.reopened`
+      // is true here (an earlier closed episode sits behind the current streak), but that must not
+      // block the fence by itself: the stored `origin` matching `read.priorClosure` (also
+      // "close-sha-1", the closure immediately behind the one being fenced) proves nothing about this
+      // confirmation is stale — it was written fresh during the cycle that just ended.
       const target = {
         ...bead("target-1"),
-        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb2"] }) },
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb2"], origin: "close-sha-1" }) },
       } as Bead;
       metadataById.set("target-1", target.metadata);
       historyMock.mockResolvedValue([

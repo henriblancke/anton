@@ -1223,6 +1223,7 @@ export async function clearBoardEvidencePending(
   // every other guarded read in this module; still unreadable after retries fails the whole cleanup
   // below rather than persist a fenceless confirmation.
   let closure: string | undefined;
+  let origin: string | undefined;
   const live = await mustRead(repo, ticketId);
   if (!live) {
     throw new PoisonEpic(
@@ -1255,8 +1256,22 @@ export async function clearBoardEvidencePending(
     if (stale.length > 0) {
       await mustPersist(() => beads.stampPendingBoardEvidenceClosure(repo, ticketId, closureToStamp));
     }
+  } else {
+    // The ticket is a standalone target being confirmed while still open — its confirmation carries
+    // no `closure` (see below) until some later close finally gives it one. `origin` is stamped
+    // alongside it instead (chatgpt-codex-connector, PR #284 review, "Preserve the originating cycle
+    // when stamping confirmations"): the ticket's last COMPLETED closure, if any, right now — the
+    // identity `stampConfirmedClosures` (review-fix-finalize.ts) must later find unchanged, read
+    // fresh, immediately behind whatever closure it is about to fence this confirmation with. Best-
+    // effort: an unreadable history here just leaves `origin` unset, which only ever makes that LATER
+    // fence attempt more conservative — a stored `undefined` fails to match a real prior closure
+    // rather than falsely matching one — never less safe than skipping this read entirely.
+    const read = await mustReadClosureVersion(repo, ticketId);
+    origin = read.read ? read.priorClosure : undefined;
   }
-  const confirmedSet = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure));
+  const confirmedSet = await mustPersist(() =>
+    beads.setBoardEvidenceConfirmed(repo, ticketId, ids, closure, origin),
+  );
   // A concurrent writer can still close the ticket between the live read above and the write just
   // above — that read narrows the race, it does not close it (chatgpt-codex-connector, anton-fc5x
   // review, "Recheck closure after writing the confirmation"). Left as `{ ids }` with no closure,
@@ -1265,15 +1280,19 @@ export async function clearBoardEvidencePending(
   // fence existed — so a later reopen-and-reclose of this exact ticket would pass this stale
   // confirmation off as the new cycle's own evidence with no fresh board delta ever checked. One more
   // read-then-write right after the first narrows the window further, from the whole dispatch down to
-  // this one write. Best-effort and skipped once `closure` is already known: the write above already
-  // landed and cannot be undone from here, so a transient recheck failure simply leaves the
-  // confirmation exactly as unfenced as it would have been without this recheck — never worse.
+  // this one write. Its OWN result is checked (chatgpt-codex-connector, PR #284 review, "Require the
+  // post-write closure fence to persist") — an exhausted retry here used to be discarded, so this
+  // block believed it had fenced the confirmation when it had not, and the marker/baseline clears
+  // below (gated only on the FIRST write's `confirmedSet`) proceeded as if the recheck had never
+  // been needed. `closureFenceFailed` below keeps that failure visible instead.
+  let closureFenceFailed = false;
   if (confirmedSet && closure === undefined) {
     const recheck = await mustRead(repo, ticketId);
     if (recheck?.status === "closed") {
       const read = await mustReadClosureVersion(repo, ticketId);
       if (read.read && read.closure !== undefined) {
-        await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, read.closure));
+        const fenced = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, read.closure));
+        closureFenceFailed = !fenced;
       }
     }
   }
@@ -1288,16 +1307,20 @@ export async function clearBoardEvidencePending(
   // already absorbed this ticket's own delivery. Skipping the clears entirely when confirmation
   // hasn't landed costs nothing (they retry for free next attempt) and keeps the two existing
   // survivors intact as recovery signals instead of leaning on a third write to replace them.
+  // Also gated on `!closureFenceFailed`: clearing these survivors while the ticket is closed but its
+  // confirmation is still unfenced would strand it — nothing else revisits a closed ticket outside
+  // `closeFinalized`'s own batch (`stampConfirmedClosures`, review-fix-finalize.ts) to fence it later.
   const markerCleared =
     stale.length === 0
       ? true
-      : confirmedSet
+      : confirmedSet && !closureFenceFailed
         ? await mustPersist(() => beads.setBoardEvidencePending(repo, ticketId, [], stale))
         : false;
-  const baselineCleared = confirmedSet
-    ? await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId))
-    : false;
-  const cleared = markerCleared && baselineCleared && confirmedSet;
+  const baselineCleared =
+    confirmedSet && !closureFenceFailed
+      ? await mustPersist(() => beads.clearBoardEvidenceBaseline(repo, ticketId))
+      : false;
+  const cleared = markerCleared && baselineCleared && confirmedSet && !closureFenceFailed;
   const synced = cleared
     ? await beads
         .push(repo)
@@ -1396,12 +1419,17 @@ export async function clearBoardEvidencePending(
                     "and will not retry; check the sync channel before resuming elsewhere"
               : ""
           }`
-        : `bd would not clear ${[
-            !markerCleared && "the pending-evidence marker",
-            !baselineCleared && "the preserved baseline",
-          ]
-            .filter((s): s is string => s !== false)
-            .join(" and ")} it left on the board (after retries)`;
+        : closureFenceFailed
+          ? `bd confirmed delivery for it, but could not persist the closure fence for the now-closed ` +
+            `ticket (after retries) — the pending-evidence marker and preserved baseline were ` +
+            `deliberately left in place rather than cleared, so a resume will retry fencing (and then ` +
+            `clearing) them together`
+          : `bd would not clear ${[
+              !markerCleared && "the pending-evidence marker",
+              !baselineCleared && "the preserved baseline",
+            ]
+              .filter((s): s is string => s !== false)
+              .join(" and ")} it left on the board (after retries)`;
     throw new PoisonEpic(
       `${ticketId} delivered and closed, but ${detail} — the run stopped rather than leave a stale ` +
         `board-evidence record on an already-closed ticket, which a later reopen could read as ` +

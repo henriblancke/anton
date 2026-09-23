@@ -1535,6 +1535,27 @@ export const beads = {
     }
   },
 
+  /** The closure identity a still-UNFENCED confirmation (`closure` absent) was written against —
+   * {@link import("./closure-cycle").lastCompletedClosureVersion} at confirmation time, `undefined`
+   * when the ticket had never closed before (chatgpt-codex-connector, PR #284 review, "Preserve the
+   * originating cycle when stamping confirmations"). `stampConfirmedClosures`
+   * (review-fix-finalize.ts) compares this against the same identity read fresh, immediately before
+   * fencing a now-closed ticket's confirmation — a mismatch means a full extra reopen-and-reclose
+   * cycle landed on the ticket after this confirmation was written but before it was ever fenced,
+   * which `confirmedBoardEvidenceClosure`'s own absence cannot by itself distinguish from a
+   * genuinely fresh, still-open confirmation. */
+  confirmedBoardEvidenceOrigin: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const origin = (parsed as { origin?: unknown } | null)?.origin;
+      return typeof origin === "string" ? origin : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
   /** Record, permanently, that this ticket's board-only delivery was confirmed — written once,
    * beside the pending-marker/baseline clear, and never unset. Carries `ids` (the confirmed
    * evidence) along with the flag, since the pending-marker label and preserved-baseline metadata
@@ -1544,6 +1565,11 @@ export const beads = {
    * settled cycle left behind (anton-fc5x review, "Invalidate confirmation when the ticket is
    * reopened"); see {@link beads.confirmedBoardEvidenceClosure}.
    *
+   * `origin` rides along too, only when `closure` is absent (chatgpt-codex-connector, PR #284
+   * review, "Preserve the originating cycle when stamping confirmations") — see
+   * {@link beads.confirmedBoardEvidenceOrigin}. Meaningless once a confirmation carries its own
+   * `closure`, since a fenced confirmation is never re-fenced.
+   *
    * Written through `--metadata @file`, never `--set-metadata key=value` (chatgpt-codex-connector,
    * PR #284 review, "Keep confirmed evidence IDs out of a single argv argument") — same ~128KiB
    * argv ceiling and `E2BIG` failure mode as {@link beads.setBoardEvidenceCleanupUnsynced} above,
@@ -1551,11 +1577,18 @@ export const beads = {
    * merely failing to retry a cleanup) leaves a large board-only batch unable to ever record its
    * delivery as confirmed. See {@link beads.setBoardEvidenceBaseline} for the same bound applied to
    * the baseline write. */
-  setBoardEvidenceConfirmed: async (cwd: string, id: string, ids: readonly string[] = [], closure?: string) => {
+  setBoardEvidenceConfirmed: async (
+    cwd: string,
+    id: string,
+    ids: readonly string[] = [],
+    closure?: string,
+    origin?: string,
+  ) => {
     const dir = mkdtempSync(join(tmpdir(), "anton-bd-confirmed-"));
     try {
       const file = join(dir, "metadata.json");
-      const value = closure === undefined ? { ids } : { ids, closure };
+      const value =
+        closure === undefined ? (origin === undefined ? { ids } : { ids, origin }) : { ids, closure };
       writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CONFIRMED_KEY]: JSON.stringify(value) }));
       return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
     } finally {
