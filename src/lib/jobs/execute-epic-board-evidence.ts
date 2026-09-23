@@ -415,9 +415,19 @@ export async function ensureBoardBaselinePersisted(
   // confirmed flag invalidates the stale baseline (via {@link abandonDispatchBaseline}, the same
   // clear/downgrade this module already trusts to release one) right alongside the flag itself,
   // whether or not a baseline happened to survive the same failed cleanup.
+  //
+  // `boardEvidenceConfirmed` itself is cleared LAST, not first (chatgpt-codex-connector, PR #284
+  // review, "Keep the old-cycle sentinel until all evidence is reset") — it is the ONLY signal that
+  // tells a RETRY of this whole call to re-enter this reset block at all. Clearing it before the
+  // baseline/locked/verified/dispatch-started downgrade and the stale-pending/cleanup-unsynced clears
+  // below made the reset non-atomic: if one of those later writes exhausted its retries, this
+  // function would fail (`return null` / throw) with the confirmed flag ALREADY gone, and the next
+  // attempt's fresh read would find it clear and skip this whole block — trusting the still-stale
+  // locked baseline as a genuine recovery baseline, or unioning the still-stale pending ids into a
+  // no-op agent's evidence, and crediting the new cycle with the old one's delivery. Left set until
+  // every survivor is confirmed cleared, a retry that finds it still true simply re-runs the same
+  // (idempotent) resets again.
   if (beads.boardEvidenceConfirmed(ticket)) {
-    const cleared = await mustPersist(() => beads.clearBoardEvidenceConfirmed(repo, ticket.id));
-    if (!cleared) return null;
     if (hadBaseline) {
       await abandonDispatchBaseline(repo, ticket);
       // `abandonDispatchBaseline` clears the baseline/locked/verified/dispatch-started metadata
@@ -473,6 +483,8 @@ export async function ensureBoardBaselinePersisted(
         .catch(() => false);
       if (!staleSynced) return null;
     }
+    const cleared = await mustPersist(() => beads.clearBoardEvidenceConfirmed(repo, ticket.id));
+    if (!cleared) return null;
   }
   if (!hadBaseline) {
     const persisted = await mustPersist(() =>
@@ -793,14 +805,30 @@ async function lockDispatchBaseline(
  * dispatch (the caller throws rather than proceeding), since dispatching anyway would leave a
  * locked-and-verified baseline with no durable record dispatch began, indistinguishable on a resume
  * from one a crash caught before dispatch ever started.
+ *
+ * A push failure AFTER the local persist succeeds must not just return `false` (chatgpt-codex-
+ * connector, PR #284 review, "Roll back an unconfirmed dispatch-start marker") — the LOCAL bd db
+ * already carries `boardEvidenceDispatchStarted`, and `ensureBoardBaselinePersisted`'s
+ * `recoveryBaseline` check reads exactly that flag (alongside locked+verified) to decide whether a
+ * baseline is safe to trust untouched. A same-machine retry would see it set, trust this baseline as
+ * already reflecting a genuine dispatch attempt that in fact never started, and skip folding in any
+ * board drift from the downtime in between — crediting whatever changed with a no-op agent's
+ * delivery. `abandonDispatchBaseline` clears baseline/locked/verified/dispatch-started together, the
+ * same all-or-nothing rollback this module already uses for every other push-confirmation failure, so
+ * a retry starts over from a genuinely fresh baseline instead of trusting this half-confirmed one.
  */
 export async function markDispatchStarted(repo: string, ticket: Bead): Promise<boolean> {
   const persisted = await mustPersist(() => beads.setBoardEvidenceDispatchStarted(repo, ticket.id));
   if (!persisted) return false;
-  return beads
+  const synced = await beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
+  if (!synced) {
+    await abandonDispatchBaseline(repo, ticket);
+    return false;
+  }
+  return true;
 }
 
 /**

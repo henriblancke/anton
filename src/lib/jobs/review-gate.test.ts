@@ -835,13 +835,17 @@ describe("runReviewGate — bounds", () => {
     async () => {
       const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
       const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
-      boardShowMock.mockResolvedValueOnce({
+      // Both the initial live read and the post-write recheck must see the ticket still open — the
+      // default `boardShowMock` implementation (below) answers "closed", which would otherwise make
+      // the recheck take the closed-on-recheck fence path this test isn't about.
+      const stillOpen = {
         id: boardOnlyTicket.id,
-        status: "open",
+        status: "open" as const,
         title: "",
         issue_type: "task",
         metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["prior-id"], origin: "prior-cycle-sha" }) },
-      });
+      };
+      boardShowMock.mockResolvedValueOnce(stillOpen).mockResolvedValueOnce(stillOpen);
       const worktree = fakeWorktree();
       let reads = 0;
       const readBoardFingerprint = async () => {

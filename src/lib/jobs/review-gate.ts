@@ -701,16 +701,27 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
               }
               if (recheck.status === "closed") {
                 const read = await mustReadClosureVersion(repo, t.id);
-                if (read.read && read.closure !== undefined) {
+                // `read.priorClosure` must still match `origin` (chatgpt-codex-connector, PR #284
+                // review, "Validate the origin before fencing review-fix evidence") — mirrors the
+                // same guard `clearBoardEvidencePending` (execute-epic-board-evidence.ts) already
+                // applies to this identical shape. Without it, a ticket that closes, reopens, and
+                // closes AGAIN in the gap between the unfenced write above and this recheck would
+                // have `read.closure` name the second close while `read.priorClosure` names the
+                // first — neither of which `merged.get(t.id)`'s ids were ever checked against — and
+                // this write would still stamp `read.closure` onto them, letting a later resume
+                // accept those stale ids as the latest cycle's evidence.
+                if (read.read && read.closure !== undefined && read.priorClosure === origin) {
                   const fenced = await mustPersist(() =>
                     beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], read.closure),
                   );
                   if (!fenced) return false;
                 } else {
-                  // Closed on recheck but its closure version is unreadable (after retries) or its
-                  // history is empty — the same ambiguity the earlier `mustReadClosureVersion` call
-                  // above already fails closed on. Falling through here would `return true` and push
-                  // an unfenced `{ ids }` confirmation a later reopen-and-reclose could reuse.
+                  // Closed on recheck but its closure version is unreadable (after retries), its
+                  // history is empty, or an extra reopen-and-reclose landed between the unfenced
+                  // write and this recheck (the `origin` mismatch above) — the same ambiguity the
+                  // earlier `mustReadClosureVersion` call above already fails closed on. Falling
+                  // through here would `return true` and push an unfenced `{ ids }` confirmation a
+                  // later reopen-and-reclose could reuse.
                   return false;
                 }
               }
