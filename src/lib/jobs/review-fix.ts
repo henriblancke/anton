@@ -274,7 +274,11 @@ async function recoverUnfencedClosure(
   const closedNow = [...runTickets(live, epic.id), liveEpic];
   if (closedNow.some((b) => b.status !== "closed")) return "skipped"; // a child was reopened — not actually finalized
   if (!(await stampConfirmedClosures(repo, closedNow))) return "attempted";
-  await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  // Checked, not fire-and-forget (chatgpt-codex-connector, PR #284 review, "Check the recovery-marker
+  // untag result"): a refused untag leaves `stage:in-review` standing while this still reports
+  // "recovered" — the dispatcher counts a success and moves on, and `closedUnfencedEpics` rediscovers
+  // the same epic on every later sweep with no way to tell that from a fresh unfenced closure.
+  if (!(await safe(() => beads.untag(repo, epic.id, [IN_REVIEW])))) return "attempted";
   return "recovered";
 }
 

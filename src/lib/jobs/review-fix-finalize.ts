@@ -613,8 +613,27 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
   );
   const fenced = await Promise.all(
     unfenced.map(async (b) => {
+      // Re-read live rather than writing off `b` (chatgpt-codex-connector, PR #284 review, "Refresh
+      // confirmation metadata before stamping closures"): `b` is `closedBeads`'s snapshot, taken
+      // before this async fan-out started, and another review-fix pass can extend this bead's
+      // confirmed ids in the meantime. Persisting `confirmedBoardEvidenceIds(b)` would overwrite that
+      // newer, wider id set with the stale one this snapshot carried, losing evidence a later reviewer
+      // or the resume ledger needs. An unreadable bead fails this one bead's fence rather than
+      // guessing off the stale snapshot.
       const read = await mustReadClosureVersion(repo, b.id);
       if (!read.read || read.closure === undefined) return false;
+      // An unfenced confirmation is only unambiguous when the bead has closed EXACTLY once
+      // (chatgpt-codex-connector, PR #284 review, "Revalidate the closure cycle before stamping
+      // confirmation") — the same rule `survivorTrustedForClosure` (execute-epic-dispatch.ts) already
+      // applies to this identical shape. A reopen-and-reclose racing between the `closedBeads`
+      // snapshot and this call does not touch `boardEvidenceConfirmed`/`confirmedBoardEvidenceClosure`
+      // at all (only `ensureBoardBaselinePersisted`'s own redispatch reset does), so `live`'s ids below
+      // could still be the PRIOR cycle's evidence while `read.closure` — and `read.reopened`, riding
+      // the same history read — names a NEW closure episode. Stamping them together would durably
+      // confirm the new cycle against evidence nothing about the new cycle ever diffed. With more than
+      // one closure episode to choose from, there is no way to tell which one these unstamped ids
+      // belong to, so this bead's fence is left for a later pass rather than guessed.
+      if (read.reopened) return false;
       // Re-read live rather than writing off `b` (chatgpt-codex-connector, PR #284 review, "Refresh
       // confirmation metadata before stamping closures"): `b` is `closedBeads`'s snapshot, taken
       // before this async fan-out started, and another review-fix pass can extend this bead's

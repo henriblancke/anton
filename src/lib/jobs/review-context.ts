@@ -21,7 +21,7 @@ import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } fr
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
 import { contentLabels, contentMetadata } from "./execute-epic-board-evidence";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
-import { mustReadWithDependencies } from "./execute-epic-persist";
+import { mustRead, mustReadWithDependencies } from "./execute-epic-persist";
 import { labelValue } from "./review-fix-context";
 import type { VerifyGateOutcome } from "./shell";
 
@@ -397,7 +397,36 @@ async function fetchConfirmedBoardEvidenceBeads(
   for (let i = 0; i < ids.length; i += CONFIRMED_BEAD_READ_CONCURRENCY) {
     const batch = ids.slice(i, i + CONFIRMED_BEAD_READ_CONCURRENCY);
     const found = await mustReadWithDependencies(repoPath, batch);
-    batch.forEach((id) => result.set(id, found ? found.get(id) ?? "deleted" : undefined));
+    await Promise.all(
+      batch.map(async (id) => {
+        if (!found) {
+          result.set(id, undefined);
+          return;
+        }
+        const bead = found.get(id);
+        if (!bead) {
+          result.set(id, "deleted");
+          return;
+        }
+        if (bead.description !== undefined) {
+          result.set(id, bead);
+          return;
+        }
+        // `bd list --json` omits `description` on some bd variants — the same gap
+        // `hydrateDescriptions` (execute-epic-board-evidence.ts) hydrates for evidence fingerprints
+        // (chatgpt-codex-connector, PR #284 review, "Hydrate descriptions in the server-board
+        // snapshot"). A server-backed reviewer has no `bd` of its own (see the caller's serverMode
+        // branch) — `confirmedBeadSummary`'s rendering below is the only field value it will ever
+        // see, so silently rendering `description=(none)` here can reject or approve a confirmed
+        // description-only delivery against false current state. `bd show` never carries
+        // `dependencies` (only `bd list --json` does — see this function's own docstring), so the
+        // list-provided edges are kept and only `description` is merged in; a `mustRead` that still
+        // can't confirm it (after its own retries) leaves this id unreadable rather than fall back to
+        // the same false "(none)" this hydration exists to prevent.
+        const detail = await mustRead(repoPath, id);
+        result.set(id, detail ? { ...bead, description: detail.description ?? "" } : undefined);
+      }),
+    );
   }
   return result;
 }

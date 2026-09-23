@@ -663,7 +663,35 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
               if (!read.read || read.closure === undefined) return false;
               closure = read.closure;
             }
-            return mustPersist(() => beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure));
+            const wrote = await mustPersist(() =>
+              beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure),
+            );
+            if (!wrote) return false;
+            // A concurrent writer can close a still-open standalone unit between the `live` read
+            // above and this write (chatgpt-codex-connector, PR #284 review, "Fence review-fix
+            // confirmation after the write") — mirrors the same post-write recheck
+            // `clearBoardEvidencePending` (execute-epic-board-evidence.ts) already runs after ITS
+            // confirming write. Left as `{ ids }` with no closure, `confirmedForThisCycle`
+            // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass anyway" —
+            // the same tolerance meant for a confirmation written before this fence existed — so a
+            // later reopen-and-reclose of this exact ticket could pass this stale confirmation off
+            // as the new cycle's own evidence with no fresh board delta ever checked. Best-effort
+            // and skipped once `closure` is already known: the write above already landed and
+            // cannot be undone from here, so a transient recheck failure simply leaves the
+            // confirmation exactly as unfenced as it would have been without this recheck — never
+            // worse.
+            if (closure === undefined) {
+              const recheck = await mustRead(repo, t.id);
+              if (recheck?.status === "closed") {
+                const read = await mustReadClosureVersion(repo, t.id);
+                if (read.read && read.closure !== undefined) {
+                  await mustPersist(() =>
+                    beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], read.closure),
+                  );
+                }
+              }
+            }
+            return true;
           }),
         );
         const synced = await beads
