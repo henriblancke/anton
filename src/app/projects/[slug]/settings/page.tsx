@@ -40,13 +40,14 @@ export default async function ProjectSettingsPage({
 
   // Independent filesystem, board and database reads share one wait. Carry board failure through
   // to the policy editor, and reuse that same snapshot for the earned-autonomy calculation.
+  // Wait for pending board writes: retained proposal history can misstate eligibility for apply.
   const [settings, basePrompt, scheduleRows, agents, bundledIds, board, pickerRecord, quotaRows] = await Promise.all([
     getProjectSettingsBySlug(slug),
     loadBaseSystemPrompt().catch(() => ""),
     listSchedules(project.id),
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
-    allIssues(project.repoPath, { blockOnPendingWrite: false }).then(
+    allIssues(project.repoPath, { blockOnPendingWrite: true }).then(
       (issues) => ({ issues, ok: true }),
       () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
     ),
