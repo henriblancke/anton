@@ -431,11 +431,14 @@ export function ledgerTiming(
     if (duration === undefined) continue;
     timed += 1;
     // An invocation that PROVABLY ended after the scope's last delivery did not go into producing it —
-    // a review-fix session that answers feedback but lands no new delivery, say. Folding its duration
-    // into `active` would let it outrun `leadMs` below, so `waitingMs` (lead − active) understates —
-    // or falsely zeroes — how long the scope actually waited (PR #320 review). Only PROVEN-later
-    // invocations are excluded: one with no recorded end stays in, same as `firstInvocationStartMs`
-    // refusing to guess in the other direction.
+    // a review-fix session that answers feedback but lands no new delivery, say. Folding its whole
+    // duration into `active` would let it outrun `leadMs` below, so `waitingMs` (lead − active)
+    // understates — or falsely zeroes — how long the scope actually waited (PR #320 review). Only the
+    // PROVEN-later portion is excluded: reparenting can combine concurrent histories, so an invocation
+    // can have started before the last delivery and still end after it — clip it at the delivery
+    // boundary and keep the pre-delivery portion rather than discarding the whole span (PR #320
+    // review). One with no recorded end stays in, same as `firstInvocationStartMs` refusing to guess
+    // in the other direction.
     //
     // Both `recordedAt` and `deliveredAtMs` are floored to whole seconds, so a tie between them proves
     // NEITHER direction: it is exactly as likely to be the invocation that produced the delivery
@@ -449,7 +452,11 @@ export function ledgerTiming(
     const endedAt = recordedAtMs(fact.rows);
     if (deliveredAtMs !== undefined && endedAt !== undefined) {
       if (endedAt === deliveredAtMs) splitAmbiguous = true;
-      else if (endedAt > deliveredAtMs) continue;
+      else if (endedAt > deliveredAtMs) {
+        const startedAt = endedAt - duration;
+        if (startedAt < deliveredAtMs) intervals.push({ start: startedAt, end: deliveredAtMs });
+        continue;
+      }
     }
     // `recordedAt` is a non-nullable column, so `endedAt` is absent only when a row is malformed
     // beyond what this fold can place on the timeline — fall back to counting its duration outright

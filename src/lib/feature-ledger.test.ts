@@ -172,6 +172,28 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
   });
 });
 
+describe("ledgerTiming with an invocation that spans delivery", () => {
+  // Reparenting can combine concurrent histories, so a single invocation's reconstructed span can
+  // start before the scope's last delivery and end after it — a call active 09:00–09:20 with delivery
+  // at 09:10. Dropping the whole invocation (the post-delivery treatment) would zero out the first ten
+  // minutes of genuine pre-delivery work; the fix clips the interval at the delivery boundary and keeps
+  // the portion that came before it (PR #320 review).
+  const start = Date.parse("2026-09-20T09:00:00Z");
+  const deliveredAt = Date.parse("2026-09-20T09:10:00Z");
+  const rows = [row({ invocationId: "inv-1", recordedAt: new Date(start + 20 * MINUTE), durationMs: 20 * MINUTE })];
+
+  it("keeps the pre-delivery portion instead of discarding the whole invocation", () => {
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(10 * MINUTE);
+    expect(timing.timedInvocations).toBe(1);
+    expect(timing.leadMs).toBe(10 * MINUTE);
+  });
+
+  it("does not let the clipped portion outrun leadMs", () => {
+    expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(0);
+  });
+});
+
 describe("ledgerTiming with a same-second delivery", () => {
   it("does not zero out a normal invocation whose push landed in the same second", () => {
     // The ordinary case: one 5-minute invocation does the work, and the push that delivers it lands
