@@ -116,6 +116,37 @@ describe("ledgerTiming on a run that parked overnight", () => {
   });
 });
 
+describe("firstInvocationStartMs with an unmeasured invocation", () => {
+  it("excludes an invocation with no reported duration, even when it is temporally first", () => {
+    // inv-1 crashed before reporting a duration (durationMs: null, the shape
+    // claude-invocations.ts writes whenever a result never reports one). Reconstructing its start
+    // from `recordedAt - 0` would collapse the start to inv-1's own end time and understate lead.
+    // The genuinely reconstructable start is inv-2's, even though inv-2 ended later.
+    const rows = [
+      row({
+        invocationId: "inv-1",
+        recordedAt: new Date("2026-09-20T09:10:00Z"),
+        durationMs: null,
+      }),
+      row({
+        invocationId: "inv-2",
+        recordedAt: new Date("2026-09-20T09:20:00Z"),
+        durationMs: 5 * MINUTE,
+      }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBe(Date.parse("2026-09-20T09:15:00Z"));
+  });
+
+  it("is undefined when no invocation in scope has a known duration", () => {
+    const rows = [
+      row({ invocationId: "inv-1", durationMs: null }),
+      row({ invocationId: "inv-2", durationMs: null }),
+    ];
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
+    expect(ledgerTiming(rows, Date.parse("2026-09-21T07:10:00Z")).leadMs).toBeUndefined();
+  });
+});
+
 describe("leadMs", () => {
   it("is absent, not zero, for a scope that has not delivered", () => {
     expect(ledgerTiming([row()]).leadMs).toBeUndefined();

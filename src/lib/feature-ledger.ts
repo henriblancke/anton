@@ -332,7 +332,9 @@ export function firstInvocationStartMs(rows: readonly LedgerTimingRow[]): number
   for (const fact of groupInvocations(rows)) {
     const endedAt = recordedAtMs(fact.rows);
     if (endedAt === undefined) continue;
-    const startedAt = endedAt - count(invocationDuration(fact.rows));
+    const duration = invocationDuration(fact.rows);
+    if (duration === undefined) continue;
+    const startedAt = endedAt - duration;
     if (earliest === undefined || startedAt < earliest) earliest = startedAt;
   }
   return earliest;
