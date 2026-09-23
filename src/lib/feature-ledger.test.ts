@@ -144,13 +144,15 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
     expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(20 * MINUTE);
   });
 
-  it("treats a same-second post-delivery invocation as ambiguous, not as pre-delivery work", () => {
-    // A no-op review-fix invocation whose recorded end floors to the SAME second as the delivery it
-    // followed — `recorded_at` and the delivery timestamp are both floored to whole seconds, so a
-    // strict `>` reads "not proven later" and folds the whole 20min into active, understating
-    // `waitingMs` exactly the way the earlier fix (above) was meant to prevent. Flooring can hide the
-    // true order here just as it can for `firstInvocationStartMs`'s own equal case, so this must
-    // exclude it too rather than trust the coincidence.
+  it("flags a same-second tie as ambiguous instead of guessing a direction", () => {
+    // `recorded_at` and the delivery timestamp are both floored to whole seconds, so a tie between
+    // them proves NEITHER order: it is exactly as likely to be the invocation that PRODUCED the
+    // delivery (work ends, the push follows within the same second) as one that followed it with no
+    // result. An earlier fix here resolved every tie as "proven later" — which broke the ordinary
+    // case below (`ledgerTiming with a same-second delivery`) far worse than the bug it was chasing.
+    // The correct answer is to guess neither direction: keep the invocation folded into `active` (the
+    // same treatment as any not-provably-later invocation) and flag the tie so `waitingMs` refuses to
+    // report a split it cannot stand behind.
     const sameSecondRows = [
       row({ invocationId: "inv-1", recordedAt: new Date("2026-09-20T09:10:00Z"), durationMs: 10 * MINUTE }),
       row({
@@ -163,9 +165,30 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
     const sameSecondDeliveredAt = Date.parse("2026-09-20T09:30:00Z");
 
     const timing = ledgerTiming(sameSecondRows, sameSecondDeliveredAt);
-    expect(timing.activeMs).toBe(10 * MINUTE);
+    expect(timing.activeMs).toBe(30 * MINUTE);
     expect(timing.timedInvocations).toBe(2);
-    expect(waitingMs(timing)).toBe(20 * MINUTE);
+    expect(timing.splitAmbiguous).toBe(true);
+    expect(waitingMs(timing)).toBeUndefined();
+  });
+});
+
+describe("ledgerTiming with a same-second delivery", () => {
+  it("does not zero out a normal invocation whose push landed in the same second", () => {
+    // The ordinary case: one 5-minute invocation does the work, and the push that delivers it lands
+    // within the same floored second as the invocation's own recorded end. Treating that tie as
+    // "proven later" (an earlier version of this fix) excluded the ENTIRE invocation from `activeMs`,
+    // reporting 5 minutes of lead, zero active time, and 5 minutes of waiting for a feature that spent
+    // its whole lead working (fresh PR #320 review finding). `activeMs` must still count the work, and
+    // the ambiguity belongs on `waitingMs`, not on burying the invocation's own time.
+    const start = Date.parse("2026-09-20T09:00:00Z");
+    const deliveredAt = Date.parse("2026-09-20T09:05:00Z");
+    const rows = [row({ invocationId: "inv-1", recordedAt: new Date(deliveredAt), durationMs: 5 * MINUTE })];
+
+    const timing = ledgerTiming(rows, deliveredAt);
+    expect(timing.activeMs).toBe(5 * MINUTE);
+    expect(timing.leadMs).toBe(deliveredAt - start);
+    expect(timing.splitAmbiguous).toBe(true);
+    expect(waitingMs(timing)).toBeUndefined();
   });
 });
 
@@ -347,11 +370,13 @@ describe("wall time", () => {
       invocations: number;
       timedInvocations: number;
       leadMs: number | undefined;
+      splitAmbiguous: boolean;
     }>();
     expect(Object.keys(ledgerTiming([row()])).sort()).toEqual([
       "activeMs",
       "invocations",
       "leadMs",
+      "splitAmbiguous",
       "timedInvocations",
     ]);
   });

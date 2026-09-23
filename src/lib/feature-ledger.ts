@@ -252,18 +252,20 @@ export interface LedgerTiming {
    * contribute their covered time once, not twice, so `waitingMs` (lead − active) never goes negative
    * off the back of double-counted overlap.
    *
-   * Excludes an invocation that ENDED after {@link leadMs}'s delivery — that work is real but sits
-   * outside this span, and counting it would let `waitingMs` understate, or falsely zero, how long
-   * the scope actually waited. {@link timedInvocations} still counts it.
+   * Excludes an invocation that PROVABLY ended after {@link leadMs}'s delivery — strictly after, with
+   * no flooring ambiguity — because that work is real but sits outside this span, and counting it
+   * would let `waitingMs` understate, or falsely zero, how long the scope actually waited. An
+   * invocation whose floored end merely TIES the delivery second is not provably later (see
+   * {@link splitAmbiguous}) and stays folded in here; {@link timedInvocations} counts both kinds.
    */
   activeMs: number;
   /** Invocations folded. `0` is an empty scope, which the caller reports as nothing-recorded. */
   invocations: number;
   /**
    * How many of those actually reported a duration — including one excluded from {@link activeMs}
-   * for having ended after delivery. Below {@link invocations} the active figure is a FLOOR, not a
-   * total — the same discipline as `spend-breakdown`'s priced/unpriced counts, so a partly-measured
-   * span can say so instead of quietly reading as complete.
+   * for having provably ended after delivery. Below {@link invocations} the active figure is a FLOOR,
+   * not a total — the same discipline as `spend-breakdown`'s priced/unpriced counts, so a
+   * partly-measured span can say so instead of quietly reading as complete.
    */
   timedInvocations: number;
   /**
@@ -271,6 +273,18 @@ export interface LedgerTiming {
    * scope has not delivered, which is absent rather than zero.
    */
   leadMs: number | undefined;
+  /**
+   * True when some invocation's floored end landed in the SAME SECOND as the scope's delivery.
+   *
+   * `recordedAt` and the delivery timestamp are both floored to whole seconds, so a tie between them
+   * does not prove the invocation happened before OR after delivery — it is exactly as likely to be
+   * the invocation that PRODUCED the delivery (the common case: work finishes, the push follows in
+   * the same second) as one that merely followed it with no result. Resolving that tie by assuming
+   * either direction is a guess this fold refuses to make — the same refusal discipline {@link leadMs}
+   * and `firstInvocationStartMs` already apply to their own unresolvable ties. {@link waitingMs}
+   * checks this and refuses to report a split rather than silently pick a side.
+   */
+  splitAmbiguous: boolean;
 }
 
 /**
@@ -411,25 +425,32 @@ export function ledgerTiming(
   const intervals: Interval[] = [];
   let untethered = 0;
   let timed = 0;
+  let splitAmbiguous = false;
   for (const fact of facts) {
     const duration = invocationDuration(fact.rows);
     if (duration === undefined) continue;
     timed += 1;
-    // An invocation that ENDED after the scope's last delivery did not go into producing it — a
-    // review-fix session that answers feedback but lands no new delivery, say. Folding its duration
+    // An invocation that PROVABLY ended after the scope's last delivery did not go into producing it —
+    // a review-fix session that answers feedback but lands no new delivery, say. Folding its duration
     // into `active` would let it outrun `leadMs` below, so `waitingMs` (lead − active) understates —
     // or falsely zeroes — how long the scope actually waited (PR #320 review). Only PROVEN-later
     // invocations are excluded: one with no recorded end stays in, same as `firstInvocationStartMs`
     // refusing to guess in the other direction.
     //
-    // Both `recordedAt` and `deliveredAtMs` are floored to whole seconds, so a no-op invocation that
-    // truly ended milliseconds after delivery can land in the SAME second as it — a strict `>` reads
-    // that as "not proven later" and folds its whole duration into `active` anyway, understating
-    // `waitingMs` exactly the way the strict comparison was meant to prevent. The equal case is this
-    // fold's own version of `firstInvocationStartMs`'s `<=`: flooring can hide the true order, so
-    // treat it the same as proven-later rather than proven-earlier.
+    // Both `recordedAt` and `deliveredAtMs` are floored to whole seconds, so a tie between them proves
+    // NEITHER direction: it is exactly as likely to be the invocation that produced the delivery
+    // itself (work ends, the push follows within the same second — the ordinary case) as one that
+    // followed it with no result. An earlier fix here treated the tie as proven-later, which broke the
+    // ordinary case outright: a single invocation whose push landed in the same second reported ZERO
+    // active time and a fully "waiting" lead (PR #320 review, fresh finding). Guessing "earlier"
+    // instead would just relocate the wrong confident answer to the opposite case. Neither guess is
+    // safe, so a tie is left folded into `active` (unlike a proven-later exclusion) and flagged via
+    // `splitAmbiguous` instead, so `waitingMs` can refuse the split rather than silently pick a side.
     const endedAt = recordedAtMs(fact.rows);
-    if (deliveredAtMs !== undefined && (endedAt ?? -Infinity) >= deliveredAtMs) continue;
+    if (deliveredAtMs !== undefined && endedAt !== undefined) {
+      if (endedAt === deliveredAtMs) splitAmbiguous = true;
+      else if (endedAt > deliveredAtMs) continue;
+    }
     // `recordedAt` is a non-nullable column, so `endedAt` is absent only when a row is malformed
     // beyond what this fold can place on the timeline — fall back to counting its duration outright
     // rather than dropping it, the same "add it anyway" reading `count()` gives an absent measure.
@@ -445,6 +466,7 @@ export function ledgerTiming(
     invocations: facts.length,
     timedInvocations: timed,
     leadMs: leadMs(firstInvocationStartMs(rows), deliveredAtMs),
+    splitAmbiguous,
   };
 }
 
@@ -496,9 +518,13 @@ function leadMs(startedAtMs: number | undefined, deliveredAtMs: number | undefin
 
 /**
  * How long the scope spent WAITING rather than working — the figure the active/lead split was built
- * to produce. `undefined` whenever lead is, since a span that cannot be stated cannot be divided.
+ * to produce. `undefined` whenever lead is, since a span that cannot be stated cannot be divided, and
+ * also `undefined` when {@link LedgerTiming.splitAmbiguous} is set — a same-second tie between an
+ * invocation's end and the delivery could go either way, and neither reading of `activeMs` is one
+ * this split can stand behind, so it refuses rather than silently pick a side.
  */
 export function waitingMs(timing: LedgerTiming): number | undefined {
+  if (timing.splitAmbiguous) return undefined;
   return timing.leadMs === undefined ? undefined : Math.max(0, timing.leadMs - timing.activeMs);
 }
 
