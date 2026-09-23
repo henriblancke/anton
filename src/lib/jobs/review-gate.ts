@@ -683,19 +683,21 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
             // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass anyway" —
             // the same tolerance meant for a confirmation written before this fence existed — so a
             // later reopen-and-reclose of this exact ticket could pass this stale confirmation off
-            // as the new cycle's own evidence with no fresh board delta ever checked. Best-effort
-            // and skipped once `closure` is already known: the write above already landed and
-            // cannot be undone from here, so a transient recheck failure simply leaves the
-            // confirmation exactly as unfenced as it would have been without this recheck — never
-            // worse.
+            // as the new cycle's own evidence with no fresh board delta ever checked. Its OWN result
+            // is checked (chatgpt-codex-connector, PR #284 review, "Require the post-write review
+            // fence to persist") — an exhausted retry here used to be discarded, so this block
+            // returned `true` believing it had fenced the confirmation when it had not, letting the
+            // caller push and report the round as durably confirmed with `{ ids, origin }` still
+            // unfenced. Mirrors `closureFenceFailed` in `clearBoardEvidencePending`.
             if (closure === undefined) {
               const recheck = await mustRead(repo, t.id);
               if (recheck?.status === "closed") {
                 const read = await mustReadClosureVersion(repo, t.id);
                 if (read.read && read.closure !== undefined) {
-                  await mustPersist(() =>
+                  const fenced = await mustPersist(() =>
                     beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], read.closure),
                   );
+                  if (!fenced) return false;
                 }
               }
             }
