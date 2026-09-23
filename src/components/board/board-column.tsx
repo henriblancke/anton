@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 
 import type { Epic, Stage, StandaloneItem } from "@/lib/types";
@@ -41,6 +42,8 @@ export function BoardColumn({
     id: lane ? `${lane}:${stage}` : stage,
     disabled: lane !== undefined,
   });
+  const [doneLimit, setDoneLimit] = useState(20);
+  const visibleEpics = stage === "done" ? epics.slice(0, doneLimit) : epics;
   const isEmpty = epics.length === 0 && standalone.length === 0;
 
   return (
@@ -89,7 +92,7 @@ export function BoardColumn({
           )
         ) : (
           <>
-            {epics.map((epic) =>
+            {visibleEpics.map((epic) =>
               lane ? (
                 <EpicCard
                   key={epic.id}
@@ -107,6 +110,12 @@ export function BoardColumn({
                   onDeleted={onEpicDeleted}
                 />
               ),
+            )}
+            {visibleEpics.length < epics.length && (
+              <button type="button" className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setDoneLimit((limit) => limit + 20)}>
+                Show more completed ({epics.length - visibleEpics.length} remaining)
+              </button>
             )}
             <StandaloneGroup
               slug={slug}

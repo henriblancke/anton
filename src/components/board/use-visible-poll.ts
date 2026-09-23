@@ -18,16 +18,24 @@ export function useVisiblePoll(read: (signal: AbortSignal) => Promise<void>, int
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
 
+    let inFlight = false;
     async function tick() {
-      if (document.visibilityState === "visible") await read(controller.signal);
-      // Reschedule even after a skipped or failed read: a poll that gives up once stops being live
-      // sync for the rest of the session.
-      if (!controller.signal.aborted) timer = setTimeout(() => void tick(), intervalMs);
+      if (inFlight || controller.signal.aborted) return;
+      clearTimeout(timer);
+      inFlight = true;
+      try {
+        if (document.visibilityState === "visible") await read(controller.signal);
+      } catch {
+        // Poll consumers retain their last good data. A rejected read must not stop the cadence.
+      } finally {
+        inFlight = false;
+        if (!controller.signal.aborted) timer = setTimeout(() => void tick(), intervalMs);
+      }
     }
 
     timer = setTimeout(() => void tick(), intervalMs);
     const onVisible = () => {
-      if (document.visibilityState === "visible") void read(controller.signal);
+      if (document.visibilityState === "visible") void tick();
     };
     document.addEventListener("visibilitychange", onVisible);
 

@@ -95,8 +95,8 @@ export interface ResolveReleaseInput {
  *   • the board and policy have not moved past it, including the age bounds the plan's digest
  *     cannot hold (`agedOutPicks`).
  *
- * A SUPERSEDED generation re-derives rather than dropping the answer (anton-k4qr). It used to skip
- * — which lost the accept while the approve and the enqueue still landed, so the operator's choice
+ * A named generation that is superseded or stale re-derives rather than dropping the answer
+ * (anton-k4qr). Skipping lost the accept while the approve and the enqueue still landed, so the operator's choice
  * left no trace and earned autonomy read a start with no evidence behind it. The honest reading of a
  * replaced generation is that we do not yet know whether the pick survived it, and that is a
  * question with an answer: re-decide the plan from the board this request already read, exactly as a
@@ -157,6 +157,12 @@ export async function resolveRelease(
         agedOutPicks(plan, board, policy, now),
       )
     ) {
+      // Approval now projects only its target, so it no longer refreshes the picker plan as a
+      // side effect of building the whole board. A named pick still needs the same re-derivation
+      // when its board changed, even if no intervening board read replaced the generation yet.
+      if (displayedPlanId !== undefined) {
+        return await rederiveRelease(db, { projectId, beadId, board, policy, deferrals, now });
+      }
       return skip("the plan that picked it is no longer the decision anton stands behind");
     }
     return { accept: pickOf(plan.planId, entry.rank, entry.rule) };

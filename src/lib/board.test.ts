@@ -186,7 +186,7 @@ vi.mock("./jobs/picker-decision", async () => {
   };
 });
 
-const { deriveStage, getBoard, getBoardVersion } = await import("./board");
+const { deriveStage, getBoard, getBoardVersion, getBoardTarget, getBoardHealth } = await import("./board");
 const { invalidateIssueSnapshot, resetIssueSnapshots } = await import("./beads/snapshot");
 const { contractBlocks, validateBeadContract } = await import("./beads/contract");
 const { stampBoard } = await import("./board-picker-plan");
@@ -312,7 +312,7 @@ describe("getBoard", () => {
       status: "in_progress",
       parent: "epic-1",
       labels: ["agent:nextjs", "risk:high", "size:S"],
-      acceptance: "Works.",
+      acceptance: undefined,
       assignee: "alice",
       created_at: "2026-07-13T10:00:00Z",
       created_by: "bob",
@@ -343,7 +343,7 @@ describe("getBoard", () => {
     const backlogEpic = board.columns.backlog.find((e) => e.id === "epic-1");
     expect(backlogEpic).toBeDefined();
     expect(backlogEpic!.goal).toBe("Ship the thing.");
-    expect(backlogEpic!.acceptance).toBe("It ships.");
+    expect(backlogEpic!.acceptance).toBeUndefined(); // detail-only text stays off the board payload
     expect(backlogEpic!.approved).toBe(true);
     expect(backlogEpic!.tickets).toHaveLength(1);
     expect(backlogEpic!.tickets[0]).toMatchObject({
@@ -351,7 +351,7 @@ describe("getBoard", () => {
       agent: "nextjs",
       risk: "high",
       size: "S",
-      acceptance: "Works.",
+      acceptance: undefined,
       stage: "implementing",
       assignee: "alice",
       createdAt: "2026-07-13T10:00:00Z",
@@ -713,7 +713,7 @@ describe("getBoard", () => {
     });
 
     listMock.mockImplementation(async (_cwd: string, extra: string[] = []) => {
-      if (extra.includes("all")) throw new Error("unsupported flag");
+      if (extra.includes("all")) throw new Error("invalid status: all");
       if (extra.includes("closed")) return [closedEpic];
       return [openEpic];
     });
@@ -2105,3 +2105,21 @@ describe("the generation a drawn pick is named by (anton-f12y)", () => {
     });
   });
 });
+
+ it("projects approval and health without recording a picker generation", async () => {
+   const all = [
+     makeBead({ id: "perf-target", title: "target", issue_type: "epic", description: "## Goal\nShip it\n## Success Criteria\nIt ships", labels: ["area:app"] }),
+     makeBead({ id: "perf-child", title: "child", issue_type: "task", parent: "perf-target" }),
+     makeBead({ id: "perf-loose", title: "loose", issue_type: "bug" }),
+   ];
+   listMock.mockResolvedValue(all);
+   const target = await getBoardTarget(project, all, "perf-target");
+   expect(target.epic?.tickets.map((ticket) => ticket.id)).toEqual(["perf-child"]);
+   expect(target.standalone).toBeUndefined();
+   expect((await getBoardTarget(project, all, "perf-loose")).standalone?.id).toBe("perf-loose");
+   const health = await getBoardHealth(project);
+   expect(planWrites).toEqual([]);
+   const board = await getBoard(project);
+   expect(health.reviewTrajectory).toEqual(board.reviewTrajectory);
+   expect(target.epic?.blockedBy).toEqual(board.columns.backlog.find((item) => item.id === "perf-target")?.blockedBy);
+ });

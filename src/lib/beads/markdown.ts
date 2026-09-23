@@ -7,6 +7,13 @@
  * source-preserving projection here.
  */
 import { fromMarkdown } from "mdast-util-from-markdown";
+import { BoundedCache } from "../bounded-cache";
+
+// A description is scanned for its goal, acceptance, validation and picker digest. Cache the
+// source projection, never the AST. Text keys make edits immediately miss, including edits to
+// an existing bead object. Both source size and line-object overhead count toward the budget.
+const scans = new BoundedCache<string, ScannedLine[]>(32 * 1024 * 1024);
+const headings = new BoundedCache<string, boolean>(1024 * 1024);
 
 /** One blockquote marker — retained for the contract's prompt policy, not Markdown parsing. */
 const BLOCKQUOTE = /^ {0,3}>[ \t]?/;
@@ -217,6 +224,14 @@ function dedentColumns(text: string, columns: number): string {
  * Bead descriptions are external input; a pathological line degrades to "not a heading" rather
  * than throwing through whichever board read/write path is judging it. */
 export function isHeading(text: string): boolean {
+  const cached = headings.get(text);
+  if (cached !== undefined) return cached;
+  const result = parseHeading(text);
+  headings.set(text, result, text.length * 2 + 64);
+  return result;
+}
+
+function parseHeading(text: string): boolean {
   try {
     const root = fromMarkdown(text) as unknown as MarkdownNode;
     const [node] = root.children ?? [];
@@ -406,6 +421,17 @@ const textOf = (node: MarkdownNode): string =>
  * the process on such input, at the cost of not recognizing that one description's structure.
  */
 export function scanMarkdown(source: string): ScannedLine[] {
+  let lines = scans.get(source);
+  if (!lines) {
+    lines = scanMarkdownUncached(source);
+    scans.set(source, lines, source.length * 8 + lines.length * 160);
+  }
+  // Writers also use this public helper. A caller editing its projection must never corrupt
+  // another contract read, so keep cached records private (headings are the only nested value).
+  return lines.map((line) => ({ ...line, ...(line.heading ? { heading: { ...line.heading } } : {}) }));
+}
+
+function scanMarkdownUncached(source: string): ScannedLine[] {
   try {
     return scanMarkdownParsed(source);
   } catch {

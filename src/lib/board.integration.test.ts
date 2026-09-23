@@ -1,12 +1,14 @@
 /**
- * Real-bd round-trip: create an epic + ticket, read the board, approve. Guards against the
- * `bd list` shape (no acceptance/external_ref fields; acceptance parsed from description) and
- * parent-child grouping. Skipped when `bd`/`git` aren't installed.
+ * Real-bd round-trip: create an epic + ticket, read the compact board and full detail, approve.
+ * Guards parent-child grouping and the detail-only acceptance contract: descriptions from
+ * `bd list` retain their acceptance text even though board projections omit it.
+ * Skipped when `bd`/`git` aren't installed.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { describeBd, makeBdRepo, makeFileDb, tmpProject, type BdRepo, type FileDb } from "@/lib/testing/integration";
 import { beads } from "./beads/bd";
 import { getBoard } from "./board";
+import { getEpicDetail } from "./epic-detail";
 import type { Epic, Project } from "./types";
 
 describeBd("board integration (real bd)", () => {
@@ -32,7 +34,7 @@ describeBd("board integration (real bd)", () => {
   const find = (epics: Record<string, Epic[]>, id: string) =>
     Object.values(epics).flat().find((e) => e.id === id);
 
-  it("round-trips create -> board -> approve", async () => {
+  it("round-trips create -> compact board -> full detail -> approve", async () => {
     const epicId = await beads.create(repo, {
       title: "CSV export",
       type: "epic",
@@ -50,7 +52,7 @@ describeBd("board integration (real bd)", () => {
     const epic = find(board.columns, epicId);
     expect(epic, "epic on board").toBeDefined();
     expect(epic!.goal).toMatch(/export to CSV/i);
-    expect(epic!.acceptance, "acceptance parsed from description").toMatch(/button exports/i);
+    expect(epic!.acceptance, "epic acceptance is detail-only").toBeUndefined();
     expect(epic!.stage).toBe("backlog");
     expect(epic!.approved).toBe(false);
 
@@ -59,6 +61,13 @@ describeBd("board integration (real bd)", () => {
     expect(ticket!.agent).toBe("nextjs");
     expect(ticket!.risk).toBe("low");
     expect(ticket!.size).toBe("S");
+    expect(ticket!.acceptance, "ticket acceptance is detail-only").toBeUndefined();
+
+    // Reuse the board's snapshot: compact projections must not discard the underlying contracts
+    // or poison subsequent detail reads through the shared Markdown/contract caches.
+    const detail = await getEpicDetail(project, epicId);
+    expect(detail.epic.acceptance, "full epic acceptance parsed from description").toMatch(/button exports/i);
+    expect(detail.tickets.find((t) => t.id === ticketId)?.acceptance).toMatch(/visible on \/reports/i);
 
     await beads.approve(repo, epicId);
     board = await getBoard(project);

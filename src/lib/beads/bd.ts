@@ -781,6 +781,13 @@ export const beads = {
   untag: (cwd: string, id: string, labels: string[]) =>
     bdWrite(cwd, ["update", id, ...labels.flatMap((l) => ["--remove-label", l])]),
 
+  /** Apply a stage transition's label deltas in one commit, retaining unrelated labels. */
+  changeLabels: (cwd: string, id: string, add: string[], remove: string[]) =>
+    bdWrite(cwd, ["update", id,
+      ...add.flatMap((label) => ["--add-label", label]),
+      ...remove.flatMap((label) => ["--remove-label", label]),
+    ]),
+
   /**
    * Write one dependency edge, `type` validated HERE because bd will not validate it (anton-igkb):
    * `--type` is free text, and every value but `blocks`/`conditional-blocks` yields a non-blocking

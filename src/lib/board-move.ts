@@ -72,13 +72,13 @@ export async function moveCard(project: Project, cardId: string, toStage: Stage)
           await beads.close(project.repoPath, cardId);
           break;
         case "tag":
-          await beads.tag(project.repoPath, cardId, op.labels);
-          break;
         case "untag":
-          await beads.untag(project.repoPath, cardId, op.labels);
-          break;
+          break; // Label deltas land atomically below, after any reopen.
       }
     }
+    const add = planned.flatMap((op) => op.kind === "tag" ? op.labels : []);
+    const remove = planned.flatMap((op) => op.kind === "untag" ? op.labels : []);
+    if (add.length || remove.length) await beads.changeLabels(project.repoPath, cardId, add, remove);
     return planned;
   });
 

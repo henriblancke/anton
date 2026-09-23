@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getBoard } from "@/lib/board";
+import { getBoardTarget } from "@/lib/board";
 import { humanGates } from "@/lib/approval-gate";
-import { epicStandaloneBlockers, standaloneBlockers } from "@/lib/epic-graph";
+import { standaloneBlockers } from "@/lib/epic-graph";
 import { refreshAllIssues } from "@/lib/beads/issues";
 import { beads, type Bead } from "@/lib/beads/bd";
 import { contractGaps, formatContractGaps } from "@/lib/beads/contract";
@@ -19,7 +19,6 @@ import { recordRelease, resolveRelease } from "@/lib/picker-release";
 import { withdrawPickerAccept } from "@/lib/picker-veto";
 import type { ApprovalRunOutcome, Project } from "@/lib/types";
 import { contractGatedBeads, deriveStage, runTickets } from "@/lib/ticket-view";
-import { STAGES } from "@/lib/types";
 import { notFoundResponse, withProject } from "../../../resolve-project";
 
 export const dynamic = "force-dynamic";
@@ -218,20 +217,9 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   const children = runTickets(allBeads, epicId);
   const contractGated = contractGatedBeads(target, children);
 
-  // Builds off the snapshot the refresh above just populated — a board rebuild, not a bd read. The
-  // route needs it for the epic-graph blocker rollup and for the item shape it answers with.
-  const board = await getBoard(project);
-  const epic = STAGES.map((stage) => board.columns[stage].find((e) => e.id === epicId)).find(
-    Boolean,
-  );
-  // A standalone task/bug (epic-of-one) lives in `standalone`, not `columns`, so it carries no
-  // epic-graph readiness — but it can still hold cross-item `blocks` edges. It must be found here
-  // or a valid run target 404s, and it must be gated on its own open blockers below. Every feature
-  // — nested or parentless — is a board CARD since anton-aul8 re-keyed getBoard off run targets, so
-  // it resolves in `columns` above and carries the epic-graph rollup's readiness.
-  const standalone = epic
-    ? undefined
-    : STAGES.map((stage) => board.standalone[stage].find((e) => e.id === epicId)).find(Boolean);
+  // Reuse the forced fresh snapshot and project only this target. Approval must not derive or
+  // persist an unrelated picker generation just to find a card's readiness and response shape.
+  const { epic, standalone } = await getBoardTarget(project, allBeads, epicId);
   if (!epic && !standalone) {
     return notFoundResponse("Run target not found");
   }
@@ -271,7 +259,7 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   // rejected before we label + enqueue work `bd ready` would keep blocked), and the refusal message,
   // which names what the operator is waiting on.
   const openBlockers = epic
-    ? [...epic.blockedBy, ...epicStandaloneBlockers(allBeads, epicId)]
+    ? epic.blockedBy
     : standaloneBlockers(allBeads, epicId);
   // Whether this request can actually start work. `openBlockers` is a target-level roll-up: it fires
   // on ANY open blocker under the target, so one gated tail child made the whole run unapprovable
