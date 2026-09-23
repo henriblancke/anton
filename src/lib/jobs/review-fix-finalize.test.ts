@@ -20,6 +20,10 @@ import { contractGaps } from "../beads/contract";
 
 const batchMock = vi.fn();
 const untagMock = vi.fn();
+const tagMock = vi.fn();
+/** The confirming push after the `stage:in-review` untag lands — mocked so the "sync can't confirm
+ * the untag reached the remote" recovery path is deterministic rather than shelling to a live `bd`. */
+const pushMock = vi.fn();
 const noteMock = vi.fn();
 const createMock = vi.fn();
 const reparentMock = vi.fn();
@@ -58,6 +62,8 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       batch: (...args: unknown[]) => batchMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      tag: (...args: unknown[]) => tagMock(...args),
+      push: (...args: unknown[]) => pushMock(...args),
       note: (...args: unknown[]) => noteMock(...args),
       create: (...args: unknown[]) => createMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
@@ -147,6 +153,8 @@ describe("finalizeMergedEpic", () => {
   beforeEach(() => {
     batchMock.mockReset().mockResolvedValue(undefined);
     untagMock.mockReset().mockResolvedValue(undefined);
+    tagMock.mockReset().mockResolvedValue(undefined);
+    pushMock.mockReset().mockResolvedValue("synced");
     noteMock.mockReset().mockResolvedValue(undefined);
     createMock.mockReset().mockResolvedValue("epic-2");
     reparentMock.mockReset().mockResolvedValue(undefined);
@@ -200,7 +208,29 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
       "stage:in-review",
     ]);
+    // Confirmed synced before this drop is trusted for good — no restore needed on the ordinary path.
+    expect(pushMock).toHaveBeenCalledWith("/repo");
+    expect(tagMock).not.toHaveBeenCalled();
   });
+
+  it(
+    "restores `stage:in-review` locally when the untag's confirming push cannot verify it reached " +
+      'the remote (chatgpt-codex-connector, PR #284 review, "Keep the recovery marker until ' +
+      'finalization syncs")',
+    async () => {
+      // On an embedded board a successful local untag can still be followed by a push that never
+      // confirms — the caller (`fixOnePr`, review-fix.ts) only logs that failure rather than
+      // propagating it, so without restoring the label here, this machine's own board would believe
+      // finalization is fully settled while the remote may still carry the epic unfenced, and
+      // nothing would ever revisit it again.
+      pushMock.mockResolvedValue("not-wired");
+
+      await finalize(bead("epic-1"), [bead("t1")]);
+
+      expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+      expect(tagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    },
+  );
 
   it(
     "stamps the closure fence on a standalone target confirmed while still open (chatgpt-codex-" +
@@ -222,6 +252,54 @@ describe("finalizeMergedEpic", () => {
 
       expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
       expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "target-1", ["anton-eb1"], "close-sha");
+    },
+  );
+
+  it(
+    "does not durably confirm a reset delivery with zero evidence when a newer cycle cleared the " +
+      'live confirmation before this fence could stamp it (chatgpt-codex-connector, PR #284 review, ' +
+      '"Revalidate confirmation before stamping its closure")',
+    async () => {
+      // The snapshot passed into finalization still shows the OLD, unfenced confirmation — taken
+      // before another writer reopened this bead, reset its confirmation for a NEW delivery cycle
+      // (`ensureBoardBaselinePersisted`'s reopen-reset), and closed it again. `metadataById` is left
+      // unset, so the LIVE re-read this fence takes sees no confirmation at all.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      // Writing off the live (empty) id set would have recreated `boardEvidenceConfirmed` with zero
+      // evidence and durably confirmed the new cycle — refused instead.
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Nothing left to fence is a settled bead, not a failed one: the close still finalizes.
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "does not overwrite a closure fence a concurrent pass already stamped on the live bead " +
+      '(chatgpt-codex-connector, PR #284 review, "Revalidate confirmation before stamping its ' +
+      'closure")',
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      // The live bead was already fenced by a concurrent review-fix pass between the snapshot and
+      // this call.
+      metadataById.set("target-1", {
+        boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "already-fenced-sha" }),
+      });
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
     },
   );
 

@@ -1151,10 +1151,21 @@ async function reDiffPreservedBaseline(repo: string, ticket: Bead): Promise<{ id
  * #284 review, "Fence pending evidence by closure cycle") — the one trust rule shared by every such
  * survivor a resume can find on a closed ticket, so `stalePending`/`cleanupUnsyncedIds` get exactly
  * the same fence `confirmedIdsTrusted` already applied to confirmed evidence. Not fenced (trusted
- * unconditionally) for an ids-empty survivor (nothing to mistrust), a ticket that isn't closed (a
- * standalone target at `stage:in-review` has no closure episode to compare), or a stamp that is
- * `undefined` — written before this fence existed, or (for the pending marker specifically) never
- * reached by a `clearBoardEvidencePending` retry that would have stamped it. `current` is the
+ * unconditionally) for an ids-empty survivor (nothing to mistrust) or a ticket that isn't closed (a
+ * standalone target at `stage:in-review` has no closure episode to compare).
+ *
+ * An UNDEFINED stored closure is trusted only when `current.reopened` says this ticket has never
+ * been reopened-and-reclosed before its current closure (chatgpt-codex-connector, PR #284 review,
+ * "Reject unstamped survivors on closed tickets") — the earlier version of this function trusted
+ * `undefined` unconditionally, on the theory that `stampPendingBoardEvidenceClosure`'s best-effort
+ * stamp (`clearBoardEvidencePending`) can never strand a false confirmation, since an unstamped
+ * survivor is exactly what this function was supposed to treat as untrusted. That theory was false:
+ * a failed stamp followed by a failed clear left an unstamped marker that a later reopen-and-reclose
+ * passed straight through, confirming the new cycle against stale evidence with no fresh board delta
+ * ever checked. A bead closed exactly once has only one episode for any survivor to belong to, so an
+ * unstamped one there is unambiguous regardless of whether the stamp ever landed — narrower than
+ * rejecting every unstamped survivor outright, which would also punish that ordinary, never-reopened
+ * resume with a forced re-diff (or a hard failure) it does nothing to deserve. `current` is the
  * shared `bd history` read every survivor on the same ticket compares against, so callers take it
  * once rather than re-reading per survivor.
  */
@@ -1162,14 +1173,11 @@ function survivorTrustedForClosure(
   ids: readonly string[],
   storedClosure: string | undefined,
   ticketClosed: boolean,
-  current: { read: boolean; closure?: string } | undefined,
+  current: { read: boolean; closure?: string; reopened?: boolean } | undefined,
 ): boolean {
-  return (
-    ids.length === 0 ||
-    !ticketClosed ||
-    storedClosure === undefined ||
-    (current !== undefined && current.read && storedClosure === current.closure)
-  );
+  if (ids.length === 0 || !ticketClosed) return true;
+  if (current === undefined || !current.read) return false;
+  return storedClosure !== undefined ? storedClosure === current.closure : !current.reopened;
 }
 
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
@@ -1277,11 +1285,15 @@ async function dispatchTicket(
     // fully-cleaned-up ticket. Retried like every other guarded read in this file before falling back
     // to the same fail-closed answer. Read ONCE and shared across every survivor's trust check below
     // (`survivorTrustedForClosure`), since they all compare against the same live closure.
+    //
+    // Triggered by ids alone, not by a DEFINED stored closure too (chatgpt-codex-connector, PR #284
+    // review, "Reject unstamped survivors on closed tickets"): `survivorTrustedForClosure` now needs
+    // `current.reopened` to judge an UNSTAMPED survivor as well as a stamped one, so an id set with no
+    // stored closure at all must still trigger this read rather than leave `closureCheck` undefined
+    // and fall through to the fence's fail-closed default.
     const closureCheck =
       ticket.status === "closed" &&
-      ((staleConfirmedIds.length > 0 && confirmedClosure !== undefined) ||
-        (stalePending.length > 0 && pendingClosure !== undefined) ||
-        (cleanupUnsyncedIds.length > 0 && cleanupClosure !== undefined))
+      (staleConfirmedIds.length > 0 || stalePending.length > 0 || cleanupUnsyncedIds.length > 0)
         ? await mustReadClosureVersion(repo, ticket.id)
         : undefined;
     const confirmedIdsTrusted = survivorTrustedForClosure(
@@ -1456,10 +1468,11 @@ async function dispatchTicket(
     const cleanupClosure =
       ticket.status === "closed" ? beads.cleanupUnsyncedBoardEvidenceClosure(ticket) : undefined;
     const pendingClosure = ticket.status === "closed" ? beads.pendingBoardEvidenceClosure(ticket) : undefined;
+    // Triggered by ids alone (chatgpt-codex-connector, PR #284 review, "Reject unstamped survivors
+    // on closed tickets") — see the `if (delivery)` fast path's own `closureCheck` above for why an
+    // undefined stored closure must still trigger this read.
     const closureCheck =
-      ticket.status === "closed" &&
-      ((cleanupUnsyncedIds.length > 0 && cleanupClosure !== undefined) ||
-        (stalePending.length > 0 && pendingClosure !== undefined))
+      ticket.status === "closed" && (cleanupUnsyncedIds.length > 0 || stalePending.length > 0)
         ? await mustReadClosureVersion(repo, ticket.id)
         : undefined;
     const cleanupTrusted = survivorTrustedForClosure(

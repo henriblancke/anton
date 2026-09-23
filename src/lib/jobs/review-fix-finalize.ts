@@ -544,7 +544,24 @@ async function closeFinalized(
   // fenced would strand that bead's fence attempt: the close already landed, durably, and cannot be
   // retried from a state where the epic is no longer selected for finalization.
   if (allFenced) {
-    await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+    const untagged = await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+    // Confirmed synced before this untag is trusted, and RESTORED locally when it can't be (chatgpt-
+    // codex-connector, PR #284 review, "Keep the recovery marker until finalization syncs"): the
+    // caller here (`fixOnePr`, review-fix.ts) only syncs from a `finally` that LOGS a push failure
+    // rather than propagating it, so on an embedded board a push that fails right after this untag
+    // would leave the LOCAL board believing finalization is fully settled while the remote may still
+    // carry the epic unfenced. `closedUnfencedEpics`/`recoverUnfencedClosure` (review-fix.ts) — the
+    // one place left that ever revisits a closed epic — reads the LOCAL board, so once the label is
+    // gone there, nothing on this machine would ever retry the push. Restoring it locally keeps this
+    // machine's own recovery path finding the epic again; that path's own sync IS propagated, not
+    // swallowed.
+    if (untagged) {
+      const synced = await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false);
+      if (!synced) await safe(() => beads.tag(repo, epic.id, [IN_REVIEW]));
+    }
   }
 }
 
@@ -592,6 +609,16 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
       // guessing off the stale snapshot.
       const live = await tryShow(repo, b.id);
       if (!live) return false;
+      // Revalidated before writing, not just used as an id source (chatgpt-codex-connector, PR #284
+      // review, "Revalidate confirmation before stamping its closure"): a writer that starts a NEW
+      // delivery cycle between the snapshot and this call can clear this bead's confirmation (a
+      // reopen resets it — `ensureBoardBaselinePersisted`) or already fence it with a closure of its
+      // own. Writing off `live`'s ids alone would recreate `boardEvidenceConfirmed` from a now-empty
+      // id set and stamp it with `read.closure` — durably confirming the NEW cycle with zero evidence
+      // ever checked. Nothing to fence either way is a settled bead, not a failure.
+      if (!beads.boardEvidenceConfirmed(live) || beads.confirmedBoardEvidenceClosure(live) !== undefined) {
+        return true;
+      }
       return mustPersist(() =>
         beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(live), read.closure),
       );

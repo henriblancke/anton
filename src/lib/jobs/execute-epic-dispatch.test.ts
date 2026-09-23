@@ -1020,6 +1020,35 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
     expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
   });
 
+  // chatgpt-codex-connector, PR #284 review, "Reject unstamped survivors on closed tickets": an
+  // UNSTAMPED pending marker (no `pendingBoardEvidenceClosure`) is safe to trust only when this
+  // ticket has never been reopened-and-reclosed — the test right above. Once `bd history` shows an
+  // earlier closed episode behind the current one, the same unstamped marker is exactly the shape a
+  // failed `stampPendingBoardEvidenceClosure` + failed clear can strand across a reopen, so it must
+  // NOT be passed through unconditionally the way the pre-fix `survivorTrustedForClosure` did.
+  it(
+    "does not trust an unstamped pending marker once this ticket's history shows an earlier " +
+      "reopen-and-reclose, and fails loud rather than fabricate a delivery when nothing survives " +
+      "to re-diff",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb1"])],
+      });
+      hasCommitMock.mockResolvedValue(true);
+      historyMock.mockResolvedValue([
+        { hash: "new-close-sha", at: "2026-09-21T00:00:00.000Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-09-20T12:00:00.000Z", status: "open" },
+        { hash: "old-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("does nothing when the ticket carries no pending marker and no preserved baseline", async () => {
     const child = bead("anton-a", { status: "closed", labels: [LABELS.boardOnly] });
     hasCommitMock.mockResolvedValue(true);
