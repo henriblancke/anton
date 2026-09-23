@@ -420,6 +420,24 @@ export async function ensureBoardBaselinePersisted(
     if (!cleared) return null;
     if (hadBaseline) {
       await abandonDispatchBaseline(repo, ticket);
+      // `abandonDispatchBaseline` clears the baseline/locked/verified/dispatch-started metadata
+      // remotely, but `ticket` is the snapshot passed into this call — left unpatched, the
+      // free-refresh loop below still hands this same stale `ticket` to `lockDispatchBaseline`,
+      // whose `preserveRecoveryBaseline` reads the still-present locked/verified flags off it and
+      // treats the new candidate as already locked, skipping both the tentative-lock and
+      // verified-lock writes (chatgpt-codex-connector, PR #284 review, "Refresh metadata after
+      // abandoning the prior baseline"). Patched here so every later read of `ticket` in this call
+      // sees the same cleared state the remote now has.
+      ticket = {
+        ...ticket,
+        metadata: {
+          ...ticket.metadata,
+          boardEvidenceBaseline: undefined,
+          boardEvidenceBaselineLocked: undefined,
+          boardEvidenceBaselineVerified: undefined,
+          boardEvidenceDispatchStarted: undefined,
+        },
+      };
       hadBaseline = false;
       locked = false;
       recoveryBaseline = false;
@@ -1331,7 +1349,14 @@ export async function clearBoardEvidencePending(
   let closureFenceFailed = false;
   if (confirmedSet && closure === undefined) {
     const recheck = await mustRead(repo, ticketId);
-    if (recheck?.status === "closed") {
+    if (!recheck) {
+      // The reread itself is exhausted (after retries) — indistinguishable from "still open" if
+      // trusted as such, which would fall through and let the clears below strand an unfenced
+      // `{ ids }` confirmation for a ticket that may already be closed (chatgpt-codex-connector,
+      // PR #284 review, "Fail closed when the post-confirmation reread fails"). Treated the same as
+      // an unreadable closure history just below: refuse to complete cleanup rather than guess.
+      closureFenceFailed = true;
+    } else if (recheck.status === "closed") {
       const read = await mustReadClosureVersion(repo, ticketId);
       if (read.read && read.closure !== undefined) {
         const fenced = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, read.closure));

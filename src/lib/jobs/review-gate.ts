@@ -691,7 +691,15 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
             // unfenced. Mirrors `closureFenceFailed` in `clearBoardEvidencePending`.
             if (closure === undefined) {
               const recheck = await mustRead(repo, t.id);
-              if (recheck?.status === "closed") {
+              if (!recheck) {
+                // The reread itself is exhausted (after retries) — trusting a missing read as "still
+                // open" would fall through and `return true`, pushing an unfenced `{ ids }`
+                // confirmation a later reopen-and-reclose could reuse (chatgpt-codex-connector, PR
+                // #284 review, "Reject review confirmation when its status reread fails"). Same
+                // failure shape as the unreadable-closure-history branch just below.
+                return false;
+              }
+              if (recheck.status === "closed") {
                 const read = await mustReadClosureVersion(repo, t.id);
                 if (read.read && read.closure !== undefined) {
                   const fenced = await mustPersist(() =>

@@ -14,7 +14,7 @@ import type { Bead } from "../beads/bd";
 import { metered, type InvocationDimensions } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
-import { branchAddedCommit } from "../git/ops";
+import { branchAddedCommit, type WorktreeState } from "../git/ops";
 import {
   abandonDispatchBaseline,
   clearBoardEvidencePending,
@@ -111,41 +111,6 @@ export async function runTicket(args: {
   const budget = startTicketBudget(ctx, timeoutMs, (remainingMs) =>
     warnBudgetRunningOut(session.logPath, ticket, timeoutMs, remainingMs),
   );
-  const baseline = await readTicketBaseline(worktreePath);
-  // The classification (anton-fc5x review round 4) is kept SEPARATE from whether the baseline read
-  // that backs it actually succeeded. A board-only ticket whose `bd list` exhausted its retries is
-  // still a board-only ticket — collapsing the two into one `null` (as before) made an unreadable
-  // baseline indistinguishable from "this was never board-only", which let `walkTicketSteps` skip
-  // the board-evidence gate entirely and fall through to the tree-based path: an incidental commit
-  // would then settle delivered without the board ever being checked, the exact false success this
-  // gate exists to prevent. The read costs a whole-board `bd list`, paid here so every OTHER
-  // ticket's zero-diff path stays exactly as cheap as it always was.
-  const boardOnly = isBoardOnlyRun(run, ticket);
-  // `ticket` is passed so a resumed attempt reuses a PRIOR attempt's preserved baseline instead of
-  // taking a fresh one (PR #284 review round 8) — see readBoardBaseline's own docstring.
-  let boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
-  // Durably persisted BEFORE the agent is ever dispatched (PR #284 review, "Persist the board
-  // baseline before dispatch") — a freshly-read baseline otherwise lives only in this process's
-  // memory until `readBoardEvidence` first writes a pending marker, and on a shared-server board the
-  // agent's own bd writes are globally visible the moment they land. A process/host death inside that
-  // window would leave a resumed attempt with nothing preserved to anchor to: `readBoardBaseline`
-  // would take a fresh read that already absorbed the delivered state, and an idempotent retry then
-  // diffs as no evidence at all, permanently. Kept SEPARATE from `!boardBaseline` below (never folded
-  // into it) so the operator note can say precisely which of "unreadable" or "read fine but could not
-  // be anchored" happened, instead of a persist failure claiming a read never occurred.
-  //
-  // `ensureBoardBaselinePersisted`'s confirming push is a pull → commit → push pass, so it can pull
-  // in remote changes made by something else with access to the same board between the read above and
-  // here — it returns a REFRESHED baseline accounting for them (chatgpt-codex-connector, PR #284
-  // review, "Refresh the baseline after the confirming pull"). Reassigned into `boardBaseline` on
-  // success so `walkTicketSteps` and the failure-path audit below both measure against the board as it
-  // stood after that one guaranteed pull, never the pre-pull read a pulled-in change would otherwise be
-  // credited against.
-  const refreshedBoardBaseline =
-    boardOnly && boardBaseline ? await ensureBoardBaselinePersisted(run.repoPath, ticket, boardBaseline) : null;
-  const boardBaselinePersistFailed = boardOnly && boardBaseline ? !refreshedBoardBaseline : false;
-  if (refreshedBoardBaseline) boardBaseline = refreshedBoardBaseline;
-  const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
   // Set only once the ticket itself has genuinely finished (PR #284 review round 9) — kept outside
   // the try/catch below so the marker cleanup after it can propagate a failure WITHOUT routing
@@ -157,8 +122,52 @@ export async function runTicket(args: {
   // so a catch reached from one of them has no dispatch to audit. Read only in the catch block, never
   // reassigned there, so a throw from `walkTicketSteps` itself still reports `true`.
   let dispatchStarted = false;
+  // Hoisted so the catch block below can still see them when the throw happens while ESTABLISHING
+  // the baseline, not just while acting on one (anton-fc5x PR #284 review, "Settle errors raised
+  // while anchoring the baseline"). `ensureBoardBaselinePersisted` can throw `PoisonEpic` through
+  // `abandonDispatchBaseline`, and that await now runs inside the `try` below specifically so that
+  // failure still reaches `settleFailedTicket` and the budget `finally` instead of leaving the
+  // ticket claimed/in-progress with its session and budget still running.
+  let boardOnly = false;
+  let boardBaseline: BoardFingerprint | null = null;
+  let baseline: WorktreeState | null = null;
 
   try {
+    baseline = await readTicketBaseline(worktreePath);
+    // The classification (anton-fc5x review round 4) is kept SEPARATE from whether the baseline read
+    // that backs it actually succeeded. A board-only ticket whose `bd list` exhausted its retries is
+    // still a board-only ticket — collapsing the two into one `null` (as before) made an unreadable
+    // baseline indistinguishable from "this was never board-only", which let `walkTicketSteps` skip
+    // the board-evidence gate entirely and fall through to the tree-based path: an incidental commit
+    // would then settle delivered without the board ever being checked, the exact false success this
+    // gate exists to prevent. The read costs a whole-board `bd list`, paid here so every OTHER
+    // ticket's zero-diff path stays exactly as cheap as it always was.
+    boardOnly = isBoardOnlyRun(run, ticket);
+    // `ticket` is passed so a resumed attempt reuses a PRIOR attempt's preserved baseline instead of
+    // taking a fresh one (PR #284 review round 8) — see readBoardBaseline's own docstring.
+    boardBaseline = boardOnly ? await readBoardBaseline(run.repoPath, ticket) : null;
+    // Durably persisted BEFORE the agent is ever dispatched (PR #284 review, "Persist the board
+    // baseline before dispatch") — a freshly-read baseline otherwise lives only in this process's
+    // memory until `readBoardEvidence` first writes a pending marker, and on a shared-server board the
+    // agent's own bd writes are globally visible the moment they land. A process/host death inside that
+    // window would leave a resumed attempt with nothing preserved to anchor to: `readBoardBaseline`
+    // would take a fresh read that already absorbed the delivered state, and an idempotent retry then
+    // diffs as no evidence at all, permanently. Kept SEPARATE from `!boardBaseline` below (never folded
+    // into it) so the operator note can say precisely which of "unreadable" or "read fine but could not
+    // be anchored" happened, instead of a persist failure claiming a read never occurred.
+    //
+    // `ensureBoardBaselinePersisted`'s confirming push is a pull → commit → push pass, so it can pull
+    // in remote changes made by something else with access to the same board between the read above and
+    // here — it returns a REFRESHED baseline accounting for them (chatgpt-codex-connector, PR #284
+    // review, "Refresh the baseline after the confirming pull"). Reassigned into `boardBaseline` on
+    // success so `walkTicketSteps` and the failure-path audit below both measure against the board as it
+    // stood after that one guaranteed pull, never the pre-pull read a pulled-in change would otherwise be
+    // credited against.
+    const refreshedBoardBaseline =
+      boardOnly && boardBaseline ? await ensureBoardBaselinePersisted(run.repoPath, ticket, boardBaseline) : null;
+    const boardBaselinePersistFailed = boardOnly && boardBaseline ? !refreshedBoardBaseline : false;
+    if (refreshedBoardBaseline) boardBaseline = refreshedBoardBaseline;
+    const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
     // A board-only ticket with no baseline is refused BEFORE dispatch, not just at the commit
     // step's evidence gate (PR #284 review round 12): letting the agent run anyway risks it making
     // the very bd writes this ticket is meant to deliver, which `concludeRunAttempt` syncs to the
