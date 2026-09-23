@@ -824,7 +824,13 @@ export async function listDeliveriesByBead(
         eq(schema.runs.delivered, true),
       );
   const ticketRows = await db
-    .select({ beadId: schema.sessions.beadId, endedAt: schema.sessions.endedAt })
+    .select({
+      beadId: schema.sessions.beadId,
+      kind: schema.sessions.kind,
+      endedAt: schema.sessions.endedAt,
+      runEndedAt: schema.runs.endedAt,
+      runUpdatedAt: schema.runs.updatedAt,
+    })
     .from(schema.sessions)
     .leftJoin(schema.runs, eq(schema.sessions.runId, schema.runs.id))
     .where(
@@ -836,10 +842,17 @@ export async function listDeliveriesByBead(
       ),
     );
   for (const row of ticketRows) {
-    // `endedAt` is written with the `done` status in one update (sessions.ts `endSession`), so a
-    // row without one is not a delivery this read can place in time — and a delivery it cannot
-    // place is not one it may spend a repair stamp on.
-    const at = toEpoch(row.endedAt);
+    // A gated execute session (`includeLocalCommits: false`) is only reached here because its
+    // CONTAINING RUN delivered — a reparented non-final child whose own run-row evidence names
+    // neither its new feature nor itself (see the run-row arm's own note above). The session's own
+    // `endedAt` is that child's local commit, stamped before the run's later PR publication; reading
+    // it as the delivery time would end `leadMs` at the commit instead of the publish it actually
+    // waited for (PR #320 review, P2). The run's own `endedAt` (falling back to `updatedAt`, exactly
+    // as the run-row arm above reads it) is the publication time for this arm.
+    const at =
+      !includeLocalCommits && row.kind === "execute"
+        ? toEpoch(row.runEndedAt) ?? toEpoch(row.runUpdatedAt)
+        : toEpoch(row.endedAt);
     if (at === undefined || row.beadId === null) continue;
     record(row.beadId, at);
   }

@@ -340,37 +340,30 @@ export function activeMs(rows: readonly LedgerTimingRow[]): number {
  *
  * `metered` records a failed driver call without a duration before rethrowing, so a retry can be the
  * first invocation THIS fold can time even when it is not the first invocation that ran. An untimed
- * invocation that ended before OR AT the earliest timed one's reconstructed start proves a real,
- * earlier invocation happened — and its own start is unrecoverable, since there is no duration to
- * subtract. Reporting the retry's start as the origin in that case would silently understate lead
+ * invocation's own start is unrecoverable — there is no duration to subtract from its end — so its
+ * mere presence means a real invocation happened whose start this fold cannot place. Reporting a
+ * later, timed invocation's reconstructed start as the origin anyway would silently understate lead
  * and waiting time, so this refuses instead: it returns `undefined` rather than a start it cannot
  * stand behind.
  *
- * The equal case matters on its own: `recorded_at` floors to whole seconds, so a failed call and its
- * immediate retry can land in the same second — the failed call's end and the retry's reconstructed
- * start can come out equal even though the failed call's own (unknown) start was strictly earlier. A
- * strict `<` would accept the retry as the origin right when the flooring hides that gap, so the
- * check below is `<=`.
+ * That refusal does not depend on comparing the untimed invocation's end to the timed one's
+ * reconstructed start. An end that lands AFTER that start does not prove the untimed invocation
+ * began later too — once a child can be reparented into a scope whose rows come from a different,
+ * possibly concurrent history, "ended after" no longer implies "started after": it may have begun
+ * earlier and merely ended later, or ended later only because flooring `recorded_at` to whole
+ * seconds hides the true order. Neither this nor any other row carries the untimed invocation's own
+ * start, so there is no ordering this fold can stand behind either way — refuse whenever an untimed
+ * invocation exists in scope, not only when it provably precedes the reconstructed start.
  */
 export function firstInvocationStartMs(rows: readonly LedgerTimingRow[]): number | undefined {
   let earliestStart: number | undefined;
-  let earliestUntimedEnd: number | undefined;
   for (const fact of groupInvocations(rows)) {
     const endedAt = recordedAtMs(fact.rows);
     if (endedAt === undefined) continue;
     const duration = invocationDuration(fact.rows);
-    if (duration === undefined) {
-      if (earliestUntimedEnd === undefined || endedAt < earliestUntimedEnd) earliestUntimedEnd = endedAt;
-      continue;
-    }
+    if (duration === undefined) return undefined;
     const startedAt = endedAt - duration;
     if (earliestStart === undefined || startedAt < earliestStart) earliestStart = startedAt;
-  }
-  if (
-    earliestUntimedEnd !== undefined &&
-    (earliestStart === undefined || earliestUntimedEnd <= earliestStart)
-  ) {
-    return undefined;
   }
   return earliestStart;
 }
@@ -420,7 +413,14 @@ export function ledgerTiming(
     // or falsely zeroes — how long the scope actually waited (PR #320 review). Only PROVEN-later
     // invocations are excluded: one with no recorded end stays in, same as `firstInvocationStartMs`
     // refusing to guess in the other direction.
-    if (deliveredAtMs !== undefined && (recordedAtMs(fact.rows) ?? -Infinity) > deliveredAtMs) continue;
+    //
+    // Both `recordedAt` and `deliveredAtMs` are floored to whole seconds, so a no-op invocation that
+    // truly ended milliseconds after delivery can land in the SAME second as it — a strict `>` reads
+    // that as "not proven later" and folds its whole duration into `active` anyway, understating
+    // `waitingMs` exactly the way the strict comparison was meant to prevent. The equal case is this
+    // fold's own version of `firstInvocationStartMs`'s `<=`: flooring can hide the true order, so
+    // treat it the same as proven-later rather than proven-earlier.
+    if (deliveredAtMs !== undefined && (recordedAtMs(fact.rows) ?? -Infinity) >= deliveredAtMs) continue;
     active += duration;
   }
 

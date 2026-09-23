@@ -515,6 +515,32 @@ describe("listDeliveriesByBead", () => {
     ).toEqual(new Map([[EPIC, [sec(SETTLED)]]]));
   });
 
+  it("uses the containing run's delivery time, not the reparented child's earlier local commit (PR #320 review, P2)", async () => {
+    // The child's own execute session settled well before the run it was opened inside actually
+    // published — the run kept working (gates, other children) after this one committed locally.
+    // Reading the session's own `endedAt` as the delivery time would end `leadMs` at that local
+    // commit instead of the later publish it actually waited for.
+    await seed({
+      id: "grouped",
+      status: "done",
+      updatedAt: SETTLED + 120_000,
+      endedAt: SETTLED + 120_000,
+      epicBeadId: "anton-old-epic",
+      ticketBeadId: "anton-final-child",
+    });
+    await seedSession({
+      id: "s1",
+      beadId: EPIC,
+      status: "done",
+      endedAt: SETTLED,
+      runId: "grouped",
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map([[EPIC, [sec(SETTLED + 120_000)]]]));
+  });
+
   it("excludes a reparented child's local commit when its own run parked or failed", async () => {
     // `delivered` defaults `true` at row creation and is only ever rewritten when a run finishes
     // `status: "done"` — a parked or failed run never gets it flipped to `false`. So excluding this

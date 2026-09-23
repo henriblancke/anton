@@ -143,6 +143,30 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
     // hiding the 20 real minutes the scope spent parked before delivery.
     expect(waitingMs(ledgerTiming(rows, deliveredAt))).toBe(20 * MINUTE);
   });
+
+  it("treats a same-second post-delivery invocation as ambiguous, not as pre-delivery work", () => {
+    // A no-op review-fix invocation whose recorded end floors to the SAME second as the delivery it
+    // followed — `recorded_at` and the delivery timestamp are both floored to whole seconds, so a
+    // strict `>` reads "not proven later" and folds the whole 20min into active, understating
+    // `waitingMs` exactly the way the earlier fix (above) was meant to prevent. Flooring can hide the
+    // true order here just as it can for `firstInvocationStartMs`'s own equal case, so this must
+    // exclude it too rather than trust the coincidence.
+    const sameSecondRows = [
+      row({ invocationId: "inv-1", recordedAt: new Date("2026-09-20T09:10:00Z"), durationMs: 10 * MINUTE }),
+      row({
+        invocationId: "inv-2",
+        step: "review-fix",
+        recordedAt: new Date("2026-09-20T09:30:00Z"),
+        durationMs: 20 * MINUTE,
+      }),
+    ];
+    const sameSecondDeliveredAt = Date.parse("2026-09-20T09:30:00Z");
+
+    const timing = ledgerTiming(sameSecondRows, sameSecondDeliveredAt);
+    expect(timing.activeMs).toBe(10 * MINUTE);
+    expect(timing.timedInvocations).toBe(2);
+    expect(waitingMs(timing)).toBe(20 * MINUTE);
+  });
 });
 
 describe("firstInvocationStartMs with an unmeasured invocation", () => {
@@ -168,9 +192,12 @@ describe("firstInvocationStartMs with an unmeasured invocation", () => {
     expect(firstInvocationStartMs(rows)).toBeUndefined();
   });
 
-  it("excludes an unmeasured invocation that ended AFTER the earliest known start", () => {
-    // inv-1 (unmeasured) ended at 09:25 — after inv-2's reconstructed 09:15 start — so it cannot be
-    // the earlier invocation. The known start still stands.
+  it("refuses even when the unmeasured invocation ended AFTER the earliest known start", () => {
+    // inv-1 (unmeasured) ended at 09:25 — after inv-2's reconstructed 09:15 start. Ending later does
+    // not prove inv-1 STARTED later: once a child can be reparented into a scope built from a
+    // different history, these two invocations are not provably sequential, so inv-1 could have begun
+    // before 09:15 and simply ended after it. Its own start is still unrecoverable, so this must
+    // refuse rather than trust the ordering "ended after" used to imply.
     const rows = [
       row({
         invocationId: "inv-1",
@@ -183,7 +210,7 @@ describe("firstInvocationStartMs with an unmeasured invocation", () => {
         durationMs: 5 * MINUTE,
       }),
     ];
-    expect(firstInvocationStartMs(rows)).toBe(Date.parse("2026-09-20T09:15:00Z"));
+    expect(firstInvocationStartMs(rows)).toBeUndefined();
   });
 
   it("refuses when an unmeasured end lands exactly on the reconstructed start", () => {
