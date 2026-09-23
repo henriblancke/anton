@@ -1336,6 +1336,12 @@ export async function clearBoardEvidencePending(
       if (read.read && read.closure !== undefined) {
         const fenced = await mustPersist(() => beads.setBoardEvidenceConfirmed(repo, ticketId, ids, read.closure));
         closureFenceFailed = !fenced;
+      } else {
+        // The recheck found the ticket closed but its closure version is unreadable (after retries)
+        // or its history is empty — the same ambiguity `mustReadClosureVersion`'s caller above
+        // already fails closed on. Falling through here would leave `closureFenceFailed` false and
+        // let the clears below strand an unfenced `{ ids }` confirmation.
+        closureFenceFailed = true;
       }
     }
   }

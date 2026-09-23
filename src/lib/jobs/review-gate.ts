@@ -698,6 +698,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
                     beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], read.closure),
                   );
                   if (!fenced) return false;
+                } else {
+                  // Closed on recheck but its closure version is unreadable (after retries) or its
+                  // history is empty — the same ambiguity the earlier `mustReadClosureVersion` call
+                  // above already fails closed on. Falling through here would `return true` and push
+                  // an unfenced `{ ids }` confirmation a later reopen-and-reclose could reuse.
+                  return false;
                 }
               }
             }
