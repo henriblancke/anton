@@ -261,6 +261,27 @@ export async function loadAllIssues(
       // names the same cycles as the copy this board is about to be paired with.
       const retryOnHydrationDrift = await recheckCycleConsistency(cwd, opts, attempt, cycles);
       if (retryOnHydrationDrift) return retryOnHydrationDrift;
+      // Matching cycle sets only proves the CYCLIC pairs held steady — this hydration is a live `bd
+      // list` in its own right, and an ordinary ACYCLIC `blocks` edge can land or vanish during that
+      // await without moving `bd dep cycles` at all (P2 review, PR #274, issues.ts:263). Left
+      // unchecked, `board` would carry that stale edge past this point: `structureGaps` walks it
+      // directly for the dangling-blocker/self-block/duplicates-parent rules and would miss a newly
+      // added external blocker, or evaluate a since-removed one, until some later refresh.
+      //
+      // `sameBlocksEdges` against a plain `loadAllIssues(cwd)` (as `recheckBlocksConsistency` above
+      // does) doesn't work here — that comparison baseline only ever discovers gates a work bead's
+      // `blocks` edge dangles toward, so it structurally mismatches `board`'s ALL-gates hydration
+      // even when nothing drifted (the same asymmetry noted above for why `sameBlocksEdges` can't be
+      // reused as-is). Rebuild the comparison the same way `board` itself was just built instead — a
+      // fresh work read plus a fresh full gate listing — so both sides are apples to apples.
+      const retryOnHydrationEdgeDrift = await recheckHydratedBlocksConsistency(
+        cwd,
+        opts,
+        attempt,
+        board,
+        missingCycleIds,
+      );
+      if (retryOnHydrationEdgeDrift) return retryOnHydrationEdgeDrift;
     }
   }
   return attachCycleEvidence(board, cycles);
@@ -305,6 +326,31 @@ async function recheckCycleConsistency(
 ): Promise<Bead[] | undefined> {
   if (opts.skipCycleConsistencyRecheck) return undefined;
   if (sameCycles(cycles, await beads.depCycles(cwd))) return undefined;
+  return retryOrFail(cwd, opts, attempt);
+}
+
+/**
+ * Guard behind `loadAllIssues`'s post-hydration recheck, alongside {@link recheckCycleConsistency}:
+ * re-read work plus a fresh full gate listing and compare their `blocks` edges against `board`'s.
+ *
+ * Unlike {@link recheckBlocksConsistency}, the comparison baseline here can't be a plain
+ * `loadAllIssues(cwd)` — that only ever discovers gates a work bead's `blocks` edge dangles toward,
+ * while `board` at this point carries EVERY gate the hydration's full `--type gate` listing named.
+ * Rebuilding the baseline the same way (a fresh work read plus a fresh full gate listing) keeps both
+ * sides comparable instead of flagging drift that isn't there. Same return contract as
+ * {@link recheckBlocksConsistency}.
+ */
+async function recheckHydratedBlocksConsistency(
+  cwd: string,
+  opts: LoadIssuesOptions,
+  attempt: number,
+  board: Bead[],
+  missingCycleIds: string[],
+): Promise<Bead[] | undefined> {
+  if (opts.skipCycleConsistencyRecheck) return undefined;
+  const freshWork = await loadWorkIssues(cwd);
+  const freshGates = await loadGateIssues(cwd, opts.strictGates ?? false, missingCycleIds);
+  if (sameBlocksEdges(board, dedupeById([...freshWork, ...freshGates]))) return undefined;
   return retryOrFail(cwd, opts, attempt);
 }
 
