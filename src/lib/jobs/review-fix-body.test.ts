@@ -1,0 +1,168 @@
+/**
+ * Unit tests for the review-fix-rounds PR-body region content (anton-te6nr): building a round from
+ * the fixer's own per-thread report, round-tripping the region's rendered text back into rounds,
+ * and capping accumulated rounds. The gh read/write orchestration around this is covered by
+ * review-fix-body.integration.test.ts.
+ */
+import { describe, expect, it } from "vitest";
+import { BODY_REGION_END, BODY_REGION_START } from "./steps/prompts";
+import {
+  extractFixRoundsRegion,
+  fixRoundFrom,
+  nextFixRoundsRegion,
+  parseFixRounds,
+  renderFixRounds,
+  type FixRound,
+} from "./review-fix-body";
+import type { ThreadOutcome } from "./review-fix-context";
+
+const now = new Date("2026-09-23T12:00:00Z");
+
+describe("fixRoundFrom", () => {
+  it("renders a round from a thread report, one line per fixed thread", () => {
+    const report: ThreadOutcome[] = [
+      { id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" },
+      { id: "RT_2", outcome: "fixed", reply: "added the missing null check" },
+    ];
+
+    expect(fixRoundFrom(report, true, now)).toEqual({
+      date: "2026-09-23",
+      fixed: ["renamed foo to bar", "added the missing null check"],
+    });
+  });
+
+  it("falls back to naming the thread when a fixed outcome carries no reply", () => {
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed" }];
+    expect(fixRoundFrom(report, true, now)).toEqual({ date: "2026-09-23", fixed: ["thread RT_1"] });
+  });
+
+  it("an empty report renders nothing", () => {
+    expect(fixRoundFrom([], true, now)).toBeUndefined();
+  });
+
+  it("excludes left/needs-human outcomes — only what was fixed is named", () => {
+    const report: ThreadOutcome[] = [
+      { id: "RT_1", outcome: "left", reply: "not worth changing" },
+      { id: "RT_2", outcome: "needs-human", reply: "founder call" },
+    ];
+    expect(fixRoundFrom(report, true, now)).toBeUndefined();
+  });
+
+  it("excludes a fabricated fix — a 'fixed' claim with nothing pushed, same rule applyThreadOutcomes uses", () => {
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }];
+    expect(fixRoundFrom(report, false, now)).toBeUndefined();
+  });
+
+  it("keeps genuinely-fixed threads alongside an excluded fabricated one", () => {
+    const report: ThreadOutcome[] = [
+      { id: "RT_1", outcome: "fixed", reply: "real fix" },
+      { id: "RT_2", outcome: "left", reply: "declined" },
+    ];
+    // pushed=true here, so RT_1 is not fabricated.
+    expect(fixRoundFrom(report, true, now)).toEqual({ date: "2026-09-23", fixed: ["real fix"] });
+  });
+});
+
+describe("renderFixRounds / parseFixRounds round-trip", () => {
+  it("renders one dated line per round, oldest first", () => {
+    const rounds: FixRound[] = [
+      { date: "2026-09-20", fixed: ["fixed A"] },
+      { date: "2026-09-21", fixed: ["fixed B", "fixed C"] },
+    ];
+    const rendered = renderFixRounds(rounds);
+    expect(rendered).toBe(
+      ["### Review-fix rounds", "", "- 2026-09-20: fixed A", "- 2026-09-21: fixed B; fixed C"].join(
+        "\n",
+      ),
+    );
+  });
+
+  it("renders nothing for an empty round list", () => {
+    expect(renderFixRounds([])).toBe("");
+  });
+
+  it("round-trips through parseFixRounds", () => {
+    const rounds: FixRound[] = [
+      { date: "2026-09-20", fixed: ["fixed A"] },
+      { date: "2026-09-21", fixed: ["fixed B", "fixed C"] },
+    ];
+    expect(parseFixRounds(renderFixRounds(rounds))).toEqual(rounds);
+  });
+
+  it("parses nothing out of undefined/empty content", () => {
+    expect(parseFixRounds(undefined)).toEqual([]);
+    expect(parseFixRounds("")).toEqual([]);
+  });
+
+  it("caps at the round limit — the oldest are dropped with a marker saying so", () => {
+    const rounds: FixRound[] = Array.from({ length: 25 }, (_, i) => ({
+      date: `2026-09-${String(i + 1).padStart(2, "0")}`,
+      fixed: [`fixed round ${i + 1}`],
+    }));
+
+    const rendered = renderFixRounds(rounds);
+
+    expect(rendered).toContain("… 5 earlier rounds dropped");
+    expect(rendered).not.toContain("fixed round 1\n"); // the oldest 5 (1..5) were dropped
+    expect(rendered).not.toContain("2026-09-05");
+    expect(rendered).toContain("2026-09-06"); // the 20 most recent survive
+    expect(rendered).toContain("2026-09-25");
+
+    // The dropped-rounds marker itself does not round-trip back into a fake round.
+    expect(parseFixRounds(rendered)).toHaveLength(20);
+  });
+
+  it("singular wording for exactly one dropped round", () => {
+    const rounds: FixRound[] = Array.from({ length: 21 }, (_, i) => ({
+      date: `2026-09-${String(i + 1).padStart(2, "0")}`,
+      fixed: [`fixed round ${i + 1}`],
+    }));
+    expect(renderFixRounds(rounds)).toContain("… 1 earlier round dropped");
+  });
+});
+
+describe("extractFixRoundsRegion", () => {
+  it("extracts the region's content from a full body", () => {
+    const body = `Narrative.\n\n${BODY_REGION_START}\n### Review-fix rounds\n\n- 2026-09-20: fixed A\n${BODY_REGION_END}\n\n🤖 footer`;
+    expect(extractFixRoundsRegion(body)).toBe("### Review-fix rounds\n\n- 2026-09-20: fixed A");
+  });
+
+  it("returns undefined for a body with no region yet", () => {
+    expect(extractFixRoundsRegion("Just a narrative, no region.")).toBeUndefined();
+    expect(extractFixRoundsRegion(undefined)).toBeUndefined();
+  });
+
+  it("returns undefined for a malformed/partial marker pair rather than guessing", () => {
+    expect(extractFixRoundsRegion(`only ${BODY_REGION_START} here`)).toBeUndefined();
+    expect(extractFixRoundsRegion(`only ${BODY_REGION_END} here`)).toBeUndefined();
+  });
+});
+
+describe("nextFixRoundsRegion", () => {
+  it("appends this round to the rounds already in the body's region", () => {
+    const body = `Narrative.\n\n${BODY_REGION_START}\n### Review-fix rounds\n\n- 2026-09-20: fixed A\n${BODY_REGION_END}`;
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "fixed B" }];
+
+    const next = nextFixRoundsRegion(body, report, true, new Date("2026-09-21T00:00:00Z"));
+
+    expect(next).toBe(
+      ["### Review-fix rounds", "", "- 2026-09-20: fixed A", "- 2026-09-21: fixed B"].join("\n"),
+    );
+  });
+
+  it("starts a fresh region when the body carries none yet", () => {
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "fixed A" }];
+    const next = nextFixRoundsRegion(undefined, report, true, now);
+    expect(next).toBe(["### Review-fix rounds", "", "- 2026-09-23: fixed A"].join("\n"));
+  });
+
+  it("an empty report renders nothing, regardless of the body's existing rounds", () => {
+    const body = `${BODY_REGION_START}\n### Review-fix rounds\n\n- 2026-09-20: fixed A\n${BODY_REGION_END}`;
+    expect(nextFixRoundsRegion(body, [], true, now)).toBeUndefined();
+  });
+
+  it("a fabricated fix (nothing pushed) renders nothing to add", () => {
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "would-be fix" }];
+    expect(nextFixRoundsRegion(undefined, report, false, now)).toBeUndefined();
+  });
+});
