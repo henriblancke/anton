@@ -957,6 +957,32 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/cycle-free/);
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
+
+    // The board-review finding this closes (PR #274, apply.ts:276): `withCycleEvidenceIfNeeded`
+    // fetched `bd dep cycles` and attached it to `board` unchecked, so a writer repairing a `blocks`
+    // edge between the caller's board read and that fetch settling could pair fresh cycle evidence
+    // with a board whose edges no longer describe it — exactly what `sameBlocksEdges` exists to
+    // catch everywhere else in this codebase (`attachCyclesBestEffort`, `ensureCycleEvidence`,
+    // `shadow.ts`'s own read). Refusing on the mismatch, same as a `depCycles` outage above, is what
+    // proves the guard is wired in rather than merely documented.
+    it("refuses rather than pair fresh cycle evidence with a board that already moved underneath it", async () => {
+      // The unrelated `blocks` edge is what makes the re-list run at all — an edge-free board has no
+      // cyclic pair that could be stale, so the guard has nothing to check without one.
+      const board = [startable({ labels: [LABELS.approved] }), blockedBy("anton-x", "anton-y")];
+      // The re-list `withCycleEvidenceIfNeeded` makes after `bd dep cycles` settles answers with a
+      // DIFFERENT edge set — as if another writer resolved that edge in the gap, on a shared-server
+      // board this apply has no way to see happen.
+      listByFlags(async () => [startable({ labels: [LABELS.approved] }), bead("anton-x")]);
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
   });
 
   /**

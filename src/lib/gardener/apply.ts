@@ -44,6 +44,7 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
+import { loadAllIssues, sameBlocksEdges } from "../beads/issues";
 import {
   notePrefix,
   planApply,
@@ -265,6 +266,19 @@ export const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["ap
  * fail the WHOLE apply for moves that have nothing to do with cycles or approval: it degrades to
  * missing evidence instead, which `approvalGaps`'s own `missingCycleEvidenceGap` already fails closed
  * on for the two decisions that ask.
+ *
+ * `board` here is often the caller's retained snapshot array, not a defensive copy — the approve
+ * route hands in `refreshAllIssuesRead`'s own `beads` (approve/route.ts), and evidence is attached by
+ * array IDENTITY (cycle-evidence.ts), so writing to it here writes into every other reader sharing
+ * that snapshot. Another writer can land or repair a `blocks` edge on a shared-server board in the
+ * gap between the caller's read and this `depCycles` call settling, and pairing a fresh `cycles`
+ * result with a `board` whose edges no longer describe it would poison that shared snapshot: every
+ * later `cycleEvidenceFor(board) === undefined` check elsewhere (`allIssues`/`readAllIssues`'s own
+ * enrichment) would then see evidence already present and skip re-fetching, serving a stale pairing
+ * until unrelated content changes it. Re-list and compare before attaching, exactly like every other
+ * cycle-evidence consumer in this codebase (`issues.ts`'s `attachCyclesBestEffort`/
+ * `ensureCycleEvidence`, `shadow.ts`'s own read, which this mirrors) — gated on `board` actually
+ * carrying a `blocks` edge, since an edge-free board has no cyclic pair that could be stale.
  */
 async function withCycleEvidenceIfNeeded(
   repo: string,
@@ -273,7 +287,19 @@ async function withCycleEvidenceIfNeeded(
 ): Promise<Bead[]> {
   if (!CYCLE_AWARE_MOVES.has(plan.move)) return board;
   try {
-    return attachCycleEvidence(board, await beads.depCycles(repo));
+    const cycles = await beads.depCycles(repo);
+    const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
+    const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(repo));
+    if (!consistent) {
+      console.warn(
+        `[gardener.apply] ${repo}: board moved between the board read and cycle evidence while ` +
+          `applying a "${plan.move}" proposal — proceeding without cycle evidence, so its own ` +
+          `approval-gap check fails closed on the missing evidence rather than pairing it with a ` +
+          `board it may no longer describe`,
+      );
+      return board;
+    }
+    return attachCycleEvidence(board, cycles);
   } catch (e) {
     console.warn(
       `[gardener.apply] ${repo}: dep cycles read failed while applying a "${plan.move}" proposal — ` +
