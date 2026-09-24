@@ -556,10 +556,36 @@ export const BODY_REGION_END = "<!-- anton:region:end -->";
 /** Keeps one oversized region from bloating a PR body past what a reviewer will actually read. */
 const MAX_BODY_REGION_CHARS = 4000;
 
+/**
+ * Region content accumulates oldest-first (a heading line, then one entry per round), so a plain
+ * head-cut at the char cap keeps stale history and discards the newest round — the one entry a
+ * reviewer actually needs. Keep the heading, then fill the remaining budget from the tail backward
+ * so the newest entries survive and older ones drop first.
+ */
 function truncateRegion(content: string): string {
   const trimmed = content.trim();
   if (trimmed.length <= MAX_BODY_REGION_CHARS) return trimmed;
-  return `${trimmed.slice(0, MAX_BODY_REGION_CHARS)}\n… [truncated]`;
+
+  const marker = "… [earlier entries truncated]";
+  const [heading = "", ...rest] = trimmed.split("\n");
+  const budget = MAX_BODY_REGION_CHARS - heading.length - marker.length - 2;
+
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const line = rest[i] ?? "";
+    const cost = line.length + 1;
+    if (used + cost > budget) break;
+    kept.unshift(line);
+    used += cost;
+  }
+
+  if (kept.length === rest.length) {
+    // No line boundary to cut at (e.g. one oversized line) — fall back to a hard char cut.
+    return `${trimmed.slice(0, MAX_BODY_REGION_CHARS)}\n… [truncated]`;
+  }
+
+  return [heading, marker, ...kept].join("\n");
 }
 
 function renderRegion(content: string): string {

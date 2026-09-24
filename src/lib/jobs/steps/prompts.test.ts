@@ -747,4 +747,26 @@ describe("upsertBodyRegion (anton-gkjb6)", () => {
     const end = result.body.indexOf(BODY_REGION_END);
     expect(end - start).toBeLessThan(huge.length);
   });
+
+  it("keeps the newest entries and drops the oldest when a line-structured region overflows", () => {
+    // Content accumulates oldest-first (mirrors review-fix-body's rendered rounds): a heading, then
+    // one ~100-char line per round. Past MAX_BODY_REGION_CHARS the OLDEST rounds must drop, not the
+    // newest — the newest round is the one a reviewer actually needs to see.
+    const lines = Array.from(
+      { length: 80 },
+      (_, i) => `- 2026-09-${String((i % 28) + 1).padStart(2, "0")}: round ${i + 1} ${"x".repeat(80)}`,
+    );
+    const content = ["### Review-fix rounds", "", ...lines].join("\n");
+    expect(content.length).toBeGreaterThan(4000);
+
+    const result = upsertBodyRegion(body, content);
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("### Review-fix rounds");
+    expect(result.body).toContain("round 80"); // newest round survives
+    expect(result.body).not.toContain("round 1 "); // oldest round is dropped, not the newest
+    const start = result.body.indexOf(BODY_REGION_START) + BODY_REGION_START.length + 1;
+    const end = result.body.indexOf(BODY_REGION_END);
+    expect(end - start).toBeLessThan(content.length);
+  });
 });

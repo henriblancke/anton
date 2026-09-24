@@ -2,7 +2,9 @@
  * What a review-fix round writes into the one PR-body region anton owns (anton-te6nr), on top of
  * the marker mechanics {@link upsertBodyRegion} in `steps/prompts.ts` already built (anton-gkjb6):
  * a dated line per round naming what got fixed, drawn straight from the per-thread outcomes the
- * fixer already reported — no new LLM call.
+ * fixer already reported — no new LLM call. When a round carries no thread report at all (a
+ * CI-only or merge-conflict-only trigger), it falls back to the verdict reasons that round acted
+ * on, so a pushed fix is never silently left off the region.
  *
  * Pure and file-local: this module only turns a report + the region's current text into the
  * region's NEXT text. Fetching that text from GitHub, writing it back, and deciding whether a gh
@@ -26,24 +28,33 @@ export interface FixRound {
 const MAX_ROUNDS = 20;
 
 const ROUND_LINE = /^- (\d{4}-\d{2}-\d{2}): (.+)$/;
+const DROPPED_LINE = /^… (\d+) earlier rounds? dropped$/;
 
 /**
  * What this round fixed, straight from the fixer's own per-thread report. A "fixed" claim with
  * nothing pushed behind it is excluded — the exact rule `applyThreadOutcomes` already answers
- * threads with ({@link fabricatedFix}), shared rather than reimplemented. `undefined` when nothing
- * survives: an empty (or entirely fabricated/non-fixed) report renders nothing, so the caller never
- * writes — or even reads towards — an empty round.
+ * threads with ({@link fabricatedFix}), shared rather than reimplemented.
+ *
+ * A run triggered solely by a failing check, a merge conflict, or a top-level change-request
+ * review carries no unresolved inline thread, so `reportingFormatSection` asks for no reporting
+ * contract and `report` comes back empty even when a real fix pushed. `fallbackReasons` — the
+ * verdict reasons that triggered this round — covers that case so the body still gets an entry.
+ *
+ * `undefined` only when neither source has anything to say: no thread report AND (nothing pushed
+ * or no reasons given) — the caller's signal that the region, and `gh`, stay untouched.
  */
 export function fixRoundFrom(
   report: ThreadOutcome[],
   pushed: boolean,
   now: Date,
+  fallbackReasons: string[] = [],
 ): FixRound | undefined {
   const fixed = report
     .filter((item) => item.outcome === "fixed" && !fabricatedFix(item, pushed))
     .map((item) => item.reply?.trim() || `thread ${item.id}`);
-  if (fixed.length === 0) return undefined;
-  return { date: now.toISOString().slice(0, 10), fixed };
+  const entries = fixed.length > 0 ? fixed : pushed ? fallbackReasons : [];
+  if (entries.length === 0) return undefined;
+  return { date: now.toISOString().slice(0, 10), fixed: entries };
 }
 
 /**
@@ -65,6 +76,20 @@ export function parseFixRounds(regionContent: string | undefined): FixRound[] {
   return rounds;
 }
 
+/**
+ * How many earlier rounds the region's dropped-marker line already claims. Carried forward so a
+ * second cap-crossing accumulates ("2 earlier rounds dropped") instead of resetting to 1 — the
+ * marker line itself isn't a {@link FixRound} so {@link parseFixRounds} skips it.
+ */
+export function parseDroppedCount(regionContent: string | undefined): number {
+  if (!regionContent) return 0;
+  for (const raw of regionContent.split("\n")) {
+    const m = DROPPED_LINE.exec(raw.trim());
+    if (m?.[1]) return Number.parseInt(m[1], 10);
+  }
+  return 0;
+}
+
 /** The region's current raw content, or undefined when `body` carries no well-formed region yet. */
 export function extractFixRoundsRegion(body: string | undefined): string | undefined {
   if (!body) return undefined;
@@ -80,10 +105,10 @@ export function extractFixRoundsRegion(body: string | undefined): string | undef
  * the life of a long-running PR. `[]` renders `""`: nothing has ever been fixed, so the region says
  * nothing rather than an empty heading.
  */
-export function renderFixRounds(rounds: FixRound[]): string {
+export function renderFixRounds(rounds: FixRound[], previouslyDropped = 0): string {
   if (rounds.length === 0) return "";
   const capped = rounds.length > MAX_ROUNDS ? rounds.slice(rounds.length - MAX_ROUNDS) : rounds;
-  const dropped = rounds.length - capped.length;
+  const dropped = previouslyDropped + (rounds.length - capped.length);
   const lines = ["### Review-fix rounds", ""];
   if (dropped > 0) lines.push(`… ${dropped} earlier round${dropped === 1 ? "" : "s"} dropped`, "");
   lines.push(...capped.map((r) => `- ${r.date}: ${r.fixed.join("; ")}`));
@@ -100,9 +125,11 @@ export function nextFixRoundsRegion(
   report: ThreadOutcome[],
   pushed: boolean,
   now: Date,
+  fallbackReasons: string[] = [],
 ): string | undefined {
-  const round = fixRoundFrom(report, pushed, now);
+  const round = fixRoundFrom(report, pushed, now, fallbackReasons);
   if (!round) return undefined;
-  const rounds = [...parseFixRounds(extractFixRoundsRegion(currentBody)), round];
-  return renderFixRounds(rounds);
+  const regionContent = extractFixRoundsRegion(currentBody);
+  const rounds = [...parseFixRounds(regionContent), round];
+  return renderFixRounds(rounds, parseDroppedCount(regionContent));
 }

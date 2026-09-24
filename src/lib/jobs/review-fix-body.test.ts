@@ -61,6 +61,27 @@ describe("fixRoundFrom", () => {
     // pushed=true here, so RT_1 is not fabricated.
     expect(fixRoundFrom(report, true, now)).toEqual({ date: "2026-09-23", fixed: ["real fix"] });
   });
+
+  it("falls back to the verdict reasons when a pushed round carries no thread report", () => {
+    // e.g. a run triggered solely by a failing check or merge conflict, which emits no reporting
+    // contract at all — `report` comes back empty even though a real fix pushed.
+    expect(fixRoundFrom([], true, now, ["failing checks: claude-review"])).toEqual({
+      date: "2026-09-23",
+      fixed: ["failing checks: claude-review"],
+    });
+  });
+
+  it("prefers the thread report over the fallback reasons when both are present", () => {
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "real fix" }];
+    expect(fixRoundFrom(report, true, now, ["failing checks: claude-review"])).toEqual({
+      date: "2026-09-23",
+      fixed: ["real fix"],
+    });
+  });
+
+  it("does not fall back to reasons when nothing pushed — a fabrication either way", () => {
+    expect(fixRoundFrom([], false, now, ["failing checks: claude-review"])).toBeUndefined();
+  });
 });
 
 describe("renderFixRounds / parseFixRounds round-trip", () => {
@@ -119,6 +140,25 @@ describe("renderFixRounds / parseFixRounds round-trip", () => {
     }));
     expect(renderFixRounds(rounds)).toContain("… 1 earlier round dropped");
   });
+
+  it("accumulates the dropped count across repeated cap-crossings instead of resetting to 1", () => {
+    // Simulate the region already carrying a "1 earlier round dropped" marker (21 rounds seen once
+    // before), then adding one more round via the full nextFixRoundsRegion pipeline.
+    const rounds: FixRound[] = Array.from({ length: 21 }, (_, i) => ({
+      date: `2026-09-${String(i + 1).padStart(2, "0")}`,
+      fixed: [`fixed round ${i + 1}`],
+    }));
+    const priorRegion = renderFixRounds(rounds);
+    expect(priorRegion).toContain("… 1 earlier round dropped");
+
+    const body = `${BODY_REGION_START}\n${priorRegion}\n${BODY_REGION_END}`;
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "fixed round 22" }];
+    const next = nextFixRoundsRegion(body, report, true, new Date("2026-10-01T00:00:00Z"));
+
+    expect(next).toContain("… 2 earlier rounds dropped");
+    expect(next).not.toContain("fixed round 2\n"); // round 2 is now dropped too
+    expect(next).toContain("fixed round 22"); // the newest round survives
+  });
 });
 
 describe("extractFixRoundsRegion", () => {
@@ -164,5 +204,12 @@ describe("nextFixRoundsRegion", () => {
   it("a fabricated fix (nothing pushed) renders nothing to add", () => {
     const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "would-be fix" }];
     expect(nextFixRoundsRegion(undefined, report, false, now)).toBeUndefined();
+  });
+
+  it("falls back to the verdict reasons when a pushed round has no thread report at all", () => {
+    const next = nextFixRoundsRegion(undefined, [], true, now, ["failing checks: claude-review"]);
+    expect(next).toBe(
+      ["### Review-fix rounds", "", "- 2026-09-23: failing checks: claude-review"].join("\n"),
+    );
   });
 });

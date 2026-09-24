@@ -756,8 +756,17 @@ async function runFixSession(args: {
     const report = parseThreadReport(result.text);
     await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
-    // fix that isn't on the remote yet.
-    await refreshFixRoundsBody({ repo, number, report, pushed, now: new Date(clock.now()), logPath });
+    // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
+    // no thread report (CI-only/conflict-only/no-inline-threads trigger).
+    await refreshFixRoundsBody({
+      repo,
+      number,
+      report,
+      pushed,
+      now: new Date(clock.now()),
+      logPath,
+      reasons: verdict.reasons,
+    });
 
     if (!pushed) {
       await appendSessionLog(
@@ -1011,8 +1020,10 @@ async function recordThreadOutcome(
  * Refresh the PR body's review-fix-rounds region with what THIS round fixed (anton-te6nr), reusing
  * the fixer's own per-thread report rather than a fresh LLM call. Runs strictly AFTER the push (the
  * caller only reaches this once `pushed` is known), so the body never claims a fix that isn't on
- * the remote yet — and touches `gh` not at all for a round that pushed nothing, or fixed nothing
- * worth naming: {@link fixRoundFrom} answers that cheaply, before any network call.
+ * the remote yet — and touches `gh` not at all for a round that pushed nothing, or has nothing
+ * worth naming: {@link fixRoundFrom} answers that cheaply, before any network call. `reasons` names
+ * this round's own trigger and backs a fallback entry when the report has no thread outcomes at all
+ * (a CI-only or merge-conflict-only round, which never emits a reporting contract to parse).
  *
  * Every `gh` step here is best-effort by construction (`readPullRequestBody`/`updatePullRequestBody`
  * already catch and report a boolean, same as `bodyStale` in `openPullRequest`) — a failure is
@@ -1027,10 +1038,12 @@ export async function refreshFixRoundsBody(args: {
   pushed: boolean;
   now: Date;
   logPath: string;
+  /** Verdict reasons this round acted on — the fallback entry when no thread report survives. */
+  reasons?: string[];
 }): Promise<void> {
-  const { repo, number, report, pushed, now, logPath } = args;
+  const { repo, number, report, pushed, now, logPath, reasons = [] } = args;
   if (!pushed) return;
-  if (!fixRoundFrom(report, pushed, now)) return; // nothing fixed this round — no gh call at all
+  if (!fixRoundFrom(report, pushed, now, reasons)) return; // nothing to say this round — no gh call
   const selector = String(number);
   const currentBody = await readPullRequestBody(repo, selector);
   if (currentBody === undefined) {
@@ -1040,7 +1053,7 @@ export async function refreshFixRoundsBody(args: {
     );
     return;
   }
-  const content = nextFixRoundsRegion(currentBody, report, pushed, now);
+  const content = nextFixRoundsRegion(currentBody, report, pushed, now, reasons);
   if (!content) return; // defensive; fixRoundFrom above already confirmed there's something to say
   const { body, skipped } = upsertBodyRegion(currentBody, content);
   if (skipped) return; // upsertBodyRegion already warned why
