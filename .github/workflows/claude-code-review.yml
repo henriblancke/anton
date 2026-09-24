@@ -69,10 +69,16 @@ jobs:
       # could hang with no result after an internal error; they now report the error and
       # exit with code 1"; "Fixed a crash ('unrecoverable interface error') that could end
       # a session while an API request was being retried").
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-24): same signature again on PR #321 —
+      # is_error:true, num_turns:1, total_cost_usd:0, ~400ms, no findings unrelated to this
+      # PR's own diff. Upstream (anthropics/claude-code-action#947) confirms this class of
+      # crash is still being reported against recent CLI builds, so this bump is the same
+      # documented mitigation as before, not a confirmed fix — if it recurs, bump further
+      # and check the changelog rather than assuming the PR's diff is at fault.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.281'
+          CLAUDE_CODE_VERSION: '2.1.282'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
