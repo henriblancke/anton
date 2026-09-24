@@ -553,8 +553,14 @@ function satisfiedByLine(by: SatisfiedSettlement): string {
 export const BODY_REGION_START = "<!-- anton:region:start -->";
 export const BODY_REGION_END = "<!-- anton:region:end -->";
 
-/** Keeps one oversized region from bloating a PR body past what a reviewer will actually read. */
-const MAX_BODY_REGION_CHARS = 4000;
+/**
+ * Keeps one oversized region from bloating a PR body past what a reviewer will actually read.
+ * Exported so `review-fix-body.ts`'s `renderFixRounds` can pre-fit its own rounds to the same
+ * budget and drop the oldest ones itself, with an accurate count — instead of leaving the cut to
+ * this module's char-level {@link truncateRegion}, which has no notion of "one round" and cannot
+ * report how many were lost (PR #321 review).
+ */
+export const MAX_BODY_REGION_CHARS = 4000;
 
 /**
  * Region content accumulates oldest-first (a heading line, then one entry per round), so a plain
@@ -606,8 +612,13 @@ function renderRegion(content: string): string {
  * code example (e.g. discussing the marker mechanics in a review comment) must not be mistaken for
  * a real owned span; a plain substring count would accept that quoted pair as well-formed and let
  * `upsertBodyRegion` rewrite everything between two unrelated prose mentions (PR #321 review).
+ *
+ * Exported so `review-fix-body.ts`'s `extractFixRoundsRegion` can apply the same standalone-line
+ * rule when reading the region back — otherwise a body that quotes both marker strings inline
+ * (with unrelated dated-looking text between them) is misread as an existing, well-formed region
+ * (PR #321 review).
  */
-function markerLines(body: string, marker: string): number[] {
+export function markerLines(body: string, marker: string): number[] {
   const indices: number[] = [];
   let offset = 0;
   for (const line of body.split("\n")) {

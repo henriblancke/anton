@@ -10,6 +10,7 @@ import {
   extractFixRoundsRegion,
   fixRoundFrom,
   nextFixRoundsRegion,
+  parseDroppedCount,
   parseFixRounds,
   renderFixRounds,
   type FixRound,
@@ -191,6 +192,43 @@ describe("renderFixRounds / parseFixRounds round-trip", () => {
     expect(next).not.toContain("fixed round 2\n"); // round 2 is now dropped too
     expect(next).toContain("fixed round 22"); // the newest round survives
   });
+
+  it("pre-fits to the char budget by dropping further oldest rounds, with an accurate count", () => {
+    // Well under MAX_ROUNDS (20), but each entry is long enough that the round-count cap alone
+    // doesn't keep the region under MAX_BODY_REGION_CHARS.
+    const rounds: FixRound[] = Array.from({ length: 5 }, (_, i) => ({
+      date: `2026-09-1${i}`,
+      fixed: ["x".repeat(1000)],
+    }));
+
+    const rendered = renderFixRounds(rounds);
+
+    expect(rendered.length).toBeLessThanOrEqual(4000);
+    expect(rendered).toMatch(/… \d+ earlier rounds? dropped/);
+    expect(parseFixRounds(rendered).length).toBeLessThan(rounds.length);
+  });
+
+  it("carries the char-truncation dropped count forward across a refresh, even once the region shrinks back under budget", () => {
+    // A region that previously had to drop long rounds to fit the char cap, then gets a new, short
+    // round appended — the retained tail plus the new round now easily fit under the cap. The
+    // dropped-count marker must still say rounds were lost rather than silently disappearing and
+    // making the remaining history look complete (PR #321 review).
+    const longRounds: FixRound[] = Array.from({ length: 5 }, (_, i) => ({
+      date: `2026-09-1${i}`,
+      fixed: ["x".repeat(1000)],
+    }));
+    const priorRegion = renderFixRounds(longRounds);
+    const priorDropped = parseDroppedCount(priorRegion);
+    expect(priorDropped).toBeGreaterThan(0);
+
+    const body = `${BODY_REGION_START}\n${priorRegion}\n${BODY_REGION_END}`;
+    const report: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "short fix" }];
+    const next = nextFixRoundsRegion(body, report, true, new Date("2026-10-01T00:00:00Z"));
+
+    expect(next).toBeDefined();
+    expect(parseDroppedCount(next)).toBeGreaterThanOrEqual(priorDropped);
+    expect(next).toContain("short fix");
+  });
 });
 
 describe("extractFixRoundsRegion", () => {
@@ -207,6 +245,21 @@ describe("extractFixRoundsRegion", () => {
   it("returns undefined for a malformed/partial marker pair rather than guessing", () => {
     expect(extractFixRoundsRegion(`only ${BODY_REGION_START} here`)).toBeUndefined();
     expect(extractFixRoundsRegion(`only ${BODY_REGION_END} here`)).toBeUndefined();
+  });
+
+  it("treats markers merely quoted in prose as no region, even with a dated bullet between them", () => {
+    // Same trap `upsertBodyRegion` already guards against (PR #321 review): a review comment that
+    // quotes both marker strings inline, with unrelated human-authored text — including something
+    // that happens to look like a dated round — sitting between them. A plain substring search
+    // would mine that prose as if it were real history; only a standalone-line match may do so.
+    const body = [
+      "Narrative discussing the region mechanics.",
+      `As discussed, the region uses ${BODY_REGION_START} and includes lines like`,
+      "- 2026-09-20: this is just an example in the comment, not a real round",
+      `before the ${BODY_REGION_END} marker.`,
+    ].join("\n");
+
+    expect(extractFixRoundsRegion(body)).toBeUndefined();
   });
 });
 

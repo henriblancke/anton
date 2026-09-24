@@ -10,7 +10,7 @@
  * region's NEXT text. Fetching that text from GitHub, writing it back, and deciding whether a gh
  * call is warranted at all are `review-fix.ts`'s job — this module owns none of that.
  */
-import { BODY_REGION_END, BODY_REGION_START } from "./steps/prompts";
+import { BODY_REGION_END, BODY_REGION_START, MAX_BODY_REGION_CHARS, markerLines } from "./steps/prompts";
 import { fabricatedFix, type ThreadOutcome } from "./review-fix-context";
 
 /** One review-fix round: the date it pushed, and one line per thread it actually fixed. */
@@ -120,12 +120,21 @@ export function parseDroppedCount(regionContent: string | undefined): number {
   return 0;
 }
 
-/** The region's current raw content, or undefined when `body` carries no well-formed region yet. */
+/**
+ * The region's current raw content, or undefined when `body` carries no well-formed region yet.
+ * Uses the same standalone-line marker rule `upsertBodyRegion` enforces (via {@link markerLines}):
+ * a body that merely quotes both marker strings in prose — with an unrelated dated-looking bullet
+ * sitting between them — must read as unmarked, not as an existing region to mine history out of
+ * (PR #321 review).
+ */
 export function extractFixRoundsRegion(body: string | undefined): string | undefined {
   if (!body) return undefined;
-  const startIdx = body.indexOf(BODY_REGION_START);
-  const endIdx = body.indexOf(BODY_REGION_END);
-  if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) return undefined;
+  const starts = markerLines(body, BODY_REGION_START);
+  const ends = markerLines(body, BODY_REGION_END);
+  if (starts.length !== 1 || ends.length !== 1) return undefined;
+  const startIdx = starts[0]!;
+  const endIdx = ends[0]!;
+  if (endIdx <= startIdx) return undefined;
   return body.slice(startIdx + BODY_REGION_START.length, endIdx).trim();
 }
 
@@ -134,14 +143,32 @@ export function extractFixRoundsRegion(body: string | undefined): string | undef
  * oldest are dropped and a marker line says so, rather than the region growing without limit for
  * the life of a long-running PR. `[]` renders `""`: nothing has ever been fixed, so the region says
  * nothing rather than an empty heading.
+ *
+ * Also pre-fits the result to {@link MAX_BODY_REGION_CHARS} by dropping further oldest rounds,
+ * rather than leaving that cut to `upsertBodyRegion`'s char-level `truncateRegion`. That generic
+ * truncator has no notion of "one round" and cannot report how many it dropped, so a body that
+ * later shrinks back under the cap (an old, long round ages out while new ones are short) would
+ * silently lose the marker and misrepresent a truncated history as complete (PR #321 review). Doing
+ * the cut here keeps one dropped-count source of truth that survives every refresh.
  */
 export function renderFixRounds(rounds: FixRound[], previouslyDropped = 0): string {
   if (rounds.length === 0) return "";
-  const capped = rounds.length > MAX_ROUNDS ? rounds.slice(rounds.length - MAX_ROUNDS) : rounds;
-  const dropped = previouslyDropped + (rounds.length - capped.length);
+  let capped = rounds.length > MAX_ROUNDS ? rounds.slice(rounds.length - MAX_ROUNDS) : rounds;
+  let dropped = previouslyDropped + (rounds.length - capped.length);
+
+  let rendered = renderFixRoundLines(capped, dropped);
+  while (capped.length > 0 && rendered.length > MAX_BODY_REGION_CHARS) {
+    capped = capped.slice(1);
+    dropped += 1;
+    rendered = renderFixRoundLines(capped, dropped);
+  }
+  return rendered;
+}
+
+function renderFixRoundLines(rounds: FixRound[], dropped: number): string {
   const lines = ["### Review-fix rounds", ""];
   if (dropped > 0) lines.push(`… ${dropped} earlier round${dropped === 1 ? "" : "s"} dropped`, "");
-  lines.push(...capped.map((r) => `- ${r.date}: ${r.fixed.join("; ")}`));
+  lines.push(...rounds.map((r) => `- ${r.date}: ${r.fixed.join("; ")}`));
   return lines.join("\n");
 }
 
