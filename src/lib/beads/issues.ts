@@ -228,20 +228,8 @@ export async function loadAllIssues(
   // between the `cycles` fetch above and this recheck would leave `work`'s own edge set unchanged,
   // so comparing only `work` waves the recheck through with evidence that no longer describes
   // `board`'s actual graph.
-  const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-  if (
-    boardHasBlocksEdge &&
-    !opts.skipCycleConsistencyRecheck &&
-    !sameBlocksEdges(board, await loadAllIssues(cwd))
-  ) {
-    if (attempt >= MAX_CYCLE_CONSISTENCY_RETRIES) {
-      throw new Error(
-        `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_CYCLE_CONSISTENCY_RETRIES + 1} ` +
-          "reads of bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
-      );
-    }
-    return loadAllIssues(cwd, opts, attempt + 1);
-  }
+  const retryOnDrift = await recheckBlocksConsistency(cwd, opts, attempt, board);
+  if (retryOnDrift) return retryOnDrift;
   // A cycle can be made entirely of gates no work bead's `blocks` edge dangles toward (e.g. two
   // gates blocking each other with no ticket pointing at either) — `dangling` above stays empty,
   // so `board` never loaded them. `cycleMembers` then can't map any id in that cycle to a bead on
@@ -251,9 +239,83 @@ export async function loadAllIssues(
   const knownIds = new Set(board.map((b) => b.id));
   const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
   if (missingCycleIds.length > 0) {
-    board = dedupeById([...board, ...await loadGateIssues(cwd, opts.strictGates ?? false, missingCycleIds)]);
+    const hydratedGates = await loadGateIssues(cwd, opts.strictGates ?? false, missingCycleIds);
+    // Only a hydration that actually lands new beads can have observed a newer graph than `cycles`
+    // did — `missingCycleIds` naming an id that isn't a gate either (an ordinary elsewhere cycle
+    // `board` was never going to carry) reads back empty and changes nothing, so paying for a cycles
+    // recheck below would buy nothing and break the two-`bd list`-call invariant `boardHasBlocksEdge`
+    // exists to protect for that (common) case.
+    if (hydratedGates.length > 0) {
+      board = dedupeById([...board, ...hydratedGates]);
+      // This hydration is its own `bd list`-backed read, made AFTER the consistency check above
+      // already passed — so it can itself land after another writer repairs the cycle `cycles`
+      // named and opens a DIFFERENT gate-only cycle under a different pair of gates (P2 review, PR
+      // #274, issues.ts:254). `cycles` (fetched even earlier, before that check) would then still
+      // name only the repaired cycle while the board this hydration just built reflects the newer
+      // graph, and `structureGaps` trusts `cycles` for the cycle rule without independently walking
+      // raw edges for it — the target owning the new cycle would read as clean. `sameBlocksEdges`
+      // can't be reused here as-is: a plain `loadAllIssues(cwd)` baseline only ever discovers gates a
+      // work bead's `blocks` edge dangles toward, so it structurally never includes a gate-only
+      // cycle's beads, making that comparison mismatch even when nothing actually drifted.
+      // Revalidate the cycle evidence itself instead — re-fetch `bd dep cycles` and require it still
+      // names the same cycles as the copy this board is about to be paired with.
+      const retryOnHydrationDrift = await recheckCycleConsistency(cwd, opts, attempt, cycles);
+      if (retryOnHydrationDrift) return retryOnHydrationDrift;
+    }
   }
   return attachCycleEvidence(board, cycles);
+}
+
+/** Whether two `bd dep cycles` results name the same set of cycles (by member id set). */
+function sameCycles(a: DepCycle[], b: DepCycle[]): boolean {
+  const key = (c: DepCycle) => [...c.ids].sort().join(",");
+  const toSet = (list: DepCycle[]) => new Set(list.map(key));
+  const [setA, setB] = [toSet(a), toSet(b)];
+  return setA.size === setB.size && [...setA].every((k) => setB.has(k));
+}
+
+/**
+ * Guard behind `loadAllIssues`'s consistency check on the ordinary board: re-list the board and
+ * compare its `blocks` edges against `board`'s. Returns a replacement result to return immediately
+ * (a retried `loadAllIssues` call) when the graph moved, `undefined` when `board` is still safe to
+ * pair with cycle evidence as-is.
+ */
+async function recheckBlocksConsistency(
+  cwd: string,
+  opts: LoadIssuesOptions,
+  attempt: number,
+  board: Bead[],
+): Promise<Bead[] | undefined> {
+  if (opts.skipCycleConsistencyRecheck) return undefined;
+  if (!beads.edgesOf(board).some((e) => e.type === "blocks")) return undefined;
+  if (sameBlocksEdges(board, await loadAllIssues(cwd))) return undefined;
+  return retryOrFail(cwd, opts, attempt);
+}
+
+/**
+ * Guard behind `loadAllIssues`'s post-hydration recheck: re-fetch `bd dep cycles` and compare it
+ * against the evidence `board` is about to be paired with. Same return contract as
+ * {@link recheckBlocksConsistency}.
+ */
+async function recheckCycleConsistency(
+  cwd: string,
+  opts: LoadIssuesOptions,
+  attempt: number,
+  cycles: DepCycle[],
+): Promise<Bead[] | undefined> {
+  if (opts.skipCycleConsistencyRecheck) return undefined;
+  if (sameCycles(cycles, await beads.depCycles(cwd))) return undefined;
+  return retryOrFail(cwd, opts, attempt);
+}
+
+async function retryOrFail(cwd: string, opts: LoadIssuesOptions, attempt: number): Promise<Bead[]> {
+  if (attempt >= MAX_CYCLE_CONSISTENCY_RETRIES) {
+    throw new Error(
+      `[beads.issues] ${cwd}: dependency graph kept moving across ${MAX_CYCLE_CONSISTENCY_RETRIES + 1} ` +
+        "reads of bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
+    );
+  }
+  return loadAllIssues(cwd, opts, attempt + 1);
 }
 
 /** Whether two bead lists agree on every `blocks` edge — the only edge type `bd dep cycles` walks. */

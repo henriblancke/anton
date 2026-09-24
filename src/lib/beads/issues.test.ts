@@ -314,6 +314,63 @@ describe("loadAllIssues", () => {
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
   });
 
+  it("retries when a gate-only cycle gets repaired and a different one opens between the cycles fetch and the gate hydration read (P2 review, PR #274, issues.ts:254)", async () => {
+    // `dangling` stays empty (no work bead points at either gate), so the hydration read below is
+    // the FIRST time `board` learns of any gate at all — a fresh `bd list --type gate` landing after
+    // a concurrent writer repairs cycle A (g-1/g-2) and opens cycle B (g-3/g-4) would otherwise merge
+    // B's gates onto `board` while `cycles` (fetched before this read) still names only A, and
+    // `structureGaps` — which trusts `cycles` alone for the cycle rule — would declare B's target
+    // clean.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    const gateC: Bead = {
+      id: "g-3",
+      title: "Gate: C",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-3", depends_on_id: "g-4", type: "blocks" }],
+    };
+    const gateD: Bead = {
+      id: "g-4",
+      title: "Gate: D",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-4", depends_on_id: "g-3", type: "blocks" }],
+    };
+    const cycleA = [{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }];
+    const cycleB = [{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }];
+    listMock
+      .mockImplementationOnce(async () => [solo]) // attempt 0's own work read
+      .mockImplementationOnce(async () => [gateA, gateB]) // attempt 0's gate hydration — still cycle A
+      .mockImplementationOnce(async () => [solo]) // attempt 1's own work read
+      .mockImplementationOnce(async () => [gateC, gateD]); // attempt 1's gate hydration — now cycle B
+    cyclesMock
+      .mockImplementationOnce(async () => cycleA) // attempt 0's own cycles fetch
+      .mockImplementationOnce(async () => cycleB) // attempt 0's post-hydration recheck — A repaired, B opened
+      .mockImplementationOnce(async () => cycleB) // attempt 1's own cycles fetch
+      .mockImplementationOnce(async () => cycleB); // attempt 1's post-hydration recheck — stable
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id).sort()).toEqual(["g-3", "g-4", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual(cycleB);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(4);
+  });
+
   it("catches a gate-owned edge that moves between the cycles fetch and the recheck, not just a work-owned one (P2 badge review, issues.ts:224)", async () => {
     // `target` dangles a blocker on `g-1`, so `board` merges the gate in. The gate itself gains a
     // NEW `blocks` edge (gate-owned, never present on `work`) between this call's own board read and
