@@ -308,6 +308,65 @@ export async function readBoardBaseline(repo: string, ticket?: Bead): Promise<Bo
 }
 
 /**
+ * A prior review-fix attempt's preserved pre-dispatch board snapshot, if one survived a crash before
+ * {@link releaseReviewFixBoardBaseline} could clear it — `undefined` when none was ever preserved.
+ * See {@link persistReviewFixBoardBaseline}.
+ */
+export function readReviewFixBoardBaseline(ticket: Bead): BoardFingerprint | undefined {
+  const preserved = beads.reviewFixBoardBaseline(ticket);
+  return preserved ? deserializeFingerprint(preserved) : undefined;
+}
+
+/**
+ * Durably persist `baseline` as review-fix's OWN recoverable pre-dispatch board snapshot
+ * (chatgpt-codex-connector, PR #284 review, "Persist the PR-fix board baseline before dispatch") —
+ * review-fix's analogue of {@link ensureBoardBaselinePersisted}'s persist step, without that
+ * function's lock/verify/dispatch-started protocol: that machinery exists to arbitrate multiple
+ * concurrent dispatch attempts racing to lock a stable candidate, a shape review-fix's own
+ * one-session-at-a-time flow never has. Without persisting anything here, a process/host death after
+ * the fixer's own live board write but before this session reads it back (or its catch-block audit
+ * runs) leaves a resumed attempt with only a FRESH read to diff against — one that already contains
+ * the repair — so the delta the repair produced could never be told apart from no progress at all.
+ * Confirmed synced like every other board-evidence write in this module; returns `false` (never
+ * throws) on persist or push failure so the caller can fail closed the same way an unreadable
+ * baseline already does. Safe to call every attempt, including one reusing a baseline
+ * {@link readReviewFixBoardBaseline} already found preserved — the write is then a no-op and the
+ * confirming push simply reconfirms it, the same reconfirm-on-retry `readBoardBaseline`'s own caller
+ * relies on.
+ */
+export async function persistReviewFixBoardBaseline(
+  repo: string,
+  ticketId: string,
+  baseline: BoardFingerprint,
+): Promise<boolean> {
+  const persisted = await mustPersist(() =>
+    beads.setReviewFixBoardBaseline(repo, ticketId, serializeFingerprint(baseline)),
+  );
+  if (!persisted) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
+ * Release the baseline {@link persistReviewFixBoardBaseline} preserved, once this session's own board
+ * evidence has been captured and confirmed synced — or once a failure is proven to have touched
+ * nothing on the board. Left standing deliberately on a poison park (a failure that DID touch the
+ * board and cannot be safely retried): that is exactly the recovery snapshot a human's resume needs.
+ * Not releasing it once evidence IS captured would leave the NEXT, genuinely new review-fix round
+ * reusing THIS round's now-stale snapshot instead of taking a fresh one.
+ */
+export async function releaseReviewFixBoardBaseline(repo: string, ticketId: string): Promise<boolean> {
+  const cleared = await mustPersist(() => beads.clearReviewFixBoardBaseline(repo, ticketId));
+  if (!cleared) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
  * Durably persist `baseline` onto `ticket` BEFORE the agent is ever dispatched (PR #284 review,
  * "Persist the board baseline before dispatch") — closes the crash window `readBoardBaseline` alone
  * leaves open. On a shared-server board the agent's `bd -C <repo>` writes are globally visible the
@@ -427,7 +486,17 @@ export async function ensureBoardBaselinePersisted(
   // no-op agent's evidence, and crediting the new cycle with the old one's delivery. Left set until
   // every survivor is confirmed cleared, a retry that finds it still true simply re-runs the same
   // (idempotent) resets again.
-  if (beads.boardEvidenceConfirmed(ticket)) {
+  // A closure-stamped pending marker is the SAME "reopened after a completed cycle" signal as a set
+  // `boardEvidenceConfirmed` (chatgpt-codex-connector, PR #284 review, "Reset closure-stamped pending
+  // evidence without confirmation") — `clearBoardEvidencePending` stamps the marker with the closure
+  // it is confirming against BEFORE attempting to clear it, so a marker that survives because
+  // `setBoardEvidenceConfirmed` itself then exhausted its retries is left carrying a real closure with
+  // `boardEvidenceConfirmed` never set at all. Gating the reset on `boardEvidenceConfirmed` alone
+  // misses exactly that shape: the pending ids and the locked/verified baseline both survive from the
+  // OLD cycle, and on reopen `recoveryBaseline` above would trust that stale baseline untouched,
+  // letting `readBoardEvidence` credit the old closure's own writes to a no-op agent in the new cycle.
+  const stalePendingClosure = beads.pendingBoardEvidenceClosure(ticket);
+  if (beads.boardEvidenceConfirmed(ticket) || stalePendingClosure !== undefined) {
     if (hadBaseline) {
       await abandonDispatchBaseline(repo, ticket);
       // `abandonDispatchBaseline` clears the baseline/locked/verified/dispatch-started metadata

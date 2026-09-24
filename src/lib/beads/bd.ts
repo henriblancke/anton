@@ -403,6 +403,26 @@ const BOARD_EVIDENCE_PENDING_CLOSURE_KEY = "boardEvidencePendingClosure";
 const BOARD_EVIDENCE_CONFIRMED_KEY = "boardEvidenceConfirmed";
 
 /**
+ * Metadata key holding review-fix's OWN recoverable pre-dispatch board snapshot (chatgpt-codex-
+ * connector, PR #284 review, "Persist the PR-fix board baseline before dispatch") — the same crash
+ * window {@link BOARD_EVIDENCE_BASELINE_KEY} closes for the initial ticket-dispatch path, closed here
+ * for review-fix's separate board-capable PR-fix path instead. That path's own pre-dispatch board
+ * read used to live only in process memory (`review-fix.ts`'s `boardBefore` local): a process/host
+ * death after the fixer's own live board write but before that session's post-run read (or its
+ * catch-block audit) left nothing durable to diff a resumed attempt against, so a fresh read on retry
+ * already contained the repair with no delta left to report — a genuine `fixed` outcome then read as
+ * fabricated and the finding could cycle forever despite the repair having landed.
+ *
+ * Deliberately a SEPARATE key from `BOARD_EVIDENCE_BASELINE_KEY`, not a reuse of it: that key's value
+ * is owned by the ticket-dispatch lock/refresh protocol keyed off `boardEvidenceConfirmed` /
+ * `boardEvidenceBaselineLocked` / `boardEvidenceDispatchStarted`, built for multiple concurrent
+ * dispatch attempts racing to lock a stable candidate — a shape review-fix's own one-session-at-a-time
+ * flow doesn't have and shouldn't have to reason about. See {@link beads.reviewFixBoardBaseline} /
+ * {@link beads.setReviewFixBoardBaseline} / {@link beads.clearReviewFixBoardBaseline}.
+ */
+const REVIEW_FIX_BOARD_BASELINE_KEY = "reviewFixBoardBaseline";
+
+/**
  * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
  * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
  * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
@@ -419,6 +439,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
   BOARD_EVIDENCE_CONFIRMED_KEY,
   BOARD_EVIDENCE_PENDING_CLOSURE_KEY,
+  REVIEW_FIX_BOARD_BASELINE_KEY,
 ];
 
 /**
@@ -1616,6 +1637,47 @@ export const beads = {
    */
   clearBoardEvidenceConfirmed: (cwd: string, id: string) =>
     bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_CONFIRMED_KEY]),
+
+  /**
+   * review-fix's own preserved pre-dispatch board fingerprint, parsed back off the bead's metadata —
+   * `undefined` when none was ever preserved, or the stored value is unreadable JSON (read as
+   * "nothing preserved", the same tolerance {@link beads.boardEvidenceBaseline} applies). See
+   * {@link REVIEW_FIX_BOARD_BASELINE_KEY}.
+   */
+  reviewFixBoardBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[REVIEW_FIX_BOARD_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /**
+   * Preserve `fingerprint` (a serialized board fingerprint) as review-fix's recoverable pre-dispatch
+   * baseline for `id`. Written through `--metadata @file`, never `--set-metadata key=value`, for the
+   * same `E2BIG` reason {@link beads.setBoardEvidenceBaseline} is: the value holds one entry per bead
+   * on the whole board, which can push a single argv argument past Linux's ~128KiB ceiling on a large
+   * board. See {@link REVIEW_FIX_BOARD_BASELINE_KEY}.
+   */
+  setReviewFixBoardBaseline: async (cwd: string, id: string, fingerprint: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-review-fix-baseline-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [REVIEW_FIX_BOARD_BASELINE_KEY]: JSON.stringify(fingerprint) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /** Release the preserved baseline above once review-fix's own board evidence for this session has
+   * been captured and confirmed synced, or a failure has been proven to have touched nothing on the
+   * board — see {@link REVIEW_FIX_BOARD_BASELINE_KEY}. */
+  clearReviewFixBoardBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_FIX_BOARD_BASELINE_KEY]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,

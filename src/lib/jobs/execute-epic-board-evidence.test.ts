@@ -17,6 +17,13 @@ const setBoardEvidenceBaselineMock = vi.fn<
   (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
 >();
 const clearBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// review-fix's OWN pre-dispatch baseline (chatgpt-codex-connector, PR #284 review, "Persist the
+// PR-fix board baseline before dispatch") shells out to `bd update` too — mocked for the same reason
+// the other baseline writes above are.
+const setReviewFixBoardBaselineMock = vi.fn<
+  (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
+>();
+const clearReviewFixBoardBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // The abandon-before-clear downgrade (chatgpt-codex-connector, PR #284 review, "Mark abandoned
 // baselines before clearing them") shells out to `bd update` too — mocked for the same reason the
 // other baseline writes above are.
@@ -59,6 +66,8 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidencePending: setBoardEvidencePendingMock,
       setBoardEvidenceBaseline: setBoardEvidenceBaselineMock,
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
+      setReviewFixBoardBaseline: setReviewFixBoardBaselineMock,
+      clearReviewFixBoardBaseline: clearReviewFixBoardBaselineMock,
       unverifyBoardEvidenceBaseline: unverifyBoardEvidenceBaselineMock,
       setBoardEvidenceDispatchStarted: setBoardEvidenceDispatchStartedMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
@@ -83,8 +92,11 @@ const {
   fingerprintBoard,
   isBoardOnlyRun,
   markDispatchStarted,
+  persistReviewFixBoardBaseline,
   readBoardBaseline,
   readBoardEvidence,
+  readReviewFixBoardBaseline,
+  releaseReviewFixBoardBaseline,
 } = await import("./execute-epic-board-evidence");
 const { LABELS } = await import("../beads/bd");
 
@@ -93,6 +105,8 @@ const { LABELS } = await import("../beads/bd");
 setBoardEvidencePendingMock.mockResolvedValue("");
 setBoardEvidenceBaselineMock.mockResolvedValue("");
 clearBoardEvidenceBaselineMock.mockResolvedValue("");
+setReviewFixBoardBaselineMock.mockResolvedValue("");
+clearReviewFixBoardBaselineMock.mockResolvedValue("");
 unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceDispatchStartedMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
@@ -1745,6 +1759,80 @@ describe("readBoardBaseline / readBoardEvidence (anton-fc5x)", () => {
 });
 
 describe(
+  "persistReviewFixBoardBaseline / readReviewFixBoardBaseline / releaseReviewFixBoardBaseline " +
+    "(chatgpt-codex-connector, PR #284 review, \"Persist the PR-fix board baseline before dispatch\") " +
+    "— review-fix's own recoverable pre-dispatch snapshot, closing the same crash window " +
+    "ensureBoardBaselinePersisted closes for the ticket-dispatch path",
+  () => {
+    it("reads undefined when nothing was ever preserved", () => {
+      expect(readReviewFixBoardBaseline(bead("t-1"))).toBeUndefined();
+    });
+
+    it("reads back a preserved snapshot off the bead's own metadata", () => {
+      const preserved = { a: "preserved-hash" };
+      const ticket = bead("t-1", { metadata: { reviewFixBoardBaseline: JSON.stringify(preserved) } });
+      expect(readReviewFixBoardBaseline(ticket)).toEqual({ beads: new Map(Object.entries(preserved)) });
+    });
+
+    it("persists the baseline and confirms it synced", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setReviewFixBoardBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+
+      await expect(persistReviewFixBoardBaseline("/repo", "t-1", baseline)).resolves.toBe(true);
+
+      expect(setReviewFixBoardBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-1",
+        Object.fromEntries(baseline.beads),
+      );
+      expect(pushMock).toHaveBeenCalledWith("/repo");
+    });
+
+    it("fails closed — never claiming success — when the persist itself cannot be written after retries", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      setReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      setReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(persistReviewFixBoardBaseline("/repo", "t-1", baseline)).resolves.toBe(false);
+
+      // Never even attempts the confirming push once the local write itself is unconfirmed.
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+
+    it("fails closed when the write lands locally but the confirming push cannot verify it reached the remote", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setReviewFixBoardBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired");
+
+      await expect(persistReviewFixBoardBaseline("/repo", "t-1", baseline)).resolves.toBe(false);
+    });
+
+    it("releases the preserved baseline and confirms the release synced", async () => {
+      clearReviewFixBoardBaselineMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+
+      await expect(releaseReviewFixBoardBaseline("/repo", "t-1")).resolves.toBe(true);
+
+      expect(clearReviewFixBoardBaselineMock).toHaveBeenCalledWith("/repo", "t-1");
+    });
+
+    it("fails closed when releasing the baseline cannot be persisted after retries", async () => {
+      clearReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      clearReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      clearReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(releaseReviewFixBoardBaseline("/repo", "t-1")).resolves.toBe(false);
+
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+  },
+);
+
+describe(
   "ensureBoardBaselinePersisted — durably anchors a fresh baseline before dispatch (PR #284 review, " +
     "\"Persist the board baseline before dispatch\")",
   () => {
@@ -1867,6 +1955,52 @@ describe(
       expect(clearBoardEvidenceCleanupUnsyncedMock).toHaveBeenCalledWith("/repo", "t-reopened-survivors");
       expect(clearBoardEvidenceCleanupUnsyncedMock.mock.calls.length).toBe(clearCleanupCallsBefore + 1);
       expect(pushMock.mock.calls.length).toBeGreaterThan(pushCallsBefore);
+    });
+
+    it("resets a closure-stamped pending marker left standing by a cleanup whose confirming " +
+      "`setBoardEvidenceConfirmed` write exhausted its retries (chatgpt-codex-connector, PR #284 " +
+      "review, \"Reset closure-stamped pending evidence without confirmation\") — even though " +
+      "`boardEvidenceConfirmed` was never actually set, the stamped marker still names a completed " +
+      "prior cycle, so the locked+verified+dispatch-started baseline it left behind must not be " +
+      "trusted as this cycle's own recovery baseline", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const strandedTicket = bead("t-stranded-pending", {
+        labels: [LABELS.boardEvidencePending(["anton-old1"])],
+        metadata: {
+          // Deliberately no `boardEvidenceConfirmed` — the confirming write is exactly what
+          // exhausted its retries in the scenario this test covers.
+          boardEvidencePendingClosure: "closure-c1",
+          boardEvidenceBaseline: JSON.stringify({ a: "preserved-hash" }),
+          boardEvidenceBaselineLocked: "1",
+          boardEvidenceBaselineVerified: "1",
+          boardEvidenceDispatchStarted: "1",
+        },
+      });
+      pushMock.mockResolvedValue("synced");
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the fresh persist after abandoning
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the refresh loop's read: no diff
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative lock write
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // the lock's own stability re-read: stable
+      setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified-marking write
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]); // that push's own stability re-read: stable
+
+      await expect(
+        ensureBoardBaselinePersisted("/repo", strandedTicket, baseline),
+      ).resolves.toEqual(baseline);
+
+      // The stale recovery baseline is abandoned (downgraded then cleared), never trusted as-is.
+      expect(unverifyBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-stranded-pending");
+      expect(clearBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-stranded-pending");
+      // The stranded pending marker is cleared right alongside it.
+      expect(setBoardEvidencePendingMock).toHaveBeenCalledWith("/repo", "t-stranded-pending", [], [
+        LABELS.boardEvidencePending(["anton-old1"]),
+      ]);
+      // A genuinely fresh baseline is persisted afterward, not the abandoned one.
+      expect(setBoardEvidenceBaselineMock).toHaveBeenCalledWith(
+        "/repo",
+        "t-stranded-pending",
+        Object.fromEntries(baseline.beads),
+      );
     });
 
     it("never clears boardEvidenceConfirmed for a ticket that never carried it, and never touches it " +

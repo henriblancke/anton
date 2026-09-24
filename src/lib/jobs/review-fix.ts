@@ -112,7 +112,13 @@ import { IN_REVIEW, tryList } from "./review-fix-board";
 import { safe } from "./safe";
 import { finalizeMergedEpic, stampConfirmedClosures } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
-import { boardEvidence, type BoardFingerprint } from "./execute-epic-board-evidence";
+import {
+  boardEvidence,
+  persistReviewFixBoardBaseline,
+  readReviewFixBoardBaseline,
+  releaseReviewFixBoardBaseline,
+  type BoardFingerprint,
+} from "./execute-epic-board-evidence";
 import { defaultReadBoardFingerprint, defaultSyncBoard } from "./review-gate";
 import type { AntonDb, Clock } from "./queue";
 import { systemClock } from "./queue";
@@ -861,6 +867,17 @@ async function runFixSession(args: {
               `remote`,
           );
         }
+        // This shortcut never diffs a before/after baseline of its own, so any snapshot a PRIOR,
+        // interrupted attempt persisted (see `persistReviewFixBoardBaseline` below) is now orphaned —
+        // left standing, the next NORMAL dispatch round for this same PR would wrongly reuse it as
+        // its own pre-dispatch state instead of taking a fresh read.
+        if (!(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+          throw new Error(
+            `the review fix for ${epic.id} resumed PR #${number} with its branch already ahead of ` +
+              `origin, but a leftover pre-dispatch board baseline from a prior attempt could not be ` +
+              `released`,
+          );
+        }
       }
       const pushed = await commitAndPushFix(
         repo,
@@ -888,15 +905,35 @@ async function runFixSession(args: {
     // The board's OWN "before" (mirrors review-gate.ts's `runGateFixSession`, PR #284 review,
     // "Wire board-only handling into PR review fixes"): a board-only ticket's fix is a `bd` write to
     // the LIVE board at `repo`, not this worktree's own (separate, unsynced) copy, and this
-    // worktree's git state can never show it. Read before dispatch and refused fail-closed when
-    // unreadable — dispatching anyway risks the fixer making board writes this session could never
-    // tell apart from no progress at all.
-    boardBefore = boardOnly ? await defaultReadBoardFingerprint(repo, epic.id) : undefined;
+    // worktree's git state can never show it. A prior, interrupted attempt's own persisted snapshot
+    // (see below) is preferred over a fresh read (chatgpt-codex-connector, PR #284 review, "Persist
+    // the PR-fix board baseline before dispatch") — a fresh read after a crash mid-attempt would
+    // already contain whatever the fixer wrote before this process died, permanently hiding that
+    // delta from every later diff. Refused fail-closed when unreadable — dispatching anyway risks the
+    // fixer making board writes this session could never tell apart from no progress at all.
+    boardBefore = boardOnly
+      ? (readReviewFixBoardBaseline(epic) ?? (await defaultReadBoardFingerprint(repo, epic.id)))
+      : undefined;
     if (boardOnly && !boardBefore) {
       throw new PoisonError(
         `the review fix for ${epic.id} could not read a board-only baseline for PR #${number} — ` +
           `refusing to dispatch: without that baseline this session's board writes (if any) could ` +
           `never be told apart from no progress. Resolve the board read, then resume.`,
+      );
+    }
+    // Durably anchored BEFORE the fixer ever runs — otherwise this baseline lives only in this
+    // process's memory until the post-run read below, and a process/host death after a live board
+    // write but before that read (or the catch-block audit further down) leaves nothing durable for a
+    // resumed attempt to diff against. Run unconditionally, including when `boardBefore` was just
+    // reused from a preserved value above: the write is then a no-op, but the confirming push still
+    // reconfirms it reached the remote, the same reconfirm-on-retry `readBoardBaseline`'s own callers
+    // already rely on.
+    if (boardOnly && boardBefore && !(await persistReviewFixBoardBaseline(repo, epic.id, boardBefore))) {
+      throw new PoisonError(
+        `the review fix for ${epic.id} read a board-only baseline for PR #${number} but could not ` +
+          `persist it before dispatch — refusing to dispatch: without a durable copy, a crash after ` +
+          `the fixer's own board write could never be told apart from no progress. Resolve the board ` +
+          `write, then resume.`,
       );
     }
 
@@ -970,6 +1007,17 @@ async function runFixSession(args: {
       throw new Error(
         `the review fix for ${epic.id} wrote directly to the board for PR #${number} but the write ` +
           `could not be confirmed synced against the remote`,
+      );
+    }
+    // This session's board evidence (changed or not) is now fully captured and, if it changed,
+    // confirmed synced above — the pre-dispatch snapshot persisted before dispatch has done its job.
+    // Released rather than left standing: a LATER, genuinely new review-fix round for this same PR
+    // would otherwise reuse this round's now-stale snapshot instead of taking a fresh one.
+    if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+      throw new Error(
+        `the review fix for ${epic.id} confirmed its board evidence for PR #${number} but could not ` +
+          `release its own pre-dispatch baseline — a later review-fix round for this PR could misread ` +
+          `it as still describing the current pre-dispatch state`,
       );
     }
 
@@ -1078,6 +1126,21 @@ async function runFixSession(args: {
               `attempt's own unverified fix and count it as progress, or a resumed attempt's fresh ` +
               `baseline could silently absorb it before anyone reviews it. Inspect and repair the ` +
               `board by hand, then resume. The fixer itself failed with: ${String(e)}`,
+          );
+          // Left standing deliberately (never released on this branch): this IS the recovery
+          // snapshot a human's eventual resume needs to tell the just-parked write apart from
+          // whatever the board looks like by the time anyone gets to it.
+        } else if (!(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+          // No board change of its own — an ordinary retryable failure, EXCEPT the baseline this
+          // attempt persisted before dispatch is now stale and could not be cleared. Left standing,
+          // a LATER review-fix round for this same PR would wrongly reuse it as its own pre-dispatch
+          // state instead of taking a fresh read, so this failure is escalated to a park rather than
+          // left to retry silently past it.
+          effective = new PoisonError(
+            `the review fix for ${epic.id} FAILED for PR #${number} with no board change of its own, ` +
+              `but its pre-dispatch board baseline could not be released — a later review-fix round ` +
+              `for this PR could misread it as still describing the current pre-dispatch state. ` +
+              `Inspect and repair the board by hand, then resume. The fixer itself failed with: ${String(e)}`,
           );
         }
       }
