@@ -12,7 +12,10 @@ import { describe, expect, it } from "vitest";
 import {
   countCancels,
   countEscalations,
+  countFailureParks,
+  countHumanTouches,
   countHumanGates,
+  countNonGateEscalations,
   countPrFixRounds,
   countQuotaParks,
   countReviewRounds,
@@ -42,9 +45,12 @@ function counts(scope: {
     prFixRounds: countPrFixRounds(jobs),
     escalations: countEscalations(escalations),
     humanGates: countHumanGates(escalations),
+    nonGateEscalations: countNonGateEscalations(escalations),
     sendBacks: countSendBacks(notes),
     cancels: countCancels(jobs),
     quotaParks: countQuotaParks(jobs),
+    failureParks: countFailureParks(jobs),
+    humanTouches: countHumanTouches({ escalations, notes, jobs }),
   };
 }
 
@@ -53,9 +59,12 @@ const ZEROES = {
   prFixRounds: 0,
   escalations: 0,
   humanGates: 0,
+  nonGateEscalations: 0,
   sendBacks: 0,
   cancels: 0,
   quotaParks: 0,
+  failureParks: 0,
+  humanTouches: 0,
 };
 
 describe("a feature with no friction", () => {
@@ -168,14 +177,24 @@ describe("prFixRounds — the PR corrected after it opened", () => {
 describe("escalations and humanGates — a total and the subset inside it", () => {
   it("counts every escalation, whatever it was raised from", () => {
     const escalations = [{ kind: "parked-run" }, { kind: "stale-pr" }];
-    expect(counts({ escalations })).toEqual({ ...ZEROES, escalations: 2 });
+    expect(counts({ escalations })).toEqual({
+      ...ZEROES,
+      escalations: 2,
+      nonGateEscalations: 2,
+      humanTouches: 2,
+    });
   });
 
   it("counts a gate in BOTH figures — `needs-human` is a kind within the same table", () => {
     // The PR #311 bug in one assertion: these two are not siblings to be added. A lone gate is one
     // escalation that is also one gate, and the sum rule (anton-l6a9z) subtracts the overlap.
     const escalations = [{ kind: "needs-human" }];
-    expect(counts({ escalations })).toEqual({ ...ZEROES, escalations: 1, humanGates: 1 });
+    expect(counts({ escalations })).toEqual({
+      ...ZEROES,
+      escalations: 1,
+      humanGates: 1,
+      humanTouches: 1,
+    });
   });
 
   it("separates the gates from the rest of the total", () => {
@@ -186,12 +205,14 @@ describe("escalations and humanGates — a total and the subset inside it", () =
     ];
     expect(countEscalations(escalations)).toBe(3);
     expect(countHumanGates(escalations)).toBe(2);
+    expect(countNonGateEscalations(escalations)).toBe(1);
   });
 
   it("does not read an autopilot disarm as a gate", () => {
     const escalations = [{ kind: "autopilot-disarm" }];
     expect(countEscalations(escalations)).toBe(1);
     expect(countHumanGates(escalations)).toBe(0);
+    expect(countNonGateEscalations(escalations)).toBe(1);
   });
 });
 
@@ -200,7 +221,7 @@ describe("sendBacks — work a human returned for another pass", () => {
     const notes = [
       { text: reopenNote("anton-tgt", "the acceptance was never met") },
     ];
-    expect(counts({ notes })).toEqual({ ...ZEROES, sendBacks: 1 });
+    expect(counts({ notes })).toEqual({ ...ZEROES, sendBacks: 1, humanTouches: 1 });
   });
 
   it("counts a follow-up's pointer on the ticket it came from", () => {
@@ -244,7 +265,7 @@ describe("sendBacks — work a human returned for another pass", () => {
 describe("cancels — the one signal that needs no heuristic", () => {
   it("counts an operator-cancelled job and moves nothing else", () => {
     const jobs = [job({ type: "execute-epic", status: "cancelled" })];
-    expect(counts({ jobs })).toEqual({ ...ZEROES, cancels: 1 });
+    expect(counts({ jobs })).toEqual({ ...ZEROES, cancels: 1, humanTouches: 1 });
   });
 
   it("does not read a park or a failure as a cancel", () => {
@@ -253,6 +274,7 @@ describe("cancels — the one signal that needs no heuristic", () => {
       job({ type: "execute-epic", status: "failed" }),
     ];
     expect(countCancels(jobs)).toBe(0);
+    expect(countFailureParks(jobs)).toBe(1);
   });
 });
 
@@ -278,6 +300,90 @@ describe("quotaParks — reported beside the human touches, never inside them", 
       job({ type: "execute-epic", status: "parked", lastError: "failed 3×: push rejected" }),
     ];
     expect(countQuotaParks(jobs)).toBe(0);
+    expect(countFailureParks(jobs)).toBe(2);
+  });
+});
+
+describe("humanTouches — each intervention counted exactly once", () => {
+  it("counts a lone `needs-human` escalation as 1, not 2", () => {
+    // The PR #311 double-count, asserted on the sum itself: `needs-human` is a kind WITHIN the
+    // escalations table, so a gate is one row that both totals see. Adding the two overlapping
+    // totals reported 2 for one interruption, and did it worst on the features that needed the most
+    // attention — which biased every cohort comparison toward whichever prompt raised more gates.
+    const escalations = [{ kind: "needs-human" }];
+    expect(countEscalations(escalations)).toBe(1);
+    expect(countHumanGates(escalations)).toBe(1);
+    expect(countHumanTouches({ escalations })).toBe(1);
+  });
+
+  it("adds the disjoint halves of the escalation total, so the total is never double-counted", () => {
+    const escalations = [
+      { kind: "needs-human" },
+      { kind: "needs-human" },
+      { kind: "parked-run" },
+    ];
+    expect(countHumanTouches({ escalations })).toBe(3);
+  });
+
+  it("sums non-gate escalations, gates, send-backs and cancels", () => {
+    const escalations = [{ kind: "needs-human" }, { kind: "stale-pr" }];
+    const notes = [{ text: reopenNote("anton-tgt", "the acceptance was never met") }];
+    const jobs = [job({ type: "execute-epic", status: "cancelled" })];
+    expect(countHumanTouches({ escalations, notes, jobs })).toBe(4);
+  });
+
+  it("excludes anton's own passes — a review round is the system working, not a person", () => {
+    const rounds = [{ verdict: "fixed" }, { verdict: "clean" }];
+    const jobs = [job({ type: "review-fix-pr", status: "done" })];
+    expect(countReviewRounds(rounds)).toBe(2);
+    expect(countPrFixRounds(jobs)).toBe(1);
+    expect(countHumanTouches({ jobs })).toBe(0);
+  });
+});
+
+describe("the park split — a quota window and a stop a human must clear are opposite facts", () => {
+  it("leaves humanTouches at zero for a quota-reasoned park", () => {
+    // The exclusion that keeps the metric from degrading as anton is used MORE: a usage limit is
+    // not a person intervening and not anton failing, so it moves `quotaParks` and nothing else.
+    const jobs = [
+      job({ type: "execute-epic", status: "queued", lastError: usageLimit() }),
+      job({ type: "execute-epic", status: "parked", lastError: usageLimit() }),
+    ];
+    expect(countQuotaParks(jobs)).toBe(2);
+    expect(countFailureParks(jobs)).toBe(0);
+    expect(countHumanTouches({ jobs })).toBe(0);
+  });
+
+  it("still counts a non-quota park as a failure signal", () => {
+    const jobs = [job({ type: "execute-epic", status: "parked", lastError: "poison: anton-x is not a run target" })];
+    expect(countFailureParks(jobs)).toBe(1);
+    expect(countQuotaParks(jobs)).toBe(0);
+  });
+
+  it("counts a park with no recorded reason as a failure, not a quota window", () => {
+    // Only the runner's own marker makes a pause a quota window. An unexplained park is the
+    // conservative half of the split: a stop nothing re-dispatches until a human looks at it.
+    const jobs = [job({ type: "execute-epic", status: "parked", lastError: null })];
+    expect(countFailureParks(jobs)).toBe(1);
+    expect(countQuotaParks(jobs)).toBe(0);
+  });
+
+  it("puts every park in exactly one half, and a settled non-park in neither", () => {
+    const jobs = [
+      job({ type: "execute-epic", status: "parked", lastError: usageLimit() }),
+      job({ type: "execute-epic", status: "parked", lastError: "failed 3×: push rejected" }),
+      job({ type: "execute-epic", status: "failed", lastError: "push rejected" }),
+      job({ type: "execute-epic", status: "done" }),
+    ];
+    expect(countQuotaParks(jobs) + countFailureParks(jobs)).toBe(2);
+  });
+
+  it("keeps a failure park out of humanTouches — anton failing is not a person touching it", () => {
+    // The attention a stuck run eventually costs arrives as the `parked-run` escalation, which
+    // humanTouches already counts. Counting the park too would bill one interruption twice.
+    const jobs = [job({ type: "execute-epic", status: "parked", lastError: "failed 3×: push rejected" })];
+    expect(countHumanTouches({ jobs })).toBe(0);
+    expect(countHumanTouches({ jobs, escalations: [{ kind: "parked-run" }] })).toBe(1);
   });
 });
 

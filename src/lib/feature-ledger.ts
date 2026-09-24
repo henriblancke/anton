@@ -795,12 +795,12 @@ export function ledgerTotals(
   };
 }
 
-// ── friction: the six intervention signals, each read from the table that already records it ──
+// ── friction: the intervention signals, each read from the table that already records it ──
 //
 // (anton-464lw) How much human attention a feature actually took, counted from rows anton already
 // writes so the series cannot rot from neglect (design §D3). Each counter below takes ONLY its own
 // source, so a fixture that exercises one leaves every other at zero — which is what makes the sum
-// rules a sibling ticket composes (`humanTouches`, the quota-park exclusion) provable one term at a
+// (anton-l6a9z: `countHumanTouches`, and the quota-park exclusion from it) provable one term at a
 // time rather than as one opaque total.
 //
 // ## Every figure here is a PROXY, and no surface may present it as a score
@@ -932,7 +932,33 @@ const QUOTA_PARK_MARKER = "usage-limit:";
  * the count would depend on when the read happened to land in that cycle.
  */
 export function countQuotaParks(jobs: readonly FrictionJobRow[]): number {
-  return jobs.filter((job) => job.lastError?.includes(QUOTA_PARK_MARKER) === true).length;
+  return jobs.filter(isQuotaPause).length;
+}
+
+/** The single reading of "this pause was a quota window" — shared so the park split cannot drift. */
+function isQuotaPause(job: FrictionJobRow): boolean {
+  return job.lastError?.includes(QUOTA_PARK_MARKER) === true;
+}
+
+/**
+ * How many times this scope's work stopped for a reason a HUMAN has to clear — a poison, an
+ * exhausted attempt budget, a push that kept being rejected.
+ *
+ * The other half of the park split, and the reason quota parks can leave the friction sum without a
+ * signal going missing with them: a park is either a usage window anton resumes from on its own or a
+ * stop nothing re-dispatches, and design §gap-3 is explicit that those two have OPPOSITE meanings
+ * and must not collapse into one "parks" number. This half IS anton failing, and is counted as one.
+ *
+ * Not a complement over every row, only over parked ones. A quota pause reschedules rather than
+ * parks, so {@link countQuotaParks} deliberately ignores status while this predicate requires it —
+ * a row can be neither, and none can be both.
+ *
+ * Reported BESIDE the human touches rather than inside them: anton failing on its own is not a
+ * person intervening, and the attention a park eventually demands arrives as the `parked-run`
+ * escalation {@link countHumanTouches} already counts.
+ */
+export function countFailureParks(jobs: readonly FrictionJobRow[]): number {
+  return jobs.filter((job) => job.status === "parked" && !isQuotaPause(job)).length;
 }
 
 /** The one column the escalation counters read: the finding kind the row was raised from. */
@@ -966,6 +992,17 @@ export function countHumanGates(escalations: readonly FrictionEscalationRow[]): 
   return escalations.filter((e) => e.kind === HUMAN_GATE_KIND).length;
 }
 
+/**
+ * The escalations that are NOT gates — anton stopped for something nobody was asked to answer.
+ *
+ * The disjoint remainder of {@link countEscalations}, named rather than left implicit so
+ * {@link countHumanTouches} can add the gates back exactly once instead of summing two overlapping
+ * totals, and so a surface can show both halves of the escalation total without re-deriving them.
+ */
+export function countNonGateEscalations(escalations: readonly FrictionEscalationRow[]): number {
+  return escalations.filter((e) => e.kind !== HUMAN_GATE_KIND).length;
+}
+
 /** What a send-back count reads off a bead: its append-only notes blob, already split into entries. */
 export interface FrictionNote {
   text: string;
@@ -987,4 +1024,50 @@ export interface FrictionNote {
  */
 export function countSendBacks(notes: readonly FrictionNote[]): number {
   return notes.filter((note) => isSendBackNote(note.text)).length;
+}
+
+/**
+ * How many times a PERSON had to touch this feature — the one number the friction counters exist to
+ * produce, and the only one that sums them (design §friction).
+ *
+ * ```
+ * humanTouches = nonGateEscalations + humanGates + sendBacks + cancels
+ * ```
+ *
+ * ## Why the escalation total is split before it is added
+ *
+ * `needs-human` is a KIND WITHIN the escalations table (`run-health.ts`), not a separate source. So
+ * `escalations + humanGates` counts every gate TWICE — and it does so worst on the features that
+ * needed the most attention, which biases every cohort comparison toward whichever prompt raised
+ * more gates (PR #311 review). Splitting first and adding the disjoint halves makes the overlap
+ * impossible to reintroduce: a lone `needs-human` is one escalation that is also one gate, and it
+ * lands here as 1. {@link countEscalations} and {@link countHumanGates} stay reported separately
+ * because they answer different questions; they are just never added to each other.
+ *
+ * ## Why quota parks are not in the sum at all
+ *
+ * A usage limit is not a human intervention and not anton failing — nobody was asked anything, and
+ * the runner resumes on its own. Folding {@link countQuotaParks} in would make this number grow
+ * every time anton is used MORE, degrading precisely as the tool succeeds, which is the opposite of
+ * what it is for. It is reported alongside, never inside — as is {@link countFailureParks}, which IS
+ * anton failing but is still not a person touching anything.
+ *
+ * Review rounds and PR-fix rounds are likewise excluded: a review round is the system working, and
+ * both are anton's own passes rather than a human's.
+ *
+ * Still a PROXY, like every counter it sums — see this section's header. Four touches says a feature
+ * took four interruptions, not that it was done badly.
+ */
+export function countHumanTouches(scope: {
+  escalations?: readonly FrictionEscalationRow[];
+  notes?: readonly FrictionNote[];
+  jobs?: readonly FrictionJobRow[];
+}): number {
+  const { escalations = [], notes = [], jobs = [] } = scope;
+  return (
+    countNonGateEscalations(escalations) +
+    countHumanGates(escalations) +
+    countSendBacks(notes) +
+    countCancels(jobs)
+  );
 }
