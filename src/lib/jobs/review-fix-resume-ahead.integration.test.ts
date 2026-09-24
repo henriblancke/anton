@@ -53,6 +53,7 @@ describeBd(
     let projectId: string;
     let restoreEnv: () => void;
     let claudeCallLog: string;
+    let prEditLog: string;
 
     const runDispatch = (epicBeadId: string) =>
       driveJob({
@@ -130,6 +131,8 @@ describeBd(
       mkdirSync(binDir);
       claudeCallLog = join(sandbox, "claude-calls.log");
       writeFileSync(claudeCallLog, "");
+      prEditLog = join(sandbox, "pr-edit.log");
+      writeFileSync(prEditLog, "");
 
       // Fake claude: records that it ran (so a test can assert it was never dispatched), then
       // behaves like a normal fix — edits a file and reports success — for the leg that does
@@ -153,16 +156,27 @@ process.stdin.on('end',()=>{
 
       // Fake gh: every PR in this suite is OPEN + CHANGES_REQUESTED (actionable) with no inline
       // threads. headRefName resolves per PR number via FAKE_BRANCHES so one script serves all
-      // three epics.
+      // three epics. `pr view --json body` and `pr edit --body` are handled separately so a test
+      // can observe `refreshFixRoundsBody`'s read-modify-write against the PR body (PR #321 review).
       const fakeGh = writeBin(
         binDir,
         "gh",
-        `const a=process.argv.slice(2);
+        `const fs=require('fs');
+const a=process.argv.slice(2);
 const branches=JSON.parse(process.env.FAKE_BRANCHES||'{}');
+if(a[0]==='pr'&&a[1]==='view'&&a.includes('--json')&&a[a.indexOf('--json')+1]==='body'){
+  console.log(JSON.stringify({body:''}));
+  process.exit(0);
+}
 if(a[0]==='pr'&&a[1]==='view'){
   const n=Number(a[2]);
   console.log(JSON.stringify({number:n,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:branches[n],url:'https://github.com/acme/repo/pull/'+n,
     reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'please fix'}],statusCheckRollup:[]}));
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='edit'){
+  const body=a[a.indexOf('--body')+1];
+  fs.appendFileSync(process.env.FAKE_PR_EDIT_LOG, JSON.stringify({pr:a[2],body})+'\\n');
   process.exit(0);
 }
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
@@ -177,6 +191,7 @@ process.exit(0);`,
         "ANTON_SESSIONS_ROOT",
         "FAKE_CLAUDE_LOG",
         "FAKE_BRANCHES",
+        "FAKE_PR_EDIT_LOG",
       ]);
       process.env.ANTON_CLAUDE_BIN = fakeClaude;
       process.env.ANTON_GH_BIN = fakeGh;
@@ -184,6 +199,7 @@ process.exit(0);`,
       process.env.ANTON_SESSIONS_ROOT = join(sandbox, "sessions");
       process.env.FAKE_CLAUDE_LOG = claudeCallLog;
       process.env.FAKE_BRANCHES = "{}";
+      process.env.FAKE_PR_EDIT_LOG = prEditLog;
 
       tdb = makeProjectDb({ repoPath: repo });
       clock = new FakeClock(1_700_000_000_000);
@@ -222,6 +238,18 @@ process.exit(0);`,
       // The operator's already-committed work reached origin, unchanged (no new commit was made).
       g(repo, ["fetch", "-q", "origin"]);
       expect(revParse(repo, `origin/${branch}`)).toBe(branchTip);
+
+      // The fast path never dispatches claude, so it has no thread report to draw from — it must
+      // still refresh the PR body's review-fix-rounds region from `verdict.reasons` directly
+      // (PR #321 review), not skip the body update just because this round took the shortcut.
+      const edits = readFileSync(prEditLog, "utf8")
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { pr: string; body: string });
+      expect(edits).toHaveLength(1);
+      expect(edits[0]?.pr).toBe("101");
+      expect(edits[0]?.body).toContain("### Review-fix rounds");
     });
 
     it("parks a red gate on an already-ahead branch and pushes nothing", async () => {

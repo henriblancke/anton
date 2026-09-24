@@ -671,6 +671,17 @@ async function runFixSession(args: {
       // (network stall, process kill) (PR #320 review).
       await endSession(db, clock, sessionId, "done", pushed);
       sessionSettled = true;
+      // This path never dispatches claude, so there's no thread report to parse — `verdict.reasons`
+      // is the only summary of what this round pushed (PR #321 review).
+      await refreshFixRoundsBody({
+        repo,
+        number,
+        report: [],
+        pushed,
+        now: new Date(clock.now()),
+        logPath,
+        reasons: verdict.reasons,
+      });
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
       return pushed;
     }

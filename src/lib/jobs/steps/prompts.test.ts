@@ -769,4 +769,20 @@ describe("upsertBodyRegion (anton-gkjb6)", () => {
     const end = result.body.indexOf(BODY_REGION_END);
     expect(end - start).toBeLessThan(content.length);
   });
+
+  it("hard-truncates an oversized newest round rather than dropping it entirely", () => {
+    // The newest (last) line alone is bigger than the whole budget — the tail-preserving loop
+    // breaks on its very first iteration with `kept` empty. The region must still carry a
+    // truncated fragment of that round, not just the heading and a marker (PR #321 review).
+    const oldRound = "- 2026-09-01: an earlier, unremarkable fix";
+    const newestRound = `- 2026-09-23: ${"x".repeat(5_000)}`;
+    const content = ["### Review-fix rounds", "", oldRound, newestRound].join("\n");
+
+    const result = upsertBodyRegion(body, content);
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("### Review-fix rounds");
+    expect(result.body).toContain("2026-09-23"); // newest round is represented, even if truncated
+    expect(result.body).not.toContain(oldRound);
+  });
 });

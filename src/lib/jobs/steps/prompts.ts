@@ -585,6 +585,14 @@ function truncateRegion(content: string): string {
     return `${trimmed.slice(0, MAX_BODY_REGION_CHARS)}\n… [truncated]`;
   }
 
+  if (kept.length === 0 && rest.length > 0) {
+    // The newest line alone already exceeds the budget — hard-truncate it rather than emit a
+    // region with the heading and marker but no round data at all (PR #321 review).
+    const newest = rest[rest.length - 1] ?? "";
+    const cut = Math.max(0, budget - 1);
+    kept.push(cut > 0 ? `${newest.slice(0, cut)}…` : "…");
+  }
+
   return [heading, marker, ...kept].join("\n");
 }
 

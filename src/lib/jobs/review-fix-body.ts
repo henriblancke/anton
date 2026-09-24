@@ -31,6 +31,17 @@ const ROUND_LINE = /^- (\d{4}-\d{2}-\d{2}): (.+)$/;
 const DROPPED_LINE = /^… (\d+) earlier rounds? dropped$/;
 
 /**
+ * Strip anton's own region markers out of freeform text before it's woven into the region. A
+ * fixer reply or verdict reason is reviewer/model-controlled text quoted verbatim; if it happens
+ * to contain `BODY_REGION_START`/`BODY_REGION_END` (e.g. quoting a review comment about the
+ * markers themselves), writing it unmodified would plant a duplicate marker that permanently
+ * wedges {@link upsertBodyRegion}'s malformed-marker guard shut (PR #321 review).
+ */
+function stripRegionMarkers(text: string): string {
+  return text.split(BODY_REGION_START).join("").split(BODY_REGION_END).join("");
+}
+
+/**
  * What this round fixed, straight from the fixer's own per-thread report. A "fixed" claim with
  * nothing pushed behind it is excluded — the exact rule `applyThreadOutcomes` already answers
  * threads with ({@link fabricatedFix}), shared rather than reimplemented.
@@ -51,8 +62,8 @@ export function fixRoundFrom(
 ): FixRound | undefined {
   const fixed = report
     .filter((item) => item.outcome === "fixed" && !fabricatedFix(item, pushed))
-    .map((item) => item.reply?.trim() || `thread ${item.id}`);
-  const entries = fixed.length > 0 ? fixed : pushed ? fallbackReasons : [];
+    .map((item) => stripRegionMarkers(item.reply?.trim() || `thread ${item.id}`));
+  const entries = fixed.length > 0 ? fixed : pushed ? fallbackReasons.map(stripRegionMarkers) : [];
   if (entries.length === 0) return undefined;
   return { date: now.toISOString().slice(0, 10), fixed: entries };
 }
