@@ -310,6 +310,30 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "self")).toEqual(["blocks-edge-self"]);
       expect(rulesFor(board, "dangling")).toEqual(["blocks-edge-dangling"]);
     });
+
+    it("faults a live gate/molecule's own dangling or self blocks-edge (PR #274 review)", () => {
+      // A gate/molecule fails `isJudged` (pipeline plumbing, judged by no tier rule), but a `blocks`
+      // edge it owns still has to resolve for whatever waits on it to ever become ready. Before this
+      // fix the per-bead loop's `isJudged` gate skipped these beads before the edge-validation loop
+      // ever ran, and an acyclic dangling edge is invisible to `bd dep cycles` too — so the fault
+      // never surfaced anywhere.
+      const board = [
+        bead("g1", "gate", { dependencies: [blocks("g1", "ghost")] }),
+        bead("m1", "molecule", { dependencies: [blocks("m1", "m1")] }),
+      ];
+      expect(rulesFor(board, "g1")).toEqual(["blocks-edge-dangling"]);
+      expect(rulesFor(board, "m1")).toEqual(["blocks-edge-self"]);
+    });
+
+    it("does not fault a closed or abandoned gate's dangling blocks-edge", () => {
+      // Closed/abandoned pipeline beads stay excluded from every rule, tier or graph-integrity —
+      // history, not live work that can stall a run.
+      const board = [
+        bead("g1", "gate", { status: "closed", dependencies: [blocks("g1", "ghost")] }),
+        bead("g2", "gate", { labels: ["abandoned"], dependencies: [blocks("g2", "ghost")] }),
+      ];
+      expect(validateBoardStructure(board)).toEqual([]);
+    });
   });
 
   describe("advisory — it runs, but the shape costs later", () => {

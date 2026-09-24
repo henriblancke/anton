@@ -94,13 +94,14 @@ function dispatchOwnerOf(bead, byId, board) {
   return undefined;
 }
 
-/** A bead is judged only while it is live work: closed is history, abandoned is a won't-do. */
+/** A bead is live while it is still open work: closed is history, abandoned is a won't-do. */
+function isLive(bead) {
+  return bead.status !== "closed" && !(bead.labels ?? []).includes(ABANDONED_LABEL);
+}
+
+/** A bead is judged only while it is live work AND not pipeline plumbing (see {@link PIPELINE_TYPES}). */
 function isJudged(bead) {
-  return (
-    bead.status !== "closed" &&
-    !(bead.labels ?? []).includes(ABANDONED_LABEL) &&
-    !PIPELINE_TYPES.has(bead.issue_type ?? "")
-  );
+  return isLive(bead) && !PIPELINE_TYPES.has(bead.issue_type ?? "");
 }
 
 /**
@@ -124,7 +125,12 @@ export function validateBoardStructure(board, { cycles } = {}) {
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
 
   for (const bead of board) {
-    if (!isJudged(bead)) continue;
+    // Live, not `isJudged`: a live gate/molecule still owns real `blocks` edges, and a dangling or
+    // self-referencing one stalls whatever waits on it exactly like a ticket's would (PR #274
+    // review) — `bd dep cycles` never reports it either, since an acyclic dangling edge isn't a
+    // cycle. The edge-validation loop below has to see these beads; only the tier-specific checks
+    // further down (cycle membership, dangling-parent, ticket/feature rules) stay judged-only.
+    if (!isLive(bead)) continue;
     const parentId = parentOf(bead);
     const parent = parentId ? byId.get(parentId) : undefined;
 
@@ -195,6 +201,12 @@ export function validateBoardStructure(board, { cycles } = {}) {
         );
       }
     }
+
+    // Everything past this point is tier judgement, not graph integrity — cycle membership,
+    // dangling-parent, and the ticket/feature rules all stay pipeline-exempt. A cycle built entirely
+    // out of gates/molecules is still caught (see the `allCycles` fallback below); this cutoff only
+    // keeps a pipeline bead from being faulted twice for the same loop.
+    if (!isJudged(bead)) continue;
 
     for (const cycle of cycleMemberships.get(bead.id) ?? []) {
       // Prefer the edge bd's own reported path actually walks (`next`), not just any `blocks` edge
