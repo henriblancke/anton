@@ -296,6 +296,34 @@ describe("featureLedger's friction half", () => {
     expect(ledger?.friction.reviewRounds).toBe(0);
   });
 
+  it("reports zero human touches for a feature parked on quota twice and never touched", async () => {
+    // Two usage-limit parks, nothing else in the scope — proves the count through the real
+    // `jobsForBeads` json_extract query rather than the pure fold, which a status-filter regression
+    // in that SQL (e.g. excluding queued rows) would not otherwise catch.
+    fakeBoard(BOARD);
+    // Different job types — `jobs_active_epic_unique` allows only one active (queued|running) job
+    // per (type, project, epicBeadId), so two quota parks on the same epic need distinct types.
+    await seedJob({
+      id: "j1",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "queued",
+      lastError: "usage-limit: resumes at 2026-09-21T02:00:00Z",
+    });
+    await seedJob({
+      id: "j2",
+      type: "review-fix",
+      epicBeadId: "feat-1",
+      status: "queued",
+      lastError: "usage-limit: resumes at 2026-09-22T02:00:00Z",
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.friction.quotaParks).toBe(2);
+    expect(ledger?.friction.humanTouches).toBe(0);
+  });
+
   it("leaves a sibling feature's jobs and escalations out of the scope", async () => {
     fakeBoard([...BOARD, bead({ id: "feat-2", issue_type: "feature" })]);
     await seedJob({ id: "j1", type: "execute-epic", epicBeadId: "feat-2", status: "cancelled" });
