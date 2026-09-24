@@ -833,15 +833,6 @@ async function runFixSession(args: {
         `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
       );
       await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
-      const pushed = await commitAndPushFix(
-        repo,
-        worktree.path,
-        epic.id,
-        branch,
-        number,
-        settings,
-        ctx.signal,
-      );
       // A board-capable epic can reach this shortcut with a PRIOR session's own board write still
       // only local (chatgpt-codex-connector, PR #284 review, "Reconfirm board writes on ahead-branch
       // resumes"): a mixed board/git fixer that self-committed and then failed to confirm its board
@@ -850,6 +841,17 @@ async function runFixSession(args: {
       // — later silently absorbed into a fresh baseline as though nothing happened. Confirmed the
       // same way the full dispatch path below confirms its own board writes; `defaultSyncBoard` is a
       // plain push, so it costs nothing when there is genuinely nothing new to sync.
+      //
+      // Checked BEFORE `commitAndPushFix` (chatgpt-codex-connector, PR #284 review, "Confirm the
+      // board before publishing the resumed Git fix"): syncing after the git push meant a failed
+      // board sync threw only once the branch was already live on the remote, which flips
+      // `alreadyAhead` false on the very next resume — this shortcut would never fire again, the
+      // resume would fall through to a fresh claude dispatch, and by the time that ran, a best-effort
+      // sync elsewhere could have already landed the stale board write. That retry then sees neither
+      // a git nor a board delta to report, so an honest `fixed` outcome reads as fabricated and the
+      // finding cycles despite both fixes having landed. Confirming the board first means a failure
+      // here still finds the branch unpushed, so `alreadyAhead` stays true and the shortcut can retry
+      // itself cleanly instead.
       if (boardOnly) {
         const boardSynced = await defaultSyncBoard(repo);
         if (!boardSynced) {
@@ -860,6 +862,15 @@ async function runFixSession(args: {
           );
         }
       }
+      const pushed = await commitAndPushFix(
+        repo,
+        worktree.path,
+        epic.id,
+        branch,
+        number,
+        settings,
+        ctx.signal,
+      );
       // Persist the push BEFORE the fallible notification below — a delivery that reached the
       // remote must count toward lead-time/repair weighting even if notifyReReview never returns
       // (network stall, process kill) (PR #320 review).

@@ -1510,30 +1510,17 @@ async function runGateFixSession(args: {
       // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
       // its own work and the branch already carries the repair the next review will read.
       const selfCommitted = !committed && afterFix.head !== before.head;
-      await appendSessionLog(
-        logPath,
-        committed
-          ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
-          : selfCommitted
-            ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
-            // Reaching here with `boardChanged` true means it is also `boardSynced` — the unsynced
-            // case is thrown above as a poisoned board-writing failure before this log line runs.
-            : boardChanged
-              ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed and is ` +
-                `confirmed synced, which is this run's actual deliverable (delivery:board)\n`
-              : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
-      );
-      if (!treeProven) {
-        await appendSessionLog(
-          logPath,
-          `[review-fix] round ${round}/${maxRounds}: the gates' evidence is not provably the committed ` +
-            `tree (${describeTree(testedTree)} → ${describeTree(committedTree)}) — a commit hook that ` +
-            `rewrites files does exactly this — so the next review runs them itself rather than ` +
-            `trusting evidence for a tree it is not reading\n`,
-        );
-      }
-      await endSession(db, clock, sessionId, "done");
-      return {
+      // Built now, before the finalization calls below (chatgpt-codex-connector, PR #284 review,
+      // "Persist board-fix IDs before settling the session"): everything this result carries —
+      // `committed`, `treeProven`, `changedBoardIds` — is already known, and a confirmed board write
+      // must reach the caller regardless of what happens next. `runReviewGate` only merges
+      // `boardEvidenceIds` into `boardEvidenceByTicket`, and durably persists it via
+      // `setBoardEvidenceConfirmed`, off this function's RETURN value — a thrown error here instead
+      // means the caller never sees this round's confirmed ids at all, and a resumed attempt
+      // reconstructs its evidence ledger from the stale `boardEvidenceConfirmed` metadata, omitting a
+      // bead this round itself repaired (especially costly for a server-backed board, where the
+      // reviewer has no shell to independently discover what changed).
+      const fixResult = {
         sessionId,
         // `boardChanged` is this round's progress signal for a board-only run (PR #284 review round
         // 13): its fix leaves no git diff by design, so `committed`/`selfCommitted` alone would read
@@ -1546,6 +1533,42 @@ async function runGateFixSession(args: {
         ...(treeProven ? { verified: gates } : {}),
         ...(boardChanged ? { boardEvidenceIds: changedBoardIds } : {}),
       };
+      // Session bookkeeping only, past this point: the fix is verified, committed, and (if
+      // board-capable) confirmed synced, so a failure writing the session log or marking the session
+      // row `done` must not cost the caller `fixResult` above — swallowed here rather than thrown, so
+      // this function still returns it instead of losing it to the same board-evidence gap this
+      // comment opens with.
+      try {
+        await appendSessionLog(
+          logPath,
+          committed
+            ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
+            : selfCommitted
+              ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
+              // Reaching here with `boardChanged` true means it is also `boardSynced` — the unsynced
+              // case is thrown above as a poisoned board-writing failure before this log line runs.
+              : boardChanged
+                ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed and is ` +
+                  `confirmed synced, which is this run's actual deliverable (delivery:board)\n`
+                : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
+        );
+        if (!treeProven) {
+          await appendSessionLog(
+            logPath,
+            `[review-fix] round ${round}/${maxRounds}: the gates' evidence is not provably the committed ` +
+              `tree (${describeTree(testedTree)} → ${describeTree(committedTree)}) — a commit hook that ` +
+              `rewrites files does exactly this — so the next review runs them itself rather than ` +
+              `trusting evidence for a tree it is not reading\n`,
+          );
+        }
+        await endSession(db, clock, sessionId, "done");
+      } catch (finalizeError) {
+        console.error(
+          `[review-fix] round ${round}/${maxRounds}: session finalization failed for ${target.id} after ` +
+            `a verified fix — returning the fix's result anyway: ${String(finalizeError)}`,
+        );
+      }
+      return fixResult;
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
       // committed its own work first, which project instructions routinely tell an agent to do. Then
