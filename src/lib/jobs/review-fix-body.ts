@@ -150,6 +150,13 @@ export function extractFixRoundsRegion(body: string | undefined): string | undef
  * later shrinks back under the cap (an old, long round ages out while new ones are short) would
  * silently lose the marker and misrepresent a truncated history as complete (PR #321 review). Doing
  * the cut here keeps one dropped-count source of truth that survives every refresh.
+ *
+ * The newest round is never dropped outright: when it alone still exceeds the cap (a giant fixer
+ * reply), older rounds shrink to nothing before the newest does, so the loop stops one round early
+ * and truncates its text instead. Otherwise the just-pushed fix — the one entry a reviewer actually
+ * needs — would vanish from the region with no trace, and `upsertBodyRegion` never gets a chance to
+ * apply its own hard-truncation fallback because the pre-fit output already fits under the cap
+ * (PR #321 review).
  */
 export function renderFixRounds(rounds: FixRound[], previouslyDropped = 0): string {
   if (rounds.length === 0) return "";
@@ -157,12 +164,29 @@ export function renderFixRounds(rounds: FixRound[], previouslyDropped = 0): stri
   let dropped = previouslyDropped + (rounds.length - capped.length);
 
   let rendered = renderFixRoundLines(capped, dropped);
-  while (capped.length > 0 && rendered.length > MAX_BODY_REGION_CHARS) {
+  while (capped.length > 1 && rendered.length > MAX_BODY_REGION_CHARS) {
     capped = capped.slice(1);
     dropped += 1;
     rendered = renderFixRoundLines(capped, dropped);
   }
+  if (rendered.length > MAX_BODY_REGION_CHARS) {
+    const [newest] = capped;
+    if (newest) {
+      capped = [truncateNewestRound(newest, dropped)];
+      rendered = renderFixRoundLines(capped, dropped);
+    }
+  }
   return rendered;
+}
+
+/** Shrink the newest round's fixed text to fit {@link MAX_BODY_REGION_CHARS} alongside `dropped`. */
+function truncateNewestRound(newest: FixRound, dropped: number): FixRound {
+  const overhead = renderFixRoundLines([], dropped).length + 1; // +1 for the newline before the round line
+  const prefix = `- ${newest.date}: `;
+  const textBudget = Math.max(0, MAX_BODY_REGION_CHARS - overhead - prefix.length - 1); // -1 for the ellipsis
+  const joined = newest.fixed.join("; ");
+  const text = textBudget > 0 ? `${joined.slice(0, textBudget)}…` : "…";
+  return { date: newest.date, fixed: [text] };
 }
 
 function renderFixRoundLines(rounds: FixRound[], dropped: number): string {

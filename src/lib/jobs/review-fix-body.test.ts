@@ -208,6 +208,20 @@ describe("renderFixRounds / parseFixRounds round-trip", () => {
     expect(parseFixRounds(rendered).length).toBeLessThan(rounds.length);
   });
 
+  it("truncates rather than drops the newest round when it alone exceeds the char budget", () => {
+    // An oversized newest round used to make the pre-fit loop shift rounds off until `capped` was
+    // empty, silently dropping the just-pushed fix with no trace and no chance for
+    // `upsertBodyRegion`'s own hard-truncation fallback to run (PR #321 review).
+    const oldRound: FixRound = { date: "2026-09-01", fixed: ["an earlier, unremarkable fix"] };
+    const newestRound: FixRound = { date: "2026-09-23", fixed: ["x".repeat(5000)] };
+
+    const rendered = renderFixRounds([oldRound, newestRound]);
+
+    expect(rendered.length).toBeLessThanOrEqual(4000);
+    expect(rendered).toContain("2026-09-23"); // newest round survives, even truncated
+    expect(rendered).not.toContain("2026-09-01"); // the old round is dropped to make room
+  });
+
   it("carries the char-truncation dropped count forward across a refresh, even once the region shrinks back under budget", () => {
     // A region that previously had to drop long rounds to fit the char cap, then gets a new, short
     // round appended — the retained tail plus the new round now easily fit under the cap. The

@@ -613,6 +613,12 @@ function renderRegion(content: string): string {
  * a real owned span; a plain substring count would accept that quoted pair as well-formed and let
  * `upsertBodyRegion` rewrite everything between two unrelated prose mentions (PR #321 review).
  *
+ * A standalone line isn't authentication enough on its own: a fenced ```/~~~ code example quoting
+ * the markers (e.g. a PR description showing what the region looks like) puts each one on its own
+ * line too, so lines inside a fence are excluded from matching even when they'd otherwise qualify —
+ * otherwise the example reads as a real owned span and the next refresh overwrites the human prose
+ * between the two mentions (PR #321 review).
+ *
  * Exported so `review-fix-body.ts`'s `extractFixRoundsRegion` can apply the same standalone-line
  * rule when reading the region back — otherwise a body that quotes both marker strings inline
  * (with unrelated dated-looking text between them) is misread as an existing, well-formed region
@@ -621,8 +627,21 @@ function renderRegion(content: string): string {
 export function markerLines(body: string, marker: string): number[] {
   const indices: number[] = [];
   let offset = 0;
+  let fence: { char: string; length: number } | null = null;
   for (const line of body.split("\n")) {
-    if (line.trim() === marker) indices.push(offset + line.indexOf(marker));
+    const trimmedLine = line.trim();
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmedLine);
+    if (fenceMatch) {
+      const token = fenceMatch[1]!;
+      const char = token[0]!;
+      if (!fence) {
+        fence = { char, length: token.length };
+      } else if (char === fence.char && token.length >= fence.length && trimmedLine === token) {
+        fence = null;
+      }
+    } else if (!fence && trimmedLine === marker) {
+      indices.push(offset + line.indexOf(marker));
+    }
     offset += line.length + 1;
   }
   return indices;

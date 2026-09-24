@@ -798,4 +798,30 @@ describe("upsertBodyRegion (anton-gkjb6)", () => {
     expect(result.body).toContain("2026-09-23"); // newest round is represented, even if truncated
     expect(result.body).not.toContain(oldRound);
   });
+
+  it("ignores markers that appear standalone inside a fenced code example", () => {
+    // A PR description can show what anton's region looks like as a fenced example, putting each
+    // marker on its own line inside the fence. That must not read as a real owned span — otherwise
+    // the next refresh treats the example as anton's region and overwrites the human prose sitting
+    // between the two mentions (PR #321 review).
+    const fenced = [
+      body,
+      "",
+      "Here's what the region looks like:",
+      "```",
+      BODY_REGION_START,
+      "- 2026-01-01: example round",
+      BODY_REGION_END,
+      "```",
+      "",
+      "Please don't remove this note.",
+    ].join("\n");
+
+    const result = upsertBodyRegion(fenced, "new content");
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("Please don't remove this note.");
+    expect(result.body).toContain("example round"); // the fenced example is left untouched
+    expect(result.body).toContain("new content");
+  });
 });
