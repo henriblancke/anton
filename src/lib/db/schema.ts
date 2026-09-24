@@ -173,6 +173,16 @@ export const runs = sqliteTable("runs", {
   // descending `writeSeq` is settlement order by construction. Null on rows written before this
   // column existed, which fall back to that proxy.
   writeSeq: integer("write_seq"),
+  // Whether this settled `done` row actually published something — opened, refreshed, or found a
+  // live pull request — as opposed to a verified already-shipped retirement that opens none
+  // (`finishRun`'s `targetRetired`, `settleRetiredStandalone`'s recovery-idempotent twin). The
+  // feature ledger (`listDeliveriesByBead`) needs this: without it, a no-op retirement settle reads
+  // as delivery evidence and hands the feature a `leadMs` ending at bookkeeping that shipped nothing
+  // (PR #320 review). Defaults true for the common case — a row written before this column existed
+  // is almost always a genuine delivery — but the no-op retirement path predates this column too
+  // (anton-5bpd, #238), so the migration that adds it also backfills the retirement rows it can
+  // still identify back to `false` (see drizzle/0053_run_delivered.sql).
+  delivered: integer("delivered", { mode: "boolean" }).notNull().default(true),
 }, (table) => [
   // Serves the tie-break's ordering and, more to the point, makes the MAX+1 stamp on every run
   // write an index lookup instead of a table scan.
@@ -827,6 +837,11 @@ export const sessions = sqliteTable(
     kind: text("kind").notNull(),
     beadId: text("bead_id"),
     status: text("status").notNull().default("running"),
+    // Whether a `review-fix` session actually committed+pushed a correction to the PR branch —
+    // `listDeliveriesByBead` (runs.ts) needs this to tell that apart from a review-fix session that
+    // only answered feedback with nothing to push, since both settle `status: "done"` the same way.
+    // Null for every other kind, and for a review-fix row written before this column existed.
+    pushed: integer("pushed", { mode: "boolean" }),
     logPath: text("log_path"),
     // Claude's own session id (from the stream-json result / system-init event), persisted so a
     // transient mid-stream death can be retried with `claude --resume <id>` (anton-juar).
@@ -972,5 +987,10 @@ export const claudeInvocations = sqliteTable(
     // Serves "what did this run spend", which is a run detail read and not a scan of the table.
     index("claude_invocations_run_idx").on(table.runId),
     index("claude_invocations_invocation_idx").on(table.invocationId),
+    // The feature ledger's own seek: `bead_id IN (<the scope>)`, one term per bead in the feature's
+    // subtree (`ledgerScope`, feature-scope.ts). Single-column rather than paired with `recorded_at`
+    // because a feature rolls up its WHOLE life — there is no window to leave the seek to, unlike the
+    // project read above.
+    index("claude_invocations_bead_idx").on(table.beadId),
   ],
 );

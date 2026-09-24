@@ -132,7 +132,9 @@ describe("walkRunPhase standalone retirement settlement", () => {
       expect.anything(),
       expect.anything(),
       "run-1",
-      expect.objectContaining({ status: "done" }),
+      // A retirement opens no pull request — the row must not read as delivery evidence
+      // (PR #320 review).
+      expect.objectContaining({ status: "done", delivered: false }),
     );
     expect(releaseRunResourcesMock).toHaveBeenCalledTimes(1);
   });

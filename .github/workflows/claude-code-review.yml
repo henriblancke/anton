@@ -63,6 +63,13 @@ jobs:
       # covers only one trigger of this failure shape. 2.1.281's changelog adds several more
       # transient-failure fixes in the same area (a crash ending a session mid API-retry;
       # 5xx/429 retry-loop and backoff fixes), any of which plausibly covers this recurrence.
+      # The exact same signature then returned across eight straight runs on PR #320 —
+      # is_error:true, num_turns:1, total_cost_usd:0, ~500ms, no findings unrelated to that
+      # PR's own diff. 2.1.277 and 2.1.281 each carry a further fix matching this shape
+      # ("Fixed `claude -p` and Agent SDK sessions that could hang with no result after an
+      # internal error; they now report the error and exit with code 1"; "Fixed a crash
+      # ('unrecoverable interface error') that could end a session while an API request was
+      # being retried").
       # If reviews start failing this way again, re-check the changelog and bump further
       # before assuming it's this PR's fault — the log's `Running Claude Code via SDK (full
       # output hidden for security)` line means the real crash detail never reaches this

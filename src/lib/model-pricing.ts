@@ -195,6 +195,74 @@ export function isPriced(model: string | null | undefined): boolean {
 }
 
 /**
+ * The price table entry a row's billing route resolves to — the same branch {@link costOf} uses
+ * internally, pulled out so a caller can ask "is this priced" without also needing counts to ask it.
+ */
+function resolvePrice(
+  model: string | null | undefined,
+  endpointHost: string | null | undefined,
+  gatewayPricing: GatewayPricing | undefined,
+): ModelPrice | undefined {
+  return endpointHost === undefined
+    ? priceOf(model)
+    : endpointHost === null
+      ? undefined
+      : endpointHost === "api.anthropic.com"
+        ? priceOf(model)
+        : gatewayPricing?.endpointHost === endpointHost
+          ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
+          : undefined;
+}
+
+/**
+ * Whether anton has a price for this row's model and routing, GIVEN what it actually used —
+ * independent of whether the row measured any counts. Lets a caller tell "no price for this model"
+ * apart from "priced, but nothing was measured", which {@link costOf}'s single `undefined` collapses
+ * (PR #320 review).
+ *
+ * `counts` matters: a price table entry can cover input/output but omit cache rates, and
+ * {@link costOf} then returns `undefined` for any row that actually used cache tokens (it will not
+ * silently price cache reads/writes at zero). Checking only "does a price entry exist" would call
+ * that row priced and drop its model from the caller's unpriced-model list — an incomplete total
+ * with no actionable name behind it (PR #320 review). This mirrors `costOf`'s own completeness
+ * check so the two never disagree about the same row.
+ */
+export function isPricedFor(
+  model: string | null | undefined,
+  counts: TokenCounts,
+  endpointHost?: string | null,
+  gatewayPricing?: GatewayPricing,
+): boolean {
+  const price = resolvePrice(model, endpointHost, gatewayPricing);
+  if (!price) return false;
+  const cacheRead = count(counts.cacheReadInputTokens);
+  const cacheWrite = count(counts.cacheCreationInputTokens);
+  if (cacheRead > 0 && price.cacheRead === undefined) return false;
+  if (cacheWrite > 0 && price.cacheWrite5m === undefined) return false;
+  return true;
+}
+
+/**
+ * Whether an unpriced row is a genuine gap in the price table, as opposed to an intentionally
+ * unpriceable transport. A `null` endpointHost means the CLI used its default transport, which
+ * may be a subscription anton never bills at API rates — {@link isPricedFor} correctly calls that
+ * row unpriced, but the model itself can still be one anton already prices (e.g. `claude-opus-5`
+ * over a plain subscription call). Reporting that model as needing a price-table entry would tell
+ * the UI to fix the wrong thing: the unknown fact is the billing mode, not the model's rate
+ * (PR #320 review). Every other unpriced reason — a model with no table entry at all, or a
+ * resolved price missing a component (e.g. cache) the row used — is a real gap and stays reported.
+ */
+export function isMissingPriceEntry(
+  model: string | null | undefined,
+  counts: TokenCounts,
+  endpointHost?: string | null,
+  gatewayPricing?: GatewayPricing,
+): boolean {
+  if (isPricedFor(model, counts, endpointHost, gatewayPricing)) return false;
+  return endpointHost === null ? priceOf(model) === undefined : true;
+}
+
+/**
  * The measured counts one ledger row carries. Structural and all-optional, so it takes a row, a
  * {@link import("./claude/model-usage").ModelUsageEntry}, or a test fixture — and so an absent
  * count is distinguishable from a zero one.
@@ -261,15 +329,7 @@ export function costOf(
   // Persisted rows always carry `null` or a host. Null means the CLI used its default transport,
   // whose billing mode (subscription vs API key) is unknown; do not invent a charge. A supplied
   // gateway table is therefore an explicit, caller-owned rate snapshot, never an implicit lookup.
-  const price = endpointHost === undefined
-    ? priceOf(model)
-    : endpointHost === null
-      ? undefined
-      : endpointHost === "api.anthropic.com"
-        ? priceOf(model)
-        : gatewayPricing?.endpointHost === endpointHost
-          ? gatewayPricing.prices[model ?? ""] ?? gatewayPricing.prices[normalizeModelId(model)]
-          : undefined;
+  const price = resolvePrice(model, endpointHost, gatewayPricing);
   if (!price || !hasAnyCount(counts)) return undefined;
 
   const input = count(counts.inputTokens);

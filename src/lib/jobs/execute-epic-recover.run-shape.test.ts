@@ -138,12 +138,13 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
     // The adjacent board recheck pulled the shared embedded board, then found the same shape.
     expect(pullMock).toHaveBeenCalledWith(REPO);
     expect(loadAllIssuesMock).toHaveBeenCalledWith(REPO, { strictGates: true });
-    // Settled as a finished run, with no PR, exactly as the uninterrupted attempt would.
+    // Settled as a finished run, with no PR, exactly as the uninterrupted attempt would — and not
+    // as delivery evidence, since no PR was ever opened (PR #320 review).
     expect(updateRunMock).toHaveBeenCalledWith(
       expect.anything(),
       expect.anything(),
       "run-1",
-      expect.objectContaining({ status: "done" }),
+      expect.objectContaining({ status: "done", delivered: false }),
     );
   });
 
@@ -155,7 +156,7 @@ describe("settleCompletedRun retirement short-circuit (run shape)", () => {
       expect.anything(),
       expect.anything(),
       "run-1",
-      expect.objectContaining({ status: "done" }),
+      expect.objectContaining({ status: "done", delivered: false }),
     );
   });
 
