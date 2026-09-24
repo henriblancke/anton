@@ -144,10 +144,11 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
       // board whose edges no longer describe it: an `approve`/`unapprove` verdict could read `apply`
       // here while the armed path's own locked reread — which DOES recheck — would refuse the same
       // proposal, recording shadow evidence that overstates how safe the kind is to arm. Re-list and
-      // compare before attaching; a cycle-blind target in this same batch still decides off the
-      // original `board` even when the recheck fails, since it never consults cycle evidence at all.
-      const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-      const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(input.repo));
+      // compare before attaching, even when `board` itself starts edge-free — that only describes the
+      // read that already happened, not whether a writer added the first edge during this gap; a
+      // cycle-blind target in this same batch still decides off the original `board` even when the
+      // recheck fails, since it never consults cycle evidence at all.
+      const consistent = sameBlocksEdges(board, await loadAllIssues(input.repo));
       if (consistent) {
         attachCycleEvidence(board, cycles);
       } else {
