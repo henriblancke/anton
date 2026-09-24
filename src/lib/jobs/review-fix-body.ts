@@ -31,14 +31,25 @@ const ROUND_LINE = /^- (\d{4}-\d{2}-\d{2}): (.+)$/;
 const DROPPED_LINE = /^… (\d+) earlier rounds? dropped$/;
 
 /**
- * Strip anton's own region markers out of freeform text before it's woven into the region. A
- * fixer reply or verdict reason is reviewer/model-controlled text quoted verbatim; if it happens
- * to contain `BODY_REGION_START`/`BODY_REGION_END` (e.g. quoting a review comment about the
- * markers themselves), writing it unmodified would plant a duplicate marker that permanently
- * wedges {@link upsertBodyRegion}'s malformed-marker guard shut (PR #321 review).
+ * Sanitize freeform text before it's woven into the region as one `- date: ...` line. A fixer
+ * reply or verdict reason is reviewer/model-controlled text quoted verbatim, so two things need
+ * neutralizing before it's safe to store:
+ *  - `BODY_REGION_START`/`BODY_REGION_END` (e.g. quoting a review comment about the markers
+ *    themselves) — writing it unmodified would plant a duplicate marker that permanently wedges
+ *    {@link upsertBodyRegion}'s malformed-marker guard shut (PR #321 review).
+ *  - embedded newlines — {@link parseFixRounds} reads the region back one line per round, so a
+ *    stored newline spreads one entry across lines; an ordinary continuation is silently dropped,
+ *    but one that happens to match the dated-line pattern is misread as its own historical round,
+ *    corrupting the persisted history and cap accounting (PR #321 review).
  */
-function stripRegionMarkers(text: string): string {
-  return text.split(BODY_REGION_START).join("").split(BODY_REGION_END).join("");
+function sanitizeSummary(text: string): string {
+  return text
+    .split(BODY_REGION_START)
+    .join("")
+    .split(BODY_REGION_END)
+    .join("")
+    .replace(/\r?\n+/g, " ")
+    .trim();
 }
 
 /**
@@ -50,6 +61,9 @@ function stripRegionMarkers(text: string): string {
  * review carries no unresolved inline thread, so `reportingFormatSection` asks for no reporting
  * contract and `report` comes back empty even when a real fix pushed. `fallbackReasons` — the
  * verdict reasons that triggered this round — covers that case so the body still gets an entry.
+ * The fallback only fires when `report` itself is empty: a nonempty report whose outcomes are all
+ * `left`/`needs-human` means the fixer looked at threads and fixed none of them, so falling back
+ * to the verdict's reasons would misreport a decline as a fix (PR #321 review).
  *
  * `undefined` only when neither source has anything to say: no thread report AND (nothing pushed
  * or no reasons given) — the caller's signal that the region, and `gh`, stay untouched.
@@ -62,8 +76,13 @@ export function fixRoundFrom(
 ): FixRound | undefined {
   const fixed = report
     .filter((item) => item.outcome === "fixed" && !fabricatedFix(item, pushed))
-    .map((item) => stripRegionMarkers(item.reply?.trim() || `thread ${item.id}`));
-  const entries = fixed.length > 0 ? fixed : pushed ? fallbackReasons.map(stripRegionMarkers) : [];
+    .map((item) => sanitizeSummary(item.reply?.trim() || `thread ${item.id}`));
+  const entries =
+    fixed.length > 0
+      ? fixed
+      : pushed && report.length === 0
+        ? fallbackReasons.map(sanitizeSummary)
+        : [];
   if (entries.length === 0) return undefined;
   return { date: now.toISOString().slice(0, 10), fixed: entries };
 }

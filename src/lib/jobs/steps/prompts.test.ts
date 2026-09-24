@@ -735,6 +735,19 @@ describe("upsertBodyRegion (anton-gkjb6)", () => {
     warn.mockRestore();
   });
 
+  it("treats markers merely quoted in prose (not on their own line) as no markers at all", () => {
+    // A review comment discussing the marker mechanics can leave both marker strings sitting in
+    // the body as inline prose. A plain substring count would read that as a well-formed pair and
+    // let upsertBodyRegion rewrite the human-authored text between them (PR #321 review).
+    const quoted = `${body}\n\nAs discussed, the region uses ${BODY_REGION_START} and ${BODY_REGION_END} as markers.`;
+
+    const result = upsertBodyRegion(quoted, "new content");
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("As discussed, the region uses");
+    expect(result.body).toContain("new content");
+  });
+
   it("truncates an oversized region rather than letting it grow unbounded", () => {
     const huge = "x".repeat(10_000);
 

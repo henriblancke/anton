@@ -600,8 +600,21 @@ function renderRegion(content: string): string {
   return `${BODY_REGION_START}\n${truncateRegion(content)}\n${BODY_REGION_END}`;
 }
 
-function occurrences(haystack: string, needle: string): number {
-  return haystack.split(needle).length - 1;
+/**
+ * A marker only counts when it occupies its own line — every marker anton itself ever writes does
+ * (see {@link renderRegion}). A body that merely mentions the marker string in prose or a quoted
+ * code example (e.g. discussing the marker mechanics in a review comment) must not be mistaken for
+ * a real owned span; a plain substring count would accept that quoted pair as well-formed and let
+ * `upsertBodyRegion` rewrite everything between two unrelated prose mentions (PR #321 review).
+ */
+function markerLines(body: string, marker: string): number[] {
+  const indices: number[] = [];
+  let offset = 0;
+  for (const line of body.split("\n")) {
+    if (line.trim() === marker) indices.push(offset + line.indexOf(marker));
+    offset += line.length + 1;
+  }
+  return indices;
 }
 
 /**
@@ -659,8 +672,10 @@ export interface BodyRegionUpdate {
  * body — and the orphaned heading — untouched, same as any other unsafe marker state.
  */
 export function upsertBodyRegion(body: string, content: string): BodyRegionUpdate {
-  const startCount = occurrences(body, BODY_REGION_START);
-  const endCount = occurrences(body, BODY_REGION_END);
+  const starts = markerLines(body, BODY_REGION_START);
+  const ends = markerLines(body, BODY_REGION_END);
+  const startCount = starts.length;
+  const endCount = ends.length;
 
   if (startCount === 0 && endCount === 0) {
     const heading = headingLine(content);
@@ -673,8 +688,8 @@ export function upsertBodyRegion(body: string, content: string): BodyRegionUpdat
     return { body: appendRegion(body, content), skipped: false };
   }
 
-  const startIdx = body.indexOf(BODY_REGION_START);
-  const endIdx = body.indexOf(BODY_REGION_END);
+  const startIdx = starts[0] ?? -1;
+  const endIdx = ends[0] ?? -1;
   const wellFormed = startCount === 1 && endCount === 1 && startIdx < endIdx;
   if (!wellFormed) {
     console.warn(
