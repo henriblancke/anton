@@ -367,6 +367,62 @@ export async function releaseReviewFixBoardBaseline(repo: string, ticketId: stri
 }
 
 /**
+ * A prior self-review-gate attempt's preserved pre-dispatch board snapshot, if one survived a
+ * crash before {@link releaseReviewGateBoardBaseline} could clear it — `undefined` when none was
+ * ever preserved. See {@link persistReviewGateBoardBaseline}.
+ */
+export function readReviewGateBoardBaseline(ticket: Bead): BoardFingerprint | undefined {
+  const preserved = beads.reviewGateBoardBaseline(ticket);
+  return preserved ? deserializeFingerprint(preserved) : undefined;
+}
+
+/**
+ * Durably persist `baseline` as the self-review gate's OWN recoverable pre-dispatch board snapshot
+ * (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline before
+ * dispatch") — {@link persistReviewFixBoardBaseline}'s analogue for `review-gate.ts`'s
+ * `runGateFixSession`. Without persisting anything here, a process/host death after that round's
+ * fixer wrote directly to the live board but before this round reads it back (or its catch-block
+ * failure audit runs) leaves a resumed attempt with only a FRESH read to diff against — one that
+ * already contains the repair — so the delta the repair produced could never be told apart from no
+ * progress at all. Confirmed synced like every other board-evidence write in this module; returns
+ * `false` (never throws) on persist or push failure so the caller can fail closed the same way an
+ * unreadable baseline already does. Safe to call every round, including one reusing a baseline
+ * {@link readReviewGateBoardBaseline} already found preserved — the write is then a no-op and the
+ * confirming push simply reconfirms it.
+ */
+export async function persistReviewGateBoardBaseline(
+  repo: string,
+  ticketId: string,
+  baseline: BoardFingerprint,
+): Promise<boolean> {
+  const persisted = await mustPersist(() =>
+    beads.setReviewGateBoardBaseline(repo, ticketId, serializeFingerprint(baseline)),
+  );
+  if (!persisted) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
+ * Release the baseline {@link persistReviewGateBoardBaseline} preserved, once this round's own
+ * board evidence has been captured and confirmed synced, or once a failure is proven to have
+ * touched nothing on the board. Left standing deliberately on a poison park (a failure that DID
+ * touch the board and cannot be safely retried): that is exactly the recovery snapshot a human's
+ * resume needs. Not releasing it once evidence IS captured would leave the NEXT round reusing THIS
+ * round's now-stale snapshot instead of taking a fresh one.
+ */
+export async function releaseReviewGateBoardBaseline(repo: string, ticketId: string): Promise<boolean> {
+  const cleared = await mustPersist(() => beads.clearReviewGateBoardBaseline(repo, ticketId));
+  if (!cleared) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
  * Durably persist `baseline` onto `ticket` BEFORE the agent is ever dispatched (PR #284 review,
  * "Persist the board baseline before dispatch") — closes the crash window `readBoardBaseline` alone
  * leaves open. On a shared-server board the agent's `bd -C <repo>` writes are globally visible the

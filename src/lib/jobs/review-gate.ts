@@ -39,6 +39,9 @@ import {
   boardEvidence,
   fingerprintBoard,
   hydrateDescriptions,
+  persistReviewGateBoardBaseline,
+  readReviewGateBoardBaseline,
+  releaseReviewGateBoardBaseline,
   type BoardFingerprint,
 } from "./execute-epic-board-evidence";
 import { mustPersist, mustRead, mustReadBoard, mustReadClosureVersion } from "./execute-epic-persist";
@@ -1347,8 +1350,13 @@ async function runGateFixSession(args: {
     const before = await args.readState(worktreePath);
     // The board's OWN "before", read alongside the tree's (PR #284 review round 13) — only for a
     // board-only run, whose fixer's actual deliverable is a bd write this worktree's git state can
-    // never show.
-    const boardBefore = boardOnly && repoPath ? await args.readBoardFingerprint(repoPath, target.id) : undefined;
+    // never show. A prior, interrupted round's own persisted snapshot (see below) is preferred over
+    // a fresh read (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline
+    // before dispatch") — a fresh read after a crash mid-round would already contain whatever the
+    // fixer wrote before this process died, permanently hiding that delta from every later diff.
+    const boardBefore = boardOnly && repoPath
+      ? (readReviewGateBoardBaseline(target) ?? (await args.readBoardFingerprint(repoPath, target.id)))
+      : undefined;
     // A board-only round is refused BEFORE dispatch when that baseline could not be read (PR #284
     // review round 15), the same fail-closed rule `execute-epic-ticket.ts` already applies before a
     // ticket's own first dispatch. Letting the fixer run anyway risks it making the very bd writes
@@ -1364,6 +1372,26 @@ async function runGateFixSession(args: {
           `round's board writes (if any) could never be told apart from no progress, so a real repair ` +
           `would misclassify as stalled while a resumed attempt takes a fresh baseline that already ` +
           `absorbed it. Resolve the board read, then resume.`,
+      );
+    }
+    // Durably anchored BEFORE the fixer ever runs (chatgpt-codex-connector, PR #284 review, "Persist
+    // the self-review board baseline before dispatch") — otherwise this baseline lives only in this
+    // process's memory until the post-run read further down, and a process/host death after a live
+    // board write but before that read (or the catch-block audit) leaves nothing durable for a
+    // resumed attempt to diff against. Run unconditionally, including when `boardBefore` was just
+    // reused from a preserved value above: the write is then a no-op, but the confirming push still
+    // reconfirms it reached the remote.
+    if (
+      boardOnly &&
+      repoPath &&
+      boardBefore &&
+      !(await persistReviewGateBoardBaseline(repoPath, target.id, boardBefore))
+    ) {
+      throw new PoisonError(
+        `the review fix for ${target.id} read a board-only baseline before round ${round} but could ` +
+          `not persist it before dispatch — refusing to dispatch: without a durable copy, a crash ` +
+          `after the fixer's own board write could never be told apart from no progress. Resolve the ` +
+          `board write, then resume.`,
       );
     }
     // Flips once the gates have passed AND the work is committed: past that point the round's output
@@ -1581,6 +1609,18 @@ async function runGateFixSession(args: {
             `a verified fix — returning the fix's result anyway: ${String(finalizeError)}`,
         );
       }
+      // Released only now — after the board write (if any) is confirmed synced and this round's
+      // outcome is logged and settled (chatgpt-codex-connector, PR #284 review, "Persist the
+      // self-review board baseline before dispatch" / mirrors the PR-fix path's "Retain the PR-fix
+      // baseline until the repair is durable"). Releasing any earlier would leave a process/host
+      // death in that window with no durable snapshot for a resumed round to diff against.
+      if (boardOnly && repoPath && !(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+        throw new Error(
+          `the review fix for ${target.id} confirmed its board evidence for round ${round} but could ` +
+            `not release its own pre-dispatch baseline — a later round for this ticket could misread ` +
+            `it as still describing the current pre-dispatch state`,
+        );
+      }
       return fixResult;
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
@@ -1650,6 +1690,21 @@ async function runGateFixSession(args: {
                 `and count it as progress, and this run's own best-effort final sync could publish it ` +
                 `before anyone reviews it. Inspect and repair the board by hand, then resume. The ` +
                 `fixer itself failed with: ${String(e)}`,
+            );
+            // Left standing deliberately (never released on this branch): this IS the recovery
+            // snapshot a human's eventual resume needs to tell the just-parked write apart from
+            // whatever the board looks like by the time anyone gets to it.
+          } else if (!(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+            // No board change of its own — an ordinary retryable failure, EXCEPT the baseline this
+            // round persisted before dispatch is now stale and could not be cleared. Left standing,
+            // a LATER round for this same ticket would wrongly reuse it as its own pre-dispatch
+            // state instead of taking a fresh read, so this failure is escalated to a park rather
+            // than left to retry silently past it.
+            throw new PoisonError(
+              `the review fix for ${target.id} FAILED for round ${round} with no board change of its ` +
+                `own, but its pre-dispatch board baseline could not be released — a later round for ` +
+                `this ticket could misread it as still describing the current pre-dispatch state. ` +
+                `Inspect and repair the board by hand, then resume. The fixer itself failed with: ${String(e)}`,
             );
           }
         }

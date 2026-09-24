@@ -1642,14 +1642,24 @@ async function dispatchTicket(
       // no delta and fails with `NoDeliveryError`, turning a real delivery into a false one. An
       // exhausted read halts the run instead of silently treating "unreadable" as "mismatched".
       const read = await mustReadClosureVersion(repo, ticket.id);
-      if (!read.read) {
+      // `read.closure === undefined` is folded into the same halt as an unreadable history
+      // (chatgpt-codex-connector, PR #284 review, "Reject empty closure histories in the stamped
+      // path"), mirroring `originMatchesPriorClosure`'s identical guard just above: `bd history`
+      // can succeed with no closure episode at all for a ticket a board import/reconstruction
+      // stripped its prior history from, even though `ticket.status === "closed"` here proves a
+      // closure exists. Comparing `confirmedClosure` (always defined in this branch) against that
+      // empty `undefined` would read as a mismatch, reopening and regenerating an already-delivered
+      // ticket against a baseline that already contains its writes — the same false no-delivery
+      // failure the unreadable-history case already refuses.
+      if (!read.read || read.closure === undefined) {
         throw new PoisonEpic(
           `${ticket.id} is confirmed delivered (board-only) against closure \`${confirmedClosure}\`, ` +
-            `but \`bd history\` could not be read (after retries) to check that still names the ` +
-            `ticket's current closure. Treating an unreadable closure as a mismatch would reopen ` +
-            `and regenerate an already-delivered ticket against a baseline that already contains ` +
-            `its writes, turning a real delivery into a false no-delivery failure. Check the beads ` +
-            `DB, then resume the run once the history read is healthy.`,
+            `but \`bd history\` could not be read (after retries), or came back without a closure for ` +
+            `a ticket that is closed, so it cannot be checked against the ticket's current closure. ` +
+            `Treating an unreadable or empty closure as a mismatch would reopen and regenerate an ` +
+            `already-delivered ticket against a baseline that already contains its writes, turning a ` +
+            `real delivery into a false no-delivery failure. Check the beads DB, then resume the run ` +
+            `once the history read is healthy.`,
         );
       }
       confirmedForThisCycle = confirmedClosure === read.closure;

@@ -45,6 +45,13 @@ const setBoardEvidenceConfirmedMock =
 const boardPushMock = vi.fn<(repo: string) => Promise<string>>();
 const boardShowMock = vi.fn<(repo: string, id: string) => Promise<Bead>>();
 const boardHistoryMock = vi.fn<(repo: string, id: string) => Promise<import("../beads/bd").BeadVersion[]>>();
+// The self-review gate's own board-only baseline persist/release (chatgpt-codex-connector, PR
+// #284 review, "Persist the self-review board baseline before dispatch") shells out to real `bd`
+// via `beads.setReviewGateBoardBaseline` / `beads.clearReviewGateBoardBaseline` — mocked here for
+// the same reason the four calls above are: the many board-only fix tests below pass a fake
+// `repoPath` a real `bd` can never succeed against.
+const setReviewGateBoardBaselineMock = vi.fn<(repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>>();
+const clearReviewGateBoardBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -56,11 +63,16 @@ vi.mock("../beads/bd", async () => {
       push: (...args: [string]) => boardPushMock(...args),
       show: (...args: [string, string]) => boardShowMock(...args),
       history: (...args: [string, string]) => boardHistoryMock(...args),
+      setReviewGateBoardBaseline: (...args: [string, string, Record<string, string>]) =>
+        setReviewGateBoardBaselineMock(...args),
+      clearReviewGateBoardBaseline: (...args: [string, string]) => clearReviewGateBoardBaselineMock(...args),
     },
   };
 });
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
 boardPushMock.mockResolvedValue("synced");
+setReviewGateBoardBaselineMock.mockResolvedValue("");
+clearReviewGateBoardBaselineMock.mockResolvedValue("");
 boardShowMock.mockImplementation(async (_repo, id) => ({ id, status: "closed", title: "", issue_type: "task" }));
 // A single closed version by default — every fixture ticket above is already closed, and this is
 // what real `bd history` returns for an ordinary bead that went through open → closed once: at

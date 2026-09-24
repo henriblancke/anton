@@ -1009,18 +1009,6 @@ async function runFixSession(args: {
           `could not be confirmed synced against the remote`,
       );
     }
-    // This session's board evidence (changed or not) is now fully captured and, if it changed,
-    // confirmed synced above — the pre-dispatch snapshot persisted before dispatch has done its job.
-    // Released rather than left standing: a LATER, genuinely new review-fix round for this same PR
-    // would otherwise reuse this round's now-stale snapshot instead of taking a fresh one.
-    if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
-      throw new Error(
-        `the review fix for ${epic.id} confirmed its board evidence for PR #${number} but could not ` +
-          `release its own pre-dispatch baseline — a later review-fix round for this PR could misread ` +
-          `it as still describing the current pre-dispatch state`,
-      );
-    }
-
     // premergeBase left any base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for
     // this same session to resolve alongside the review feedback. Commit that resolution NOW, before
     // the gates run: a red gate below still throws and parks the branch, but the merge itself is
@@ -1071,6 +1059,15 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
+      // Nothing to protect — `pushed` false means `boardChanged` was also false, so releasing here
+      // (rather than deferring, as the genuine-repair path below does) risks nothing.
+      if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+        throw new Error(
+          `the review fix for ${epic.id} produced no changes for PR #${number} but could not release ` +
+            `its own pre-dispatch board baseline — a later review-fix round for this PR could misread ` +
+            `it as still describing the current pre-dispatch state`,
+        );
+      }
       return false;
     }
     if (!gitPushed && boardChanged) {
@@ -1088,6 +1085,19 @@ async function runFixSession(args: {
       reasons: verdict.reasons,
       signal: ctx.signal,
     });
+    // Released only now — after the board write is confirmed synced, the session outcome is durably
+    // recorded, thread outcomes are applied, and re-review is requested (chatgpt-codex-connector, PR
+    // #284 review, "Retain the PR-fix baseline until the repair is durable"). Releasing right after
+    // the sync (as this used to) left a process/host death in THIS window with no durable snapshot to
+    // resume against: the next attempt would take a fresh baseline that already contains the
+    // published repair, see no delta, and reject the fixer's own truthful `fixed` result.
+    if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+      throw new Error(
+        `the review fix for ${epic.id} confirmed its board evidence for PR #${number} but could not ` +
+          `release its own pre-dispatch baseline — a later review-fix round for this PR could misread ` +
+          `it as still describing the current pre-dispatch state`,
+      );
+    }
     return true;
   } catch (e) {
     if (!sessionSettled) await endSession(db, clock, sessionId, "failed");

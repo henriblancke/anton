@@ -423,6 +423,25 @@ const BOARD_EVIDENCE_CONFIRMED_KEY = "boardEvidenceConfirmed";
 const REVIEW_FIX_BOARD_BASELINE_KEY = "reviewFixBoardBaseline";
 
 /**
+ * Metadata key holding the pre-PR self-review gate's OWN recoverable pre-dispatch board snapshot
+ * (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline before
+ * dispatch") — {@link REVIEW_FIX_BOARD_BASELINE_KEY}'s analogue for `review-gate.ts`'s
+ * `runGateFixSession`, which read that round's own pre-dispatch board fingerprint into a plain
+ * local (`boardBefore`) with nothing durable behind it. A process/host death after a board-capable
+ * self-review fixer's live write but before that round's post-run read or failure audit left a
+ * resumed attempt with only a FRESH baseline to diff against — one that already contains the
+ * repair — so the delta could never be told apart from no progress, the same failure mode
+ * {@link REVIEW_FIX_BOARD_BASELINE_KEY} closes for the PR-fix path.
+ *
+ * A separate key rather than a shared one: the self-review gate and a PR-fix round can be live for
+ * the SAME ticket at different points of its lifecycle (self-review before the PR exists,
+ * review-fix after), and each owns its own one-round-at-a-time recovery snapshot. See
+ * {@link beads.reviewGateBoardBaseline} / {@link beads.setReviewGateBoardBaseline} /
+ * {@link beads.clearReviewGateBoardBaseline}.
+ */
+const REVIEW_GATE_BOARD_BASELINE_KEY = "reviewGateBoardBaseline";
+
+/**
  * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
  * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
  * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
@@ -440,6 +459,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   BOARD_EVIDENCE_CONFIRMED_KEY,
   BOARD_EVIDENCE_PENDING_CLOSURE_KEY,
   REVIEW_FIX_BOARD_BASELINE_KEY,
+  REVIEW_GATE_BOARD_BASELINE_KEY,
 ];
 
 /**
@@ -1678,6 +1698,46 @@ export const beads = {
    * board — see {@link REVIEW_FIX_BOARD_BASELINE_KEY}. */
   clearReviewFixBoardBaseline: (cwd: string, id: string) =>
     bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_FIX_BOARD_BASELINE_KEY]),
+
+  /**
+   * The self-review gate's own preserved pre-dispatch board fingerprint, parsed back off the
+   * bead's metadata — `undefined` when none was ever preserved, or the stored value is unreadable
+   * JSON (read as "nothing preserved", the same tolerance {@link beads.reviewFixBoardBaseline}
+   * applies). See {@link REVIEW_GATE_BOARD_BASELINE_KEY}.
+   */
+  reviewGateBoardBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[REVIEW_GATE_BOARD_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /**
+   * Preserve `fingerprint` (a serialized board fingerprint) as the self-review gate's recoverable
+   * pre-dispatch baseline for `id`. Written through `--metadata @file`, never
+   * `--set-metadata key=value`, for the same `E2BIG` reason {@link beads.setReviewFixBoardBaseline}
+   * is. See {@link REVIEW_GATE_BOARD_BASELINE_KEY}.
+   */
+  setReviewGateBoardBaseline: async (cwd: string, id: string, fingerprint: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-review-gate-baseline-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [REVIEW_GATE_BOARD_BASELINE_KEY]: JSON.stringify(fingerprint) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /** Release the preserved baseline above once the self-review gate's own board evidence for this
+   * round has been captured and confirmed synced, or a failure has been proven to have touched
+   * nothing on the board — see {@link REVIEW_GATE_BOARD_BASELINE_KEY}. */
+  clearReviewGateBoardBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_GATE_BOARD_BASELINE_KEY]),
 
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
