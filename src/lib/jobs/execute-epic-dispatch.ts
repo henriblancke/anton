@@ -1209,14 +1209,36 @@ function survivorTrustedForClosure(
  * the ticket's CURRENT (post-close) history, immediately behind the closure it currently shows.
  * Mirrors `stampConfirmedClosures` (review-fix-finalize.ts), which fences the identical shape the
  * other direction (a closed bead's own stored closure against a fresh read's prior closure). A
- * mismatch — including an unreadable history, which fails this closed the same way — means a full
- * extra close/reopen/close cycle landed since the confirmation was written, so the caller falls
- * through to the regeneration path, which re-diffs the preserved baseline instead of trusting stale
- * evidence.
+ * genuine mismatch means a full extra close/reopen/close cycle landed since the confirmation was
+ * written, so the caller falls through to the regeneration path, which re-diffs the preserved
+ * baseline instead of trusting stale evidence.
+ *
+ * An unreadable history, or one that comes back empty for a ticket the caller already knows is
+ * CLOSED (`read.closure === undefined`), is NOT folded into that same mismatch (chatgpt-codex-
+ * connector, PR #284 review, "Validate closure reads before matching confirmation origins") — the
+ * caller's other branch (the `confirmedClosure !== undefined` case just above) already halts the run
+ * rather than silently reopening an already-delivered ticket on an unreadable read, for exactly the
+ * `NoDeliveryError` reason documented there; treating this branch's read differently would leave the
+ * same failure mode standing for every confirmation written while the ticket was still open. An empty
+ * read is failed the same way rather than compared: `undefined === undefined` would otherwise let a
+ * confirmation with no stamped origin (legitimately `undefined` when the ticket had never closed at
+ * write time) match an empty read's `priorClosure` (also `undefined`, but because the read told us
+ * nothing) even though the ticket's own status proves a closure exists that this read failed to find.
  */
 async function originMatchesPriorClosure(repo: string, ticket: Bead): Promise<boolean> {
   const read = await mustReadClosureVersion(repo, ticket.id);
-  return read.read && beads.confirmedBoardEvidenceOrigin(ticket) === read.priorClosure;
+  if (!read.read || read.closure === undefined) {
+    throw new PoisonEpic(
+      `${ticket.id} is confirmed delivered (board-only) with an unfenced confirmation, but \`bd ` +
+        `history\` could not be read (after retries), or came back without a closure for a ticket ` +
+        `that is closed, so its origin cannot be checked against the ticket's current closure. ` +
+        `Treating that as a mismatch would reopen and regenerate an already-delivered ticket ` +
+        `against a baseline that already contains its writes, turning a real delivery into a false ` +
+        `no-delivery failure. Check the beads DB, then resume the run once the history read is ` +
+        `healthy.`,
+    );
+  }
+  return beads.confirmedBoardEvidenceOrigin(ticket) === read.priorClosure;
 }
 
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
@@ -1594,11 +1616,14 @@ async function dispatchTicket(
   // written while the ticket was still open — so it stamped no closure of its own — is not waved
   // through unconditionally either (chatgpt-codex-connector, PR #284 review, "Validate the origin of
   // unfenced confirmations"): see {@link originMatchesPriorClosure}, which fences it against its own
-  // stored `confirmedBoardEvidenceOrigin` instead. A mismatch on either check (or an unreadable
-  // closure/history, which fails closed the same way) is treated as "not confirmed for this cycle" —
-  // this whole block is skipped, and the ticket falls through to the regeneration path below, which
-  // redispatches it and lets `ensureBoardBaselinePersisted` clear the stale confirmation as it
-  // establishes the new cycle's own baseline.
+  // stored `confirmedBoardEvidenceOrigin` instead. A genuine mismatch on either check is treated as
+  // "not confirmed for this cycle" — this whole block is skipped, and the ticket falls through to the
+  // regeneration path below, which redispatches it and lets `ensureBoardBaselinePersisted` clear the
+  // stale confirmation as it establishes the new cycle's own baseline. An unreadable history halts
+  // the run instead of feeding that regeneration path in EITHER branch, the same way and for the
+  // same reason: the `confirmedClosure !== undefined` branch below throws directly, and
+  // {@link originMatchesPriorClosure} throws the same `PoisonEpic` for its own read (including one
+  // that comes back empty for a ticket already known closed).
   const confirmedClosure =
     doneOnBoard && ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
   let confirmedForThisCycle =

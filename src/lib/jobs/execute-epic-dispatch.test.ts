@@ -1245,6 +1245,9 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
     });
     hasCommitMock.mockResolvedValue(false);
+    // A legacy bare-array confirmation carries no closure/origin of its own, so the fence falls
+    // back to reading `bd history` fresh — closed exactly once, never reopened, is unambiguous.
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
 
     const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
 
@@ -1292,6 +1295,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
     const run = makeRun([child], new AbortController().signal);
     (run.target as Bead).labels = [LABELS.boardOnly];
     hasCommitMock.mockResolvedValue(false);
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
 
     const outcome = await dispatchRunTickets(run, prep());
 
@@ -1337,6 +1341,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
     });
     hasCommitMock.mockResolvedValue(false);
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
 
     const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
 
@@ -1361,6 +1366,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       },
     });
     hasCommitMock.mockResolvedValue(false);
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
 
     await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
 
@@ -1392,6 +1398,7 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
         dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
       });
       hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
       runTicketMock.mockImplementation(async ({ ticket }) => {
         if (ticket.id === "anton-a") {
           throw new TicketTimeoutError("anton-a", 60_000, false);
@@ -1495,6 +1502,63 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
     },
   );
+
+  // chatgpt-codex-connector, PR #284 review, "Validate closure reads before matching confirmation
+  // origins": the same retry-before-reopening guarantee as above, but for a confirmation written
+  // while the ticket was still open (stamped `origin`, not `closure`) — `originMatchesPriorClosure`
+  // used to fold an unreadable history into a plain mismatch, silently reopening and regenerating an
+  // already-delivered ticket against a baseline that already contains its writes.
+  it(
+    "halts instead of reopening a confirmed board-only delivery whose confirmation carries only " +
+      "`origin` when its closure history is unreadable after retries",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], origin: "first-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  // Same fence, the other degenerate read: `bd history` resolves without throwing but comes back
+  // empty for a ticket this run already knows is CLOSED — `read.closure` is `undefined` even though
+  // the ticket's own status proves a closure exists. A confirmation written before the origin fence
+  // existed carries no `origin` either, so the old comparison (`undefined === undefined`) trusted this
+  // exactly like a legitimate "never closed before" origin, waving through a read that told us nothing
+  // about the ticket's actual closure history.
+  it(
+    "halts instead of trusting a confirmed board-only delivery with no stamped origin when its " +
+      "closure history reads back empty for a ticket that is closed",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([]);
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
 });
 
 // PR #284 review ("Recover cleanup-only resumes before regeneration"): a prior attempt can clear
@@ -1575,6 +1639,7 @@ describe(
         },
       });
       hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
 
       const outcome = await dispatchRunTickets(
         makeRun([child], new AbortController().signal),
