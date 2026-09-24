@@ -313,6 +313,38 @@ export async function resumableExecuteEpicId(
   return rows[0]?.id;
 }
 
+/**
+ * Every job of this project whose payload names one of `beadIds` — the feature ledger's friction
+ * sources on the jobs table (anton-sdz00): PR-fix rounds, operator cancels, and the park split.
+ *
+ * Keyed on the payload's `epicBeadId`, which is the RUN TARGET a job was dispatched for. That is
+ * what makes a scope's id list the right predicate: a feature's tickets never carry jobs of their
+ * own — the run is enqueued against the target — so the target's own id matches while the child ids
+ * simply find nothing, and a standalone ticket run (its own target) matches on itself.
+ *
+ * Every status, unlike the queue's own reads: the counters are about what ALREADY happened, and a
+ * park, a failure and a cancel are precisely the rows they exist to count. db-injectable; read-only.
+ */
+export async function jobsForBeads(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<JobRow[]> {
+  if (beadIds.length === 0) return [];
+  return db
+    .select()
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.projectId, projectId),
+        inArray(
+          sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`,
+          [...new Set(beadIds)],
+        ),
+      ),
+    );
+}
+
 /** One operator cancel: which job was stopped, and when (anton-rgso). */
 export interface CancelledJob {
   id: string;

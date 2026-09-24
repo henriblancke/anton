@@ -15,7 +15,7 @@
  * path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, count, desc, eq, isNotNull, lt, or } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNotNull, lt, or } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import { isUniqueViolation, type AntonDb, type Clock } from "./jobs/queue";
@@ -366,6 +366,41 @@ export async function listOpenEscalations(
       and(eq(schema.escalations.projectId, projectId), eq(schema.escalations.status, "open")),
     )
     .orderBy(desc(schema.escalations.raisedAt));
+}
+
+/**
+ * Every escalation ever raised against one of `beadIds`, whatever its status — the feature ledger's
+ * escalation and human-gate counters (anton-sdz00).
+ *
+ * OPEN and settled alike, unlike {@link listOpenEscalations}: friction counts what a feature cost in
+ * attention over its whole life, and an escalation a founder already resolved is exactly a moment
+ * they were interrupted. Counting only the open ones would report a feature as frictionless the
+ * moment its asks were answered.
+ *
+ * Matched on `beadId` OR `epicBeadId` because the two name different halves of the same stall: a
+ * gate raised on a TICKET carries the ticket's id, while a run-level park carries the target's.
+ * Both ids are in a feature's scope, so either column matching is the same feature's interruption.
+ * db-injectable; read-only.
+ */
+export async function escalationsForBeads(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<EscalationRow[]> {
+  if (beadIds.length === 0) return [];
+  const ids = [...new Set(beadIds)];
+  return db
+    .select()
+    .from(schema.escalations)
+    .where(
+      and(
+        eq(schema.escalations.projectId, projectId),
+        or(
+          inArray(schema.escalations.beadId, ids),
+          inArray(schema.escalations.epicBeadId, ids),
+        ),
+      ),
+    );
 }
 
 /** One escalation, scoped to its project so a route can't settle another project's item by id. */

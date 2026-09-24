@@ -1071,3 +1071,109 @@ export function countHumanTouches(scope: {
     countCancels(jobs)
   );
 }
+
+/**
+ * One scope's friction, composed — every counter above read off its own source in one shape.
+ *
+ * ## Each field is an observed SIGNAL, and no surface may render it as a quality score
+ *
+ * The rule the whole section is written under (design §D3), restated on the type because this is
+ * what a caller actually holds: these are proxies for how much attention a feature took, not
+ * measurements of how well it was done. Three review rounds may mean a weak implementation, an
+ * ambitious scope or a strict reviewer, and nothing recorded tells them apart. A surface renders
+ * them labelled as what was observed.
+ *
+ * ## Zero here means "nothing happened", never "nothing was measured"
+ *
+ * Every field is a plain number, so a feature that sailed through and a feature nobody has run yet
+ * both read 0. The ledger's own {@link LedgerTotals.recorded} is what tells those apart — see the
+ * section header for why that distinction stays one level up rather than turning these into
+ * `undefined`s each caller would have to re-handle.
+ */
+export interface LedgerFriction {
+  /**
+   * Rounds the self-review took to reach a clean verdict — the cheapest quality SIGNAL anton has,
+   * and still only a signal ({@link countReviewRounds}). Not a person's doing: excluded from
+   * {@link humanTouches}.
+   */
+  reviewRounds: number;
+  /**
+   * Times a PR had to be corrected after it opened ({@link countPrFixRounds}). anton's own pass, so
+   * likewise outside {@link humanTouches}.
+   */
+  prFixRounds: number;
+  /**
+   * Every escalation raised against the scope, gates INCLUDED ({@link countEscalations}) — anton
+   * stopped and said something, for any reason. Overlaps {@link humanGates} by construction; the two
+   * are never added to each other.
+   */
+  escalations: number;
+  /**
+   * The escalations that were human GATES — an open ask only a person could answer
+   * ({@link countHumanGates}). A strict SUBSET of {@link escalations}.
+   */
+  humanGates: number;
+  /**
+   * The disjoint remainder: escalations that asked nobody anything
+   * ({@link countNonGateEscalations}). Reported so both halves of the total are readable without
+   * re-deriving them, and so the sum below can add each gate exactly once.
+   */
+  nonGateEscalations: number;
+  /**
+   * Times a human sent work in this scope back ({@link countSendBacks}) — a reopen with
+   * instructions, or a follow-up opened off a review. Read from free-text notes, so a proxy in the
+   * strongest sense: a founder can write the phrase by hand.
+   */
+  sendBacks: number;
+  /**
+   * Jobs an operator terminally killed ({@link countCancels}) — the one counter here that rests on
+   * no heuristic, since no durability path reaches `cancelled`.
+   */
+  cancels: number;
+  /**
+   * Times the scope's work paused on an exhausted usage limit ({@link countQuotaParks}). Reported
+   * beside {@link humanTouches} and deliberately never inside it: a quota window is not a person
+   * intervening, and folding it in would degrade the metric every time anton is used MORE.
+   */
+  quotaParks: number;
+  /**
+   * Parks a human has to clear ({@link countFailureParks}) — the other half of the park split, and
+   * the one that IS anton failing. Still not a person touching anything, so also outside the sum.
+   */
+  failureParks: number;
+  /**
+   * How many times a PERSON had to touch this feature ({@link countHumanTouches}) — the one figure
+   * that sums the others, and the only one that does. Four touches says four interruptions, not
+   * that the work was done badly.
+   */
+  humanTouches: number;
+}
+
+/**
+ * Fold one scope's four friction sources into {@link LedgerFriction}.
+ *
+ * Pure, like the rest of this module: the caller resolves the rows (review rounds off the run
+ * target's comment thread, jobs by payload, escalations by bead, notes off the board) and this
+ * composes them. Each source is optional because they are read independently and a scope can be
+ * missing any of them — an unreviewed target has no thread, a feature nobody escalated has no rows.
+ */
+export function ledgerFriction(scope: {
+  rounds?: readonly FrictionReviewRound[];
+  jobs?: readonly FrictionJobRow[];
+  escalations?: readonly FrictionEscalationRow[];
+  notes?: readonly FrictionNote[];
+}): LedgerFriction {
+  const { rounds = [], jobs = [], escalations = [], notes = [] } = scope;
+  return {
+    reviewRounds: countReviewRounds(rounds),
+    prFixRounds: countPrFixRounds(jobs),
+    escalations: countEscalations(escalations),
+    humanGates: countHumanGates(escalations),
+    nonGateEscalations: countNonGateEscalations(escalations),
+    sendBacks: countSendBacks(notes),
+    cancels: countCancels(jobs),
+    quotaParks: countQuotaParks(jobs),
+    failureParks: countFailureParks(jobs),
+    humanTouches: countHumanTouches({ escalations, notes, jobs }),
+  };
+}

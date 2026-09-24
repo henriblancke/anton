@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   countCancels,
+  ledgerFriction,
   countEscalations,
   countFailureParks,
   countHumanTouches,
@@ -24,6 +25,7 @@ import {
   type FrictionJobRow,
   type FrictionNote,
   type FrictionReviewRound,
+  type LedgerFriction,
 } from "./feature-ledger";
 import type { EscalationRow } from "./escalations";
 import type { TicketNote } from "./beads/notes";
@@ -442,5 +444,52 @@ describe("the structural row types match the tables they claim to read", () => {
     const replayed: ReviewReportRound[] = [{ round: 1, blocking: 0, advisory: 0, verdict: "clean" }];
     const asRounds: FrictionReviewRound[] = replayed;
     expect(countReviewRounds(asRounds)).toBe(1);
+  });
+});
+
+describe("ledgerFriction — the counters composed into one shape", () => {
+  it("reads each counter off its own source in a single fold", () => {
+    // The composed answer over a scope that exercised every source at once: what the ledger hands a
+    // caller, asserted as one object so a field wired to the wrong source cannot pass.
+    const friction = ledgerFriction({
+      rounds: [{ verdict: "fixed" }, { verdict: "clean" }],
+      jobs: [
+        job({ type: "review-fix-pr", status: "done" }),
+        job({ type: "execute-epic", status: "cancelled" }),
+        job({ type: "execute-epic", status: "queued", lastError: usageLimit() }),
+        job({ type: "execute-epic", status: "parked", lastError: "poison: anton-x is not a run target" }),
+      ],
+      escalations: [{ kind: "needs-human" }, { kind: "parked-run" }],
+      notes: [{ text: reopenNote("anton-tgt", "the acceptance was never met") }],
+    });
+
+    expect(friction).toEqual({
+      reviewRounds: 2,
+      prFixRounds: 1,
+      escalations: 2,
+      humanGates: 1,
+      nonGateEscalations: 1,
+      sendBacks: 1,
+      cancels: 1,
+      quotaParks: 1,
+      failureParks: 1,
+      // One gate + one non-gate escalation + one send-back + one cancel. The quota park, the
+      // failure park and anton's own review and PR-fix rounds are all outside the sum.
+      humanTouches: 4,
+    });
+  });
+
+  it("reports zeroes for a scope with no friction, matching every counter read alone", () => {
+    expect(ledgerFriction({})).toEqual(ZEROES satisfies LedgerFriction);
+  });
+
+  it("keeps the quota park out of the sum it composes", () => {
+    // The same exclusion `countHumanTouches` guarantees, re-asserted through the composition: a
+    // metric that grew every time anton is used MORE would degrade exactly as the tool succeeds.
+    const friction = ledgerFriction({
+      jobs: [job({ type: "execute-epic", status: "queued", lastError: usageLimit() })],
+    });
+    expect(friction.quotaParks).toBe(1);
+    expect(friction.humanTouches).toBe(0);
   });
 });
