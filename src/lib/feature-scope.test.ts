@@ -7,7 +7,7 @@
  * dropped for not being on the board loses every run-phase invocation stamped against the target.
  */
 import { describe, expect, it } from "vitest";
-import { hasLedgerScope, ledgerScope } from "./feature-scope";
+import { currentRunTargetOf, hasLedgerScope, ledgerScope } from "./feature-scope";
 import type { Bead } from "./beads/bd";
 
 function makeBead(overrides: Partial<Bead> & { id: string }): Bead {
@@ -146,5 +146,38 @@ describe("hasLedgerScope", () => {
     expect(hasLedgerScope(board, "epic-p")).toBe(false);
     expect(hasLedgerScope(board, "task-1")).toBe(false);
     expect(hasLedgerScope(board, "anton-gone")).toBe(false);
+  });
+});
+
+describe("currentRunTargetOf", () => {
+  it("walks a working ticket up to the feature that owns it right now", () => {
+    expect(currentRunTargetOf(board, "task-1")).toBe("feat-1");
+    // Two hops down, same as `ledgerScope`'s own walk — the reverse of the same card index.
+    expect(currentRunTargetOf(board, "sub-1")).toBe("feat-1");
+  });
+
+  it("returns a run target unchanged — it owns itself, nothing sits above it", () => {
+    expect(currentRunTargetOf(board, "feat-1")).toBe("feat-1");
+  });
+
+  it("follows a re-parented ticket to its NEW feature, never the one it was raised under", () => {
+    // The whole reason this exists beside `ledgerScope` (§D1 already moves the scope on re-parent):
+    // a source that froze `task-1`'s owner in a column at some earlier point must be re-resolved
+    // through the board, not trusted, or it keeps naming feat-1 forever (PR #322 review).
+    const moved = board.map((b) => (b.id === "task-1" ? { ...b, parent: "feat-2" } : b));
+    expect(currentRunTargetOf(moved, "task-1")).toBe("feat-2");
+  });
+
+  it("leaves an id unresolved when the board holds no card above it", () => {
+    // A purged bead and a task parented directly on a container epic (not under either feature)
+    // both have no run target: the id comes back unchanged, matching no scope's `beadId` — the same
+    // "orphaned" reading `ledgerScope` gives a root the board no longer carries.
+    expect(currentRunTargetOf(board, "anton-gone")).toBe("anton-gone");
+    const underContainer: Bead[] = [
+      makeBead({ id: "epic-c", issue_type: "epic" }),
+      makeBead({ id: "feat-c", issue_type: "feature", parent: "epic-c" }),
+      makeBead({ id: "task-c", parent: "epic-c" }),
+    ];
+    expect(currentRunTargetOf(underContainer, "task-c")).toBe("task-c");
   });
 });

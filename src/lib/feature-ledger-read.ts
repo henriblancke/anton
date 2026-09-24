@@ -22,7 +22,7 @@ import { beads, type Bead } from "./beads/bd";
 import { parseTicketNotes } from "./beads/notes";
 import { invocationsForBeads } from "./claude-invocations";
 import { getDb } from "./db";
-import { escalationsForBeads } from "./escalations";
+import { escalationsForBeads, type EscalationRow } from "./escalations";
 import {
   lastDeliveryMs,
   ledgerFriction,
@@ -34,7 +34,7 @@ import {
   type LedgerTiming,
   type LedgerTotals,
 } from "./feature-ledger";
-import { ledgerScope, type LedgerScope } from "./feature-scope";
+import { currentRunTargetOf, ledgerScope, type LedgerScope } from "./feature-scope";
 import { jobsForBeads, type AntonDb } from "./jobs/queue";
 import type { GatewayPricing } from "./model-pricing";
 import { getProjectById } from "./projects";
@@ -90,8 +90,40 @@ export async function featureLedger(
     scope,
     totals: ledgerTotals(rows, gatewayPricing),
     timing: ledgerTiming(rows, lastDeliveryMs(deliveries, scope.ids)),
-    friction: ledgerFriction({ rounds, jobs, escalations, notes: sendBackNotes(board, scope.ids) }),
+    friction: ledgerFriction({
+      rounds,
+      jobs,
+      escalations: scopedEscalations(board, scope, escalations),
+      notes: sendBackNotes(board, scope.ids),
+    }),
   };
+}
+
+/**
+ * `escalations`, kept to the ones that CURRENTLY belong to `scope` — the fix for a double-count
+ * `escalationsForBeads`' own broader fetch cannot avoid on its own (PR #322 review).
+ *
+ * That fetch matches a row whose `beadId` OR `epicBeadId` is in `scope.ids`, and both columns are
+ * frozen at raise time (`raiseEscalation` never touches an already-open row again). Reparent the
+ * ticket a human-gate escalation names and the row's `epicBeadId` still names its OLD feature while
+ * `beadId` — the ticket's own, never-reassigned id — now falls inside a DIFFERENT feature's scope:
+ * the old feature's call matches through `epicBeadId`, the new feature's through `beadId`, and one
+ * interruption bills twice.
+ *
+ * Resolved with {@link currentRunTargetOf} on `beadId` (falling back to `epicBeadId` only when a row
+ * carries no `beadId` at all, which `parked-run`/`stale-pr`/`dead-lease` rows sometimes don't) rather
+ * than trusting either frozen column: that walk re-derives the CURRENT card from the board `scope`
+ * itself was just resolved against, so the two can never disagree about which feature owns the row.
+ */
+function scopedEscalations(
+  board: Bead[],
+  scope: LedgerScope,
+  rows: readonly EscalationRow[],
+): EscalationRow[] {
+  return rows.filter((row) => {
+    const anchor = row.beadId ?? row.epicBeadId ?? scope.beadId;
+    return currentRunTargetOf(board, anchor) === scope.beadId;
+  });
 }
 
 /**

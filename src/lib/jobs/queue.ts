@@ -1217,13 +1217,20 @@ export async function complete(
  * independent of the job. The discharge is gated on `type === 'sync-push'`: only its queued-only
  * index can raise UNIQUE on a running→queued move, so a violation from any other job type re-throws
  * loudly rather than being silently swallowed as `done`.
+ *
+ * `quotaPark` increments the row's durable `quotaParkCount` (PR #322 review): the caller passes it
+ * only for the `outcome.kind === "quota"` case, since this function reschedules plenty of non-quota
+ * outcomes (lease-held, not-wired, …) that must never inflate a quota-pause count. The friction
+ * ledger's `countQuotaParks` sums that counter rather than sniffing `lastError` for the runner's own
+ * marker text, because this row's `lastError`/`status` are overwritten on the very next settle —
+ * a job that quota-parked twice, or since resumed, otherwise reads as at most one pause, or zero.
  */
 export async function reschedule(
   db: AntonDb,
   clock: Clock,
   jobId: string,
   runAtMs: number,
-  opts?: { lastError?: string; refundAttempt?: boolean },
+  opts?: { lastError?: string; refundAttempt?: boolean; quotaPark?: boolean },
 ): Promise<void> {
   const nowMs = clock.now();
   try {
@@ -1233,6 +1240,9 @@ export async function reschedule(
         status: "queued",
         runAt: secDate(runAtMs),
         leaseExpiresAt: null,
+        ...(opts?.quotaPark
+          ? { quotaParkCount: sql`${schema.jobs.quotaParkCount} + 1` }
+          : {}),
         lastError: opts?.lastError ?? null,
         attempts: opts?.refundAttempt
           ? sql`MAX(${schema.jobs.attempts} - 1, 0)`
@@ -1431,6 +1441,12 @@ export async function resumeBudgetDeferredJobs(
  * Returns whether it actually parked. Callers that depend on the job being parked afterwards MUST
  * check — a `done`/`failed`/already-`parked` job is left alone and reports `false` rather than
  * pretending to have parked it.
+ *
+ * Every call here is a failure park (the doc comment above is the invariant), so `failureParkCount`
+ * increments unconditionally — the friction ledger's durable half of the park split (PR #322
+ * review). `resumeJob` clears this row's `status`/`lastError` on recovery; without the counter, a
+ * feature's failure-park count fell from 1 to 0 the moment an operator un-stuck the very job the
+ * count exists to remember.
  */
 export async function park(
   db: AntonDb,
@@ -1444,6 +1460,7 @@ export async function park(
     .set({
       status: "parked",
       leaseExpiresAt: null,
+      failureParkCount: sql`${schema.jobs.failureParkCount} + 1`,
       lastError,
       updatedAt: secDate(nowMs),
     })

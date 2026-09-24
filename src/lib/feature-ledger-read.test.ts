@@ -192,6 +192,8 @@ describe("featureLedger's friction half", () => {
     epicBeadId: string;
     status: string;
     lastError?: string;
+    quotaParkCount?: number;
+    failureParkCount?: number;
   }): Promise<void> {
     await t.db.insert(schema.jobs).values({
       id: row.id,
@@ -200,6 +202,8 @@ describe("featureLedger's friction half", () => {
       payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId: row.epicBeadId }),
       status: row.status,
       ...(row.lastError ? { lastError: row.lastError } : {}),
+      ...(row.quotaParkCount ? { quotaParkCount: row.quotaParkCount } : {}),
+      ...(row.failureParkCount ? { failureParkCount: row.failureParkCount } : {}),
     });
   }
 
@@ -254,6 +258,7 @@ describe("featureLedger's friction half", () => {
       epicBeadId: "feat-1",
       status: "queued",
       lastError: "usage-limit: resumes at 2026-09-21T02:00:00Z",
+      quotaParkCount: 1,
     });
     // A gate raised on the TICKET and a park raised on the TARGET — both are this feature's.
     await seedEscalation({ id: "e1", kind: "needs-human", beadId: "task-1" });
@@ -309,6 +314,7 @@ describe("featureLedger's friction half", () => {
       epicBeadId: "feat-1",
       status: "queued",
       lastError: "usage-limit: resumes at 2026-09-21T02:00:00Z",
+      quotaParkCount: 1,
     });
     await seedJob({
       id: "j2",
@@ -316,6 +322,7 @@ describe("featureLedger's friction half", () => {
       epicBeadId: "feat-1",
       status: "queued",
       lastError: "usage-limit: resumes at 2026-09-22T02:00:00Z",
+      quotaParkCount: 1,
     });
 
     const ledger = await featureLedger(t.db, t.projectId, "feat-1");
@@ -333,6 +340,26 @@ describe("featureLedger's friction half", () => {
 
     expect(ledger?.friction.cancels).toBe(0);
     expect(ledger?.friction.escalations).toBe(0);
+  });
+
+  it("attributes a reparented gate to its NEW feature only, not the one it was raised under", async () => {
+    // The row `raiseEscalation` wrote back when task-1 still lived under feat-1: `epicBeadId` is
+    // frozen at "feat-1" forever, but `beadId` (task-1's own, never-reassigned id) now falls under
+    // feat-2 on the board this test hands both reads. Matching on either frozen column independently
+    // would bill this one gate to both features (PR #322 review); the fix must bill it to exactly
+    // the one the board says owns task-1 right now.
+    fakeBoard([
+      bead({ id: "feat-1", issue_type: "feature" }),
+      bead({ id: "feat-2", issue_type: "feature" }),
+      bead({ id: "task-1", parent: "feat-2" }),
+    ]);
+    await seedEscalation({ id: "e1", kind: "needs-human", beadId: "task-1", epicBeadId: "feat-1" });
+
+    const oldFeature = await featureLedger(t.db, t.projectId, "feat-1");
+    const newFeature = await featureLedger(t.db, t.projectId, "feat-2");
+
+    expect(oldFeature?.friction.escalations).toBe(0);
+    expect(newFeature?.friction.escalations).toBe(1);
   });
 
   it("still answers the cost half when the review thread cannot be read", async () => {

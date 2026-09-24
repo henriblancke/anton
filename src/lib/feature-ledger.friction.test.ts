@@ -272,7 +272,7 @@ describe("cancels — the one signal that needs no heuristic", () => {
 
   it("does not read a park or a failure as a cancel", () => {
     const jobs = [
-      job({ type: "execute-epic", status: "parked" }),
+      job({ type: "execute-epic", status: "parked", failureParkCount: 1 }),
       job({ type: "execute-epic", status: "failed" }),
     ];
     expect(countCancels(jobs)).toBe(0);
@@ -284,22 +284,26 @@ describe("quotaParks — reported beside the human touches, never inside them", 
   it("counts a usage-limit pause and moves nothing else", () => {
     // The counter that must stay isolated most of all: folding a quota window into the human-touch
     // sum would make the metric degrade every time anton is used MORE.
-    const jobs = [job({ type: "execute-epic", status: "queued", lastError: usageLimit() })];
+    const jobs = [job({ type: "execute-epic", status: "queued", quotaParkCount: 1 })];
     expect(counts({ jobs })).toEqual({ ...ZEROES, quotaParks: 1 });
   });
 
-  it("reads the park REASON, not the status — a quota pause reschedules rather than parks", () => {
+  it("sums the durable counter rather than reading the row's CURRENT status", () => {
+    // `reschedule` returns a quota-parked job to `queued`, so a reader off `status` sees nothing —
+    // and a job that quota-paused twice while resuming in between must still read as 2, not 1
+    // (PR #322 review: the old heuristic read the row's current `lastError`, which the very next
+    // settle overwrites).
     const jobs = [
-      job({ type: "execute-epic", status: "queued", lastError: usageLimit() }),
-      job({ type: "execute-epic", status: "parked", lastError: usageLimit() }),
+      job({ type: "execute-epic", status: "done", quotaParkCount: 2 }),
+      job({ type: "execute-epic", status: "parked", quotaParkCount: 1 }),
     ];
-    expect(countQuotaParks(jobs)).toBe(2);
+    expect(countQuotaParks(jobs)).toBe(3);
   });
 
   it("does not count a park a human has to clear", () => {
     const jobs = [
-      job({ type: "execute-epic", status: "parked", lastError: "poison: anton-x is not a run target" }),
-      job({ type: "execute-epic", status: "parked", lastError: "failed 3×: push rejected" }),
+      job({ type: "execute-epic", status: "parked", failureParkCount: 1 }),
+      job({ type: "execute-epic", status: "parked", failureParkCount: 1 }),
     ];
     expect(countQuotaParks(jobs)).toBe(0);
     expect(countFailureParks(jobs)).toBe(2);
@@ -348,8 +352,8 @@ describe("the park split — a quota window and a stop a human must clear are op
     // The exclusion that keeps the metric from degrading as anton is used MORE: a usage limit is
     // not a person intervening and not anton failing, so it moves `quotaParks` and nothing else.
     const jobs = [
-      job({ type: "execute-epic", status: "queued", lastError: usageLimit() }),
-      job({ type: "execute-epic", status: "parked", lastError: usageLimit() }),
+      job({ type: "execute-epic", status: "queued", quotaParkCount: 1 }),
+      job({ type: "execute-epic", status: "parked", quotaParkCount: 1 }),
     ];
     expect(countQuotaParks(jobs)).toBe(2);
     expect(countFailureParks(jobs)).toBe(0);
@@ -357,24 +361,34 @@ describe("the park split — a quota window and a stop a human must clear are op
   });
 
   it("still counts a non-quota park as a failure signal", () => {
-    const jobs = [job({ type: "execute-epic", status: "parked", lastError: "poison: anton-x is not a run target" })];
+    const jobs = [job({ type: "execute-epic", status: "parked", failureParkCount: 1 })];
     expect(countFailureParks(jobs)).toBe(1);
     expect(countQuotaParks(jobs)).toBe(0);
   });
 
-  it("counts a park with no recorded reason as a failure, not a quota window", () => {
-    // Only the runner's own marker makes a pause a quota window. An unexplained park is the
-    // conservative half of the split: a stop nothing re-dispatches until a human looks at it.
-    const jobs = [job({ type: "execute-epic", status: "parked", lastError: null })];
+  it("keeps counting a failure park after the job resumes, unlike the row's own status", () => {
+    // `resumeJob` flips a parked row back to `queued` and clears `lastError` — the fact a reader off
+    // the CURRENT row would lose. `failureParkCount` is never touched by resume, so recovery does not
+    // erase the interruption it exists to remember (PR #322 review).
+    const jobs = [job({ type: "execute-epic", status: "queued", failureParkCount: 1 })];
     expect(countFailureParks(jobs)).toBe(1);
     expect(countQuotaParks(jobs)).toBe(0);
   });
 
-  it("puts every park in exactly one half, and a settled non-park in neither", () => {
+  it("sums both counters on one job that took both kinds of pause over its life", () => {
+    // The two are disjoint PER INCREMENT (`park()` and a quota `reschedule()` are separate call
+    // sites that never both fire on the same settle), but not disjoint per JOB: a row can quota-pause
+    // twice on its way to eventually parking for a human, and both totals must survive that history.
+    const jobs = [job({ type: "execute-epic", status: "parked", quotaParkCount: 2, failureParkCount: 1 })];
+    expect(countQuotaParks(jobs)).toBe(2);
+    expect(countFailureParks(jobs)).toBe(1);
+  });
+
+  it("puts every park's weight in its own half, and a settled non-park contributes to neither", () => {
     const jobs = [
-      job({ type: "execute-epic", status: "parked", lastError: usageLimit() }),
-      job({ type: "execute-epic", status: "parked", lastError: "failed 3×: push rejected" }),
-      job({ type: "execute-epic", status: "failed", lastError: "push rejected" }),
+      job({ type: "execute-epic", status: "done", quotaParkCount: 1 }),
+      job({ type: "execute-epic", status: "parked", failureParkCount: 1 }),
+      job({ type: "execute-epic", status: "failed" }),
       job({ type: "execute-epic", status: "done" }),
     ];
     expect(countQuotaParks(jobs) + countFailureParks(jobs)).toBe(2);
@@ -383,7 +397,7 @@ describe("the park split — a quota window and a stop a human must clear are op
   it("keeps a failure park out of humanTouches — anton failing is not a person touching it", () => {
     // The attention a stuck run eventually costs arrives as the `parked-run` escalation, which
     // humanTouches already counts. Counting the park too would bill one interruption twice.
-    const jobs = [job({ type: "execute-epic", status: "parked", lastError: "failed 3×: push rejected" })];
+    const jobs = [job({ type: "execute-epic", status: "parked", failureParkCount: 1 })];
     expect(countHumanTouches({ jobs })).toBe(0);
     expect(countHumanTouches({ jobs, escalations: [{ kind: "parked-run" }] })).toBe(1);
   });
@@ -391,12 +405,7 @@ describe("the park split — a quota window and a stop a human must clear are op
 
 /** A `jobs` row as the counters read it. */
 function job(overrides: Partial<FrictionJobRow> = {}): FrictionJobRow {
-  return { type: "execute-epic", status: "done", lastError: null, ...overrides };
-}
-
-/** The runner's own quota marker, as `nextAction` writes it (jobs/runner.ts). */
-function usageLimit(): string {
-  return `usage-limit: resumes at ${new Date("2026-09-21T03:00:00Z").toISOString()}`;
+  return { type: "execute-epic", status: "done", quotaParkCount: 0, failureParkCount: 0, ...overrides };
 }
 
 /** A reopen's instruction note, rendered by the path that actually writes it. */
@@ -420,6 +429,8 @@ describe("the structural row types match the tables they claim to read", () => {
       leaseExpiresAt: null,
       attempts: 1,
       spentAttempts: 1,
+      quotaParkCount: 0,
+      failureParkCount: 0,
       lastError: null,
       outcome: null,
       outcomeNote: null,
@@ -456,8 +467,8 @@ describe("ledgerFriction — the counters composed into one shape", () => {
       jobs: [
         job({ type: "review-fix-pr", status: "done" }),
         job({ type: "execute-epic", status: "cancelled" }),
-        job({ type: "execute-epic", status: "queued", lastError: usageLimit() }),
-        job({ type: "execute-epic", status: "parked", lastError: "poison: anton-x is not a run target" }),
+        job({ type: "execute-epic", status: "queued", quotaParkCount: 1 }),
+        job({ type: "execute-epic", status: "parked", failureParkCount: 1 }),
       ],
       escalations: [{ kind: "needs-human" }, { kind: "parked-run" }],
       notes: [{ text: reopenNote("anton-tgt", "the acceptance was never met") }],
@@ -487,7 +498,7 @@ describe("ledgerFriction — the counters composed into one shape", () => {
     // The same exclusion `countHumanTouches` guarantees, re-asserted through the composition: a
     // metric that grew every time anton is used MORE would degrade exactly as the tool succeeds.
     const friction = ledgerFriction({
-      jobs: [job({ type: "execute-epic", status: "queued", lastError: usageLimit() })],
+      jobs: [job({ type: "execute-epic", status: "queued", quotaParkCount: 1 })],
     });
     expect(friction.quotaParks).toBe(1);
     expect(friction.humanTouches).toBe(0);

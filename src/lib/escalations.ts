@@ -379,8 +379,13 @@ export async function listOpenEscalations(
  *
  * Matched on `beadId` OR `epicBeadId` because the two name different halves of the same stall: a
  * gate raised on a TICKET carries the ticket's id, while a run-level park carries the target's.
- * Both ids are in a feature's scope, so either column matching is the same feature's interruption.
- * db-injectable; read-only.
+ *
+ * A superset, not the final answer: both columns are frozen at raise time, so a ticket reparented
+ * after its gate opened can leave `epicBeadId` naming its OLD feature while `beadId` now falls under
+ * a NEW one — this fetch then matches both features' calls for the SAME row. The caller
+ * (`feature-ledger-read.ts`'s `scopedEscalations`) re-resolves each row's canonical current owner
+ * off the board before folding it in, which is what actually prevents the double count (PR #322
+ * review). db-injectable; read-only.
  */
 export async function escalationsForBeads(
   db: AntonDb,

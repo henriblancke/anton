@@ -865,8 +865,16 @@ export interface FrictionJobRow {
   type?: string | null;
   /** `queued` | `running` | `parked` | `done` | `failed` | `cancelled`. */
   status?: string | null;
-  /** The durable park/failure reason, which is where a quota park names itself. */
-  lastError?: string | null;
+  /**
+   * How many times this row paused on an exhausted usage limit, ever — only ever incremented
+   * (`reschedule`, jobs/queue.ts). Optional so a fixture that never sets it reads as zero.
+   */
+  quotaParkCount?: number | null;
+  /**
+   * How many times this row was parked for a human to clear, ever — only ever incremented (`park`,
+   * jobs/queue.ts). Optional for the same reason as {@link quotaParkCount}.
+   */
+  failureParkCount?: number | null;
 }
 
 /** The job types that exist to correct a run AFTER its PR opened — `JOB_TYPE_PHASES`' `pr-fix` pair. */
@@ -911,13 +919,6 @@ export function countCancels(jobs: readonly FrictionJobRow[]): number {
 }
 
 /**
- * The marker the runner stamps on a job it parked/rescheduled for an exhausted usage limit
- * (`nextAction`'s `quota` arm, jobs/runner.ts). The reason string is the only durable record that a
- * pause was a quota window rather than a failure — the row's own status cannot tell them apart.
- */
-const QUOTA_PARK_MARKER = "usage-limit:";
-
-/**
  * How many times this scope's work paused on an exhausted quota.
  *
  * Reported ALONGSIDE the human-touch counters and never inside them (design §friction): a usage limit
@@ -925,19 +926,14 @@ const QUOTA_PARK_MARKER = "usage-limit:";
  * every time anton is used MORE, which is the opposite of what it is for — so this is the one counter
  * whose value is that it stays out of the sum a sibling ticket composes.
  *
- * Read off the park REASON rather than the status, because `parked` covers both a quota window and a
- * poison a human has to clear, and those are opposite facts about a run. A quota pause reschedules
- * rather than parks (the attempt is refunded — you cannot retry an exhausted quota), so the row is
- * usually `queued` with the marker on it; the status is deliberately not part of the predicate, or
- * the count would depend on when the read happened to land in that cycle.
+ * Sums the durable `quotaParkCount` rather than sniffing the row's CURRENT `status`/`lastError` for
+ * the runner's usage-limit marker (PR #322 review): `reschedule` overwrites `lastError` on the job's
+ * very next settle, so a row that quota-paused twice, or has since completed, read as at most one
+ * pause under the old heuristic — a friction number that fell as work proceeded is one nobody could
+ * trend. The counter only ever increments (jobs/queue.ts), so this is a true lifetime total.
  */
 export function countQuotaParks(jobs: readonly FrictionJobRow[]): number {
-  return jobs.filter(isQuotaPause).length;
-}
-
-/** The single reading of "this pause was a quota window" — shared so the park split cannot drift. */
-function isQuotaPause(job: FrictionJobRow): boolean {
-  return job.lastError?.includes(QUOTA_PARK_MARKER) === true;
+  return jobs.reduce((total, job) => total + (job.quotaParkCount ?? 0), 0);
 }
 
 /**
@@ -949,16 +945,14 @@ function isQuotaPause(job: FrictionJobRow): boolean {
  * stop nothing re-dispatches, and design §gap-3 is explicit that those two have OPPOSITE meanings
  * and must not collapse into one "parks" number. This half IS anton failing, and is counted as one.
  *
- * Not a complement over every row, only over parked ones. A quota pause reschedules rather than
- * parks, so {@link countQuotaParks} deliberately ignores status while this predicate requires it —
- * a row can be neither, and none can be both.
- *
- * Reported BESIDE the human touches rather than inside them: anton failing on its own is not a
- * person intervening, and the attention a park eventually demands arrives as the `parked-run`
- * escalation {@link countHumanTouches} already counts.
+ * Sums the durable `failureParkCount` rather than reading the row's CURRENT `status` (PR #322
+ * review): `resumeJob` flips a parked row back to `queued`, so a failure park counted off `status`
+ * alone vanished the moment an operator un-stuck the very job the count exists to remember. The
+ * counter only ever increments (`park`, jobs/queue.ts), and — mirroring {@link countQuotaParks} —
+ * never the same increment as that one: `park()` and a quota `reschedule()` are disjoint call sites.
  */
 export function countFailureParks(jobs: readonly FrictionJobRow[]): number {
-  return jobs.filter((job) => job.status === "parked" && !isQuotaPause(job)).length;
+  return jobs.reduce((total, job) => total + (job.failureParkCount ?? 0), 0);
 }
 
 /** The one column the escalation counters read: the finding kind the row was raised from. */
