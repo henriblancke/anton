@@ -1,5 +1,5 @@
 /**
- * The warm-outcome migration (drizzle/0048, anton-de17i), asserted against the database that could
+ * The warm-outcome migration (drizzle/0054, anton-de17i), asserted against the database that could
  * go wrong: one already holding runs from before the column existed.
  *
  * Those rows must stay NULL. Null is what the schema reads as "warming was never attempted", and
@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0048_run_warm_outcome.sql";
+const MIGRATION = "0054_run_warm_outcome.sql";
 
 /** The reverse, read out of the migration's own header so the tested recipe is the documented one. */
 function reverseStatements(): string[] {
@@ -58,7 +58,7 @@ function insertRun(sqlite: Database.Database, id: string, warm: Partial<WarmRow>
 
 let sqlite: Database.Database;
 
-/** An anton.db at 0047, with a run that predates the warm columns. */
+/** An anton.db at 0053, with a run that predates the warm columns. */
 beforeEach(() => {
   sqlite = new Database(":memory:");
   sqlite.pragma("foreign_keys = ON");
@@ -73,9 +73,9 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-describe("drizzle/0048 — runs gain a warm outcome", () => {
-  it("applies to a DB at 0047 and leaves the pre-column row wholly NULL", () => {
-    // Guard the premise: `before` must have stopped at 0047, or "applies at 0047" proves nothing.
+describe("drizzle/0054 — runs gain a warm outcome", () => {
+  it("applies to a DB at 0053 and leaves the pre-column row wholly NULL", () => {
+    // Guard the premise: `before` must have stopped at 0053, or "applies at 0053" proves nothing.
     expect(columnsOf(sqlite, "runs")).toContain("prior_base_refresh_sha");
     expect(columnsOf(sqlite, "runs")).not.toContain("warm_outcome");
 
