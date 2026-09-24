@@ -803,6 +803,11 @@ async function runFixSession(args: {
   // against the SAME baseline the try read, rather than losing it to block scope the moment
   // anything after the board write throws.
   let boardBefore: BoardFingerprint | undefined;
+  // Once a push's outcome is durably recorded (`endSession` below), the catch at the bottom must
+  // not overwrite it back to `failed` just because a LATER fallible step (thread replies, the
+  // re-review notification) throws — that would erase delivery evidence for a push that already
+  // reached the remote (PR #320 review).
+  let sessionSettled = false;
 
   try {
     // A resume can land here with the fix already committed on the branch — an operator resolving
@@ -855,8 +860,12 @@ async function runFixSession(args: {
           );
         }
       }
+      // Persist the push BEFORE the fallible notification below — a delivery that reached the
+      // remote must count toward lead-time/repair weighting even if notifyReReview never returns
+      // (network stall, process kill) (PR #320 review).
+      await endSession(db, clock, sessionId, "done", pushed);
+      sessionSettled = true;
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
-      await endSession(db, clock, sessionId, "done");
       return pushed;
     }
 
@@ -979,6 +988,13 @@ async function runFixSession(args: {
     // so it is never reported as progress before it is actually published.
     const pushed = gitPushed || boardChanged;
 
+    // Persist the outcome BEFORE the fallible thread/notification work below — a push that reached
+    // the remote must count toward lead-time/repair weighting even if `applyThreadOutcomes` or
+    // `notifyReReview` never returns (network stall, GitHub outage, process kill), and the catch
+    // below must not then downgrade this durable state back to `failed` (PR #320 review).
+    await endSession(db, clock, sessionId, "done", pushed);
+    sessionSettled = true;
+
     await applyThreadOutcomes({
       repo,
       number,
@@ -996,7 +1012,6 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      await endSession(db, clock, sessionId, "done");
       return false;
     }
     if (!gitPushed && boardChanged) {
@@ -1014,10 +1029,9 @@ async function runFixSession(args: {
       reasons: verdict.reasons,
       signal: ctx.signal,
     });
-    await endSession(db, clock, sessionId, "done");
     return true;
   } catch (e) {
-    await endSession(db, clock, sessionId, "failed");
+    if (!sessionSettled) await endSession(db, clock, sessionId, "failed");
     // Board evidence audit-on-failure (mirrors review-gate.ts's self-review path, PR #284 review,
     // "Preserve board evidence after post-sync failures"): a board-only fixer writes straight to the
     // LIVE board, confirmed synced above before anything else runs — so a failure past that point

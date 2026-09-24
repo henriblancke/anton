@@ -8,6 +8,9 @@
  * gardener patrol over a clean board deliberately leaves no session row behind (pass-preamble.ts
  * `deferPassSession`) and a missing entry would render as a broken row rather than as a quiet pass.
  */
+import { stat } from "node:fs/promises";
+import { BoundedCache } from "../bounded-cache";
+
 import {
   isCleanPass,
   isPassLogLine,
@@ -16,6 +19,23 @@ import {
 } from "../gardener/record";
 import { readSessionLogLines, type JobSessionLink } from "../sessions";
 import type { JobStatus, JobType } from "./queue";
+
+// Cache compact records, never transcripts. Stat on every request so appends, truncation and
+// rotation invalidate immediately. A file changing during a read is never cached.
+const logRecords = new BoundedCache<string, {
+  fingerprint: string;
+  summary: PassRecordSummary;
+  truncated: boolean;
+  lineCount: number;
+}>(8 * 1024 * 1024, 512);
+async function fingerprint(path: string): Promise<string | undefined> {
+  try {
+    const info = await stat(path, { bigint: true });
+    return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
+  } catch {
+    return undefined;
+  }
+}
 
 /** The job types that file proposals — the only ones with a record to show. */
 const PASS_JOB_TYPES: ReadonlySet<JobType> = new Set<JobType>(["gardener", "product-master"]);
@@ -89,8 +109,26 @@ async function readAttempts(logPaths: string[]): Promise<PassRecordSummary> {
  * something different when the other three attempts read fine.
  */
 async function readLog(logPath: string, index: number, of: number): Promise<PassRecordSummary> {
-  const { lines, truncated, unreadable } = await readSessionLogLines(logPath, isPassLogLine);
-  const summary = readPassRecords(lines.join("\n"));
+  const before = await fingerprint(logPath);
+  const cached = before === undefined ? undefined : logRecords.get(logPath);
+  let summary: PassRecordSummary;
+  let truncated = false;
+  let unreadable = false;
+  let lineCount = 0;
+  if (cached && cached.fingerprint === before) {
+    summary = structuredClone(cached.summary);
+    truncated = cached.truncated;
+    lineCount = cached.lineCount;
+  } else {
+    const read = await readSessionLogLines(logPath, isPassLogLine);
+    ({ truncated, unreadable } = read);
+    lineCount = read.lines.length;
+    summary = readPassRecords(read.lines.join("\n"));
+    if (!unreadable && before !== undefined && before === await fingerprint(logPath)) {
+      logRecords.set(logPath, { fingerprint: before, summary: structuredClone(summary), truncated, lineCount },
+        JSON.stringify(summary).length * 2 + logPath.length * 2 + 256);
+    }
+  }
   const attempt = of > 1 ? `attempt ${index + 1} of ${of}: ` : "";
   if (unreadable) {
     // The one silence that is NOT a result: the session row stands but its disposable log is gone
@@ -98,7 +136,7 @@ async function readLog(logPath: string, index: number, of: number): Promise<Pass
     // have written to the board unattended — the only UI record of which is the file we just failed
     // to read.
     summary.notes.push(
-      `${attempt}this pass's session log could not be read${lines.length > 0 ? " to the end" : ""} — ` +
+      `${attempt}this pass's session log could not be read${lineCount > 0 ? " to the end" : ""} — ` +
         `whatever it applied, shadowed or refused is not recorded here`,
     );
   }
@@ -106,7 +144,7 @@ async function readLog(logPath: string, index: number, of: number): Promise<Pass
     // Never a silent cap, for the same reason the write cap is not one: a record that shows some of
     // a pass's writes reads exactly like one that shows all of them.
     summary.notes.push(
-      `${attempt}this pass wrote more record lines than the jobs page reads — ${lines.length} ` +
+      `${attempt}this pass wrote more record lines than the jobs page reads — ${lineCount} ` +
         `shown; open the session log for the rest`,
     );
   }

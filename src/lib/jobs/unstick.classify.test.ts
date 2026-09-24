@@ -77,11 +77,13 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",
+    structuralError: null,
     startedAt: new Date(NOW - 4 * HOUR),
     attemptStartedAt: new Date(NOW - 4 * HOUR),
     endedAt: null,
     updatedAt: new Date(NOW - HOUR),
     writeSeq: 1,
+    delivered: true,
     ...o,
   };
 }

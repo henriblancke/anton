@@ -1,0 +1,1 @@
+CREATE INDEX `claude_invocations_bead_idx` ON `claude_invocations` (`bead_id`);

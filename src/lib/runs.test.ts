@@ -57,6 +57,7 @@ interface SeedRun {
   reviewScore?: number;
   reviewKeyScore?: number;
   narrative?: string;
+  delivered?: boolean;
 }
 
 async function seed(run: SeedRun): Promise<void> {
@@ -77,6 +78,7 @@ async function seed(run: SeedRun): Promise<void> {
     startedAt: new Date(run.startedAt ?? run.updatedAt),
     endedAt: run.endedAt === undefined ? null : new Date(run.endedAt),
     updatedAt: new Date(run.updatedAt),
+    ...(run.delivered === undefined ? {} : { delivered: run.delivered }),
   });
 }
 
@@ -87,14 +89,18 @@ async function seedSession(row: {
   status: string;
   endedAt?: number;
   kind?: string;
+  pushed?: boolean;
+  runId?: string;
 }): Promise<void> {
   await t.db.insert(schema.sessions).values({
     id: row.id,
     projectId: PROJECT,
+    runId: row.runId,
     kind: row.kind ?? "execute",
     beadId: row.beadId,
     status: row.status,
     endedAt: row.endedAt === undefined ? null : new Date(row.endedAt),
+    pushed: row.pushed,
   });
 }
 
@@ -389,6 +395,23 @@ describe("listDeliveriesByBead", () => {
     expect(await listDeliveriesByBead(t.db, PROJECT, [])).toEqual(new Map());
   });
 
+  it("excludes a done run that verified-retired its target rather than publishing anything", async () => {
+    // `finishRun`'s `targetRetired` path (and its recovery twin, `settleRetiredStandalone`) settle
+    // the row `done` with no pull request ever opened — a `status: "done"` row alone is not
+    // publication evidence (PR #320 review).
+    await seed({ id: "retired", status: "done", updatedAt: SETTLED, endedAt: SETTLED, delivered: false });
+    await seed({
+      id: "delivered",
+      status: "done",
+      updatedAt: SETTLED + 60_000,
+      endedAt: SETTLED + 60_000,
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
+      new Map([[EPIC, [sec(SETTLED + 60_000)]]]),
+    );
+  });
+
   it("credits a grouped run's EVERY completed child, not only the ticket its row kept", async () => {
     // `openTicketSession` rewrites `ticketBeadId` per child, so the row remembers the LAST one. A
     // child repaired and delivered earlier in the same run would otherwise have no delivery at all,
@@ -423,6 +446,139 @@ describe("listDeliveriesByBead", () => {
     expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
       new Map([[EPIC, [sec(SETTLED)]]]),
     );
+  });
+
+  it("credits a review-fix session that actually pushed a correction", async () => {
+    // A PR fixed after it opened is delivered again by that push, not by the run row (which named
+    // only the PR-opening execute session) — see PR #320 review.
+    await seedSession({
+      id: "fix1",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED + 90_000,
+      pushed: true,
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(
+      new Map([[EPIC, [sec(SETTLED + 90_000)]]]),
+    );
+  });
+
+  it("excludes local ticket commits when the caller asks for delivery evidence only", async () => {
+    // The feature ledger's use (PR #320 review): a run that parks or fails before pushing must not
+    // let a child's own local commit count as the feature having delivered. A pushed review-fix
+    // correction still counts — it genuinely reached the remote.
+    await seedSession({ id: "s1", beadId: EPIC, status: "done", endedAt: SETTLED });
+    await seedSession({
+      id: "fix1",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED + 60_000,
+      pushed: true,
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map([[EPIC, [sec(SETTLED + 60_000)]]]));
+    // The default keeps counting the local commit too.
+    const withLocalCommits = await listDeliveriesByBead(t.db, PROJECT, [EPIC]);
+    expect([...(withLocalCommits.get(EPIC) ?? [])].sort()).toEqual(
+      [sec(SETTLED), sec(SETTLED + 60_000)].sort(),
+    );
+  });
+
+  it("still credits a reparented grouped-run child whose own run delivered (PR #320 review, P2)", async () => {
+    // A grouped run's row keeps only its FINAL child's `ticketBeadId` — a non-final child later
+    // reparented onto a different feature has no run-row evidence in the new scope at all (the row
+    // still names the OLD epic and the LAST child). Its own `execute` session is the only evidence
+    // left, and it must still count once the run it was opened inside actually delivered.
+    await seed({
+      id: "grouped",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-old-epic",
+      ticketBeadId: "anton-final-child",
+    });
+    await seedSession({
+      id: "s1",
+      beadId: EPIC,
+      status: "done",
+      endedAt: SETTLED,
+      runId: "grouped",
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map([[EPIC, [sec(SETTLED)]]]));
+  });
+
+  it("uses the containing run's delivery time, not the reparented child's earlier local commit (PR #320 review, P2)", async () => {
+    // The child's own execute session settled well before the run it was opened inside actually
+    // published — the run kept working (gates, other children) after this one committed locally.
+    // Reading the session's own `endedAt` as the delivery time would end `leadMs` at that local
+    // commit instead of the later publish it actually waited for.
+    await seed({
+      id: "grouped",
+      status: "done",
+      updatedAt: SETTLED + 120_000,
+      endedAt: SETTLED + 120_000,
+      epicBeadId: "anton-old-epic",
+      ticketBeadId: "anton-final-child",
+    });
+    await seedSession({
+      id: "s1",
+      beadId: EPIC,
+      status: "done",
+      endedAt: SETTLED,
+      runId: "grouped",
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map([[EPIC, [sec(SETTLED + 120_000)]]]));
+  });
+
+  it("excludes a reparented child's local commit when its own run parked or failed", async () => {
+    // `delivered` defaults `true` at row creation and is only ever rewritten when a run finishes
+    // `status: "done"` — a parked or failed run never gets it flipped to `false`. So excluding this
+    // local commit needs the run's `status`, not just its `delivered` flag.
+    await seed({ id: "parked", status: "parked", updatedAt: SETTLED, endedAt: SETTLED });
+    await seedSession({
+      id: "s1",
+      beadId: EPIC,
+      status: "done",
+      endedAt: SETTLED,
+      runId: "parked",
+    });
+
+    expect(
+      await listDeliveriesByBead(t.db, PROJECT, [EPIC], { includeLocalCommits: false }),
+    ).toEqual(new Map());
+  });
+
+  it("excludes a review-fix session that settled done without pushing anything", async () => {
+    // "answered the review feedback; nothing to push" still settles `status: "done"` — it must not
+    // read as a delivery the same way a pushed correction does.
+    await seedSession({
+      id: "fix-answered",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED,
+      pushed: false,
+    });
+    await seedSession({
+      id: "fix-legacy",
+      beadId: EPIC,
+      kind: "review-fix",
+      status: "done",
+      endedAt: SETTLED,
+    });
+
+    expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
   });
 });
 

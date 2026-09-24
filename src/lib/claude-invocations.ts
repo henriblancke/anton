@@ -25,7 +25,7 @@
  * db-injectable, like `runs` and `picker-starts`: the handler and its tests share one connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, desc, eq, gte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import { selfBuildVersion } from "./build/drift";
 import type { ClaudeResult, RunClaudeOptions } from "./claude/driver";
 import type { ModelUsageEntry } from "./claude/model-usage";
@@ -265,6 +265,28 @@ export async function listInvocations(
     : groupInvocations(rows)
         .slice(0, opts.limit)
         .flatMap((invocation) => invocation.rows);
+}
+
+/**
+ * One project's invocations for a SET of beads, unordered — the feature ledger's own seek
+ * (`claude_invocations_bead_idx`, added for exactly this read). A feature rolls up its whole life,
+ * so there is no window to bound this by the way {@link listInvocations} bounds a project's.
+ */
+export async function invocationsForBeads(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<ClaudeInvocationRow[]> {
+  if (beadIds.length === 0) return [];
+  return db
+    .select()
+    .from(schema.claudeInvocations)
+    .where(
+      and(
+        eq(schema.claudeInvocations.projectId, projectId),
+        inArray(schema.claudeInvocations.beadId, [...new Set(beadIds)]),
+      ),
+    );
 }
 
 /** One project's spend over a window, read as invocations rather than as rows. */

@@ -201,3 +201,15 @@ describe("passRecordsByJob", () => {
     expect(Object.keys(records)).toEqual(["g3"]);
   });
 });
+
+it("invalidates cached records after rewriting or removing a log, and isolates returned notes", async () => {
+  const path = logFile("cached.log", APPLIED);
+  const read = () => passRecordsByJob([job("cached", "gardener")], { cached: { id: "session", logPaths: [path] } });
+  const first = await read();
+  first.cached!.notes.push("caller mutation");
+  expect((await read()).cached!.notes).not.toContain("caller mutation");
+  writeFileSync(path, "");
+  expect((await read()).cached!.records).toEqual([]);
+  rmSync(path);
+  expect((await read()).cached!.notes.join(" ")).toContain("could not be read");
+});

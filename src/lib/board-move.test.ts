@@ -98,6 +98,15 @@ describe("moveCard serializes with the gardener's apply lock", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  it("reopens before applying both stage label deltas in a single write", async () => {
+    vi.spyOn(beads, "show").mockResolvedValue(makeBead({ id: "card", title: "Card", status: "closed" }));
+    const reopen = vi.spyOn(beads, "reopen").mockResolvedValue("");
+    const labels = vi.spyOn(beads, "changeLabels").mockResolvedValue("");
+    await moveCard(project, "card", "implementing");
+    expect(labels).toHaveBeenCalledExactlyOnceWith("/repo", "card", ["stage:implementing"], ["stage:in-review"]);
+    expect(reopen.mock.invocationCallOrder[0]).toBeLessThan(labels.mock.invocationCallOrder[0]!);
+  });
+
   it("waits for the card's write lock instead of closing under a concurrent apply", async () => {
     let card = makeBead({ id: "anton-card", title: "t", status: "open" });
     vi.spyOn(beads, "show").mockImplementation(async () => card);

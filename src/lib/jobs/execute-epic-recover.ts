@@ -380,6 +380,9 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
   await updateRun(db, clock, runId, {
     status: "done",
     endedAt: clock.now(),
+    // No PR was ever opened for this target — `finishRun`'s own `targetRetired` twin, recovered
+    // here after a crash (PR #320 review). See the column's own note.
+    delivered: false,
     error:
       `${targetId} had already shipped — anton verified that against the repository and the board ` +
       `and retired it as superseded by ${retirement.survivor}. Nothing was committed here, so this ` +

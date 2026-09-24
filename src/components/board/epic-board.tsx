@@ -1,5 +1,6 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useState } from "react";
 import { DndContext, closestCorners } from "@dnd-kit/core";
 import { restrictToWindowEdges } from "@dnd-kit/modifiers";
@@ -23,7 +24,11 @@ import { useUnwatchedParks } from "@/components/board/use-unwatched-parks";
 import { useUpNextReorder } from "@/components/board/use-up-next-reorder";
 import { useBoardGrouping } from "@/lib/use-board-grouping";
 import type { BoardGrouping, BoardSort } from "@/components/board/board-utils";
-import { TicketDialog } from "@/components/ticket/ticket-dialog";
+
+const TicketDialog = dynamic(() =>
+  import("@/components/ticket/ticket-dialog").then((module) => module.TicketDialog),
+);
+
 
 /**
  * The project board: every run target and loose ticket, in the arrangement the operator chose, live.
@@ -151,16 +156,18 @@ export function EpicBoard({
         onVetoed={state.vetoBead}
       />
       <BoardDragOverlay slug={slug} epic={drag.activeEpic} />
-      <TicketDialog
-        slug={slug}
-        ticketId={openTicketId}
-        open={openTicketId !== null}
-        onClose={() => setOpenTicketId(null)}
-        // A saved/deleted standalone ticket may change title, stage, or drop off the board — force a
-        // fresh load so the chips reflect it.
-        onSaved={state.refresh}
-        onDeleted={state.refresh}
-      />
+      {openTicketId !== null && (
+        <TicketDialog
+          slug={slug}
+          ticketId={openTicketId}
+          open={openTicketId !== null}
+          onClose={() => setOpenTicketId(null)}
+          // A saved/deleted standalone ticket may change title, stage, or drop off the board — force a
+          // fresh load so the chips reflect it.
+          onSaved={state.refresh}
+          onDeleted={state.refresh}
+        />
+      )}
     </DndContext>
   );
 }

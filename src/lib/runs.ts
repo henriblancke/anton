@@ -105,6 +105,7 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
     leaseExpiresAt: toEpoch(row.leaseExpiresAt),
     attemptStartedAt: toEpoch(row.attemptStartedAt),
     error: row.error ?? undefined,
+    structuralError: row.structuralError ?? undefined,
     jobId: row.jobId ?? undefined,
     reviewScore: row.reviewScore ?? undefined,
     formula: row.formula ?? undefined,
@@ -213,6 +214,8 @@ export type RunPatch = Partial<{
   priorBaseRefreshSha: string | null;
   attempts: number;
   error: string | null;
+  /** Anton's own account of why the run stopped, held apart from `error` above (anton-4kvp) — see schema. */
+  structuralError: string | null;
   /** The score this attempt's review gate reported (anton-cekf) — see the column's own note. */
   reviewScore: number | null;
   /** A clean verdict's resume key (anton-qmuyt) — see the column's own note. */
@@ -226,6 +229,8 @@ export type RunPatch = Partial<{
   /** ms; converted to seconds. Rewritten by a resume — see the column's own note. */
   attemptStartedAt: number;
   endedAt: number; // ms; converted to seconds
+  /** Whether a `done` settle actually published a pull request — see the column's own note. */
+  delivered: boolean;
 }>;
 
 /** Patch a run row (touches updatedAt). Pass endedAt (ms) to close it out. */
@@ -718,30 +723,55 @@ export async function listRecentRunOutcomes(
 /**
  * When work carrying each of these beads DELIVERED — in unix SECONDS, unordered.
  *
- * Read for the repair weigher alone (gardener/repair.ts): a repair's double weight lasts only until
- * the repaired bead next delivers, and a delivery that old is behind the streak the breaker walks —
- * it is not in the run window and no board read remembers it.
+ * Read for the repair weigher (gardener/repair.ts) and the feature ledger (feature-ledger-read.ts
+ * `lastDeliveryMs`): a repair's double weight lasts only until the repaired bead next delivers, and
+ * a delivery that old is behind the streak the breaker walks — it is not in the run window and no
+ * board read remembers it; the ledger needs the same evidence to know when a feature's `leadMs` span
+ * actually ends.
  *
- * TWO sources, because the run row cannot name every bead a run delivered (PR #223 review). It
+ * THREE sources, because the run row cannot name every bead a run delivered (PR #223 review). It
  * carries one `ticketBeadId`, and a grouped run OVERWRITES it per child
  * (jobs/execute-epic-ticket-bookends.ts `openTicketSession`) — so on the rows alone a repaired
  * child that succeeded, followed by any other child, leaves no delivery at all, and its stamp goes
  * on weighing later unrelated failures double until the breaker disarms the picker early. So the
- * rows answer for the run's TARGET and its final ticket, and each ticket's own `execute` session —
- * opened per child and settled `done` only once that child's work committed — answers for the rest.
+ * rows answer for the run's TARGET and its final ticket, each ticket's own `execute` session —
+ * opened per child and settled `done` only once that child's work committed — answers for the rest,
+ * and a `review-fix` session that actually pushed a correction (`sessions.pushed`, PR #320 review)
+ * answers for a delivery that lands AFTER the PR opened — a review-fix session settles `done` the
+ * same way whether or not it pushed anything, so an unpushed one (nothing but an answered thread)
+ * must not count.
  *
  * A ticket session settles `done` on its own commit, whatever becomes of the run around it: the
  * repair the child carried was PROVEN by that landing, which is the whole test this evidence exists
  * to apply.
  *
- * Bounded by the ids handed in — the beads that actually carry a repair stamp — so an unrepaired
- * board costs no query at all.
+ * Bounded by the ids handed in — the beads that actually carry a repair stamp, or a ledger's scope —
+ * so an unrepaired board costs no query at all.
+ *
+ * `includeLocalCommits` (default true) gates the `execute`-session arm above, but only for a
+ * session whose CONTAINING RUN never delivered — not every local commit. The repair weigher wants
+ * every one of them: a child's own commit proves ITS repair regardless of what the run around it
+ * does next. The feature ledger (`feature-ledger-read.ts`) must exclude the ones whose run parked or
+ * failed before ever pushing — that local commit is not a feature delivery — yet the run-row arm
+ * above is not enough on its own: a grouped run overwrites `ticketBeadId` per child, so a non-final
+ * child later reparented onto a different feature has no run-row evidence of its own (the row still
+ * names the OLD epic and the LAST child, neither of which is in the new feature's scope) — only its
+ * `execute` session is. Gating that session on its run's `status: "done"` AND `delivered` flag,
+ * instead of dropping the whole arm, keeps crediting a child that genuinely published while still
+ * excluding one whose run parked or failed (P2, PR #320 review).
+ *
+ * The run-row arm is further filtered on `delivered` (PR #320 review): a verified already-shipped
+ * retirement settles the row `done` too, but opens no pull request, so a `done` status alone is not
+ * publication evidence — counting it would hand a feature (or a repair) credit for a settle that
+ * shipped nothing.
  */
 export async function listDeliveriesByBead(
   db: AntonDb,
   projectId: string,
   beadIds: readonly string[],
+  options?: { includeLocalCommits?: boolean },
 ): Promise<Map<string, number[]>> {
+  const includeLocalCommits = options?.includeLocalCommits ?? true;
   const out = new Map<string, number[]>();
   if (beadIds.length === 0) return out;
   const ids = [...new Set(beadIds)];
@@ -759,6 +789,11 @@ export async function listDeliveriesByBead(
       and(
         eq(schema.runs.projectId, projectId),
         eq(schema.runs.status, "done"),
+        // A verified already-shipped retirement settles `done` too, but opens no pull request —
+        // `delivered` is false only there (PR #320 review). Excluding it here serves both callers:
+        // neither the ledger's `leadMs` nor the repair weigher's double-weight should read a no-op
+        // settle as proof anything landed.
+        eq(schema.runs.delivered, true),
         or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
       ),
     );
@@ -773,22 +808,51 @@ export async function listDeliveriesByBead(
     }
   }
 
+  // `execute` always delivers (its own commit) once settled `done`; `review-fix` settles `done`
+  // whether or not it pushed anything, so it only counts when `pushed` says it did. With
+  // `includeLocalCommits: false`, an execute session only counts when ITS OWN run settled `done`
+  // AND delivered — the same two conditions the run-row arm above applies, read here off the run
+  // the session was opened inside via the left join. `delivered` defaults `true` at row creation and
+  // is only ever written when a run finishes `done` (see the column's own note above), so a run that
+  // parked or failed before pushing still needs the `status: "done"` check — it is never rewritten
+  // to `false` on its own. A session with no matching run is excluded the same way.
+  const executeCondition = includeLocalCommits
+    ? eq(schema.sessions.kind, "execute")
+    : and(
+        eq(schema.sessions.kind, "execute"),
+        eq(schema.runs.status, "done"),
+        eq(schema.runs.delivered, true),
+      );
   const ticketRows = await db
-    .select({ beadId: schema.sessions.beadId, endedAt: schema.sessions.endedAt })
+    .select({
+      beadId: schema.sessions.beadId,
+      kind: schema.sessions.kind,
+      endedAt: schema.sessions.endedAt,
+      runEndedAt: schema.runs.endedAt,
+      runUpdatedAt: schema.runs.updatedAt,
+    })
     .from(schema.sessions)
+    .leftJoin(schema.runs, eq(schema.sessions.runId, schema.runs.id))
     .where(
       and(
         eq(schema.sessions.projectId, projectId),
-        eq(schema.sessions.kind, "execute"),
         eq(schema.sessions.status, "done"),
         inArray(schema.sessions.beadId, ids),
+        or(and(eq(schema.sessions.kind, "review-fix"), eq(schema.sessions.pushed, true)), executeCondition),
       ),
     );
   for (const row of ticketRows) {
-    // `endedAt` is written with the `done` status in one update (sessions.ts `endSession`), so a
-    // row without one is not a delivery this read can place in time — and a delivery it cannot
-    // place is not one it may spend a repair stamp on.
-    const at = toEpoch(row.endedAt);
+    // A gated execute session (`includeLocalCommits: false`) is only reached here because its
+    // CONTAINING RUN delivered — a reparented non-final child whose own run-row evidence names
+    // neither its new feature nor itself (see the run-row arm's own note above). The session's own
+    // `endedAt` is that child's local commit, stamped before the run's later PR publication; reading
+    // it as the delivery time would end `leadMs` at the commit instead of the publish it actually
+    // waited for (PR #320 review, P2). The run's own `endedAt` (falling back to `updatedAt`, exactly
+    // as the run-row arm above reads it) is the publication time for this arm.
+    const at =
+      !includeLocalCommits && row.kind === "execute"
+        ? toEpoch(row.runEndedAt) ?? toEpoch(row.runUpdatedAt)
+        : toEpoch(row.endedAt);
     if (at === undefined || row.beadId === null) continue;
     record(row.beadId, at);
   }

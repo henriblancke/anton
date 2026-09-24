@@ -28,9 +28,8 @@ import { formatStructureViolations, structureGaps } from "./beads/structure";
 import type { Bead } from "./beads/types";
 import {
   computeEpicGraph,
-  epicStandaloneBlockers,
+  createBlockerIndex,
   isUnit,
-  standaloneBlockers,
   type EpicGraphNode,
 } from "./epic-graph";
 import { boardCards, contractGatedBeads, isRunTicket, type BoardCards } from "./ticket-view";
@@ -60,6 +59,7 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
   const cards = boardCards(board);
   const tickets = ticketIndex(board, cards);
   const graph = computeEpicGraph(board);
+  const blockers = createBlockerIndex(board);
   const unitNodes = new Map(graph.epics.map((node) => [node.id, node]));
 
   return {
@@ -82,7 +82,7 @@ export function makeApprovalGate(board: Bead[]): ApprovalGate {
           message: formatStructureViolations([violation]),
         }),
       ),
-      ...blockedGap(target, board, unitNodes),
+      ...blockedGap(target, blockers, unitNodes),
     ],
   };
 }
@@ -175,13 +175,13 @@ export function notRunnableWhy(target: Bead, board: Bead[]): string | undefined 
  */
 function blockedGap(
   target: Bead,
-  board: Bead[],
+  blockers: ReturnType<typeof createBlockerIndex>,
   unitNodes: Map<string, EpicGraphNode>,
 ): ApprovalGap[] {
   const unit = isUnit(target) ? unitNodes.get(target.id) : undefined;
   const open = isUnit(target)
-    ? [...(unit?.blockedBy ?? []), ...epicStandaloneBlockers(board, target.id)]
-    : standaloneBlockers(board, target.id);
+    ? [...(unit?.blockedBy ?? []), ...blockers.epic(target.id)]
+    : blockers.standalone(target.id);
   // A unit absent from the graph (a board read that doesn't carry it) has no per-child verdict to
   // read, so it falls back to the coarse list rather than silently reading as runnable.
   const runnable = unit ? unit.childReadiness !== "blocked" : open.length === 0;

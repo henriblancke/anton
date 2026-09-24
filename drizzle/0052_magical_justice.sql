@@ -1,0 +1,12 @@
+-- Whether a `review-fix` session actually committed+pushed a correction, so
+-- `listDeliveriesByBead` (runs.ts) can tell that apart from a review-fix session that only
+-- answered feedback with nothing to push — both settle `status: "done"` the same way otherwise
+-- (PR #320 review).
+--
+-- Nullable and NOT backfilled: null on every other kind, and on a review-fix row written before
+-- this column existed. Only a review-fix row that explicitly set `pushed = true` counts as a
+-- delivery.
+--
+-- Reverse:
+--   ALTER TABLE `sessions` DROP COLUMN `pushed`;
+ALTER TABLE `sessions` ADD `pushed` integer;

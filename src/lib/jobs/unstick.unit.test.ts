@@ -61,10 +61,12 @@ function run(o: Partial<RunRow> = {}): RunRow {
     attempts: 1,
     leaseExpiresAt: null,
     error: "usage-limit",
+    structuralError: null,
     startedAt: secDate(NOW - 4 * HOUR),
     attemptStartedAt: secDate(NOW - 4 * HOUR),
     endedAt: null,
     updatedAt: secDate(NOW - 4 * HOUR),
+    delivered: true,
     ...o,
   };
 }

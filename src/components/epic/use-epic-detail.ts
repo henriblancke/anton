@@ -42,10 +42,10 @@ interface EpicTarget {
  * fired in the same commit rather than in sequence: the page paints off the snapshot while the score
  * series fills in.
  */
-export function useEpicDetail(target: EpicTarget): EpicDetailModel {
+export function useEpicDetail(target: EpicTarget, initialDetail?: EpicDetail): EpicDetailModel {
   const [attempt, setAttempt] = useState(0);
   const refresh = () => setAttempt((n) => n + 1);
-  const snapshot = useEpicSnapshot(target, attempt);
+  const snapshot = useEpicSnapshot(target, attempt, initialDetail);
   const history = useReviewHistory(target, attempt);
   const actions = useEpicActions(target, refresh);
 
@@ -53,11 +53,12 @@ export function useEpicDetail(target: EpicTarget): EpicDetailModel {
 }
 
 /** The detail read itself — the epic, its tickets and their edges, as one deliberately spawn-free GET. */
-function useEpicSnapshot({ slug, epicId }: EpicTarget, attempt: number) {
-  const [detail, setDetail] = useState<EpicDetail | null>(null);
+function useEpicSnapshot({ slug, epicId }: EpicTarget, attempt: number, initialDetail?: EpicDetail) {
+  const [detail, setDetail] = useState<EpicDetail | null>(initialDetail ?? null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    if (attempt === 0 && initialDetail) return;
     let cancelled = false;
     async function load() {
       try {
@@ -75,9 +76,10 @@ function useEpicSnapshot({ slug, epicId }: EpicTarget, attempt: number) {
     return () => {
       cancelled = true;
     };
-  }, [slug, epicId, attempt]);
+  }, [slug, epicId, attempt, initialDetail]);
 
-  return { detail, error };
+  // A router refresh can supply a newer server snapshot before any client-side mutation.
+  return { detail: attempt === 0 && initialDetail ? initialDetail : detail, error };
 }
 
 /**

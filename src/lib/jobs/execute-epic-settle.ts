@@ -24,6 +24,7 @@ import {
   BlockedTailError,
   NeedsHumanError,
   ReviewBlockedError,
+  runFailureParts,
   StrandedHumanGateError,
   WorktreeDirtyError,
 } from "./execute-epic-errors";
@@ -185,9 +186,15 @@ async function settleRunRow(run: EpicRun, raw: unknown): Promise<RunSettlement> 
     await updateRun(db, clock, runId, { status: "parked", error: e.message });
   } else {
     settledAs = "failed";
+    // `runFailureParts` recovers anton's own half from a `NoDeliveryError`/`BlockedByAgentError` —
+    // the split composed in execute-epic-ticket.ts (anton-4kvp) — and degrades anything else to its
+    // whole message, so the column is never a gap the streak breaker's `signatureOf` has to special-
+    // case (anton-ocm4).
+    const { structural } = runFailureParts(e);
     await updateRun(db, clock, runId, {
       status: "failed",
       error: `${e instanceof Error ? e.message : String(e)}${orphanNotice}`,
+      structuralError: `${structural}${orphanNotice}`,
       endedAt: clock.now(),
     });
   }
