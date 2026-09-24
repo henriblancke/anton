@@ -12,7 +12,6 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { claimGuard } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
-import { readCurrentClosureVersion } from "../beads/closure-cycle";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
 import { appendSessionLog } from "../sessions";
@@ -1173,11 +1172,25 @@ function survivorTrustedForClosure(
   ids: readonly string[],
   storedClosure: string | undefined,
   ticketClosed: boolean,
-  current: { read: boolean; closure?: string; reopened?: boolean } | undefined,
+  current: { read: boolean; closure?: string; reopened?: boolean; priorClosure?: string } | undefined,
+  /**
+   * The survivor's own `confirmedBoardEvidenceOrigin`, when it has one (only the confirmed-ids
+   * survivor does — see {@link originMatchesPriorClosure}). An unstamped survivor that carries an
+   * origin is fenced against it directly, the same comparison `originMatchesPriorClosure` makes,
+   * rather than falling back to the blunter `!current.reopened` (chatgpt-codex-connector, PR #284
+   * review, "Honor confirmation origins in the delivery resume path"): a standalone ticket confirmed
+   * while still open in an EARLIER lifecycle, then reopened and closed again in a later one, has
+   * `current.reopened` true regardless of whether that later close is the one the origin names —
+   * `!current.reopened` rejects it outright even when the origin proves it is the same episode,
+   * turning a genuinely delivered board-only resume into a needless (and, once nothing survives to
+   * re-diff, failing) regeneration.
+   */
+  origin?: string,
 ): boolean {
   if (ids.length === 0 || !ticketClosed) return true;
   if (current === undefined || !current.read) return false;
-  return storedClosure !== undefined ? storedClosure === current.closure : !current.reopened;
+  if (storedClosure !== undefined) return storedClosure === current.closure;
+  return origin !== undefined ? origin === current.priorClosure : !current.reopened;
 }
 
 /**
@@ -1322,11 +1335,16 @@ async function dispatchTicket(
       (staleConfirmedIds.length > 0 || stalePending.length > 0 || cleanupUnsyncedIds.length > 0)
         ? await mustReadClosureVersion(repo, ticket.id)
         : undefined;
+    // `origin` passed only for the confirmed-ids survivor (chatgpt-codex-connector, PR #284 review,
+    // "Honor confirmation origins in the delivery resume path") — the pending marker and cleanup
+    // obligation below carry no `confirmedBoardEvidenceOrigin` of their own, so they keep falling
+    // back to the coarser `!current.reopened` check inside `survivorTrustedForClosure`.
     const confirmedIdsTrusted = survivorTrustedForClosure(
       staleConfirmedIds,
       confirmedClosure,
       ticket.status === "closed",
       closureCheck,
+      confirmedClosure === undefined ? beads.confirmedBoardEvidenceOrigin(ticket) : undefined,
     );
     const pendingTrusted = survivorTrustedForClosure(
       stalePending,
@@ -1583,14 +1601,35 @@ async function dispatchTicket(
   // establishes the new cycle's own baseline.
   const confirmedClosure =
     doneOnBoard && ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
-  const confirmedForThisCycle =
-    doneOnBoard &&
-    isBoardOnlyRun(run, ticket) &&
-    beads.boardEvidenceConfirmed(ticket) &&
-    (ticket.status !== "closed" ||
-      (confirmedClosure === undefined
-        ? await originMatchesPriorClosure(repo, ticket)
-        : confirmedClosure === (await readCurrentClosureVersion(repo, ticket.id).catch(() => undefined))));
+  let confirmedForThisCycle =
+    doneOnBoard && isBoardOnlyRun(run, ticket) && beads.boardEvidenceConfirmed(ticket);
+  if (confirmedForThisCycle && ticket.status === "closed") {
+    if (confirmedClosure === undefined) {
+      confirmedForThisCycle = await originMatchesPriorClosure(repo, ticket);
+    } else {
+      // Retried via `mustReadClosureVersion`, not a bare `readCurrentClosureVersion(...)
+      // .catch(() => undefined)` (chatgpt-codex-connector, PR #284 review, "Retry closure reads
+      // before reopening confirmed work"): the bare read folded "bd history refused every attempt"
+      // into the same `undefined` a genuine closure mismatch produces, so a single transient
+      // history hiccup made this durably-confirmed, already-delivered ticket read as
+      // reopened-and-reclosed. The caller then reopened it for regeneration and ran it against a
+      // fresh baseline that already contains its delivered board writes — an idempotent agent finds
+      // no delta and fails with `NoDeliveryError`, turning a real delivery into a false one. An
+      // exhausted read halts the run instead of silently treating "unreadable" as "mismatched".
+      const read = await mustReadClosureVersion(repo, ticket.id);
+      if (!read.read) {
+        throw new PoisonEpic(
+          `${ticket.id} is confirmed delivered (board-only) against closure \`${confirmedClosure}\`, ` +
+            `but \`bd history\` could not be read (after retries) to check that still names the ` +
+            `ticket's current closure. Treating an unreadable closure as a mismatch would reopen ` +
+            `and regenerate an already-delivered ticket against a baseline that already contains ` +
+            `its writes, turning a real delivery into a false no-delivery failure. Check the beads ` +
+            `DB, then resume the run once the history read is healthy.`,
+        );
+      }
+      confirmedForThisCycle = confirmedClosure === read.closure;
+    }
+  }
   if (confirmedForThisCycle) {
     // The pending marker and preserved baseline that would normally carry these ids are the very
     // things `clearBoardEvidencePending` cleared when it set the confirmed flag — `bd.ts` persists

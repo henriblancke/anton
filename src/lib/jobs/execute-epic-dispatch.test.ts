@@ -1187,6 +1187,44 @@ describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x r
       expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
     },
   );
+
+  // chatgpt-codex-connector, PR #284 review, "Honor confirmation origins in the delivery resume
+  // path": a standalone board-only ticket confirmed while still OPEN in an earlier lifecycle stamps
+  // `origin` instead of `closure` (see `notedSatisfaction`'s "still trusts a confirmation written
+  // while the ticket was still open" shape). If that ticket is later reopened and delivered again in
+  // a SECOND lifecycle, `bd history` shows a reopen, so the pre-fix `!current.reopened` fallback
+  // rejected the confirmation outright — even though `origin` names exactly the closure right before
+  // the reopen, proving the confirmation belongs to this very history and not a stale one.
+  it(
+    "trusts an unstamped confirmed-evidence id set in the `if (delivery)` fast path when its " +
+      "origin matches the ticket's history, even though the ticket has since been reopened once",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], origin: "first-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true); // this branch already carries the attribution commit
+      historyMock.mockResolvedValue([
+        { hash: "second-close-sha", at: "2026-09-21T00:00:00.000Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-09-20T12:00:00.000Z", status: "open" },
+        { hash: "first-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        false,
+      );
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    },
+  );
 });
 
 // A board-only ticket closed and cleaned up on ANOTHER machine (its pending marker and preserved
@@ -1425,6 +1463,36 @@ describe("a board-only ticket durably confirmed delivered with no commit on this
       expect(dispatchedIds()).toEqual([]);
       expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
       expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+    },
+  );
+
+  // chatgpt-codex-connector, PR #284 review, "Retry closure reads before reopening confirmed work":
+  // a durably-confirmed, closed board-only ticket resuming on a machine with no attribution commit
+  // of its own for it must retry an unreadable `bd history` before trusting it as a genuine closure
+  // mismatch. A bare read that folds "history unreadable" and "history read but mismatched" into the
+  // same `undefined` would fall through to the regeneration path below — reopening and re-dispatching
+  // a ticket whose delivered board writes are already in a fresh baseline, so an idempotent agent
+  // finds nothing to do and the real delivery fails as undelivered.
+  it(
+    "halts instead of reopening a confirmed board-only delivery when its closure history is " +
+      "unreadable after retries, rather than treating that as a closure mismatch",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
     },
   );
 });
