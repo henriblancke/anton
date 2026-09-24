@@ -1538,6 +1538,12 @@ async function runGateFixSession(args: {
       // row `done` must not cost the caller `fixResult` above — swallowed here rather than thrown, so
       // this function still returns it instead of losing it to the same board-evidence gap this
       // comment opens with.
+      //
+      // The log append and `endSession` are in SEPARATE try/catches (PR #284 review, "End the fix
+      // session despite final log failures"): a single shared try meant a log write failure (full
+      // disk, unwritable session dir) jumped straight past `endSession`, leaving the session row
+      // stuck `running` forever — `pickAttachSession` prefers a `running` row, so the run UI would
+      // attach to this dead session instead of a later one.
       try {
         await appendSessionLog(
           logPath,
@@ -1561,6 +1567,13 @@ async function runGateFixSession(args: {
               `trusting evidence for a tree it is not reading\n`,
           );
         }
+      } catch (logError) {
+        console.error(
+          `[review-fix] round ${round}/${maxRounds}: session log append failed for ${target.id} after ` +
+            `a verified fix — settling the session anyway: ${String(logError)}`,
+        );
+      }
+      try {
         await endSession(db, clock, sessionId, "done");
       } catch (finalizeError) {
         console.error(
