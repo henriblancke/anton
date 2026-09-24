@@ -171,7 +171,7 @@ export async function loadAllIssues(
   const dangling = danglingBlockerIds(work);
   // Deduped rather than concatenated: a future bd that starts carrying gates in the ordinary
   // listing must not double them (and a test double answering both reads alike must not either).
-  const board = dangling.length === 0
+  let board = dangling.length === 0
     ? work
     : dedupeById([...work, ...await loadGateIssues(cwd, opts.strictGates ?? false, dangling)]);
   // Fetched AFTER `board` is fully assembled, not alongside `loadWorkIssues` (PR #274 review):
@@ -241,6 +241,17 @@ export async function loadAllIssues(
       );
     }
     return loadAllIssues(cwd, opts, attempt + 1);
+  }
+  // A cycle can be made entirely of gates no work bead's `blocks` edge dangles toward (e.g. two
+  // gates blocking each other with no ticket pointing at either) — `dangling` above stays empty,
+  // so `board` never loaded them. `cycleMembers` then can't map any id in that cycle to a bead on
+  // `board` and reports it as a synthetic, unscoped "board" fault that blocks every approval
+  // target instead of just the cycle's own subtree (P2 review, PR #274, issues.ts:176). Hydrate
+  // whatever the evidence names that `board` is still missing before pairing them.
+  const knownIds = new Set(board.map((b) => b.id));
+  const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
+  if (missingCycleIds.length > 0) {
+    board = dedupeById([...board, ...await loadGateIssues(cwd, opts.strictGates ?? false, missingCycleIds)]);
   }
   return attachCycleEvidence(board, cycles);
 }

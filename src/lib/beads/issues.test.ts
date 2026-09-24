@@ -271,15 +271,47 @@ describe("loadAllIssues", () => {
     listMock
       .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
       .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
-      .mockImplementationOnce(async () => [repaired, other]); // retry's work read — no blocks edge left
+      .mockImplementationOnce(async () => [repaired, other]) // retry's work read — no blocks edge left
+      .mockImplementationOnce(async () => []); // retry's gate hydration read — t-9 isn't a gate either
     cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
 
     const board = await loadAllIssues(REPO, { withCycles: true });
 
     expect(board).toEqual([repaired, other]);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
-    expect(listMock).toHaveBeenCalledTimes(3);
+    expect(listMock).toHaveBeenCalledTimes(4);
     expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("hydrates gate members a cycle names when no work bead's edge dangles toward them (P2 review, PR #274, issues.ts:176)", async () => {
+    // Two gates blocking each other with no ticket pointing at either: `dangling` stays empty, so the
+    // ordinary load never reaches for the gate listing at all. Without hydrating what `cycles` itself
+    // names, `cycleMembers` can't map either id and reports a synthetic, unscoped "board" fault that
+    // blocks every approval target instead of just this cycle's own (empty) subtree.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
   });
 
   it("catches a gate-owned edge that moves between the cycles fetch and the recheck, not just a work-owned one (P2 badge review, issues.ts:224)", async () => {
