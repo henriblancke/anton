@@ -269,6 +269,34 @@ describe("validateBoardStructure", () => {
       expect(violations[0].message).toContain("g2");
     });
 
+    it("ignores a cycle made entirely of closed (historical) beads (P2 review, PR #274)", () => {
+      // Neither `t1` nor `t2` is closed's live, so the per-bead loop skips both (`isJudged` is false
+      // for closed beads too) — but unlike the gates/molecules case above, there is no LIVE edge left
+      // on this loop to deadlock anything. A closed bead's `blocks` edge no longer holds anyone back.
+      const board = [
+        task("t1", undefined, { status: "closed", dependencies: [blocks("t1", "t2")] }),
+        task("t2", undefined, { status: "closed", dependencies: [blocks("t2", "t1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }],
+      });
+      expect(violations).toEqual([]);
+    });
+
+    it("still faults a cycle mixing a closed bead with a live gate (live edge remains)", () => {
+      const board = [
+        task("t1", undefined, { status: "closed", dependencies: [blocks("t1", "g1")] }),
+        bead("g1", "gate", { dependencies: [blocks("g1", "t1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["t1", "g1"], raw: { cycle: ["t1", "g1"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule, v.severity])).toEqual([
+        ["t1", "blocks-cycle", "blocking"],
+        ["g1", "blocks-cycle", "blocking"],
+      ]);
+    });
+
     it("still faults the judged member, not the board, when only one side of the cycle is a gate", () => {
       const board = [
         task("t1", undefined, { dependencies: [blocks("t1", "g1")] }),

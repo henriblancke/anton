@@ -275,10 +275,12 @@ export const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["ap
  * result with a `board` whose edges no longer describe it would poison that shared snapshot: every
  * later `cycleEvidenceFor(board) === undefined` check elsewhere (`allIssues`/`readAllIssues`'s own
  * enrichment) would then see evidence already present and skip re-fetching, serving a stale pairing
- * until unrelated content changes it. Re-list and compare before attaching, exactly like every other
- * cycle-evidence consumer in this codebase (`issues.ts`'s `attachCyclesBestEffort`/
- * `ensureCycleEvidence`, `shadow.ts`'s own read, which this mirrors) — gated on `board` actually
- * carrying a `blocks` edge, since an edge-free board has no cyclic pair that could be stale.
+ * until unrelated content changes it. Re-list and compare before attaching, exactly like `shadow.ts`'s
+ * own read — even when `board` itself starts edge-free, since that only describes the read that
+ * already happened, not whether a writer added the FIRST edge during this gap. Skipping the recheck
+ * on an edge-free `board` (as `issues.ts`'s `attachCyclesBestEffort`/`ensureCycleEvidence` still do
+ * for their own, differently-shaped callers) would let a cycle that only exists because of that new
+ * edge get attached to a board snapshot that predates it.
  */
 async function withCycleEvidenceIfNeeded(
   repo: string,
@@ -288,8 +290,7 @@ async function withCycleEvidenceIfNeeded(
   if (!CYCLE_AWARE_MOVES.has(plan.move)) return board;
   try {
     const cycles = await beads.depCycles(repo);
-    const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-    const consistent = !boardHasBlocksEdge || sameBlocksEdges(board, await loadAllIssues(repo));
+    const consistent = sameBlocksEdges(board, await loadAllIssues(repo));
     if (!consistent) {
       console.warn(
         `[gardener.apply] ${repo}: board moved between the board read and cycle evidence while ` +

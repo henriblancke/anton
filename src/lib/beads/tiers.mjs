@@ -341,6 +341,13 @@ export function validateBoardStructure(board, { cycles } = {}) {
   // reporting it. Complete cycles only — an incomplete one is already covered by the unreadable-cycle
   // fallback below, and double-reporting it would fault the same bd record twice.
   //
+  // Gated on LIVE membership, not judged membership: a live gate/molecule is exactly the case this
+  // fallback exists to catch (its cycle is real — it still deadlocks dispatch), but it is `!isJudged`
+  // same as a closed or abandoned bead. Testing `isJudged` here would treat "no judged member" as
+  // "nothing live", so a cycle made entirely of CLOSED/abandoned beads — pure history, no live edge
+  // left to deadlock anything — would fault right alongside a live gates/molecules loop. Testing
+  // `isLive` instead keeps the live-pipeline case faulting while a historical-only cycle goes quiet.
+  //
   // Faulted at EACH member's own id, not the synthetic "board" id: every member here is a mapped,
   // known bead (that is what "complete" means), so — unlike the unreadable-cycle fallback below,
   // which has no members to name — `structureGaps`'s subtree scoping can and should apply. Faulting
@@ -348,6 +355,8 @@ export function validateBoardStructure(board, { cycles } = {}) {
   // unrelated run B that shares no subtree with the cycle simply because run A's gates/molecules loop.
   for (const evidence of allCycles) {
     if (!evidence.complete) continue;
+    const hasLiveMember = [...evidence.members].some((id) => isLive(byId.get(id)));
+    if (!hasLiveMember) continue;
     const hasJudgedMember = [...evidence.members].some((id) => isJudged(byId.get(id)));
     if (hasJudgedMember) continue;
     for (const id of evidence.members) {
@@ -356,10 +365,10 @@ export function validateBoardStructure(board, { cycles } = {}) {
         "blocks-cycle",
         "blocking",
         `bd dep cycles reported a blocks cycle with no judged member (${[...evidence.members].join(", ")}) ` +
-          "— every id is closed, abandoned, or a pipeline gate/molecule, so no bead on it ever reaches " +
-          "the per-bead check, yet the loop still deadlocks whatever depends on it. Break one edge on it " +
-          "(`bd dep remove <blocked> <blocker>`), then restore the intended order " +
-          "(`bd dep add <blocked> <blocker>`).",
+          "— every id is a live pipeline gate/molecule (closed and abandoned ids in the same cycle " +
+          "carry no live edge), so no bead on it ever reaches the per-bead check, yet the loop still " +
+          "deadlocks whatever depends on it. Break one edge on it (`bd dep remove <blocked> <blocker>`), " +
+          "then restore the intended order (`bd dep add <blocked> <blocker>`).",
       );
     }
   }

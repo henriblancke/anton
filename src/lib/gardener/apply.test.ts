@@ -983,6 +983,26 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/cycle-free/);
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
+
+    // P2 review (PR #274, round 23): the guard above used to skip the re-list entirely when `board`
+    // itself carried no `blocks` edge, reasoning an edge-free board has no cyclic pair that could be
+    // stale. That reasoning only describes the read that already happened — a writer can land the
+    // FIRST blocking edge in the gap between this board read and `bd dep cycles` settling, and the
+    // fresh cycle evidence would then get attached to a board that predates it. `shadow.ts` never
+    // took that shortcut; this proves `withCycleEvidenceIfNeeded` no longer does either.
+    it("refuses when the board gains its first blocks edge in the gap, even though it started edge-free", async () => {
+      const board = [startable({ labels: [LABELS.approved] }), bead("anton-x")];
+      listByFlags(async () => [startable({ labels: [LABELS.approved] }), blockedBy("anton-x", "anton-y"), bead("anton-y")]);
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
   });
 
   /**
