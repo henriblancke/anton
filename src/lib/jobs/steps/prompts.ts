@@ -545,6 +545,86 @@ function satisfiedByLine(by: SatisfiedSettlement): string {
 }
 
 /**
+ * Stable HTML-comment markers around the one region of a PR body anton owns (anton-gkjb6). HTML
+ * comments render invisibly on GitHub, so they cost nothing to leave in a body a human reads, and
+ * they survive a body a human has otherwise edited by hand — everything outside them is the
+ * narrative, and a refresh must never touch it.
+ */
+export const BODY_REGION_START = "<!-- anton:region:start -->";
+export const BODY_REGION_END = "<!-- anton:region:end -->";
+
+/** Keeps one oversized region from bloating a PR body past what a reviewer will actually read. */
+const MAX_BODY_REGION_CHARS = 4000;
+
+function truncateRegion(content: string): string {
+  const trimmed = content.trim();
+  if (trimmed.length <= MAX_BODY_REGION_CHARS) return trimmed;
+  return `${trimmed.slice(0, MAX_BODY_REGION_CHARS)}\n… [truncated]`;
+}
+
+function renderRegion(content: string): string {
+  return `${BODY_REGION_START}\n${truncateRegion(content)}\n${BODY_REGION_END}`;
+}
+
+function occurrences(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+/** The line `prBody` appends last; a fresh region is inserted above it rather than at the very end. */
+const FOOTER_PREFIX = "🤖 Generated with [anton]";
+
+function appendRegion(body: string, content: string): string {
+  const region = renderRegion(content);
+  const lines = body.split("\n");
+  const footerIdx = lines.findIndex((line) => line.startsWith(FOOTER_PREFIX));
+  if (footerIdx === -1) return [body.replace(/\n+$/, ""), "", region].join("\n");
+  const before = lines.slice(0, footerIdx);
+  while (before[before.length - 1] === "") before.pop();
+  return [...before, "", region, "", ...lines.slice(footerIdx)].join("\n");
+}
+
+export interface BodyRegionUpdate {
+  body: string;
+  /** True when a malformed or partial marker pair made the region unsafe to touch. */
+  skipped: boolean;
+}
+
+/**
+ * Rewrites only the region of `body` anton owns, leaving every byte outside
+ * {@link BODY_REGION_START}/{@link BODY_REGION_END} untouched (anton-gkjb6). An unmarked body gets the
+ * region appended once, directly above the anton footer, so the first render and every refresh after
+ * it converge on one region rather than accumulating copies.
+ *
+ * A marker pair that is not exactly one well-formed `start … end` span — one of the two missing, more
+ * than one of either, or a stray `start` appearing again before the matching `end` (nested) — is left
+ * exactly as found. Matching the outermost pair greedily could swallow content a human placed between
+ * two unrelated marker-shaped strings, and re-marking a partially hand-edited body would silently
+ * discard whatever the edit was. `skipped: true` tells the caller to leave the PR body alone; this
+ * also logs once so a run doesn't quietly stop updating its own region forever.
+ */
+export function upsertBodyRegion(body: string, content: string): BodyRegionUpdate {
+  const startCount = occurrences(body, BODY_REGION_START);
+  const endCount = occurrences(body, BODY_REGION_END);
+
+  if (startCount === 0 && endCount === 0) {
+    return { body: appendRegion(body, content), skipped: false };
+  }
+
+  const startIdx = body.indexOf(BODY_REGION_START);
+  const endIdx = body.indexOf(BODY_REGION_END);
+  const wellFormed = startCount === 1 && endCount === 1 && startIdx < endIdx;
+  if (!wellFormed) {
+    console.warn(
+      `[pr-body-region] malformed marker pair (start=${startCount}, end=${endCount}) — leaving the body untouched`,
+    );
+    return { body, skipped: true };
+  }
+
+  const rewritten = body.slice(0, startIdx) + renderRegion(content) + body.slice(endIdx + BODY_REGION_END.length);
+  return { body: rewritten, skipped: false };
+}
+
+/**
  * The context appended beneath the describer's reasoning contract (anton-aucch): the run target,
  * every ticket with its contract, and the diff under description — plus the reporting format the
  * narrative is parsed back out of (`parseNarrativeReport` in `steps/describe.ts`).
