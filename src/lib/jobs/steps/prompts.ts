@@ -570,6 +570,20 @@ function occurrences(haystack: string, needle: string): number {
   return haystack.split(needle).length - 1;
 }
 
+/**
+ * The region's first line — a heading like `### Review-fix rounds` — stays the same across every
+ * refresh even as the rest of `content` accumulates. It is the one part of a rendered region a
+ * marker-stripping edit would still leave recognisable.
+ */
+function headingLine(content: string): string | undefined {
+  return content.trim().split("\n")[0]?.trim() || undefined;
+}
+
+/** Whether `line` already appears verbatim as a whole line somewhere in `body`. */
+function bodyHasLine(body: string, line: string): boolean {
+  return body.split("\n").some((candidate) => candidate.trim() === line);
+}
+
 /** The line `prBody` appends last; a fresh region is inserted above it rather than at the very end. */
 const FOOTER_PREFIX = "🤖 Generated with [anton]";
 
@@ -601,12 +615,27 @@ export interface BodyRegionUpdate {
  * two unrelated marker-shaped strings, and re-marking a partially hand-edited body would silently
  * discard whatever the edit was. `skipped: true` tells the caller to leave the PR body alone; this
  * also logs once so a run doesn't quietly stop updating its own region forever.
+ *
+ * Zero markers is ambiguous by itself: it is both "this body has never had a region" (append) and
+ * "a human hand-deleted just the two marker comments, leaving the region's visible content behind"
+ * (skip — the markers are gone, so there is no safe span left to rewrite). The two are told apart by
+ * `content`'s heading line, which stays stable across refreshes even as the rest of the region's text
+ * accumulates: if that line is already sitting in `body` unmarked, the region was here before and its
+ * markers are the part that went missing, so the append branch is skipped in favour of leaving the
+ * body — and the orphaned heading — untouched, same as any other unsafe marker state.
  */
 export function upsertBodyRegion(body: string, content: string): BodyRegionUpdate {
   const startCount = occurrences(body, BODY_REGION_START);
   const endCount = occurrences(body, BODY_REGION_END);
 
   if (startCount === 0 && endCount === 0) {
+    const heading = headingLine(content);
+    if (heading && bodyHasLine(body, heading)) {
+      console.warn(
+        `[pr-body-region] no markers found, but the body already contains "${heading}" — leaving the body untouched rather than guessing where a hand-deleted region went`,
+      );
+      return { body, skipped: true };
+    }
     return { body: appendRegion(body, content), skipped: false };
   }
 

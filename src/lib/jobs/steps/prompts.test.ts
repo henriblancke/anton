@@ -659,6 +659,28 @@ describe("upsertBodyRegion (anton-gkjb6)", () => {
     expect(after(twice)).toBe(after(once));
   });
 
+  it("skips and logs rather than guessing when both markers were hand-deleted but the region's visible content remains", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const handEdited = [
+      "Narrative.",
+      "",
+      "### Review-fix rounds",
+      "",
+      "- 2026-09-20: fixed A",
+      "",
+      body,
+    ].join("\n");
+    const content = "### Review-fix rounds\n\n- 2026-09-20: fixed A\n- 2026-09-23: fixed B";
+
+    const result = upsertBodyRegion(handEdited, content);
+
+    expect(result).toEqual({ body: handEdited, skipped: true });
+    expect(warn).toHaveBeenCalledOnce();
+    // The original history survives untouched — no second heading was appended above it.
+    expect(handEdited.match(/### Review-fix rounds/g)).toHaveLength(1);
+    warn.mockRestore();
+  });
+
   it("skips and logs rather than guessing when the closing marker was hand-deleted", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const halfMarked = `Some narrative.\n\n${BODY_REGION_START}\nold content\n\n${body}`;
