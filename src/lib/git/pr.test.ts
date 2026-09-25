@@ -29,6 +29,7 @@ function pr(overrides: Partial<PrReview> = {}): PrReview {
     reviewDecision: null,
     mergeable: null,
     headRefName: "anton/epic-1",
+    headSha: "sha1",
     url: "https://github.com/o/r/pull/7",
     reviews: [],
     failingChecks: [],

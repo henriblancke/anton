@@ -627,4 +627,82 @@ process.stdin.on('end',()=>{
       restore();
     }
   });
+
+  /**
+   * anton-bzm7s: a red gate re-dispatched every scheduled pass. Before this fix, `parked` sat
+   * outside the dispatcher's dedupe entirely, so the scheduled 15-minute poll spent a fresh attempt
+   * budget on the SAME doomed PR head every pass — 106 re-runs of one real PR in two days, each
+   * re-running the whole lint/typecheck/build gate suite. Two dispatcher passes over a target whose
+   * only job is parked at the current PR head must produce ONE job total, not two — and a THIRD pass,
+   * after the PR head has moved, must admit a fresh attempt.
+   */
+  it("does not re-dispatch a target whose job is parked at the current PR head; admits one once the head moves", async () => {
+    const parkEpic = await beads.create(repo, {
+      title: "Feature stuck behind a red gate",
+      type: "epic",
+      description: "## Goal\nRed gate.",
+    });
+    const parkBranch = `anton/${parkEpic}`;
+    const g = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, stdio: "ignore" });
+    g(["checkout", "-q", "-b", parkBranch]);
+    writeFileSync(join(repo, "park.txt"), "v1\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "park work"]);
+    g(["push", "-q", "-u", "origin", parkBranch]);
+    g(["checkout", "-q", "main"]);
+    await beads.tag(repo, parkEpic, [LABELS.stage("in-review")]);
+    await beads.setPrRef(repo, parkEpic, "gh-11");
+
+    // Always actionable (CHANGES_REQUESTED); the head SHA it reports comes from FAKE_PARK_HEAD, so
+    // the test can move it like a real push would.
+    const parkGh = writeBin(
+      binDir,
+      "gh-park-head",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){console.log(JSON.stringify({number:11,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:'${parkBranch}',headRefOid:process.env.FAKE_PARK_HEAD,url:'u',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}],statusCheckRollup:[]}));process.exit(0);}
+if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));process.exit(0);}
+process.exit(0);`,
+    );
+
+    const restore = saveEnv(["ANTON_GH_BIN", "FAKE_PARK_HEAD"]);
+    process.env.ANTON_GH_BIN = parkGh;
+    process.env.FAKE_PARK_HEAD = "sha-old";
+    const jobsForParkEpic = () =>
+      tdb.db
+        .select()
+        .from(schema.jobs)
+        .where(eq(schema.jobs.type, "review-fix-pr"))
+        .all()
+        .filter((j) => JSON.parse(j.payloadJson).epicBeadId === parkEpic);
+
+    try {
+      // Pass 1: nothing covers the target yet — one job is dispatched.
+      await runDispatch(parkEpic);
+      let jobs = jobsForParkEpic();
+      expect(jobs).toHaveLength(1);
+      const parkedId = jobs[0].id;
+
+      // The gate parks it (anton-h0hwc's PoisonError path — simulated directly here since what
+      // parks a job is out of this ticket's scope).
+      tdb.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, parkedId)).run();
+
+      // Pass 2: same PR head — the parked job suppresses a fresh enqueue. Still one job, still parked.
+      await runDispatch(parkEpic);
+      jobs = jobsForParkEpic();
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0].id).toBe(parkedId);
+      expect(jobs[0].status).toBe("parked");
+
+      // New commits land on the PR — the head moves. Pass 3 must admit the retry that could now
+      // actually act on it.
+      process.env.FAKE_PARK_HEAD = "sha-new";
+      await runDispatch(parkEpic);
+      jobs = jobsForParkEpic();
+      expect(jobs).toHaveLength(2);
+      expect(jobs.some((j) => j.status === "queued")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
 });

@@ -330,6 +330,11 @@ async function openRunRow(args: {
   // reason (anton-tebf): the repair weigher orders a failure against when its attempt began, and a
   // `dep-missing` repair parks the run it repaired — so a row still claiming the original start
   // would price the resumed attempt's failure as if it predated the repair.
+  //
+  // The interval that rewrite DISCARDS is what `run_attempts` keeps (anton-rnrdr): `updateRun` reads
+  // `attemptStartedAt` as the signal that a new attempt has begun and appends a row for it, having
+  // already closed the previous one when its park settled. So this column keeps its meaning and the
+  // earlier intervals survive beside it — nothing here changes, which is the point.
   await updateRun(db, clock, runId, {
     status: "running",
     jobId: ctx.jobId,

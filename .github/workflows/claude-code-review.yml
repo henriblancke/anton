@@ -76,6 +76,10 @@ jobs:
       # evidently didn't cover every path into this crash. If this still recurs on 2.1.282,
       # the fix is likely upstream of what changelog entries alone can diagnose — consider
       # turning on `show_full_output: true` to capture the real crash detail next time.
+      # Recurred again on PR #326, same run — is_error:true, num_turns:1, total_cost_usd:0,
+      # 425ms, no findings unrelated to that PR's own diff, still on 2.1.282. Following this
+      # comment's own instruction: bump before assuming it's the PR's fault — but there is no
+      # further changelog entry yet to bump to, so this one stays open.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
