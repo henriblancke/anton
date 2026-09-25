@@ -65,6 +65,7 @@ function run(o: Partial<RunRow> = {}): RunRow {
     leaseExpiresAt: null,
     error: "usage-limit",
     structuralError: null,
+    lastGateFailure: null,
     startedAt: secDate(NOW - 4 * HOUR),
     attemptStartedAt: secDate(NOW - 4 * HOUR),
     endedAt: null,

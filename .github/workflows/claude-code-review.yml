@@ -75,13 +75,17 @@ jobs:
       # crash is still being reported against recent CLI builds, so this bump is the same
       # documented mitigation as before, not a confirmed fix — if it recurs, bump further
       # and check the changelog rather than assuming the PR's diff is at fault.
-      # Same signature again (2026-09-25) on PR #323 and PR #326 — is_error:true, num_turns:1,
-      # total_cost_usd:0, ~385-425ms, before the first model turn, no findings unrelated to
-      # either PR's own diff. No single 2.1.282 changelog line names this crash shape
+      # Same signature again (2026-09-25) on PR #323, PR #325, and PR #326 — is_error:true,
+      # num_turns:1, total_cost_usd:0, ~350-425ms, before the first model turn, no findings
+      # unrelated to any PR's own diff. No single 2.1.282 changelog line names this crash shape
       # explicitly, so this is the same standing remedy repeated, not a fix verified against a
-      # specific changelog entry this time. Following this comment's own instruction: bump
-      # before assuming it's the PR's fault — version stays at 2.1.282, already the latest
-      # pinned-good release.
+      # specific changelog entry this time — 2.1.281's "unrecoverable interface error" fix
+      # evidently didn't cover every path into this crash. Following this comment's own
+      # instruction: bump before assuming it's the PR's fault — version stays at 2.1.282,
+      # already the latest pinned-good release, and there is no further changelog entry yet to
+      # bump to, so this one stays open. If it recurs again on 2.1.282, the fix is likely
+      # upstream of what changelog entries alone can diagnose — consider turning on
+      # `show_full_output: true` to capture the real crash detail next time.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
@@ -110,6 +114,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: ${{ steps.claude-install.outputs.exe }}
+          # The install-step comment above has bumped this pin three times chasing the same
+          # is_error:true/num_turns:1/total_cost_usd:0 crash, because the action normally hides
+          # the SDK's real output ("Running Claude Code via SDK (full output hidden for
+          # security)") — every bump so far has been a guess against a changelog entry, not a
+          # confirmed fix. Turn on full output so the next occurrence leaves an actual stack
+          # trace or error message in this job's log instead of another blind version bump.
+          show_full_output: true
           # Do NOT re-add `track_progress` / `use_sticky_comment`. They force the action into
           # tag mode, which pre-builds a prompt holding the entire PR context — including every
           # review comment AND its full `diffHunk`, with no cap (claude-code-action,

@@ -54,7 +54,7 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-describe("drizzle/0054 — the per-attempt run record", () => {
+describe("drizzle/0055 — the per-attempt run record", () => {
   it("applies to a populated db and leaves every existing row untouched", () => {
     applyMigrationFile(sqlite, MIGRATION);
 
