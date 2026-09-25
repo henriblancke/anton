@@ -48,10 +48,13 @@
  * while claiming to be wall time including retries — understating precisely the runs that struggled
  * most, which is the opposite of what anyone asks wall time for.
  *
- * **What would unblock it:** a per-attempt record — a `run_attempts` row (run id, attempt number,
- * started, ended, outcome), append-only, the same shape as `claude_invocations`. Filed as its own
- * bead rather than smuggled into this fold. Until that lands, no field here carries wall time and no
- * caller can render a wrong one.
+ * **What unblocks it, and has now landed:** the per-attempt record — a `run_attempts` row (run id,
+ * attempt number, started, ended, outcome), append-only, the same shape as `claude_invocations`
+ * (anton-rnrdr, `run-attempts.ts`). `attemptWallMs` folds one run's rows into its wall time including
+ * retries. It is deliberately NOT read here yet: this fold's own bead owns what the ledger reports,
+ * and the record carries no history for the runs that settled before it existed — so adopting it is a
+ * separate decision about a figure that would be present for recent features and absent for older
+ * ones. Until that decision, no field here carries wall time and no caller can render a wrong one.
  *
  * The rejected alternative was reporting the last attempt's duration as `lastAttemptMs`. It is a
  * third number nobody asked for, and its RESEMBLANCE to wall time is the trap: a plausible wrong
