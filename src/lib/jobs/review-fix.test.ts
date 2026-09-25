@@ -268,6 +268,7 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     reviewDecision: "APPROVED",
     mergeable: "MERGEABLE",
     headRefName: `anton/pr-${number}`,
+    headSha: `sha-${number}`,
     url: `https://example.test/pull/${number}`,
     reviews: [],
     failingChecks: [],
@@ -340,6 +341,49 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     await dispatch();
     await dispatch();
     expect(dispatchedTargets()).toEqual(["e-1"]);
+  });
+
+  // anton-bzm7s: a parked job at the SAME head must suppress re-dispatch — and the pass's own note
+  // must let an operator tell that suppressed target apart from a merely-idle one (a clean PR that
+  // never reaches this branch at all, and so never contributes to either count).
+  it("suppresses a target parked at the current PR head, and says so distinctly from an idle target", async () => {
+    listMock.mockResolvedValue([target("e-1", 1), target("e-2", 2)]);
+    getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
+      number === 1 ? openPr(1, { reviewDecision: "CHANGES_REQUESTED" }) : openPr(2), // e-2 stays clean
+    );
+
+    await dispatch();
+    t.db
+      .update(schema.jobs)
+      .set({ status: "parked" })
+      .where(eq(schema.jobs.type, "review-fix-pr"))
+      .run();
+
+    const job = await getJob(t.db, await dispatch());
+    expect(dispatchedTargets()).toEqual(["e-1"]); // still the one row from the first pass
+    expect(job?.outcomeNote).toBe(
+      "examined 2 PR(s) in review, dispatched 0, suppressed 1 (parked, unchanged head)",
+    );
+  });
+
+  it("admits a fresh job once the PR head SHA moves past a parked attempt", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    t.db
+      .update(schema.jobs)
+      .set({ status: "parked" })
+      .where(eq(schema.jobs.type, "review-fix-pr"))
+      .run();
+
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, { reviewDecision: "CHANGES_REQUESTED", headSha: "sha-new" }),
+    );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
   });
 
   // One unreadable PR must not cost the others their dispatch — but the failure still surfaces, so
@@ -429,6 +473,7 @@ process.exit(0);
       reviewDecision: "CHANGES_REQUESTED",
       mergeable: "MERGEABLE",
       headRefName: "anton/epic-1",
+      headSha: "sha1",
       url: "https://github.com/o/r/pull/7",
       reviews: [],
       failingChecks: [],
