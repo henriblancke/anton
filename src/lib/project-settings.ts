@@ -176,6 +176,20 @@ export interface ProjectSettings {
    */
   reviewLowScoreRounds?: number;
   /**
+   * Churn threshold, in changed lines, above which {@link reviewChurnRoundFloor} applies
+   * (anton-ecdl / anton-z8uv) — a run whose diff exceeds it cannot exit the gate clean on a single
+   * round. Below it a clean round 1 still exits in one round; there is no added cost on small diffs.
+   * Absent → DEFAULT_REVIEW_CHURN_THRESHOLD_LINES.
+   */
+  reviewChurnThresholdLines?: number;
+  /**
+   * Minimum rounds a run above {@link reviewChurnThresholdLines} must clear before the gate can exit
+   * clean (anton-z8uv) — never pushes the loop past {@link reviewMaxRounds}. `0` turns the floor off
+   * outright — the single knob for an operator who would rather anton exited large diffs as fast as
+   * small ones. Absent → DEFAULT_REVIEW_CHURN_ROUND_FLOOR.
+   */
+  reviewChurnRoundFloor?: number;
+  /**
    * How many runs in a row ending parked, failed, or abandoned disarm the picker for this project
    * (anton-rgso / R4.4). A delivered run resets the count; a run an operator CANCELLED is not
    * counted at all. `0` turns the breaker off outright — the single knob for an operator who would
@@ -514,6 +528,20 @@ export const DEFAULT_REVIEW_MIN_SCORE = 5;
 /** Twice is a trend, once is a round the fix loop exists to answer. */
 export const DEFAULT_REVIEW_LOW_SCORE_ROUNDS = 2;
 /**
+ * Changed-lines threshold for the large-diff round floor (anton-ecdl), read off the Audit of the
+ * last 40 anton-spawned PRs (703 external findings from chatgpt-codex-connector + claude bots
+ * across 4 repos): 31 of 40 PRs sat under ~4,400 changed lines and drew a median of 1 external
+ * finding, while the 9 above it drew a median of 33. The cliff sits at ~4,400, so that is the floor.
+ */
+export const DEFAULT_REVIEW_CHURN_THRESHOLD_LINES = 4_400;
+/**
+ * Minimum rounds a run above {@link DEFAULT_REVIEW_CHURN_THRESHOLD_LINES} must clear before the
+ * gate can exit clean (anton-z8uv). Two — the audit's above-threshold cohort demonstrably lacked a
+ * second, fresh-context look: PR #238 (+13,507/-273) exited clean on round 1 and then took 73 P1
+ * findings from external review over 77 hours.
+ */
+export const DEFAULT_REVIEW_CHURN_ROUND_FLOOR = 2;
+/**
  * Three is the smallest count that can only be a pattern. One failure is a hard ticket; two in a row
  * is bad luck often enough that disarming on it would train an operator to re-arm without reading.
  */
@@ -585,6 +613,13 @@ export const REVIEW_MAX_ROUNDS_RANGE = { min: 1, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression alarm off. */
 export const REVIEW_MIN_SCORE_RANGE = { min: 0, max: 10 } as const;
 export const REVIEW_LOW_SCORE_ROUNDS_RANGE = { min: 1, max: 5 } as const;
+/** 1 changed line … 1,000,000. No off-switch here — `reviewChurnRoundFloor`'s 0 is the off switch. */
+export const REVIEW_CHURN_THRESHOLD_LINES_RANGE = { min: 1, max: 1_000_000 } as const;
+/**
+ * `0` is in range on purpose: it is how the operator turns the large-diff round floor off. The
+ * ceiling matches {@link REVIEW_MAX_ROUNDS_RANGE}'s — a floor above the round cap could never bind.
+ */
+export const REVIEW_CHURN_ROUND_FLOOR_RANGE = { min: 0, max: 5 } as const;
 /** `0` is in range on purpose: it is how the operator turns the consecutive-failure breaker off. */
 export const AUTOPILOT_FAILURE_STREAK_RANGE = { min: 0, max: 10 } as const;
 /** `0` is in range on purpose: it is how the operator turns the score-regression breaker off. */
@@ -606,6 +641,19 @@ export interface ReviewConfig {
    * `reviewMinScore` of 0.
    */
   scoreAlarm?: ScoreAlarm;
+  /**
+   * The large-diff round floor (anton-ecdl / anton-z8uv); absent when the operator turned it off
+   * with a `reviewChurnRoundFloor` of 0.
+   */
+  churnRoundFloor?: ChurnRoundFloor;
+}
+
+/** The large-diff round floor's resolved shape (anton-ecdl) — never partial when present. */
+export interface ChurnRoundFloor {
+  /** Changed-lines threshold above which {@link minRounds} applies. */
+  thresholdLines: number;
+  /** Minimum rounds the run must clear before the gate can exit clean. */
+  minRounds: number;
 }
 
 /**
@@ -615,6 +663,8 @@ export interface ReviewConfig {
  */
 export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
   const minScore = settings.reviewMinScore ?? DEFAULT_REVIEW_MIN_SCORE;
+  const churnRoundFloorMinRounds =
+    settings.reviewChurnRoundFloor ?? DEFAULT_REVIEW_CHURN_ROUND_FLOOR;
   return {
     enabled: settings.reviewEnabled ?? true,
     agent: settings.reviewAgent || undefined,
@@ -627,6 +677,17 @@ export function resolveReviewConfig(settings: ProjectSettings): ReviewConfig {
           scoreAlarm: {
             minScore,
             rounds: settings.reviewLowScoreRounds ?? DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+          },
+        }
+      : {}),
+    // Same seam as scoreAlarm above: absent rather than a floor of 0, so the gate reads "no floor"
+    // as a shape instead of having to know that 0 is the off switch.
+    ...(churnRoundFloorMinRounds > 0
+      ? {
+          churnRoundFloor: {
+            thresholdLines:
+              settings.reviewChurnThresholdLines ?? DEFAULT_REVIEW_CHURN_THRESHOLD_LINES,
+            minRounds: churnRoundFloorMinRounds,
           },
         }
       : {}),

@@ -20,6 +20,8 @@ let resolveReviewConfig: typeof import("./projects").resolveReviewConfig;
 let DEFAULT_REVIEW_MAX_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_MAX_ROUNDS;
 let DEFAULT_REVIEW_MIN_SCORE: typeof import("./projects").DEFAULT_REVIEW_MIN_SCORE;
 let DEFAULT_REVIEW_LOW_SCORE_ROUNDS: typeof import("./projects").DEFAULT_REVIEW_LOW_SCORE_ROUNDS;
+let DEFAULT_REVIEW_CHURN_THRESHOLD_LINES: typeof import("./projects").DEFAULT_REVIEW_CHURN_THRESHOLD_LINES;
+let DEFAULT_REVIEW_CHURN_ROUND_FLOOR: typeof import("./projects").DEFAULT_REVIEW_CHURN_ROUND_FLOOR;
 let budgetPolicySchema: typeof import("./projects").budgetPolicySchema;
 let resolveProjectBudgetPolicy: typeof import("./projects").resolveProjectBudgetPolicy;
 let resolveBudgetPolicy: typeof import("./projects").resolveBudgetPolicy;
@@ -60,6 +62,8 @@ beforeAll(async () => {
   DEFAULT_REVIEW_MAX_ROUNDS = mod.DEFAULT_REVIEW_MAX_ROUNDS;
   DEFAULT_REVIEW_MIN_SCORE = mod.DEFAULT_REVIEW_MIN_SCORE;
   DEFAULT_REVIEW_LOW_SCORE_ROUNDS = mod.DEFAULT_REVIEW_LOW_SCORE_ROUNDS;
+  DEFAULT_REVIEW_CHURN_THRESHOLD_LINES = mod.DEFAULT_REVIEW_CHURN_THRESHOLD_LINES;
+  DEFAULT_REVIEW_CHURN_ROUND_FLOOR = mod.DEFAULT_REVIEW_CHURN_ROUND_FLOOR;
   budgetPolicySchema = mod.budgetPolicySchema;
   resolveProjectBudgetPolicy = mod.resolveProjectBudgetPolicy;
   resolveBudgetPolicy = mod.resolveBudgetPolicy;
@@ -211,7 +215,7 @@ describe("resolvePushTimeoutMs (anton-n93lo)", () => {
 });
 
 describe("resolveReviewConfig (anton-of1m)", () => {
-  it("is ON with the default round cap and score alarm when nothing is configured", () => {
+  it("is ON with the default round cap, score alarm and churn round floor when nothing is configured", () => {
     expect(resolveReviewConfig({})).toEqual({
       enabled: true,
       agent: undefined,
@@ -220,6 +224,10 @@ describe("resolveReviewConfig (anton-of1m)", () => {
       scoreAlarm: {
         minScore: DEFAULT_REVIEW_MIN_SCORE,
         rounds: DEFAULT_REVIEW_LOW_SCORE_ROUNDS,
+      },
+      churnRoundFloor: {
+        thresholdLines: DEFAULT_REVIEW_CHURN_THRESHOLD_LINES,
+        minRounds: DEFAULT_REVIEW_CHURN_ROUND_FLOOR,
       },
     });
   });
@@ -260,6 +268,25 @@ describe("resolveReviewConfig (anton-of1m)", () => {
     expect(resolveReviewConfig({ reviewMinScore: 0 }).scoreAlarm).toBeUndefined();
     // The streak length is still stored; turning the alarm back on must restore it, not reset it.
     expect(resolveReviewConfig({ reviewMinScore: 0, reviewLowScoreRounds: 4 }).scoreAlarm).toBeUndefined();
+  });
+
+  it("carries the operator's churn threshold and round floor (anton-ecdl)", () => {
+    expect(
+      resolveReviewConfig({ reviewChurnThresholdLines: 8000, reviewChurnRoundFloor: 3 })
+        .churnRoundFloor,
+    ).toEqual({
+      thresholdLines: 8000,
+      minRounds: 3,
+    });
+  });
+
+  it("resolves a round floor of 0 to NO churn floor — that is the operator's off switch", () => {
+    expect(resolveReviewConfig({ reviewChurnRoundFloor: 0 }).churnRoundFloor).toBeUndefined();
+    // The threshold is still stored; turning the floor back on must restore it, not reset it.
+    expect(
+      resolveReviewConfig({ reviewChurnRoundFloor: 0, reviewChurnThresholdLines: 9000 })
+        .churnRoundFloor,
+    ).toBeUndefined();
   });
 });
 
