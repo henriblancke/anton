@@ -8,9 +8,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 
 import { schema } from "../../db";
+import { findRunGateFailureForBranch } from "../../runs";
 import { isVerifyGateFailedError } from "../errors";
 import type { ReviewGateResult } from "../review-gate";
-import { closeSandbox, openSandbox } from "./step.fixture";
+import { BRANCH, closeSandbox, openSandbox, target } from "./step.fixture";
 
 const runReviewGate = vi.hoisted(() => vi.fn());
 vi.mock("../review-gate", () => ({ runReviewGate }));
@@ -96,6 +97,43 @@ describe("step:verify", () => {
     await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
 
     expect(await recordOf()).toBeNull();
+  });
+
+  // The reviewer's 3-attempt repro: attempt 1 records a red gate and settles `failed`; attempt 2 (a
+  // fresh row) passes the gate, then stops for some other reason. Attempt 3 must not be sent after
+  // the failure attempt 2 already fixed, and the stale record sits on attempt 1's row, not attempt 2's.
+  it("forgets a failure an EARLIER attempt on the branch recorded once the gates pass", async () => {
+    await sandbox.tdb.db.insert(schema.runs).values({
+      id: "attempt-1",
+      projectId: sandbox.projectId,
+      epicBeadId: target.id,
+      branch: BRANCH,
+      status: "failed",
+      lastGateFailure: RECORD,
+    });
+    const read = () => findRunGateFailureForBranch(sandbox.tdb.db, sandbox.projectId, target.id, BRANCH);
+    expect((await read())?.label).toBe("tests");
+
+    await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
+
+    expect(await read()).toBeUndefined();
+  });
+
+  it("never forgets a failure recorded on a different branch", async () => {
+    await sandbox.tdb.db.insert(schema.runs).values({
+      id: "other-branch",
+      projectId: sandbox.projectId,
+      epicBeadId: target.id,
+      branch: "anton/elsewhere",
+      status: "failed",
+      lastGateFailure: RECORD,
+    });
+
+    await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
+
+    expect(
+      await findRunGateFailureForBranch(sandbox.tdb.db, sandbox.projectId, target.id, "anton/elsewhere"),
+    ).toBeDefined();
   });
 
   // Nothing proved anything green here, so the record is left for the settle/resume to carry.

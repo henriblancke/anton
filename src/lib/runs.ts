@@ -299,6 +299,39 @@ export async function getRunGateFailure(
 }
 
 /**
+ * Forget every gate failure this epic's BRANCH still remembers, on whichever attempt's row recorded
+ * it. Called by a passing `step:verify`: green gates prove the tree no longer fails, so no attempt on
+ * this branch may inherit a record from before the pass.
+ *
+ * Branch-wide rather than this row alone, because a failure is always recorded on an EARLIER attempt's
+ * row (see {@link findRunGateFailureForBranch}). Clearing only the passing attempt's own row, which is
+ * already empty, would leave the fixed failure behind for the next attempt to find: fail on attempt 1,
+ * pass on attempt 2 and then stop for another reason, and attempt 3 would be sent after a bug attempt 2
+ * already fixed.
+ *
+ * Deliberately leaves `updatedAt`/`writeSeq` alone. The other branch-scoped reads rank earlier attempts
+ * by those, and clearing a stale record must not make a long-settled row look like the latest attempt.
+ */
+export async function clearRunGateFailuresForBranch(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  branch: string,
+): Promise<void> {
+  await db
+    .update(schema.runs)
+    .set({ lastGateFailure: null })
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.epicBeadId, epicBeadId),
+        eq(schema.runs.branch, branch),
+        isNotNull(schema.runs.lastGateFailure),
+      ),
+    );
+}
+
+/**
  * The verify-gate failure the most recent attempt on this epic's BRANCH recorded, whatever became of
  * that run — the branch-scoped counterpart {@link findRunBaseForkShaForBranch} and
  * {@link findRunFormulaForBranch} already exist for, and the read `implementStep` (steps/agent.ts)

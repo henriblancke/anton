@@ -4,7 +4,7 @@
  * become a PR — and both report rather than act, leaving the park/halt call to the caller.
  */
 import { resolveVerifyGates } from "../../projects";
-import { updateRun } from "../../runs";
+import { clearRunGateFailuresForBranch, updateRun } from "../../runs";
 import { endSession } from "../../sessions";
 import { runReviewGate } from "../review-gate";
 import { runVerifyGates } from "../shell";
@@ -50,7 +50,10 @@ export async function verifyStep(ctx: StepContext): Promise<StepResult> {
   // exists — and a next attempt opening with it would be sent after a bug that is already fixed
   // (anton-vynb8). Cleared HERE, at the pass, rather than only at the settle: a run that goes green
   // and later stops for some other reason must not carry a stale gate failure into its resume.
+  // Branch-wide, not just this row: the failure a next attempt would inherit sits on an EARLIER
+  // attempt's row (clearRunGateFailuresForBranch says why).
   await updateRun(ctx.db, ctx.clock, ctx.runId, { lastGateFailure: null });
+  await clearRunGateFailuresForBranch(ctx.db, ctx.projectId, ctx.target.id, ctx.branch);
   if (owned) await endSession(ctx.db, ctx.clock, session.sessionId, "done");
   return { ok: true, detail: `${gates.length} gate(s) passed`, facts: { sessionIds: [session.sessionId] } };
 }
