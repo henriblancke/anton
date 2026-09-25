@@ -20,6 +20,10 @@ import { contractGaps } from "../beads/contract";
 
 const batchMock = vi.fn();
 const untagMock = vi.fn();
+const tagMock = vi.fn();
+/** The confirming push after the `stage:in-review` untag lands — mocked so the "sync can't confirm
+ * the untag reached the remote" recovery path is deterministic rather than shelling to a live `bd`. */
+const pushMock = vi.fn();
 const noteMock = vi.fn();
 const createMock = vi.fn();
 const reparentMock = vi.fn();
@@ -29,6 +33,12 @@ const setStatusMock = vi.fn();
 const showMock = vi.fn();
 /** The board read the rehome takes when the sweep's snapshot names no follow-up candidate. */
 const listMock = vi.fn();
+/** `bd history`, read by the closure-fence backfill this close now stamps on a confirmed-but-open
+ * bead — versions newest first, matching `currentClosureVersion`'s own contract. */
+const historyMock = vi.fn();
+/** The closure-fence write itself (`bd update --metadata`), mocked so the backfill tests assert the
+ * ids/closure it persists without shelling to a live `bd`. */
+const setBoardEvidenceConfirmedMock = vi.fn();
 /** id → current assignee, so the claim guard's CAS (show → unassign → show) reads a live board. */
 const assignees = new Map<string, string>();
 /** id → current status, so the re-read before a status write sees the board, not the snapshot. */
@@ -39,6 +49,9 @@ const parents = new Map<string, string | undefined>();
 const boardLabels = new Map<string, string[]>();
 /** id → creation time, which is how two racing processes agree on which follow-up survives. */
 const createdAt = new Map<string, string>();
+/** id → current metadata, so the closure-fence backfill's live re-read sees the board's confirmed
+ * evidence ids, not whatever the caller's now-stale snapshot happened to carry. */
+const metadataById = new Map<string, Bead["metadata"]>();
 
 vi.mock("../beads/bd", async () => {
   const actual =
@@ -49,6 +62,8 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       batch: (...args: unknown[]) => batchMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      tag: (...args: unknown[]) => tagMock(...args),
+      push: (...args: unknown[]) => pushMock(...args),
       note: (...args: unknown[]) => noteMock(...args),
       create: (...args: unknown[]) => createMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
@@ -57,6 +72,8 @@ vi.mock("../beads/bd", async () => {
       setStatus: (...args: unknown[]) => setStatusMock(...args),
       show: (...args: unknown[]) => showMock(...args),
       list: (...args: unknown[]) => listMock(...args),
+      history: (...args: unknown[]) => historyMock(...args),
+      setBoardEvidenceConfirmed: (...args: unknown[]) => setBoardEvidenceConfirmedMock(...args),
     },
   };
 });
@@ -136,6 +153,8 @@ describe("finalizeMergedEpic", () => {
   beforeEach(() => {
     batchMock.mockReset().mockResolvedValue(undefined);
     untagMock.mockReset().mockResolvedValue(undefined);
+    tagMock.mockReset().mockResolvedValue(undefined);
+    pushMock.mockReset().mockResolvedValue("synced");
     noteMock.mockReset().mockResolvedValue(undefined);
     createMock.mockReset().mockResolvedValue("epic-2");
     reparentMock.mockReset().mockResolvedValue(undefined);
@@ -145,6 +164,7 @@ describe("finalizeMergedEpic", () => {
     parents.clear();
     boardLabels.clear();
     createdAt.clear();
+    metadataById.clear();
     unassignMock
       .mockReset()
       .mockImplementation(async (_repo: string, id: string) => {
@@ -152,6 +172,8 @@ describe("finalizeMergedEpic", () => {
       });
     setStatusMock.mockReset().mockResolvedValue(undefined);
     listMock.mockReset().mockResolvedValue([]);
+    historyMock.mockReset().mockResolvedValue([]);
+    setBoardEvidenceConfirmedMock.mockReset().mockResolvedValue("");
     findOpenRunMock.mockReset().mockResolvedValue(null);
     updateRunMock.mockReset().mockResolvedValue(undefined);
     showMock.mockReset().mockImplementation(
@@ -164,6 +186,7 @@ describe("finalizeMergedEpic", () => {
           assignee: assignees.get(id),
           parent: parents.get(id),
           created_at: createdAt.get(id),
+          metadata: metadataById.get(id),
         }) as Bead,
     );
   });
@@ -185,7 +208,298 @@ describe("finalizeMergedEpic", () => {
     expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", [
       "stage:in-review",
     ]);
+    // Confirmed synced before this drop is trusted for good — no restore needed on the ordinary path.
+    expect(pushMock).toHaveBeenCalledWith("/repo");
+    expect(tagMock).not.toHaveBeenCalled();
   });
+
+  it(
+    "restores `stage:in-review` locally when the untag's confirming push cannot verify it reached " +
+      'the remote (chatgpt-codex-connector, PR #284 review, "Keep the recovery marker until ' +
+      'finalization syncs")',
+    async () => {
+      // On an embedded board a successful local untag can still be followed by a push that never
+      // confirms — the caller (`fixOnePr`, review-fix.ts) only logs that failure rather than
+      // propagating it, so without restoring the label here, this machine's own board would believe
+      // finalization is fully settled while the remote may still carry the epic unfenced, and
+      // nothing would ever revisit it again.
+      pushMock.mockResolvedValue("not-wired");
+
+      await finalize(bead("epic-1"), [bead("t1")]);
+
+      expect(untagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+      expect(tagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "throws when the restore itself fails, rather than returning as if the marker were back " +
+      '(chatgpt-codex-connector, PR #284 review, "Require the recovery-marker restore to succeed")',
+    async () => {
+      // Both the confirming push AND the compensating re-tag fail: the label is now gone locally
+      // with nothing to put it back, so `closedUnfencedEpics` (review-fix.ts) would never select this
+      // epic again. Silently returning here would let the caller believe finalization settled cleanly.
+      pushMock.mockResolvedValue("not-wired");
+      tagMock.mockRejectedValue(new Error("dolt write failed"));
+
+      await expect(finalize(bead("epic-1"), [bead("t1")])).rejects.toThrow(
+        /could not restore stage:in-review/,
+      );
+
+      expect(tagMock).toHaveBeenCalledWith("/repo", "epic-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "stamps the closure fence on a standalone target confirmed while still open (chatgpt-codex-" +
+      'connector, PR #284 review, "Fence standalone confirmations when merge closes the target")',
+    async () => {
+      // A standalone board-only run target is IS its own ticket (no children) and is confirmed
+      // while intentionally left open at `stage:in-review` — its `boardEvidenceConfirmed` metadata
+      // therefore carries `ids` but no `closure` yet. This close is the first time it ever closes,
+      // so the fence has to be stamped here or a later reopen-and-reclose can pass the stale
+      // confirmation off as new-cycle evidence with nothing new ever checked.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      metadataById.set("target-1", target.metadata);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "target-1", ["anton-eb1"], "close-sha");
+    },
+  );
+
+  it(
+    "stamps the closure fence on a SECOND delivery cycle's fresh confirmation, despite an earlier " +
+      'closure further back in the same bead\'s history (chatgpt-codex-connector, anton-fc5x review, ' +
+      '"Allow fresh confirmations after earlier closure cycles")',
+    async () => {
+      // target-1 was delivered once already (closed, then reopened for legitimate rework), and
+      // `ensureBoardBaselinePersisted`'s reopen-reset cleared the stale confirmation before this
+      // NEW cycle wrote a fresh one — still unfenced (open) until this close, carrying `origin:
+      // "close-sha-1"` (the cycle it was written against) the way `clearBoardEvidencePending`
+      // (execute-epic-board-evidence.ts) now always stamps a still-open confirmation. `read.reopened`
+      // is true here (an earlier closed episode sits behind the current streak), but that must not
+      // block the fence by itself: the stored `origin` matching `read.priorClosure` (also
+      // "close-sha-1", the closure immediately behind the one being fenced) proves nothing about this
+      // confirmation is stale — it was written fresh during the cycle that just ended.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb2"], origin: "close-sha-1" }) },
+      } as Bead;
+      metadataById.set("target-1", target.metadata);
+      historyMock.mockResolvedValue([
+        { hash: "close-sha-2", at: "2026-02-01T00:00:00Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-01-15T00:00:00Z", status: "open" },
+        { hash: "close-sha-1", at: "2026-01-02T00:00:00Z", status: "closed" },
+        { hash: "create-sha", at: "2026-01-01T00:00:00Z", status: "open" },
+      ]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repo",
+        "target-1",
+        ["anton-eb2"],
+        "close-sha-2",
+      );
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "does not stamp a closure fence when a reopen-and-reclose lands between the history read and " +
+      'the write (chatgpt-codex-connector, PR #284 review, "Revalidate the closure cycle before ' +
+      'stamping confirmation")',
+    async () => {
+      // Another writer reopens and recloses `target-1` after `mustReadClosureVersion`'s first read
+      // (which sees no reopen yet) but before this fence's write. Neither `boardEvidenceConfirmed`
+      // nor `confirmedBoardEvidenceClosure` changes underneath that race, so only a closure-version
+      // read taken again right before the write can tell the two cycles apart.
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      metadataById.set("target-1", target.metadata);
+      historyMock
+        .mockResolvedValueOnce([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }])
+        .mockResolvedValueOnce([{ hash: "new-close-sha", at: "2026-01-02T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Not fenced — `stage:in-review` has to stay so a later sweep re-selects and retries the fence.
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "does not durably confirm a reset delivery with zero evidence when a newer cycle cleared the " +
+      'live confirmation before this fence could stamp it, but still finalizes because the live ' +
+      'bead is genuinely closed again (chatgpt-codex-connector, PR #284 review, "Revalidate ' +
+      'confirmation before stamping its closure")',
+    async () => {
+      // The snapshot passed into finalization still shows the OLD, unfenced confirmation — taken
+      // before another writer reopened this bead, reset its confirmation for a NEW delivery cycle
+      // (`ensureBoardBaselinePersisted`'s reopen-reset), and closed it again. `metadataById` is left
+      // unset, so the LIVE re-read this fence takes sees no confirmation at all — but the live bead
+      // IS closed (the reopen-and-reclose already completed), which is what makes "nothing left to
+      // fence" a settled bead here rather than a still-open one (see the next test).
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      statuses.set("target-1", "closed");
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      // Writing off the live (empty) id set would have recreated `boardEvidenceConfirmed` with zero
+      // evidence and durably confirmed the new cycle — refused instead.
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Nothing left to fence is a settled bead, not a failed one: the close still finalizes.
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "keeps `stage:in-review` in place, rather than declare the fence complete, when a concurrent " +
+      'writer reopened the live bead and cleared its confirmation but has not reclosed it yet ' +
+      '(chatgpt-codex-connector, PR #284 review, "Reject reopened beads before declaring fences ' +
+      'complete") — unlike the previous test, the live bead is still OPEN, so this close never ' +
+      'actually landed for good and the recovery marker must survive for a later sweep to retry',
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      // The live re-read sees no confirmation (cleared by the concurrent reopen) AND a live status
+      // that is still "open" — `ensureBoardBaselinePersisted`'s reopen-reset landed, but the new
+      // cycle it started has not closed the bead again yet.
+      statuses.set("target-1", "open");
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Treating this as fenced would drop `stage:in-review` while the bead sits open with nothing
+      // left on the board to rediscover it — the marker must stay for the next sweep.
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "does not overwrite a closure fence a concurrent pass already stamped on the live bead " +
+      '(chatgpt-codex-connector, PR #284 review, "Revalidate confirmation before stamping its ' +
+      'closure")',
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      // The live bead was already fenced by a concurrent review-fix pass between the snapshot and
+      // this call.
+      metadataById.set("target-1", {
+        boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "already-fenced-sha" }),
+      });
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it("does not re-stamp a closure fence a confirmation already carries", async () => {
+    const target = {
+      ...bead("target-1"),
+      metadata: {
+        boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "earlier-close-sha" }),
+      },
+    } as Bead;
+
+    await finalize(target, []);
+
+    expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+    expect(historyMock).not.toHaveBeenCalled();
+    expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+  });
+
+  it("does not stamp a closure fence on a ticket with no board-evidence confirmation", async () => {
+    await finalize(bead("epic-1"), [bead("t1")]);
+
+    expect(historyMock).not.toHaveBeenCalled();
+    expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+  });
+
+  it(
+    "leaves `stage:in-review` in place when the closure fence read fails, so the next sweep " +
+      'retries it (chatgpt-codex-connector, PR #284 review, "Require closure stamps before ' +
+      'completing finalization") — the close already landed, but the fence did not',
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      historyMock.mockRejectedValue(new Error("bd history: DB locked"));
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // The close batch still ran (it is durable and cannot be undone from here), but the label
+      // stays so a later sweep gets another chance to stamp the fence on this now-already-closed
+      // bead — `closedNow` is recomputed from the full subtree each pass, not just `stillOpen`.
+      expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "leaves `stage:in-review` in place when `bd history` succeeds but returns no leading closed " +
+      "version (chatgpt-codex-connector, PR #284 review, 'Refuse fenceless confirmation for closed " +
+      "tickets') — e.g. an imported/legacy closed bead with empty history — rather than reporting " +
+      "the fence persisted with no closure hash at all",
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      historyMock.mockResolvedValue([]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      expect(batchMock.mock.calls[0][1]).toEqual([{ op: "close", id: "target-1" }]);
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "retries a closure fence a previous pass left unstamped, on a bead already closed in the " +
+      "snapshot — the resumption point `stillOpen` alone could never offer again",
+    async () => {
+      // Simulates the second sweep after the test above: `target-1` is already `closed` on the
+      // board (the batch from the interrupted pass landed), but its confirmation still carries no
+      // closure — the read failed last time. This time `bd history` succeeds.
+      const target = {
+        ...bead("target-1", "closed"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      metadataById.set("target-1", target.metadata);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(batchMock.mock.calls[0][1]).toEqual([]); // nothing left open to close
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith("/repo", "target-1", ["anton-eb1"], "close-sha");
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
 
   it("leaves an already-closed target out of the batch but still clears the stage", async () => {
     // The idempotent re-run: a prior sweep closed everything and only the label write failed.

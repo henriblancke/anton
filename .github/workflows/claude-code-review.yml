@@ -62,19 +62,27 @@ jobs:
       # PR's fault — the log's `Running Claude Code via SDK (full output hidden for
       # security)` line means the real crash detail never reaches this job's log; add
       # `show_full_output: true` on the action to see it.
-      # Bumped 2.1.274 -> 2.1.281 (2026-09-23): the exact same signature returned across
-      # eight straight runs on PR #320 — is_error:true, num_turns:1, total_cost_usd:0,
-      # ~500ms, no findings unrelated to this PR's own diff. 2.1.277 and 2.1.281 each carry
-      # a further fix matching this shape ("Fixed `claude -p` and Agent SDK sessions that
-      # could hang with no result after an internal error; they now report the error and
-      # exit with code 1"; "Fixed a crash ('unrecoverable interface error') that could end
-      # a session while an API request was being retried").
+      # Bumped 2.1.274 -> 2.1.281 (2026-09-23): the same crash signature came back (is_error:true,
+      # num_turns:1, total_cost_usd:0, ~400-500ms) across every run on this PR, matching eight
+      # straight runs on PR #320 — no findings unrelated to either PR's own diff. Tracked upstream
+      # as anthropics/claude-code-action#1759 (open, unresolved as of 2026-08-31 — ruled out auth,
+      # action version, model, and config, so it is not this repo's config causing it). 2.1.277 and
+      # 2.1.281 each carry a further fix matching this shape ("Fixed `claude -p` and Agent SDK
+      # sessions that could hang with no result after an internal error; they now report the error
+      # and exit with code 1"; "Fixed a crash ('unrecoverable interface error') that could end a
+      # session while an API request was being retried") — bumping to the latest available pin
+      # picks up both. If this recurs, it's the upstream bug, not this PR's diff — check #1759's
+      # status before re-bumping blindly.
       # Bumped 2.1.281 -> 2.1.282 (2026-09-24): same signature again on PR #321 —
       # is_error:true, num_turns:1, total_cost_usd:0, ~400ms, no findings unrelated to this
       # PR's own diff. Upstream (anthropics/claude-code-action#947) confirms this class of
       # crash is still being reported against recent CLI builds, so this bump is the same
       # documented mitigation as before, not a confirmed fix — if it recurs, bump further
       # and check the changelog rather than assuming the PR's diff is at fault.
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-25): same signature on PR #326 —
+      # is_error:true, num_turns:1, total_cost_usd:0, 425ms, no findings unrelated to this
+      # PR's own diff. Following this comment's own instruction: bump before assuming it's
+      # the PR's fault.
       # Recurred again on PR #325 (2026-09-25) — is_error:true, num_turns:1, total_cost_usd:0,
       # 350ms, no findings unrelated to this PR's own diff. 2.1.282's changelog has no entry
       # naming this exact shape; already on latest per the standing instruction above, since

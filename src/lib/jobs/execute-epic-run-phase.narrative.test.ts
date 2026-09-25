@@ -116,6 +116,7 @@ const dispatched = () => ({
   satisfied: new Map(),
   skipped: new Map(),
   targetRetired: false,
+  boardEvidenceByTicket: new Map(),
 });
 
 const narrative = (summary: string): RunNarrative => ({ summary });

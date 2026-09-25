@@ -6,6 +6,7 @@
  * without, {@link mustRead} for the read a guarded write is decided on.
  */
 import { beads, type Bead } from "../beads/bd";
+import { currentClosureVersion, lastCompletedClosureVersion, reopenedBeforeCurrentClosure } from "../beads/closure-cycle";
 import { loadAllIssues } from "../beads/issues";
 import { sleepMs } from "../retry-helpers";
 
@@ -62,6 +63,86 @@ export async function mustRead(
     }
   }
   return undefined;
+}
+
+/**
+ * Like {@link mustRead}, but for a caller that needs `dependencies` too — {@link beads.show} is
+ * deliberately count-only (see its own docstring) and never carries them, while `bd list --json`
+ * inlines them for every issue it returns. Takes the whole batch of ids in ONE `bd list --id
+ * a,b,c --json` call rather than one `bd show` subprocess per id, which is both cheaper and the
+ * only way to get edges without a second round trip. `--all` so a CLOSED bead (e.g. a standalone
+ * board-only target closed at merge) still resolves instead of silently dropping out of the
+ * result — `bd list` filters to open issues by default.
+ *
+ * Answers `undefined` only once bd has refused every attempt, exactly like {@link mustRead}; an id
+ * bd's read genuinely has nothing for (never existed, or filtered out by something other than
+ * status) simply has no entry in the returned map, which the caller must distinguish from a wholly
+ * failed read.
+ */
+export async function mustReadWithDependencies(
+  repo: string,
+  ids: readonly string[],
+  attempts = 3,
+): Promise<Map<string, Bead> | undefined> {
+  if (ids.length === 0) return new Map();
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const found = await beads.list(repo, ["--id", ids.join(","), "--all"]);
+      return new Map(found.map((b) => [b.id, b]));
+    } catch (e) {
+      console.error(`[execute-epic] bd list (by id) read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * {@link currentClosureVersion}, retried like every other guarded read here. Distinguishes "bd
+ * history refused every attempt" (`read: false`) from "bd history answered and this ticket has no
+ * closure episode" (`read: true, closure: undefined`) — a bare `.catch(() => undefined)` folds both
+ * into the same value, which a caller writing a closure fence cannot tell apart from a genuinely
+ * fenceless confirmation. That matters because an unfenced `{ ids }` confirmation is treated by
+ * `confirmedForThisCycle` (execute-epic-dispatch.ts) as "cannot verify, pass anyway" — the same
+ * pass-through meant for a confirmation written before the fence existed — so a transient read
+ * failure must not be allowed to silently produce one.
+ *
+ * `reopened` rides along on the SAME history read (chatgpt-codex-connector, PR #284 review, "Reject
+ * unstamped survivors on closed tickets") — {@link survivorTrustedForClosure} (execute-epic-
+ * dispatch.ts) needs it to tell an unstamped survivor that is genuinely unambiguous (this ticket has
+ * never been reopened, so there is only one closure episode it could belong to) apart from one that
+ * is stranded evidence from an earlier episode a reopen-and-reclose left behind.
+ *
+ * `priorClosure` rides along too (chatgpt-codex-connector, PR #284 review, "Preserve the originating
+ * cycle when stamping confirmations") — {@link lastCompletedClosureVersion}, read off the same
+ * `versions`. Doubles as the origin a still-open confirmation stamps itself with (its last completed
+ * cycle, if any) and as the value `stampConfirmedClosures` (review-fix-finalize.ts) later compares
+ * that stored origin against, right before fencing a CLOSED ticket's confirmation — a mismatch means
+ * a full extra cycle landed on the ticket in between, unlike `reopened`, which only knows the ticket
+ * was EVER reopened, not whether that happened before or after this confirmation was written.
+ */
+export async function mustReadClosureVersion(
+  repo: string,
+  id: string,
+  attempts = 3,
+): Promise<
+  { read: true; closure: string | undefined; reopened: boolean; priorClosure: string | undefined } | { read: false }
+> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const versions = await beads.history(repo, id);
+      return {
+        read: true,
+        closure: currentClosureVersion(versions),
+        reopened: reopenedBeforeCurrentClosure(versions),
+        priorClosure: lastCompletedClosureVersion(versions),
+      };
+    } catch (e) {
+      console.error(`[execute-epic] bd history read failed (attempt ${attempt}/${attempts}):`, e);
+      if (attempt < attempts) await sleepMs(PERSIST_RETRY_MS);
+    }
+  }
+  return { read: false };
 }
 
 /**

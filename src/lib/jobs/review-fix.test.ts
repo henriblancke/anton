@@ -36,9 +36,25 @@ import type { ProjectSettings } from "../projects";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
 const listMock = vi.fn();
+/** The `stage:in-review` untag a stranded-closure recovery attempts (review-fix.ts's
+ * `recoverUnfencedClosure`) and its confirming push — mocked so the "sync can't confirm the untag
+ * reached the remote" restore path is deterministic rather than shelling to a live `bd`. */
+const untagMock = vi.fn();
+const tagMock = vi.fn();
+const pushMock = vi.fn();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
-  return { ...actual, beads: { ...actual.beads, list: (...a: unknown[]) => listMock(...a), sync: vi.fn() } };
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      list: (...a: unknown[]) => listMock(...a),
+      sync: vi.fn(),
+      untag: (...a: unknown[]) => untagMock(...a),
+      tag: (...a: unknown[]) => tagMock(...a),
+      push: (...a: unknown[]) => pushMock(...a),
+    },
+  };
 });
 
 /** The one `gh` read per target. `classifyReview` stays real — the verdict is what is under test. */
@@ -528,6 +544,104 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
 });
 
 /**
+ * `recoverUnfencedClosure`'s untag confirmation (chatgpt-codex-connector, PR #284 review, "Restore
+ * the recovery marker when its sync fails"): a stranded epic's `stage:in-review` untag can commit
+ * locally and still fail to reach the remote, and the dispatcher only re-syncs a repo whose board
+ * this pass actually wrote to — once the label is gone locally, `closedUnfencedEpics` would never
+ * select this epic again on a same-machine retry. Mirrors `closeFinalized`'s own restore-on-
+ * unconfirmed-push test (review-fix-finalize.test.ts).
+ */
+describe("makeReviewFixHandler — stranded closure recovery", () => {
+  const strandedEpic = (id: string, prNumber: number): Bead => ({
+    id,
+    title: id,
+    status: "closed",
+    issue_type: "epic",
+    labels: [LABELS.stage("in-review")],
+    metadata: { pr: `gh-${prNumber}` },
+  });
+
+  const mergedPr = (number: number): PrReview => ({
+    number,
+    state: "MERGED",
+    reviewDecision: "APPROVED",
+    mergeable: "MERGEABLE",
+    headRefName: `anton/pr-${number}`,
+    headSha: `sha-${number}`,
+    url: `https://example.test/pull/${number}`,
+    reviews: [],
+    failingChecks: [],
+    pendingChecks: 0,
+    threads: [],
+  });
+
+  let t: TestProjectDb;
+  const clock: Clock = { now: () => 1_700_000_000_000 };
+
+  beforeEach(() => {
+    t = makeProjectDb();
+    vi.clearAllMocks();
+    resolveOperatorMock.mockResolvedValue("alice");
+    untagMock.mockReset().mockResolvedValue(undefined);
+    tagMock.mockReset().mockResolvedValue(undefined);
+    pushMock.mockReset().mockResolvedValue("synced");
+  });
+  afterEach(() => t.close());
+
+  const dispatch = () =>
+    driveJob({
+      db: t.db,
+      clock,
+      type: "review-fix",
+      handler: makeReviewFixHandler,
+      projectId: t.projectId,
+      config: { leaseMs: 30_000 },
+    });
+
+  it("confirms the untag's push before reporting the closure recovered", async () => {
+    listMock.mockResolvedValue([strandedEpic("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(mergedPr(1));
+
+    const job = await getJob(t.db, await dispatch());
+
+    expect(job?.status).toBe("done");
+    expect(job?.outcomeNote).toContain("fenced 1 previously-stranded closure(s)");
+    expect(untagMock).toHaveBeenCalledWith("/tmp/sandbox", "e-1", ["stage:in-review"]);
+    expect(pushMock).toHaveBeenCalledWith("/tmp/sandbox");
+    expect(tagMock).not.toHaveBeenCalled(); // confirmed synced — nothing to restore
+  });
+
+  it("restores stage:in-review locally when the untag's confirming push cannot verify it reached the remote", async () => {
+    listMock.mockResolvedValue([strandedEpic("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(mergedPr(1));
+    pushMock.mockResolvedValue("not-wired");
+
+    const job = await getJob(t.db, await dispatch());
+
+    expect(untagMock).toHaveBeenCalledWith("/tmp/sandbox", "e-1", ["stage:in-review"]);
+    expect(tagMock).toHaveBeenCalledWith("/tmp/sandbox", "e-1", ["stage:in-review"]);
+    // The restore itself succeeded, so this is a retryable "attempted", not a hard failure — the job
+    // still settles clean, just without counting this epic as recovered.
+    expect(job?.status).toBe("done");
+    expect(job?.outcomeNote).not.toContain("fenced 1");
+  });
+
+  it("fails the pass (so it retries) when neither the push nor the local restore can be confirmed", async () => {
+    listMock.mockResolvedValue([strandedEpic("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(mergedPr(1));
+    pushMock.mockResolvedValue("not-wired");
+    tagMock.mockRejectedValue(new Error("dolt write failed"));
+
+    const job = await getJob(t.db, await dispatch());
+
+    expect(untagMock).toHaveBeenCalledWith("/tmp/sandbox", "e-1", ["stage:in-review"]);
+    expect(tagMock).toHaveBeenCalledWith("/tmp/sandbox", "e-1", ["stage:in-review"]);
+    expect(job?.status).toBe("queued"); // retried, not settled clean
+    expect(job?.lastError).toContain("could not restore stage:in-review");
+  });
+});
+
+/**
  * The calibration reaction (anton-iwum0): each triaged finding's anchor comment gets a reaction
  * mirroring its outcome, alongside the existing reply. `applyThreadOutcomes` is exercised directly
  * against a fake `gh` binary — real `replyToReviewComment` / `reactToReviewComment` /
@@ -597,13 +711,20 @@ process.exit(0);
     };
   }
 
-  const run = (report: ThreadOutcome[], threads: ReviewThread[], pushed: boolean) =>
+  const run = (
+    report: ThreadOutcome[],
+    threads: ReviewThread[],
+    gitPushed: boolean,
+    opts: { boardChanged?: boolean; mixedBoardOnly?: boolean } = {},
+  ) =>
     applyThreadOutcomes({
       repo: sandbox,
       number: 7,
       pr: pr(threads),
       report,
-      pushed,
+      gitPushed,
+      boardChanged: opts.boardChanged ?? false,
+      mixedBoardOnly: opts.mixedBoardOnly ?? false,
       signal: new AbortController().signal,
       logPath: join(sandbox, "session.log"),
     });
@@ -667,6 +788,28 @@ process.exit(0);
 
     expect(ghCalls()).toEqual([]);
   });
+
+  it("honors a board-only 'fixed' claim in a pure board-only run", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "reassigned via bd" }], [thread()], false, {
+      boardChanged: true,
+    });
+
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
+
+  it(
+    "posts no reaction (and no reply) for a 'fixed' claim backed only by a board change in a " +
+      "MIXED board+git run — an epic with both a delivery:board ticket and an ordinary one, whose " +
+      "board write cannot be told apart from a thread the ordinary ticket still needs a git fix for",
+    async () => {
+      await run([{ id: "RT_1", outcome: "fixed", reply: "reassigned via bd" }], [thread()], false, {
+        boardChanged: true,
+        mixedBoardOnly: true,
+      });
+
+      expect(ghCalls()).toEqual([]);
+    },
+  );
 
   it("a reaction failure is best-effort — the reply still lands and the run stays green", async () => {
     process.env.ANTON_TEST_FAIL_REACTIONS = "1";

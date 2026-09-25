@@ -139,13 +139,114 @@ export const LABELS = {
    * read here by every chokepoint that must refuse it — see {@link beads.isHumanWork}.
    */
   agentHuman: `agent:${HUMAN_AGENT}`,
+  /**
+   * This run target's entire deliverable is board writes — bd updates to the Dolt DB, which
+   * `.beads/.gitignore` deliberately keeps out of the tree (`refs/dolt/data` is the sync channel,
+   * not the tree; see CLAUDE.md and anton-fc5x). Set at SHAPING time, on the bead, like
+   * `agentHuman` — never inferred from the agent's own report, because an agent claiming its own
+   * ticket is exempt from the zero-diff guard is exactly the false success that guard exists to
+   * catch. Read by {@link beads.isBoardOnly} and consulted only where a clean git tree would
+   * otherwise be read as "nothing delivered" (execute-epic-ticket.ts `assertDelivered`).
+   */
+  boardOnly: "delivery:board",
+  /**
+   * Board-only evidence (anton-fc5x) a PRIOR attempt found changed but could not confirm synced —
+   * `board-evidence-pending:<id>,<id>,...`. Carries the ids across a park/resume: `readBoardBaseline`
+   * takes a FRESH board read on every attempt, so a resumed ticket whose agent makes no further
+   * board writes (because the prior attempt's writes already landed, just unsynced) would otherwise
+   * diff its new baseline against an unchanged board and read as no evidence at all — even once the
+   * sync channel recovers. Prefix-diffed like `reviewScore`, so the value stays single (the latest
+   * known set), never inferred from the agent's own report for the same reason `boardOnly` itself
+   * isn't. See {@link beads.pendingBoardEvidence} / {@link beads.setBoardEvidencePending}.
+   */
+  boardEvidencePending: (ids: readonly string[]) => `board-evidence-pending:${ids.join(",")}`,
 } as const;
 
 /** Prefix of the run-lease label (see LABELS.runLease). */
-const RUN_LEASE_PREFIX = "run-lease:";
+export const RUN_LEASE_PREFIX = "run-lease:";
 
 /** Prefix of the review-score label (see LABELS.reviewScore). */
-const REVIEW_SCORE_PREFIX = "review-score:";
+export const REVIEW_SCORE_PREFIX = "review-score:";
+
+/** Prefix of the board-evidence-pending label (see LABELS.boardEvidencePending). */
+export const BOARD_EVIDENCE_PENDING_PREFIX = "board-evidence-pending:";
+
+/**
+ * Safe byte budget for one `board-evidence-pending:<ids>` label value (chatgpt-codex-connector, PR
+ * #284 review, "Bound pending evidence before adding it as one label") — comfortably under Linux's
+ * `MAX_ARG_STRLEN` (~128 KiB), the same ceiling {@link beads.setBoardEvidenceBaseline} moved off
+ * argv entirely for by writing through a temp file instead. A label can't go through a temp file
+ * the same way (`--add-label` takes its value straight on argv), so a board-only batch large enough
+ * to overflow a single argument instead spans MULTIPLE `board-evidence-pending:*` labels, each kept
+ * under this budget — see {@link chunkBoardEvidenceIds}.
+ */
+const BOARD_EVIDENCE_PENDING_LABEL_BUDGET = 100_000;
+
+/**
+ * Split `ids` into contiguous groups whose serialized `board-evidence-pending:<ids>` label stays
+ * under {@link BOARD_EVIDENCE_PENDING_LABEL_BUDGET}. `ids` is expected sorted (every caller passes
+ * the already-deduped, sorted evidence set), so chunk boundaries fall in sorted order too — which
+ * is what lets a caller compare the resulting label set against a bead's current labels by sorting
+ * both sides, rather than needing write order preserved.
+ */
+function chunkBoardEvidenceIds(ids: readonly string[]): string[][] {
+  const chunks: string[][] = [];
+  let current: string[] = [];
+  let currentLen = 0;
+  for (const id of ids) {
+    const nextLen = currentLen + id.length + (current.length > 0 ? 1 : 0);
+    if (current.length > 0 && BOARD_EVIDENCE_PENDING_PREFIX.length + nextLen > BOARD_EVIDENCE_PENDING_LABEL_BUDGET) {
+      chunks.push(current);
+      current = [id];
+      currentLen = id.length;
+    } else {
+      current.push(id);
+      currentLen = nextLen;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Safe combined-argv budget for ONE `bd update` invocation's `--add-label`/`--remove-label` flags
+ * (chatgpt-codex-connector, PR #284 review, "Bound the total pending-label argument vector"). Each
+ * individual label already stays under {@link BOARD_EVIDENCE_PENDING_LABEL_BUDGET}, but
+ * {@link setBoardEvidencePending} previously put every stale label to remove AND every chunked
+ * replacement label to add into that SAME invocation — so a board sweep large enough to need many
+ * chunks, or a replacement carrying both a large stale set and a large new set, could still sum past
+ * Linux's total `ARG_MAX` (commonly ~2 MiB, shared with the process environment) and fail `E2BIG`
+ * after the confirming board read already landed. Kept well under that ceiling so label flags are
+ * instead split across as many `bd update` calls as needed — see {@link chunkLabelFlags}.
+ */
+export const BOARD_EVIDENCE_UPDATE_ARGV_BUDGET = 500_000;
+
+/**
+ * Split `--add-label`/`--remove-label` flag pairs into groups whose combined label-value length
+ * stays under `budget` — see {@link BOARD_EVIDENCE_UPDATE_ARGV_BUDGET}. Each group is later issued
+ * as its own `bd update` invocation, so order across groups doesn't matter for correctness: adds and
+ * removes never target the same label value. Exposed for testing, like `buildUpdateArgs`.
+ */
+export function chunkLabelFlags(flags: readonly (readonly [string, string])[], budget: number): (readonly [string, string])[][] {
+  const groups: (readonly [string, string])[][] = [];
+  let current: (readonly [string, string])[] = [];
+  let currentLen = 0;
+  for (const flag of flags) {
+    const len = flag[1].length;
+    if (current.length > 0 && currentLen + len > budget) {
+      groups.push(current);
+      current = [];
+      currentLen = 0;
+    }
+    current.push(flag);
+    currentLen += len;
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+/** Prefix of the stage label (see LABELS.stage). */
+export const STAGE_PREFIX = "stage:";
 
 /**
  * Shape of a GitHub PR pointer (`gh-<number>`). The ONLY `external_ref` value anton treats as a PR:
@@ -159,6 +260,207 @@ export const GH_PR_REF = /^gh-\d+$/i;
  * {@link beads.retirePrRef}. Deliberately NOT `pr`: nothing may read it as a live pointer.
  */
 const RETIRED_PR_KEY = "retiredPr";
+
+/**
+ * Metadata key holding a board-only ticket's PRESERVED pre-dispatch board fingerprint (PR #284
+ * review) — see {@link beads.setBoardEvidenceBaseline} / {@link beads.boardEvidenceBaseline}. Set
+ * only when a post-run board read fails outright, so a resumed attempt can diff against the
+ * ORIGINAL baseline instead of a fresh one that may already have absorbed this ticket's own
+ * writes through an unrelated sync pass (the heartbeat backstop, a write-nudged push) that runs
+ * independently of this check's own confirming push.
+ *
+ * The value is a fingerprint of the WHOLE board, not just this ticket's beads (PR #284 review round
+ * 11 follow-up) — diffing a future read against it needs every bead's prior content, not only the
+ * ones already known to differ. On a board with hundreds/thousands of beads that is a real per-row
+ * cost, and it lands only when the board is already contended (a failed read is the trigger), i.e.
+ * exactly when it is least welcome. Accepted for now because this path is a recovery fallback, not
+ * the common case; a cheaper representation (e.g. only the ids seen so far plus a per-bead content
+ * hash) would need `bd` support this module does not currently have — see this file's own docstring
+ * on the equivalent per-write-attribution gap.
+ */
+const BOARD_EVIDENCE_BASELINE_KEY = "boardEvidenceBaseline";
+
+/**
+ * Metadata key marking {@link BOARD_EVIDENCE_BASELINE_KEY} as a RECOVERY baseline — one preserved
+ * by {@link execute-epic-board-evidence.ts!readBoardEvidence} AFTER a dispatch attempt already ran,
+ * as opposed to the never-dispatched pre-dispatch baseline {@link
+ * execute-epic-board-evidence.ts!ensureBoardBaselinePersisted} persists and freely refreshes across
+ * its own confirming pull (PR #284 review round 17, "Preserve recovery baselines when resuming
+ * dispatched tickets"). Both baselines share the same key and shape, so this is the only signal
+ * that tells them apart: a confirming pull `ensureBoardBaselinePersisted` runs before a RETRY can
+ * legitimately pick up that prior attempt's own not-yet-confirmed delivery, and folding that into a
+ * "refreshed" baseline would erase the only pre-delivery snapshot an idempotent resumed agent's
+ * evidence check needs to diff against. Never set on the never-dispatched baseline, so it stays
+ * absent until the first `readBoardEvidence` call after a dispatch actually ran.
+ */
+const BOARD_EVIDENCE_BASELINE_LOCKED_KEY = "boardEvidenceBaselineLocked";
+
+/**
+ * Metadata key marking {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY} as VERIFIED — set only once
+ * {@link execute-epic-board-evidence.ts!lockDispatchBaseline}'s own stability round actually
+ * confirmed the locked value against a fresh board read, as opposed to the instant it merely wrote
+ * the tentative lock (chatgpt-codex-connector, PR #284 review, "Distinguish tentative locks before
+ * trusting them on resume"). A round locks its candidate BEFORE that same round's own confirming
+ * push and re-read prove it stable — a process death in that exact window leaves `locked` set on a
+ * value nothing has actually verified yet. Without this key, `ensureBoardBaselinePersisted`'s
+ * `recoveryBaseline` fast path cannot tell that tentative lock apart from one a completed
+ * `lockDispatchBaseline` call (or a post-dispatch `readBoardEvidence` recovery lock) already proved
+ * stable, and would trust it blindly on resume — on a shared-server board the tentative write is
+ * already global the instant it lands, and the fast path's skipped refresh means any board write
+ * concurrent with that unfinished round is later credited to a no-op agent as its own evidence.
+ * Absent is read as "not yet verified", the correct default for a tentative lock; every OTHER lock
+ * this codebase writes (a `readBoardEvidence` recovery lock, or `lockDispatchBaseline`'s own
+ * completed round) sets this key in the SAME write as the lock itself, so it is never left stale on
+ * a resumed candidate that changes after {@link beads.setBoardEvidenceBaseline} last ran.
+ */
+const BOARD_EVIDENCE_BASELINE_VERIFIED_KEY = "boardEvidenceBaselineVerified";
+
+/**
+ * Metadata key marking that dispatch actually BEGAN against the currently locked baseline above
+ * (chatgpt-codex-connector, PR #284 review, "Distinguish pre-dispatch locks from recovery
+ * baselines"). `BOARD_EVIDENCE_BASELINE_VERIFIED_KEY` is set the instant `lockDispatchBaseline`'s
+ * stability round proves a PRE-dispatch candidate stable — before the caller has dispatched
+ * anything — so a process death right after that (before the agent session ever starts) leaves a
+ * locked-and-verified baseline indistinguishable from one `readBoardEvidence` preserves AFTER a
+ * dispatch attempt genuinely ran. Without this key, `ensureBoardBaselinePersisted`'s
+ * `recoveryBaseline` fast path cannot tell the two apart and would trust the never-dispatched
+ * snapshot untouched — skipping the refresh that would otherwise fold in a board change made during
+ * that downtime, and crediting a no-op agent with drift it never produced. Set once, by the caller
+ * (`runTicket`), right before the agent session starts and never before — see
+ * {@link execute-epic-board-evidence.ts!markDispatchStarted}. Absent is read as "dispatch never
+ * started against this locked baseline", which routes `ensureBoardBaselinePersisted` back through
+ * `lockDispatchBaseline`'s own re-verification loop instead of trusting it blind.
+ */
+const BOARD_EVIDENCE_DISPATCH_STARTED_KEY = "boardEvidenceDispatchStarted";
+
+/**
+ * Metadata key marking that a board-evidence cleanup ({@link beads.setBoardEvidencePending} /
+ * {@link beads.clearBoardEvidenceBaseline} clearing to empty) wrote successfully to the LOCAL bd
+ * DB but its confirming push failed (PR #284 review, "retain a retry obligation after cleanup
+ * push failure") — the one case the pending-ids marker and the preserved baseline cannot cover,
+ * because both are already cleared locally by the time the push fails, so neither survives to
+ * tell a resume there is still an unconfirmed remote write. Set right before
+ * `clearBoardEvidencePending` throws in exactly that case, and released only once a later push
+ * actually confirms — see {@link beads.setBoardEvidenceCleanupUnsynced} /
+ * {@link beads.clearBoardEvidenceCleanupUnsynced} / {@link beads.hasBoardEvidenceCleanupUnsynced}.
+ *
+ * Carries the ids still owed confirmation (JSON array), not just a boolean (PR #284 review,
+ * "Recover cleanup-only resumes before regeneration") — the pending-marker label and
+ * preserved-baseline metadata that would otherwise carry those ids are already cleared by the time
+ * this obligation is set, so a resume with no attribution commit on its own branch (a fresh
+ * cross-machine worktree) has no other way to recover which ids still need confirming before it can
+ * safely retry, rather than falling through to regenerate a ticket whose delivery already landed.
+ * See {@link beads.cleanupUnsyncedBoardEvidenceIds}.
+ */
+const BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY = "boardEvidenceCleanupUnsynced";
+
+/**
+ * Metadata key naming the closure episode a still-present `board-evidence-pending:*` marker was
+ * last confirmed against (chatgpt-codex-connector, PR #284 review, "Fence pending evidence by
+ * closure cycle") — the same fencing {@link BOARD_EVIDENCE_CONFIRMED_KEY}'s `closure` field
+ * applies to confirmed evidence, extended to the marker `clearBoardEvidencePending` could not
+ * clear. Without it, a marker (or {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY} obligation) a failed
+ * cleanup left behind survives untouched across a reopen-and-reclose that never redispatches this
+ * ticket — `ensureBoardBaselinePersisted`'s own reopen-reset only fires on an actual redispatch —
+ * and a later resume's `dispatchTicket` fast path would trust it unconditionally as THIS cycle's
+ * evidence, skipping the re-diff that would otherwise catch a closure with no new work checked.
+ * Stamped by {@link execute-epic-board-evidence.ts!clearBoardEvidencePending} right after it reads
+ * the closure a closed ticket is confirming against — the same read that feeds
+ * {@link beads.setBoardEvidenceConfirmed}'s `closure` — and cleared whenever the marker itself
+ * clears. Absent is read as "written before this fence existed (or before the ticket ever closed)",
+ * which a caller treats as untrusted for an ALREADY-closed ticket rather than blindly passed
+ * through, since (unlike the confirmed-evidence fence) there is no pre-existing production state to
+ * stay backward-compatible with. See {@link beads.pendingBoardEvidenceClosure}.
+ */
+const BOARD_EVIDENCE_PENDING_CLOSURE_KEY = "boardEvidencePendingClosure";
+
+/**
+ * Durable proof that a board-only ticket's delivery was confirmed and its cleanup completed (PR
+ * #284 review, "no record that this bead's board-only delivery ever happened") — set once, right
+ * beside the marker/baseline clear in {@link clearBoardEvidencePending}, and never cleared by that
+ * cycle's own completion. Unlike the pending marker and preserved baseline, which exist only to
+ * recover an IN-FLIGHT confirmation and are deliberately wiped once it lands, this key's whole job
+ * starts where theirs ends: it is the one thing left on the bead once both are gone, and it lives
+ * in the synced board rather than on any one machine's git branch — so it answers "was this ticket
+ * ever confirmed delivered" long after the branch that carried its attribution commit is gone (a
+ * crash before that branch was pushed, a fresh worktree on another machine) and independently of
+ * whether this branch happens to carry that commit. See {@link beads.boardEvidenceConfirmed} /
+ * {@link beads.setBoardEvidenceConfirmed}.
+ *
+ * The one exception (PR #284 review, "Reset stale confirmations before a reopened delivery"): a
+ * REOPEN starts a new delivery cycle this flag was never meant to speak for, so
+ * {@link execute-epic-board-evidence.ts!ensureBoardBaselinePersisted} clears it — via
+ * {@link beads.clearBoardEvidenceConfirmed} — the moment it establishes that new cycle's own
+ * never-dispatched baseline, before any new evidence exists to confuse it with.
+ *
+ * Carries the confirmed evidence ids themselves (JSON array), not just a boolean (PR #284 review,
+ * "track which beads a durably-confirmed board-only delivery touched") — a dispatch resume that
+ * finds this flag set has no OTHER way to recover which ids were confirmed: the pending-marker
+ * label and preserved-baseline metadata that carried them are cleared in the same write that sets
+ * this key. Without the ids riding along, a resumed run's per-ticket board-evidence ledger entry
+ * for this ticket is silently empty even though its delivery was genuinely confirmed.
+ */
+const BOARD_EVIDENCE_CONFIRMED_KEY = "boardEvidenceConfirmed";
+
+/**
+ * Metadata key holding review-fix's OWN recoverable pre-dispatch board snapshot (chatgpt-codex-
+ * connector, PR #284 review, "Persist the PR-fix board baseline before dispatch") — the same crash
+ * window {@link BOARD_EVIDENCE_BASELINE_KEY} closes for the initial ticket-dispatch path, closed here
+ * for review-fix's separate board-capable PR-fix path instead. That path's own pre-dispatch board
+ * read used to live only in process memory (`review-fix.ts`'s `boardBefore` local): a process/host
+ * death after the fixer's own live board write but before that session's post-run read (or its
+ * catch-block audit) left nothing durable to diff a resumed attempt against, so a fresh read on retry
+ * already contained the repair with no delta left to report — a genuine `fixed` outcome then read as
+ * fabricated and the finding could cycle forever despite the repair having landed.
+ *
+ * Deliberately a SEPARATE key from `BOARD_EVIDENCE_BASELINE_KEY`, not a reuse of it: that key's value
+ * is owned by the ticket-dispatch lock/refresh protocol keyed off `boardEvidenceConfirmed` /
+ * `boardEvidenceBaselineLocked` / `boardEvidenceDispatchStarted`, built for multiple concurrent
+ * dispatch attempts racing to lock a stable candidate — a shape review-fix's own one-session-at-a-time
+ * flow doesn't have and shouldn't have to reason about. See {@link beads.reviewFixBoardBaseline} /
+ * {@link beads.setReviewFixBoardBaseline} / {@link beads.clearReviewFixBoardBaseline}.
+ */
+const REVIEW_FIX_BOARD_BASELINE_KEY = "reviewFixBoardBaseline";
+
+/**
+ * Metadata key holding the pre-PR self-review gate's OWN recoverable pre-dispatch board snapshot
+ * (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline before
+ * dispatch") — {@link REVIEW_FIX_BOARD_BASELINE_KEY}'s analogue for `review-gate.ts`'s
+ * `runGateFixSession`, which read that round's own pre-dispatch board fingerprint into a plain
+ * local (`boardBefore`) with nothing durable behind it. A process/host death after a board-capable
+ * self-review fixer's live write but before that round's post-run read or failure audit left a
+ * resumed attempt with only a FRESH baseline to diff against — one that already contains the
+ * repair — so the delta could never be told apart from no progress, the same failure mode
+ * {@link REVIEW_FIX_BOARD_BASELINE_KEY} closes for the PR-fix path.
+ *
+ * A separate key rather than a shared one: the self-review gate and a PR-fix round can be live for
+ * the SAME ticket at different points of its lifecycle (self-review before the PR exists,
+ * review-fix after), and each owns its own one-round-at-a-time recovery snapshot. See
+ * {@link beads.reviewGateBoardBaseline} / {@link beads.setReviewGateBoardBaseline} /
+ * {@link beads.clearReviewGateBoardBaseline}.
+ */
+const REVIEW_GATE_BOARD_BASELINE_KEY = "reviewGateBoardBaseline";
+
+/**
+ * `metadata` keys anton itself writes for its own bookkeeping — never a board-only ticket's own
+ * content (anton-fc5x PR #284 review). Exported so a caller that needs to read `metadata` as
+ * ticket-authored content (the board-evidence fingerprint) can exclude exactly these and treat
+ * everything else in the object as real, fingerprintable data — the same shape as the
+ * `*_PREFIX` label exclusions above, just for metadata keys instead of label prefixes.
+ */
+export const ANTON_METADATA_KEYS: readonly string[] = [
+  "pr",
+  RETIRED_PR_KEY,
+  BOARD_EVIDENCE_BASELINE_KEY,
+  BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
+  BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
+  BOARD_EVIDENCE_DISPATCH_STARTED_KEY,
+  BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY,
+  BOARD_EVIDENCE_CONFIRMED_KEY,
+  BOARD_EVIDENCE_PENDING_CLOSURE_KEY,
+  REVIEW_FIX_BOARD_BASELINE_KEY,
+  REVIEW_GATE_BOARD_BASELINE_KEY,
+];
 
 /**
  * Parse a `run-lease:<expiry>[:<owner>]` label into its expiry (ms epoch) and optional owner (the
@@ -943,6 +1245,500 @@ export const beads = {
       LABELS.reviewScore(score),
     ]),
 
+  /** The bead's existing `board-evidence-pending:*` label — the stale set
+   * {@link beads.setBoardEvidencePending} replaces (anton-fc5x). */
+  boardEvidencePendingLabels: (b: Bead): string[] =>
+    (b.labels ?? []).filter((l) => l.startsWith(BOARD_EVIDENCE_PENDING_PREFIX)),
+
+  /** Ids a PRIOR attempt found changed but could not confirm synced, parsed back off the bead's own
+   * label(s) (anton-fc5x) — empty when none is pending. Reads EVERY `board-evidence-pending:*`
+   * label, not just the first (PR #284 review, "Bound pending evidence before adding it as one
+   * label"): a batch large enough to need {@link chunkBoardEvidenceIds} spreads its ids across
+   * several labels, and reading only one would silently drop the rest. See
+   * {@link LABELS.boardEvidencePending}. */
+  pendingBoardEvidence: (b: Bead): string[] => {
+    const ids = beads
+      .boardEvidencePendingLabels(b)
+      .flatMap((label) => label.slice(BOARD_EVIDENCE_PENDING_PREFIX.length).split(",").filter(Boolean));
+    return [...new Set(ids)];
+  },
+
+  /** The closure episode a still-present pending marker was last confirmed against, if any — see
+   * {@link BOARD_EVIDENCE_PENDING_CLOSURE_KEY}. `undefined` when never stamped (a marker written
+   * pre-close and never survived to a `clearBoardEvidencePending` retry, or one written before this
+   * fence existed). */
+  pendingBoardEvidenceClosure: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_PENDING_CLOSURE_KEY];
+    return typeof raw === "string" && raw ? raw : undefined;
+  },
+
+  /** Stamp a still-present pending marker with the closure episode it was just confirmed against
+   * (chatgpt-codex-connector, PR #284 review, "Fence pending evidence by closure cycle") — called by
+   * {@link execute-epic-board-evidence.ts!clearBoardEvidencePending} right after it reads a closed
+   * ticket's closure, BEFORE attempting to clear the marker, so a marker that survives a failed clear
+   * still carries the closure it belongs to. See {@link beads.pendingBoardEvidenceClosure}. */
+  stampPendingBoardEvidenceClosure: (cwd: string, id: string, closure: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_PENDING_CLOSURE_KEY}=${closure}`]),
+
+  /**
+   * The exact `board-evidence-pending:*` label SET {@link beads.setBoardEvidencePending} would
+   * write for `ids` (PR #284 review) — exposed so a caller can compare it against a bead's current
+   * labels ({@link beads.boardEvidencePendingLabels}) to decide whether a write is a no-op, without
+   * duplicating {@link chunkBoardEvidenceIds}'s chunking itself.
+   */
+  boardEvidencePendingLabelsFor: (ids: readonly string[]): string[] =>
+    chunkBoardEvidenceIds(ids).map((chunk) => LABELS.boardEvidencePending(chunk)),
+
+  /**
+   * Publish the board-only evidence still awaiting sync confirmation as state label(s), like
+   * {@link beads.setReviewScore}: drop every prior `board-evidence-pending:*` (pass them as `stale`)
+   * and add the new set. An empty `ids` with a non-empty `stale` clears the marker (confirmed synced)
+   * without adding a replacement. `ids` is split across multiple labels when it would otherwise
+   * overflow one argv argument — see {@link beads.boardEvidencePendingLabelsFor}. The resulting
+   * `--add-label`/`--remove-label` flags are then split across as many `bd update` calls as
+   * {@link BOARD_EVIDENCE_UPDATE_ARGV_BUDGET} requires (chatgpt-codex-connector, PR #284 review):
+   * a batch with enough chunks could otherwise sum past Linux's total `ARG_MAX` even with every
+   * individual label bounded.
+   */
+  setBoardEvidencePending: async (cwd: string, id: string, ids: readonly string[], stale: string[] = []) => {
+    const flags: [string, string][] = [
+      ...stale.map((l): [string, string] => ["--remove-label", l]),
+      ...beads.boardEvidencePendingLabelsFor(ids).map((label): [string, string] => ["--add-label", label]),
+    ];
+    for (const group of chunkLabelFlags(flags, BOARD_EVIDENCE_UPDATE_ARGV_BUDGET)) {
+      await bdWrite(cwd, ["update", id, ...group.flat()]);
+    }
+    // The marker is gone (or was never chunked to begin with) — drop the closure fence stamp with
+    // it (PR #284 review, "Fence pending evidence by closure cycle"), so it never outlives the label
+    // it describes and gets read back against a LATER marker this same key would otherwise misname.
+    if (ids.length === 0) {
+      await bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_PENDING_CLOSURE_KEY]);
+    }
+  },
+
+  /**
+   * A prior attempt's PRESERVED pre-dispatch board fingerprint (PR #284 review), parsed back off
+   * the bead's own metadata — `undefined` when none was ever preserved, or the stored value is
+   * unreadable JSON (read as "nothing preserved" rather than thrown, since a malformed value is no
+   * worse than one that was never written). See {@link BOARD_EVIDENCE_BASELINE_KEY}.
+   */
+  boardEvidenceBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** Whether the preserved baseline above is a RECOVERY baseline — one `readBoardEvidence` wrote
+   * AFTER a dispatch attempt already ran, as opposed to the never-dispatched pre-dispatch baseline
+   * `ensureBoardBaselinePersisted` freely refreshes. See {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY}. */
+  boardEvidenceBaselineLocked: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_BASELINE_LOCKED_KEY] !== undefined,
+
+  /** Whether the locked baseline above was actually VERIFIED stable, as opposed to a tentative lock
+   * a round wrote before its own confirming push and re-read had a chance to prove it so. See
+   * {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY}. */
+  boardEvidenceBaselineVerified: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_BASELINE_VERIFIED_KEY] !== undefined,
+
+  /** Whether dispatch actually began against the currently locked baseline — the one signal that
+   * tells a genuine post-dispatch recovery lock apart from a pre-dispatch lock a crash caught
+   * before dispatch ever started. See {@link BOARD_EVIDENCE_DISPATCH_STARTED_KEY}. */
+  boardEvidenceDispatchStarted: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_DISPATCH_STARTED_KEY] !== undefined,
+
+  /** Durably mark that dispatch has begun against `id`'s currently locked baseline. Called once,
+   * by the caller, right before the agent session starts and never before — see
+   * {@link BOARD_EVIDENCE_DISPATCH_STARTED_KEY}. A single flag, so a plain `--set-metadata` is safe
+   * (unlike the fingerprint writes above, this never risks the argv `E2BIG` ceiling). */
+  setBoardEvidenceDispatchStarted: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${BOARD_EVIDENCE_DISPATCH_STARTED_KEY}=1`]),
+
+  /**
+   * Preserve `fingerprint` (a serialized {@link BoardFingerprint}) as this ticket's recoverable
+   * pre-dispatch baseline. `locked` (default false) marks it a RECOVERY baseline — set by callers
+   * preserving it AFTER a dispatch attempt already ran (see {@link BOARD_EVIDENCE_BASELINE_LOCKED_KEY})
+   * — so `ensureBoardBaselinePersisted`'s own confirming-pull refresh never overwrites it with a
+   * "refreshed" value that folds in that same prior attempt's own not-yet-confirmed delivery.
+   * `verified` (default false) additionally marks the lock as proven stable — see
+   * {@link BOARD_EVIDENCE_BASELINE_VERIFIED_KEY} — and is meaningless (ignored) when `locked` is
+   * false, since there is no lock yet for it to describe.
+   *
+   * Written through `--metadata @file` (a temp file, cleaned up in `finally` like {@link
+   * beads.createGraph}'s plan file), never `--set-metadata key=value` (chatgpt-codex-connector,
+   * PR #284 review, "Bound the complete baseline metadata argument") — `fingerprintOf` already
+   * hashes each bead down to 16 hex chars, but `fingerprint` still holds one entry per bead in the
+   * WHOLE board (see {@link BoardFingerprint}'s own docstring on that tradeoff), so the serialized
+   * JSON stays proportional to board size with no per-bead cap. A board of several thousand beads
+   * can still push that single argv argument past Linux's ~128KiB single-argument ceiling and fail
+   * `E2BIG` outright, parking every board-only ticket before dispatch ever starts. `--metadata`
+   * merges into existing custom metadata rather than replacing it (verified against bd 1.1.2: prior
+   * keys, including this one on a resumed ticket, survive untouched aside from the key being
+   * written) — the same replace-one-key semantics `--set-metadata` had, just off a bounded file
+   * instead of an unbounded argv string.
+   */
+  setBoardEvidenceBaseline: async (
+    cwd: string,
+    id: string,
+    fingerprint: Record<string, string>,
+    locked = false,
+    verified = false,
+  ) => {
+    // `--metadata` MERGES into existing custom metadata rather than replacing it (see this
+    // function's own docstring), so a write that isn't itself marking verified must explicitly
+    // unset a stale VERIFIED_KEY left by an earlier round — otherwise a candidate that changed
+    // after being verified would keep reading as verified.
+    //
+    // Run as its OWN `bd update`, never combined with the `--metadata @file` write below: bd
+    // (verified against 1.1.2) refuses that combination outright — "cannot combine --metadata
+    // with --set-metadata or --unset-metadata" — so folding `--unset-metadata` onto the same argv
+    // this function used to build made EVERY non-final-verified write in this module fail every
+    // retry, which is what actually broke `ensureBoardBaselinePersisted` end to end (anton-fc5x
+    // review round 18). Unset FIRST, not after the merge write: a crash between the two calls
+    // then leaves, at worst, a baseline that reads as unverified — the same conservative shape
+    // every other tentative write in this module already risks — never a crash that leaves a
+    // STALE verified flag pointing at whatever candidate the second call was about to replace it
+    // with. Unsetting a key the bead never had is a safe no-op (verified against bd 1.1.2).
+    if (!(locked && verified)) {
+      await bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]);
+    }
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-baseline-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(
+        file,
+        JSON.stringify({
+          [BOARD_EVIDENCE_BASELINE_KEY]: JSON.stringify(fingerprint),
+          ...(locked ? { [BOARD_EVIDENCE_BASELINE_LOCKED_KEY]: "1" } : {}),
+          ...(locked && verified ? { [BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]: "1" } : {}),
+        }),
+      );
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /** Release a preserved baseline (and its recovery lock/verification, if any) once the handoff it
+   * backed has completed. */
+  clearBoardEvidenceBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--unset-metadata",
+      BOARD_EVIDENCE_BASELINE_KEY,
+      "--unset-metadata",
+      BOARD_EVIDENCE_BASELINE_LOCKED_KEY,
+      "--unset-metadata",
+      BOARD_EVIDENCE_BASELINE_VERIFIED_KEY,
+      "--unset-metadata",
+      BOARD_EVIDENCE_DISPATCH_STARTED_KEY,
+    ]),
+
+  /**
+   * Downgrade a locked baseline from VERIFIED back to merely tentative, touching neither the
+   * fingerprint nor the lock itself (chatgpt-codex-connector, PR #284 review, "Mark abandoned
+   * baselines before clearing them"). Called by {@link execute-epic-board-evidence.ts!abandonDispatchBaseline}
+   * and confirmed synced BEFORE that function's own clear runs: a crash between the clear's local
+   * write and its confirming push otherwise leaves the remote holding a STALE but still-VERIFIED
+   * baseline, which a fresh-machine resume's `recoveryBaseline` fast path would trust without ever
+   * re-reading the board. Stripping VERIFIED first means that same crash instead leaves the remote
+   * locked-but-unverified, which routes any resume into re-verification instead. Unsetting a key the
+   * bead never had is a safe no-op (verified against bd 1.1.2), so this is safe to call
+   * unconditionally, whether or not this particular candidate was ever actually marked verified.
+   */
+  unverifyBoardEvidenceBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_BASELINE_VERIFIED_KEY]),
+
+  /** Whether a prior attempt's board-evidence cleanup wrote locally but never confirmed reaching
+   * the remote — parsed off the bead's own metadata. See {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}.
+   * `!== undefined` rather than a value check (PR #284 review, "Recover cleanup-only resumes
+   * before regeneration"): the key now carries a JSON ids array (possibly empty) rather than the
+   * literal string `"true"`, so presence alone is what marks the obligation. */
+  hasBoardEvidenceCleanupUnsynced: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY] !== undefined,
+
+  /** The evidence ids an unsynced cleanup still owes confirmation, parsed back off the same
+   * metadata {@link beads.hasBoardEvidenceCleanupUnsynced} checks — empty when the stored value
+   * predates this field, carries no ids, or is unreadable, matching
+   * {@link beads.confirmedBoardEvidenceIds}'s tolerance for a malformed value. Reads both the legacy
+   * bare-array shape and the current `{ ids, closure }` shape (PR #284 review, "Fence pending
+   * evidence by closure cycle") — see {@link beads.cleanupUnsyncedBoardEvidenceClosure}. See
+   * {@link BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY}. */
+  cleanupUnsyncedBoardEvidenceIds: (b: Bead): string[] => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY];
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const ids = Array.isArray(parsed) ? parsed : (parsed as { ids?: unknown } | null)?.ids;
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  },
+
+  /** The closure episode this cleanup obligation was recorded against, if any (PR #284 review,
+   * "Fence pending evidence by closure cycle") — `undefined` for an obligation written before this
+   * fence existed, or for one recorded while the ticket stayed open. Mirrors
+   * {@link beads.confirmedBoardEvidenceClosure}, just for the cleanup-unsynced survivor instead of
+   * the confirmed one; `dispatchTicket`'s resume fast paths (execute-epic-dispatch.ts) compare this
+   * against the ticket's CURRENT closure before trusting it as this cycle's evidence. */
+  cleanupUnsyncedBoardEvidenceClosure: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const closure = (parsed as { closure?: unknown } | null)?.closure;
+      return typeof closure === "string" ? closure : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** Record that this ticket's board-evidence cleanup landed locally but its confirming push
+   * failed, carrying the ids still owed confirmation so a resume — same machine or, once this
+   * state syncs, a fresh cross-machine worktree — can finish confirming them even after the
+   * pending marker and preserved baseline that otherwise carry them are already cleared.
+   *
+   * Written through `--metadata @file`, never `--set-metadata key=value` (chatgpt-codex-connector,
+   * PR #284 review, "Keep confirmed evidence IDs out of a single argv argument") — `ids` is a
+   * board-only batch's whole confirmed-id set, so a large enough batch pushes this single argv
+   * argument past the ~128KiB single-argument ceiling and fails `E2BIG`, poisoning an
+   * already-transitioned ticket that can never persist its cross-machine recovery obligation. See
+   * {@link beads.setBoardEvidenceBaseline} for the same bound applied to the baseline write.
+   *
+   * Carries `closure` too, mirroring {@link beads.setBoardEvidenceConfirmed} (PR #284 review, "Fence
+   * pending evidence by closure cycle") — the closed ticket's closure episode at the moment this
+   * obligation was recorded, so a later resume can tell this cycle's still-unsynced obligation apart
+   * from one an earlier, already-settled cycle left behind. See
+   * {@link beads.cleanupUnsyncedBoardEvidenceClosure}. */
+  setBoardEvidenceCleanupUnsynced: async (
+    cwd: string,
+    id: string,
+    ids: readonly string[] = [],
+    closure?: string,
+  ) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-cleanup-unsynced-"));
+    try {
+      const file = join(dir, "metadata.json");
+      const value = closure === undefined ? { ids } : { ids, closure };
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]: JSON.stringify(value) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /** Release the retry obligation once a later push actually confirms the cleanup reached the remote. */
+  clearBoardEvidenceCleanupUnsynced: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_CLEANUP_UNSYNCED_KEY]),
+
+  /** Whether this ticket's board-only delivery was ever confirmed and its cleanup completed —
+   * the durable proof that survives {@link beads.clearBoardEvidenceBaseline}/pending-marker
+   * clearing. See {@link BOARD_EVIDENCE_CONFIRMED_KEY}. */
+  boardEvidenceConfirmed: (b: Bead): boolean =>
+    b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY] !== undefined,
+
+  /** The evidence ids a confirmed board-only delivery touched, parsed back off the same metadata
+   * {@link beads.boardEvidenceConfirmed} checks (PR #284 review) — empty when the stored value
+   * predates this field or is unreadable, read as "confirmed but nothing to attribute" rather than
+   * thrown, matching {@link beads.boardEvidenceBaseline}'s tolerance for a malformed value. Reads
+   * both the legacy bare-array shape and the current `{ ids, closure }` shape (anton-fc5x review,
+   * "Invalidate confirmation when the ticket is reopened") — see {@link beads.confirmedBoardEvidenceClosure}. */
+  confirmedBoardEvidenceIds: (b: Bead): string[] => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
+    if (typeof raw !== "string" || !raw) return [];
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const ids = Array.isArray(parsed) ? parsed : (parsed as { ids?: unknown } | null)?.ids;
+      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+    } catch {
+      return [];
+    }
+  },
+
+  /** The closure episode a confirmed board-only delivery was recorded against, if any (anton-fc5x
+   * review, "Invalidate confirmation when the ticket is reopened") — `undefined` for a confirmation
+   * written before this fence existed, or for one recorded while the ticket stayed open (a standalone
+   * target at `stage:in-review`, which has no closure episode to fence). `dispatchTicket`'s confirmed
+   * fast path (execute-epic-dispatch.ts) compares this against {@link
+   * import("./closure-cycle").readCurrentClosureVersion} before trusting a CLOSED ticket's
+   * confirmation: a ticket reopened and closed again by anything other than this run — before this
+   * run ever redispatches it — starts a new closure episode this stored value does not name, and
+   * `ensureBoardBaselinePersisted`'s own reopen-reset (see {@link beads.clearBoardEvidenceConfirmed})
+   * never runs for a ticket the confirmed fast path skips redispatching entirely. */
+  confirmedBoardEvidenceClosure: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const closure = (parsed as { closure?: unknown } | null)?.closure;
+      return typeof closure === "string" ? closure : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** The closure identity a still-UNFENCED confirmation (`closure` absent) was written against —
+   * {@link import("./closure-cycle").lastCompletedClosureVersion} at confirmation time, `undefined`
+   * when the ticket had never closed before (chatgpt-codex-connector, PR #284 review, "Preserve the
+   * originating cycle when stamping confirmations"). `stampConfirmedClosures`
+   * (review-fix-finalize.ts) compares this against the same identity read fresh, immediately before
+   * fencing a now-closed ticket's confirmation — a mismatch means a full extra reopen-and-reclose
+   * cycle landed on the ticket after this confirmation was written but before it was ever fenced,
+   * which `confirmedBoardEvidenceClosure`'s own absence cannot by itself distinguish from a
+   * genuinely fresh, still-open confirmation. */
+  confirmedBoardEvidenceOrigin: (b: Bead): string | undefined => {
+    const raw = b.metadata?.[BOARD_EVIDENCE_CONFIRMED_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const origin = (parsed as { origin?: unknown } | null)?.origin;
+      return typeof origin === "string" ? origin : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /** Record, permanently, that this ticket's board-only delivery was confirmed — written once,
+   * beside the pending-marker/baseline clear, and never unset. Carries `ids` (the confirmed
+   * evidence) along with the flag, since the pending-marker label and preserved-baseline metadata
+   * that otherwise carry them are cleared in the same handoff. Also carries `closure` — the ticket's
+   * {@link import("./closure-cycle").currentClosureVersion} at confirmation time, for a ticket closed
+   * this cycle — so a later resume can tell THIS confirmation apart from one an earlier, already-
+   * settled cycle left behind (anton-fc5x review, "Invalidate confirmation when the ticket is
+   * reopened"); see {@link beads.confirmedBoardEvidenceClosure}.
+   *
+   * `origin` rides along too, only when `closure` is absent (chatgpt-codex-connector, PR #284
+   * review, "Preserve the originating cycle when stamping confirmations") — see
+   * {@link beads.confirmedBoardEvidenceOrigin}. Meaningless once a confirmation carries its own
+   * `closure`, since a fenced confirmation is never re-fenced.
+   *
+   * Written through `--metadata @file`, never `--set-metadata key=value` (chatgpt-codex-connector,
+   * PR #284 review, "Keep confirmed evidence IDs out of a single argv argument") — same ~128KiB
+   * argv ceiling and `E2BIG` failure mode as {@link beads.setBoardEvidenceCleanupUnsynced} above,
+   * and this write is the one that PERSISTS the confirmation, so failing it outright (rather than
+   * merely failing to retry a cleanup) leaves a large board-only batch unable to ever record its
+   * delivery as confirmed. See {@link beads.setBoardEvidenceBaseline} for the same bound applied to
+   * the baseline write. */
+  setBoardEvidenceConfirmed: async (
+    cwd: string,
+    id: string,
+    ids: readonly string[] = [],
+    closure?: string,
+    origin?: string,
+  ) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-confirmed-"));
+    try {
+      const file = join(dir, "metadata.json");
+      const value =
+        closure === undefined ? (origin === undefined ? { ids } : { ids, origin }) : { ids, closure };
+      writeFileSync(file, JSON.stringify({ [BOARD_EVIDENCE_CONFIRMED_KEY]: JSON.stringify(value) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /**
+   * Unset a confirmation left over from an EARLIER, already-completed delivery cycle (PR #284
+   * review, "Reset stale confirmations before a reopened delivery") — the one exception to
+   * {@link BOARD_EVIDENCE_CONFIRMED_KEY}'s own "never cleared afterwards", scoped to the one caller
+   * that can prove the prior cycle is over: {@link execute-epic-board-evidence.ts!ensureBoardBaselinePersisted}
+   * establishing a brand-new pre-dispatch baseline. A ticket only reaches that call with a stale
+   * `confirmed` flag still set by being reopened after a completed cycle — `dispatchTicket`'s
+   * confirmed fast path returns before ever dispatching again while the ticket stays closed/in-review
+   * — so clearing it there, before the new cycle's own evidence exists, cannot discard a confirmation
+   * that still describes live, undelivered work.
+   */
+  clearBoardEvidenceConfirmed: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", BOARD_EVIDENCE_CONFIRMED_KEY]),
+
+  /**
+   * review-fix's own preserved pre-dispatch board fingerprint, parsed back off the bead's metadata —
+   * `undefined` when none was ever preserved, or the stored value is unreadable JSON (read as
+   * "nothing preserved", the same tolerance {@link beads.boardEvidenceBaseline} applies). See
+   * {@link REVIEW_FIX_BOARD_BASELINE_KEY}.
+   */
+  reviewFixBoardBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[REVIEW_FIX_BOARD_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /**
+   * Preserve `fingerprint` (a serialized board fingerprint) as review-fix's recoverable pre-dispatch
+   * baseline for `id`. Written through `--metadata @file`, never `--set-metadata key=value`, for the
+   * same `E2BIG` reason {@link beads.setBoardEvidenceBaseline} is: the value holds one entry per bead
+   * on the whole board, which can push a single argv argument past Linux's ~128KiB ceiling on a large
+   * board. See {@link REVIEW_FIX_BOARD_BASELINE_KEY}.
+   */
+  setReviewFixBoardBaseline: async (cwd: string, id: string, fingerprint: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-review-fix-baseline-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [REVIEW_FIX_BOARD_BASELINE_KEY]: JSON.stringify(fingerprint) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /** Release the preserved baseline above once review-fix's own board evidence for this session has
+   * been captured and confirmed synced, or a failure has been proven to have touched nothing on the
+   * board — see {@link REVIEW_FIX_BOARD_BASELINE_KEY}. */
+  clearReviewFixBoardBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_FIX_BOARD_BASELINE_KEY]),
+
+  /**
+   * The self-review gate's own preserved pre-dispatch board fingerprint, parsed back off the
+   * bead's metadata — `undefined` when none was ever preserved, or the stored value is unreadable
+   * JSON (read as "nothing preserved", the same tolerance {@link beads.reviewFixBoardBaseline}
+   * applies). See {@link REVIEW_GATE_BOARD_BASELINE_KEY}.
+   */
+  reviewGateBoardBaseline: (b: Bead): Record<string, string> | undefined => {
+    const raw = b.metadata?.[REVIEW_GATE_BOARD_BASELINE_KEY];
+    if (typeof raw !== "string" || !raw) return undefined;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+    } catch {
+      return undefined;
+    }
+  },
+
+  /**
+   * Preserve `fingerprint` (a serialized board fingerprint) as the self-review gate's recoverable
+   * pre-dispatch baseline for `id`. Written through `--metadata @file`, never
+   * `--set-metadata key=value`, for the same `E2BIG` reason {@link beads.setReviewFixBoardBaseline}
+   * is. See {@link REVIEW_GATE_BOARD_BASELINE_KEY}.
+   */
+  setReviewGateBoardBaseline: async (cwd: string, id: string, fingerprint: Record<string, string>) => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-bd-review-gate-baseline-"));
+    try {
+      const file = join(dir, "metadata.json");
+      writeFileSync(file, JSON.stringify({ [REVIEW_GATE_BOARD_BASELINE_KEY]: JSON.stringify(fingerprint) }));
+      return await bdWrite(cwd, ["update", id, "--metadata", `@${file}`]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+
+  /** Release the preserved baseline above once the self-review gate's own board evidence for this
+   * round has been captured and confirmed synced, or a failure has been proven to have touched
+   * nothing on the board — see {@link REVIEW_GATE_BOARD_BASELINE_KEY}. */
+  clearReviewGateBoardBaseline: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_GATE_BOARD_BASELINE_KEY]),
+
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
    * which a plain close leaves blank. Deliberately NOT the abandon path: a reason here describes
@@ -1383,6 +2179,13 @@ export const beads = {
    * the runner agree at every level of the tree.
    */
   isHumanWork: (b: Bead) => b.labels?.includes(LABELS.agentHuman) ?? false,
+
+  /**
+   * A run target shaped as board-only (`delivery:board`, {@link LABELS.boardOnly}): its deliverable
+   * is bd writes, never a git diff. `assertDelivered`'s zero-diff guard reads this to decide whether
+   * a clean git tree needs board evidence instead of a commit before it can settle as delivered.
+   */
+  isBoardOnly: (b: Bead) => b.labels?.includes(LABELS.boardOnly) ?? false,
 
   isEpic: (b: Bead) => b.issue_type === "epic",
 

@@ -13,11 +13,13 @@ import { dirname, join } from "node:path";
 import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
+  hasBoardOnlyTicket,
   parseReviewFindings,
   reviewContext,
 } from "./review-context";
 import type { BranchDiff } from "../git/ops";
 import type { Bead } from "../beads/bd";
+import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { ProjectSettings } from "../projects";
 
 /** An id no bundled/global agent can shadow, so precedence is measured, not guessed. */
@@ -345,7 +347,246 @@ describe("reviewContext", () => {
       diff: { files: [], patch: "", truncated: false },
     });
     expect(empty).toContain("NO changes against its base");
+    expect(empty).toContain("report that as blocking");
   });
+
+  it(
+    "reads an empty diff as expected, not blocking, when every bead this run delivered is " +
+      "`delivery:board` (PR #284 review) — the run's own board-evidence check already confirmed " +
+      "those writes before this review ran",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: epic,
+        tickets: [boardOnlyTicket],
+        diff: { files: [], patch: "", truncated: false },
+      });
+      expect(out).toContain("NO changes against its base");
+      expect(out).toContain("expected here");
+      expect(out).not.toContain("report that as blocking");
+      expect(out).toContain("Judge the Acceptance criteria above against that confirmed board delivery");
+    },
+  );
+
+  it(
+    "also reads an empty diff as expected when only the RUN TARGET carries `delivery:board` — the " +
+      "documented legacy shape where a child ticket never carries the label itself",
+    () => {
+      const boardOnlyEpic: Bead = { ...epic, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: boardOnlyEpic,
+        tickets: [ticket],
+        diff: { files: [], patch: "", truncated: false },
+      });
+      // isBoardOnlyRun-style fallback: a plain ticket under a board-only-labelled target still
+      // counts as board-only (the documented legacy shape), so this is deliberately NOT blocking.
+      expect(out).not.toContain("report that as blocking");
+    },
+  );
+
+  it(
+    "still reports blocking on an empty diff for a MIXED run — one ticket is `delivery:board` " +
+      "but another (and the target) is not, so the diff being empty is unexplained",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-x1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-x1.2", labels: [] };
+      const codeEpic: Bead = { ...epic, labels: [] };
+      const out = reviewContext({
+        target: codeEpic,
+        tickets: [boardOnlyTicket, plainTicket],
+        diff: { files: [], patch: "", truncated: false },
+      });
+      expect(out).toContain("report that as blocking");
+    },
+  );
+
+  it(
+    "hasBoardOnlyTicket reads a MIXED run as board-capable — unlike isBoardOnlyDelivery's " +
+      "all-tickets rule, review-gate's fix routing (PR #284 review round 15) must still give the " +
+      "board-only ticket's fix session live-board handling even though a sibling ticket isn't board-only",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-x1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-x1.2", labels: [] };
+      const codeEpic: Bead = { ...epic, labels: [] };
+      expect(hasBoardOnlyTicket({ target: codeEpic, tickets: [boardOnlyTicket, plainTicket] })).toBe(true);
+      expect(hasBoardOnlyTicket({ target: codeEpic, tickets: [plainTicket] })).toBe(false);
+    },
+  );
+
+  it(
+    "tells the reviewer to read a board-only ticket's beads off the live board, not this " +
+      "worktree's own frozen `bd` (PR #284 review round 12) — the confirmed ids AND the `-C` " +
+      "instruction, since the worktree's beads copy is a separate, unsynced one",
+    () => {
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: epic,
+        tickets: [boardOnlyTicket],
+        diff: { files: [], patch: "", truncated: false },
+        boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+        repoPath: "/repos/anton",
+      });
+      expect(out).toContain("- anton-x1.1: anton-y9");
+      expect(out).toContain("bd -C '/repos/anton' show <id>");
+      expect(out).toContain("frozen, pre-delivery copy");
+    },
+  );
+
+  it(
+    "still gives the live-board instruction with no confirmed ids to name — the legacy shape " +
+      "where only the run target carries `delivery:board`",
+    () => {
+      const boardOnlyEpic: Bead = { ...epic, labels: ["delivery:board"] };
+      const out = reviewContext({
+        target: boardOnlyEpic,
+        tickets: [ticket],
+        diff: { files: [], patch: "", truncated: false },
+        repoPath: "/repos/anton",
+      });
+      expect(out).toContain("bd -C '/repos/anton' show <id>");
+      // No evidence map was given, so there is nothing to list — but the instruction still fires.
+      expect(out).not.toContain("confirmed evidence covers");
+    },
+  );
+
+  it(
+    "withholds the live `bd -C <repoPath>` read instruction for a server-backed board (PR #284 " +
+      "review, \"Block server-backed board writes during review\") — that path is write-capable and " +
+      "a shared server has no filesystem sandbox to contain it, so the reviewer is pointed at the " +
+      "already-confirmed ids' field values instead",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+        });
+        expect(out).toContain("- anton-x1.1: anton-y9");
+        expect(out).not.toContain("bd -C");
+        expect(out).toContain("shared server");
+        expect(out).toContain("anton read the current field values of every id above");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
+  it(
+    "renders the CURRENT field values of a confirmed id on a server-backed board (PR #284 review " +
+      "round 18, \"Supply field values to server-backed reviewers\") — a confirmed id alone proves " +
+      "only that SOME field changed, not which one",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const confirmed: Bead = {
+          id: "anton-y9",
+          title: "Reparent the orphaned ticket",
+          status: "closed",
+          issue_type: "task",
+          labels: ["domain:eng"],
+          parent: "anton-fc5x",
+          assignee: "anton",
+          dependencies: [{ issue_id: "anton-y9", depends_on_id: "anton-fc5x", type: "parent-child" }],
+          description: "Move it under the right epic.",
+          acceptance_criteria: "- [ ] parent is anton-fc5x",
+          design: "Use `bd update --parent`.",
+          priority: 1,
+          external_ref: "LINEAR-42",
+          metadata: { source: "gardener" },
+        };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+          confirmedBoardEvidenceBeads: new Map([["anton-y9", confirmed]]),
+        });
+        expect(out).toContain("- anton-y9: status=closed, type=task, title=\"Reparent the orphaned ticket\"");
+        expect(out).toContain("labels=[domain:eng], parent=anton-fc5x, assignee=anton");
+        expect(out).toContain("dependencies=[parent-child:anton-fc5x], priority=1, external_ref=LINEAR-42");
+        expect(out).toContain('metadata={source="gardener"}');
+        expect(out).toContain("description=Move it under the right epic.");
+        expect(out).toContain("acceptance_criteria=- [ ] parent is anton-fc5x");
+        expect(out).toContain("design=Use `bd update --parent`.");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
+  it(
+    "tells the reviewer a confirmed id's current values could not be read, rather than silently " +
+      "omitting it, when the host-side read failed",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+          confirmedBoardEvidenceBeads: new Map([["anton-y9", undefined]]),
+        });
+        expect(out).toContain("current field values could not be read from the live board");
+        expect(out).toContain("treat");
+        expect(out).toContain("unconfirmed");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
+  it(
+    'renders a confirmed id\'s successful deletion as DELETED, not as a read failure ' +
+      '(chatgpt-codex-connector, PR #284 review, "Represent deleted beads as successful absence") ' +
+      "— the live read succeeded and simply found nothing at that id",
+    () => {
+      pinBoardMode("/repos/server-board", { mode: "server" });
+      try {
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const out = reviewContext({
+          target: epic,
+          tickets: [boardOnlyTicket],
+          diff: { files: [], patch: "", truncated: false },
+          boardEvidenceByTicket: new Map([[boardOnlyTicket.id, ["anton-y9"]]]),
+          repoPath: "/repos/server-board",
+          confirmedBoardEvidenceBeads: new Map([["anton-y9", "deleted"]]),
+        });
+        expect(out).toContain("- anton-y9: no longer exists on the live board");
+        expect(out).toContain("not a");
+        expect(out).toContain("read failure");
+        expect(out).not.toContain("could not be read from the live board");
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
+
+  it("gives neither board-evidence section when repoPath and boardEvidenceByTicket are both absent", () => {
+    const out = reviewContext({ target: epic, tickets: [ticket], diff });
+    expect(out).not.toContain("bd -C");
+    expect(out).not.toContain("confirmed evidence covers");
+  });
+
+  it(
+    "omits the live-board instruction for an ORDINARY run with a real diff and no board evidence, " +
+      "even though repoPath is given (PR #284 review) — `repoPath` is a required field every gate " +
+      "forwards regardless of whether this run has any board-only ticket, so gating on repoPath " +
+      "alone would leak this paragraph into every ordinary code review",
+    () => {
+      const out = reviewContext({ target: epic, tickets: [ticket], diff, repoPath: "/repos/anton" });
+      expect(out).not.toContain("bd -C");
+      expect(out).not.toContain("confirmed evidence covers");
+    },
+  );
 
   // anton-0b1d: 9 of 40 PRs hit truncation and carried 68% of all findings — "read the worktree" was
   // never enough on its own, so the cut is named and the exact unreviewed paths are computed and
@@ -1058,6 +1299,72 @@ describe("buildFindingsFixPrompt", () => {
 
     expect(prompt).toContain("If a finding is WRONG");
     expect(prompt).toContain("Do not commit, push, or open a PR");
+  });
+
+  it(
+    "tells a board-only fixer that an unchanged tree is expected and how to write to the live " +
+      "board, not the ordinary instructions (PR #284 review round 12)",
+    async () => {
+      const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
+        target: epic,
+        findings: [{ severity: "blocking", location: "anton-x1", note: "the bead was never closed" }],
+        settings: {},
+        projectDir,
+        round: 1,
+        maxRounds: 2,
+        boardOnly: true,
+        repoPath: "/repos/anton",
+      });
+
+      expect(prompt).toContain("This run may deliver via the board");
+      expect(prompt).toContain("is NOT evidence you made no progress");
+      expect(prompt).toContain("bd -C '/repos/anton' update <id>");
+      // The system prompt must carry the same carve-out (PR #284 review round 16): without it, the
+      // fixer's base contract still forbids reporting `delivered` on an unchanged tree, contradicting
+      // the human-turn prompt above.
+      expect(appendSystemPrompt).toContain("## This ticket is board-only");
+      expect(appendSystemPrompt).toContain("bd -C '/repos/anton' update <id>");
+    },
+  );
+
+  it(
+    "softens the system-prompt carve-out for a MIXED run (chatgpt-codex-connector, PR #284 review, " +
+      "\"Avoid the board-only system contract for mixed runs\") — `mixedBoardOnly` must route to the " +
+      "run-level wording, never the single-ticket 'editing the tree is neither required nor expected' " +
+      "carve-out a fully board-only run can safely state",
+    async () => {
+      const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
+        target: epic,
+        findings: [{ severity: "blocking", location: "src/a.ts:1", note: "drops the error path" }],
+        settings: {},
+        projectDir,
+        round: 1,
+        maxRounds: 2,
+        boardOnly: true,
+        mixedBoardOnly: true,
+        repoPath: "/repos/anton",
+      });
+
+      // The human-turn prompt already disambiguates per finding — unaffected by this flag.
+      expect(prompt).toContain("This run may deliver via the board");
+      // The system prompt must use the mixed-run wording, not the unconditional single-ticket one.
+      expect(appendSystemPrompt).toContain("## This run includes a board-only ticket");
+      expect(appendSystemPrompt).not.toContain("## This ticket is board-only");
+    },
+  );
+
+  it("omits the board-only section entirely for an ordinary (non-board-only) fix", async () => {
+    const { prompt } = await buildFindingsFixPrompt({
+      target: epic,
+      findings: [{ severity: "blocking", location: "src/a.ts:1", note: "drops the error path" }],
+      settings: {},
+      projectDir,
+      round: 1,
+      maxRounds: 2,
+    });
+
+    expect(prompt).not.toContain("This run may deliver via the board");
+    expect(prompt).not.toContain("bd -C");
   });
 });
 

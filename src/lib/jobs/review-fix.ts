@@ -103,22 +103,29 @@ import {
   type ProjectSettings,
 } from "../projects";
 import { captureVerifyGates } from "./shell";
-import { tailLines } from "./review-context";
+import { tailLines, hasBoardOnlyTicket, isBoardOnlyDelivery } from "./review-context";
 import { findOpenRunForEpic } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import {
   buildReviewFixPrompt,
-  fabricatedFix,
   parseThreadReport,
   type ThreadOutcome,
 } from "./review-fix-context";
 import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
-import { IN_REVIEW } from "./review-fix-board";
+import { IN_REVIEW, tryList } from "./review-fix-board";
 import { safe } from "./safe";
-import { finalizeMergedEpic } from "./review-fix-finalize";
+import { finalizeMergedEpic, stampConfirmedClosures } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
+import {
+  boardEvidence,
+  persistReviewFixBoardBaseline,
+  readReviewFixBoardBaseline,
+  releaseReviewFixBoardBaseline,
+  type BoardFingerprint,
+} from "./execute-epic-board-evidence";
+import { defaultReadBoardFingerprint, defaultSyncBoard } from "./review-gate";
 import type { AntonDb, Clock } from "./queue";
 import { reviewFixPrParkedAtHead, systemClock } from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
@@ -213,6 +220,106 @@ export function inReviewEpics(
 }
 
 /**
+ * Closed epics stranded at `stage:in-review` by a fence write that failed during merge finalization
+ * (`closeFinalized`/`stampConfirmedClosures`, review-fix-finalize.ts): the batch close committed, but
+ * the closure-fence backfill on the epic or one of its children did not, and `inReviewEpics` excludes
+ * every closed bead unconditionally — so once an epic lands here, that function will never see it
+ * again. This is the one place left that still looks: a plain filter over the board this dispatcher
+ * already read, narrowed to `epicBeadId` exactly like `inReviewEpics` on a targeted run.
+ */
+function closedUnfencedEpics(all: Bead[], epicBeadId?: string): Bead[] {
+  return all.filter(
+    (b) =>
+      b.status === "closed" &&
+      (b.labels?.includes(IN_REVIEW) ?? false) &&
+      (epicBeadId === undefined || b.id === epicBeadId),
+  );
+}
+
+/** What one stranded-epic recovery attempt did (`recoverUnfencedClosure`). */
+type RecoveryResult = "recovered" | "attempted" | "skipped";
+
+/**
+ * Retry the fence backfill `closeFinalized` could not complete before ending: rebuild the same
+ * `[...children, epic]` set it would have closed, this time from the board (`runTickets`) rather than
+ * from that call's own snapshot, and re-run {@link stampConfirmedClosures} against it. Idempotent —
+ * a bead already fenced is filtered out inside that function — so a repeat pass over a stuck epic
+ * costs nothing beyond the read. Only once every bead in the set is confirmed fenced does the label
+ * drop, exactly like `closeFinalized`'s own gate.
+ *
+ * `closedUnfencedEpics` selects on shape alone (closed + still `stage:in-review`), which a target
+ * can also reach by a route this recovery must NOT touch: an operator closing the bead directly
+ * while its PR is still open (or closed unmerged). Nothing there was ever fenced, so
+ * `stampConfirmedClosures` over an empty unfenced set returns `true` vacuously — stripping the label
+ * off a target that was never actually finalized, and losing the one signal that would let PR
+ * monitoring resume if it were reopened. So recovery only proceeds once the PR itself confirms a
+ * merge landed (chatgpt-codex-connector, PR #284 review, "Restrict recovery to actual unfenced
+ * finalizations"); anything else — no PR ref, or a PR that never merged — is left exactly as is.
+ *
+ * `runTickets` is status-blind by construction (it filters on shape, not state), so `closedNow` can
+ * carry a child someone reopened after `closeFinalized`'s own batch close landed but before this
+ * retry ran. `stampConfirmedClosures` only ever looks at confirmation metadata, never status — a
+ * reopened child with no unfenced board-evidence confirmation of its own is silently excluded from
+ * its `unfenced` set, so the call can return `true` vacuously over a subtree that is not actually
+ * all closed. Requiring every member of `closedNow` to still read `closed` here is what
+ * `closeFinalized`'s own fresh-read loop already guards for the batch close itself (chatgpt-codex-
+ * connector, PR #284 review, "Recheck reopened children before clearing finalization") — this is
+ * the same guard for the fence retry.
+ */
+async function recoverUnfencedClosure(
+  repo: string,
+  epic: Bead,
+  signal: AbortSignal,
+): Promise<RecoveryResult> {
+  const number = prNumberFromRef(beads.getPrRef(epic));
+  if (number === undefined) return "skipped"; // no PR to confirm a merge against
+  const pr = await getPrReview(repo, number, signal);
+  if (pr.state !== "MERGED") return "skipped"; // closed by hand, not by finalization — leave it
+  // Rebuilt from a FRESH read, never the dispatcher's board snapshot (chatgpt-codex-connector, PR
+  // #284 review, "Re-read the subtree before clearing finalization"): `closedUnfencedEpics` already
+  // selected `epic` off that snapshot, so a status recheck built from the same snapshot is comparing
+  // it against itself and can never see a child reopened in the meantime. That reopen would still
+  // read `closed` here, and the fence/untag below would strand the reopened child beneath a target
+  // this call wrongly treats as fully settled.
+  const live = await tryList(repo);
+  if (!live) return "attempted"; // board unreadable — try again next sweep rather than guess off a stale snapshot
+  const liveEpic = live.find((b) => b.id === epic.id);
+  if (!liveEpic) return "attempted"; // epic vanished from a live read — try again next sweep
+  const closedNow = [...runTickets(live, epic.id), liveEpic];
+  if (closedNow.some((b) => b.status !== "closed")) return "skipped"; // a child was reopened — not actually finalized
+  if (!(await stampConfirmedClosures(repo, closedNow))) return "attempted";
+  // Checked, not fire-and-forget (chatgpt-codex-connector, PR #284 review, "Check the recovery-marker
+  // untag result"): a refused untag leaves `stage:in-review` standing while this still reports
+  // "recovered" — the dispatcher counts a success and moves on, and `closedUnfencedEpics` rediscovers
+  // the same epic on every later sweep with no way to tell that from a fresh unfenced closure.
+  if (!(await safe(() => beads.untag(repo, epic.id, [IN_REVIEW])))) return "attempted";
+  // Confirmed synced before this untag is trusted, and RESTORED locally when it can't be (mirrors
+  // `closeFinalized`, review-fix-finalize.ts — chatgpt-codex-connector, PR #284 review, "Restore the
+  // recovery marker when its sync fails"): the caller here (`dispatchInReview`) only calls `beads.sync`
+  // when `closedUnfencedEpics` still finds something to recover, and this untag just dropped `epic`
+  // out of that query's local result — so an unconfirmed push here would never get another sync
+  // attempt, even though `dispatchInReview`'s own sync failure IS propagated. Restoring the label
+  // keeps this machine's own recovery path finding the epic again next sweep.
+  const synced = await beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+  if (synced) return "recovered";
+  // A failed restore must not read as a restored one: with the label gone locally and never put
+  // back, `closedUnfencedEpics` has nothing left to select — the untag may still be unpublished, and
+  // no machine would ever revisit it. Thrown, not returned as "attempted": the caller folds this into
+  // `lastError` so the job itself is the retry signal, same as an aggregate sync failure.
+  const restored = await safe(() => beads.tag(repo, epic.id, [IN_REVIEW]));
+  if (!restored) {
+    throw new Error(
+      `${epic.id}: could not restore stage:in-review after an unconfirmed untag push — ` +
+        "closedUnfencedEpics can no longer find this epic to retry the sync",
+    );
+  }
+  return "attempted";
+}
+
+/**
  * Who this job is, as the worktree claim records it. The same name goes to `createWorktree`, which
  * refuses to hand a claimed checkout to anyone but its holder.
  *
@@ -263,7 +370,60 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // before dispatching a merged target by id (anton-k0kj).
   const operator = await resolveOperator();
   const targets = inReviewEpics(all, { operator, epicBeadId });
-  if (targets.length === 0) return { changed: false, note: "nothing in review" };
+
+  // Closed epics a merge finalization stranded (see closedUnfencedEpics) — checked every pass,
+  // targets or not, since this is the only place left that ever looks at them again.
+  let recovered = 0;
+  // A fence stamp or a label untag is a local dolt write — this dispatcher returns straight to the
+  // scheduler afterward, unlike the per-PR handler which pushes from its `finally` (fixOnePr, above).
+  // Left unsynced, a recovered fence or a dropped `stage:in-review` sits only in this machine's local
+  // DB: another operator's board (or this one's after a restart) still reads the epic as unfenced/
+  // stranded, and a same-machine retry that already dropped the label locally would never see its own
+  // write reflected back either (chatgpt-codex-connector, PR #284 review, "Sync recovered closure
+  // fences before declaring success").
+  let wroteToBoard = false;
+  // Set alongside `wroteToBoard` (never just logged): `recoverUnfencedClosure` can throw AFTER its
+  // untag already committed locally (an unconfirmed push it could not restore either — see its own
+  // comment), so the epic this pass just wrote to is one `closedUnfencedEpics` may never surface
+  // again. Folded into `syncError` below so it reaches the job the same way an aggregate sync
+  // failure does — one unfenceable epic still must not cost the others their recovery attempt, but
+  // it must not read as a clean pass either.
+  let recoveryError: unknown;
+  for (const stuck of closedUnfencedEpics(all, epicBeadId)) {
+    await ctx.heartbeat();
+    try {
+      const result = await recoverUnfencedClosure(repo, stuck, ctx.signal);
+      if (result !== "skipped") wroteToBoard = true;
+      if (result === "recovered") recovered += 1;
+    } catch (e) {
+      wroteToBoard = true;
+      recoveryError ??= e;
+      consoleLog.error(`epic ${stuck.id}: unfenced-closure recovery failed`, e);
+    }
+  }
+  // Rejected, not swallowed (chatgpt-codex-connector, PR #284 review, "Propagate closure-recovery
+  // sync failures"): `beads.sync` rejects on a real push failure, and a `.catch`-and-log here would
+  // report this pass as a clean recovery while the fence/untag it just committed sits unpushed —
+  // `closedUnfencedEpics` already excludes the epic locally, so no same-machine retry would ever
+  // notice. Thrown below alongside `lastError`, so the job itself is the retry signal instead.
+  let syncError: unknown = recoveryError;
+  if (wroteToBoard) {
+    try {
+      await beads.sync(repo);
+    } catch (e) {
+      syncError ??= e;
+      consoleLog.error("beads dolt sync failed after closure-fence recovery", e);
+    }
+  }
+
+  if (targets.length === 0) {
+    if (syncError !== undefined) {
+      throw syncError instanceof Error ? syncError : new Error(String(syncError));
+    }
+    return recovered > 0
+      ? { changed: true, note: `fenced ${recovered} previously-stranded closure(s)` }
+      : { changed: false, note: "nothing in review" };
+  }
 
   let dispatched = 0;
   // A target the dispatcher declined to (re-)dispatch even though it needs a fix (anton-bzm7s): a
@@ -271,7 +431,7 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // identically — counted apart from `dispatched` so an operator reading the pass's note can tell
   // this suppressed target from a merely-idle one (a clean PR never reaches this loop's insides).
   let suppressed = 0;
-  let lastError: unknown;
+  let lastError: unknown = syncError;
   for (const target of targets) {
     await ctx.heartbeat();
     try {
@@ -293,7 +453,9 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
       }
     } catch (e) {
       // One unreadable PR must not cost the others their dispatch; the failure is surfaced below.
-      lastError = e;
+      // A prior sync failure is not overwritten — both are already logged, and either is enough to
+      // fail the pass.
+      lastError ??= e;
       consoleLog.error(`epic ${target.id}: triage failed; continuing fan-out`, e);
     }
   }
@@ -308,8 +470,10 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // nothing, and the counts together are what an operator checks the poll against.
   const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
   return {
-    changed: dispatched > 0,
-    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}`,
+    changed: dispatched > 0 || recovered > 0,
+    note:
+      `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}` +
+      (recovered > 0 ? `, fenced ${recovered} stranded closure(s)` : ""),
   };
 }
 
@@ -463,6 +627,15 @@ async function handleEpic(args: {
   // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
   // the commit and push behind it.
   const claimOwner = claimOwnerFor(ctx.jobId);
+  // Same predicate execute-epic's own fix session uses (review-gate.ts's `runGateFixSession`): ANY
+  // ticket under this epic being `delivery:board` means a blocking finding against IT is resolved by
+  // a `bd` write, not a git diff, so the fixer needs the live-board plumbing — while `mixedBoardOnly`
+  // (every-ticket rule) governs whether the system prompt's carve-out may safely say "editing the
+  // tree is neither required nor expected" for the WHOLE session, or must scope that to the
+  // board-only ticket alone because another ticket under this same epic still needs a real commit.
+  const epicTickets = runTickets(all, epic.id);
+  const boardOnly = hasBoardOnlyTicket({ target: epic, tickets: epicTickets });
+  const mixedBoardOnly = boardOnly && !isBoardOnlyDelivery({ target: epic, tickets: epicTickets });
   return withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
@@ -492,6 +665,8 @@ async function handleEpic(args: {
       alreadyAhead,
       branch,
       number,
+      boardOnly,
+      mixedBoardOnly,
     });
     return pushed ? "pushed" : "answered";
   });
@@ -635,6 +810,10 @@ async function runFixSession(args: {
   alreadyAhead: boolean;
   branch: string;
   number: number;
+  /** See {@link import("../claude/system-prompt").SystemPromptLayers.boardOnly}. */
+  boardOnly: boolean;
+  /** See {@link import("../claude/system-prompt").SystemPromptLayers.mixedBoardOnly}. */
+  mixedBoardOnly: boolean;
 }): Promise<boolean> {
   const {
     db,
@@ -651,6 +830,8 @@ async function runFixSession(args: {
     alreadyAhead,
     branch,
     number,
+    boardOnly,
+    mixedBoardOnly,
   } = args;
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
@@ -666,6 +847,11 @@ async function runFixSession(args: {
   // terminal hits the SAME gateway this fix session does, even if settings drift mid-run.
   ctx.report({ sessionId, cwd: worktree.path, routing: claudeRouting(settings) });
 
+  // Hoisted out of the try below (mirrors review-gate.ts's self-review path, PR #284 review,
+  // "Preserve board evidence after post-sync failures") so the catch's failure audit can diff
+  // against the SAME baseline the try read, rather than losing it to block scope the moment
+  // anything after the board write throws.
+  let boardBefore: BoardFingerprint | undefined;
   // Once a push's outcome is durably recorded (`endSession` below), the catch at the bottom must
   // not overwrite it back to `failed` just because a LATER fallible step (thread replies, the
   // re-review notification) throws — that would erase delivery evidence for a push that already
@@ -696,6 +882,46 @@ async function runFixSession(args: {
         `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
       );
       await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+      // A board-capable epic can reach this shortcut with a PRIOR session's own board write still
+      // only local (chatgpt-codex-connector, PR #284 review, "Reconfirm board writes on ahead-branch
+      // resumes"): a mixed board/git fixer that self-committed and then failed to confirm its board
+      // push is exactly what makes `alreadyAhead` true on THIS resume, so without this check the
+      // shortcut above would declare success and request re-review while that write sits unpublished
+      // — later silently absorbed into a fresh baseline as though nothing happened. Confirmed the
+      // same way the full dispatch path below confirms its own board writes; `defaultSyncBoard` is a
+      // plain push, so it costs nothing when there is genuinely nothing new to sync.
+      //
+      // Checked BEFORE `commitAndPushFix` (chatgpt-codex-connector, PR #284 review, "Confirm the
+      // board before publishing the resumed Git fix"): syncing after the git push meant a failed
+      // board sync threw only once the branch was already live on the remote, which flips
+      // `alreadyAhead` false on the very next resume — this shortcut would never fire again, the
+      // resume would fall through to a fresh claude dispatch, and by the time that ran, a best-effort
+      // sync elsewhere could have already landed the stale board write. That retry then sees neither
+      // a git nor a board delta to report, so an honest `fixed` outcome reads as fabricated and the
+      // finding cycles despite both fixes having landed. Confirming the board first means a failure
+      // here still finds the branch unpushed, so `alreadyAhead` stays true and the shortcut can retry
+      // itself cleanly instead.
+      if (boardOnly) {
+        const boardSynced = await defaultSyncBoard(repo);
+        if (!boardSynced) {
+          throw new Error(
+            `the review fix for ${epic.id} resumed PR #${number} with its branch already ahead of ` +
+              `origin, but a board write for this ticket could not be confirmed synced against the ` +
+              `remote`,
+          );
+        }
+        // This shortcut never diffs a before/after baseline of its own, so any snapshot a PRIOR,
+        // interrupted attempt persisted (see `persistReviewFixBoardBaseline` below) is now orphaned —
+        // left standing, the next NORMAL dispatch round for this same PR would wrongly reuse it as
+        // its own pre-dispatch state instead of taking a fresh read.
+        if (!(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+          throw new Error(
+            `the review fix for ${epic.id} resumed PR #${number} with its branch already ahead of ` +
+              `origin, but a leftover pre-dispatch board baseline from a prior attempt could not be ` +
+              `released`,
+          );
+        }
+      }
       const pushed = await commitAndPushFix(
         repo,
         worktree.path,
@@ -730,6 +956,41 @@ async function runFixSession(args: {
       `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
     );
 
+    // The board's OWN "before" (mirrors review-gate.ts's `runGateFixSession`, PR #284 review,
+    // "Wire board-only handling into PR review fixes"): a board-only ticket's fix is a `bd` write to
+    // the LIVE board at `repo`, not this worktree's own (separate, unsynced) copy, and this
+    // worktree's git state can never show it. A prior, interrupted attempt's own persisted snapshot
+    // (see below) is preferred over a fresh read (chatgpt-codex-connector, PR #284 review, "Persist
+    // the PR-fix board baseline before dispatch") — a fresh read after a crash mid-attempt would
+    // already contain whatever the fixer wrote before this process died, permanently hiding that
+    // delta from every later diff. Refused fail-closed when unreadable — dispatching anyway risks the
+    // fixer making board writes this session could never tell apart from no progress at all.
+    boardBefore = boardOnly
+      ? (readReviewFixBoardBaseline(epic) ?? (await defaultReadBoardFingerprint(repo, epic.id)))
+      : undefined;
+    if (boardOnly && !boardBefore) {
+      throw new PoisonError(
+        `the review fix for ${epic.id} could not read a board-only baseline for PR #${number} — ` +
+          `refusing to dispatch: without that baseline this session's board writes (if any) could ` +
+          `never be told apart from no progress. Resolve the board read, then resume.`,
+      );
+    }
+    // Durably anchored BEFORE the fixer ever runs — otherwise this baseline lives only in this
+    // process's memory until the post-run read below, and a process/host death after a live board
+    // write but before that read (or the catch-block audit further down) leaves nothing durable for a
+    // resumed attempt to diff against. Run unconditionally, including when `boardBefore` was just
+    // reused from a preserved value above: the write is then a no-op, but the confirming push still
+    // reconfirms it reached the remote, the same reconfirm-on-retry `readBoardBaseline`'s own callers
+    // already rely on.
+    if (boardOnly && boardBefore && !(await persistReviewFixBoardBaseline(repo, epic.id, boardBefore))) {
+      throw new PoisonError(
+        `the review fix for ${epic.id} read a board-only baseline for PR #${number} but could not ` +
+          `persist it before dispatch — refusing to dispatch: without a durable copy, a crash after ` +
+          `the fixer's own board write could never be told apart from no progress. Resolve the board ` +
+          `write, then resume.`,
+      );
+    }
+
     const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
       epic,
       pr,
@@ -737,6 +998,9 @@ async function runFixSession(args: {
       conflicts,
       settings,
       projectDir: worktree.path,
+      boardOnly,
+      mixedBoardOnly,
+      repoPath: repo,
     });
 
     const routing = claudeRouting(settings);
@@ -774,6 +1038,31 @@ async function runFixSession(args: {
       );
     }
 
+    // The board's "after", read right alongside claude's own output and before anything else can
+    // touch it (mirrors review-gate.ts). Thrown as a plain Error, not PoisonError: nothing has been
+    // committed yet, so this is an ordinary retryable failure, not a stray-branch park.
+    const boardAfter = boardBefore ? await defaultReadBoardFingerprint(repo, epic.id) : undefined;
+    if (boardBefore && !boardAfter) {
+      throw new Error(
+        `the review fix for ${epic.id} could not read the board fingerprint after PR #${number} — ` +
+          `refusing to treat this as no board change: a board-only fixer may have written directly ` +
+          `to the live board, and without this read that write can never be told apart from no progress.`,
+      );
+    }
+    // Anti-stall signal only, never anton's authoritative board-evidence gate (there is none on this
+    // path — a review-fix PR's board writes are confirmed synced here and that is the whole check).
+    const changedBoardIds = boardBefore && boardAfter ? boardEvidence(boardBefore, boardAfter) : [];
+    const boardChanged = changedBoardIds.length > 0;
+    // A board write only reaches another machine once it is actually pushed — confirmed here, not
+    // assumed, so an unconfirmed local-only write on this worktree's LIVE board copy never gets
+    // reported as this session's progress.
+    const boardSynced = boardChanged ? await defaultSyncBoard(repo) : false;
+    if (boardChanged && !boardSynced) {
+      throw new Error(
+        `the review fix for ${epic.id} wrote directly to the board for PR #${number} but the write ` +
+          `could not be confirmed synced against the remote`,
+      );
+    }
     // premergeBase left any base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for
     // this same session to resolve alongside the review feedback. Commit that resolution NOW, before
     // the gates run: a red gate below still throws and parks the branch, but the merge itself is
@@ -786,7 +1075,7 @@ async function runFixSession(args: {
 
     await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
 
-    const pushed = await commitAndPushFix(
+    const gitPushed = await commitAndPushFix(
       repo,
       worktree.path,
       epic.id,
@@ -795,6 +1084,10 @@ async function runFixSession(args: {
       settings,
       ctx.signal,
     );
+    // A confirmed board write is this session's real progress even with no git diff — reaching here
+    // with `boardChanged` true already guarantees `boardSynced` (the unconfirmed case throws above),
+    // so it is never reported as progress before it is actually published.
+    const pushed = gitPushed || boardChanged;
 
     // Persist the outcome BEFORE the fallible thread/notification work below — a push that reached
     // the remote must count toward lead-time/repair weighting even if `applyThreadOutcomes` or
@@ -804,7 +1097,17 @@ async function runFixSession(args: {
     sessionSettled = true;
 
     const report = parseThreadReport(result.text);
-    await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
+    await applyThreadOutcomes({
+      repo,
+      number,
+      pr,
+      report,
+      gitPushed,
+      boardChanged,
+      mixedBoardOnly,
+      signal: ctx.signal,
+      logPath,
+    });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
     // no thread report (CI-only/conflict-only/no-inline-threads trigger).
@@ -823,7 +1126,23 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
+      // Nothing to protect — `pushed` false means `boardChanged` was also false, so releasing here
+      // (rather than deferring, as the genuine-repair path below does) risks nothing.
+      if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+        throw new Error(
+          `the review fix for ${epic.id} produced no changes for PR #${number} but could not release ` +
+            `its own pre-dispatch board baseline — a later review-fix round for this PR could misread ` +
+            `it as still describing the current pre-dispatch state`,
+        );
+      }
       return false;
+    }
+    if (!gitPushed && boardChanged) {
+      await appendSessionLog(
+        logPath,
+        `[review-fix] PR #${number}: no git changes — the board changed and is confirmed synced, ` +
+          `which is this ticket's actual deliverable (delivery:board)\n`,
+      );
     }
 
     await notifyReReview({
@@ -833,16 +1152,83 @@ async function runFixSession(args: {
       reasons: verdict.reasons,
       signal: ctx.signal,
     });
+    // Released only now — after the board write is confirmed synced, the session outcome is durably
+    // recorded, thread outcomes are applied, and re-review is requested (chatgpt-codex-connector, PR
+    // #284 review, "Retain the PR-fix baseline until the repair is durable"). Releasing right after
+    // the sync (as this used to) left a process/host death in THIS window with no durable snapshot to
+    // resume against: the next attempt would take a fresh baseline that already contains the
+    // published repair, see no delta, and reject the fixer's own truthful `fixed` result.
+    if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+      throw new Error(
+        `the review fix for ${epic.id} confirmed its board evidence for PR #${number} but could not ` +
+          `release its own pre-dispatch baseline — a later review-fix round for this PR could misread ` +
+          `it as still describing the current pre-dispatch state`,
+      );
+    }
     return true;
   } catch (e) {
     if (!sessionSettled) await endSession(db, clock, sessionId, "failed");
+    // Board evidence audit-on-failure (mirrors review-gate.ts's self-review path, PR #284 review,
+    // "Preserve board evidence after post-sync failures"): a board-only fixer writes straight to the
+    // LIVE board, confirmed synced above before anything else runs — so a failure past that point
+    // (the verify gate, the git commit/push) leaves a real, published repair standing on the shared
+    // board with nothing here to say so. A plain retry takes a FRESH baseline that already contains
+    // that write, sees no delta of its own, and neither credits the repair nor resolves its review
+    // thread. Re-diffing against the baseline this session actually read — rather than trusting the
+    // thrown error's own wording — is what tells a genuine board write apart from an ordinary failure
+    // that never touched the board at all; only the former parks.
+    let effective = e;
+    if (boardOnly && boardBefore) {
+      const boardOnFailure = await defaultReadBoardFingerprint(repo, epic.id);
+      // An unreadable failure-audit read is poisoned, never read as proof the board is unchanged —
+      // the same fail-closed rule the pre-fix baseline and post-fix "after" reads already follow
+      // above. Folding a read failure into "no board change" would let a fixer that mutated the
+      // board and then failed escape as an ordinary retryable failure, and a resumed attempt's
+      // fresh baseline would silently absorb the unreviewed write before anyone looked at it.
+      if (!boardOnFailure) {
+        effective = new PoisonError(
+          `the review fix for ${epic.id} FAILED and the post-failure board audit could not be read ` +
+            `for PR #${number} — refusing to treat this as no board change: the fixer may have ` +
+            `written directly to the live board before failing, and without this read that write can ` +
+            `never be told apart from no progress. Inspect and repair the board by hand, then resume. ` +
+            `The fixer itself failed with: ${String(e)}`,
+        );
+      } else {
+        const changedOnFailure = boardEvidence(boardBefore, boardOnFailure);
+        if (changedOnFailure.length > 0) {
+          effective = new PoisonError(
+            `the review fix for ${epic.id} FAILED after writing directly to the board for PR ` +
+              `#${number} — bead(s) ${changedOnFailure.join(", ")} changed and cannot be safely ` +
+              `auto-reverted. Parked instead of retried — a retry could read that state as this ` +
+              `attempt's own unverified fix and count it as progress, or a resumed attempt's fresh ` +
+              `baseline could silently absorb it before anyone reviews it. Inspect and repair the ` +
+              `board by hand, then resume. The fixer itself failed with: ${String(e)}`,
+          );
+          // Left standing deliberately (never released on this branch): this IS the recovery
+          // snapshot a human's eventual resume needs to tell the just-parked write apart from
+          // whatever the board looks like by the time anyone gets to it.
+        } else if (!(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+          // No board change of its own — an ordinary retryable failure, EXCEPT the baseline this
+          // attempt persisted before dispatch is now stale and could not be cleared. Left standing,
+          // a LATER review-fix round for this same PR would wrongly reuse it as its own pre-dispatch
+          // state instead of taking a fresh read, so this failure is escalated to a park rather than
+          // left to retry silently past it.
+          effective = new PoisonError(
+            `the review fix for ${epic.id} FAILED for PR #${number} with no board change of its own, ` +
+              `but its pre-dispatch board baseline could not be released — a later review-fix round ` +
+              `for this PR could misread it as still describing the current pre-dispatch state. ` +
+              `Inspect and repair the board by hand, then resume. The fixer itself failed with: ${String(e)}`,
+          );
+        }
+      }
+    }
     // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say
     // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
     // only a stale badge, not why anton stopped (anton-gvqk3).
-    if (isPoisonError(e)) {
-      await notifyGateParked({ repo, number, error: e, conflicts, signal: ctx.signal });
+    if (isPoisonError(effective)) {
+      await notifyGateParked({ repo, number, error: effective, conflicts, signal: ctx.signal });
     }
-    throw e; // propagate so the runner applies quota backoff / retry / park
+    throw effective; // propagate so the runner applies quota backoff / retry / park
   }
 }
 
@@ -1031,7 +1417,9 @@ export async function applyThreadOutcomes(args: {
   number: number;
   pr: PrReview;
   report: ThreadOutcome[];
-  pushed: boolean;
+  gitPushed: boolean;
+  boardChanged: boolean;
+  mixedBoardOnly: boolean;
   signal: AbortSignal;
   logPath: string;
 }): Promise<void> {
@@ -1040,10 +1428,27 @@ export async function applyThreadOutcomes(args: {
     const thread = waiting.find((t) => t.id === item.id);
     const anchor = thread?.comments[0];
     if (!thread || !anchor) continue;
-    if (fabricatedFix(item, args.pushed)) continue;
+    if (fabricatedFix(item, args.gitPushed, args.boardChanged, args.mixedBoardOnly)) continue;
     await recordThreadOutcome(args, thread, anchor.id, item);
   }
 }
+
+/**
+ * A "fixed" claim with nothing pushed behind it — left untouched rather than answered. Git and
+ * board progress are tracked separately (PR #284 review, "Keep board progress separate from Git
+ * progress") because an epic can carry both a `delivery:board` ticket and an ordinary one: a
+ * `boardChanged` write is only proof for the threads that ticket owns, and in a MIXED run there is
+ * no per-thread way to tell those apart from ones an ordinary ticket's fix still needs a real git
+ * change to resolve. So a board-only edit only counts as "pushed" when every thread in the run
+ * could legitimately be its deliverable — i.e. NOT mixed; a mixed run requires `gitPushed` itself
+ * before honoring any "fixed" claim.
+ */
+const fabricatedFix = (
+  item: ThreadOutcome,
+  gitPushed: boolean,
+  boardChanged: boolean,
+  mixedBoardOnly: boolean,
+): boolean => item.outcome === "fixed" && !(gitPushed || (boardChanged && !mixedBoardOnly));
 
 /** Reply on the thread, resolve it when the fix landed, and log what was said. */
 async function recordThreadOutcome(

@@ -13,7 +13,8 @@
  * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
  * wiring is what makes it unit-testable against a fake driver.
  */
-import { labelValueOf, type Bead } from "../beads/bd";
+import { beads, labelValueOf, type Bead } from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
 import { metered, type ReasoningAttribution } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -35,10 +36,22 @@ import { resolveCommitTimeoutMs, resolveReviewConfig, resolveVerifyGates, type P
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
+import {
+  boardEvidence,
+  fingerprintBoard,
+  hydrateDescriptions,
+  persistReviewGateBoardBaseline,
+  readReviewGateBoardBaseline,
+  releaseReviewGateBoardBaseline,
+  type BoardFingerprint,
+} from "./execute-epic-board-evidence";
+import { mustPersist, mustRead, mustReadBoard, mustReadClosureVersion } from "./execute-epic-persist";
 import { detectScoreRegression, type ScoreRegression } from "./review-alarm";
 import {
   buildFindingsFixPrompt,
   buildReviewPrompt,
+  hasBoardOnlyTicket,
+  isBoardOnlyDelivery,
   parseReviewFindings,
   resolveReviewerContract,
   type ReviewFinding,
@@ -205,6 +218,18 @@ export interface ReviewGateDeps {
   gitCommonDir?: (worktreePath: string) => Promise<string>;
   /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
   hashTree?: (worktreePath: string) => Promise<string>;
+  /**
+   * Read the live board's content fingerprint — a board-only fix session's before/after progress
+   * signal (see {@link readBoardFingerprint}). Overridable so a test can fake the board without
+   * shelling out to a real `bd`, exactly like every other side effect in this list.
+   */
+  readBoardFingerprint?: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
+  /**
+   * Confirm a board-only fix's write actually reached the remote — the gate a board-only round's
+   * progress signal is required to clear (PR #284 review round 14). Overridable so a test can fake
+   * the sync channel without shelling out to a real `bd`, exactly like {@link readBoardFingerprint}.
+   */
+  syncBoard?: (repoPath: string) => Promise<boolean>;
   /** Total changed lines from `baseRev` to HEAD — the large-diff round floor's measure (anton-z8uv). */
   churn?: (worktreePath: string, baseRev: string) => Promise<number>;
 }
@@ -226,6 +251,16 @@ export interface ReviewGateArgs {
   target: Bead;
   /** Every ticket the run implemented, in execution order. */
   tickets: Bead[];
+  /** See {@link import("./steps/context").StepContext.boardEvidenceByTicket}. */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /**
+   * See {@link import("./steps/context").StepContext.repoPath} — the live board's repo path, never
+   * the worktree. Handed to the reviewer so a board-only ticket's evidence can be read fresh instead
+   * of off this worktree's own frozen, unsynced beads copy (PR #284 review round 12), and to a
+   * board-only fix session so its `bd` writes land on the board anton's own evidence check actually
+   * reads (round 13) rather than being stranded in the worktree's copy.
+   */
+  repoPath?: string;
   /**
    * The cooked pipeline's content digest, stamped on the gate's invocations (anton-jpmdw). Absent
    * for a caller driving the gate directly, which records it as the absence it is.
@@ -293,13 +328,38 @@ export interface ReviewGateArgs {
  * writing subcommands: an enumeration rots into a gap the next git release opens, and the reviewer
  * needs none of it — anton hands it the diff, the file list, and the beads.
  *
- * `Bash` itself stays, because the review contract asks the reviewer to run the project's own
+ * `Bash` itself stays here, because the review contract asks the reviewer to run the project's own
  * read-only checks — and a shell writes bytes with none of the tools above, so this list is only
  * half the guard. The other half is not a tool filter at all: the session runs under Claude Code's
  * Bash sandbox with the repository's ref store denied at the OS level (anton-t6tu, see
- * jobs/review-sandbox).
+ * jobs/review-sandbox). {@link reviewDeniedTools} widens this base list to drop `Bash` too on a
+ * server-backed board, where that OS-level sandbox cannot reach the board at all — see there for why.
  */
 export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash(git:*)"];
+
+/**
+ * `REVIEW_DENIED_TOOLS`, widened to deny `Bash` OUTRIGHT when the project's board is `dolt_mode:
+ * server` (PR #284 review, "Block server-backed board writes during review"; hardened per PR #284
+ * review round 18, "Deny Bash instead of only the bd command prefix").
+ *
+ * The OS-level sandbox (`jobs/review-sandbox`) pins the ref store AND `<repoPath>/.beads` shut, but
+ * that only contains a FILESYSTEM-backed board — a server-backed one is mutated over a connection
+ * string, invisible to a filesystem deny rule by construction. This used to deny only the `Bash(bd:*)`
+ * TOOL, on the theory that `boardEvidenceSection` (review-context.ts) is the only thing that teaches
+ * this session the `bd` invocation syntax. That denial is a PREFIX rule on the literal command string
+ * Claude Code hands to Bash, not a parse of what the shell actually runs — `cd /tmp && bd -C <repo>
+ * update ...`, a wrapper script, an alias, or any other command that doesn't itself start with `bd`
+ * sails straight past it, and the session keeps unrestricted Bash under `bypassPermissions` to run it
+ * with. No enumeration of prefixes closes that: a shell can invoke the same binary in unboundedly many
+ * shapes. Denying `Bash` itself removes the shell entirely, which is the only rule a shell cannot route
+ * around. The cost is real — the reviewer can no longer run the project's own checks itself on a
+ * server-mode-board project — and is paid deliberately: `readOnlySection` (review-context.ts) tells the
+ * reviewer explicitly it has no shell here and to judge from anton's own already-run gate results (or
+ * their absence) instead of trying to reach for one.
+ */
+export function reviewDeniedTools(repoPath: string | undefined): string[] {
+  return repoPath && isServerMode(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
+}
 
 /**
  * Settings sources a review session loads: the operator's `user` settings only.
@@ -353,6 +413,16 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const rounds: ReviewRound[] = args.rounds ?? [];
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, baseBranch } = args;
   const config = resolveReviewConfig(settings);
+  // Whether the FIX SESSION this gate may dispatch needs board-fix handling (PR #284 review round
+  // 15): decided once, off the same bead pair the reviewer's own {@link diffSection} judges — never
+  // re-derived per round, since the tickets' labels don't change mid-gate. Deliberately the "any
+  // ticket" predicate ({@link hasBoardOnlyTicket}), not the "every ticket" one
+  // ({@link isBoardOnlyDelivery}) `diffSection` uses to decide how to render the diff: a MIXED run
+  // (some tickets git-delivered, one `delivery:board`) fails the all-tickets rule, but a fix session
+  // repairing a blocking finding against that one board-only ticket still needs the live-board
+  // instructions and board-progress handling, or it runs `bd` against the worktree's frozen copy and
+  // a correct repair that writes no git diff gets misclassified as stalled.
+  const boardOnly = hasBoardOnlyTicket({ target, tickets });
   const driver = args.deps?.runClaude ?? runClaude;
   const readDiff = args.deps?.diff ?? diffAgainstBase;
   const mergeBase = args.deps?.mergeBase ?? resolveMergeBase;
@@ -363,6 +433,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
+  const readBoard = args.deps?.readBoardFingerprint ?? defaultReadBoardFingerprint;
+  const syncBoard = args.deps?.syncBoard ?? defaultSyncBoard;
   const churn = args.deps?.churn ?? diffChurnLines;
 
   // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
@@ -371,6 +443,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const sandbox = await resolveReviewSandbox({
     worktreePath,
     readGitCommonDir: args.deps?.gitCommonDir ?? gitCommonDir,
+    // Denies the live board's checkout too (PR #284 review, "protect the live board from
+    // review-session writes"): `boardEvidenceSection` hands the reviewer the exact `bd -C
+    // <repoPath>` syntax to READ confirmed evidence, and a stray write-capable command against
+    // that same path would mutate the canonical board unseen by `enforceReadOnly`, which only
+    // watches this worktree.
+    repoPath: args.repoPath,
   });
 
   // Pin the fork point once, for every round: `baseBranch` is a MOVABLE ref (`origin/<base>`), and a
@@ -454,6 +532,15 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
    * session was actually dispatched to close (see {@link ReviewRun.previousBlocking}).
    */
   let previousBlocking: ReviewFinding[] | undefined;
+  /**
+   * The run's board-only per-ticket evidence, extended as each fix round confirms a NEW board write
+   * (chatgpt-codex-connector, PR #284 review, "carry board-fix IDs into the confirming review"):
+   * without this, a blocking finding that requires creating or modifying a bead outside the
+   * original evidence set left the next round's reviewer with only the stale ids from before this
+   * gate ever ran — no git diff records a board-only repair either, so the reviewer had nothing
+   * telling it which live-board state to inspect and could repeat the finding or clear it blind.
+   */
+  let boardEvidenceByTicket = args.boardEvidenceByTicket;
 
   for (let round = 1; round <= config.maxRounds; round++) {
     await ctx.heartbeat();
@@ -467,6 +554,8 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       runId,
       target,
       tickets,
+      boardEvidenceByTicket,
+      repoPath: args.repoPath,
       settings,
       worktreePath,
       baseRev,
@@ -606,12 +695,190 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       readState,
       restoreState,
       hashTree,
+      boardOnly,
+      repoPath: args.repoPath,
+      readBoardFingerprint: readBoard,
+      syncBoard,
     });
     entry.fixSessionId = fix.sessionId;
     entry.fixCommitted = fix.committed;
     // The fix ran the gates on what it committed, so the next round is handed that evidence rather
     // than re-running the suite to learn the same thing.
     verified = fix.verified;
+    // Merge this round's confirmed board write into every board-only ticket's evidence entry
+    // (chatgpt-codex-connector, PR #284 review, "carry board-fix IDs into the confirming review") —
+    // attributed to every board-only ticket in this run rather than one specific ticket, since a fix
+    // session repairs findings against the whole `tickets` set and this diff cannot tell which of
+    // them the write was actually for. Unioned with whatever the run already carried, not replaced,
+    // so an earlier ticket's confirmed evidence from before this gate ran is never dropped.
+    if (fix.boardEvidenceIds?.length) {
+      const units = tickets.length > 0 ? tickets : [target];
+      const boardOnlyUnits = units.filter((t) => beads.isBoardOnly(t) || beads.isBoardOnly(target));
+      const merged = new Map(boardEvidenceByTicket ?? []);
+      for (const t of boardOnlyUnits) {
+        merged.set(t.id, [...new Set([...(merged.get(t.id) ?? []), ...fix.boardEvidenceIds])].toSorted());
+      }
+      boardEvidenceByTicket = merged;
+      // Durably persisted onto every board-only ticket (PR #284 review, "Persist board-fix evidence
+      // IDs across review retries") — `merged` otherwise lives only in this loop's local variable,
+      // and a process death after this round's board sync but before a later round (or the PR step)
+      // finishes would leave a resumed attempt reconstructing `boardEvidenceByTicket` from scratch
+      // off each ticket's `boardEvidenceConfirmed` metadata (see `execute-epic-dispatch.ts`'s ledger
+      // build) — which never learned about a bead this FIX round created or first touched, recreating
+      // the blind-review problem this merge exists to close. Writing it into the SAME durable field
+      // every other board-evidence path already reads on resume, rather than a parallel mechanism,
+      // means a resumed run's dispatch ledger picks this up for free the moment it re-reads each
+      // ticket. `repo` is always set here in practice — `fix.boardEvidenceIds` is only ever populated
+      // when `runGateFixSession` was itself given a `repoPath` (see its own `boardBefore` gate) — but
+      // checked rather than asserted so a future caller without one degrades to the in-memory-only
+      // behavior this replaces instead of throwing. `merged.get(t.id) ?? []` always passes the FULL
+      // known set, never just `fix.boardEvidenceIds` alone: `setBoardEvidenceConfirmed` is not
+      // idempotent on its `ids` argument (see that function's own docstring), so a narrower write
+      // here would overwrite already-durable evidence with less. NOT best-effort (chatgpt-codex-
+      // connector, PR #284 review, "Fail when board-fix evidence cannot be persisted"): every
+      // `mustPersist` result is checked and the confirming push must report `synced`/`shared-server`
+      // like every other board-evidence write in this codebase — a discarded failure here would
+      // leave this round's confirmed IDs living only in the in-memory `merged` map, so a process
+      // death before the next round (or the PR step) reads back only the stale
+      // `boardEvidenceConfirmed` metadata and can no longer tell the reviewer which beads THIS
+      // round's fix touched, defeating the crash-recovery purpose documented above.
+      const repo = args.repoPath;
+      if (repo) {
+        // Preserve the closure fence this extends (chatgpt-codex-connector, PR #284 review,
+        // "Preserve the closure fence when extending evidence") — a ticket already carrying a
+        // stored closure keeps it; a closed ticket with none yet (this round's own fix just
+        // closed it) gets the current episode, same as `clearBoardEvidencePending` computes it.
+        // Writing `{ ids }` with no closure would erase the fence `confirmedForThisCycle`
+        // (execute-epic-dispatch.ts) relies on, letting a later reopen-and-reclose before this
+        // run redispatches the ticket pass as "same cycle" with no new evidence.
+        //
+        // Derived off a FRESH read, never `t` itself (chatgpt-codex-connector review, "Re-read
+        // tickets before preserving closure fences") — `t` is `tickets`/`target` as passed into
+        // this whole gate, a snapshot from before ANY round's fix ran. When THIS round's fix just
+        // closed the ticket, `t.status` still reads open/in_progress and carries no confirmed
+        // closure, so deriving off `t` would resolve `closure` to `undefined` and overwrite an
+        // existing `{ ids, closure }` confirmation with an unfenced `{ ids }`. An unreadable live
+        // ticket (after retries) fails this write rather than guess off the stale snapshot.
+        //
+        // The closure READ itself goes through `mustReadClosureVersion`, retried like every other
+        // guarded read here — NOT a bare `readCurrentClosureVersion(...).catch(() => undefined)`
+        // (chatgpt-codex-connector, PR #284 review, "Fail closed when the review-fix closure read
+        // fails"): a closed ticket with no stored closure yet (this round's own fix just closed it)
+        // that hits a transient `bd history` failure would otherwise persist an unfenced `{ ids }`
+        // confirmation, and `confirmedForThisCycle` (execute-epic-dispatch.ts) treats an absent
+        // closure as "cannot verify, pass anyway" — the same tolerance meant for a confirmation
+        // written before the fence existed — so a later reopen-and-reclose could reuse these ids as
+        // this new cycle's evidence with no new board delta ever checked. An unavailable read (after
+        // retries) fails this ticket's persist the same as an unreadable bead does, rather than
+        // silently produce the exact fenceless shape the closure fence exists to prevent.
+        const persisted = await Promise.all(
+          boardOnlyUnits.map(async (t) => {
+            const live = await mustRead(repo, t.id);
+            if (!live) return false;
+            const storedClosure = beads.confirmedBoardEvidenceClosure(live);
+            let closure = storedClosure;
+            if (storedClosure === undefined && live.status === "closed") {
+              const read = await mustReadClosureVersion(repo, t.id);
+              // `read.read` alone is not enough (chatgpt-codex-connector, PR #284 review, "Reject
+              // empty closure histories before confirming fixes"): `bd history` can answer
+              // successfully with no closed version at all — an imported/legacy closed bead with
+              // empty history — leaving `read.closure` `undefined` even though the read itself
+              // succeeded. Persisting that as `{ ids }` with no closure would land exactly the
+              // unfenced confirmation this whole block exists to prevent: `confirmedForThisCycle`
+              // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass
+              // anyway", so a later reopen-and-reclose could reuse this round's ids as the new
+              // cycle's evidence with no further board delta ever checked. Mirrors the same guard
+              // in `clearBoardEvidencePending` (execute-epic-board-evidence.ts) and
+              // `stampConfirmedClosures` (review-fix-finalize.ts).
+              if (!read.read || read.closure === undefined) return false;
+              closure = read.closure;
+            }
+            // Still open (no closure yet): this write extends whatever unfenced confirmation `live`
+            // already carries, so its stored `origin` — the prior closure `stampConfirmedClosures`
+            // (review-fix-finalize.ts) will later compare against — must ride along too (chatgpt-
+            // codex-connector, PR #284 review, "Preserve the confirmation origin when extending
+            // evidence"). Dropping it here would replace `{ ids, origin }` with a bare `{ ids }`,
+            // erasing the identity that fence relies on and leaving a second-lifecycle standalone
+            // target's confirmation permanently unfenceable once it does close.
+            const origin = closure === undefined ? beads.confirmedBoardEvidenceOrigin(live) : undefined;
+            const wrote = await mustPersist(() =>
+              beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], closure, origin),
+            );
+            if (!wrote) return false;
+            // A concurrent writer can close a still-open standalone unit between the `live` read
+            // above and this write (chatgpt-codex-connector, PR #284 review, "Fence review-fix
+            // confirmation after the write") — mirrors the same post-write recheck
+            // `clearBoardEvidencePending` (execute-epic-board-evidence.ts) already runs after ITS
+            // confirming write. Left as `{ ids }` with no closure, `confirmedForThisCycle`
+            // (execute-epic-dispatch.ts) treats a missing closure as "cannot verify, pass anyway" —
+            // the same tolerance meant for a confirmation written before this fence existed — so a
+            // later reopen-and-reclose of this exact ticket could pass this stale confirmation off
+            // as the new cycle's own evidence with no fresh board delta ever checked. Its OWN result
+            // is checked (chatgpt-codex-connector, PR #284 review, "Require the post-write review
+            // fence to persist") — an exhausted retry here used to be discarded, so this block
+            // returned `true` believing it had fenced the confirmation when it had not, letting the
+            // caller push and report the round as durably confirmed with `{ ids, origin }` still
+            // unfenced. Mirrors `closureFenceFailed` in `clearBoardEvidencePending`.
+            if (closure === undefined) {
+              const recheck = await mustRead(repo, t.id);
+              if (!recheck) {
+                // The reread itself is exhausted (after retries) — trusting a missing read as "still
+                // open" would fall through and `return true`, pushing an unfenced `{ ids }`
+                // confirmation a later reopen-and-reclose could reuse (chatgpt-codex-connector, PR
+                // #284 review, "Reject review confirmation when its status reread fails"). Same
+                // failure shape as the unreadable-closure-history branch just below.
+                return false;
+              }
+              if (recheck.status === "closed") {
+                const read = await mustReadClosureVersion(repo, t.id);
+                // `read.priorClosure` must still match `origin` (chatgpt-codex-connector, PR #284
+                // review, "Validate the origin before fencing review-fix evidence") — mirrors the
+                // same guard `clearBoardEvidencePending` (execute-epic-board-evidence.ts) already
+                // applies to this identical shape. Without it, a ticket that closes, reopens, and
+                // closes AGAIN in the gap between the unfenced write above and this recheck would
+                // have `read.closure` name the second close while `read.priorClosure` names the
+                // first — neither of which `merged.get(t.id)`'s ids were ever checked against — and
+                // this write would still stamp `read.closure` onto them, letting a later resume
+                // accept those stale ids as the latest cycle's evidence.
+                if (read.read && read.closure !== undefined && read.priorClosure === origin) {
+                  const fenced = await mustPersist(() =>
+                    beads.setBoardEvidenceConfirmed(repo, t.id, merged.get(t.id) ?? [], read.closure),
+                  );
+                  if (!fenced) return false;
+                } else {
+                  // Closed on recheck but its closure version is unreadable (after retries), its
+                  // history is empty, or an extra reopen-and-reclose landed between the unfenced
+                  // write and this recheck (the `origin` mismatch above) — the same ambiguity the
+                  // earlier `mustReadClosureVersion` call above already fails closed on. Falling
+                  // through here would `return true` and push an unfenced `{ ids }` confirmation a
+                  // later reopen-and-reclose could reuse.
+                  return false;
+                }
+              }
+            }
+            return true;
+          }),
+        );
+        const synced = await beads
+          .push(repo)
+          .then((outcome) => outcome === "synced" || outcome === "shared-server")
+          .catch(() => false);
+        if (persisted.some((ok) => !ok) || !synced) {
+          const allPersisted = persisted.every(Boolean);
+          throw new PoisonError(
+            `${target.id}'s board-fix evidence from review round ${round} could not be durably ` +
+              `confirmed: ${
+                allPersisted
+                  ? "every ticket's write landed locally, but the confirming push could not verify " +
+                    "it reached the remote"
+                  : "bd refused a read or write for at least one board-only ticket (after retries)"
+              } — the run stopped rather than let a resumed attempt rebuild this round's evidence ` +
+              `from stale metadata with no record of which beads this fix changed. Check the beads ` +
+              `DB${allPersisted ? " and the sync channel" : ""}, then resume the run.`,
+          );
+        }
+      }
+    }
 
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
@@ -662,6 +929,10 @@ async function runReviewSession(args: {
   runId?: string;
   target: Bead;
   tickets: Bead[];
+  /** See {@link ReviewGateArgs.boardEvidenceByTicket}. */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /** See {@link ReviewGateArgs.repoPath}. */
+  repoPath?: string;
   settings: ProjectSettings;
   worktreePath: string;
   /** The pinned fork-point commit: the patch AND the reviewer's trusted inputs both come from it. */
@@ -788,6 +1059,8 @@ async function runReviewSession(args: {
         target,
         tickets,
         diff,
+        boardEvidenceByTicket: args.boardEvidenceByTicket,
+        repoPath: args.repoPath,
         settings,
         projectDir: worktreePath,
         // Literally the same commit the diff is taken from — a pinned SHA, not the movable base ref
@@ -818,7 +1091,7 @@ async function runReviewSession(args: {
         }),
         routing: reviewRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
-        disallowedTools: REVIEW_DENIED_TOOLS,
+        disallowedTools: reviewDeniedTools(args.repoPath),
         settingSources: [...REVIEW_SETTING_SOURCES],
         // Outranks the `user` sources above, so the machine's own config cannot relax the sandbox
         // this session is contained by.
@@ -1081,6 +1354,45 @@ function describeTree(tree: string | undefined): string {
 }
 
 /**
+ * The board's content fingerprint, read fresh off `repoPath` — the anti-stall signal a board-only
+ * fix session's round needs (PR #284 review round 13), NOT the authoritative delivery evidence
+ * ({@link import("./execute-epic-board-evidence").readBoardEvidence}, which this deliberately
+ * doesn't call: that check owns a baseline/pending/sync-confirmation protocol scoped to a ticket's
+ * one-time settlement, and reusing it here — inside a converging review loop that can run several
+ * times per ticket — would race its own retry/persist bookkeeping for a question this loop only
+ * needs a best-effort answer to). `ticketId` excludes THAT bead's own assignee from the fingerprint,
+ * the same exclusion {@link fingerprintBoard} applies for the ticket currently being dispatched, so
+ * anton's own claim/heartbeat rewrites never read as this round's fix. Returns `undefined` on a read
+ * failure (after `mustReadBoard`'s own retries) — folded by the caller into "no board signal this
+ * round", same as it would answer before this existed.
+ *
+ * Descriptions are hydrated the same way {@link import("./execute-epic-board-evidence").readBoardEvidence}
+ * does before fingerprinting (PR #284 review): on a `bd` variant whose `bd list --json` omits
+ * `description`, every bead would otherwise fingerprint that field as `""` on both the before and
+ * after read, so a fixer whose sole repair is a description edit would fingerprint as unchanged and
+ * this loop would read a genuine repair as a stalled round. A hydration failure folds to `undefined`
+ * exactly like an unreadable board — this signal is best-effort, never a reason to fabricate a diff.
+ */
+export async function defaultReadBoardFingerprint(repoPath: string, ticketId: string): Promise<BoardFingerprint | undefined> {
+  const board = await mustReadBoard(repoPath);
+  const hydrated = board && (await hydrateDescriptions(repoPath, board));
+  return hydrated && fingerprintBoard(hydrated, ticketId);
+}
+
+/**
+ * Confirm a board write actually reached the remote (PR #284 review round 14) — the same
+ * persisted-and-synced check {@link import("./execute-epic-board-evidence").readBoardEvidence} uses
+ * before trusting a board-only delivery. `false` on anything short of a confirmed push, including a
+ * push that fails outright: an unconfirmed write is not this round's progress, whatever the reason.
+ */
+export async function defaultSyncBoard(repoPath: string): Promise<boolean> {
+  return beads
+    .push(repoPath)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
  * One fix: a fresh claude session over the round's blocking findings, the operator's verify gates,
  * then a commit onto the run's branch. Advisory findings are deliberately NOT dispatched — they are
  * surfaced to the founder, and letting the fixer roam past the blocking list widens the diff with
@@ -1124,9 +1436,34 @@ async function runGateFixSession(args: {
   restoreState: (worktreePath: string, state: WorktreeState) => Promise<void>;
   /** Hash the tree a commit would write — how the gate proves the committed tree is the tested one. */
   hashTree: (worktreePath: string) => Promise<string>;
-}): Promise<{ sessionId: string; committed: boolean; verified?: VerifyGateOutcome[] }> {
+  /** See {@link ReviewGateArgs.repoPath} — computed once by {@link runReviewGate} for the whole run. */
+  boardOnly?: boolean;
+  /** See {@link ReviewGateArgs.repoPath}. Only read when {@link boardOnly} is set. */
+  repoPath?: string;
+  /** See {@link ReviewGateDeps.readBoardFingerprint}. Only called when {@link boardOnly} and {@link repoPath} are both set. */
+  readBoardFingerprint: (repoPath: string, ticketId: string) => Promise<BoardFingerprint | undefined>;
+  /** See {@link ReviewGateDeps.syncBoard}. Only called when the board actually changed this round. */
+  syncBoard: (repoPath: string) => Promise<boolean>;
+}): Promise<{
+  sessionId: string;
+  committed: boolean;
+  verified?: VerifyGateOutcome[];
+  /** The bead ids this round's confirmed board write touched (chatgpt-codex-connector, PR #284
+   * review, "carry board-fix IDs into the confirming review") — empty/absent when the board did not
+   * change this round. See {@link runReviewGate}'s merge into the next round's `boardEvidenceByTicket`. */
+  boardEvidenceIds?: string[];
+}> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, findings, round, maxRounds, claude, commit } =
     args;
+  const { boardOnly, repoPath } = args;
+  // `boardOnly` above is `hasBoardOnlyTicket`'s "any ticket" read — right for deciding whether this
+  // fix session needs the live-board plumbing at all, wrong for deciding how strongly to word the
+  // carve-out: a MIXED run (some tickets git-delivered, one `delivery:board`) still has findings
+  // against the ordinary ticket(s) that need a real code change, so the system prompt must not tell
+  // the whole session "editing the tree is neither required nor expected" the way a run where EVERY
+  // ticket is board-only ({@link isBoardOnlyDelivery}) safely can (chatgpt-codex-connector, PR #284
+  // review, "Avoid the board-only system contract for mixed runs").
+  const mixedBoardOnly = boardOnly && !isBoardOnlyDelivery({ target, tickets });
 
   const { prompt, appendSystemPrompt } = await buildFindingsFixPrompt({
     target,
@@ -1135,6 +1472,9 @@ async function runGateFixSession(args: {
     projectDir: worktreePath,
     round,
     maxRounds,
+    boardOnly,
+    mixedBoardOnly,
+    repoPath,
   });
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
@@ -1151,6 +1491,52 @@ async function runGateFixSession(args: {
       `[review-fix] round ${round}/${maxRounds}: fixing ${findings.length} blocking finding(s)\n`,
     );
     const before = await args.readState(worktreePath);
+    // The board's OWN "before", read alongside the tree's (PR #284 review round 13) — only for a
+    // board-only run, whose fixer's actual deliverable is a bd write this worktree's git state can
+    // never show. A prior, interrupted round's own persisted snapshot (see below) is preferred over
+    // a fresh read (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline
+    // before dispatch") — a fresh read after a crash mid-round would already contain whatever the
+    // fixer wrote before this process died, permanently hiding that delta from every later diff.
+    const boardBefore = boardOnly && repoPath
+      ? (readReviewGateBoardBaseline(target) ?? (await args.readBoardFingerprint(repoPath, target.id)))
+      : undefined;
+    // A board-only round is refused BEFORE dispatch when that baseline could not be read (PR #284
+    // review round 15), the same fail-closed rule `execute-epic-ticket.ts` already applies before a
+    // ticket's own first dispatch. Letting the fixer run anyway risks it making the very bd writes
+    // this round exists to repair with no baseline to diff against: `boardAfter` below is only read
+    // when `boardBefore` is set, so an unreadable baseline would make `boardChanged` read false no
+    // matter what the fixer wrote, misclassifying a genuine board-only repair as stalled — and a
+    // resumed attempt's fresh baseline would then silently absorb that write, so the round's own
+    // progress could never be proven either way.
+    if (boardOnly && repoPath && !boardBefore) {
+      throw new PoisonError(
+        `the review fix for ${target.id} could not read a board-only baseline before round ${round} — ` +
+          `\`mustReadBoard\` exhausted its retries. Refusing to dispatch: without that baseline this ` +
+          `round's board writes (if any) could never be told apart from no progress, so a real repair ` +
+          `would misclassify as stalled while a resumed attempt takes a fresh baseline that already ` +
+          `absorbed it. Resolve the board read, then resume.`,
+      );
+    }
+    // Durably anchored BEFORE the fixer ever runs (chatgpt-codex-connector, PR #284 review, "Persist
+    // the self-review board baseline before dispatch") — otherwise this baseline lives only in this
+    // process's memory until the post-run read further down, and a process/host death after a live
+    // board write but before that read (or the catch-block audit) leaves nothing durable for a
+    // resumed attempt to diff against. Run unconditionally, including when `boardBefore` was just
+    // reused from a preserved value above: the write is then a no-op, but the confirming push still
+    // reconfirms it reached the remote.
+    if (
+      boardOnly &&
+      repoPath &&
+      boardBefore &&
+      !(await persistReviewGateBoardBaseline(repoPath, target.id, boardBefore))
+    ) {
+      throw new PoisonError(
+        `the review fix for ${target.id} read a board-only baseline before round ${round} but could ` +
+          `not persist it before dispatch — refusing to dispatch: without a durable copy, a crash ` +
+          `after the fixer's own board write could never be told apart from no progress. Resolve the ` +
+          `board write, then resume.`,
+      );
+    }
     // Flips once the gates have passed AND the work is committed: past that point the round's output
     // is verified, and the rollback below must not touch it however the session ends.
     let verified = false;
@@ -1178,6 +1564,66 @@ async function runGateFixSession(args: {
         );
       }
 
+      // The board's "after" (PR #284 review round 13) — read right alongside the tree's, before the
+      // gates run: nothing between here and the gate suite can touch the board, so there is no
+      // reason to delay it, and doing so keeps this read next to the baseline it is diffed against.
+      const boardAfter = boardBefore ? await args.readBoardFingerprint(repoPath!, target.id) : undefined;
+      // An unreadable post-fix fingerprint is refused the same way an unreadable pre-fix baseline is
+      // (PR #284 review round 16): folding it into "no board change" would let a board-capable
+      // fixer's real write pass as a stalled round — skipping `syncBoard` below, and leaving a retry
+      // to take a fresh baseline that silently absorbs the unconfirmed mutation before any review
+      // sees it.
+      //
+      // Thrown as a plain `Error`, NOT `PoisonError` (PR #284 review, "restore git state before
+      // poisoning on an unreadable board") — a mixed fixer that also touched the git tree has an
+      // UNVERIFIED tree at this point (no gates have run, nothing is committed), and `PoisonError`
+      // is exactly what the catch below leaves untouched, on the assumption that a poison always
+      // means legitimate work parked on a stray branch. This one isn't that: routing it through the
+      // ordinary catch instead runs `discardSessionWrites` first, exactly as a red gate would, and
+      // its own board-only handling below re-reads the fingerprint and escalates to `PoisonError`
+      // itself if that confirms (or still can't rule out) a live board write — see the fail-closed
+      // handling there.
+      if (boardBefore && !boardAfter) {
+        throw new Error(
+          `the review fix for ${target.id} could not read the board fingerprint after round ${round} — ` +
+            `\`mustReadBoard\` exhausted its retries. Refusing to treat this as no board change: a ` +
+            `board-only fixer may have written directly to the live board, and without this read that ` +
+            `write can never be told apart from no progress.`,
+        );
+      }
+      // Whether the fixer actually wrote to the board, for a board-only run only: `boardEvidence`
+      // is the same pure diff `execute-epic-board-evidence.ts` uses for the run's OWN delivery
+      // check, reused here only as an anti-stall SIGNAL for this loop — never as proof for anton's
+      // authoritative board-evidence gate, which still runs at ticket settlement regardless of what
+      // this round observed.
+      const changedBoardIds = boardBefore && boardAfter ? boardEvidence(boardBefore, boardAfter) : [];
+      const boardChanged = changedBoardIds.length > 0;
+      // A board-only fix's write only reaches another machine — and this run's own best-effort final
+      // sync in `concludeRunAttempt`, which logs a push failure rather than surfacing it — once it is
+      // actually pushed (PR #284 review). Confirmed here rather than assumed: without this, a change
+      // that landed only in this worktree's LOCAL Dolt DB would still count as the round's progress,
+      // a subsequent clean review could open the PR on the strength of that unconfirmed write, and
+      // another machine (or `concludeRunAttempt`'s own failed sync) could settle the ticket having
+      // never actually seen the fix. Only attempted when the board actually changed — nothing to
+      // confirm otherwise.
+      const boardSynced = boardChanged ? await args.syncBoard(repoPath!) : false;
+
+      // A detected-but-unsynced board change is a poisoned board-writing failure, never a normal
+      // no-progress return (PR #284 review round 15) — thrown as a plain error so it runs through the
+      // SAME catch below that a red gate or a failed commit does: `discardSessionWrites` still cleans
+      // up any incidental git dirt, and the board-still-changed check re-reads the fingerprint and
+      // escalates to `PoisonError` from the one place that already knows how to phrase it. Reported as
+      // `committed: false` instead, this round would read as merely "stalled" and leave the unconfirmed
+      // local mutation standing on the board for a resume — or this run's OWN best-effort final
+      // `beads.sync` in `concludeRunAttempt`, which logs a push failure rather than surfacing it — to
+      // publish later with no confirming review ever having looked at the repair.
+      if (boardChanged && !boardSynced) {
+        throw new Error(
+          `the review fix for ${target.id} wrote directly to the board but the write could not be ` +
+            `confirmed synced against the remote`,
+        );
+      }
+
       // Checked before the gates and the commit: work is only a fix if it lands where the PR looks.
       // The fixer's commits are legitimate, so they are parked for a human rather than reverted —
       // gating and committing onto the stray branch would only bury them deeper.
@@ -1187,7 +1633,19 @@ async function runGateFixSession(args: {
           `the review fix for ${target.id} left ${worktreePath} on a branch of its own: ${describeRef(afterFix)}, ` +
             `not the run's ${describeRef(before)}. Parked instead of retried — anton pushes the run's branch by ` +
             `name, so the fix (and every later commit) would never reach the PR, while the confirming review ` +
-            `would read it and pass. Move the commits back onto the run's branch by hand, then resume.`,
+            `would read it and pass. Move the commits back onto the run's branch by hand, then resume.` +
+            // `boardChanged` (PR #284 review, "Audit board changes even when the fixer switches
+            // branches") is already computed above, and reaching here means it is also `boardSynced`
+            // — the unsynced case throws before this branch check ever runs. The fixer's commits stay
+            // exactly where they are (parked, not reverted), but a board-capable fixer's bd writes
+            // already escaped to the shared board regardless of the stray branch, and this poison must
+            // say so — the outer catch's `!(e instanceof PoisonError)` skips the board-failure audit
+            // below entirely for a `PoisonError` like this one.
+            (boardChanged
+              ? ` This round also wrote directly to the live board before switching branches — bead(s) ` +
+                `${changedBoardIds.join(", ")} changed and are already confirmed synced, so review ` +
+                `those writes by hand too before resuming.`
+              : ""),
         );
       }
 
@@ -1223,29 +1681,90 @@ async function runGateFixSession(args: {
       // Nothing staged is only "no progress" if HEAD also stood still — otherwise the fixer committed
       // its own work and the branch already carries the repair the next review will read.
       const selfCommitted = !committed && afterFix.head !== before.head;
-      await appendSessionLog(
-        logPath,
-        committed
-          ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
-          : selfCommitted
-            ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
-            : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
-      );
-      if (!treeProven) {
+      // Built now, before the finalization calls below (chatgpt-codex-connector, PR #284 review,
+      // "Persist board-fix IDs before settling the session"): everything this result carries —
+      // `committed`, `treeProven`, `changedBoardIds` — is already known, and a confirmed board write
+      // must reach the caller regardless of what happens next. `runReviewGate` only merges
+      // `boardEvidenceIds` into `boardEvidenceByTicket`, and durably persists it via
+      // `setBoardEvidenceConfirmed`, off this function's RETURN value — a thrown error here instead
+      // means the caller never sees this round's confirmed ids at all, and a resumed attempt
+      // reconstructs its evidence ledger from the stale `boardEvidenceConfirmed` metadata, omitting a
+      // bead this round itself repaired (especially costly for a server-backed board, where the
+      // reviewer has no shell to independently discover what changed).
+      const fixResult = {
+        sessionId,
+        // `boardChanged` is this round's progress signal for a board-only run (PR #284 review round
+        // 13): its fix leaves no git diff by design, so `committed`/`selfCommitted` alone would read
+        // a genuine bd repair as `!committed` and the caller's stall check would park a healthy round
+        // as stalled — exactly the false negative this thread reported. Reaching here with
+        // `boardChanged` true already guarantees `boardSynced` (PR #284 review round 15) — the
+        // unconfirmed case is thrown above as a poisoned failure rather than reaching this return, so
+        // an unconfirmed local-only write can never masquerade as this round's progress.
+        committed: committed || selfCommitted || boardChanged,
+        ...(treeProven ? { verified: gates } : {}),
+        ...(boardChanged ? { boardEvidenceIds: changedBoardIds } : {}),
+      };
+      // Session bookkeeping only, past this point: the fix is verified, committed, and (if
+      // board-capable) confirmed synced, so a failure writing the session log or marking the session
+      // row `done` must not cost the caller `fixResult` above — swallowed here rather than thrown, so
+      // this function still returns it instead of losing it to the same board-evidence gap this
+      // comment opens with.
+      //
+      // The log append and `endSession` are in SEPARATE try/catches (PR #284 review, "End the fix
+      // session despite final log failures"): a single shared try meant a log write failure (full
+      // disk, unwritable session dir) jumped straight past `endSession`, leaving the session row
+      // stuck `running` forever — `pickAttachSession` prefers a `running` row, so the run UI would
+      // attach to this dead session instead of a later one.
+      try {
         await appendSessionLog(
           logPath,
-          `[review-fix] round ${round}/${maxRounds}: the gates' evidence is not provably the committed ` +
-            `tree (${describeTree(testedTree)} → ${describeTree(committedTree)}) — a commit hook that ` +
-            `rewrites files does exactly this — so the next review runs them itself rather than ` +
-            `trusting evidence for a tree it is not reading\n`,
+          committed
+            ? `[review-fix] round ${round}/${maxRounds}: committed the fix\n`
+            : selfCommitted
+              ? `[review-fix] round ${round}/${maxRounds}: the fixer committed its own changes — nothing left to stage\n`
+              // Reaching here with `boardChanged` true means it is also `boardSynced` — the unsynced
+              // case is thrown above as a poisoned board-writing failure before this log line runs.
+              : boardChanged
+                ? `[review-fix] round ${round}/${maxRounds}: no git changes — the board changed and is ` +
+                  `confirmed synced, which is this run's actual deliverable (delivery:board)\n`
+                : `[review-fix] round ${round}/${maxRounds}: no changes produced — findings left unresolved\n`,
+        );
+        if (!treeProven) {
+          await appendSessionLog(
+            logPath,
+            `[review-fix] round ${round}/${maxRounds}: the gates' evidence is not provably the committed ` +
+              `tree (${describeTree(testedTree)} → ${describeTree(committedTree)}) — a commit hook that ` +
+              `rewrites files does exactly this — so the next review runs them itself rather than ` +
+              `trusting evidence for a tree it is not reading\n`,
+          );
+        }
+      } catch (logError) {
+        console.error(
+          `[review-fix] round ${round}/${maxRounds}: session log append failed for ${target.id} after ` +
+            `a verified fix — settling the session anyway: ${String(logError)}`,
         );
       }
-      await endSession(db, clock, sessionId, "done");
-      return {
-        sessionId,
-        committed: committed || selfCommitted,
-        ...(treeProven ? { verified: gates } : {}),
-      };
+      try {
+        await endSession(db, clock, sessionId, "done");
+      } catch (finalizeError) {
+        console.error(
+          `[review-fix] round ${round}/${maxRounds}: session finalization failed for ${target.id} after ` +
+            `a verified fix — returning the fix's result anyway: ${String(finalizeError)}`,
+        );
+      }
+      // Released only now — after the board write (if any) is confirmed synced and this round's
+      // outcome is logged and settled (chatgpt-codex-connector, PR #284 review, "Persist the
+      // self-review board baseline before dispatch" / mirrors the PR-fix path's "Retain the PR-fix
+      // baseline until the repair is durable"). Releasing any earlier would leave a process/host
+      // death in that window with no durable snapshot for a resumed round to diff against.
+      if (boardOnly && repoPath && !(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+        throw new Error(
+          `the review fix for ${target.id} confirmed its board evidence for round ${round} but could ` +
+            `not release its own pre-dispatch baseline — a later round for this ticket could misread ` +
+            `it as still describing the current pre-dispatch state`,
+        );
+      }
+      return fixResult;
     } catch (e) {
       // Gates run before the commit so a failure leaves the fix uncommitted — unless the fixer
       // committed its own work first, which project instructions routinely tell an agent to do. Then
@@ -1276,6 +1795,62 @@ async function runGateFixSession(args: {
           readState: args.readState,
           restoreState: args.restoreState,
         });
+        // A board-only fix writes directly to the LIVE board — there is no worktree copy of it for
+        // the revert above to touch (PR #284 review). A failure past that point (a stray branch, a
+        // red gate, a failed commit) can therefore leave unverified bd writes standing on the shared
+        // board with none of this round's own gates having passed on them. There is no generic
+        // un-apply for every write shape `bd` supports (labels, dependency edges, custom metadata,
+        // reparenting…) to safely restore from the fingerprint diff alone, so rather than let a
+        // later round — or this run's own best-effort final sync in `concludeRunAttempt` — silently
+        // treat that state as settled, the run parks here for a human to inspect and repair the
+        // board by hand.
+        if (boardOnly && repoPath && boardBefore) {
+          const boardOnFailure = await args.readBoardFingerprint(repoPath, target.id);
+          // An unreadable failure-audit read is poisoned, never read as proof the board is
+          // unchanged (PR #284 review, "poison when the failed-fix board audit is unreadable") —
+          // the same fail-closed rule the pre-fix baseline and post-fix "after" reads already
+          // follow above. Folding an exhausted `mustReadBoard` into `[]` here would let a fixer
+          // that mutated the board and THEN failed — e.g. because `syncBoard` itself returned
+          // false — escape with its write untold apart from no progress: the original error would
+          // propagate as an ordinary retryable failure, and a resumed attempt's fresh baseline
+          // would silently absorb the locally-mutated, unreviewed state before any later sync
+          // published it.
+          if (!boardOnFailure) {
+            throw new PoisonError(
+              `the review fix for ${target.id} FAILED and the post-failure board audit could not be read ` +
+                `— \`mustReadBoard\` exhausted its retries. Refusing to treat this as no board change: the ` +
+                `fixer may have written directly to the live board before failing, and without this read ` +
+                `that write can never be told apart from no progress. Inspect and repair the board by ` +
+                `hand, then resume. The fixer itself failed with: ${String(e)}`,
+            );
+          }
+          const changedOnFailure = boardEvidence(boardBefore, boardOnFailure);
+          if (changedOnFailure.length > 0) {
+            throw new PoisonError(
+              `the review fix for ${target.id} FAILED after writing directly to the board — bead(s) ` +
+                `${changedOnFailure.join(", ")} changed and cannot be safely auto-reverted. Parked ` +
+                `instead of retried — a retry could read that state as this round's own unverified fix ` +
+                `and count it as progress, and this run's own best-effort final sync could publish it ` +
+                `before anyone reviews it. Inspect and repair the board by hand, then resume. The ` +
+                `fixer itself failed with: ${String(e)}`,
+            );
+            // Left standing deliberately (never released on this branch): this IS the recovery
+            // snapshot a human's eventual resume needs to tell the just-parked write apart from
+            // whatever the board looks like by the time anyone gets to it.
+          } else if (!(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+            // No board change of its own — an ordinary retryable failure, EXCEPT the baseline this
+            // round persisted before dispatch is now stale and could not be cleared. Left standing,
+            // a LATER round for this same ticket would wrongly reuse it as its own pre-dispatch
+            // state instead of taking a fresh read, so this failure is escalated to a park rather
+            // than left to retry silently past it.
+            throw new PoisonError(
+              `the review fix for ${target.id} FAILED for round ${round} with no board change of its ` +
+                `own, but its pre-dispatch board baseline could not be released — a later round for ` +
+                `this ticket could misread it as still describing the current pre-dispatch state. ` +
+                `Inspect and repair the board by hand, then resume. The fixer itself failed with: ${String(e)}`,
+            );
+          }
+        }
       }
       throw e;
     }

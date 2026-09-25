@@ -9,7 +9,7 @@
  * bottom, which pins a trivial `echo` gate — the gate evidence the reviewer is handed is loop
  * behavior (which session runs the gates, and how often), so it is asserted where the loop is.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,7 +20,69 @@ import { selfBuildVersion } from "../build/drift";
 import { systemPromptDigest } from "../claude/system-prompt";
 import { schema } from "../db";
 import type { Bead } from "../beads/bd";
+import { pinBoardMode, resetBoardModeCache } from "../beads/board-mode";
 import type { ClaudeResult, RunClaudeOptions } from "../claude/driver";
+
+// `runReviewGate`'s durable persist of board-fix evidence (PR #284 review, "Persist board-fix
+// evidence IDs across review retries") shells out to real `bd` via `beads.setBoardEvidenceConfirmed`
+// / `beads.push` — mocked here so the many board-only fix tests below, which pass a fake `repoPath`
+// ("/repos/anton"), don't pay `mustPersist`'s real retry backoff against a `bd` that can never
+// succeed there. `beads.show` is mocked too (chatgpt-codex-connector review, "Re-read tickets before
+// preserving closure fences") — the persist step now re-reads each board-only ticket's live state
+// before deriving its closure fence, which otherwise shells out for real and, unmocked, exhausts
+// `mustRead`'s retries against a `bd` that can never succeed at this fake path. Every fixture ticket
+// here is already closed, so the default mirrors that rather than leaving `beads.show` unmocked.
+// `beads.history` is mocked for the same reason (chatgpt-codex-connector, PR #284 review, "Fail
+// closed when the review-fix closure read fails"): the persist step now REQUIRES this read to
+// succeed for a closed ticket with no stored closure yet, via the retrying `mustReadClosureVersion`,
+// rather than tolerating a failure — unmocked, that would exhaust its retries against a `bd` that can
+// never succeed at this fake path and poison every board-only fix test below. `beads.isBoardOnly` and
+// everything else stays real: only these four calls shell out.
+const setBoardEvidenceConfirmedMock =
+  vi.fn<
+    (repo: string, id: string, ids: readonly string[], closure?: string, origin?: string) => Promise<string>
+  >();
+const boardPushMock = vi.fn<(repo: string) => Promise<string>>();
+const boardShowMock = vi.fn<(repo: string, id: string) => Promise<Bead>>();
+const boardHistoryMock = vi.fn<(repo: string, id: string) => Promise<import("../beads/bd").BeadVersion[]>>();
+// The self-review gate's own board-only baseline persist/release (chatgpt-codex-connector, PR
+// #284 review, "Persist the self-review board baseline before dispatch") shells out to real `bd`
+// via `beads.setReviewGateBoardBaseline` / `beads.clearReviewGateBoardBaseline` — mocked here for
+// the same reason the four calls above are: the many board-only fix tests below pass a fake
+// `repoPath` a real `bd` can never succeed against.
+const setReviewGateBoardBaselineMock = vi.fn<(repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>>();
+const clearReviewGateBoardBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+vi.mock("../beads/bd", async () => {
+  const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
+  return {
+    ...actual,
+    beads: {
+      ...actual.beads,
+      setBoardEvidenceConfirmed: (...args: [string, string, readonly string[], string?, string?]) =>
+        setBoardEvidenceConfirmedMock(...args),
+      push: (...args: [string]) => boardPushMock(...args),
+      show: (...args: [string, string]) => boardShowMock(...args),
+      history: (...args: [string, string]) => boardHistoryMock(...args),
+      setReviewGateBoardBaseline: (...args: [string, string, Record<string, string>]) =>
+        setReviewGateBoardBaselineMock(...args),
+      clearReviewGateBoardBaseline: (...args: [string, string]) => clearReviewGateBoardBaselineMock(...args),
+    },
+  };
+});
+setBoardEvidenceConfirmedMock.mockResolvedValue("");
+boardPushMock.mockResolvedValue("synced");
+setReviewGateBoardBaselineMock.mockResolvedValue("");
+clearReviewGateBoardBaselineMock.mockResolvedValue("");
+boardShowMock.mockImplementation(async (_repo, id) => ({ id, status: "closed", title: "", issue_type: "task" }));
+// A single closed version by default — every fixture ticket above is already closed, and this is
+// what real `bd history` returns for an ordinary bead that went through open → closed once: at
+// least one version with `status: "closed"`, which `readCurrentClosureVersion` folds to that
+// version's hash. `[]` (bd answering with NO history at all — an imported/legacy bead) is reserved
+// for the dedicated test below (chatgpt-codex-connector, PR #284 review, "Reject empty closure
+// histories before confirming fixes"): every OTHER board-only fix test needs a real closure fence
+// to persist, or the fail-closed guard that finding added would poison them all on this shared
+// default instead of exercising the behavior each of them actually tests.
+boardHistoryMock.mockResolvedValue([{ hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" }]);
 import type { BranchDiff, WorktreeState } from "../git/ops";
 import type { ProjectSettings } from "../projects";
 import { UsageLimitError, isPoisonError } from "./errors";
@@ -28,7 +90,9 @@ import type { ReviewFinding } from "./review-context";
 import type { Clock } from "./queue";
 import {
   blockingFindings,
+  reviewDeniedTools,
   runReviewGate,
+  REVIEW_DENIED_TOOLS,
   REVIEW_SETTING_SOURCES,
   type ReviewGateContext,
   type ReviewGateResult,
@@ -612,6 +676,786 @@ describe("runReviewGate — bounds", () => {
     expect(calls).toHaveLength(2);
   });
 
+  it(
+    "treats a board-only fixer's bd write as progress, not a stall (PR #284 review round 13) — " +
+      "the fix leaves no git diff by design, so only the board's own before/after tells them apart",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      // First read is the pre-fix baseline; the second (post-fix) reports the bead changed.
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }), // board-only: nothing ever staged
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true, // the fix's board write is confirmed synced
+        },
+      });
+
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
+      expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "still gives the fix session board-fix handling for a MIXED run — one ticket is `delivery:board`, " +
+      "another is not (PR #284 review round 15) — so a fix to the board-only ticket isn't sent " +
+      "against the worktree's frozen bd copy and a real bd-only repair isn't misread as a stall",
+    async () => {
+      const codeTarget: Bead = { ...target, labels: [] };
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-gate1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-gate1.2", labels: [] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: codeTarget,
+        tickets: [boardOnlyTicket, plainTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }), // no code change staged — the fix was on the board
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true,
+        },
+      });
+
+      // Board handling kicked in even though this run is NOT all-board-only: the fix session's own
+      // prompt was told about the live board, and the bd-only write counted as progress rather than
+      // a stall.
+      expect(calls[1]?.prompt).toContain("This run may deliver via the board");
+      // Shell-quoted, matching `shellQuotePath` (review-context.ts) — this assertion predated that
+      // and never followed the quoting change, failing every run regardless of this PR's own edits.
+      expect(calls[1]?.prompt).toContain(`bd -C '/repos/anton' update`);
+      // chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for mixed
+      // runs": this run mixes `boardOnlyTicket` with `plainTicket`, so the SYSTEM prompt must use the
+      // softened mixed-run wording — never the unconditional "editing the tree is neither required
+      // nor expected" carve-out a run where EVERY ticket is board-only can safely state.
+      expect(calls[1]?.appendSystemPrompt).toContain("This run includes a board-only ticket");
+      expect(calls[1]?.appendSystemPrompt).not.toContain("This ticket is board-only");
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
+      expect(calls).toHaveLength(3); // the confirming review still ran, unlike a stalled loop
+    },
+  );
+
+  it(
+    "fails closed rather than persist an unfenced board-fix confirmation when `bd history` stays " +
+      "unavailable (chatgpt-codex-connector, PR #284 review, \"Fail closed when the review-fix " +
+      "closure read fails\") — a closed ticket with no stored closure yet must have one READ, not " +
+      "silently dropped, or a later reopen-and-reclose could reuse this round's ids with no new work",
+    async () => {
+      boardHistoryMock.mockRejectedValue(new Error("database is locked"));
+      // No `beforeEach` clears this mock's call history across the file's tests, so the baseline is
+      // whatever earlier tests already left behind — not zero.
+      const callsBefore = setBoardEvidenceConfirmedMock.mock.calls.length;
+      try {
+        const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const worktree = fakeWorktree();
+        let reads = 0;
+        const readBoardFingerprint = async () => {
+          reads += 1;
+          return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+        };
+        const { run } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+        const result = runReviewGate({
+          db: tdb.db,
+          clock,
+          ctx,
+          projectId,
+          target: boardOnlyTarget,
+          tickets: [boardOnlyTicket],
+          settings: { reviewMaxRounds: 2 },
+          worktreePath: dir,
+          baseBranch: "main",
+          repoPath: "/repos/anton",
+          deps: {
+            runClaude: async (options) => {
+              worktree.onDispatch();
+              return run(options);
+            },
+            diff: async () => ({ files: [], patch: "", truncated: false }),
+            commit: async () => ({ committed: false }),
+            readState: worktree.readState,
+            restoreState: worktree.restoreState,
+            readBoardFingerprint,
+            syncBoard: async () => true,
+          },
+        });
+
+        const error = await result.then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(isPoisonError(error)).toBe(true);
+        expect((error as Error).message).toContain("board-fix evidence");
+        // Never reached the write it would have needed a closure fence for.
+        expect(setBoardEvidenceConfirmedMock.mock.calls.length).toBe(callsBefore);
+      } finally {
+        boardHistoryMock.mockResolvedValue([
+          { hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" },
+        ]);
+      }
+    },
+  );
+
+  it(
+    "fails closed rather than persist an unfenced board-fix confirmation when `bd history` answers " +
+      "with NO closed version at all (chatgpt-codex-connector, PR #284 review, \"Reject empty " +
+      "closure histories before confirming fixes\") — an imported/legacy closed bead whose history " +
+      "is genuinely empty must not be treated as a successful-but-fenceless read, or a later " +
+      "reopen-and-reclose could reuse this round's ids with no new work",
+    async () => {
+      boardHistoryMock.mockResolvedValue([]);
+      const callsBefore = setBoardEvidenceConfirmedMock.mock.calls.length;
+      try {
+        const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+        const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+        const worktree = fakeWorktree();
+        let reads = 0;
+        const readBoardFingerprint = async () => {
+          reads += 1;
+          return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+        };
+        const { run } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+        const result = runReviewGate({
+          db: tdb.db,
+          clock,
+          ctx,
+          projectId,
+          target: boardOnlyTarget,
+          tickets: [boardOnlyTicket],
+          settings: { reviewMaxRounds: 2 },
+          worktreePath: dir,
+          baseBranch: "main",
+          repoPath: "/repos/anton",
+          deps: {
+            runClaude: async (options) => {
+              worktree.onDispatch();
+              return run(options);
+            },
+            diff: async () => ({ files: [], patch: "", truncated: false }),
+            commit: async () => ({ committed: false }),
+            readState: worktree.readState,
+            restoreState: worktree.restoreState,
+            readBoardFingerprint,
+            syncBoard: async () => true,
+          },
+        });
+
+        const error = await result.then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+        expect(isPoisonError(error)).toBe(true);
+        expect((error as Error).message).toContain("board-fix evidence");
+        // Never reached the write it would have needed a closure fence for.
+        expect(setBoardEvidenceConfirmedMock.mock.calls.length).toBe(callsBefore);
+      } finally {
+        boardHistoryMock.mockResolvedValue([
+          { hash: "closure-hash", at: "2026-01-01T00:00:00.000Z", status: "closed" },
+        ]);
+      }
+    },
+  );
+
+  it(
+    "preserves a still-open standalone ticket's stored confirmation `origin` when extending it with " +
+      "this round's evidence (chatgpt-codex-connector, PR #284 review, \"Preserve the confirmation " +
+      "origin when extending evidence\") — an open ticket in its second delivery lifecycle already " +
+      "carries the previous closure in `origin`; overwriting it with a bare `{ ids }` would erase the " +
+      "identity `stampConfirmedClosures` (review-fix-finalize.ts) later compares against, leaving the " +
+      "eventual merge close permanently unfenceable and the ticket stuck at `stage:in-review`",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      // Both the initial live read and the post-write recheck must see the ticket still open — the
+      // default `boardShowMock` implementation (below) answers "closed", which would otherwise make
+      // the recheck take the closed-on-recheck fence path this test isn't about.
+      const stillOpen = {
+        id: boardOnlyTicket.id,
+        status: "open" as const,
+        title: "",
+        issue_type: "task",
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["prior-id"], origin: "prior-cycle-sha" }) },
+      };
+      boardShowMock.mockResolvedValueOnce(stillOpen).mockResolvedValueOnce(stillOpen);
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run } = fakeClaude([report(4, [BLOCKING]), "fixed it", report(9, [])]);
+      await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true,
+        },
+      });
+      expect(setBoardEvidenceConfirmedMock).toHaveBeenCalledWith(
+        "/repos/anton",
+        boardOnlyTicket.id,
+        expect.any(Array),
+        undefined,
+        "prior-cycle-sha",
+      );
+    },
+  );
+
+  it(
+    "gives the fix session the UNCONDITIONAL board-only system carve-out when EVERY ticket in the " +
+      "run is board-only (chatgpt-codex-connector, PR #284 review, \"Avoid the board-only system " +
+      "contract for mixed runs\") — only a MIXED run needs the softened wording, since here there is " +
+      "no ordinary ticket a blanket 'editing the tree is neither required nor expected' could " +
+      "wrongly excuse",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true,
+        },
+      });
+
+      expect(calls[1]?.appendSystemPrompt).toContain("This ticket is board-only");
+      expect(calls[1]?.appendSystemPrompt).not.toContain("This run includes a board-only ticket");
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
+    },
+  );
+
+  it(
+    "refuses to dispatch a board-only fix when the pre-fix board baseline could not be read " +
+      "(PR #284 review round 15) — the same fail-closed rule execute-epic-ticket.ts already applies " +
+      "before a ticket's first dispatch, so a fixer never runs with nothing to diff its bd writes against",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint: async () => undefined, // mustReadBoard exhausted its retries
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not read a board-only baseline/);
+      // The review itself still ran (round 1 dispatched a review), but the fix session it triggered
+      // was refused before it ever reached claude.
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it(
+    "still refuses to dispatch on an unreadable board baseline in a MIXED run even when the round's " +
+      "blocking finding is against the NON-board-only ticket (@claude, PR #284 review) — `boardOnly` " +
+      "is deliberately the any-ticket predicate (see runReviewGate's own comment on `hasBoardOnlyTicket` " +
+      "vs `isBoardOnlyDelivery`): a fix session has no way to tell, from a finding's `file:line` alone, " +
+      "which ticket it concerns, so a transient board-read failure fails the WHOLE round closed rather " +
+      "than risk dispatching a fixer this run could not durably anchor if it turned out to touch the " +
+      "board-only ticket after all",
+    async () => {
+      const codeTarget: Bead = { ...target, labels: [] };
+      const boardOnlyTicket: Bead = { ...ticket, id: "anton-gate1.1", labels: ["delivery:board"] };
+      const plainTicket: Bead = { ...ticket, id: "anton-gate1.2", labels: [] };
+      const worktree = fakeWorktree();
+      // The blocking finding names only a file that belongs to the plain, non-board-only ticket —
+      // nothing here implicates the board-only one.
+      const { run, calls } = fakeClaude([report(4, [{ severity: "blocking", location: "src/plain.ts:1", note: "plain bug" }]), "fixed it"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: codeTarget,
+        tickets: [boardOnlyTicket, plainTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint: async () => undefined, // mustReadBoard exhausted its retries (network blip)
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not read a board-only baseline/);
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it(
+    "parks instead of treating an unreadable post-fix board read as no change (PR #284 review round " +
+      "16) — a board-capable fixer's real write must never fold into a false no-progress signal just " +
+      "because the confirming read failed",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      // First read (pre-fix baseline) succeeds; the second (post-fix) exhausts its retries.
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return reads === 1 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not read the board fingerprint after round/);
+      expect((error as Error).message).toContain(boardOnlyTarget.id);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
+    "reverts a mixed fixer's git changes before poisoning on an unreadable post-fix board read " +
+      "(PR #284 review, \"restore git state before poisoning on an unreadable board\") — a fixer " +
+      "that also touched the git tree has an UNVERIFIED tree at that point (no gates ran, nothing " +
+      "committed), so the poison must not bypass the same discard a red gate would trigger",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      // dispatch #2 is the fix session — it dirties the tree, mimicking a fixer that wrote both a
+      // file AND a bd update before the confirming board read fails.
+      const worktree = fakeWorktree([2]);
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return reads === 1 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "touched a file and wrote to bd"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      // The whole point: the git dirt the fixer left standing was reverted BEFORE the run parked —
+      // discardSessionWrites only calls restoreState when the post-session state differs from the
+      // pre-round baseline, so a non-empty call here proves the rollback actually ran.
+      expect(worktree.restores.length).toBeGreaterThan(0);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
+    "poisons instead of treating an unreadable failure-audit as no board change (PR #284 review, " +
+      '"poison when the failed-fix board audit is unreadable") — a fixer that mutated the board and ' +
+      "THEN failed (e.g. because its own sync came back false) must not have that write waved through " +
+      "as an ordinary retryable stall just because the audit read itself could not confirm it",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        // The pre-fix baseline succeeds; every read taken AFTER the fixer's own failure is
+        // unreadable — `mustReadBoard` exhausted its retries on a genuinely contended board.
+        return reads === 1 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+      };
+      const { run, calls } = fakeClaude([
+        report(4, [BLOCKING]),
+        new Error("the board write could not be confirmed synced"),
+      ]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/post-failure board audit could not be read/);
+      expect((error as Error).message).toContain(boardOnlyTarget.id);
+      // The original failure survives in the poison, so a human sees WHY the fixer stopped, not
+      // just that the audit read afterward was unreadable.
+      expect((error as Error).message).toContain("could not be confirmed synced");
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
+    "includes the changed beads in the stray-branch poison when a board-capable fixer also " +
+      'switches branches (PR #284 review, "Audit board changes even when the fixer switches ' +
+      'branches") — the outer catch skips the failed-fix board audit entirely for a PoisonError ' +
+      "like the stray-branch one, so that poison itself has to say a live board write already " +
+      "escaped before anyone reviewed it",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      // Dispatch 2 is the fix session — it writes to the board AND checks out a branch of its own.
+      const worktree = fakeWorktree([], "", [], [2]);
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "fixed it on a branch of my own, via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 2 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true, // the fixer's board write is confirmed synced
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/on a branch of its own/);
+      expect((error as Error).message).toContain(boardOnlyTicket.id);
+      expect(calls).toHaveLength(2); // no confirming review on work the PR would never carry
+    },
+  );
+
+  it(
+    "parks instead of stalling when a board-only fix's write cannot be confirmed synced " +
+      "(PR #284 review round 15) — a local-only Dolt write must not read as a normal no-progress " +
+      "round, since a resume or this run's own best-effort final sync could later publish it with no " +
+      "confirming review ever having looked at it",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => false, // the confirming push never lands
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/could not be confirmed synced/);
+      expect((error as Error).message).toContain(boardOnlyTicket.id);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
+    "parks instead of retrying when a board-only fix FAILS after already writing to the live board " +
+      "(PR #284 review round 14) — the git side is reverted, but the bd write already landed on the " +
+      "shared board with none of this round's gates having passed on it, so the run halts for a human " +
+      "rather than letting a retry or the run's own best-effort sync treat it as settled",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      // First read is the pre-fix baseline; the second (from the catch block, after the fixer
+      // crashed) reports the bead already changed — the fixer's own `bd` write landed before it died.
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        return { beads: new Map([[boardOnlyTicket.id, reads === 1 ? "before" : "after"]]) };
+      };
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), new Error("claude crashed after writing to bd")]);
+      const error = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      }).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+
+      expect(isPoisonError(error)).toBe(true);
+      expect((error as Error).message).toMatch(/FAILED after writing directly to the board/);
+      expect((error as Error).message).toContain(boardOnlyTicket.id);
+      expect(calls).toHaveLength(2); // no confirming review dispatched after the park
+    },
+  );
+
+  it(
+    "still stalls a board-only fix that changed neither the tree nor the board — a genuinely " +
+      "declined or no-op fix must not be read as progress just because the run is board-only",
+    async () => {
+      const boardOnlyTarget: Bead = { ...target, labels: ["delivery:board"] };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      // Same fingerprint every read: nothing on the board moved either.
+      const readBoardFingerprint = async () => ({ beads: new Map([[boardOnlyTicket.id, "unchanged"]]) });
+      const { run, calls } = fakeClaude([report(4, [BLOCKING]), "every finding is wrong; left as-is"]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }),
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+        },
+      });
+
+      expect(out.outcome).toBe("stalled");
+      expect(out.rounds[0].fixCommitted).toBe(false);
+      expect(calls).toHaveLength(2); // no confirming review dispatched on a stall
+    },
+  );
+
   it("never passes a protocol violation as a clean review, and dispatches no fix for it", async () => {
     const { result, calls } = gate(["I read everything and it looks fine."], { reviewMaxRounds: 3 });
     const out = await result;
@@ -764,6 +1608,26 @@ describe("runReviewGate — sessions", () => {
     // The fixer writes code and commits it; denying it those tools would break the round.
     expect(calls[1].disallowedTools).toBeUndefined();
   });
+
+  it(
+    "also denies `Bash` outright when the board is server-backed (PR #284 review, \"Block " +
+      "server-backed board writes during review\", hardened round 18 \"Deny Bash instead of only " +
+      "the bd command prefix\") — the OS sandbox only pins a filesystem-backed board shut, and a " +
+      "`Bash(bd:*)` command-prefix rule only matches a command that itself starts with `bd`, which " +
+      "a shell can route around (`cd` first, a wrapper script, an alias) — so a shared-server board " +
+      "gets the whole tool denied instead",
+    () => {
+      try {
+        pinBoardMode("/repos/server-board", { mode: "server" });
+        expect(reviewDeniedTools("/repos/server-board")).toEqual([...REVIEW_DENIED_TOOLS, "Bash"]);
+        // Unaffected for an embedded board, or when no live board path is in play at all.
+        expect(reviewDeniedTools("/repos/anton")).toEqual(REVIEW_DENIED_TOOLS);
+        expect(reviewDeniedTools(undefined)).toEqual(REVIEW_DENIED_TOOLS);
+      } finally {
+        resetBoardModeCache();
+      }
+    },
+  );
 
   it("loads the reviewer from the operator's settings only, never the branch's", async () => {
     // `.claude/settings.json` is source-controlled, so a diff that adds one would configure the

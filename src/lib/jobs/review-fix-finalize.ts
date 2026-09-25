@@ -21,6 +21,7 @@ import {
   type Worktree,
 } from "../git/worktree";
 import { findOpenRunForEpic, updateRun } from "../runs";
+import { mustPersist, mustReadClosureVersion } from "./execute-epic-persist";
 import { IN_REVIEW, tryShow } from "./review-fix-board";
 import { safe } from "./safe";
 import { safeToRerunAtMerge, undeliveredAtMerge } from "./review-fix-delivery";
@@ -460,9 +461,16 @@ async function finalizeRunRow(
  * Close the remaining open tickets and the target in ONE bd transaction (anton-aijz), children
  * first. All-or-nothing: a failure part-way leaves every bead exactly as it was, rather than a
  * half-closed unit no reader can interpret. Only drop the in-review stage once that transaction
- * lands — a transient failure (swallowed by `safe`) must leave the label in place so the next
- * review-fix sweep re-selects the epic (inReviewEpics) and retries, rather than orphaning a
- * still-open ticket/epic behind a run already marked done.
+ * lands AND every confirmed board-evidence bead in the subtree has its closure fence stamped
+ * ({@link stampConfirmedClosures}) — a transient failure in the fence backfill must leave the label
+ * in place, because it is the ONLY remaining signal that this closed epic still owes a fence: once
+ * the batch close lands, `inReviewEpics` (review-fix.ts) excludes the epic unconditionally, so it can
+ * never be re-selected as an in-review target again. What actually retries it is
+ * `recoverUnfencedClosure` (review-fix.ts), which the dispatcher runs every pass specifically over
+ * closed-but-still-labelled epics — a separate, narrower read than `inReviewEpics` that is the one
+ * place left that still looks at them. A failure in the batch itself (swallowed by `safe`) is the
+ * other case this label guards: that one IS retried by `inReviewEpics`, because the epic never closed
+ * at all.
  *
  * LAST on purpose, after every other finalization write (PR #199 review). It is the CLOSE, not the
  * label, that makes this epic undiscoverable: inReviewEpics drops a closed run target whatever
@@ -520,5 +528,178 @@ async function closeFinalized(
         [...stillOpen.keys()].map((id): BatchOp => ({ op: "close", id })),
       ),
     ));
-  if (closed) await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+  if (!closed) return;
+  // Every non-preserved bead in this subtree is closed now — the ones `stillOpen` just named, plus
+  // any the snapshot already found closed, which includes a bead an EARLIER, interrupted pass of
+  // this same finalization closed but could not fence (chatgpt-codex-connector, PR #284 review,
+  // "Require closure stamps before completing finalization"). Passing only `stillOpen` gave a failed
+  // stamp no later resumption point at all: the next sweep's snapshot reads that bead as already
+  // closed, so it would never appear in `stillOpen` again and `stampConfirmedClosures` would never be
+  // asked about it a second time. Recomputing the full set here every pass is what makes the fence
+  // retryable rather than a single best-effort attempt tied to the one call that happened to close it.
+  const closedNow = [...children, epic].filter((b) => !skip.has(b.id));
+  const allFenced = await stampConfirmedClosures(repo, closedNow);
+  // `stage:in-review` is what makes this epic reachable to the next sweep at all (inReviewEpics
+  // excludes a closed target). Dropping it before every confirmed-but-unfenced bead is actually
+  // fenced would strand that bead's fence attempt: the close already landed, durably, and cannot be
+  // retried from a state where the epic is no longer selected for finalization.
+  if (allFenced) {
+    const untagged = await safe(() => beads.untag(repo, epic.id, [IN_REVIEW]));
+    // Confirmed synced before this untag is trusted, and RESTORED locally when it can't be (chatgpt-
+    // codex-connector, PR #284 review, "Keep the recovery marker until finalization syncs"): the
+    // caller here (`fixOnePr`, review-fix.ts) only syncs from a `finally` that LOGS a push failure
+    // rather than propagating it, so on an embedded board a push that fails right after this untag
+    // would leave the LOCAL board believing finalization is fully settled while the remote may still
+    // carry the epic unfenced. `closedUnfencedEpics`/`recoverUnfencedClosure` (review-fix.ts) — the
+    // one place left that ever revisits a closed epic — reads the LOCAL board, so once the label is
+    // gone there, nothing on this machine would ever retry the push. Restoring it locally keeps this
+    // machine's own recovery path finding the epic again; that path's own sync IS propagated, not
+    // swallowed.
+    if (untagged) {
+      const synced = await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false);
+      // A failed restore must not read as a restored one (chatgpt-codex-connector, PR #284 review,
+      // "Require the recovery-marker restore to succeed"): `safe` swallows the write's own error, and
+      // discarding its result here meant this function returned normally either way. With the label
+      // gone locally and never put back, `closedUnfencedEpics` has nothing left to select — the untag
+      // may still be unpublished, and no machine would ever revisit it. Thrown, not logged: this is
+      // the caller's only signal, and the job runner's retry is the one path left to try the restore
+      // again.
+      if (!synced) {
+        const restored = await safe(() => beads.tag(repo, epic.id, [IN_REVIEW]));
+        if (!restored) {
+          throw new Error(
+            `${epic.id}: could not restore stage:in-review after an unconfirmed untag push — ` +
+              "closedUnfencedEpics can no longer find this epic to retry the sync",
+          );
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Backfill the closure fence ({@link beads.confirmedBoardEvidenceClosure}) on every bead this close
+ * just settled that carries a board-evidence confirmation recorded with NONE (chatgpt-codex-
+ * connector, PR #284 review, "Fence standalone confirmations when merge closes the target"). A
+ * standalone board-only run target is confirmed while still open — intentionally left at
+ * `stage:in-review` rather than closed (`clearBoardEvidencePending`,
+ * execute-epic-board-evidence.ts) — so its confirmation carries no closure episode until a close
+ * like this one finally gives it one. Left unstamped, a later reopen-and-reclose of that SAME bead —
+ * before anton ever redispatches it again — reads the still-`undefined` stored closure as "cannot
+ * verify, pass anyway" (`confirmedForThisCycle`, execute-epic-dispatch.ts — the tolerance meant for a
+ * confirmation written before this fence existed) and accepts THIS confirmation's stale ids as the
+ * new cycle's evidence with no fresh board delta ever checked.
+ *
+ * Reports whether every unfenced bead actually got fenced (chatgpt-codex-connector, PR #284 review,
+ * "Require closure stamps before completing finalization") — an exhausted
+ * {@link mustReadClosureVersion}/{@link mustPersist} retry no longer disappears silently. The batch
+ * close itself already committed, durably, and cannot be undone from here, but the caller now holds
+ * `stage:in-review` open on a `false` result instead of treating the close as fully settled.
+ *
+ * Exported because a `false` here is retried from TWO different places, depending on whether the
+ * enclosing batch close itself landed: a batch-close failure leaves the epic open, so `inReviewEpics`
+ * re-selects it and the next `closeFinalized` call recomputes `closedNow` fresh. A fence failure
+ * AFTER the batch close landed is different — the epic is closed now, `inReviewEpics` can never see
+ * it again — so that retry is `recoverUnfencedClosure` (review-fix.ts), called directly against this
+ * function with a `closedNow` it rebuilds from the board (`runTickets` + the epic), not from a second
+ * `closeFinalized` pass.
+ */
+export async function stampConfirmedClosures(repo: string, closedBeads: readonly Bead[]): Promise<boolean> {
+  const unfenced = closedBeads.filter(
+    (b) => beads.boardEvidenceConfirmed(b) && beads.confirmedBoardEvidenceClosure(b) === undefined,
+  );
+  const fenced = await Promise.all(
+    unfenced.map(async (b) => {
+      // Re-read live rather than writing off `b` (chatgpt-codex-connector, PR #284 review, "Refresh
+      // confirmation metadata before stamping closures"): `b` is `closedBeads`'s snapshot, taken
+      // before this async fan-out started, and another review-fix pass can extend this bead's
+      // confirmed ids in the meantime. Persisting `confirmedBoardEvidenceIds(b)` would overwrite that
+      // newer, wider id set with the stale one this snapshot carried, losing evidence a later reviewer
+      // or the resume ledger needs. An unreadable bead fails this one bead's fence rather than
+      // guessing off the stale snapshot.
+      const read = await mustReadClosureVersion(repo, b.id);
+      if (!read.read || read.closure === undefined) return false;
+      // Unlike `survivorTrustedForClosure` (execute-epic-dispatch.ts), `read.reopened` — whether
+      // this bead closed at all BEFORE its current closed streak, anywhere in its whole history — is
+      // not, by itself, a reason to reject this bead (chatgpt-codex-connector, anton-fc5x review,
+      // "Allow fresh confirmations after earlier closure cycles"). That function guards a
+      // STAMPED-OR-NOT survivor found on an arbitrary resume, where an unstamped one predating the
+      // reset genuinely could belong to either episode; here, this filter only ever admits a bead
+      // with `boardEvidenceConfirmed` true and `confirmedBoardEvidenceClosure` still undefined, and
+      // the ONLY write that clears a stamped closure is `ensureBoardBaselinePersisted`'s reopen-reset,
+      // which clears the confirmed flag right alongside it — so a bead reopened exactly once, redis-
+      // patched by THIS run, and reconfirmed fresh during that new open period is legitimate even
+      // though `read.reopened` is true.
+      //
+      // What `read.reopened` cannot tell apart from that legitimate shape (chatgpt-codex-connector,
+      // PR #284 review, "Preserve the originating cycle when stamping confirmations") is a bead an
+      // EXTERNAL writer reopened and reclosed AGAIN after this confirmation was written but before
+      // this fence ever ran — `ensureBoardBaselinePersisted`'s reopen-reset only fires when THIS run
+      // redispatches the ticket, so a reopen nobody here ever sees leaves the stale confirmation
+      // standing, and `read.closure` above already reflects that later, unrelated cycle. The
+      // confirmation's own stored `origin` — {@link beads.confirmedBoardEvidenceOrigin}, the ticket's
+      // last completed closure AT THE MOMENT this confirmation was written — pins down which cycle it
+      // actually belongs to; comparing it against `read.priorClosure` (the SAME identity, read fresh
+      // off the CURRENT history, immediately behind the closure `read.closure` just found) tells a
+      // confirmation still anchored to that same prior cycle apart from one an extra, undetected
+      // reopen-and-reclose has since orphaned. A mismatch leaves this bead unfenced for a later pass
+      // rather than stamp `read.closure` onto evidence that never saw it.
+      if (beads.confirmedBoardEvidenceOrigin(b) !== read.priorClosure) return false;
+      // Re-read live rather than writing off `b` (chatgpt-codex-connector, PR #284 review, "Refresh
+      // confirmation metadata before stamping closures"): `b` is `closedBeads`'s snapshot, taken
+      // before this async fan-out started, and another review-fix pass can extend this bead's
+      // confirmed ids in the meantime. Persisting `confirmedBoardEvidenceIds(b)` would overwrite that
+      // newer, wider id set with the stale one this snapshot carried, losing evidence a later reviewer
+      // or the resume ledger needs. An unreadable bead fails this one bead's fence rather than
+      // guessing off the stale snapshot.
+      const live = await tryShow(repo, b.id);
+      if (!live) return false;
+      // Revalidated before writing, not just used as an id source (chatgpt-codex-connector, PR #284
+      // review, "Revalidate confirmation before stamping its closure"): a writer that starts a NEW
+      // delivery cycle between the snapshot and this call can clear this bead's confirmation (a
+      // reopen resets it — `ensureBoardBaselinePersisted`) or already fence it with a closure of its
+      // own. Writing off `live`'s ids alone would recreate `boardEvidenceConfirmed` from a now-empty
+      // id set and stamp it with `read.closure` — durably confirming the NEW cycle with zero evidence
+      // ever checked. Nothing to fence either way is a settled bead, not a failure. The origin is
+      // revalidated too, off this same fresh read, for the identical reason the check above exists —
+      // the snapshot's origin could be stale even when its confirmed/closure flags are not.
+      if (!beads.boardEvidenceConfirmed(live)) {
+        // The confirmation is only ever cleared by `ensureBoardBaselinePersisted`'s reopen-reset
+        // (chatgpt-codex-connector, PR #284 review, "Reject reopened beads before declaring fences
+        // complete") — a concurrent writer starting a NEW delivery cycle on this exact bead. If that
+        // reopen has not yet reclosed it, this close never actually landed for good and treating it
+        // as settled would drop `stage:in-review` out from under a bead that is open right now, with
+        // nothing left to rediscover it. Settled only once the live bead is closed again — whether by
+        // that new cycle finishing or anything else — since a genuinely fresh, still-open confirmation
+        // for THIS cycle would have left `boardEvidenceConfirmed` true, not cleared.
+        return live.status === "closed";
+      }
+      if (
+        beads.confirmedBoardEvidenceClosure(live) !== undefined ||
+        beads.confirmedBoardEvidenceOrigin(live) !== read.priorClosure
+      ) {
+        return true;
+      }
+      // Revalidated again, right before the write (chatgpt-codex-connector, PR #284 review,
+      // "Revalidate the closure cycle before stamping confirmation" round 2): a reopen-and-reclose
+      // landing between the history read above and this point clears neither
+      // `boardEvidenceConfirmed` nor `confirmedBoardEvidenceClosure` — only a fresh closure-version
+      // read can tell the prior cycle from a brand-new one. `currentClosureVersion` (closure-cycle.ts)
+      // already folds a currently-open bead into `undefined`, so comparing this fresh read against
+      // `read.closure` for an EXACT match — the same compare-and-check `survivorTrustedForClosure`
+      // (execute-epic-dispatch.ts) already applies to this identical shape — catches both a
+      // still-open reopen and a reopen-and-reclose in one check; anything but an exact match means a
+      // newer cycle exists and this bead's fence is left for a later pass rather than stamped onto
+      // stale ids.
+      const recheck = await mustReadClosureVersion(repo, b.id);
+      if (!recheck.read || recheck.closure !== read.closure) return false;
+      return mustPersist(() =>
+        beads.setBoardEvidenceConfirmed(repo, b.id, beads.confirmedBoardEvidenceIds(live), read.closure),
+      );
+    }),
+  );
+  return fenced.every(Boolean);
 }

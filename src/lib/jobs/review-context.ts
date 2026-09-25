@@ -10,15 +10,18 @@
  * relies on. That is why the score is demanded by the appended context rather than by the skill.
  */
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
-import { type Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
+import { isServerMode } from "../beads/board-mode";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { bundledSkillDigest, loadSkill } from "../claude/prompt";
 import { textDigest } from "../claude/skill-stamp.mjs";
-import { buildExecutionSystemPrompt } from "../claude/system-prompt";
+import { buildExecutionSystemPrompt, shellQuotePath } from "../claude/system-prompt";
 import type { ReasoningAttribution } from "../claude-invocations";
 import { listDirBlobsAtRev, readFileAtRev, resolveRepoPath, type BranchDiff } from "../git/ops";
 import { resolveReviewConfig, type ProjectSettings } from "../projects";
+import { contentLabels, contentMetadata } from "./execute-epic-board-evidence";
 import { classifyFindingClass, type FindingClass } from "./finding-class";
+import { mustRead, mustReadWithDependencies } from "./execute-epic-persist";
 import { MAX_GATE_OUTPUT_CHARS, tailLines } from "./gate-output";
 import { labelValue } from "./review-fix-context";
 import type { VerifyGateOutcome } from "./shell";
@@ -133,6 +136,46 @@ export interface ReviewRun {
   /** Every ticket the run implemented, in execution order. */
   tickets: Bead[];
   diff: BranchDiff;
+  /**
+   * The bead ids a board-only ticket's CONFIRMED evidence covered, by ticket id (PR #284 review round
+   * 11, follow-up to round 10). `assertBoardOnlyDelivered` blocks or parks a ticket whose own
+   * board-evidence check failed before it ever reaches this run's tickets, so every id here names a
+   * bead this run's own evidence check found changed and confirmed synced — never inferred from the
+   * (empty) diff. Read by {@link diffSection} so a board-only run's reviewer can check the changed
+   * beads against the Acceptance criteria above, rather than being told only that some board write
+   * happened. Absent for a ticket that is not board-only, or whose evidence check never confirmed —
+   * the section then falls back to the unspecific note it always gave.
+   */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /**
+   * Current field values for every bead named in {@link boardEvidenceByTicket}, keyed by bead id (PR
+   * #284 review round 18, "Supply field values to server-backed reviewers"). A confirmed id only
+   * proves that SOME field on that bead changed — it says nothing about which one, so on a
+   * server-backed board, where the reviewer has no `bd` of its own (see {@link readOnlySection}'s
+   * `noBash`), an id alone cannot tell it a status flip from a mislabel from a reparent to the wrong
+   * parent. `buildReviewPrompt` fetches these with a HOST-SIDE `bd show` — outside the sandboxed
+   * reviewer session entirely, the same trust boundary `execute-epic-board-evidence.ts`'s own
+   * fingerprinting already reads through — before this run's prompt is ever built, so the reviewer is
+   * handed the values directly rather than a path to go read them itself. `undefined` for an id names
+   * a read that failed even after retries: shown as unconfirmed rather than silently dropped, so a
+   * reviewer never mistakes "could not check" for "checked and fine". Absent entirely for a
+   * non-server board, where {@link boardEvidenceSection}'s live `bd -C <repoPath>` instruction already
+   * lets the reviewer read current values itself.
+   */
+  confirmedBoardEvidenceBeads?: ReadonlyMap<string, Bead | "deleted" | undefined>;
+  /**
+   * The live board's repo path ({@link import("./steps/context").StepContext.repoPath}) — the same
+   * path a board-only IMPLEMENTER is told to point `bd -C` at (see
+   * {@link import("../claude/system-prompt").SystemPromptLayers.repoPath}), handed to the reviewer
+   * for the identical reason: `projectDir` above is this run's WORKTREE, which on a non-server Dolt
+   * board carries its own separate, unsynced beads copy with no remote to publish from. A reviewer
+   * whose only tool is a bare `bd show <id>` at that cwd reads that frozen, pre-delivery copy — never
+   * the board anton's own evidence check already confirmed the ticket changed and synced — and so can
+   * never confirm a board-only Acceptance criterion either way. Passed through so the reviewer is told
+   * explicitly to run `bd` against THIS path instead of relying on its cwd (see
+   * {@link boardEvidenceSection}). Absent for a caller that never resolved it (a direct test call).
+   */
+  repoPath?: string;
   /** `.product/principles.md` at the base revision, when the project has one. */
   principles?: string;
   /**
@@ -246,6 +289,10 @@ export async function buildReviewPrompt(args: {
   target: Bead;
   tickets: Bead[];
   diff: BranchDiff;
+  /** See {@link ReviewRun.boardEvidenceByTicket}. */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
+  /** See {@link ReviewRun.repoPath}. */
+  repoPath?: string;
   settings: ProjectSettings;
   /** The worktree under review. Its files are read at `baseRev`, never from the working tree. */
   projectDir: string;
@@ -282,6 +329,16 @@ export async function buildReviewPrompt(args: {
     readPrinciples(projectDir, baseRev),
     readInstructions(projectDir, baseRev, diff.files),
   ]);
+  // Host-side, before this run's prompt exists at all (PR #284 review round 18, "Supply field values
+  // to server-backed reviewers") — see {@link ReviewRun.confirmedBoardEvidenceBeads}. Only worth
+  // fetching on a server-backed board with confirmed ids to look up: a non-server board already hands
+  // the reviewer a live `bd -C <repoPath>` read of its own, and a run with nothing confirmed has
+  // nothing to fetch.
+  const serverMode = args.repoPath !== undefined && isServerMode(args.repoPath);
+  const confirmedBoardEvidenceBeads =
+    serverMode && args.repoPath && args.boardEvidenceByTicket && args.boardEvidenceByTicket.size > 0
+      ? await fetchConfirmedBoardEvidenceBeads(args.repoPath, args.boardEvidenceByTicket)
+      : undefined;
   const prompt = [
     reasoning,
     "",
@@ -297,9 +354,88 @@ export async function buildReviewPrompt(args: {
       previousBlocking: args.previousBlocking,
       verified: args.verified,
       gatesDiscarded: args.gatesDiscarded,
+      boardEvidenceByTicket: args.boardEvidenceByTicket,
+      confirmedBoardEvidenceBeads,
+      repoPath: args.repoPath,
     }),
   ].join("\n");
   return { prompt, reviewer };
+}
+
+/**
+ * Batch size for {@link fetchConfirmedBoardEvidenceBeads}'s host-side reads — unlike
+ * `execute-epic-board-evidence.ts`'s `DESCRIPTION_HYDRATION_CONCURRENCY`, which fires up to 4
+ * single-id `bd show` calls concurrently via `Promise.all`, this is a batch size for one combined
+ * `bd list --id a,b,c,d` SUBPROCESS per batch, and each batch is `await`ed before the next starts —
+ * no concurrency at all. Kept sequential rather than fired in parallel because a run confirming
+ * many ids at once would otherwise contend the same Dolt server this review is trying to read
+ * safely; batching still caps how many ids land in a single `bd list --id ...` invocation.
+ */
+const CONFIRMED_BEAD_READ_CONCURRENCY = 4;
+
+/**
+ * The current field values of every bead named in `boardEvidenceByTicket`, read HOST-SIDE — outside
+ * the sandboxed reviewer session entirely, before its prompt is ever built. See
+ * {@link ReviewRun.confirmedBoardEvidenceBeads} for why a confirmed id alone is not enough evidence
+ * for a reviewer with no `bd` of its own on a server-backed board.
+ *
+ * Goes through {@link mustReadWithDependencies}, never {@link mustRead}: a reviewer checking a
+ * dependency-only acceptance criterion (a `bd dep add`/`bd supersede` board-only delivery) needs the
+ * `dependencies` field this snapshot renders, and `mustRead` (`bd show`) never carries it — only `bd
+ * list --json` inlines edges (`src/lib/ticket-view.test.ts`). Rendering `dependencies=[(none)]` off a
+ * `bd show` read would tell the reviewer no edges exist even when the confirmed bead has blocking or
+ * related ones, a false current state on exactly the criterion the read exists to settle.
+ *
+ * `mustReadWithDependencies` already retries and never throws, and its own contract distinguishes
+ * two different absences: `undefined` for a batch where EVERY attempt was refused, and a returned
+ * Map simply missing an id bd's read succeeded on but found nothing for (never existed, or was
+ * deleted). Those are not the same fact for a reviewer, so they are kept apart here too instead of
+ * both collapsing to `undefined` (chatgpt-codex-connector, PR #284 review, "Represent deleted beads
+ * as successful absence") — a `"deleted"` id renders as a confirmed absence by
+ * {@link confirmedBeadSummary}, and only a batch-level read failure renders as an explicit refusal
+ * to vouch.
+ */
+async function fetchConfirmedBoardEvidenceBeads(
+  repoPath: string,
+  boardEvidenceByTicket: ReadonlyMap<string, string[]>,
+): Promise<ReadonlyMap<string, Bead | "deleted" | undefined>> {
+  const ids = [...new Set([...boardEvidenceByTicket.values()].flat())];
+  const result = new Map<string, Bead | "deleted" | undefined>();
+  for (let i = 0; i < ids.length; i += CONFIRMED_BEAD_READ_CONCURRENCY) {
+    const batch = ids.slice(i, i + CONFIRMED_BEAD_READ_CONCURRENCY);
+    const found = await mustReadWithDependencies(repoPath, batch);
+    await Promise.all(
+      batch.map(async (id) => {
+        if (!found) {
+          result.set(id, undefined);
+          return;
+        }
+        const bead = found.get(id);
+        if (!bead) {
+          result.set(id, "deleted");
+          return;
+        }
+        if (bead.description !== undefined) {
+          result.set(id, bead);
+          return;
+        }
+        // `bd list --json` omits `description` on some bd variants — the same gap
+        // `hydrateDescriptions` (execute-epic-board-evidence.ts) hydrates for evidence fingerprints
+        // (chatgpt-codex-connector, PR #284 review, "Hydrate descriptions in the server-board
+        // snapshot"). A server-backed reviewer has no `bd` of its own (see the caller's serverMode
+        // branch) — `confirmedBeadSummary`'s rendering below is the only field value it will ever
+        // see, so silently rendering `description=(none)` here can reject or approve a confirmed
+        // description-only delivery against false current state. `bd show` never carries
+        // `dependencies` (only `bd list --json` does — see this function's own docstring), so the
+        // list-provided edges are kept and only `description` is merged in; a `mustRead` that still
+        // can't confirm it (after its own retries) leaves this id unreadable rather than fall back to
+        // the same false "(none)" this hydration exists to prevent.
+        const detail = await mustRead(repoPath, id);
+        result.set(id, detail ? { ...bead, description: detail.description ?? "" } : undefined);
+      }),
+    );
+  }
+  return result;
 }
 
 /**
@@ -531,15 +667,23 @@ function withoutCode(text: string): string {
  * Assembled from independent section builders so each stays testable in isolation.
  */
 export function reviewContext(run: ReviewRun): string {
+  const noBash = run.repoPath !== undefined && isServerMode(run.repoPath);
   return [
     ...headerSection(run),
     ...beadsSection(run),
-    ...diffSection(run.diff),
+    ...diffSection(
+      run.diff,
+      isBoardOnlyDelivery(run),
+      run.tickets,
+      run.boardEvidenceByTicket,
+      run.repoPath,
+      run.confirmedBoardEvidenceBeads,
+    ),
     ...principlesSection(run),
     ...carriedAdvisorySection(run.carriedAdvisories ?? []),
     ...previousBlockingClassSection(run.previousBlocking ?? []),
     ...verifiedGatesSection(run.verified ?? [], run.gatesDiscarded ?? false),
-    ...readOnlySection(run.verified ?? [], run.gatesDiscarded ?? false),
+    ...readOnlySection(run.verified ?? [], run.gatesDiscarded ?? false, noBash),
     ...reportingFormatSection(run.diff.truncated),
   ]
     .join("\n")
@@ -629,8 +773,239 @@ function truncatedContractNote(cut: boolean): string[] {
   ];
 }
 
-function diffSection(diff: BranchDiff): string[] {
+/**
+ * Whether every bead this run had to deliver was labelled `delivery:board` up front (anton-fc5x
+ * follow-up, PR #284 review) — read off the beads' OWN labels (or the run target's, for the legacy
+ * shape a ticket doesn't carry itself — see {@link beads.isBoardOnly}'s docstring), never inferred
+ * from the diff being empty: that would let any zero-diff run masquerade as a confirmed board-only
+ * delivery. Safe to trust here because a ticket that failed its OWN board-evidence check never
+ * reaches `step:review` at all — `assertBoardOnlyDelivered` blocks or parks it before the run's
+ * `step:commit`/`step:review` — so a labelled ticket that made it into this run's tickets already
+ * had its evidence confirmed and synced.
+ *
+ * Takes the bare `target`/`tickets` pair rather than a whole {@link ReviewRun} so the review GATE
+ * (review-gate.ts) can reuse the identical rule to decide whether a fix session it is about to
+ * dispatch is repairing a board-only delivery too (PR #284 review round 12) — that caller has no
+ * diff, principles, or reviewer contract to build a `ReviewRun` from, only the same bead pair this
+ * check actually reads. Only fit for the ALL-tickets question this section answers (how to render a
+ * run's diff to its reviewer); a MIXED run's fix routing wants {@link hasBoardOnlyTicket} instead —
+ * see that function's docstring for why the two must not share one predicate.
+ */
+export function isBoardOnlyDelivery(run: { target: Bead; tickets: Bead[] }): boolean {
+  const units = run.tickets.length > 0 ? run.tickets : [run.target];
+  return units.every((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
+}
+
+/**
+ * Whether ANY ticket this run had to deliver is board-only (PR #284 review round 15) — the predicate
+ * FIX ROUTING reads, as opposed to {@link isBoardOnlyDelivery}'s "every ticket" rule that governs how
+ * this run's diff is rendered to its reviewer. A mixed run — some tickets delivered as an ordinary
+ * commit, one labelled `delivery:board` — fails the all-tickets rule, but a blocking finding raised
+ * against that one board-only ticket still needs its fix session dispatched with the live-board
+ * instructions, fingerprinting, and board-progress handling: the reviewer was shown that ticket's OWN
+ * confirmed board evidence, so a fixer sent to repair it without those must not be pointed only at the
+ * worktree's frozen `bd` copy, nor have a real repair that writes no git diff misread as a stalled
+ * round. Safe by the same guarantee `isBoardOnlyDelivery` documents: a ticket that failed its OWN
+ * board-evidence check never reaches this run's tickets at all.
+ */
+export function hasBoardOnlyTicket(run: { target: Bead; tickets: Bead[] }): boolean {
+  const units = run.tickets.length > 0 ? run.tickets : [run.target];
+  return units.some((t) => beads.isBoardOnly(t) || beads.isBoardOnly(run.target));
+}
+
+/**
+ * WHICH beads a board-only run's confirmed evidence actually covers, one line per ticket (PR #284
+ * review round 11), plus — when `repoPath` is given — how to read their CURRENT content (PR #284
+ * review round 12/13).
+ *
+ * The id list falls back to nothing (the caller's surrounding prose still stands alone) when this
+ * run predates the plumbing or no ticket's evidence carried ids this round — never a claim that
+ * nothing changed, since the check upstream already refused a run with no evidence at all.
+ *
+ * The live-board instruction is independent of whether ids are known: `projectDir` throughout this
+ * module is this run's WORKTREE, and on a non-server Dolt board that worktree carries its own
+ * separate, unsynced beads copy (see {@link ReviewRun.repoPath}). Without an explicit `-C`, a
+ * reviewer's `bd show <id>` reads that frozen, pre-delivery copy regardless of whether this section
+ * could name the changed ids — so the instruction is worth giving even when the ids themselves are
+ * not, e.g. for the legacy shape where only the run target carries the `delivery:board` label.
+ *
+ * Gated on `boardOnly`, not on `repoPath` alone (PR #284 review, "board-checking instruction leaks
+ * into every ordinary review"): `repoPath` ({@link import("./steps/context").StepContext.repoPath})
+ * is a required field every gate forwards regardless of whether this run has any board-only ticket,
+ * so a bare `!repoPath` check never actually early-returns in production — every ordinary review
+ * with a real diff and zero board evidence got this paragraph appended after the diff, with no id to
+ * check it against.
+ *
+ * The live-read instruction itself is further gated on the board NOT being `dolt_mode: server` (PR
+ * #284 review, "Block server-backed board writes during review"): `resolveReviewSandbox`'s OS-level
+ * deny only reaches a filesystem-backed board (the ref store, and `<repoPath>/.beads` for an embedded
+ * Dolt checkout) — a server-backed one is mutated over a connection string, which no filesystem rule
+ * can see. Teaching this session `bd -C <repoPath>` there hands it a live, write-capable path with
+ * nothing but a tool-name filter standing between a typo and the canonical board, so
+ * `reviewDeniedTools` (review-gate.ts) denies `Bash` outright for a server-backed board instead — this
+ * section stops teaching the command for the same reason.
+ *
+ * In server mode the ids alone are replaced with `confirmedBeads`' actual field values (PR #284
+ * review round 18, "Supply field values to server-backed reviewers"): an id only proves SOME field on
+ * that bead changed, never which one, and a reviewer with no `bd` of its own and no rendered snapshot
+ * of the board cannot tell a correct edit from a wrong-field one from the id alone — it could
+ * "confirm" a ticket that changed the wrong bead, or the right bead's wrong field, with nothing here
+ * to catch it. `confirmedBeads` is the host-side read {@link buildReviewPrompt} took before this
+ * session ever started, so the values it renders are trusted the same way the confirmed ids
+ * themselves already are.
+ */
+function boardEvidenceSection(
+  tickets: Bead[],
+  boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
+  repoPath: string | undefined,
+  boardOnly: boolean,
+  confirmedBeads: ReadonlyMap<string, Bead | "deleted" | undefined> | undefined,
+): string[] {
+  const lines = tickets
+    .map((t) => ({ ticket: t, ids: boardEvidenceByTicket?.get(t.id) }))
+    .filter((e): e is { ticket: Bead; ids: string[] } => !!e.ids?.length)
+    .map((e) => `- ${e.ticket.id}: ${e.ids.join(", ")}`);
+  if (lines.length === 0 && !boardOnly) return [];
+  const serverMode = repoPath !== undefined && isServerMode(repoPath);
+  const confirmedIds = [...new Set(tickets.flatMap((t) => boardEvidenceByTicket?.get(t.id) ?? []))];
+  return [
+    ...(lines.length > 0 ? [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``] : []),
+    ...(repoPath && !serverMode
+      ? [
+          `This worktree's own \`bd\` reads a separate, unsynced copy of the board — the same reason a`,
+          `board-only implementer is told to point every \`bd\` write at the live path explicitly,`,
+          `rather than its cwd. Do the same to READ: check a bead's CURRENT field values against the`,
+          `live board, not this worktree's default \`bd\`, e.g.:`,
+          ``,
+          "```",
+          `bd -C ${shellQuotePath(repoPath)} show <id>`,
+          "```",
+          ``,
+          `A plain \`bd show <id>\` here reports this worktree's frozen, pre-delivery copy — not usable`,
+          `evidence either way for whether Acceptance was met.`,
+          ``,
+        ]
+      : []),
+    ...(serverMode
+      ? [
+          `This project's board runs on a shared server rather than a local per-worktree copy, so this`,
+          `session has no \`bd\` access to it at all — a live read there would be a live write path too,`,
+          `and nothing here can sandbox a connection string the way a local checkout's files can be`,
+          `sandboxed. anton read the current field values of every id above directly from the live`,
+          `board before this review began (a host-side read outside this sandboxed session) — judge`,
+          `Acceptance against them, not against the bare fact that "some field changed":`,
+          ``,
+          ...confirmedIds.flatMap((id) => confirmedBeadSummary(id, confirmedBeads?.get(id))),
+        ]
+      : []),
+  ];
+}
+
+/**
+ * One confirmed bead's current field values, rendered for a reviewer with no `bd` of its own. Every
+ * field {@link import("./execute-epic-board-evidence").fingerprintOf} hashes is rendered here too
+ * (PR #284 review round 17, "Render all fingerprinted fields for server-board review") — a
+ * fingerprint change a reviewer can't see is a delivery it can't check, so this list must track that
+ * one field-for-field rather than only the subset a status/label/reparent check happens to need.
+ * `labels`/`metadata` reuse that module's own `contentLabels`/`contentMetadata` rather than
+ * reimplementing the bookkeeping-key filter, so the two can never drift apart again.
+ *
+ * `undefined` (the host-side read exhausted its retries) is rendered as an explicit refusal to
+ * vouch, never silently skipped: a reviewer that never sees this id again would read its absence as
+ * "nothing to check" rather than "this run could not confirm what changed here", which is a false
+ * pass on exactly the criterion the read was meant to settle.
+ *
+ * `"deleted"` is a DIFFERENT, successful outcome (chatgpt-codex-connector, PR #284 review,
+ * "Represent deleted beads as successful absence") — the live read succeeded and simply found no
+ * bead at that id, which for a board-only ticket whose evidence names it is what a deletion looks
+ * like. Folding it into the same "could not be read" message as an actual failure tells the
+ * reviewer a valid deletion is unconfirmed board state, when the board confirmed it as absent.
+ */
+function confirmedBeadSummary(id: string, bead: Bead | "deleted" | undefined): string[] {
+  if (bead === "deleted") {
+    return [
+      `- ${id}: no longer exists on the live board — the read succeeded and found it deleted, not a`,
+      `  read failure. If Acceptance called for deleting it, this confirms that happened.`,
+      ``,
+    ];
+  }
+  if (!bead) {
+    return [
+      `- ${id}: current field values could not be read from the live board (after retries) — treat`,
+      `  this id's evidence as unconfirmed and say so in your rationale.`,
+      ``,
+    ];
+  }
+  const labels = contentLabels(bead).join(", ") || "(none)";
+  const deps =
+    (bead.dependencies ?? [])
+      .map((d) => `${d.type}:${d.depends_on_id}`)
+      .toSorted()
+      .join(", ") || "(none)";
+  const metadata =
+    contentMetadata(bead)
+      .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+      .join(", ") || "(none)";
+  // A server-backed reviewer has no `bd` of its own (see the caller's serverMode branch) — this
+  // rendering IS the only field value it will ever see. A field cut at MAX_BEAD_FIELD_CHARS can hide
+  // an acceptance-relevant edit past the cutoff with nothing here to say so, so a cut is never silent
+  // (PR #284 review, "Preserve the complete server-board field snapshot"): every truncated label is
+  // collected and the caller is told, in terms it can't miss, to treat that field as unconfirmed
+  // rather than judge only the visible prefix.
+  const truncatedFields: string[] = [];
+  const field = (label: string, value: string | undefined): string => {
+    const trimmed = value?.trim();
+    if (!trimmed) return `  ${label}=(none)`;
+    if (trimmed.length > MAX_BEAD_FIELD_CHARS) truncatedFields.push(label);
+    return `  ${label}=${truncate(trimmed, MAX_BEAD_FIELD_CHARS)}`;
+  };
+  return [
+    `- ${id}: status=${bead.status}, type=${bead.issue_type ?? "(none)"}, title="${bead.title}"`,
+    `  labels=[${labels}], parent=${beads.parentOf(bead) ?? "(none)"}, assignee=${bead.assignee ?? "(none)"}`,
+    `  dependencies=[${deps}], priority=${bead.priority ?? "(none)"}, external_ref=${bead.external_ref ?? "(none)"}`,
+    `  metadata={${metadata}}`,
+    field("description", bead.description),
+    field("acceptance_criteria", bead.acceptance_criteria),
+    field("design", bead.design),
+    ...(truncatedFields.length > 0
+      ? [
+          `  ⚠ ${id}: ${truncatedFields.join(", ")} exceeded ${MAX_BEAD_FIELD_CHARS} chars and was cut —`,
+          `  anything past the cut is UNCONFIRMED. Treat Acceptance against ${truncatedFields.length > 1 ? "these fields" : "this field"}`,
+          `  as unverifiable and say so in your rationale rather than judging the visible prefix alone.`,
+        ]
+      : []),
+    ``,
+  ];
+}
+
+function diffSection(
+  diff: BranchDiff,
+  boardOnlyDelivery: boolean,
+  tickets: Bead[],
+  boardEvidenceByTicket: ReadonlyMap<string, string[]> | undefined,
+  repoPath: string | undefined,
+  confirmedBeads: ReadonlyMap<string, Bead | "deleted" | undefined> | undefined,
+): string[] {
   if (diff.files.length === 0) {
+    if (boardOnlyDelivery) {
+      return [
+        `## The diff under review`,
+        ``,
+        `The run produced NO changes against its base — expected here. Every bead this run had to`,
+        `deliver is labelled \`delivery:board\`: its product is a bd write (a bead's status, labels,`,
+        `parentage, or another board field), which \`.beads/.gitignore\` deliberately keeps out of the`,
+        `git tree. anton's own board-evidence check already confirmed those writes landed and synced`,
+        `before this review ran — a zero-diff run is not, by itself, evidence of nothing delivered`,
+        `here.`,
+        ``,
+        ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath, boardOnlyDelivery, confirmedBeads),
+        `Judge the Acceptance criteria above against that confirmed board delivery instead of a code`,
+        `diff; there is deliberately none to read. If Acceptance names a specific bead or field, check`,
+        `it against the ids and beads named above (or their absence) rather than taking "the gate`,
+        `passed" as proof the right bead changed.`,
+        ``,
+      ];
+    }
     return [
       `## The diff under review`,
       ``,
@@ -650,6 +1025,12 @@ function diffSection(diff: BranchDiff): string[] {
     diff.patch,
     "```",
     ``,
+    // A board-only ticket whose branch ALSO carries an incidental tree change still has confirmed
+    // evidence to show (PR #284 review): `boardEvidenceByTicket` is only ever populated by a
+    // CONFIRMED board-only delivery, so surfacing it here is never a false claim, and omitting it
+    // just because the diff happens to be nonempty would leave the reviewer with only the unrelated
+    // patch and no way to check Acceptance against the bd writes that were the actual deliverable.
+    ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath, boardOnlyDelivery, confirmedBeads),
     ...deletionsBlock(diff),
   ];
 }
@@ -964,8 +1345,16 @@ function previousBlockingClassSection(previousBlocking: ReviewFinding[]): string
  * The closing paragraph names the OS-level sandbox (anton-t6tu) for one reason: the boundary is
  * enforced whether or not the reviewer knows about it, and a reviewer that doesn't would read its
  * own blocked write as a defect in the run and report a blocking finding that parks it.
+ *
+ * `noBash` (PR #284 review round 18, "Deny Bash instead of only the bd command prefix") is true on a
+ * server-backed board, where {@link reviewDeniedTools} (review-gate.ts) denies the `Bash` TOOL
+ * outright rather than just the `git`/`bd` prefixes — a shell is the one thing a `Bash(bd:*)`-style
+ * rule cannot actually keep off the live board. A reviewer told to "run this in the FOREGROUND" with
+ * no shell to run it in would either stall trying, or read the refusal as a defect in the run; told
+ * plainly it has none, it judges from the diff and anton's own gate results (or their absence)
+ * instead.
  */
-function readOnlySection(verified: VerifyGateOutcome[], gatesDiscarded: boolean): string[] {
+function readOnlySection(verified: VerifyGateOutcome[], gatesDiscarded: boolean, noBash: boolean): string[] {
   return [
     `## This review is READ-ONLY`,
     ``,
@@ -980,26 +1369,39 @@ function readOnlySection(verified: VerifyGateOutcome[], gatesDiscarded: boolean)
     `already above: the diff, the changed-file list, and the beads. Reading and searching are`,
     `expected — just leave the tree exactly as you found it.`,
     ``,
-    `Your shell is SANDBOXED: commands may write inside this worktree and to \`$TMPDIR\`, and nowhere`,
-    `else. A command that fails on a write outside them has hit that boundary, not a defect in this`,
-    `run — do not report it as a finding, and do not try to work around it.`,
-    ``,
-    ...(verified.length > 0
+    ...(noBash
       ? [
-          `Running the project's checks is NOT: they were run for you, above. Re-run at most one`,
-          `targeted test to settle one question, in the FOREGROUND. See that section for why.`,
+          `You have NO SHELL this session: this project's board runs on a shared server, and a`,
+          `command-prefix filter cannot keep a shell off it — anything that reaches the \`bd\` binary`,
+          `without itself starting with \`bd\` (a \`cd\` first, a wrapper script, an alias) would sail`,
+          `straight past one. So \`Bash\` is denied outright instead. Judge everything below from the`,
+          `diff, the beads, and anton's own gate results and confirmed board evidence, when given — a`,
+          `failed attempt to reach a shell tool is this boundary, not a defect in the run.`,
         ]
-      : gatesDiscarded
+      : [
+          `Your shell is SANDBOXED: commands may write inside this worktree and to \`$TMPDIR\`, and`,
+          `nowhere else. A command that fails on a write outside them has hit that boundary, not a`,
+          `defect in this run — do not report it as a finding, and do not try to work around it.`,
+        ]),
+    ``,
+    ...(noBash
+      ? []
+      : verified.length > 0
         ? [
-            `Running the project's checks IS expected here — see the section above for why anton's own`,
-            `run of them does not count. Run them in the FOREGROUND, and read the reporting rules`,
-            `below before you start anything slow.`,
+            `Running the project's checks is NOT: they were run for you, above. Re-run at most one`,
+            `targeted test to settle one question, in the FOREGROUND. See that section for why.`,
           ]
-        : [
-            `This project pins no verify gates, so running its own read-only checks (tests, type-check,`,
-            `lint) is expected too. Run them in the FOREGROUND — see the reporting rules below, and do`,
-            `not background anything.`,
-          ]),
+        : gatesDiscarded
+          ? [
+              `Running the project's checks IS expected here — see the section above for why anton's own`,
+              `run of them does not count. Run them in the FOREGROUND, and read the reporting rules`,
+              `below before you start anything slow.`,
+            ]
+          : [
+              `This project pins no verify gates, so running its own read-only checks (tests, type-check,`,
+              `lint) is expected too. Run them in the FOREGROUND — see the reporting rules below, and do`,
+              `not background anything.`,
+            ]),
     ``,
   ];
 }
@@ -1178,12 +1580,37 @@ export async function buildFindingsFixPrompt(args: {
   projectDir: string;
   round: number;
   maxRounds: number;
+  /**
+   * Set when this fix session may be repairing a `delivery:board` ticket ({@link hasBoardOnlyTicket},
+   * PR #284 review round 15) — true both for a run where EVERY ticket is board-only ({@link
+   * isBoardOnlyDelivery}) and for a MIXED run where only some are, since the caller cannot tell from
+   * the findings alone which ticket a given one is about. Carried so the fixer is told its
+   * outcome-reporting rule differs from an ordinary fix (PR #284 review round 12): an unchanged tree
+   * here is not necessarily "no progress", and the gate's own stall check reads the board, not just
+   * the diff, for this run.
+   */
+  boardOnly?: boolean;
+  /**
+   * Set when {@link boardOnly} is true because SOME but not all of this run's tickets are
+   * board-only (chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for
+   * mixed runs") — the caller's {@link hasBoardOnlyTicket} vs. {@link isBoardOnlyDelivery} split.
+   * Tells the system prompt to soften its carve-out: a run where every ticket is board-only can
+   * safely tell the whole session "editing the tree is neither required nor expected", but a mixed
+   * run still has findings against an ordinary ticket that need a real code change, and stating the
+   * carve-out unconditionally would let a fixer leave those untouched and read that as compliant.
+   */
+  mixedBoardOnly?: boolean;
+  /** See {@link ReviewRun.repoPath} — only meaningful when {@link boardOnly} is set. */
+  repoPath?: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string }> {
-  const { target, findings, settings, projectDir, round, maxRounds } = args;
+  const { target, findings, settings, projectDir, round, maxRounds, boardOnly, mixedBoardOnly, repoPath } = args;
 
   const appendSystemPrompt = await buildExecutionSystemPrompt({
     agentPrompt: await loadAgentPrompt(labelValue(target.labels, "agent"), { projectDir }),
     seedPrompt: settings.seedPrompt,
+    boardOnly,
+    mixedBoardOnly,
+    repoPath,
   });
 
   const prompt = [
@@ -1209,6 +1636,30 @@ export async function buildFindingsFixPrompt(args: {
     `  in your final message, with the reason. Do NOT make a token change to look responsive: unresolved`,
     `  findings are surfaced to a human, which is the correct outcome for a bad finding.`,
     `- Do not commit, push, or open a PR — anton commits what you change.`,
+    ...(boardOnly
+      ? [
+          ``,
+          `### This run may deliver via the board`,
+          ``,
+          `At least one ticket in this run is labelled \`delivery:board\`: its deliverable is \`bd\``,
+          `writes, not a code change, so the finding(s) above may be about that board delivery itself`,
+          `rather than a code diff. If a finding is about the board-only ticket, fix it there — an`,
+          `unchanged git tree when you finish is NOT evidence you made no progress on it, since anton`,
+          `checks that ticket's outcome against the board, not the diff. Fix findings about any other`,
+          `ticket the ordinary way, with a code change.`,
+          ...(repoPath
+            ? [
+                ``,
+                `Run every \`bd\` write against the live board, not this worktree's own separate, unsynced`,
+                `copy — pass \`bd\`'s own directory flag rather than relying on your cwd, e.g.:`,
+                ``,
+                "```",
+                `bd -C ${shellQuotePath(repoPath)} update <id> --status done`,
+                "```",
+              ]
+            : []),
+        ]
+      : []),
   ].join("\n");
 
   return { prompt, appendSystemPrompt };

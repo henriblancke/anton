@@ -13,6 +13,7 @@ export interface Bead {
   acceptance?: string;
   acceptance_criteria?: string; // the field bd show/dep return
   context?: string;
+  design?: string; // `bd update <id> --design`, part of the contract (see CONTRACT_FIELDS)
   labels?: string[];
   /**
    * Why a closed bead was closed (`bd close --reason`). Declared rather than left to the index

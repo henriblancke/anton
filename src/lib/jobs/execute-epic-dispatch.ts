@@ -25,6 +25,12 @@ import {
   worktreeHasCommitFor,
   type SatisfiedClaim,
 } from "../git/ops";
+import {
+  clearBoardEvidencePending,
+  isBoardOnlyRun,
+  readBoardBaseline,
+  readBoardEvidence,
+} from "./execute-epic-board-evidence";
 import { blockedTailReason, PoisonEpic } from "./errors";
 import {
   deliveredTickets,
@@ -48,12 +54,13 @@ import {
   TicketRetiredError,
   TicketTimeoutError,
 } from "./execute-epic-errors";
-import { mustPersist, mustRead, mustReadBoard } from "./execute-epic-persist";
+import { mustPersist, mustRead, mustReadBoard, mustReadClosureVersion } from "./execute-epic-persist";
 import { safe } from "./safe";
 import { runTargetAbove } from "./gate-targets";
 import type { RunPreparation } from "./execute-epic-prepare";
 import type { EpicRun } from "./execute-epic-run";
 import { runTicket } from "./execute-epic-ticket";
+import { recordBoardOnlyAttribution } from "./step-registry";
 import type { SatisfiedSettlement, StepContext } from "./step-registry";
 
 /** What the ticket phase leaves for the run phase to speak for. */
@@ -74,6 +81,13 @@ export interface DispatchOutcome {
   satisfied: Map<string, SatisfiedSettlement>;
   /** Tickets this run never dispatched, and the timeout each is waiting behind. */
   skipped: Map<string, SkipCause>;
+  /**
+   * The bead ids a board-only ticket's CONFIRMED evidence covered, by ticket id (PR #284 review round
+   * 11) — so the review gate can tell the reviewer which beads a ticket actually changed instead of
+   * only that a board write happened somewhere. Absent for a ticket that is not board-only, or whose
+   * evidence never confirmed.
+   */
+  boardEvidenceByTicket: Map<string, string[]>;
   /**
    * The run's ONLY ticket was its standalone target, and THIS attempt verified and retired it as
    * already shipped (PR #238 review). There is nothing to review, no pull request to open, and
@@ -107,6 +121,8 @@ interface DispatchLedger {
   onBranch: Set<string>;
   /** Tickets that settled on an earlier commit of the run — see {@link DispatchOutcome.satisfied}. */
   satisfied: Map<string, SatisfiedSettlement>;
+  /** See {@link DispatchOutcome.boardEvidenceByTicket}. */
+  boardEvidence: Map<string, string[]>;
 }
 
 /** Dispatch every ticket this run may run, then answer what it delivered. */
@@ -166,6 +182,7 @@ export async function dispatchRunTickets(
     // ticket and skip valid work behind it.
     onBranch: new Set(run.retired.map((r) => r.id)),
     satisfied: new Map(),
+    boardEvidence: new Map(),
   };
   const recordSkipped = makeSkipRecorder(run, ledger);
 
@@ -199,6 +216,7 @@ export async function dispatchRunTickets(
     targetRetired: verdict.targetRetired,
     satisfied: ledger.satisfied,
     skipped: ledger.skipped,
+    boardEvidenceByTicket: ledger.boardEvidence,
   };
 }
 
@@ -1075,6 +1093,154 @@ export async function branchDelivery(
   return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
 }
 
+/**
+ * Re-diffs a preserved baseline against the live board when it is the ONLY board-evidence
+ * survivor for a done, board-only ticket — the baseline's mere presence never proves a bd write
+ * happened, since `lockDispatchBaseline`/`ensureBoardBaselinePersisted` write it unconditionally
+ * before every board-only dispatch, whether or not the agent (or `readBoardEvidence`) ever ran (PR
+ * #284 review, "Do not confirm baseline-only resumes as delivered"). Shared by both resume shapes
+ * that can land on a baseline-only survivor: the no-commit recovery path below, and the
+ * `if (delivery)` fast path above — a reopened ticket can carry an OLD attribution commit from a
+ * PRIOR delivery cycle while `ensureBoardBaselinePersisted` reset confirmation for a NEW one
+ * (anton-fc5x review, "Re-diff baseline-only resumes despite an old commit"), so an old commit
+ * being present on this branch is no substitute for this re-diff either.
+ */
+async function reDiffPreservedBaseline(repo: string, ticket: Bead): Promise<{ ids: string[]; ticket: Bead }> {
+  const baseline = await readBoardBaseline(repo, ticket);
+  const result = baseline ? await readBoardEvidence(repo, baseline, ticket) : undefined;
+  if (!result?.found) {
+    throw new PoisonEpic(
+      `${ticket.id} is done on the board (closed, or moved to review) and this run is marked ` +
+        `\`delivery:board\`, whose deliverable is bd writes to the board — but only a ` +
+        `pre-dispatch baseline survives from a prior attempt whose evidence check never ` +
+        `completed, and re-diffing that baseline against the board just now found ` +
+        `${result ? "no bd write since the baseline was taken" : "the board unreadable"}. ` +
+        `Accepting this ticket as delivered on the baseline's presence alone would be a false ` +
+        `success. Check the beads DB and the sync channel, then resume the run once the board ` +
+        `read is healthy — or, if ${ticket.id}'s board delivery genuinely happened outside this ` +
+        `evidence check, resolve it by hand before reclaiming the epic.`,
+    );
+  }
+  // Re-read before clearing, mirroring `runTicket`'s own success path in execute-epic-ticket.ts
+  // (chatgpt-codex-connector, PR #284 review, "Re-read the ticket before clearing re-diffed
+  // evidence"): `readBoardEvidence` just above may have added a fresh
+  // `board-evidence-pending:*` label to the LIVE bead, but the caller's `ticket` snapshot predates
+  // this resume and carries none of it. `clearBoardEvidencePending` derives which label to remove
+  // from the bead it is passed, so handing it the stale snapshot leaves that new label stranded on
+  // the board for a later reopen to union into a fresh evidence check and misread as current
+  // evidence. A failed re-read must not fall back to the stale snapshot — poison instead, since
+  // this ticket is already done on the board and silently mislabeling the cleanup risks a
+  // false-evidence strand no later attempt would know to look for.
+  const freshTicket = await mustRead(repo, ticket.id);
+  if (!freshTicket) {
+    throw new PoisonEpic(
+      `${ticket.id}'s board evidence was just re-diffed and found, but the ticket could not be ` +
+        `re-read to find its live board-evidence-pending label before cleanup — clearing it ` +
+        `from the stale pre-dispatch snapshot risks leaving that label on the board, which a ` +
+        `later reopen could misread as current evidence for no new work. Check the beads DB, ` +
+        `then resume the run.`,
+    );
+  }
+  return { ids: result.ids, ticket: freshTicket };
+}
+
+/**
+ * Whether a closure-stamped board-evidence survivor (confirmed ids, a pending marker, or a
+ * cleanup-unsynced obligation) still names the CURRENT closure episode (chatgpt-codex-connector, PR
+ * #284 review, "Fence pending evidence by closure cycle") — the one trust rule shared by every such
+ * survivor a resume can find on a closed ticket, so `stalePending`/`cleanupUnsyncedIds` get exactly
+ * the same fence `confirmedIdsTrusted` already applied to confirmed evidence. Not fenced (trusted
+ * unconditionally) for an ids-empty survivor (nothing to mistrust) or a ticket that isn't closed (a
+ * standalone target at `stage:in-review` has no closure episode to compare).
+ *
+ * An UNDEFINED stored closure is trusted only when `current.reopened` says this ticket has never
+ * been reopened-and-reclosed before its current closure (chatgpt-codex-connector, PR #284 review,
+ * "Reject unstamped survivors on closed tickets") — the earlier version of this function trusted
+ * `undefined` unconditionally, on the theory that `stampPendingBoardEvidenceClosure`'s best-effort
+ * stamp (`clearBoardEvidencePending`) can never strand a false confirmation, since an unstamped
+ * survivor is exactly what this function was supposed to treat as untrusted. That theory was false:
+ * a failed stamp followed by a failed clear left an unstamped marker that a later reopen-and-reclose
+ * passed straight through, confirming the new cycle against stale evidence with no fresh board delta
+ * ever checked. A bead closed exactly once has only one episode for any survivor to belong to, so an
+ * unstamped one there is unambiguous regardless of whether the stamp ever landed — narrower than
+ * rejecting every unstamped survivor outright, which would also punish that ordinary, never-reopened
+ * resume with a forced re-diff (or a hard failure) it does nothing to deserve. `current` is the
+ * shared `bd history` read every survivor on the same ticket compares against, so callers take it
+ * once rather than re-reading per survivor.
+ */
+function survivorTrustedForClosure(
+  ids: readonly string[],
+  storedClosure: string | undefined,
+  ticketClosed: boolean,
+  current: { read: boolean; closure?: string; reopened?: boolean; priorClosure?: string } | undefined,
+  /**
+   * The survivor's own `confirmedBoardEvidenceOrigin`, when it has one (only the confirmed-ids
+   * survivor does — see {@link originMatchesPriorClosure}). An unstamped survivor that carries an
+   * origin is fenced against it directly, the same comparison `originMatchesPriorClosure` makes,
+   * rather than falling back to the blunter `!current.reopened` (chatgpt-codex-connector, PR #284
+   * review, "Honor confirmation origins in the delivery resume path"): a standalone ticket confirmed
+   * while still open in an EARLIER lifecycle, then reopened and closed again in a later one, has
+   * `current.reopened` true regardless of whether that later close is the one the origin names —
+   * `!current.reopened` rejects it outright even when the origin proves it is the same episode,
+   * turning a genuinely delivered board-only resume into a needless (and, once nothing survives to
+   * re-diff, failing) regeneration.
+   */
+  origin?: string,
+): boolean {
+  if (ids.length === 0 || !ticketClosed) return true;
+  if (current === undefined || !current.read) return false;
+  if (storedClosure !== undefined) return storedClosure === current.closure;
+  return origin !== undefined ? origin === current.priorClosure : !current.reopened;
+}
+
+/**
+ * Whether a confirmation written while the ticket was still open — so it stamped no closure of its
+ * own — still names the ticket's CURRENT closure now that it has one (chatgpt-codex-connector, PR
+ * #284 review, "Validate the origin of unfenced confirmations"). `confirmedForThisCycle`'s caller
+ * used to wave every such confirmation through unconditionally: a standalone target can be closed,
+ * reopened, and closed again externally — by another board writer, or a process outside anton
+ * entirely — after the confirmation was written but before this fence ever ran, and the fresh close
+ * that reaches this fast path can be that LATER, unconfirmed cycle, with zero board delta this run
+ * ever checked for it.
+ *
+ * The confirmation's own stored `confirmedBoardEvidenceOrigin` — its last completed closure at write
+ * time, the same identity {@link lastCompletedClosureVersion} computes for an open bead — is compared
+ * against a fresh {@link mustReadClosureVersion} read's `priorClosure`, the SAME identity read now off
+ * the ticket's CURRENT (post-close) history, immediately behind the closure it currently shows.
+ * Mirrors `stampConfirmedClosures` (review-fix-finalize.ts), which fences the identical shape the
+ * other direction (a closed bead's own stored closure against a fresh read's prior closure). A
+ * genuine mismatch means a full extra close/reopen/close cycle landed since the confirmation was
+ * written, so the caller falls through to the regeneration path, which re-diffs the preserved
+ * baseline instead of trusting stale evidence.
+ *
+ * An unreadable history, or one that comes back empty for a ticket the caller already knows is
+ * CLOSED (`read.closure === undefined`), is NOT folded into that same mismatch (chatgpt-codex-
+ * connector, PR #284 review, "Validate closure reads before matching confirmation origins") — the
+ * caller's other branch (the `confirmedClosure !== undefined` case just above) already halts the run
+ * rather than silently reopening an already-delivered ticket on an unreadable read, for exactly the
+ * `NoDeliveryError` reason documented there; treating this branch's read differently would leave the
+ * same failure mode standing for every confirmation written while the ticket was still open. An empty
+ * read is failed the same way rather than compared: `undefined === undefined` would otherwise let a
+ * confirmation with no stamped origin (legitimately `undefined` when the ticket had never closed at
+ * write time) match an empty read's `priorClosure` (also `undefined`, but because the read told us
+ * nothing) even though the ticket's own status proves a closure exists that this read failed to find.
+ */
+async function originMatchesPriorClosure(repo: string, ticket: Bead): Promise<boolean> {
+  const read = await mustReadClosureVersion(repo, ticket.id);
+  if (!read.read || read.closure === undefined) {
+    throw new PoisonEpic(
+      `${ticket.id} is confirmed delivered (board-only) with an unfenced confirmation, but \`bd ` +
+        `history\` could not be read (after retries), or came back without a closure for a ticket ` +
+        `that is closed, so its origin cannot be checked against the ticket's current closure. ` +
+        `Treating that as a mismatch would reopen and regenerate an already-delivered ticket ` +
+        `against a baseline that already contains its writes, turning a real delivery into a false ` +
+        `no-delivery failure. Check the beads DB, then resume the run once the history read is ` +
+        `healthy.`,
+    );
+  }
+  return beads.confirmedBoardEvidenceOrigin(ticket) === read.priorClosure;
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -1133,6 +1299,139 @@ async function dispatchTicket(
     );
   }
   if (delivery) {
+    // A prior attempt's board-evidence cleanup can fail (bd keeps refusing the write) AFTER this
+    // ticket already closed/transitioned — `runTicket` throws `PoisonEpic` and halts that attempt,
+    // but `runTicket` is the only caller of `clearBoardEvidencePending` and this resume just skipped
+    // it. Retry the cleanup here so a stale pending marker does not survive past the run that halted
+    // on it: `doneOnBoard` (required for `delivery` to be set at all) means this ticket's
+    // close/in-review transition already landed, the same post-condition `runTicket` gates the
+    // cleanup on, so retrying it now is exactly as safe as the original call was. A no-op for every
+    // ticket with nothing pending — not board-only, or one whose marker already cleared.
+    //
+    // Checked as THREE independent survivors, not just the marker (PR #284 review): a prior halt can
+    // clear the marker and then exhaust its retries on the preserved baseline, so `stalePending`
+    // alone reads as "nothing left to do" while the baseline is still stranded on the bead. Passing
+    // `hasPreservedBaseline` lets the retry reach it even when no ids are pending at all.
+    //
+    // A third halt shape clears BOTH writes locally and only the confirming push fails — that
+    // leaves neither of the first two survivors behind, so `hasCleanupUnsynced` (PR #284 review,
+    // "retain a retry obligation after cleanup push failure") is checked independently too: without
+    // it this fast path reads "nothing pending" and never retries the push, silently leaving the
+    // remote holding a stale marker/baseline on an already-closed bead for a later, unrelated reopen
+    // to misread as current evidence.
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    const cleanupUnsyncedIds = beads.cleanupUnsyncedBoardEvidenceIds(ticket);
+    // Every recovery survivor here is only trustworthy for THIS closure episode (PR #284 review,
+    // "Fence pending evidence by closure cycle"): a board-only ticket reopened and closed again — by
+    // this run or anything else — before this fast path ever redispatches it leaves
+    // `ensureBoardBaselinePersisted`'s reopen-reset unreached (that reset only fires on an actual
+    // redispatch), so `confirmedBoardEvidenceIds`, the pending marker, and a surviving cleanup
+    // obligation can each still name a PRIOR cycle's evidence — mirroring the closure fence
+    // `confirmedForThisCycle` applies further down, which this earlier return bypasses entirely by
+    // skipping straight to `clearBoardEvidencePending`.
+    const staleConfirmedIds = beads.confirmedBoardEvidenceIds(ticket);
+    const confirmedClosure =
+      ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
+    const pendingClosure = ticket.status === "closed" ? beads.pendingBoardEvidenceClosure(ticket) : undefined;
+    const cleanupClosure =
+      ticket.status === "closed" ? beads.cleanupUnsyncedBoardEvidenceClosure(ticket) : undefined;
+    // Routed through `mustReadClosureVersion` rather than a bare `readCurrentClosureVersion(...)
+    // .catch(() => undefined)` (PR #284 review, "Retry the closure read before trusting it"): unlike
+    // the symmetric check further down (`confirmedForThisCycle`), where an unreadable closure only
+    // costs a redundant redispatch, an unreadable closure HERE can leave `idsToConfirm` empty with no
+    // preserved baseline to re-diff, and `reDiffPreservedBaseline` fails that with a hard `PoisonEpic`
+    // — a single transient `bd history` hiccup should not be able to halt an already-fully-confirmed,
+    // fully-cleaned-up ticket. Retried like every other guarded read in this file before falling back
+    // to the same fail-closed answer. Read ONCE and shared across every survivor's trust check below
+    // (`survivorTrustedForClosure`), since they all compare against the same live closure.
+    //
+    // Triggered by ids alone, not by a DEFINED stored closure too (chatgpt-codex-connector, PR #284
+    // review, "Reject unstamped survivors on closed tickets"): `survivorTrustedForClosure` now needs
+    // `current.reopened` to judge an UNSTAMPED survivor as well as a stamped one, so an id set with no
+    // stored closure at all must still trigger this read rather than leave `closureCheck` undefined
+    // and fall through to the fence's fail-closed default.
+    const closureCheck =
+      ticket.status === "closed" &&
+      (staleConfirmedIds.length > 0 || stalePending.length > 0 || cleanupUnsyncedIds.length > 0)
+        ? await mustReadClosureVersion(repo, ticket.id)
+        : undefined;
+    // `origin` passed only for the confirmed-ids survivor (chatgpt-codex-connector, PR #284 review,
+    // "Honor confirmation origins in the delivery resume path") — the pending marker and cleanup
+    // obligation below carry no `confirmedBoardEvidenceOrigin` of their own, so they keep falling
+    // back to the coarser `!current.reopened` check inside `survivorTrustedForClosure`.
+    const confirmedIdsTrusted = survivorTrustedForClosure(
+      staleConfirmedIds,
+      confirmedClosure,
+      ticket.status === "closed",
+      closureCheck,
+      confirmedClosure === undefined ? beads.confirmedBoardEvidenceOrigin(ticket) : undefined,
+    );
+    const pendingTrusted = survivorTrustedForClosure(
+      stalePending,
+      pendingClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    const cleanupTrusted = survivorTrustedForClosure(
+      cleanupUnsyncedIds,
+      cleanupClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    // The ids to (re)confirm are the UNION of the still-pending marker, whatever a prior cleanup
+    // obligation already carried, and whatever is already durably confirmed for THIS closure (PR
+    // #284 review, "Preserve confirmed evidence IDs during cleanup retries") — never bare
+    // `stalePending` alone. A prior halt can clear the pending marker (and write the real confirmed
+    // ids) before failing only on the confirming push or on releasing the obligation itself, so
+    // `stalePending` reads empty on exactly the resume this retry exists for. Passing it alone into
+    // `clearBoardEvidencePending` would overwrite the durable confirmation with an empty array
+    // instead of retrying it with the real ids — `setBoardEvidenceConfirmed` is not idempotent on
+    // its `ids` argument (see that function's own docstring). Each source is excluded when untrusted
+    // for THIS closure (PR #284 review, "Fence pending evidence by closure cycle") — otherwise a
+    // stale pending/cleanup-unsynced survivor from an earlier cycle would keep `idsToConfirm`
+    // non-empty and mask the very closure mismatch the re-diff below exists to catch.
+    let idsToConfirm = [
+      ...new Set([
+        ...(pendingTrusted ? stalePending : []),
+        ...(cleanupTrusted ? cleanupUnsyncedIds : []),
+        ...(confirmedIdsTrusted ? staleConfirmedIds : []),
+      ]),
+    ].toSorted();
+    // A reopened board-only ticket can still carry an OLD attribution commit from a PRIOR delivery
+    // cycle — `branchDelivery`'s scan is unbounded, so `delivery` is truthy here even though
+    // `ensureBoardBaselinePersisted` reset confirmation for THIS cycle when the ticket reopened
+    // (anton-fc5x review, "Re-diff baseline-only resumes despite an old commit"). If the only
+    // survivor is the fresh pre-dispatch baseline this new cycle wrote, an empty `idsToConfirm`
+    // here is not proof nothing changed — it just means this cycle's own evidence check never
+    // completed. Re-diffing before clearing (mirroring the no-commit recovery path below) keeps a
+    // process death right after this new attempt closes the ticket from being confirmed as
+    // delivered with zero evidence. Also forced when the closure fence just excluded a stale
+    // confirmation, pending marker, or cleanup obligation and left nothing else to trust:
+    // `reDiffPreservedBaseline` fails loud with a `PoisonEpic` when no baseline survives either,
+    // which is the right outcome here — a reopened, reclosed ticket with no fresh baseline and no
+    // valid survivor has no evidence this cycle ever checked the board, and fabricating a delivery
+    // from the stale ids would be a false success.
+    if (
+      idsToConfirm.length === 0 &&
+      (hasPreservedBaseline || !confirmedIdsTrusted || !pendingTrusted || !cleanupTrusted)
+    ) {
+      const rediffed = await reDiffPreservedBaseline(repo, ticket);
+      idsToConfirm = rediffed.ids;
+      ticket = rediffed.ticket;
+    }
+    // Recorded into the ledger BEFORE the clear, mirroring the fresh-run path below (PR #284
+    // review): these ids are exactly the confirmed evidence the reviewer's board-only section
+    // cross-checks, and `deliveredTickets` carries this ticket into `ReviewRun.tickets`
+    // regardless of this fast path — so without this, the ticket lands in the board-only run
+    // with no per-ticket evidence line, silently undercutting that cross-check.
+    if (idsToConfirm.length > 0) {
+      ledger.boardEvidence.set(ticket.id, idsToConfirm);
+    }
+    if (idsToConfirm.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
+      await clearBoardEvidencePending(repo, ticket, idsToConfirm, hasPreservedBaseline, hasCleanupUnsynced);
+    }
     if (standaloneRun) {
       // Resume after a failed PR step: this standalone ticket committed and moved to in-review
       // on a prior attempt. Step 2 above re-tagged the target stage:implementing (it can't
@@ -1168,12 +1467,272 @@ async function dispatchTicket(
     }
     return;
   }
+  // A board-only ticket already CONFIRMED delivered — `clearBoardEvidencePending` set this
+  // durable flag and cleared the pending marker/baseline that would otherwise recover it (PR
+  // #284 review, "no record that this bead's board-only delivery ever happened") — has nothing
+  // left for a regenerated agent to prove: `readBoardBaseline` on this resume takes a FRESH read
+  // that already reflects this ticket's own landed change, so an idempotent retry can only ever
+  // find a zero diff and fail with `NoDeliveryError`, undoing a delivery that already happened.
+  // Checked BEFORE `assertRerunGates`/`reopenForRegeneration` below, neither of which apply here
+  // — no agent runs, so a disabled `agent:` label or a contract gap regressed since this ticket
+  // closed is not this path's business. Only the attribution commit `step:pr` needs (this
+  // branch, unlike the one that confirmed the delivery, carries no commit ahead of base for this
+  // ticket) is missing, so write it directly instead of re-dispatching.
+  //
+  // `isBoardOnlyRun`, not a bare `beads.isBoardOnly(ticket)` (PR #284 review, "honor every
+  // confirmed board-only resume shape"): a child of a board-only run TARGET inherits the label
+  // from the target, not from itself, and would otherwise fall through here into regeneration
+  // against a fresh baseline that already contains its delivered writes. Dropping the redundant
+  // `ticket.status === "closed"` admits the other missed shape, a standalone success that stays
+  // OPEN at `stage:in-review` by design — `doneOnBoard` (via `resumeSkipped`) already accounts for
+  // both the closed and the standalone-in-review case, so re-checking `closed` here only excluded
+  // the second one.
+  // A ticket whose earlier board-evidence cleanup landed locally but never confirmed reaching the
+  // remote survives that fact independently of whether THIS machine's branch carries its
+  // attribution commit (PR #284 review, "Recover cleanup-only resumes before regeneration"):
+  // `hasBoardEvidenceCleanupUnsynced` is board state that syncs across machines, while `delivery`
+  // above only answers "is the commit on THIS branch". A resume that reaches here with the
+  // obligation still set never took the `if (delivery)` retry above — this machine has no
+  // attribution commit for this ticket at all (a fresh cross-machine worktree, or one where
+  // `concludeRunAttempt`'s best-effort final sync is the only thing that ever published the
+  // obligation) — so without finishing the retry here it falls straight through the
+  // confirmed-evidence fast path below (confirmation never landed) into full regeneration against
+  // a fresh baseline that already contains the delivered writes; an idempotent agent then finds
+  // nothing to do and fails with `NoDeliveryError`, undoing a delivery that already happened.
+  // Finished here instead, using every id this machine can recover — the obligation's own carried
+  // ids, anything still pending, and anything already durably confirmed — since the pending marker
+  // and preserved baseline that normally carry them may already be cleared. Guarded on NOT already
+  // confirmed so a ticket the fast path below already handles doesn't get retried twice.
+  //
+  // Also entered on a surviving pending marker or preserved baseline alone, not just
+  // `hasBoardEvidenceCleanupUnsynced` (chatgpt-codex-connector, PR #284 review, "Reconfirm pending
+  // evidence before regenerating the ticket"): a process dying AFTER `finishTicket` closes/transitions
+  // this ticket but BEFORE `clearBoardEvidencePending` ever runs leaves the pending marker and
+  // baseline `readBoardEvidence` wrote (and already confirmed synced, per `assertBoardOnlyDelivered`'s
+  // own gate) on the board exactly as they were — with no cleanup obligation, because the cleanup call
+  // that would have written one never started. A fresh machine then sees `doneOnBoard` true,
+  // `boardEvidenceConfirmed` false, and `hasBoardEvidenceCleanupUnsynced` false, which used to fall
+  // through both this guard and the confirmed-shortcut below into full regeneration against a fresh
+  // baseline that already contains the delivered writes — the same undone-delivery shape the
+  // obligation check above exists to prevent, just reached one call earlier.
+  if (
+    doneOnBoard &&
+    isBoardOnlyRun(run, ticket) &&
+    !beads.boardEvidenceConfirmed(ticket) &&
+    (beads.hasBoardEvidenceCleanupUnsynced(ticket) ||
+      beads.pendingBoardEvidence(ticket).length > 0 ||
+      beads.boardEvidenceBaseline(ticket) !== undefined)
+  ) {
+    const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    const cleanupUnsyncedIds = beads.cleanupUnsyncedBoardEvidenceIds(ticket);
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    // Fenced by closure cycle exactly like the `if (delivery)` fast path above's `idsToConfirm`
+    // union (PR #284 review, "Fence pending evidence by closure cycle") — this resume shape can
+    // land on the same stale pending marker or cleanup-unsynced obligation left behind by an
+    // earlier, already-superseded closure episode that a reopen-and-reclose never redispatched.
+    const cleanupClosure =
+      ticket.status === "closed" ? beads.cleanupUnsyncedBoardEvidenceClosure(ticket) : undefined;
+    const pendingClosure = ticket.status === "closed" ? beads.pendingBoardEvidenceClosure(ticket) : undefined;
+    // Triggered by ids alone (chatgpt-codex-connector, PR #284 review, "Reject unstamped survivors
+    // on closed tickets") — see the `if (delivery)` fast path's own `closureCheck` above for why an
+    // undefined stored closure must still trigger this read.
+    const closureCheck =
+      ticket.status === "closed" && (cleanupUnsyncedIds.length > 0 || stalePending.length > 0)
+        ? await mustReadClosureVersion(repo, ticket.id)
+        : undefined;
+    const cleanupTrusted = survivorTrustedForClosure(
+      cleanupUnsyncedIds,
+      cleanupClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    const pendingTrusted = survivorTrustedForClosure(
+      stalePending,
+      pendingClosure,
+      ticket.status === "closed",
+      closureCheck,
+    );
+    let recoveredIds = [
+      ...new Set([
+        ...(cleanupTrusted ? cleanupUnsyncedIds : []),
+        ...(pendingTrusted ? stalePending : []),
+        ...beads.confirmedBoardEvidenceIds(ticket),
+      ]),
+    ].toSorted();
+    // An empty `recoveredIds` here means either the ONLY reason this block was entered is the OR
+    // condition's third branch, `hasPreservedBaseline` alone (chatgpt-codex-connector, PR #284
+    // review, "Do not confirm baseline-only resumes as delivered") — the other two branches each
+    // union real ids into `recoveredIds` above, so a nonempty `stalePending` or
+    // `hasCleanupUnsynced` normally can't leave it empty — OR the closure fence just excluded a
+    // stale pending/cleanup-unsynced survivor and left nothing else to trust (PR #284 review,
+    // "Fence pending evidence by closure cycle"). That baseline is written by
+    // `lockDispatchBaseline`/`ensureBoardBaselinePersisted` BEFORE every board-only dispatch,
+    // unconditionally — its mere presence says nothing about whether the agent ever ran, let
+    // alone whether `readBoardEvidence` ever confirmed a board delta. Reaching `doneOnBoard` with
+    // only this survivor means the post-run evidence check never completed (the process died, or
+    // something else closed the ticket directly), so there is no real record of delivery to
+    // recover — accepting it here would write `boardEvidenceConfirmed: []` and record an
+    // attribution commit for a ticket nothing ever proved changed the board. Re-diff the preserved
+    // baseline against the board now, the same comparison the original evidence check would have
+    // made, before trusting this as a delivery.
+    if (recoveredIds.length === 0) {
+      const rediffed = await reDiffPreservedBaseline(repo, ticket);
+      recoveredIds = rediffed.ids;
+      ticket = rediffed.ticket;
+    }
+    await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
+    if (recoveredIds.length > 0) {
+      ledger.boardEvidence.set(ticket.id, recoveredIds);
+    }
+    if (standaloneRun) {
+      // Same cleanup as the `if (delivery)` fast path above (PR #284 review, "Clear the
+      // implementing tag on standalone confirmed resumes"): this resume also skips runTicket,
+      // the only standalone path that clears `stage:implementing`, so without this the target
+      // carries both stage labels into merge-finalize, which strips only in-review.
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
+    await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
+    onBranch.add(ticket.id);
+    if (ledger.skipCause.has(ticket.id)) {
+      ledger.skipCause = skippedDependents(timedOut, tickets, all, onBranch);
+    }
+    return;
+  }
+  // A confirmed board-only ticket can be reopened for rework and closed again by something other
+  // than THIS run — another board writer, or a process outside anton entirely — before this run
+  // ever redispatches it (chatgpt-codex-connector, anton-fc5x review, "Invalidate confirmation when
+  // the ticket is reopened"). `ensureBoardBaselinePersisted`'s own reopen-reset only clears a stale
+  // `boardEvidenceConfirmed` when THIS run actually redispatches the ticket — the one call site that
+  // can prove a new cycle started — but this fast path is precisely what skips that redispatch, so a
+  // reopen-and-reclose with no new dispatch in between leaves the OLD confirmation standing and this
+  // fast path accepts the new cycle without finding any new board delta. `currentClosureVersion`
+  // survives exactly this: it names the closure EPISODE, not just the flag, from `bd history` rather
+  // than anton's own (possibly stale) board read, so a reopen this run's read never caught still
+  // changes it. Compared only for a ticket THIS read finds closed — a standalone target parked at
+  // `stage:in-review` never closes, so it has no episode to compare and keeps trusting the flag as
+  // before. A confirmation written before this fence existed, with a closure already recorded at
+  // write time, compares that stored closure directly against the current one. A confirmation
+  // written while the ticket was still open — so it stamped no closure of its own — is not waved
+  // through unconditionally either (chatgpt-codex-connector, PR #284 review, "Validate the origin of
+  // unfenced confirmations"): see {@link originMatchesPriorClosure}, which fences it against its own
+  // stored `confirmedBoardEvidenceOrigin` instead. A genuine mismatch on either check is treated as
+  // "not confirmed for this cycle" — this whole block is skipped, and the ticket falls through to the
+  // regeneration path below, which redispatches it and lets `ensureBoardBaselinePersisted` clear the
+  // stale confirmation as it establishes the new cycle's own baseline. An unreadable history halts
+  // the run instead of feeding that regeneration path in EITHER branch, the same way and for the
+  // same reason: the `confirmedClosure !== undefined` branch below throws directly, and
+  // {@link originMatchesPriorClosure} throws the same `PoisonEpic` for its own read (including one
+  // that comes back empty for a ticket already known closed).
+  const confirmedClosure =
+    doneOnBoard && ticket.status === "closed" ? beads.confirmedBoardEvidenceClosure(ticket) : undefined;
+  let confirmedForThisCycle =
+    doneOnBoard && isBoardOnlyRun(run, ticket) && beads.boardEvidenceConfirmed(ticket);
+  if (confirmedForThisCycle && ticket.status === "closed") {
+    if (confirmedClosure === undefined) {
+      confirmedForThisCycle = await originMatchesPriorClosure(repo, ticket);
+    } else {
+      // Retried via `mustReadClosureVersion`, not a bare `readCurrentClosureVersion(...)
+      // .catch(() => undefined)` (chatgpt-codex-connector, PR #284 review, "Retry closure reads
+      // before reopening confirmed work"): the bare read folded "bd history refused every attempt"
+      // into the same `undefined` a genuine closure mismatch produces, so a single transient
+      // history hiccup made this durably-confirmed, already-delivered ticket read as
+      // reopened-and-reclosed. The caller then reopened it for regeneration and ran it against a
+      // fresh baseline that already contains its delivered board writes — an idempotent agent finds
+      // no delta and fails with `NoDeliveryError`, turning a real delivery into a false one. An
+      // exhausted read halts the run instead of silently treating "unreadable" as "mismatched".
+      const read = await mustReadClosureVersion(repo, ticket.id);
+      // `read.closure === undefined` is folded into the same halt as an unreadable history
+      // (chatgpt-codex-connector, PR #284 review, "Reject empty closure histories in the stamped
+      // path"), mirroring `originMatchesPriorClosure`'s identical guard just above: `bd history`
+      // can succeed with no closure episode at all for a ticket a board import/reconstruction
+      // stripped its prior history from, even though `ticket.status === "closed"` here proves a
+      // closure exists. Comparing `confirmedClosure` (always defined in this branch) against that
+      // empty `undefined` would read as a mismatch, reopening and regenerating an already-delivered
+      // ticket against a baseline that already contains its writes — the same false no-delivery
+      // failure the unreadable-history case already refuses.
+      if (!read.read || read.closure === undefined) {
+        throw new PoisonEpic(
+          `${ticket.id} is confirmed delivered (board-only) against closure \`${confirmedClosure}\`, ` +
+            `but \`bd history\` could not be read (after retries), or came back without a closure for ` +
+            `a ticket that is closed, so it cannot be checked against the ticket's current closure. ` +
+            `Treating an unreadable or empty closure as a mismatch would reopen and regenerate an ` +
+            `already-delivered ticket against a baseline that already contains its writes, turning a ` +
+            `real delivery into a false no-delivery failure. Check the beads DB, then resume the run ` +
+            `once the history read is healthy.`,
+        );
+      }
+      confirmedForThisCycle = confirmedClosure === read.closure;
+    }
+  }
+  if (confirmedForThisCycle) {
+    // The pending marker and preserved baseline that would normally carry these ids are the very
+    // things `clearBoardEvidencePending` cleared when it set the confirmed flag — `bd.ts` persists
+    // them alongside it for exactly this resume (PR #284 review, "track which beads a
+    // durably-confirmed board-only delivery touched"), so the reviewer's per-ticket evidence
+    // section still names them instead of falling back to a generic "some board write happened"
+    // note for a ticket whose evidence genuinely was confirmed.
+    const confirmedIds = beads.confirmedBoardEvidenceIds(ticket);
+    // `boardEvidenceConfirmed` is not proof the marker/baseline clear it's normally paired with
+    // ever landed (chatgpt-codex-connector, PR #284 review, "Finish surviving cleanup before
+    // accepting confirmation"): `clearBoardEvidencePending` can persist the confirmed flag and
+    // still fail one of its PRECEDING clears, and a later best-effort sync can publish that
+    // partial state on its own. A fresh-machine resume with no attribution commit of its own must
+    // finish that survivor cleanup before trusting `confirmed` as fully settled — otherwise a
+    // stale preserved baseline anchors a future, unrelated reopen of this ticket to a board
+    // snapshot from before this delivery, or a stale pending marker is read as current evidence
+    // for a ticket that got no new work.
+    //
+    // `hasBoardEvidenceCleanupUnsynced` is checked here too, not left to the block above (chatgpt-
+    // codex-connector, PR #284 review, "Clear obligations on confirmed cross-machine resumes"): the
+    // block above requires `!boardEvidenceConfirmed`, so a failed cleanup push that wrote BOTH
+    // `boardEvidenceConfirmed` and the obligation locally — then had a later best-effort sync
+    // publish both together — reaches a fresh machine with `confirmed` already true, which skips
+    // that block entirely. Left uncleared here, the obligation survives indefinitely on an
+    // already-fully-settled ticket and can later be unioned into a REOPENED delivery's evidence ids
+    // (the `if (delivery)` resume-retry above reads `cleanupUnsyncedBoardEvidenceIds`
+    // unconditionally), misattributing this stale evidence to a future, unrelated delivery.
+    const stalePending = beads.pendingBoardEvidence(ticket);
+    const hasPreservedBaseline = beads.boardEvidenceBaseline(ticket) !== undefined;
+    const hasCleanupUnsynced = beads.hasBoardEvidenceCleanupUnsynced(ticket);
+    if (stalePending.length > 0 || hasPreservedBaseline || hasCleanupUnsynced) {
+      const recoveredIds = [
+        ...new Set([...stalePending, ...confirmedIds, ...beads.cleanupUnsyncedBoardEvidenceIds(ticket)]),
+      ].toSorted();
+      await clearBoardEvidencePending(repo, ticket, recoveredIds, hasPreservedBaseline, hasCleanupUnsynced);
+      if (recoveredIds.length > 0) {
+        ledger.boardEvidence.set(ticket.id, recoveredIds);
+      }
+    } else if (confirmedIds.length > 0) {
+      ledger.boardEvidence.set(ticket.id, confirmedIds);
+    }
+    if (standaloneRun) {
+      // Same cleanup as the `if (delivery)` fast path above (PR #284 review, "Clear the
+      // implementing tag on standalone confirmed resumes"): this resume also skips runTicket,
+      // the only standalone path that clears `stage:implementing`, so without this the target
+      // carries both stage labels into merge-finalize, which strips only in-review.
+      await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
+    }
+    await recordBoardOnlyAttribution({ ...runStep, tickets: [ticket] });
+    onBranch.add(ticket.id);
+    if (ledger.skipCause.has(ticket.id)) {
+      ledger.skipCause = skippedDependents(timedOut, tickets, all, onBranch);
+    }
+    return;
+  }
   // A ticket whose prerequisite ran out of time is SKIPPED, not dispatched (anton-67xj). The
   // rollback took the mechanism it was written against off the branch, so its agent can only
   // report the absence and exit with a zero diff — which the no-delivery gate then reads as a
-  // failed run, poisoning the tickets that DID deliver. Checked after the done-on-board skip
-  // above (work already on this branch is delivered, whatever timed out later) and before the
-  // re-gates below, which must not park a run over a ticket that is no longer going to run.
+  // failed run, poisoning the tickets that DID deliver. Checked AFTER the two board-only fast
+  // paths above, not before them (PR #284 review, "board-only confirmed dependent wrongly
+  // skipped by an unrelated timeout"): `skipCause` is a graph verdict recomputed from `onBranch`
+  // as each timeout lands, and a board-only ticket already closed with `boardEvidenceConfirmed`
+  // (or a pending cleanup obligation) from an EARLIER attempt has not yet been added to
+  // `onBranch` — that only happens when this loop actually reaches it — so an unrelated ticket's
+  // timeout could cascade onto it here and have `recordSkipped` reopen an already-durably-
+  // delivered ticket and tag it `not-delivered`, even though its board-only delivery has nothing
+  // to do with the timed-out ticket's rolled-back mechanism. Checked before the re-gates below,
+  // which must not park a run over a ticket that is no longer going to run.
   const skipping = ledger.skipCause.get(ticket.id);
   if (skipping) {
     await recordSkipped(ticket, skipping, doneOnBoard);
@@ -1211,6 +1770,9 @@ async function dispatchTicket(
     // standalone target is never closed here, and a bd that refused the close left the bead open.
     if (settlement.how === "satisfied") {
       ledger.satisfied.set(ticket.id, { ...settlement.by, closed: settlement.closed });
+    }
+    if (settlement.boardEvidenceIds?.length) {
+      ledger.boardEvidence.set(ticket.id, settlement.boardEvidenceIds);
     }
   } catch (e) {
     // A ticket anton RETIRED as already shipped is absorbed too (anton-5bpd). The repair verified
