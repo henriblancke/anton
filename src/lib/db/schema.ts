@@ -110,6 +110,30 @@ export const runs = sqliteTable("runs", {
   // Read back only while baseRefreshOutcome = pending (see findRunBaseRefreshShaForBranch); inert and
   // never cleared once a real outcome resettles the row, since nothing reads it in that state.
   priorBaseRefreshSha: text("prior_base_refresh_sha"),
+  // What warming (worktree.ts) did to this run's checkout before the agent was dispatched
+  // (anton-de17i) — ok | failed | skipped | disabled:
+  //   ok       — the install ran and exited 0; the tree is warm.
+  //   failed   — the install ran and did not exit 0 (non-zero, timeout, or an operator's abort).
+  //              `warmCommand` carries its label and `warmError` the tail of what it said.
+  //   skipped  — warming was attempted and had nothing to run: no recognized lockfile, a completed
+  //              install already newer than the lockfile (a resume reusing its worktree), or no
+  //              package manager on the search path.
+  //   disabled — warming was turned off, so nothing was even looked for.
+  // Until this existed the outcome reached only a console.warn the job runner doesn't persist, so a
+  // warm that failed on a missing devDependency surfaced minutes later as a git push error naming an
+  // unrelated subsystem. Null is "never attempted" — rows written before this column existed, and
+  // callers that don't warm at all (review-fix's PR branches) — which is deliberately NOT `skipped`:
+  // a warm that ran and found nothing to do must stay distinguishable from one that never ran. Not
+  // backfilled.
+  warmOutcome: text("warm_outcome"),
+  // The command warming actually ran, as its log label (`bun install`, or an operator's pinned
+  // string) — the half of a failure report that says WHAT failed, which the outcome alone cannot.
+  // Null whenever no command ran: every outcome but `ok` and `failed`.
+  warmCommand: text("warm_command"),
+  // The tail of what a failed install said — stderr when it wrote any, else the spawn error.
+  // Bounded at the source (warmWorktree already slices to the last 2000 chars) so a runaway
+  // installer cannot grow a run row without limit. Null unless `warmOutcome` is `failed`.
+  warmError: text("warm_error"),
   // queued | running | parked | done | failed
   status: text("status").notNull().default("queued"),
   // The self-review score THIS attempt earned (anton-cekf), 0-10, null until its review gate reports

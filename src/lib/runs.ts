@@ -13,13 +13,14 @@ import {
   type RunDetail,
   type RunStatus,
   type RunSummary,
+  type RunWarmOutcome,
 } from "@/components/runs/run-view-utils";
 
 /**
  * The run vocabulary is declared once, in the client-safe module, and imported here — never the
  * reverse (anton-f3qj). Re-exported so server callers keep asking `@/lib/runs` for it.
  */
-export type { RunDetail, RunStatus, RunSummary };
+export type { RunDetail, RunStatus, RunSummary, RunWarmOutcome };
 
 export type RunRow = typeof schema.runs.$inferSelect;
 
@@ -112,8 +113,28 @@ function toDetail(row: typeof schema.runs.$inferSelect): RunDetail {
     reviewScore: row.reviewScore ?? undefined,
     formula: row.formula ?? undefined,
     formulaVariant: row.formulaVariant ?? undefined,
+    ...toWarm(row),
   };
 }
+
+/**
+ * The warm columns as the detail view reads them (anton-rqwy8). The column is free text, so an
+ * outcome this build doesn't know is dropped rather than narrowed by assertion — a stored value
+ * from a newer writer must not make the view render a word it has no rule for. Null stays absent:
+ * "never attempted" is not an outcome.
+ */
+function toWarm(row: typeof schema.runs.$inferSelect): Pick<RunDetail, "warmOutcome" | "warmCommand" | "warmError"> {
+  const outcome = RUN_WARM_OUTCOMES.find((o) => o === row.warmOutcome);
+  if (!outcome) return {};
+  return {
+    warmOutcome: outcome,
+    warmCommand: row.warmCommand ?? undefined,
+    warmError: row.warmError ?? undefined,
+  };
+}
+
+/** The outcome vocabulary `warmOutcome` is validated against on read — see the column's own note. */
+const RUN_WARM_OUTCOMES: readonly RunWarmOutcome[] = ["ok", "failed", "skipped", "disabled"];
 
 export async function getRunDetail(
   projectId: string,
@@ -222,6 +243,15 @@ export type RunPatch = Partial<{
   pendingRefreshKind: string | null;
   /** This row's own last effective refresh boundary, snapshotted before it goes pending (anton-s55u) — see schema. */
   priorBaseRefreshSha: string | null;
+  /**
+   * What warming did to this run's checkout, and — on a failure — which command failed and the tail
+   * of what it said (anton-jyrhf). Written once, right after warming returns, so the cause is
+   * queryable at the moment it occurs rather than inferred from a later symptom. See the columns'
+   * own notes for the vocabulary; nulls are meaningful (never attempted) and are never backfilled.
+   */
+  warmOutcome: string | null;
+  warmCommand: string | null;
+  warmError: string | null;
   attempts: number;
   error: string | null;
   /** Anton's own account of why the run stopped, held apart from `error` above (anton-4kvp) — see schema. */

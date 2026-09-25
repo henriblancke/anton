@@ -552,7 +552,18 @@ export async function warmRunWorktree(
   // The project's own warm setting rides along (anton-z5li2): this is the one call site a real run
   // reaches, so it is what makes a pinned command — or a project that turned warming off — take
   // effect instead of the machine-wide env var and lockfile detection alone.
-  await warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings));
+  const warmOutcome = await warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings));
+  // Persisted at the moment warming finishes, not at the symptom (anton-jyrhf): a failed warm used
+  // to reach only a console the job runner doesn't keep, and surfaced minutes later as an error
+  // naming an unrelated subsystem. Best-effort in both directions — warming already refused to fail
+  // the run, and recording what it did must not be the thing that does.
+  await safe(() =>
+    updateRun(db, clock, runId, {
+      warmOutcome: warmOutcome.outcome,
+      warmCommand: warmOutcome.command ?? null,
+      warmError: warmOutcome.error ?? null,
+    }),
+  );
   await ctx.heartbeat();
 
   // What an `already-shipped` claim is checked against (PR #279 review). `baseForkSha` above is

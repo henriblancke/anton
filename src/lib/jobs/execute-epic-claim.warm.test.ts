@@ -156,8 +156,12 @@ it("leaves a project with no warm settings on the env/lockfile rungs", async () 
 // process killed mid-warm can never leave a mutated branch with no record of what it was moved onto.
 it("warms only after the refresh boundary is persisted", async () => {
   const warmedAtPersist: boolean[] = [];
+  const warmedAtOutcome: boolean[] = [];
   updateRunMock.mockImplementation(async (...a: unknown[]) => {
-    warmedAtPersist.push(existsSync(marker));
+    // The warm's own outcome (anton-jyrhf) is necessarily written after it; every other persist is
+    // part of the boundary the warm must wait for.
+    const patch = a[3] as { warmOutcome?: unknown } | undefined;
+    (patch && "warmOutcome" in patch ? warmedAtOutcome : warmedAtPersist).push(existsSync(marker));
     return (actualRuns.updateRun as (...args: unknown[]) => Promise<unknown>)(...a);
   });
 
@@ -165,6 +169,7 @@ it("warms only after the refresh boundary is persisted", async () => {
 
   expect(warmedAtPersist.length).toBeGreaterThan(0);
   expect(warmedAtPersist).not.toContain(true);
+  expect(warmedAtOutcome).toEqual([true]);
   expect(existsSync(marker)).toBe(true);
 });
 
