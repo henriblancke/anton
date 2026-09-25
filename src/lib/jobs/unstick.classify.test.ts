@@ -78,6 +78,7 @@ function parkedRun(o: Partial<RunRow> = {}): RunRow {
     leaseExpiresAt: null,
     error: "usage-limit",
     structuralError: null,
+    lastGateFailure: null,
     startedAt: new Date(NOW - 4 * HOUR),
     attemptStartedAt: new Date(NOW - 4 * HOUR),
     endedAt: null,

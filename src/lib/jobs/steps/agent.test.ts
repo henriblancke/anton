@@ -3,12 +3,17 @@
  * where `step:claude` gets its reasoning from.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { InvocationDimensions } from "../../claude-invocations";
 import { beads, type Bead } from "../../beads/bd";
-import { RunAlreadyLiveError } from "../errors";
+import { schema } from "../../db";
+import { updateRun } from "../../runs";
+import { RunAlreadyLiveError, VerifyGateFailedError } from "../errors";
+import { encodeGateFailure } from "../gate-failure-record";
 
 /**
  * Capture what reaches the spend ledger's metered boundary. Wrapping rather than stubbing: the
@@ -35,7 +40,7 @@ vi.mock("../../claude-invocations", async () => {
 });
 
 const { claudeStep, implementStep, readForDispatch } = await import("./agent");
-const { closeSandbox, fakeClaude, openSandbox, target } = await import("./step.fixture");
+const { BRANCH, closeSandbox, clock, fakeClaude, openSandbox, target } = await import("./step.fixture");
 
 let sandbox: Awaited<ReturnType<typeof openSandbox>>;
 
@@ -124,6 +129,126 @@ describe("step:implement", () => {
       ),
     ).rejects.toThrow(/lease lapsed/);
     expect(claude.calls).toHaveLength(0);
+  });
+});
+
+// Records a red verify gate against the sandbox's run row, the same way `gateFailurePatch`
+// (execute-epic-settle.ts) does, so `implementStep`'s branch-scoped read has something to find —
+// this row is the only one on the sandbox's branch, so it stands in for whichever attempt (this run
+// or an earlier, now-`failed` one on the same branch) actually recorded it.
+async function recordGateFailure(beadId: string, overrides: Partial<{ label: string; command: string; output: string }> = {}): Promise<void> {
+  const label = overrides.label ?? "tests";
+  const command = overrides.command ?? "bun run test";
+  const e = new VerifyGateFailedError(
+    `${label} gate failed for ${beadId} (exit 1)`,
+    { label, command, ok: false, code: 1, output: overrides.output ?? "FAIL something" },
+    { beadId },
+  );
+  await updateRun(sandbox.tdb.db, clock, sandbox.runId, {
+    lastGateFailure: encodeGateFailure(e, { beadId }) ?? null,
+  });
+}
+
+describe("step:implement — the recorded gate failure (anton-pm3kv)", () => {
+  // The whole point of the gate this feeds: a first attempt has no row to read, so its prompt must
+  // read exactly as it did before this wiring existed.
+  it("dispatches without the block when the run has no recorded gate failure", async () => {
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+
+    await implementStep(sandbox.context({ tickets: [ticket("anton-a")], deps: { runClaude: claude.run } }));
+
+    expect(claude.calls[0].prompt).not.toContain("A gate failed on a previous attempt");
+  });
+
+  // A gate failure always settles its row `failed`, so the attempt that recorded one is never THIS
+  // run's own row on a real retry — the branch-scoped read is what reaches across that boundary,
+  // and this is the read half of anton-vynb8 that actually reaches the agent.
+  it("names the failing gate when a previous attempt on this branch recorded one", async () => {
+    await recordGateFailure("anton-a", { label: "typecheck", command: "bun run typecheck" });
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+
+    await implementStep(sandbox.context({ tickets: [ticket("anton-a")], deps: { runClaude: claude.run } }));
+
+    expect(claude.calls[0].prompt).toContain("A gate failed on a previous attempt");
+    expect(claude.calls[0].prompt).toContain("**typecheck** gate failed");
+    expect(claude.calls[0].prompt).toContain("`bun run typecheck`");
+  });
+
+  // The real shape a retry hits: a PRIOR row on this branch settled `failed` with the gate recorded
+  // (findOpenRunForEpic never resumes it), and the current attempt is a wholly separate, fresh row —
+  // no `lastGateFailure` of its own. Proves the branch-scoped read actually reaches across that row
+  // boundary, not just within one row (anton-q0lpo finding: a runId-scoped read never could).
+  it("names the failing gate a DIFFERENT, now-failed row on this branch recorded", async () => {
+    const priorRunId = randomUUID();
+    const e = new VerifyGateFailedError(
+      "lint gate failed for anton-a (exit 1)",
+      { label: "lint", command: "bun run lint", ok: false, code: 1, output: "FAIL lint" },
+      { beadId: "anton-a" },
+    );
+    await sandbox.tdb.db.insert(schema.runs).values({
+      id: priorRunId,
+      projectId: sandbox.projectId,
+      epicBeadId: target.id,
+      branch: BRANCH,
+      status: "failed",
+      lastGateFailure: encodeGateFailure(e, { beadId: "anton-a" }),
+    });
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+
+    await implementStep(sandbox.context({ tickets: [ticket("anton-a")], deps: { runClaude: claude.run } }));
+
+    expect(claude.calls[0].prompt).toContain("A gate failed on a previous attempt");
+    expect(claude.calls[0].prompt).toContain("**lint** gate failed");
+  });
+
+  // The record names the bead its gate ran under; a run-phase gate names the run target, and a
+  // sibling ticket in this walk must not be told about a failure that was never its own.
+  it("shows the block only to the ticket the recorded failure names", async () => {
+    await recordGateFailure("anton-a");
+    const claude = fakeClaude("ANTON-RESULT: delivered", "ANTON-RESULT: delivered");
+
+    await implementStep(
+      sandbox.context({
+        tickets: [ticket("anton-a"), ticket("anton-b")],
+        deps: { runClaude: claude.run },
+      }),
+    );
+
+    expect(claude.calls[0].prompt).toContain("A gate failed on a previous attempt");
+    expect(claude.calls[1].prompt).not.toContain("A gate failed on a previous attempt");
+  });
+
+  // Read fresh at dispatch, not cached across the call: a multi-ticket walk where an earlier
+  // ticket's own `step:verify` clears the row (a pass) must not still show the failure to a later
+  // ticket dispatched within the same run.
+  it("stops naming the failure once the row it reads has been cleared", async () => {
+    await recordGateFailure("anton-a");
+    await updateRun(sandbox.tdb.db, clock, sandbox.runId, { lastGateFailure: null });
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+
+    await implementStep(sandbox.context({ tickets: [ticket("anton-a")], deps: { runClaude: claude.run } }));
+
+    expect(claude.calls[0].prompt).not.toContain("A gate failed on a previous attempt");
+  });
+
+  // A resumed ticket can carry both an earlier attempt's preserved commit AND a recorded gate
+  // failure at once. ticketPrompt already orders the two (anton-ahsja); this proves implementStep
+  // actually resolves and hands it both rather than just one.
+  it("hands a ticket both the recorded-failure and continuation blocks, failure first", async () => {
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: sandbox.dir, stdio: "ignore" });
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "anton@example.com");
+    git("config", "user.name", "anton");
+    git("commit", "-q", "--allow-empty", "-m", "WIP anton-a: partial work, stopped at its budget");
+    await recordGateFailure("anton-a");
+    const claude = fakeClaude("ANTON-RESULT: delivered");
+
+    await implementStep(sandbox.context({ tickets: [ticket("anton-a")], deps: { runClaude: claude.run } }));
+
+    const prompt = claude.calls[0].prompt;
+    expect(prompt).toContain("A gate failed on a previous attempt");
+    expect(prompt).toContain("CONTINUATION");
+    expect(prompt.indexOf("A gate failed on a previous attempt")).toBeLessThan(prompt.indexOf("CONTINUATION"));
   });
 });
 

@@ -305,6 +305,9 @@ async function finishRun(
     error:
       [timeoutNotice, retiredNotice, skippedNotice, staleBodyFallback].filter(Boolean).join(" — ") ||
       null,
+    // The run finished, so nothing about a gate a past attempt left red still describes this tree
+    // (anton-vynb8). Cleared so the record cannot outlive the run that earned it.
+    lastGateFailure: null,
   });
   if (retirement && !(await verifiedStandaloneRetirementStillHeld(repo, epicBeadId, retirement))) {
     throw new PoisonEpic(

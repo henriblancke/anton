@@ -295,7 +295,14 @@ export async function settleCompletedRun(
           status: "done",
         });
       });
-      await updateRun(db, clock, runId, { status: "done", endedAt: clock.now(), error: null });
+      // `lastGateFailure` cleared with the rest: a finished run leaves no gate for a next attempt
+      // to inherit (anton-vynb8).
+      await updateRun(db, clock, runId, {
+        status: "done",
+        endedAt: clock.now(),
+        error: null,
+        lastGateFailure: null,
+      });
       return true;
     }
     // Closed-without-merging ref → stale. Fall through to recover the epic: the foreign-lease gate
@@ -408,6 +415,9 @@ async function settleRetiredStandalone(run: EpicRun, leaseTarget: Bead): Promise
     // No PR was ever opened for this target — `finishRun`'s own `targetRetired` twin, recovered
     // here after a crash (PR #320 review). See the column's own note.
     delivered: false,
+    // The run finished, so nothing about a gate a past attempt left red still describes this tree
+    // (anton-vynb8). Cleared so the record cannot outlive the run that earned it.
+    lastGateFailure: null,
     error:
       `${targetId} had already shipped — anton verified that against the repository and the board ` +
       `and retired it as superseded by ${retirement.survivor}. Nothing was committed here, so this ` +

@@ -153,6 +153,16 @@ export const runs = sqliteTable("runs", {
   // column existed, or whose failure never carried a `RunFailureParts` split — `runFailureParts`
   // degrades those to their whole message, so nothing here is a gap the reader must special-case.
   structuralError: text("structural_error"),
+  // The last verify gate that came back RED on this run (anton-vynb8), as JSON: the gate's label,
+  // command, exit code, tailed output, and the bead/step it failed under. `error` cannot serve this
+  // — it is one sentence, it renders to operators, and the resume that reopens a parked row CLEARS
+  // it along with `reviewScore` and `attemptStartedAt` so the new attempt is judged on its own. A
+  // gate failure is the one thing the next attempt genuinely needs to INHERIT: a retry is a fresh
+  // walk over this same row, so the row is the only place it can survive. Deliberately outside that
+  // clear, and cleared instead by the two events that make it stale — the gate going green, and the
+  // run settling done. NULL means "no recorded failure", which is also the first-attempt behaviour;
+  // rows written before this column existed are not backfilled and read the same way.
+  lastGateFailure: text("last_gate_failure"),
   startedAt: ts("started_at"),
   // When the CURRENT attempt on this row began (anton-tebf) — equal to `started_at` on a fresh run,
   // rewritten every time a resume picks a parked row back up. A row is not one attempt: a parked run

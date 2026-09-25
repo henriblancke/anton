@@ -1,0 +1,17 @@
+-- Record the last verify gate that came back RED on a run (anton-vynb8), as JSON: label, command,
+-- exit code, tailed output, and the bead/step it failed under.
+--
+-- `runs.error` cannot carry this. It is one operator-facing sentence, and the resume that reopens a
+-- parked row CLEARS it (along with `review_score` and `attempt_started_at`) so the new attempt is
+-- judged on its own — which is exactly what makes a separate column necessary: a retry is a fresh
+-- walk over this same row, so the row is the only place a gate failure can survive to the next
+-- attempt. This column sits outside that clear and is instead cleared by the two events that make it
+-- stale: the gate going green, and the run settling done.
+--
+-- Nullable and NOT backfilled on purpose: NULL means "no recorded failure", which is also the
+-- first-attempt behaviour, so a pre-column row and a fresh run read the same way and nothing has to
+-- invent a failure it cannot know about.
+--
+-- Reverse:
+--   ALTER TABLE `runs` DROP COLUMN `last_gate_failure`;
+ALTER TABLE `runs` ADD `last_gate_failure` text;
