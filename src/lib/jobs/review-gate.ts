@@ -21,6 +21,7 @@ import { quotaMeterKey } from "../quota-meter";
 import {
   commitAll,
   diffAgainstBase,
+  git,
   gitCommonDir,
   readWorktreeState,
   resolveMergeBase,
@@ -116,6 +117,12 @@ export interface ReviewGateResult {
   score?: number;
   /** Set with the `score-regression` outcome: the low scores that tripped the alarm (anton-i98r). */
   regression?: ScoreRegression;
+  /**
+   * Set on a `clean` exit whose diff cleared the operator's churn threshold (anton-z8uv) — how a
+   * founder tells a large-diff run apart from an ordinary clean exit, and how many rounds the floor
+   * demanded of it.
+   */
+  churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
 }
 
 /**
@@ -140,6 +147,8 @@ export interface ReviewGateDeps {
   gitCommonDir?: (worktreePath: string) => Promise<string>;
   /** Hash the tree a commit would write — the fix session's proof across its own commit hooks. */
   hashTree?: (worktreePath: string) => Promise<string>;
+  /** Total changed lines from `baseRev` to HEAD — the large-diff round floor's measure (anton-z8uv). */
+  churn?: (worktreePath: string, baseRev: string) => Promise<number>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -296,6 +305,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const readState = args.deps?.readState ?? readWorktreeState;
   const restoreState = args.deps?.restoreState ?? restoreWorktreeState;
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
+  const churn = args.deps?.churn ?? diffChurnLines;
 
   // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
   // between rounds, and an unsandboxable host must fail the gate outright rather than after a review
@@ -311,6 +321,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // contract, the principles, the instruction files — come from a newer tip, so a base commit that
   // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
   const baseRev = await mergeBase(worktreePath, baseBranch);
+
+  // The large-diff round floor's measure (anton-ecdl / anton-z8uv), taken once against the pinned
+  // fork point: the RUN's own diff, not whatever size the gate's own fix commits grow it to as
+  // rounds proceed. Skipped when the operator turned the floor off, so a project that never enables
+  // it pays no extra git call — the same "no added cost on small diffs" the floor itself promises.
+  const churnLines = config.churnRoundFloor ? await churn(worktreePath, baseRev) : undefined;
 
   // Resolved once, up front, to stamp the REVIEW meter with who actually reviews (PR #313 review),
   // and handed to every round's `buildReviewPrompt` below instead of letting it re-resolve: `config`
@@ -447,7 +463,44 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     }
 
     if (blocking.length === 0) {
-      return { outcome: "clean", baseRev, rounds, unresolved, reviewer, score: review.report.score };
+      // Above the operator's threshold, {@link DEFAULT_REVIEW_CHURN_ROUND_FLOOR}'s whole point:
+      // PR #238 (+13,507/-273) exited clean on round 1 and then took 73 P1 findings from external
+      // review — a single fresh-context look is not enough scrutiny for a diff this size. Never
+      // consulted below the threshold, so a small diff's clean round 1 is byte-identical to before
+      // this floor existed.
+      const churnExceeded =
+        config.churnRoundFloor !== undefined &&
+        churnLines !== undefined &&
+        churnLines >= config.churnRoundFloor.thresholdLines;
+      const churnFloorApplied = churnExceeded
+        ? {
+            churnLines: churnLines!,
+            thresholdLines: config.churnRoundFloor!.thresholdLines,
+            minRounds: config.churnRoundFloor!.minRounds,
+          }
+        : undefined;
+      // The floor demands more rounds only while both hold: it hasn't cleared its minimum yet, AND
+      // another round still fits under the operator's cap — the floor raises the bar, it never
+      // pushes the loop past `maxRounds` (anton-z8uv).
+      const floorPending =
+        churnExceeded && round < config.churnRoundFloor!.minRounds && round < config.maxRounds;
+      if (!floorPending) {
+        return {
+          outcome: "clean",
+          baseRev,
+          rounds,
+          unresolved,
+          reviewer,
+          score: review.report.score,
+          ...(churnFloorApplied ? { churnFloorApplied } : {}),
+        };
+      }
+      // No fix to dispatch — nothing was reported blocking — so the next iteration runs a REAL
+      // review round (a fresh claude session over the diff as it stands) rather than re-parsing
+      // this round's report. Advisories still carry forward exactly as they would ahead of a fix.
+      carried = findings.filter((f) => f.severity === "advisory");
+      previousBlocking = blocking;
+      continue;
     }
     if (round === config.maxRounds) {
       return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: review.report.score };
@@ -912,6 +965,22 @@ async function discardSessionWrites(args: {
           `read (${String(readError)}) — the worktree was reset to ${before.head.slice(0, 12)} regardless, so the ` +
           `next attempt cannot inherit anything it may have written\n`,
   ).catch(() => {});
+}
+
+/**
+ * Total changed lines (insertions + deletions) from `baseRev` to HEAD — the large-diff round
+ * floor's measure (anton-z8uv).
+ *
+ * A `git diff --shortstat`, not the review patch {@link runReviewSession} reads: that patch is cut
+ * at {@link DEFAULT_DIFF_PATCH_CHARS}, and the runs the floor exists to catch — PR #238's
+ * +13,507/-273 — are exactly the ones that cut hides most of. `--shortstat` costs one cheap git call
+ * and reports the true total regardless of patch size.
+ */
+async function diffChurnLines(worktreePath: string, baseRev: string): Promise<number> {
+  const stdout = await git(worktreePath, ["diff", "--shortstat", baseRev, "HEAD"]);
+  const insertions = Number(/(\d+) insertion/.exec(stdout)?.[1] ?? 0);
+  const deletions = Number(/(\d+) deletion/.exec(stdout)?.[1] ?? 0);
+  return insertions + deletions;
 }
 
 /**
