@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7da7e4b8-c293-4fa8-894d-aaa5558542a0",
-  "prevId": "6e40261d-f3b8-4200-8333-328e8766bff5",
+  "id": "96e25576-7c1f-4639-b592-f01478b4d6e1",
+  "prevId": "7da7e4b8-c293-4fa8-894d-aaa5558542a0",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -1692,6 +1692,27 @@
         },
         "prior_base_refresh_sha": {
           "name": "prior_base_refresh_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "warm_outcome": {
+          "name": "warm_outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "warm_command": {
+          "name": "warm_command",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "warm_error": {
+          "name": "warm_error",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

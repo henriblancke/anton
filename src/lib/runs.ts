@@ -5,6 +5,7 @@
 import { and, count, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
+import { recordAttemptEnd, recordAttemptStart, type AttemptOutcome } from "./run-attempts";
 import type { AntonDb, Clock } from "./jobs/queue";
 import {
   ACTIVE_RUN_STATUSES,
@@ -201,6 +202,14 @@ export async function createRun(db: AntonDb, clock: Clock, input: CreateRunInput
     updatedAt: secDate(nowMs),
     writeSeq: nextWriteSeq(),
   });
+  // The run's FIRST attempt (anton-rnrdr) — the per-attempt record opens here rather than at each
+  // caller, for the reason the spend ledger meters at the driver: a per-site call is one a new write
+  // path forgets. Best-effort, and after the row it describes: a lost interval must never cost a run.
+  await recordAttemptStart(db, clock, {
+    runId: input.id,
+    projectId: input.projectId,
+    startedAtMs: nowMs,
+  });
   return input.id;
 }
 
@@ -279,6 +288,37 @@ export async function updateRun(
     else set[k] = v;
   }
   await db.update(schema.runs).set(set).where(eq(schema.runs.id, id));
+  await recordAttemptTransition(db, clock, id, patch);
+}
+
+/**
+ * Keep the per-attempt record in step with a run patch (anton-rnrdr) — the attempt this patch settles,
+ * or the one a resume begins.
+ *
+ * Hooked into {@link updateRun} rather than into each settle path, for the reason the spend ledger is
+ * a driver wrapper: every terminal write already goes through here, and a per-site call is one the
+ * next settle path forgets. Both writes are best-effort and neither can fail this patch.
+ *
+ * A resume is recognised by `attemptStartedAt`, which is the ONE thing only a resume writes
+ * (`startEpicRun`) — so the new row opens exactly where the previous attempt's start would otherwise
+ * be overwritten and lost. The ordering matters: the settle is recorded before the start, so a patch
+ * that somehow did both closes the old attempt rather than the new one.
+ */
+async function recordAttemptTransition(
+  db: AntonDb,
+  clock: Clock,
+  runId: string,
+  patch: RunPatch,
+): Promise<void> {
+  if (patch.status && patch.status !== "queued" && patch.status !== "running") {
+    // `patch.endedAt` where the settle recorded one, else now: a PARK writes no `endedAt` on the run
+    // row — it must stay open for the resume to continue in — so the attempt's own end is the park
+    // instant, and the attempt record is the only place that interval is kept at all.
+    await recordAttemptEnd(db, clock, runId, patch.status satisfies AttemptOutcome, patch.endedAt);
+  }
+  if (patch.attemptStartedAt !== undefined) {
+    await recordAttemptStart(db, clock, { runId, startedAtMs: patch.attemptStartedAt });
+  }
 }
 
 /**
@@ -635,6 +675,10 @@ export async function settleParkedRun(
       ),
     )
     .returning({ id: schema.runs.id });
+  // No attempt is closed here, deliberately (anton-rnrdr). This settles a run that is already PARKED,
+  // and the park that parked it already closed its attempt — the work stopped then, not now. Closing
+  // one here would stretch that interval across the whole wait for the abandon, reporting time nothing
+  // was executing in as wall time of the work. A parked run has no open attempt by construction.
   return settled.length > 0;
 }
 
