@@ -1666,6 +1666,11 @@ describe("runReviewGate — the large-diff round floor (anton-z8uv)", () => {
     // so this only passes if round 2 was a genuine second claude call, not a re-parse of round 1.
     expect(calls).toHaveLength(2);
     expect(out.churnFloorApplied).toEqual({ churnLines: 500, thresholdLines: 100, minRounds: 2 });
+    // Round 1 reported nothing blocking and dispatched no fix — the floor alone forced round 2. Its
+    // OWN round record has to carry that (anton-re02 follow-up), because the board history
+    // (review-score.ts) reads per-round state, never the gate's overall outcome, to label round 1.
+    expect(out.rounds[0].fixSessionId).toBeUndefined();
+    expect(out.rounds[0].churnFloorApplied).toEqual({ churnLines: 500, thresholdLines: 100, minRounds: 2 });
   });
 
   it("exits a clean round 1 in one round when the diff sits below the threshold", async () => {

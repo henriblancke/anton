@@ -85,6 +85,14 @@ export interface ReviewRound {
    * untouched.
    */
   scoreCap?: ReviewScoreCap;
+  /**
+   * Set when this round's diff cleared the operator's churn threshold (anton-z8uv) — on a round the
+   * floor forced (nothing blocking, but the minimum round count wasn't met yet) as well as on the
+   * final round that satisfied it. Carried through to the board (review-score.ts) so a round the floor
+   * extended reads as that, distinct from `fixed`: no fix was ever dispatched for it, so labelling it
+   * `fixed` would claim a repair that never happened.
+   */
+  churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
 }
 
 /** Why and how much a round's score was capped — carried on {@link ReviewRound} and the board history it feeds. */
@@ -527,6 +535,10 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
             minRounds: config.churnRoundFloor!.minRounds,
           }
         : undefined;
+      // Stamped on the ROUND itself, not just returned on a `clean` exit: a round the floor forces to
+      // continue never reaches that return, and without this the board (review-score.ts) has no way
+      // to tell it apart from a round that genuinely dispatched a fix (anton-re02 follow-up).
+      if (churnFloorApplied) entry.churnFloorApplied = churnFloorApplied;
       // The floor demands more rounds only while both hold: it hasn't cleared its minimum yet, AND
       // another round still fits under the operator's cap — the floor raises the bar, it never
       // pushes the loop past `maxRounds` (anton-z8uv).

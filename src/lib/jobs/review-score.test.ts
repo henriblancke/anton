@@ -31,7 +31,16 @@ describe("reviewScoreEntries", () => {
       result({
         outcome: "unresolved",
         rounds: [
-          { round: 1, reviewSessionId: "s1", score: 4, blocking: 2, advisory: 1, rationale: "gaps" },
+          {
+            round: 1,
+            reviewSessionId: "s1",
+            score: 4,
+            blocking: 2,
+            advisory: 1,
+            rationale: "gaps",
+            fixSessionId: "f1",
+            fixCommitted: true,
+          },
           { round: 2, reviewSessionId: "s2", score: 6, blocking: 1, advisory: 1 },
         ],
       }),
@@ -39,6 +48,27 @@ describe("reviewScoreEntries", () => {
     expect(entries).toEqual([
       { round: 1, score: 4, blocking: 2, advisory: 1, verdict: "fixed", rationale: "gaps" },
       { round: 2, score: 6, blocking: 1, advisory: 1, verdict: "unresolved" },
+    ]);
+  });
+
+  // anton-hk9z: a round the churn floor forced to continue (anton-z8uv) reported nothing blocking
+  // and dispatched no fix — labelling it `fixed`, as every other non-final round is, would fabricate
+  // a repair that never happened. Its own `churnFloorApplied` marker is what tells the two apart.
+  it("gives a floor-forced round its own verdict, distinct from a round that actually dispatched a fix", () => {
+    const churnFloorApplied = { churnLines: 500, thresholdLines: 100, minRounds: 2 };
+    const entries = reviewScoreEntries(
+      result({
+        outcome: "clean",
+        churnFloorApplied,
+        rounds: [
+          { round: 1, reviewSessionId: "s1", score: 9, blocking: 0, advisory: 0, churnFloorApplied },
+          { round: 2, reviewSessionId: "s2", score: 9, blocking: 0, advisory: 0, churnFloorApplied },
+        ],
+      }),
+    );
+    expect(entries).toEqual([
+      { round: 1, score: 9, blocking: 0, advisory: 0, verdict: "floor-continued", churnFloorApplied },
+      { round: 2, score: 9, blocking: 0, advisory: 0, verdict: "clean", churnFloorApplied },
     ]);
   });
 
@@ -72,7 +102,15 @@ describe("partialReviewScoreEntries", () => {
   it("marks only the round the gate DIED in, so the earlier ones still read as fixed", () => {
     expect(
       partialReviewScoreEntries([
-        { round: 1, reviewSessionId: "s1", score: 4, blocking: 2, advisory: 0 },
+        {
+          round: 1,
+          reviewSessionId: "s1",
+          score: 4,
+          blocking: 2,
+          advisory: 0,
+          fixSessionId: "f1",
+          fixCommitted: true,
+        },
         { round: 2, reviewSessionId: "s2", score: 6, blocking: 1, advisory: 1, rationale: "closer" },
       ]),
     ).toEqual([
@@ -96,6 +134,19 @@ describe("formatReviewScoreComment", () => {
     expect(text).toContain("solid, three nits");
     const payload = JSON.parse(/```json\s*\n([\s\S]*?)```/.exec(text)![1]);
     expect(payload).toMatchObject({ kind: REVIEW_SCORE_KIND, round: 2, score: 7, verdict: "clean" });
+  });
+
+  it("says why a clean large diff still took extra rounds, not just that it did", () => {
+    const text = formatReviewScoreComment({
+      round: 1,
+      score: 9,
+      blocking: 0,
+      advisory: 0,
+      verdict: "floor-continued",
+      churnFloorApplied: { churnLines: 500, thresholdLines: 100, minRounds: 2 },
+    });
+    expect(text).toContain("large diff (500 lines ≥ 100)");
+    expect(text).toContain("requires 2 round(s)");
   });
 
   it("says so plainly when the round produced no score", () => {
