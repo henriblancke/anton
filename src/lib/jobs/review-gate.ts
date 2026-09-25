@@ -76,6 +76,49 @@ export interface ReviewRound {
   fixSessionId?: string;
   /** Whether the fix session actually changed (and so committed) anything. */
   fixCommitted?: boolean;
+  /**
+   * Set when this round's `score` was capped down from what the reviewer reported (anton-re02): the
+   * diff it reviewed was truncated, so the anchored scale's ships-as-is band (8+) — "all criteria met
+   * and verified" — is a claim no partial read can support, whatever the reviewer itself believed.
+   * Applied by the gate from `BranchDiff.truncated`, never trusted to a reviewer that self-limits its
+   * own number. Absent whenever the round's diff was complete, so `score` there is the reported value
+   * untouched.
+   */
+  scoreCap?: ReviewScoreCap;
+}
+
+/** Why and how much a round's score was capped — carried on {@link ReviewRound} and the board history it feeds. */
+export interface ReviewScoreCap {
+  /** The reviewer's own number, before the cap. */
+  reported: number;
+  /** One line a founder reads on the board next to the capped score. */
+  reason: string;
+}
+
+/** The lowest score the anchored scale (skills/review/SKILL.md) reserves for "ships as-is". */
+export const REVIEW_SHIPS_AS_IS_SCORE = 8;
+
+/** The highest score a review of a truncated diff may record — one band below ships-as-is. */
+export const REVIEW_TRUNCATED_SCORE_CAP = REVIEW_SHIPS_AS_IS_SCORE - 1;
+
+/**
+ * Cap a round's score from the DIFF it reviewed, never from the reviewer's own claim to have limited
+ * itself (anton-re02): a review of a truncated diff cannot record a score in the ships-as-is band —
+ * PRs over the patch budget self-scored 8 and 9 on a partial read and then took a median of 33
+ * external findings; #238 scored 8 on a truncated diff and took 73 P1s. An untruncated review's score
+ * is returned exactly as reported.
+ */
+export function capTruncatedScore(score: number, truncated: boolean): { score: number; cap?: ReviewScoreCap } {
+  if (!truncated || score < REVIEW_SHIPS_AS_IS_SCORE) return { score };
+  return {
+    score: REVIEW_TRUNCATED_SCORE_CAP,
+    cap: {
+      reported: score,
+      reason:
+        `the diff was truncated, so this round could not read all of it — a ships-as-is score ` +
+        `(${REVIEW_SHIPS_AS_IS_SCORE}+) claims coverage a partial read cannot support`,
+    },
+  };
 }
 
 /**
@@ -429,6 +472,11 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
     const findings = review.report.findings;
     const blocking = blockingFindings(findings);
+    // Capped here, from the diff THIS round actually read — not from anything the reviewer claimed
+    // about its own coverage — so every score `rounds` carries from this point on is already the
+    // honest one (anton-re02).
+    const scoreCap = review.report.ok ? capTruncatedScore(review.report.score, review.truncated) : undefined;
+    const roundScore = scoreCap?.score;
     const entry: ReviewRound = {
       round,
       reviewSessionId: review.sessionId,
@@ -436,7 +484,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       advisory: findings.length - blocking.length,
       findings,
       ...(review.report.ok
-        ? { score: review.report.score, rationale: review.report.rationale }
+        ? { score: roundScore, rationale: review.report.rationale, ...(scoreCap!.cap ? { scoreCap: scoreCap!.cap } : {}) }
         : { violation: review.report.violation }),
     };
     rounds.push(entry);
@@ -459,7 +507,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // score that isn't moving) is the more useful thing to say about why the run stopped.
     const regression = detectScoreRegression(rounds, config.scoreAlarm);
     if (regression) {
-      return { outcome: "score-regression", baseRev, rounds, unresolved, reviewer, score: review.report.score, regression };
+      return { outcome: "score-regression", baseRev, rounds, unresolved, reviewer, score: roundScore, regression };
     }
 
     if (blocking.length === 0) {
@@ -491,7 +539,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
           rounds,
           unresolved,
           reviewer,
-          score: review.report.score,
+          score: roundScore,
           ...(churnFloorApplied ? { churnFloorApplied } : {}),
         };
       }
@@ -503,7 +551,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       continue;
     }
     if (round === config.maxRounds) {
-      return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: roundScore };
     }
 
     // Replaces, never accumulates: this round was shown the previous carry and restated whatever
@@ -542,7 +590,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
     if (!fix.committed) {
-      return { outcome: "stalled", baseRev, rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "stalled", baseRev, rounds, unresolved, reviewer, score: roundScore };
     }
   }
 
@@ -618,7 +666,7 @@ async function runReviewSession(args: {
    * this session then runs them itself.
    */
   verified?: VerifyGateOutcome[];
-}): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
+}): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult; truncated: boolean }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, round, maxRounds, claude } = args;
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
@@ -768,7 +816,7 @@ async function runReviewSession(args: {
       });
       await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, reviewer, report };
+      return { sessionId, reviewer, report, truncated: diff.truncated };
     } catch (e) {
       // Throws PoisonError of its own when the reviewer's COMMIT could not be reverted — the one case
       // where retrying this worktree is more dangerous than losing the original error's backoff.

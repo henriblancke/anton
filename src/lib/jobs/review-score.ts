@@ -12,7 +12,7 @@
  */
 import { beads } from "../beads/bd";
 import { findingLines, type ReviewFinding } from "./review-context";
-import type { ReviewGateOutcome, ReviewGateResult, ReviewRound } from "./review-gate";
+import type { ReviewGateOutcome, ReviewGateResult, ReviewRound, ReviewScoreCap } from "./review-gate";
 
 /**
  * What a single round settled on. Only the LAST round can carry the gate's outcome — every earlier
@@ -42,6 +42,12 @@ export interface ReviewScoreEntry {
    * that reported nothing.
    */
   findings?: ReviewFinding[];
+  /**
+   * Set when `score` was capped down from what the reviewer reported (anton-re02) — the diff it
+   * reviewed was truncated, so the board history states the cap and why rather than showing a bare
+   * number the founder would otherwise read as the reviewer's own verdict.
+   */
+  scoreCap?: ReviewScoreCap;
 }
 
 /** Marks a comment as anton's score payload, so a reader can skip every other comment on the bead. */
@@ -75,6 +81,7 @@ function toEntries(rounds: ReviewRound[], final: ReviewRoundVerdict): ReviewScor
     verdict: i === last ? final : ("fixed" as const),
     ...(r.rationale ? { rationale: r.rationale } : {}),
     ...(r.findings?.length ? { findings: r.findings } : {}),
+    ...(r.scoreCap ? { scoreCap: r.scoreCap } : {}),
   }));
 }
 
@@ -89,6 +96,7 @@ export function formatReviewScoreComment(entry: ReviewScoreEntry): string {
     `${entry.blocking} blocking, ${entry.advisory} advisory · ${entry.verdict}`;
   return [
     head,
+    ...(entry.scoreCap ? [`capped from ${entry.scoreCap.reported}/10 — ${entry.scoreCap.reason}`] : []),
     ...(entry.rationale ? ["", entry.rationale] : []),
     ...(entry.findings?.length ? ["", ...findingLines(entry.findings)] : []),
     "",

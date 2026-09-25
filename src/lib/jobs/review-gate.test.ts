@@ -466,6 +466,68 @@ describe("runReviewGate — convergence", () => {
   });
 });
 
+/**
+ * The truncated-diff score cap (anton-re02): a review of a diff the gate could only read PART of
+ * cannot record a score in the anchored scale's ships-as-is band (8+) — the gate enforces this from
+ * `BranchDiff.truncated`, not from the reviewer's own claim to have limited its number. Bypasses the
+ * `gate()` helper above (whose fake diff is fixed at `truncated: false`), same as the churn-floor and
+ * base-pinning suites below.
+ */
+describe("runReviewGate — the truncated-diff score cap (anton-re02)", () => {
+  /** A reviewer report carrying `unreviewedPaths`, mandatory whenever the diff is truncated. */
+  function truncatedReport(score: number): string {
+    return [
+      "reviewed.",
+      "```json",
+      JSON.stringify({ score, rationale: `scored ${score}`, findings: [], unreviewedPaths: ["src/a.ts"] }),
+      "```",
+    ].join("\n");
+  }
+
+  function gateOverDiff(reply: string, diffToRead: BranchDiff) {
+    const { run } = fakeClaude([reply]);
+    const worktree = fakeWorktree();
+    return runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      target,
+      tickets: [ticket],
+      settings: {},
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diffToRead,
+        commit: async () => ({ committed: true }),
+        readState: worktree.readState,
+        restoreState: worktree.restoreState,
+      },
+    });
+  }
+
+  it("caps a 9 reported on a truncated diff below the ships-as-is band, with the reason recorded", async () => {
+    const out = await gateOverDiff(truncatedReport(9), { ...diff, truncated: true });
+
+    expect(out.outcome).toBe("clean");
+    expect(out.score).toBe(7);
+    expect(out.rounds).toHaveLength(1);
+    expect(out.rounds[0].score).toBe(7);
+    expect(out.rounds[0].scoreCap).toMatchObject({ reported: 9 });
+    expect(out.rounds[0].scoreCap?.reason).toContain("truncated");
+  });
+
+  it("passes the same 9 through untouched on an untruncated diff", async () => {
+    const out = await gateOverDiff(report(9, []), { ...diff, truncated: false });
+
+    expect(out.outcome).toBe("clean");
+    expect(out.score).toBe(9);
+    expect(out.rounds[0].score).toBe(9);
+    expect(out.rounds[0].scoreCap).toBeUndefined();
+  });
+});
+
 describe("runReviewGate — bounds", () => {
   it("stops at reviewMaxRounds with the unresolved findings rather than looping forever", async () => {
     const stubborn = report(5, [BLOCKING, ADVISORY]);
