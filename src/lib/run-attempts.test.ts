@@ -187,6 +187,29 @@ describe("one row per attempt", () => {
     expect(await listRunAttempts(t.db, "r1")).toHaveLength(1);
   });
 
+  it("closes the most recently opened attempt when two are open at once", async () => {
+    // Mirrors reconcileInterruptedRuns leaving a crashed `running` row's attempt open when its job is
+    // about to be re-dispatched (runs.ts), then the resume opening a second attempt on top of it
+    // (execute-epic-start.ts) — two open rows for one run. The settle that follows must close the
+    // attempt that actually ran (the newest), not the stale crashed one left open by the reconciler.
+    await start("r1");
+    clock.set(T0 + 5 * MIN);
+    await recordAttemptStart(t.db, clock, { runId: "r1" });
+    clock.set(T0 + 15 * MIN);
+    await updateRun(t.db, clock, "r1", { status: "done", endedAt: clock.now() });
+
+    const rows = await listRunAttempts(t.db, "r1");
+    expect(rows.map((r) => [r.attempt, r.outcome, r.endedAt !== null])).toEqual([
+      [1, null, false],
+      [2, "done", true],
+    ]);
+    expect(await runWallMs(t.db, "r1")).toEqual({
+      wallMs: 10 * MIN,
+      attempts: 2,
+      openAttempts: 1,
+    });
+  });
+
   it("keeps two runs' attempts apart", async () => {
     await start("r1");
     await start("r2");

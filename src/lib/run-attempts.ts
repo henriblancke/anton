@@ -17,7 +17,7 @@
  * db-injectable, like `runs` and `claude-invocations`: the handler and its tests share one connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, asc, count, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, count, desc, eq, isNull, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -86,10 +86,18 @@ export async function recordAttemptStart(
  * closes its attempt without each having to remember to — the same reason the spend ledger is a
  * driver wrapper rather than a call in each dispatch.
  *
- * Closes only the run's OPEN row (`ended_at IS NULL`), oldest first, and writes nothing when there is
- * none: a run's terminal status can be written more than once (a `done` row re-settled by recovery, a
- * park whose corrective write follows it), and a second close must not revise an interval already
- * recorded. That is the append-only rule — a row's interval is true of the attempt that ran it.
+ * Closes only the run's OPEN row (`ended_at IS NULL`), MOST RECENTLY OPENED first, and writes nothing
+ * when there is none: a run's terminal status can be written more than once (a `done` row re-settled
+ * by recovery, a park whose corrective write follows it), and a second close must not revise an
+ * interval already recorded. That is the append-only rule — a row's interval is true of the attempt
+ * that ran it.
+ *
+ * Two open rows can coexist for one run: `reconcileInterruptedRuns` deliberately leaves a crashed
+ * `running` row's attempt unclosed when its job is about to be re-dispatched, and the resume
+ * (`findOpenRunForEpic` / `openRunRow`) then opens a second attempt on top of it. When that resumed
+ * attempt later settles, the row to close is the one that actually ran — the most recent — not the
+ * stale crashed one, or the crash gap gets attributed to the attempt that ran and the attempt that
+ * really ran is left open forever, excluded from `wallMs`.
  */
 export async function recordAttemptEnd(
   db: AntonDb,
@@ -103,7 +111,7 @@ export async function recordAttemptEnd(
       .select({ id: schema.runAttempts.id })
       .from(schema.runAttempts)
       .where(and(eq(schema.runAttempts.runId, runId), isNull(schema.runAttempts.endedAt)))
-      .orderBy(asc(schema.runAttempts.attempt))
+      .orderBy(desc(schema.runAttempts.attempt))
       .limit(1);
     const id = open[0]?.id;
     if (!id) return;
