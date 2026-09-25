@@ -86,6 +86,7 @@ import {
 } from "../git/pr";
 import {
   createWorktree,
+  warmWorktreeBestEffort,
   withWorktreeClaim,
   type Worktree,
 } from "../git/worktree";
@@ -96,6 +97,7 @@ import {
   resolveCommitTimeoutMs,
   resolvePushTimeoutMs,
   resolveVerifyGates,
+  resolveWarmConfig,
   type ProjectSettings,
 } from "../projects";
 import { captureVerifyGates } from "./shell";
@@ -496,7 +498,7 @@ async function handleEpic(args: {
  * CONFLICTING — pre-merge the base so claude only has conflict markers to resolve. Every git step
  * is best-effort: a repo with no reachable origin still gets the review-comment flow.
  */
-async function prepareFixWorktree(args: {
+export async function prepareFixWorktree(args: {
   ctx: JobContext;
   repo: string;
   branch: string;
@@ -515,6 +517,9 @@ async function prepareFixWorktree(args: {
     repoPath: repo,
     branch,
     baseBranch: settings.baseBranch,
+    // Warmed explicitly below, once the worktree is confirmed to exist — createWorktree's own
+    // `warm: true` would run the install with no project config, silently ignoring an operator's
+    // pinned command or opt-out (see resolveWarmConfig below and worktree.ts:1601).
     warm: false,
     claimedBy: claimOwner,
   });
@@ -526,6 +531,11 @@ async function prepareFixWorktree(args: {
       `PR #${number}: worktree for ${branch} is missing after creation (${worktree.path}) — refusing to run claude against a non-existent cwd`,
     );
   }
+  // Reused checkouts land here with the lockfile already declaring modules `node_modules` never
+  // linked (verified on #1698) — `safe()` on top of `warmWorktreeBestEffort`'s own internal catch
+  // (belt and suspenders, matching every other best-effort step in this function) so a stuck install
+  // can never block the fix from proceeding.
+  await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
   await ctx.heartbeat();
 
   await safe(() =>

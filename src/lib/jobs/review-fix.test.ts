@@ -13,8 +13,10 @@ import * as schema from "../db/schema";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
+import type { JobContext } from "./runner";
 import { GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrReview, type ReviewThread } from "../git/pr";
+import type { Worktree } from "../git/worktree";
 import {
   applyThreadOutcomes,
   claimOwnerFor,
@@ -22,12 +24,14 @@ import {
   makeReviewFixHandler,
   notifyGateParked,
   parseThreadReport,
+  prepareFixWorktree,
   resolveReviewFixModel,
   runTestGate,
   type ThreadOutcome,
 } from "./review-fix";
 import { LABELS, type Bead } from "../beads/bd";
 import { PoisonError } from "./errors";
+import type { ProjectSettings } from "../projects";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
 const listMock = vi.fn();
@@ -49,12 +53,28 @@ vi.mock("../operator", () => ({ resolveOperator: (...a: unknown[]) => resolveOpe
 // Stubbed so an assertion can prove the dispatcher never reaches them — the whole point of the
 // split is that triage costs a board read and one `gh` call per PR, nothing heavier.
 const createWorktreeMock = vi.fn();
+const warmWorktreeBestEffortMock = vi.fn();
 vi.mock("../git/worktree", () => ({
   createWorktree: (...a: unknown[]) => createWorktreeMock(...a),
+  warmWorktreeBestEffort: (...a: unknown[]) => warmWorktreeBestEffortMock(...a),
   withWorktreeClaim: vi.fn(),
 }));
 const runClaudeMock = vi.fn();
 vi.mock("../claude/driver", () => ({ runClaude: (...a: unknown[]) => runClaudeMock(...a) }));
+
+// prepareFixWorktree's own git steps (sync + premerge) — none of them under test here, so they're
+// no-ops rather than hitting a real repo the mocked `createWorktree` above never actually made.
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return {
+    ...actual,
+    fetchOrigin: vi.fn().mockResolvedValue(undefined),
+    mergeIntoCurrent: vi.fn().mockResolvedValue({ conflicts: [] }),
+    branchAheadOfRemote: vi.fn().mockResolvedValue(false),
+    needsHooksPathOverrideForMerge: vi.fn().mockResolvedValue(false),
+    resolveHooksPathOverrideForMerge: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 describe("parseThreadReport (re-exported from ./review-fix)", () => {
   it("parses the fenced json report block", () => {
@@ -243,6 +263,100 @@ describe("claimOwnerFor", () => {
   it("has no whitespace, so it survives the git lock reason round-trip", () => {
     // claimLockReason writes `anton-claim <owner> pid=… host=…` and parses the owner back as \S+.
     expect(claimOwnerFor("job-1")).not.toMatch(/\s/);
+  });
+});
+
+/**
+ * anton-u02rt: prepareFixWorktree used to materialize the fix worktree with `warm: false` and
+ * nothing after it, so a reused checkout landed a review-fix session with `node_modules` never
+ * installed for a lockfile that had just changed — a gate then fails on a module the lockfile
+ * plainly declares. The fix threads the project's resolved warm config through exactly like the
+ * run path (execute-epic-claim.ts) does.
+ */
+describe("prepareFixWorktree (anton-u02rt)", () => {
+  const pr: PrReview = {
+    number: 7,
+    state: "OPEN",
+    reviewDecision: "CHANGES_REQUESTED",
+    mergeable: "MERGEABLE",
+    headRefName: "anton/fix-7",
+    headSha: "sha-7",
+    url: "https://example.test/pull/7",
+    reviews: [],
+    failingChecks: [],
+    pendingChecks: 0,
+    threads: [],
+  };
+
+  const fakeCtx = (): JobContext =>
+    ({
+      jobId: "job-test",
+      type: "review-fix-pr",
+      payload: {},
+      attempt: 1,
+      heartbeat: async () => {},
+      signal: new AbortController().signal,
+    }) as JobContext;
+
+  let worktreePath: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    worktreePath = mkdtempSync(join(tmpdir(), "anton-review-fix-warm-"));
+    createWorktreeMock.mockResolvedValue({
+      path: worktreePath,
+      branch: "anton/fix-7",
+      baseBranch: "main",
+      createdBranch: false,
+      repoPath: "/repo",
+    } satisfies Worktree);
+    warmWorktreeBestEffortMock.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    rmSync(worktreePath, { recursive: true, force: true });
+  });
+
+  const run = (settings: ProjectSettings) =>
+    prepareFixWorktree({
+      ctx: fakeCtx(),
+      repo: "/repo",
+      branch: "anton/fix-7",
+      settings,
+      baseBranch: "main",
+      pr,
+      number: 7,
+      claimOwner: "review-fix:job-test",
+    });
+
+  it("a review-fix gate failing on a module the lockfile declares", async () => {
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+    const [warmedWorktree, , warmConfig] = warmWorktreeBestEffortMock.mock.calls[0]!;
+    expect(warmedWorktree).toMatchObject({ path: worktreePath });
+    expect(warmConfig).toEqual({ command: "pnpm install --frozen-lockfile", enabled: true });
+  });
+
+  it("a warm that throws still returns a usable worktree and the job proceeds", async () => {
+    warmWorktreeBestEffortMock.mockRejectedValueOnce(new Error("install boom"));
+
+    const result = await run({} as ProjectSettings);
+
+    expect(result.worktree.path).toBe(worktreePath);
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("warming disabled by config does not install", async () => {
+    const settings = { warmEnabled: false } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+    const [, , warmConfig] = warmWorktreeBestEffortMock.mock.calls[0]!;
+    expect(warmConfig).toEqual({ command: undefined, enabled: false });
   });
 });
 
