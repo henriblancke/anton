@@ -757,7 +757,7 @@ async function runReviewSession(args: {
       }
 
       const report = await enforceReadOnly({
-        report: parseReviewFindings(result.text),
+        report: parseReviewFindings(result.text, { truncated: diff.truncated }),
         worktreePath,
         before,
         logPath,

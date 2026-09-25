@@ -52,6 +52,20 @@ describe("reviewScoreEntries", () => {
     expect(entry.score).toBeUndefined();
     expect(entry.verdict).toBe("protocol-violation");
   });
+
+  // anton-0b1d: a truncated review that never named its unreviewed paths reaches the board the same
+  // way every other protocol violation does — no special-casing, no score, the round's outcome as the
+  // verdict — so the founder sees it and reads the same as any other parked round.
+  it("records a truncated review with no coverage field as its own violation, not a score", () => {
+    const [entry] = reviewScoreEntries(
+      result({
+        outcome: "protocol-violation",
+        rounds: [{ round: 1, reviewSessionId: "s1", violation: "missing-coverage", blocking: 0, advisory: 0 }],
+      }),
+    );
+    expect(entry.score).toBeUndefined();
+    expect(entry.verdict).toBe("protocol-violation");
+  });
 });
 
 describe("partialReviewScoreEntries", () => {
