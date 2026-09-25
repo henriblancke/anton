@@ -13,8 +13,10 @@ import * as schema from "../db/schema";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
+import type { JobContext } from "./runner";
 import { GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrReview, type ReviewThread } from "../git/pr";
+import type { Worktree } from "../git/worktree";
 import {
   applyThreadOutcomes,
   claimOwnerFor,
@@ -29,6 +31,7 @@ import {
 } from "./review-fix";
 import { LABELS, type Bead } from "../beads/bd";
 import { PoisonError } from "./errors";
+import type { ProjectSettings } from "../projects";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
 const listMock = vi.fn();
@@ -50,12 +53,28 @@ vi.mock("../operator", () => ({ resolveOperator: (...a: unknown[]) => resolveOpe
 // Stubbed so an assertion can prove the dispatcher never reaches them — the whole point of the
 // split is that triage costs a board read and one `gh` call per PR, nothing heavier.
 const createWorktreeMock = vi.fn();
+const warmWorktreeBestEffortMock = vi.fn();
 vi.mock("../git/worktree", () => ({
   createWorktree: (...a: unknown[]) => createWorktreeMock(...a),
+  warmWorktreeBestEffort: (...a: unknown[]) => warmWorktreeBestEffortMock(...a),
   withWorktreeClaim: vi.fn(),
 }));
 const runClaudeMock = vi.fn();
 vi.mock("../claude/driver", () => ({ runClaude: (...a: unknown[]) => runClaudeMock(...a) }));
+
+// prepareFixWorktree's own git steps (sync + premerge) — none of them under test here, so they're
+// no-ops rather than hitting a real repo the mocked `createWorktree` above never actually made.
+vi.mock("../git/ops", async () => {
+  const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  return {
+    ...actual,
+    fetchOrigin: vi.fn().mockResolvedValue(undefined),
+    mergeIntoCurrent: vi.fn().mockResolvedValue({ conflicts: [] }),
+    branchAheadOfRemote: vi.fn().mockResolvedValue(false),
+    needsHooksPathOverrideForMerge: vi.fn().mockResolvedValue(false),
+    resolveHooksPathOverrideForMerge: vi.fn().mockResolvedValue(undefined),
+  };
+});
 
 describe("parseThreadReport (re-exported from ./review-fix)", () => {
   it("parses the fenced json report block", () => {
@@ -248,6 +267,100 @@ describe("claimOwnerFor", () => {
 });
 
 /**
+ * anton-u02rt: prepareFixWorktree used to materialize the fix worktree with `warm: false` and
+ * nothing after it, so a reused checkout landed a review-fix session with `node_modules` never
+ * installed for a lockfile that had just changed — a gate then fails on a module the lockfile
+ * plainly declares. The fix threads the project's resolved warm config through exactly like the
+ * run path (execute-epic-claim.ts) does.
+ */
+describe("prepareFixWorktree (anton-u02rt)", () => {
+  const pr: PrReview = {
+    number: 7,
+    state: "OPEN",
+    reviewDecision: "CHANGES_REQUESTED",
+    mergeable: "MERGEABLE",
+    headRefName: "anton/fix-7",
+    headSha: "sha-7",
+    url: "https://example.test/pull/7",
+    reviews: [],
+    failingChecks: [],
+    pendingChecks: 0,
+    threads: [],
+  };
+
+  const fakeCtx = (): JobContext =>
+    ({
+      jobId: "job-test",
+      type: "review-fix-pr",
+      payload: {},
+      attempt: 1,
+      heartbeat: async () => {},
+      signal: new AbortController().signal,
+    }) as JobContext;
+
+  let worktreePath: string;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    worktreePath = mkdtempSync(join(tmpdir(), "anton-review-fix-warm-"));
+    createWorktreeMock.mockResolvedValue({
+      path: worktreePath,
+      branch: "anton/fix-7",
+      baseBranch: "main",
+      createdBranch: false,
+      repoPath: "/repo",
+    } satisfies Worktree);
+    warmWorktreeBestEffortMock.mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    rmSync(worktreePath, { recursive: true, force: true });
+  });
+
+  const run = (settings: ProjectSettings) =>
+    prepareFixWorktree({
+      ctx: fakeCtx(),
+      repo: "/repo",
+      branch: "anton/fix-7",
+      settings,
+      baseBranch: "main",
+      pr,
+      number: 7,
+      claimOwner: "review-fix:job-test",
+    });
+
+  it("a review-fix gate failing on a module the lockfile declares", async () => {
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+    const [warmedWorktree, , warmConfig] = warmWorktreeBestEffortMock.mock.calls[0]!;
+    expect(warmedWorktree).toMatchObject({ path: worktreePath });
+    expect(warmConfig).toEqual({ command: "pnpm install --frozen-lockfile", enabled: true });
+  });
+
+  it("a warm that throws still returns a usable worktree and the job proceeds", async () => {
+    warmWorktreeBestEffortMock.mockRejectedValueOnce(new Error("install boom"));
+
+    const result = await run({} as ProjectSettings);
+
+    expect(result.worktree.path).toBe(worktreePath);
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("warming disabled by config does not install", async () => {
+    const settings = { warmEnabled: false } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+    const [, , warmConfig] = warmWorktreeBestEffortMock.mock.calls[0]!;
+    expect(warmConfig).toEqual({ command: undefined, enabled: false });
+  });
+});
+
+/**
  * The dispatcher (anton-mcbp). The scheduled poll's whole job is now triage: read the board, read
  * each in-review PR once, and hand every target that is MERGED or actionable to its own
  * `review-fix-pr` job. It must materialize no worktree and drive no claude session — that is what
@@ -269,6 +382,7 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     reviewDecision: "APPROVED",
     mergeable: "MERGEABLE",
     headRefName: `anton/pr-${number}`,
+    headSha: `sha-${number}`,
     url: `https://example.test/pull/${number}`,
     reviews: [],
     failingChecks: [],
@@ -341,6 +455,49 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     await dispatch();
     await dispatch();
     expect(dispatchedTargets()).toEqual(["e-1"]);
+  });
+
+  // anton-bzm7s: a parked job at the SAME head must suppress re-dispatch — and the pass's own note
+  // must let an operator tell that suppressed target apart from a merely-idle one (a clean PR that
+  // never reaches this branch at all, and so never contributes to either count).
+  it("suppresses a target parked at the current PR head, and says so distinctly from an idle target", async () => {
+    listMock.mockResolvedValue([target("e-1", 1), target("e-2", 2)]);
+    getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
+      number === 1 ? openPr(1, { reviewDecision: "CHANGES_REQUESTED" }) : openPr(2), // e-2 stays clean
+    );
+
+    await dispatch();
+    t.db
+      .update(schema.jobs)
+      .set({ status: "parked" })
+      .where(eq(schema.jobs.type, "review-fix-pr"))
+      .run();
+
+    const job = await getJob(t.db, await dispatch());
+    expect(dispatchedTargets()).toEqual(["e-1"]); // still the one row from the first pass
+    expect(job?.outcomeNote).toBe(
+      "examined 2 PR(s) in review, dispatched 0, suppressed 1 (parked, unchanged head)",
+    );
+  });
+
+  it("admits a fresh job once the PR head SHA moves past a parked attempt", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    t.db
+      .update(schema.jobs)
+      .set({ status: "parked" })
+      .where(eq(schema.jobs.type, "review-fix-pr"))
+      .run();
+
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, { reviewDecision: "CHANGES_REQUESTED", headSha: "sha-new" }),
+    );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
   });
 
   // One unreadable PR must not cost the others their dispatch — but the failure still surfaces, so
@@ -430,6 +587,7 @@ process.exit(0);
       reviewDecision: "CHANGES_REQUESTED",
       mergeable: "MERGEABLE",
       headRefName: "anton/epic-1",
+      headSha: "sha1",
       url: "https://github.com/o/r/pull/7",
       reviews: [],
       failingChecks: [],

@@ -105,7 +105,15 @@ export async function enqueue(db: AntonDb, clock: Clock, input: EnqueueInput): P
   return row.id;
 }
 
-/** The active statuses that must hold at most one execute-epic job per (project, epic). */
+/**
+ * The active statuses that must hold at most one execute-epic (or review-fix-pr) job per
+ * (project, epic). Deliberately excludes `parked` — a permanent park would wedge the target
+ * forever with no way back, since nothing but `resumeJob` un-parks a row and this const gates
+ * every OTHER caller's dedupe too (`activeExecuteEpicId`, `enqueueScheduledTypeIfAbsent`'s default
+ * `coveredBy`). `enqueueReviewFixPrIfAbsent`'s head-SHA suppression (anton-bzm7s) achieves the
+ * "don't re-enqueue a doomed retry" outcome without widening this: it keys on the PR head instead
+ * of the bare status, so it self-heals the moment the head moves rather than staying stuck.
+ */
 const ACTIVE_STATUSES = ["queued", "running"] as const;
 
 /**
@@ -453,6 +461,18 @@ export function enqueueExecuteEpicIfAbsent(
  * counted as covering either; it is a different type that only triages, so treating its in-flight
  * poll as coverage would strand this target until the next slot.
  *
+ * `headSha` (anton-bzm7s), when passed, adds ONE more suppression: a `parked` row for the same
+ * target whose payload carries the SAME head SHA is also treated as covering it. A park is a red
+ * gate (anton-h0hwc PoisonError), and a red gate on an UNCHANGED commit will fail again identically
+ * — re-enqueuing it every scheduled 15-minute pass burns a full lint/typecheck/build gate suite on a
+ * doomed input. `parked` is deliberately NOT added to `ACTIVE_STATUSES` for this (see that const's
+ * own doc): a bare status check would wedge the target forever with no way back once a fix landed.
+ * Keying on the head SHA instead means the suppression lifts itself the moment new commits land —
+ * exactly what a retry could act on — with no separate un-suppress step. `resumeJob` is untouched by
+ * this: it un-parks a SPECIFIC job id directly and never calls this function, so a human resuming the
+ * parked job is never re-suppressed by this check. Omitted (the merge-finalize dispatch has no PR
+ * commit of its own to key on), the suppression is simply skipped — unchanged prior behavior.
+ *
  * Synchronous transaction with no awaits inside, like the execute-epic helpers above: better-sqlite3
  * runs one connection, so the read→write pair cannot interleave and two overlapping passes yield
  * exactly one job — don't make this async. `jobs_active_epic_unique` keys on
@@ -473,7 +493,7 @@ export function enqueueReviewFixPrIfAbsent(
   clock: Clock,
   projectId: string,
   epicBeadId: string,
-  opts?: { refuseProject?: (projectId: string) => boolean },
+  opts?: { refuseProject?: (projectId: string) => boolean; headSha?: string },
 ): string | undefined {
   const nowMs = clock.now();
   try {
@@ -491,13 +511,17 @@ export function enqueueReviewFixPrIfAbsent(
       );
       if (existing) return undefined;
 
+      if (opts?.headSha && parkedAtHead(tx, projectId, epicBeadId, opts.headSha)) return undefined;
+
       const id = randomUUID();
       tx.insert(schema.jobs)
         .values({
           id,
           type: "review-fix-pr",
           projectId,
-          payloadJson: JSON.stringify({ projectId, epicBeadId }),
+          payloadJson: JSON.stringify(
+            opts?.headSha ? { projectId, epicBeadId, headSha: opts.headSha } : { projectId, epicBeadId },
+          ),
           status: "queued",
           runAt: secDate(nowMs),
           attempts: 0,
@@ -511,6 +535,42 @@ export function enqueueReviewFixPrIfAbsent(
     if (isUniqueViolation(e)) return undefined;
     throw e;
   }
+}
+
+/** Id of a `parked` `review-fix-pr` job for this target whose payload's `headSha` matches. */
+function parkedAtHead(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+  headSha: string,
+): string | undefined {
+  return firstJobId(
+    tx,
+    and(
+      eq(schema.jobs.type, "review-fix-pr"),
+      eq(schema.jobs.projectId, projectId),
+      eq(schema.jobs.status, "parked"),
+      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
+    ),
+  );
+}
+
+/**
+ * Is a target's most recent `review-fix-pr` attempt parked at the SAME head as `headSha` — i.e. is
+ * a fresh enqueue for it currently suppressed by {@link enqueueReviewFixPrIfAbsent}'s head check?
+ * Exported so a caller that already knows a target needs a fix, but got no job id back, can tell an
+ * operator WHY: suppressed (a red gate parked on this exact commit, nothing to retry yet) versus
+ * merely covered by a job already in flight. Read-only and outside any transaction — a harmless race
+ * with the enqueue's own check, at worst a beat-stale log line.
+ */
+export function reviewFixPrParkedAtHead(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  headSha: string,
+): boolean {
+  return parkedAtHead(db, projectId, epicBeadId, headSha) !== undefined;
 }
 
 /**
