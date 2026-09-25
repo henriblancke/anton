@@ -421,9 +421,12 @@ export interface JobContext {
    * queue helper bare because the runner holds the project-teardown barrier (PR #250 review): a
    * dispatcher that inserts directly can land a fresh `queued` row after `quiesceProject` swept the
    * project's active rows, and the delete then fails over it. Returns the new job id, or undefined
-   * when a live job already covers the target — or the project is being torn down.
+   * when a live job already covers the target — or the project is being torn down — or (anton-bzm7s)
+   * a `parked` job for it is already sitting at the same PR `headSha`, so a fresh attempt would just
+   * fail identically. `headSha` is optional — omit it (as the merge-finalize dispatch does) to skip
+   * that last check entirely.
    */
-  enqueueReviewFixPr: (projectId: string, epicBeadId: string) => string | undefined;
+  enqueueReviewFixPr: (projectId: string, epicBeadId: string, headSha?: string) => string | undefined;
 }
 
 /**
@@ -930,10 +933,13 @@ export class JobRunner {
    * barrier is handed INTO the insert's transaction (like `resume`), not read here first: a
    * dispatcher mid-triage can only reach the write after `quiesceProject` has raised the flag and
    * swept, and a pre-read check would still let that write through. Refused → undefined, no row.
+   * `headSha`, when passed, also suppresses a `parked` job for this target at the same head
+   * (anton-bzm7s) — see `enqueueReviewFixPrIfAbsent` (queue.ts) for why.
    */
-  enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string): string | undefined {
+  enqueueReviewFixPrIfAbsent(projectId: string, epicBeadId: string, headSha?: string): string | undefined {
     return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
       refuseProject: (pid) => this.quiescedProjects.has(pid),
+      headSha,
     });
   }
 
@@ -1959,8 +1965,8 @@ export class JobRunner {
             burnBefore = this.readProjectUsageFreshSafe(job.projectId ?? null, meterKey);
             await burnBefore;
           },
-          enqueueReviewFixPr: (projectId, epicBeadId) =>
-            this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId),
+          enqueueReviewFixPr: (projectId, epicBeadId, headSha) =>
+            this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId, headSha),
         };
         effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };

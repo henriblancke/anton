@@ -19,6 +19,7 @@ import {
   getJob,
   resumeBudgetDeferredJobs,
   resumeJob,
+  reviewFixPrParkedAtHead,
   systemClock,
   toMs,
 } from "./queue";
@@ -472,6 +473,71 @@ describe("enqueueReviewFixPrIfAbsent", () => {
       t.db.update(schema.jobs).set({ status }).where(eq(schema.jobs.id, id)).run();
       expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", `epic-${status}`)).toBeDefined();
     }
+  });
+
+  /**
+   * anton-bzm7s: a red gate re-dispatched every scheduled pass. Before this, a `parked` row (not in
+   * ACTIVE_STATUSES) held nothing back, so the scheduled 15-minute dispatcher re-enqueued a fresh attempt budget
+   * against the SAME doomed commit every slot — 106 re-runs of one PR in two days. Keying the
+   * suppression on `headSha` (rather than widening ACTIVE_STATUSES) is what makes it self-heal.
+   */
+  describe("headSha suppression (a parked gate on an unchanged PR head)", () => {
+    it("does not create a new job for a target whose prior job is parked at the same PR head", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      expect(
+        enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" }),
+      ).toBeUndefined();
+      expect(activeRows()).toHaveLength(1);
+      // `reviewFixPrParkedAtHead` is the observability half — it is what lets the dispatcher tell a
+      // suppressed target from a merely-idle one and log why (anton-bzm7s).
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1")).toBe(true);
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha2")).toBe(false);
+    });
+
+    it("lifts the suppression once the PR head SHA changes", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      // New commits landed on the PR — sha2 is exactly what a retry could act on.
+      const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha2" });
+      expect(b).toBeDefined();
+      expect(b).not.toBe(a);
+      expect(activeRows()).toHaveLength(2);
+    });
+
+    it("is per target, never project-wide — a second PR in review is dispatched normally", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-2", { headSha: "sha1" });
+      expect(b).toBeDefined();
+    });
+
+    it("does not suppress when no headSha is supplied — existing callers are unaffected", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeDefined();
+    });
+
+    it("a resumed (un-parked) job re-enqueues normally and is not re-suppressed", async () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      // A human resumes the parked job directly — resumeJob must not be suppressed by the head check.
+      expect(await resumeJob(t.db, systemClock, a)).toBe(true);
+      expect(t.db.select().from(schema.jobs).where(eq(schema.jobs.id, a)).all()[0].status).toBe(
+        "queued",
+      );
+
+      // The now-queued job covers the target via the ordinary ACTIVE_STATUSES dedupe.
+      expect(
+        enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" }),
+      ).toBeUndefined();
+      expect(activeRows()).toHaveLength(1);
+    });
   });
 
   // The dispatcher only triages; treating its in-flight poll as coverage would strand this target

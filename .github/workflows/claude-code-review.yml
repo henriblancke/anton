@@ -69,10 +69,10 @@ jobs:
       # could hang with no result after an internal error; they now report the error and
       # exit with code 1"; "Fixed a crash ('unrecoverable interface error') that could end
       # a session while an API request was being retried").
-      # Bumped 2.1.281 -> 2.1.282 (2026-09-24): same signature again on PR #322 —
-      # is_error:true, num_turns:1, total_cost_usd:0, ~400ms, init crash before any model
-      # turn, unrelated to this PR's diff. 2.1.282 is the latest published build at the
-      # time of this bump; re-check the changelog and bump further if this recurs.
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-25): same signature on PR #326 —
+      # is_error:true, num_turns:1, total_cost_usd:0, 425ms, no findings unrelated to this
+      # PR's own diff. Following this comment's own instruction: bump before assuming it's
+      # the PR's fault.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:

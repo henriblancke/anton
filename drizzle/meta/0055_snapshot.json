@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7da7e4b8-c293-4fa8-894d-aaa5558542a0",
-  "prevId": "6e40261d-f3b8-4200-8333-328e8766bff5",
+  "id": "26cb6fd9-cf33-4e6d-b315-e4e1f3027997",
+  "prevId": "7da7e4b8-c293-4fa8-894d-aaa5558542a0",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -954,6 +954,22 @@
         },
         "spent_attempts": {
           "name": "spent_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "quota_park_count": {
+          "name": "quota_park_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
+        },
+        "failure_park_count": {
+          "name": "failure_park_count",
           "type": "integer",
           "primaryKey": false,
           "notNull": true,
