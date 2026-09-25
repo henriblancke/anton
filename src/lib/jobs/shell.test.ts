@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { captureVerifyGates, KILL_GRACE_ENV, MAX_OUTPUT_ENV, runShell, runVerifyGates } from "./shell";
+import { isVerifyGateFailedError } from "./errors";
 import type { VerifyGate } from "../projects";
 
 // runVerifyGates is the shared backstop (anton-3oh8) that both execute-epic and review-fix run
@@ -47,6 +48,30 @@ describe("runVerifyGates (anton-3oh8)", () => {
     );
     // The build gate after the failing lint gate never ran.
     expect(() => readFileSync(marker)).toThrow();
+  });
+
+  it("throws a typed error carrying the red gate's label, command, exit code and output", async () => {
+    const gates: VerifyGate[] = [
+      { label: "tests", command: "true" },
+      { label: "lint", command: "echo boom >&2; exit 3" },
+    ];
+    let caught: unknown;
+    try {
+      await runVerifyGates(gates, dir, undefined, logPath, fail);
+    } catch (e) {
+      caught = e;
+    }
+    expect(isVerifyGateFailedError(caught)).toBe(true);
+    if (!isVerifyGateFailedError(caught)) throw new Error("unreachable");
+    // The message is byte-identical to what `onFail` built — unchanged for every caller.
+    expect(caught.message).toBe("lint failed (exit 3)");
+    expect(caught.outcome).toMatchObject({
+      label: "lint",
+      command: "echo boom >&2; exit 3",
+      ok: false,
+      code: 3,
+    });
+    expect(caught.outcome.output).toContain("boom");
   });
 
   it("is a no-op when there are no gates (unchanged behavior)", async () => {

@@ -4,6 +4,7 @@
  * become a PR — and both report rather than act, leaving the park/halt call to the caller.
  */
 import { resolveVerifyGates } from "../../projects";
+import { clearRunGateFailuresForBranch, updateRun } from "../../runs";
 import { endSession } from "../../sessions";
 import { runReviewGate } from "../review-gate";
 import { runVerifyGates } from "../shell";
@@ -19,7 +20,8 @@ import type { StepResult, StepResultWith } from "./result";
 export async function verifyStep(ctx: StepContext): Promise<StepResult> {
   const gates = resolveVerifyGates(ctx.settings);
   // No gates ⇒ nothing to run and nothing to record: return before a session is opened for an
-  // empty log.
+  // empty log. A project that pins none also proves nothing green, so a record from before they
+  // were unpinned is left alone rather than cleared by a gate that never ran.
   if (gates.length === 0) return { ok: true, detail: "no verify gates configured" };
 
   const subject = stepSubject(ctx).id;
@@ -37,11 +39,21 @@ export async function verifyStep(ctx: StepContext): Promise<StepResult> {
       ctx.ctx.signal,
       session.logPath,
       (gate, code) => `${gate.label} gate failed for ${subject} (exit ${code})`,
+      // Which bead and step went red, so the record the run settles with names where (anton-vynb8).
+      { beadId: subject, ...(ctx.step ? { stepId: ctx.step.id } : {}) },
     );
   } catch (e) {
     if (owned) await endSession(ctx.db, ctx.clock, session.sessionId, "failed");
     throw e;
   }
+  // The gates are green, so any failure the row still remembers describes a tree that no longer
+  // exists — and a next attempt opening with it would be sent after a bug that is already fixed
+  // (anton-vynb8). Cleared HERE, at the pass, rather than only at the settle: a run that goes green
+  // and later stops for some other reason must not carry a stale gate failure into its resume.
+  // Branch-wide, not just this row: the failure a next attempt would inherit sits on an EARLIER
+  // attempt's row (clearRunGateFailuresForBranch says why).
+  await updateRun(ctx.db, ctx.clock, ctx.runId, { lastGateFailure: null });
+  await clearRunGateFailuresForBranch(ctx.db, ctx.projectId, ctx.target.id, ctx.branch);
   if (owned) await endSession(ctx.db, ctx.clock, session.sessionId, "done");
   return { ok: true, detail: `${gates.length} gate(s) passed`, facts: { sessionIds: [session.sessionId] } };
 }

@@ -16,6 +16,7 @@ import {
   BODY_REGION_START,
   narrativeFieldLines,
   prBody,
+  type PromptGateFailure,
   stepTaskBlock,
   ticketPrompt,
   truncateField,
@@ -210,6 +211,63 @@ describe("ticketPrompt — the continuation block (anton-16pq)", () => {
 
     expect(ticketPrompt(fresh, undefined)).toBe(ticketPrompt(fresh));
     expect(ticketPrompt(fresh)).not.toContain("CONTINUATION");
+  });
+});
+
+describe("ticketPrompt — the recorded gate failure block (anton-ahsja)", () => {
+  const failure: PromptGateFailure = {
+    label: "test",
+    command: "bun run test",
+    code: 1,
+    output: "FAIL test_stt_stream_restart_midcall_is_transparent\nexpected true, got false",
+  };
+
+  it("names the gate, its command, its exit code, and the tail of its output", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), undefined, failure);
+
+    expect(prompt).toContain("**test** gate failed");
+    expect(prompt).toContain("`bun run test`");
+    expect(prompt).toContain("exited 1");
+    expect(prompt).toContain("test_stt_stream_restart_midcall_is_transparent");
+  });
+
+  // The block reports the class and the evidence and stops there (anton-4gnv): it never asserts
+  // this attempt's diff caused a failure recorded by a DIFFERENT attempt.
+  it("asks the agent to determine whether the failure is pre-existing, and never blames the agent", () => {
+    const prompt = ticketPrompt(ticket(), undefined, failure);
+
+    expect(prompt).toContain("PRE-EXISTING");
+    expect(prompt).toMatch(/figure out which/i);
+    expect(prompt).toMatch(/say so in your report/i);
+    expect(prompt).not.toMatch(/caused/i);
+    expect(prompt).not.toMatch(/you (broke|introduced)/i);
+    expect(prompt).not.toMatch(/your (diff|change|work) (broke|introduced)/i);
+  });
+
+  it("places the block after the spec", () => {
+    const prompt = ticketPrompt(ticket({ description: "## Goal\n\nShip it." }), undefined, failure);
+
+    expect(prompt.indexOf("A gate failed on a previous attempt")).toBeGreaterThan(
+      prompt.indexOf("Ship it."),
+    );
+  });
+
+  it("tails a long output and caps it, rather than heading it", () => {
+    const lines = Array.from({ length: 2000 }, (_, i) => `line ${i}`);
+    const long = ticketPrompt(ticket(), undefined, { ...failure, output: lines.join("\n") });
+
+    expect(long).not.toContain("line 0\n");
+    expect(long).toContain(`line ${lines.length - 1}`);
+    expect(long).toContain("[earlier output omitted]");
+  });
+
+  // The whole point of the gate this feeds: a ticket with no recorded failure reads exactly as it
+  // did before this block existed.
+  it("leaves a prompt with no recorded failure byte-identical", () => {
+    const fresh = ticket({ description: "## Goal\n\nShip it.", acceptance_criteria: "- [ ] ships" });
+
+    expect(ticketPrompt(fresh, undefined, undefined)).toBe(ticketPrompt(fresh));
+    expect(ticketPrompt(fresh)).not.toContain("A gate failed on a previous attempt");
   });
 });
 
