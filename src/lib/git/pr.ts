@@ -56,6 +56,8 @@ export interface PrReview {
   mergeable: string | null;
   /** The PR's head branch — the branch anton pushes fixes to. */
   headRefName: string;
+  /** The PR head's commit SHA — what distinguishes "same doomed input" from new commits (anton-bzm7s). */
+  headSha: string;
   url: string;
   /** Submitted reviews (latest state per reviewer as gh reports them). */
   reviews: Array<{ author: string; state: string; body: string }>;
@@ -72,6 +74,7 @@ interface GhPrView {
   reviewDecision: string | null;
   mergeable?: string | null;
   headRefName: string;
+  headRefOid?: string;
   url: string;
   reviews?: Array<{ author?: { login?: string }; state?: string; body?: string }>;
   statusCheckRollup?: Array<{
@@ -115,7 +118,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,headRefOid,url,reviews,statusCheckRollup",
     ],
     signal,
   );
@@ -140,6 +143,7 @@ export async function getPrReview(
     reviewDecision: view.reviewDecision ?? null,
     mergeable: view.mergeable ?? null,
     headRefName: view.headRefName,
+    headSha: view.headRefOid ?? "",
     url: view.url,
     reviews,
     failingChecks,
