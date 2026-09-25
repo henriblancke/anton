@@ -69,10 +69,17 @@ jobs:
       # could hang with no result after an internal error; they now report the error and
       # exit with code 1"; "Fixed a crash ('unrecoverable interface error') that could end
       # a session while an API request was being retried").
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-25): same signature again on PR #325 — is_error:true,
+      # num_turns:1, total_cost_usd:0, 350ms, no findings unrelated to this PR's own diff.
+      # 2.1.282's changelog has no entry naming this exact shape; bumping to latest anyway per
+      # the standing instruction above, since 2.1.281's "unrecoverable interface error" fix
+      # evidently didn't cover every path into this crash. If this still recurs on 2.1.282,
+      # the fix is likely upstream of what changelog entries alone can diagnose — consider
+      # turning on `show_full_output: true` to capture the real crash detail next time.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.281'
+          CLAUDE_CODE_VERSION: '2.1.282'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"
@@ -97,6 +104,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           path_to_claude_code_executable: ${{ steps.claude-install.outputs.exe }}
+          # The install-step comment above has bumped this pin three times chasing the same
+          # is_error:true/num_turns:1/total_cost_usd:0 crash, because the action normally hides
+          # the SDK's real output ("Running Claude Code via SDK (full output hidden for
+          # security)") — every bump so far has been a guess against a changelog entry, not a
+          # confirmed fix. Turn on full output so the next occurrence leaves an actual stack
+          # trace or error message in this job's log instead of another blind version bump.
+          show_full_output: true
           # Do NOT re-add `track_progress` / `use_sticky_comment`. They force the action into
           # tag mode, which pre-builds a prompt holding the entire PR context — including every
           # review comment AND its full `diffHunk`, with no cap (claude-code-action,
