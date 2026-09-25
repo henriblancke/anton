@@ -14,7 +14,7 @@ import type { SatisfiedSettlement } from "./context";
 import {
   narrativeFieldLines,
   prBody,
-  type RecordedGateFailure,
+  type PromptGateFailure,
   stepTaskBlock,
   ticketPrompt,
   truncateField,
@@ -212,7 +212,7 @@ describe("ticketPrompt — the continuation block (anton-16pq)", () => {
 });
 
 describe("ticketPrompt — the recorded gate failure block (anton-ahsja)", () => {
-  const failure: RecordedGateFailure = {
+  const failure: PromptGateFailure = {
     label: "test",
     command: "bun run test",
     code: 1,

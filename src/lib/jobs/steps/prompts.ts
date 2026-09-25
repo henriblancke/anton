@@ -28,8 +28,12 @@ export interface TicketPreserved {
  * can open with it instead of starting blind (anton-q0lpo). Same fields the reviewer already reads
  * off {@link VerifyGateOutcome} in `verifiedGatesSection` — this is the same evidence, shown one
  * stage earlier.
+ *
+ * Named distinctly from `gate-failure-record.ts`'s `RecordedGateFailure` (the persisted shape,
+ * which also carries `beadId`/`stepId`): this is only the subset the prompt renders. The persisted
+ * record satisfies this structurally, so callers pass it straight through.
  */
-export type RecordedGateFailure = Pick<VerifyGateOutcome, "label" | "command" | "code" | "output">;
+export type PromptGateFailure = Pick<VerifyGateOutcome, "label" | "command" | "code" | "output">;
 
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
@@ -167,7 +171,7 @@ export function truncateField(text: string): string {
 export function ticketPrompt(
   ticket: Bead,
   preserved?: PreservedCommit,
-  recordedFailure?: RecordedGateFailure,
+  recordedFailure?: PromptGateFailure,
 ): string {
   return [
     `Implement this beads ticket in the current worktree:`,
@@ -187,7 +191,7 @@ export function ticketPrompt(
  * ticket asks. Omitted entirely when nothing is recorded — a ticket with no gate history is
  * unchanged.
  */
-function recordedFailureSection(failure: RecordedGateFailure | undefined): string[] {
+function recordedFailureSection(failure: PromptGateFailure | undefined): string[] {
   if (!failure) return [];
   return [``, recordedFailurePromptBlock(failure)];
 }
@@ -203,7 +207,7 @@ function recordedFailureSection(failure: RecordedGateFailure | undefined): strin
  * that hit it is not this attempt, and the failure may be pre-existing and untouched by either. The
  * agent judges which; this block only asks it to say so in its report if that's what it finds.
  */
-function recordedFailurePromptBlock(failure: RecordedGateFailure): string {
+function recordedFailurePromptBlock(failure: PromptGateFailure): string {
   return [
     `## A gate failed on a previous attempt`,
     ``,
