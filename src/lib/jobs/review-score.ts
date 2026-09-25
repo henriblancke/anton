@@ -12,19 +12,21 @@
  */
 import { beads } from "../beads/bd";
 import { findingLines, type ReviewFinding } from "./review-context";
-import type { ReviewGateOutcome, ReviewGateResult, ReviewRound } from "./review-gate";
+import type { ReviewGateOutcome, ReviewGateResult, ReviewRound, ReviewScoreCap } from "./review-gate";
 
 /**
- * What a single round settled on. Only the LAST round can carry the gate's outcome — every earlier
- * round reported blocking findings, dispatched a fix for them, and was re-reviewed, which is exactly
- * what `fixed` records.
+ * What a single round settled on. Only the LAST round can carry the gate's outcome. Of the earlier
+ * rounds, most reported blocking findings, dispatched a fix for them, and were re-reviewed, which is
+ * exactly what `fixed` records — but a round the large-diff churn floor (anton-z8uv) forced to
+ * continue reported NOTHING blocking and dispatched no fix at all, so it earns `floor-continued`
+ * instead: `fixed` on that round would claim a repair that never happened.
  *
  * `interrupted` is the one verdict no gate OUTCOME produces: the gate died mid-round — a poison
  * worktree (an unrevertable reviewer commit, a fixer that switched branches), an exhausted quota, a
  * claude failure — and never returned a result at all, so the round it was in settled nothing. Named
  * for what the founder can tell from the comment alone: which of those it was is on the run row.
  */
-export type ReviewRoundVerdict = ReviewGateOutcome | "fixed" | "interrupted";
+export type ReviewRoundVerdict = ReviewGateOutcome | "fixed" | "floor-continued" | "interrupted";
 
 /** The machine-readable payload of one round's comment — the shape the score UI reads back. */
 export interface ReviewScoreEntry {
@@ -42,6 +44,24 @@ export interface ReviewScoreEntry {
    * that reported nothing.
    */
   findings?: ReviewFinding[];
+  /**
+   * Set when `score` was capped down from what the reviewer reported (anton-re02) — the diff it
+   * reviewed was truncated, so the board history states the cap and why rather than showing a bare
+   * number the founder would otherwise read as the reviewer's own verdict.
+   */
+  scoreCap?: ReviewScoreCap;
+  /**
+   * Set when this round's diff cleared the operator's churn threshold (anton-z8uv) — on the round(s)
+   * the floor forced as well as the final round that satisfied it. Carried through so the board says
+   * why a clean large diff still took extra rounds, not just that it did (anton-z8uv's 4th criterion).
+   */
+  churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
+  /**
+   * The paths this round's reviewer named as unable to fully review (anton-0b1d) — carried from
+   * `ReviewRound.unreviewedPaths` so the board states WHICH part of a large diff still has nobody's
+   * eyes on it, not just that it was truncated and the score capped.
+   */
+  unreviewedPaths?: string[];
 }
 
 /** Marks a comment as anton's score payload, so a reader can skip every other comment on the bead. */
@@ -72,9 +92,16 @@ function toEntries(rounds: ReviewRound[], final: ReviewRoundVerdict): ReviewScor
     ...(r.score !== undefined ? { score: r.score } : {}),
     blocking: r.blocking,
     advisory: r.advisory,
-    verdict: i === last ? final : ("fixed" as const),
+    // Every non-final round either dispatched a fix (`fixSessionId` set) or was a clean round the
+    // churn floor forced to continue (`churnFloorApplied` set, no fix session — anton-z8uv): those are
+    // the only two ways a round can end without being the gate's last. Labelling the second one
+    // `fixed` would claim a repair that was never dispatched.
+    verdict: i === last ? final : r.fixSessionId ? ("fixed" as const) : ("floor-continued" as const),
     ...(r.rationale ? { rationale: r.rationale } : {}),
     ...(r.findings?.length ? { findings: r.findings } : {}),
+    ...(r.scoreCap ? { scoreCap: r.scoreCap } : {}),
+    ...(r.churnFloorApplied ? { churnFloorApplied: r.churnFloorApplied } : {}),
+    ...(r.unreviewedPaths?.length ? { unreviewedPaths: r.unreviewedPaths } : {}),
   }));
 }
 
@@ -89,6 +116,16 @@ export function formatReviewScoreComment(entry: ReviewScoreEntry): string {
     `${entry.blocking} blocking, ${entry.advisory} advisory · ${entry.verdict}`;
   return [
     head,
+    ...(entry.scoreCap ? [`capped from ${entry.scoreCap.reported}/10 — ${entry.scoreCap.reason}`] : []),
+    ...(entry.churnFloorApplied
+      ? [
+          `large diff (${entry.churnFloorApplied.churnLines} lines ≥ ${entry.churnFloorApplied.thresholdLines}) — ` +
+            `the churn floor requires ${entry.churnFloorApplied.minRounds} round(s) of review before a clean exit`,
+        ]
+      : []),
+    ...(entry.unreviewedPaths?.length
+      ? [`unreviewed (truncated diff): ${entry.unreviewedPaths.join(", ")}`]
+      : []),
     ...(entry.rationale ? ["", entry.rationale] : []),
     ...(entry.findings?.length ? ["", ...findingLines(entry.findings)] : []),
     "",

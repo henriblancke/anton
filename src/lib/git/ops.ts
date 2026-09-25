@@ -3701,7 +3701,16 @@ export async function diffAgainstBase(
   const files = await diffPaths(worktreePath, ["--name-only", "--no-renames", from, "HEAD"]);
 
   const max = opts.maxPatchChars ?? DEFAULT_DIFF_PATCH_CHARS;
-  const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
+  // `core.quotePath=false`: `files` above is read with `-z`, so it carries real unquoted paths. The
+  // `diff --git a/... b/...` headers below are matched against those paths (review-context.ts's
+  // `unpatchedPaths`) to find what a truncated patch cut entirely — without this flag a non-ASCII
+  // path is C-quoted in the header (`"src/caf\303\251.ts"`) and never matches, so a fully-included
+  // file would be wrongly reported to the reviewer as carrying no hunk at all.
+  const { text, truncated } = await gitBounded(
+    worktreePath,
+    ["-c", "core.quotePath=false", "diff", from, "HEAD"],
+    max,
+  );
   if (!truncated) return { files, patch: text.trim(), truncated: false };
 
   const { patch: deletions, incomplete, unshown } = await deletionPatch(

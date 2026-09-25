@@ -14,6 +14,7 @@ const VERDICT_LABELS: Record<string, string> = {
   "protocol-violation": "no usable report — the review settled nothing",
   "score-regression": "parked — the score stopped moving",
   interrupted: "interrupted before it settled",
+  "floor-continued": "clean, but the large-diff floor demanded another look",
 };
 
 /** Only the verdicts that mean the run STOPPED are tinted; the rest are ordinary progress. */

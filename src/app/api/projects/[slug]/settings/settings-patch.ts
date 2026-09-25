@@ -22,6 +22,8 @@ import {
   TICKET_TIMEOUT_MINUTES_RANGE,
   MAX_RETRIES_RANGE,
   PUSH_TIMEOUT_MINUTES_RANGE,
+  REVIEW_CHURN_ROUND_FLOOR_RANGE,
+  REVIEW_CHURN_THRESHOLD_LINES_RANGE,
   REVIEW_LOW_SCORE_ROUNDS_RANGE,
   REVIEW_MAX_ROUNDS_RANGE,
   REVIEW_MIN_SCORE_RANGE,
@@ -88,7 +90,8 @@ const settingsField = <K extends keyof ProjectSettings & string>(
  * Numeric job-policy fields, including the autopilot breakers' thresholds. Several accept 0 as a
  * REAL value rather than a clear — it is how the operator turns that guard off: the score-regression
  * alarm (anton-i98r), the consecutive-failure breaker (anton-rgso), the score-regression breaker
- * (anton-cekf) and the WIP hold (anton-wy9y). The shared `null` / `""` clear leaves that intact.
+ * (anton-cekf), the WIP hold (anton-wy9y) and the large-diff round floor (anton-ecdl). The shared
+ * `null` / `""` clear leaves that intact.
  */
 const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("concurrency", integerInRange(CONCURRENCY_RANGE)),
@@ -101,6 +104,8 @@ const JOB_POLICY_FIELDS: readonly FieldRule<ProjectSettings>[] = [
   settingsField("reviewMaxRounds", integerInRange(REVIEW_MAX_ROUNDS_RANGE)),
   settingsField("reviewMinScore", integerInRange(REVIEW_MIN_SCORE_RANGE)),
   settingsField("reviewLowScoreRounds", integerInRange(REVIEW_LOW_SCORE_ROUNDS_RANGE)),
+  settingsField("reviewChurnThresholdLines", integerInRange(REVIEW_CHURN_THRESHOLD_LINES_RANGE)),
+  settingsField("reviewChurnRoundFloor", integerInRange(REVIEW_CHURN_ROUND_FLOOR_RANGE)),
   settingsField("autopilotFailureStreak", integerInRange(AUTOPILOT_FAILURE_STREAK_RANGE)),
   settingsField("autopilotScoreFloor", integerInRange(AUTOPILOT_SCORE_FLOOR_RANGE)),
   settingsField("autopilotScoreWindow", integerInRange(AUTOPILOT_SCORE_WINDOW_RANGE)),
