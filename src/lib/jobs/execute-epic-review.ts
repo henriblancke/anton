@@ -39,6 +39,8 @@ export function reviewFailureReason(review: ReviewGateResult, blocking: ReviewFi
       return `the reviewer scored the run without justifying the score`;
     case "trailing-content":
       return `the reviewer appended text after its report block`;
+    case "missing-coverage":
+      return `the reviewer's diff was truncated but it named no unreviewed paths`;
     default:
       return `the reviewer never reported a valid score`;
   }
@@ -217,6 +219,13 @@ function violationParkHead(review: ReviewGateResult, rounds: number): string {
         `(${review.outcome}) — no PR was opened, because trailing prose is where a reviewer retracts ` +
         `or corrects the verdict above it. Check that the reviewer ends its final message with the ` +
         `json block and nothing else.`
+      );
+    case "missing-coverage":
+      return (
+        `anton: the pre-PR self-review's diff was truncated but it named no unreviewed paths after ` +
+        `${rounds} round(s) (${review.outcome}) — no PR was opened, because a truncated review that ` +
+        `claims full coverage may be vouching for code it never read. Check that the reviewer emits ` +
+        `"unreviewedPaths" whenever the diff section reports the patch was cut.`
       );
     default:
       return (

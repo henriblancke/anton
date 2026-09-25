@@ -466,6 +466,70 @@ describe("runReviewGate — convergence", () => {
   });
 });
 
+/**
+ * The truncated-diff score cap (anton-re02): a review of a diff the gate could only read PART of
+ * cannot record a score in the anchored scale's ships-as-is band (8+) — the gate enforces this from
+ * `BranchDiff.truncated`, not from the reviewer's own claim to have limited its number. Bypasses the
+ * `gate()` helper above (whose fake diff is fixed at `truncated: false`), same as the churn-floor and
+ * base-pinning suites below.
+ */
+describe("runReviewGate — the truncated-diff score cap (anton-re02)", () => {
+  /** A reviewer report carrying `unreviewedPaths`, mandatory whenever the diff is truncated. */
+  function truncatedReport(score: number): string {
+    return [
+      "reviewed.",
+      "```json",
+      JSON.stringify({ score, rationale: `scored ${score}`, findings: [], unreviewedPaths: ["src/a.ts"] }),
+      "```",
+    ].join("\n");
+  }
+
+  function gateOverDiff(reply: string, diffToRead: BranchDiff) {
+    const { run } = fakeClaude([reply]);
+    const worktree = fakeWorktree();
+    return runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      target,
+      tickets: [ticket],
+      settings: {},
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diffToRead,
+        commit: async () => ({ committed: true }),
+        readState: worktree.readState,
+        restoreState: worktree.restoreState,
+      },
+    });
+  }
+
+  it("caps a 9 reported on a truncated diff below the ships-as-is band, with the reason recorded", async () => {
+    const out = await gateOverDiff(truncatedReport(9), { ...diff, truncated: true });
+
+    expect(out.outcome).toBe("clean");
+    expect(out.score).toBe(7);
+    expect(out.rounds).toHaveLength(1);
+    expect(out.rounds[0].score).toBe(7);
+    expect(out.rounds[0].scoreCap).toMatchObject({ reported: 9 });
+    expect(out.rounds[0].scoreCap?.reason).toContain("truncated");
+    expect(out.rounds[0].unreviewedPaths).toEqual(["src/a.ts"]);
+  });
+
+  it("passes the same 9 through untouched on an untruncated diff", async () => {
+    const out = await gateOverDiff(report(9, []), { ...diff, truncated: false });
+
+    expect(out.outcome).toBe("clean");
+    expect(out.score).toBe(9);
+    expect(out.rounds[0].score).toBe(9);
+    expect(out.rounds[0].scoreCap).toBeUndefined();
+    expect(out.rounds[0].unreviewedPaths).toBeUndefined();
+  });
+});
+
 describe("runReviewGate — bounds", () => {
   it("stops at reviewMaxRounds with the unresolved findings rather than looping forever", async () => {
     const stubborn = report(5, [BLOCKING, ADVISORY]);
@@ -1552,5 +1616,119 @@ describe("runReviewGate — what produced each invocation", () => {
     // driver call sets no `appendSystemPrompt` for `metered` to digest on its own.
     expect(rows[0].promptBodyDigest).toMatch(/^[0-9a-f]{12}$/);
     expect(rows[0].skillId).toBeNull();
+  });
+});
+
+describe("runReviewGate — the large-diff round floor (anton-z8uv)", () => {
+  /**
+   * Drives the gate with a fake churn measure, bypassing the `gate()` helper above (which has no
+   * seam for it) — the churn floor's own deps, everything else identical to a bare `runReviewGate`
+   * call.
+   */
+  function gateWithChurn(
+    replies: ScriptedReply[],
+    settings: ProjectSettings,
+    churnLines: number,
+  ): { result: Promise<ReviewGateResult>; calls: RunClaudeOptions[] } {
+    const { run, calls } = fakeClaude(replies);
+    const worktree = fakeWorktree();
+    const result = runReviewGate({
+      db: tdb.db,
+      clock,
+      ctx,
+      projectId,
+      target,
+      tickets: [ticket],
+      settings,
+      worktreePath: dir,
+      baseBranch: "main",
+      deps: {
+        runClaude: run,
+        diff: async () => diff,
+        commit: async () => ({ committed: true }),
+        readState: worktree.readState,
+        restoreState: worktree.restoreState,
+        churn: async () => churnLines,
+      },
+    });
+    return { result, calls };
+  }
+
+  it("runs a second, fresh review before a large-churn diff can exit clean", async () => {
+    const { result, calls } = gateWithChurn(
+      [report(9, []), report(9, [])],
+      { reviewChurnThresholdLines: 100, reviewChurnRoundFloor: 2 },
+      500, // above the 100-line threshold
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds).toHaveLength(2);
+    // A THIRD scripted reply is never consumed, and `fakeClaude` throws on an unscripted dispatch —
+    // so this only passes if round 2 was a genuine second claude call, not a re-parse of round 1.
+    expect(calls).toHaveLength(2);
+    expect(out.churnFloorApplied).toEqual({ churnLines: 500, thresholdLines: 100, minRounds: 2 });
+    // Round 1 reported nothing blocking and dispatched no fix — the floor alone forced round 2. Its
+    // OWN round record has to carry that (anton-re02 follow-up), because the board history
+    // (review-score.ts) reads per-round state, never the gate's overall outcome, to label round 1.
+    expect(out.rounds[0].fixSessionId).toBeUndefined();
+    expect(out.rounds[0].churnFloorApplied).toEqual({ churnLines: 500, thresholdLines: 100, minRounds: 2 });
+  });
+
+  it("exits a clean round 1 in one round when the diff sits below the threshold", async () => {
+    const { result, calls } = gateWithChurn(
+      [report(9, [])],
+      { reviewChurnThresholdLines: 100, reviewChurnRoundFloor: 2 },
+      50, // below the 100-line threshold
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds).toHaveLength(1);
+    expect(calls).toHaveLength(1); // no added cost on a small diff
+    expect(out.churnFloorApplied).toBeUndefined();
+  });
+
+  it("never pushes the loop past the configured maxRounds", async () => {
+    const { result, calls } = gateWithChurn(
+      [report(9, []), report(9, [])],
+      { reviewChurnThresholdLines: 100, reviewChurnRoundFloor: 5, reviewMaxRounds: 2 },
+      500, // above the threshold, and the floor asks for 5 — the cap wins
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds).toHaveLength(2); // capped at reviewMaxRounds, not the floor's 5
+    expect(calls).toHaveLength(2);
+    expect(out.churnFloorApplied).toEqual({ churnLines: 500, thresholdLines: 100, minRounds: 5 });
+  });
+
+  it("turns off with a round floor of 0 — the operator's off switch", async () => {
+    const { result, calls } = gateWithChurn(
+      [report(9, [])],
+      { reviewChurnThresholdLines: 100, reviewChurnRoundFloor: 0 },
+      500, // above the threshold, but the floor itself is disabled
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    expect(out.rounds).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+    expect(out.churnFloorApplied).toBeUndefined();
+  });
+
+  it("still fixes a blocking finding while the floor is pending, then runs its extra round", async () => {
+    const { result, calls } = gateWithChurn(
+      [report(4, [BLOCKING]), "fixed the loop bound", report(9, []), report(9, [])],
+      { reviewChurnThresholdLines: 100, reviewChurnRoundFloor: 3, reviewMaxRounds: 4 },
+      500,
+    );
+    const out = await result;
+
+    expect(out.outcome).toBe("clean");
+    // review(blocking) -> fix -> review(clean, floor not yet met) -> review(clean, floor met)
+    expect(out.rounds).toHaveLength(3);
+    expect(calls).toHaveLength(4);
+    expect(out.churnFloorApplied).toEqual({ churnLines: 500, thresholdLines: 100, minRounds: 3 });
   });
 });

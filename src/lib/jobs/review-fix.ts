@@ -62,9 +62,11 @@ import {
   mergeIntoCurrent,
   needsHooksPathOverrideForMerge,
   pushBranch,
+  readPullRequestBody,
   resolveHooksPathOverride,
   resolveHooksPathOverrideForMerge,
   stageAll,
+  updatePullRequestBody,
 } from "../git/ops";
 import {
   ANTON_MARK,
@@ -107,9 +109,12 @@ import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import {
   buildReviewFixPrompt,
+  fabricatedFix,
   parseThreadReport,
   type ThreadOutcome,
 } from "./review-fix-context";
+import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
+import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
 import { finalizeMergedEpic } from "./review-fix-finalize";
@@ -705,6 +710,17 @@ async function runFixSession(args: {
       // (network stall, process kill) (PR #320 review).
       await endSession(db, clock, sessionId, "done", pushed);
       sessionSettled = true;
+      // This path never dispatches claude, so there's no thread report to parse — `verdict.reasons`
+      // is the only summary of what this round pushed (PR #321 review).
+      await refreshFixRoundsBody({
+        repo,
+        number,
+        report: [],
+        pushed,
+        now: new Date(clock.now()),
+        logPath,
+        reasons: verdict.reasons,
+      });
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
       return pushed;
     }
@@ -787,14 +803,19 @@ async function runFixSession(args: {
     await endSession(db, clock, sessionId, "done", pushed);
     sessionSettled = true;
 
-    await applyThreadOutcomes({
+    const report = parseThreadReport(result.text);
+    await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
+    // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
+    // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
+    // no thread report (CI-only/conflict-only/no-inline-threads trigger).
+    await refreshFixRoundsBody({
       repo,
       number,
-      pr,
-      report: parseThreadReport(result.text),
+      report,
       pushed,
-      signal: ctx.signal,
+      now: new Date(clock.now()),
       logPath,
+      reasons: verdict.reasons,
     });
 
     if (!pushed) {
@@ -1024,10 +1045,6 @@ export async function applyThreadOutcomes(args: {
   }
 }
 
-/** A "fixed" claim with nothing pushed behind it — left untouched rather than answered. */
-const fabricatedFix = (item: ThreadOutcome, pushed: boolean): boolean =>
-  item.outcome === "fixed" && !pushed;
-
 /** Reply on the thread, resolve it when the fix landed, and log what was said. */
 async function recordThreadOutcome(
   args: ThreadReplyArgs,
@@ -1047,6 +1064,55 @@ async function recordThreadOutcome(
     logPath,
     `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
   );
+}
+
+/**
+ * Refresh the PR body's review-fix-rounds region with what THIS round fixed (anton-te6nr), reusing
+ * the fixer's own per-thread report rather than a fresh LLM call. Runs strictly AFTER the push (the
+ * caller only reaches this once `pushed` is known), so the body never claims a fix that isn't on
+ * the remote yet — and touches `gh` not at all for a round that pushed nothing, or has nothing
+ * worth naming: {@link fixRoundFrom} answers that cheaply, before any network call. `reasons` names
+ * this round's own trigger and backs a fallback entry when the report has no thread outcomes at all
+ * (a CI-only or merge-conflict-only round, which never emits a reporting contract to parse).
+ *
+ * Every `gh` step here is best-effort by construction (`readPullRequestBody`/`updatePullRequestBody`
+ * already catch and report a boolean, same as `bodyStale` in `openPullRequest`) — a failure is
+ * logged and this function returns normally, exactly like the review gate's own refusal-is-reported
+ * precedent. The caller's session has already been marked `done` by the time this runs, so nothing
+ * here can turn a delivered push into a failed job.
+ */
+export async function refreshFixRoundsBody(args: {
+  repo: string;
+  number: number;
+  report: ThreadOutcome[];
+  pushed: boolean;
+  now: Date;
+  logPath: string;
+  /** Verdict reasons this round acted on — the fallback entry when no thread report survives. */
+  reasons?: string[];
+}): Promise<void> {
+  const { repo, number, report, pushed, now, logPath, reasons = [] } = args;
+  if (!pushed) return;
+  if (!fixRoundFrom(report, pushed, now, reasons)) return; // nothing to say this round — no gh call
+  const selector = String(number);
+  const currentBody = await readPullRequestBody(repo, selector);
+  if (currentBody === undefined) {
+    await appendSessionLog(
+      logPath,
+      `[review-fix] could not read PR #${number}'s body to refresh its review-fix rounds\n`,
+    );
+    return;
+  }
+  const content = nextFixRoundsRegion(currentBody, report, pushed, now, reasons);
+  if (!content) return; // defensive; fixRoundFrom above already confirmed there's something to say
+  const { body, skipped } = upsertBodyRegion(currentBody, content);
+  if (skipped) return; // upsertBodyRegion already warned why
+  if (!(await updatePullRequestBody(repo, selector, body))) {
+    await appendSessionLog(
+      logPath,
+      `[review-fix] could not write the review-fix-rounds update to PR #${number}'s body\n`,
+    );
+  }
 }
 
 /** What anton says on a thread claude reported without a reply of its own. */

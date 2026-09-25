@@ -4,12 +4,22 @@
  * own exhaustive tests; this file's job is only to prove the wiring itself: the right beads get
  * queried, the right rows come back, and an unresolvable project is told apart from a resolved scope
  * that recorded nothing.
+ *
+ * The friction half (anton-sdz00) is tested the same way. Every counter is proved in isolation by
+ * `feature-ledger.friction.test.ts`; what is proved here is that each one is fed from the source
+ * that actually holds it, over a scope that spent money AND took interventions — a field wired to
+ * the wrong table reads zero, which is indistinguishable from a quiet feature until a fixture makes
+ * it move.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReviewScoreEntry } from "./jobs/review-score";
 import { beads, type Bead } from "./beads/bd";
+import { formatHumanNote } from "./beads/notes";
 import { resetIssueSnapshots } from "./beads/snapshot";
 import * as schema from "./db/schema";
 import { featureLedger } from "./feature-ledger-read";
+import { formatReviewScoreComment } from "./jobs/review-score";
+import { originNoteBody } from "./rework-notes";
 import { makeProjectDb, type TestProjectDb } from "./testing/project";
 
 const bead = (over: Partial<Bead> & { id: string }): Bead =>
@@ -25,11 +35,26 @@ function fakeBoard(board: Bead[]) {
   return vi.spyOn(beads, "list").mockImplementation(async () => [...board]);
 }
 
+/**
+ * The run target's hydrated comment thread — the one friction source that is not a table. Defaults
+ * to an empty thread so every existing case reads as "never reviewed" rather than throwing on the
+ * unmocked bd spawn.
+ */
+function fakeThread(rounds: ReviewScoreEntry[] = []) {
+  return vi.spyOn(beads, "showWithComments").mockImplementation(async (_cwd, id) => ({
+    ...bead({ id }),
+    comments: rounds.map((entry) => ({ text: formatReviewScoreComment(entry) })),
+  }));
+}
+
 let t: TestProjectDb;
 
 beforeEach(() => {
   resetIssueSnapshots();
   t = makeProjectDb({ repoPath: "/repo" });
+  // Every case reaches the review thread, so the bd spawn is stubbed by default; a case that cares
+  // about the rounds re-stubs it with its own.
+  fakeThread();
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -156,5 +181,213 @@ describe("featureLedger", () => {
     const ledger = await featureLedger(t.db, t.projectId, "feat-1");
 
     expect(ledger?.totals.recorded).toBe(false);
+  });
+});
+
+describe("featureLedger's friction half", () => {
+  /** A job of `type` for `epicBeadId`, in the status the counter reads it at. */
+  async function seedJob(row: {
+    id: string;
+    type: string;
+    epicBeadId: string;
+    status: string;
+    lastError?: string;
+    quotaParkCount?: number;
+    failureParkCount?: number;
+  }): Promise<void> {
+    await t.db.insert(schema.jobs).values({
+      id: row.id,
+      type: row.type,
+      projectId: t.projectId,
+      payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId: row.epicBeadId }),
+      status: row.status,
+      ...(row.lastError ? { lastError: row.lastError } : {}),
+      ...(row.quotaParkCount ? { quotaParkCount: row.quotaParkCount } : {}),
+      ...(row.failureParkCount ? { failureParkCount: row.failureParkCount } : {}),
+    });
+  }
+
+  async function seedEscalation(row: {
+    id: string;
+    kind: string;
+    beadId?: string;
+    epicBeadId?: string;
+    status?: string;
+  }): Promise<void> {
+    await t.db.insert(schema.escalations).values({
+      id: row.id,
+      projectId: t.projectId,
+      findingKey: `${row.kind}:${row.id}`,
+      kind: row.kind,
+      reason: "stalled",
+      ...(row.beadId ? { beadId: row.beadId } : {}),
+      ...(row.epicBeadId ? { epicBeadId: row.epicBeadId } : {}),
+      status: row.status ?? "open",
+    });
+  }
+
+  it("returns friction beside the phases, totals and timing, each counter from its own source", async () => {
+    // One feature that both SPENT and took interventions — the composed answer a surface reads.
+    fakeBoard([
+      BOARD[0]!,
+      bead({
+        id: "task-1",
+        parent: "feat-1",
+        notes: formatHumanNote(
+          originNoteBody("anton-followup"),
+          "Henri Blancke",
+          new Date("2026-09-20T11:00:00Z"),
+        ),
+      }),
+    ]);
+    fakeThread([
+      { round: 1, blocking: 2, advisory: 0, verdict: "fixed" },
+      { round: 2, blocking: 0, advisory: 0, verdict: "clean" },
+    ]);
+    await seedInvocation({
+      id: "i1",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 10 * 60_000,
+    });
+    await seedJob({ id: "j1", type: "review-fix-pr", epicBeadId: "feat-1", status: "done" });
+    await seedJob({ id: "j2", type: "execute-epic", epicBeadId: "feat-1", status: "cancelled" });
+    await seedJob({
+      id: "j3",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "queued",
+      lastError: "usage-limit: resumes at 2026-09-21T02:00:00Z",
+      quotaParkCount: 1,
+    });
+    // A gate raised on the TICKET and a park raised on the TARGET — both are this feature's.
+    await seedEscalation({ id: "e1", kind: "needs-human", beadId: "task-1" });
+    await seedEscalation({ id: "e2", kind: "parked-run", epicBeadId: "feat-1" });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    // The spend half still answers, from the same resolved scope.
+    expect(ledger?.totals.recorded).toBe(true);
+    expect(ledger?.timing.activeMs).toBe(10 * 60_000);
+    expect(ledger?.friction).toEqual({
+      reviewRounds: 2,
+      prFixRounds: 1,
+      escalations: 2,
+      humanGates: 1,
+      nonGateEscalations: 1,
+      sendBacks: 1,
+      cancels: 1,
+      quotaParks: 1,
+      failureParks: 0,
+      // The gate, the non-gate escalation, the send-back and the cancel. The quota park and anton's
+      // own review and PR-fix rounds are reported beside the sum, never inside it.
+      humanTouches: 4,
+    });
+  });
+
+  it("reports zero friction for a feature that recorded spend and nothing else", async () => {
+    fakeBoard(BOARD);
+    await seedInvocation({
+      id: "i1",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 5 * 60_000,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.totals.recorded).toBe(true);
+    expect(ledger?.friction.humanTouches).toBe(0);
+    expect(ledger?.friction.reviewRounds).toBe(0);
+  });
+
+  it("reports zero human touches for a feature parked on quota twice and never touched", async () => {
+    // Two usage-limit parks, nothing else in the scope — proves the count through the real
+    // `jobsForBeads` json_extract query rather than the pure fold, which a status-filter regression
+    // in that SQL (e.g. excluding queued rows) would not otherwise catch.
+    fakeBoard(BOARD);
+    // Different job types — `jobs_active_epic_unique` allows only one active (queued|running) job
+    // per (type, project, epicBeadId), so two quota parks on the same epic need distinct types.
+    await seedJob({
+      id: "j1",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "queued",
+      lastError: "usage-limit: resumes at 2026-09-21T02:00:00Z",
+      quotaParkCount: 1,
+    });
+    await seedJob({
+      id: "j2",
+      type: "review-fix",
+      epicBeadId: "feat-1",
+      status: "queued",
+      lastError: "usage-limit: resumes at 2026-09-22T02:00:00Z",
+      quotaParkCount: 1,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.friction.quotaParks).toBe(2);
+    expect(ledger?.friction.humanTouches).toBe(0);
+  });
+
+  it("leaves a sibling feature's jobs and escalations out of the scope", async () => {
+    fakeBoard([...BOARD, bead({ id: "feat-2", issue_type: "feature" })]);
+    await seedJob({ id: "j1", type: "execute-epic", epicBeadId: "feat-2", status: "cancelled" });
+    await seedEscalation({ id: "e1", kind: "needs-human", beadId: "feat-2" });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.friction.cancels).toBe(0);
+    expect(ledger?.friction.escalations).toBe(0);
+  });
+
+  it("attributes a reparented gate to its NEW feature only, not the one it was raised under", async () => {
+    // The row `raiseEscalation` wrote back when task-1 still lived under feat-1: `epicBeadId` is
+    // frozen at "feat-1" forever, but `beadId` (task-1's own, never-reassigned id) now falls under
+    // feat-2 on the board this test hands both reads. Matching on either frozen column independently
+    // would bill this one gate to both features (PR #322 review); the fix must bill it to exactly
+    // the one the board says owns task-1 right now.
+    fakeBoard([
+      bead({ id: "feat-1", issue_type: "feature" }),
+      bead({ id: "feat-2", issue_type: "feature" }),
+      bead({ id: "task-1", parent: "feat-2" }),
+    ]);
+    await seedEscalation({ id: "e1", kind: "needs-human", beadId: "task-1", epicBeadId: "feat-1" });
+
+    const oldFeature = await featureLedger(t.db, t.projectId, "feat-1");
+    const newFeature = await featureLedger(t.db, t.projectId, "feat-2");
+
+    expect(oldFeature?.friction.escalations).toBe(0);
+    expect(newFeature?.friction.escalations).toBe(1);
+  });
+
+  it("still answers the cost half when the review thread cannot be read", async () => {
+    // The footnote must not cost the answer: an unreadable comment thread reports no rounds, and
+    // the dollars and timing — which come from anton.db — are unaffected.
+    fakeBoard(BOARD);
+    vi.spyOn(beads, "showWithComments").mockRejectedValue(new Error("bd exploded"));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await seedInvocation({
+      id: "i1",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 5 * 60_000,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.totals.recorded).toBe(true);
+    expect(ledger?.friction.reviewRounds).toBe(0);
+  });
+
+  it("counts an escalation a founder already settled — it interrupted them either way", async () => {
+    fakeBoard(BOARD);
+    await seedEscalation({ id: "e1", kind: "needs-human", beadId: "feat-1", status: "resolved" });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.friction.humanGates).toBe(1);
+    expect(ledger?.friction.humanTouches).toBe(1);
   });
 });

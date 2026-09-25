@@ -69,13 +69,19 @@ jobs:
       # could hang with no result after an internal error; they now report the error and
       # exit with code 1"; "Fixed a crash ('unrecoverable interface error') that could end
       # a session while an API request was being retried").
-      # Bumped 2.1.281 -> 2.1.282 (2026-09-25): same signature again on PR #323 and PR #326 —
-      # is_error:true, num_turns:1, total_cost_usd:0, ~385-425ms, before the first model turn,
-      # no findings unrelated to either PR's own diff. No single 2.1.282 changelog line names
-      # this crash shape explicitly; bumping to the latest pinned-good release is this file's
-      # standing remedy for the signature (see the two notes above), not a fix verified against
-      # a specific changelog entry this time. Following this comment's own instruction: bump
-      # before assuming it's the PR's fault.
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-24): same signature again on PR #321 —
+      # is_error:true, num_turns:1, total_cost_usd:0, ~400ms, no findings unrelated to this
+      # PR's own diff. Upstream (anthropics/claude-code-action#947) confirms this class of
+      # crash is still being reported against recent CLI builds, so this bump is the same
+      # documented mitigation as before, not a confirmed fix — if it recurs, bump further
+      # and check the changelog rather than assuming the PR's diff is at fault.
+      # Same signature again (2026-09-25) on PR #323 and PR #326 — is_error:true, num_turns:1,
+      # total_cost_usd:0, ~385-425ms, before the first model turn, no findings unrelated to
+      # either PR's own diff. No single 2.1.282 changelog line names this crash shape
+      # explicitly, so this is the same standing remedy repeated, not a fix verified against a
+      # specific changelog entry this time. Following this comment's own instruction: bump
+      # before assuming it's the PR's fault — version stays at 2.1.282, already the latest
+      # pinned-good release.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:

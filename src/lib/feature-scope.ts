@@ -32,7 +32,7 @@
  * instead of pulling them into the pure half.
  */
 import { beads, type Bead } from "./beads/bd";
-import { runTickets } from "./ticket-view";
+import { boardCards, runTickets } from "./ticket-view";
 
 /** The ids one feature's ledger folds over, and the board fact behind them. */
 export interface LedgerScope {
@@ -93,4 +93,27 @@ export function ledgerScope(board: Bead[], beadId: string): LedgerScope {
 export function hasLedgerScope(board: Bead[], beadId: string): boolean {
   const target = board.find((b) => b.id === beadId);
   return target !== undefined && beads.isRunTarget(target, board);
+}
+
+/**
+ * The run target `beadId` belongs to RIGHT NOW, per the same card-walk {@link ledgerScope} uses —
+ * `beadId` itself when it already is one, otherwise `boardCards(board).cardOf` on it.
+ *
+ * A friction source (`escalations.ts`) freezes the target it resolved to at RAISE time in a column,
+ * and a ticket reparented afterward leaves that column stale while the ticket's OWN id (never
+ * reassigned) still resolves correctly through the board's current structure. Matching a scope
+ * against the frozen column double-counts across the old and new feature; matching it against this
+ * function's answer does not, because it always re-derives the walk from the board the caller is
+ * holding right now (PR #322 review).
+ *
+ * `beadId` unchanged when the board holds no bead by that id (purged) or no card sits above it
+ * (pipeline plumbing, a task parented directly on a container epic) — neither is a real run target,
+ * so the id simply matches no scope's `beadId`, the same "orphaned, not reattributed" behavior
+ * {@link ledgerScope} already gives a purged id.
+ */
+export function currentRunTargetOf(board: Bead[], beadId: string): string {
+  const bead = board.find((b) => b.id === beadId);
+  if (!bead) return beadId;
+  if (beads.isRunTarget(bead, board)) return beadId;
+  return boardCards(board).cardOf(bead) ?? beadId;
 }

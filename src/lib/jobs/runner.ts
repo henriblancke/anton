@@ -2128,6 +2128,7 @@ export class JobRunner {
         await reschedule(this.db, this.clock, job.id, action.runAtMs, {
           lastError: action.lastError,
           refundAttempt: action.refundAttempt,
+          quotaPark: outcome.kind === "quota",
         });
         break;
       case "park":

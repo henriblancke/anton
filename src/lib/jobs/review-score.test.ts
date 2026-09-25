@@ -31,7 +31,16 @@ describe("reviewScoreEntries", () => {
       result({
         outcome: "unresolved",
         rounds: [
-          { round: 1, reviewSessionId: "s1", score: 4, blocking: 2, advisory: 1, rationale: "gaps" },
+          {
+            round: 1,
+            reviewSessionId: "s1",
+            score: 4,
+            blocking: 2,
+            advisory: 1,
+            rationale: "gaps",
+            fixSessionId: "f1",
+            fixCommitted: true,
+          },
           { round: 2, reviewSessionId: "s2", score: 6, blocking: 1, advisory: 1 },
         ],
       }),
@@ -39,6 +48,27 @@ describe("reviewScoreEntries", () => {
     expect(entries).toEqual([
       { round: 1, score: 4, blocking: 2, advisory: 1, verdict: "fixed", rationale: "gaps" },
       { round: 2, score: 6, blocking: 1, advisory: 1, verdict: "unresolved" },
+    ]);
+  });
+
+  // anton-hk9z: a round the churn floor forced to continue (anton-z8uv) reported nothing blocking
+  // and dispatched no fix — labelling it `fixed`, as every other non-final round is, would fabricate
+  // a repair that never happened. Its own `churnFloorApplied` marker is what tells the two apart.
+  it("gives a floor-forced round its own verdict, distinct from a round that actually dispatched a fix", () => {
+    const churnFloorApplied = { churnLines: 500, thresholdLines: 100, minRounds: 2 };
+    const entries = reviewScoreEntries(
+      result({
+        outcome: "clean",
+        churnFloorApplied,
+        rounds: [
+          { round: 1, reviewSessionId: "s1", score: 9, blocking: 0, advisory: 0, churnFloorApplied },
+          { round: 2, reviewSessionId: "s2", score: 9, blocking: 0, advisory: 0, churnFloorApplied },
+        ],
+      }),
+    );
+    expect(entries).toEqual([
+      { round: 1, score: 9, blocking: 0, advisory: 0, verdict: "floor-continued", churnFloorApplied },
+      { round: 2, score: 9, blocking: 0, advisory: 0, verdict: "clean", churnFloorApplied },
     ]);
   });
 
@@ -52,13 +82,57 @@ describe("reviewScoreEntries", () => {
     expect(entry.score).toBeUndefined();
     expect(entry.verdict).toBe("protocol-violation");
   });
+
+  // anton-0b1d: a truncated review that never named its unreviewed paths reaches the board the same
+  // way every other protocol violation does — no special-casing, no score, the round's outcome as the
+  // verdict — so the founder sees it and reads the same as any other parked round.
+  it("records a truncated review with no coverage field as its own violation, not a score", () => {
+    const [entry] = reviewScoreEntries(
+      result({
+        outcome: "protocol-violation",
+        rounds: [{ round: 1, reviewSessionId: "s1", violation: "missing-coverage", blocking: 0, advisory: 0 }],
+      }),
+    );
+    expect(entry.score).toBeUndefined();
+    expect(entry.verdict).toBe("protocol-violation");
+  });
+
+  // anton-hk9z: the specific paths a truncated round's reviewer could not fully read have to survive
+  // onto the board entry — a founder reading the score history can otherwise only tell that SOME part
+  // of a large diff went unreviewed, never which part.
+  it("carries a truncated round's unreviewedPaths through to its entry", () => {
+    const [entry] = reviewScoreEntries(
+      result({
+        outcome: "clean",
+        rounds: [
+          {
+            round: 1,
+            reviewSessionId: "s1",
+            score: 7,
+            blocking: 0,
+            advisory: 0,
+            unreviewedPaths: ["src/a.ts", "src/b.ts"],
+          },
+        ],
+      }),
+    );
+    expect(entry.unreviewedPaths).toEqual(["src/a.ts", "src/b.ts"]);
+  });
 });
 
 describe("partialReviewScoreEntries", () => {
   it("marks only the round the gate DIED in, so the earlier ones still read as fixed", () => {
     expect(
       partialReviewScoreEntries([
-        { round: 1, reviewSessionId: "s1", score: 4, blocking: 2, advisory: 0 },
+        {
+          round: 1,
+          reviewSessionId: "s1",
+          score: 4,
+          blocking: 2,
+          advisory: 0,
+          fixSessionId: "f1",
+          fixCommitted: true,
+        },
         { round: 2, reviewSessionId: "s2", score: 6, blocking: 1, advisory: 1, rationale: "closer" },
       ]),
     ).toEqual([
@@ -82,6 +156,31 @@ describe("formatReviewScoreComment", () => {
     expect(text).toContain("solid, three nits");
     const payload = JSON.parse(/```json\s*\n([\s\S]*?)```/.exec(text)![1]);
     expect(payload).toMatchObject({ kind: REVIEW_SCORE_KIND, round: 2, score: 7, verdict: "clean" });
+  });
+
+  it("says why a clean large diff still took extra rounds, not just that it did", () => {
+    const text = formatReviewScoreComment({
+      round: 1,
+      score: 9,
+      blocking: 0,
+      advisory: 0,
+      verdict: "floor-continued",
+      churnFloorApplied: { churnLines: 500, thresholdLines: 100, minRounds: 2 },
+    });
+    expect(text).toContain("large diff (500 lines ≥ 100)");
+    expect(text).toContain("requires 2 round(s)");
+  });
+
+  it("names the paths a truncated round could not fully review", () => {
+    const text = formatReviewScoreComment({
+      round: 1,
+      score: 7,
+      blocking: 0,
+      advisory: 0,
+      verdict: "clean",
+      unreviewedPaths: ["src/a.ts", "src/b.ts"],
+    });
+    expect(text).toContain("unreviewed (truncated diff): src/a.ts, src/b.ts");
   });
 
   it("says so plainly when the round produced no score", () => {
