@@ -24,6 +24,7 @@ import {
   makeReviewFixHandler,
   notifyGateParked,
   parseThreadReport,
+  prepareFixWorktree,
   refreshFixRoundsBody,
   resolveReviewFixModel,
   runTestGate,
