@@ -25,6 +25,7 @@ import {
   notifyGateParked,
   parseThreadReport,
   prepareFixWorktree,
+  refreshFixRoundsBody,
   resolveReviewFixModel,
   runTestGate,
   type ThreadOutcome,
@@ -819,6 +820,171 @@ process.exit(0);
 
     const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
     expect(reply).toBeDefined();
+  });
+});
+
+/**
+ * `refreshFixRoundsBody` (anton-te6nr) exercised directly against a fake `gh` binary — real
+ * `readPullRequestBody` / `updatePullRequestBody` run, and every invocation is logged so a test can
+ * assert on it. `nextFixRoundsRegion`'s content-building is covered at the unit level in
+ * review-fix-body.test.ts; this spec is about when `gh` is (and is not) reached, and what happens
+ * when it fails.
+ */
+describe("refreshFixRoundsBody (anton-te6nr)", () => {
+  let sandbox: string;
+  let binDir: string;
+  let logFile: string;
+  let bodyStore: string;
+  let logPath: string;
+  let prevGh: string | undefined;
+  let prevFailRead: string | undefined;
+  let prevFailWrite: string | undefined;
+
+  /** Fake gh: `pr view --json body` reads `bodyStore`, `pr edit --body` overwrites it. Each call is
+   * logged as one JSON argv line so a test can assert exactly what (and how often) gh was reached.
+   * Either leg can be made to fail via an env toggle, to prove the best-effort contract. */
+  function installFakeGh(): void {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const a = process.argv.slice(2);
+fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
+if (a[0] === 'pr' && a[1] === 'view') {
+  if (process.env.ANTON_TEST_FAIL_BODY_READ === '1') { process.stderr.write('boom'); process.exit(1); }
+  let body = '';
+  try { body = fs.readFileSync(process.env.ANTON_TEST_BODY_STORE, 'utf8'); } catch {}
+  process.stdout.write(JSON.stringify({ body }));
+  process.exit(0);
+}
+if (a[0] === 'pr' && a[1] === 'edit') {
+  if (process.env.ANTON_TEST_FAIL_BODY_WRITE === '1') { process.stderr.write('boom'); process.exit(1); }
+  fs.writeFileSync(process.env.ANTON_TEST_BODY_STORE, a[a.indexOf('--body') + 1]);
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+  }
+
+  const ghCalls = (): string[][] =>
+    readFileSync(logFile, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as string[]);
+
+  const sessionLog = (): string => {
+    try {
+      return readFileSync(logPath, "utf8");
+    } catch {
+      return "";
+    }
+  };
+
+  const run = (report: ThreadOutcome[], pushed: boolean) =>
+    refreshFixRoundsBody({
+      repo: sandbox,
+      number: 7,
+      report,
+      pushed,
+      now: new Date("2026-09-23T12:00:00Z"),
+      logPath,
+    });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-fix-rounds-body-"));
+    binDir = join(sandbox, "bin");
+    mkdirSync(binDir);
+    logFile = join(sandbox, "gh-calls.log");
+    bodyStore = join(sandbox, "body.txt");
+    logPath = join(sandbox, "session.log");
+    writeFileSync(logFile, "");
+    writeFileSync(bodyStore, "Some narrative.\n");
+    installFakeGh();
+    prevGh = process.env[GH_BIN_ENV];
+    prevFailRead = process.env.ANTON_TEST_FAIL_BODY_READ;
+    prevFailWrite = process.env.ANTON_TEST_FAIL_BODY_WRITE;
+    process.env[GH_BIN_ENV] = join(binDir, "gh");
+    process.env.ANTON_TEST_GH_LOG = logFile;
+    process.env.ANTON_TEST_BODY_STORE = bodyStore;
+    delete process.env.ANTON_TEST_FAIL_BODY_READ;
+    delete process.env.ANTON_TEST_FAIL_BODY_WRITE;
+  });
+
+  afterEach(() => {
+    if (prevGh === undefined) delete process.env[GH_BIN_ENV];
+    else process.env[GH_BIN_ENV] = prevGh;
+    if (prevFailRead === undefined) delete process.env.ANTON_TEST_FAIL_BODY_READ;
+    else process.env.ANTON_TEST_FAIL_BODY_READ = prevFailRead;
+    if (prevFailWrite === undefined) delete process.env.ANTON_TEST_FAIL_BODY_WRITE;
+    else process.env.ANTON_TEST_FAIL_BODY_WRITE = prevFailWrite;
+    delete process.env.ANTON_TEST_GH_LOG;
+    delete process.env.ANTON_TEST_BODY_STORE;
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("refreshes the PR body with a dated round after a pushing round", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], true);
+
+    expect(ghCalls().some((c) => c[0] === "pr" && c[1] === "view")).toBe(true);
+    expect(ghCalls().some((c) => c[0] === "pr" && c[1] === "edit")).toBe(true);
+    const written = readFileSync(bodyStore, "utf8");
+    expect(written).toContain("Some narrative."); // everything outside the region survives
+    expect(written).toContain("### Review-fix rounds");
+    expect(written).toContain("- 2026-09-23: renamed foo to bar");
+  });
+
+  it("a round that pushes nothing does not call gh at all", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "would-be fix" }], false);
+
+    expect(ghCalls()).toEqual([]);
+    expect(readFileSync(bodyStore, "utf8")).toBe("Some narrative.\n"); // untouched
+  });
+
+  it("a round that fixed nothing worth naming does not call gh either", async () => {
+    await run([{ id: "RT_1", outcome: "left", reply: "declined" }], true);
+
+    expect(ghCalls()).toEqual([]);
+  });
+
+  it("a failed body read is logged and the round still completes successfully", async () => {
+    process.env.ANTON_TEST_FAIL_BODY_READ = "1";
+
+    await expect(
+      run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], true),
+    ).resolves.toBeUndefined();
+
+    expect(sessionLog()).toContain("could not read PR #7's body");
+    // Never reached the write leg, since there was nothing to amend.
+    expect(ghCalls().some((c) => c[0] === "pr" && c[1] === "edit")).toBe(false);
+  });
+
+  it("a failed body write is logged and the round still completes successfully", async () => {
+    process.env.ANTON_TEST_FAIL_BODY_WRITE = "1";
+
+    await expect(
+      run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], true),
+    ).resolves.toBeUndefined();
+
+    expect(sessionLog()).toContain("could not write the review-fix-rounds update");
+    // The store was never overwritten — the failure left the PR body as gh last had it.
+    expect(readFileSync(bodyStore, "utf8")).toBe("Some narrative.\n");
+  });
+
+  it("accumulates a second round onto the first, oldest first", async () => {
+    await run([{ id: "RT_1", outcome: "fixed", reply: "first round fix" }], true);
+    await run(
+      [{ id: "RT_2", outcome: "fixed", reply: "second round fix" }],
+      true,
+    );
+
+    const written = readFileSync(bodyStore, "utf8");
+    const firstIdx = written.indexOf("first round fix");
+    const secondIdx = written.indexOf("second round fix");
+    expect(firstIdx).toBeGreaterThan(-1);
+    expect(secondIdx).toBeGreaterThan(firstIdx);
   });
 });
 

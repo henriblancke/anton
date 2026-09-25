@@ -22,6 +22,7 @@ import { quotaMeterKey } from "../quota-meter";
 import {
   commitAll,
   diffAgainstBase,
+  git,
   gitCommonDir,
   readWorktreeState,
   resolveMergeBase,
@@ -88,6 +89,64 @@ export interface ReviewRound {
   fixSessionId?: string;
   /** Whether the fix session actually changed (and so committed) anything. */
   fixCommitted?: boolean;
+  /**
+   * Set when this round's `score` was capped down from what the reviewer reported (anton-re02): the
+   * diff it reviewed was truncated, so the anchored scale's ships-as-is band (8+) — "all criteria met
+   * and verified" — is a claim no partial read can support, whatever the reviewer itself believed.
+   * Applied by the gate from `BranchDiff.truncated`, never trusted to a reviewer that self-limits its
+   * own number. Absent whenever the round's diff was complete, so `score` there is the reported value
+   * untouched.
+   */
+  scoreCap?: ReviewScoreCap;
+  /**
+   * Set when this round's diff cleared the operator's churn threshold (anton-z8uv) — on a round the
+   * floor forced (nothing blocking, but the minimum round count wasn't met yet) as well as on the
+   * final round that satisfied it. Carried through to the board (review-score.ts) so a round the floor
+   * extended reads as that, distinct from `fixed`: no fix was ever dispatched for it, so labelling it
+   * `fixed` would claim a repair that never happened.
+   */
+  churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
+  /**
+   * The paths this round's reviewer named as unable to fully review (anton-0b1d), carried through from
+   * `review.report.unreviewedPaths` so the board can say WHICH files still have nobody's eyes on them —
+   * not just that the diff was truncated and the score capped. Set only on a truncated round whose
+   * report passed the coverage check (`unreviewedPaths` is otherwise mandatory there).
+   */
+  unreviewedPaths?: string[];
+}
+
+/** Why and how much a round's score was capped — carried on {@link ReviewRound} and the board history it feeds. */
+export interface ReviewScoreCap {
+  /** The reviewer's own number, before the cap. */
+  reported: number;
+  /** One line a founder reads on the board next to the capped score. */
+  reason: string;
+}
+
+/** The lowest score the anchored scale (skills/review/SKILL.md) reserves for "ships as-is". */
+export const REVIEW_SHIPS_AS_IS_SCORE = 8;
+
+/** The highest score a review of a truncated diff may record — one band below ships-as-is. */
+export const REVIEW_TRUNCATED_SCORE_CAP = REVIEW_SHIPS_AS_IS_SCORE - 1;
+
+/**
+ * Cap a round's score from the DIFF it reviewed, never from the reviewer's own claim to have limited
+ * itself (anton-re02): a review of a truncated diff cannot record a score in the ships-as-is band —
+ * PRs over the patch budget self-scored 8 and 9 on a partial read and then took a median of 33
+ * external findings; #238 scored 8 on a truncated diff and took 73 P1s. An untruncated review's score
+ * is returned exactly as reported.
+ */
+export function capTruncatedScore(score: number, truncated: boolean): { score: number; cap?: ReviewScoreCap } {
+  if (!truncated || score < REVIEW_SHIPS_AS_IS_SCORE) return { score };
+  return {
+    score: REVIEW_TRUNCATED_SCORE_CAP,
+    cap: {
+      reported: score,
+      reason:
+        `the diff was truncated, so this round could not read all of it — a ships-as-is score ` +
+        `(${REVIEW_SHIPS_AS_IS_SCORE}+) claims coverage a partial read cannot support`,
+    },
+  };
 }
 
 /**
@@ -129,6 +188,12 @@ export interface ReviewGateResult {
   score?: number;
   /** Set with the `score-regression` outcome: the low scores that tripped the alarm (anton-i98r). */
   regression?: ScoreRegression;
+  /**
+   * Set on a `clean` exit whose diff cleared the operator's churn threshold (anton-z8uv) — how a
+   * founder tells a large-diff run apart from an ordinary clean exit, and how many rounds the floor
+   * demanded of it.
+   */
+  churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
 }
 
 /**
@@ -165,6 +230,8 @@ export interface ReviewGateDeps {
    * the sync channel without shelling out to a real `bd`, exactly like {@link readBoardFingerprint}.
    */
   syncBoard?: (repoPath: string) => Promise<boolean>;
+  /** Total changed lines from `baseRev` to HEAD — the large-diff round floor's measure (anton-z8uv). */
+  churn?: (worktreePath: string, baseRev: string) => Promise<number>;
 }
 
 /** The slice of the runner's JobContext the gate needs — narrow, so tests can fake it in two lines. */
@@ -368,6 +435,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   const hashTree = args.deps?.hashTree ?? stageAllAndHashTree;
   const readBoard = args.deps?.readBoardFingerprint ?? defaultReadBoardFingerprint;
   const syncBoard = args.deps?.syncBoard ?? defaultSyncBoard;
+  const churn = args.deps?.churn ?? diffChurnLines;
 
   // Resolved ONCE, before the first session is recorded: the repository's ref store does not move
   // between rounds, and an unsandboxable host must fail the gate outright rather than after a review
@@ -389,6 +457,12 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
   // contract, the principles, the instruction files — come from a newer tip, so a base commit that
   // deleted a rule would quietly stop that rule from grading this branch. One SHA, one baseline.
   const baseRev = await mergeBase(worktreePath, baseBranch);
+
+  // The large-diff round floor's measure (anton-ecdl / anton-z8uv), taken once against the pinned
+  // fork point: the RUN's own diff, not whatever size the gate's own fix commits grow it to as
+  // rounds proceed. Skipped when the operator turned the floor off, so a project that never enables
+  // it pays no extra git call — the same "no added cost on small diffs" the floor itself promises.
+  const churnLines = config.churnRoundFloor ? await churn(worktreePath, baseRev) : undefined;
 
   // Resolved once, up front, to stamp the REVIEW meter with who actually reviews (PR #313 review),
   // and handed to every round's `buildReviewPrompt` below instead of letting it re-resolve: `config`
@@ -502,6 +576,11 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
 
     const findings = review.report.findings;
     const blocking = blockingFindings(findings);
+    // Capped here, from the diff THIS round actually read — not from anything the reviewer claimed
+    // about its own coverage — so every score `rounds` carries from this point on is already the
+    // honest one (anton-re02).
+    const scoreCap = review.report.ok ? capTruncatedScore(review.report.score, review.truncated) : undefined;
+    const roundScore = scoreCap?.score;
     const entry: ReviewRound = {
       round,
       reviewSessionId: review.sessionId,
@@ -509,7 +588,14 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       advisory: findings.length - blocking.length,
       findings,
       ...(review.report.ok
-        ? { score: review.report.score, rationale: review.report.rationale }
+        ? {
+            score: roundScore,
+            rationale: review.report.rationale,
+            ...(scoreCap!.cap ? { scoreCap: scoreCap!.cap } : {}),
+            ...(review.report.unreviewedPaths?.length
+              ? { unreviewedPaths: review.report.unreviewedPaths }
+              : {}),
+          }
         : { violation: review.report.violation }),
     };
     rounds.push(entry);
@@ -532,14 +618,55 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // score that isn't moving) is the more useful thing to say about why the run stopped.
     const regression = detectScoreRegression(rounds, config.scoreAlarm);
     if (regression) {
-      return { outcome: "score-regression", baseRev, rounds, unresolved, reviewer, score: review.report.score, regression };
+      return { outcome: "score-regression", baseRev, rounds, unresolved, reviewer, score: roundScore, regression };
     }
 
     if (blocking.length === 0) {
-      return { outcome: "clean", baseRev, rounds, unresolved, reviewer, score: review.report.score };
+      // Above the operator's threshold, {@link DEFAULT_REVIEW_CHURN_ROUND_FLOOR}'s whole point:
+      // PR #238 (+13,507/-273) exited clean on round 1 and then took 73 P1 findings from external
+      // review — a single fresh-context look is not enough scrutiny for a diff this size. Never
+      // consulted below the threshold, so a small diff's clean round 1 is byte-identical to before
+      // this floor existed.
+      const churnExceeded =
+        config.churnRoundFloor !== undefined &&
+        churnLines !== undefined &&
+        churnLines >= config.churnRoundFloor.thresholdLines;
+      const churnFloorApplied = churnExceeded
+        ? {
+            churnLines: churnLines!,
+            thresholdLines: config.churnRoundFloor!.thresholdLines,
+            minRounds: config.churnRoundFloor!.minRounds,
+          }
+        : undefined;
+      // Stamped on the ROUND itself, not just returned on a `clean` exit: a round the floor forces to
+      // continue never reaches that return, and without this the board (review-score.ts) has no way
+      // to tell it apart from a round that genuinely dispatched a fix (anton-re02 follow-up).
+      if (churnFloorApplied) entry.churnFloorApplied = churnFloorApplied;
+      // The floor demands more rounds only while both hold: it hasn't cleared its minimum yet, AND
+      // another round still fits under the operator's cap — the floor raises the bar, it never
+      // pushes the loop past `maxRounds` (anton-z8uv).
+      const floorPending =
+        churnExceeded && round < config.churnRoundFloor!.minRounds && round < config.maxRounds;
+      if (!floorPending) {
+        return {
+          outcome: "clean",
+          baseRev,
+          rounds,
+          unresolved,
+          reviewer,
+          score: roundScore,
+          ...(churnFloorApplied ? { churnFloorApplied } : {}),
+        };
+      }
+      // No fix to dispatch — nothing was reported blocking — so the next iteration runs a REAL
+      // review round (a fresh claude session over the diff as it stands) rather than re-parsing
+      // this round's report. Advisories still carry forward exactly as they would ahead of a fix.
+      carried = findings.filter((f) => f.severity === "advisory");
+      previousBlocking = blocking;
+      continue;
     }
     if (round === config.maxRounds) {
-      return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "unresolved", baseRev, rounds, unresolved, reviewer, score: roundScore };
     }
 
     // Replaces, never accumulates: this round was shown the previous carry and restated whatever
@@ -756,7 +883,7 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
     // Nothing changed: the next review would read the identical diff and report the identical
     // findings. Stop and let the call-site decide, rather than burning the remaining rounds.
     if (!fix.committed) {
-      return { outcome: "stalled", baseRev, rounds, unresolved, reviewer, score: review.report.score };
+      return { outcome: "stalled", baseRev, rounds, unresolved, reviewer, score: roundScore };
     }
   }
 
@@ -836,7 +963,7 @@ async function runReviewSession(args: {
    * this session then runs them itself.
    */
   verified?: VerifyGateOutcome[];
-}): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult }> {
+}): Promise<{ sessionId: string; reviewer: ReviewerSource; report: ReviewReportResult; truncated: boolean }> {
   const { db, clock, ctx, projectId, runId, target, tickets, settings, worktreePath, round, maxRounds, claude } = args;
 
   const { sessionId, logPath, onEvent } = await startJobSession(db, clock, {
@@ -977,7 +1104,7 @@ async function runReviewSession(args: {
       }
 
       const report = await enforceReadOnly({
-        report: parseReviewFindings(result.text),
+        report: parseReviewFindings(result.text, { truncated: diff.truncated }),
         worktreePath,
         before,
         logPath,
@@ -988,7 +1115,7 @@ async function runReviewSession(args: {
       });
       await appendSessionLog(logPath, `[review] round ${round}/${maxRounds}: ${describeReport(report)}\n`);
       await endSession(db, clock, sessionId, "done");
-      return { sessionId, reviewer, report };
+      return { sessionId, reviewer, report, truncated: diff.truncated };
     } catch (e) {
       // Throws PoisonError of its own when the reviewer's COMMIT could not be reverted — the one case
       // where retrying this worktree is more dangerous than losing the original error's backoff.
@@ -1185,6 +1312,22 @@ async function discardSessionWrites(args: {
           `read (${String(readError)}) — the worktree was reset to ${before.head.slice(0, 12)} regardless, so the ` +
           `next attempt cannot inherit anything it may have written\n`,
   ).catch(() => {});
+}
+
+/**
+ * Total changed lines (insertions + deletions) from `baseRev` to HEAD — the large-diff round
+ * floor's measure (anton-z8uv).
+ *
+ * A `git diff --shortstat`, not the review patch {@link runReviewSession} reads: that patch is cut
+ * at {@link DEFAULT_DIFF_PATCH_CHARS}, and the runs the floor exists to catch — PR #238's
+ * +13,507/-273 — are exactly the ones that cut hides most of. `--shortstat` costs one cheap git call
+ * and reports the true total regardless of patch size.
+ */
+async function diffChurnLines(worktreePath: string, baseRev: string): Promise<number> {
+  const stdout = await git(worktreePath, ["diff", "--shortstat", baseRev, "HEAD"]);
+  const insertions = Number(/(\d+) insertion/.exec(stdout)?.[1] ?? 0);
+  const deletions = Number(/(\d+) deletion/.exec(stdout)?.[1] ?? 0);
+  return insertions + deletions;
 }
 
 /**

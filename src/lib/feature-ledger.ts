@@ -85,10 +85,18 @@
  * MEASURES are per invocation (`duration_ms`, `duration_api_ms`, `num_turns`, `outcome` are all
  * copied onto every row of one invocation), so the fold walks invocations and prices their rows.
  *
- * Pure and dependency-free — no db, no node builtins, and the two union types below are imported
- * for their types only — so a server component, the fold and any later CLI share one definition
- * instead of three that drift. The DB reads stay with the caller: invocation rows from
- * `claude-invocations`, delivery times from `runs.listDeliveriesByBead`.
+ * ## Friction — the six intervention signals, counted one source at a time
+ *
+ * The other half of the ledger: how much human attention a feature took (design §D3), read entirely
+ * from tables anton already writes so the series cannot rot from neglect. Each counter at the bottom
+ * of this file takes only its own source and increments alone, and every one is a PROXY signal — see
+ * that section's own note for why no surface may render them as a quality score.
+ *
+ * Pure and dependency-free — no db, no node builtins; the two union types below are imported for
+ * their types only, and `rework-marks` is a leaf module of string constants — so a server component,
+ * the fold and any later CLI share one definition instead of three that drift. The DB reads stay with
+ * the caller: invocation rows from `claude-invocations`, delivery times from
+ * `runs.listDeliveriesByBead`, and the friction counters' own four sources (see below).
  */
 import type { JobType } from "./jobs/queue";
 import type { BuiltinStepId } from "./jobs/step-ids";
@@ -103,6 +111,7 @@ import {
   type GatewayPricing,
   type TokenCounts,
 } from "./model-pricing";
+import { isSendBackNote } from "./rework-marks";
 
 /** The phases a feature's recorded spend splits into. */
 export const LEDGER_PHASES = ["implement", "self-review", "describe", "pr-fix", "overhead"] as const;
@@ -786,5 +795,382 @@ export function ledgerTotals(
     unpricedModels: [...unpricedModels.entries()]
       .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
       .map(([model]) => model),
+  };
+}
+
+// ── friction: the intervention signals, each read from the table that already records it ──
+//
+// (anton-464lw) How much human attention a feature actually took, counted from rows anton already
+// writes so the series cannot rot from neglect (design §D3). Each counter below takes ONLY its own
+// source, so a fixture that exercises one leaves every other at zero — which is what makes the sum
+// (anton-l6a9z: `countHumanTouches`, and the quota-park exclusion from it) provable one term at a
+// time rather than as one opaque total.
+//
+// ## Every figure here is a PROXY, and no surface may present it as a score
+//
+// `reviewRounds > 1` is the best cheap quality signal available and is still only a signal: a run
+// that took three rounds may have been badly implemented, ambitiously scoped, or strictly reviewed,
+// and nothing recorded tells the three apart. Same for the rest — an escalation says anton stopped
+// and asked, not that it was wrong to. Design §D3 accepts that cost explicitly; the countervailing
+// rule is that these are labelled as observed signals everywhere they are shown.
+//
+// ## Nothing recorded is EMPTY, not zero — the same rule `ledgerTotals` applies to money
+//
+// Each counter is a plain number, and a scope that really recorded nothing genuinely counted zero
+// interventions — a feature that sailed through and one nobody has run yet both read 0 here. What
+// must NOT happen is the second being PRESENTED as the first, so that distinction lives one level
+// up rather than in these return types: every counter takes rows a caller has already resolved for a
+// scope, and the caller says "nothing recorded" from the ledger's own flag (see
+// `LedgerTotals.recorded`), never by reading a wall of zeroes as a frictionless run.
+
+/**
+ * One review round as this counter reads it: the verdict it settled on.
+ *
+ * Structural, so a `ReviewScoreEntry` replayed off the board (`review-report.ts`) satisfies it
+ * without a mapper — and so this fold stays free of `jobs/review-score.ts`, which reaches bd.
+ */
+export interface FrictionReviewRound {
+  /** The round's verdict. `clean` is the only one that ends the gate with nothing left to fix. */
+  verdict?: string | null;
+}
+
+/** The verdict that ends a review gate with nothing outstanding — see {@link countReviewRounds}. */
+const CLEAN_VERDICT = "clean";
+
+/**
+ * How many rounds it took to reach a CLEAN verdict — not how many comments the thread holds, and
+ * not how many rounds ran.
+ *
+ * The distinction is the whole value of the number. Every round the gate runs appends its own
+ * comment, and a round that found blocking findings appends one too — so a comment count answers
+ * "how chatty was the reviewer", while what a founder is asking is "how many times did this work
+ * have to go back before it passed". Those diverge exactly on the runs worth looking at.
+ *
+ * Counted up to and INCLUDING the first clean round, because reaching clean is what the rounds were
+ * spent on: two rounds where the second came back clean is one round of rework, reported as 2. Rounds
+ * after a clean verdict belong to a LATER gate — a resumed run restarts at round 1, and a send-back
+ * re-reviews the same target — so they are not part of the arc this figure describes.
+ *
+ * A thread that never reached clean returns every round in it. That is the honest answer for a
+ * feature still in flight or one that exhausted the round cap: the rounds were really spent, and
+ * reporting 0 for "never got clean" would make the worst outcome read as the best one. `round`
+ * numbers are deliberately NOT read — a resumed gate restarts its numbering, so they are not a total
+ * order (see `review-report.ts`) — the position in the thread is.
+ */
+export function countReviewRounds(rounds: readonly FrictionReviewRound[]): number {
+  const clean = rounds.findIndex((r) => r.verdict === CLEAN_VERDICT);
+  return clean === -1 ? rounds.length : clean + 1;
+}
+
+/** The columns a friction count reads off a `jobs` row. Structural, like every other row type here. */
+export interface FrictionJobRow {
+  /** The job's type — `review-fix` / `review-fix-pr` are the PR-fix rounds. */
+  type?: string | null;
+  /** `queued` | `running` | `parked` | `done` | `failed` | `cancelled`. */
+  status?: string | null;
+  /**
+   * How many times this row paused on an exhausted usage limit, ever — only ever incremented
+   * (`reschedule`, jobs/queue.ts). Optional so a fixture that never sets it reads as zero.
+   */
+  quotaParkCount?: number | null;
+  /**
+   * How many times this row was parked for a human to clear, ever — only ever incremented (`park`,
+   * jobs/queue.ts). Optional for the same reason as {@link quotaParkCount}.
+   */
+  failureParkCount?: number | null;
+}
+
+/** The job types that exist to correct a run AFTER its PR opened — `JOB_TYPE_PHASES`' `pr-fix` pair. */
+const PR_FIX_JOB_TYPES: readonly string[] = ["review-fix", "review-fix-pr"];
+
+/**
+ * How many times a PR of this feature's had to be corrected after it opened.
+ *
+ * Counts SETTLED rows only. A queued or running job has not corrected anything yet, and counting one
+ * would make the figure fall back down when the job finishes — a friction number that decreases as
+ * work continues is one nobody can trend. A parked or failed round is counted: it cost the attention
+ * the number exists to measure, and it is the rounds that went badly that a founder most wants
+ * counted.
+ *
+ * `review-fix` (the scheduled dispatcher) and `review-fix-pr` (one PR's own pass) are both counted,
+ * because the ledger's own `JOB_TYPE_PHASES` bills their spend to the one `pr-fix` phase: a rounds
+ * figure that disagreed with the phase it is read beside would be unreconcilable. In practice the
+ * dispatcher carries no bead in its payload, so a bead-scoped read hands this only per-PR rows.
+ */
+export function countPrFixRounds(jobs: readonly FrictionJobRow[]): number {
+  return jobs.filter(
+    (job) => typeof job.type === "string" && PR_FIX_JOB_TYPES.includes(job.type) && isSettled(job),
+  ).length;
+}
+
+/** Job statuses that are over — the only ones a friction counter reads. See {@link countPrFixRounds}. */
+const SETTLED_JOB_STATUSES: readonly string[] = ["done", "failed", "parked", "cancelled"];
+
+function isSettled(job: FrictionJobRow): boolean {
+  return typeof job.status === "string" && SETTLED_JOB_STATUSES.includes(job.status);
+}
+
+/**
+ * How many times an operator terminally killed a job in this scope (`jobs.status = 'cancelled'`).
+ *
+ * A cancel is the most unambiguous human touch anton records: no durability path reaches this status
+ * — the runner parks, reschedules or fails, and only an operator's click cancels (see `JobStatus`,
+ * jobs/queue.ts) — so unlike every other counter here this one needs no heuristic at all.
+ */
+export function countCancels(jobs: readonly FrictionJobRow[]): number {
+  return jobs.filter((job) => job.status === "cancelled").length;
+}
+
+/**
+ * How many times this scope's work paused on an exhausted quota.
+ *
+ * Reported ALONGSIDE the human-touch counters and never inside them (design §friction): a usage limit
+ * is not a human intervention and not anton failing. Folding it in would make the metric degrade
+ * every time anton is used MORE, which is the opposite of what it is for — so this is the one counter
+ * whose value is that it stays out of the sum a sibling ticket composes.
+ *
+ * Sums the durable `quotaParkCount` rather than sniffing the row's CURRENT `status`/`lastError` for
+ * the runner's usage-limit marker (PR #322 review): `reschedule` overwrites `lastError` on the job's
+ * very next settle, so a row that quota-paused twice, or has since completed, read as at most one
+ * pause under the old heuristic — a friction number that fell as work proceeded is one nobody could
+ * trend. The counter only ever increments (jobs/queue.ts), so this is a true lifetime total.
+ */
+export function countQuotaParks(jobs: readonly FrictionJobRow[]): number {
+  return jobs.reduce((total, job) => total + (job.quotaParkCount ?? 0), 0);
+}
+
+/**
+ * How many times this scope's work stopped for a reason a HUMAN has to clear — a poison, an
+ * exhausted attempt budget, a push that kept being rejected.
+ *
+ * The other half of the park split, and the reason quota parks can leave the friction sum without a
+ * signal going missing with them: a park is either a usage window anton resumes from on its own or a
+ * stop nothing re-dispatches, and design §gap-3 is explicit that those two have OPPOSITE meanings
+ * and must not collapse into one "parks" number. This half IS anton failing, and is counted as one.
+ *
+ * Sums the durable `failureParkCount` rather than reading the row's CURRENT `status` (PR #322
+ * review): `resumeJob` flips a parked row back to `queued`, so a failure park counted off `status`
+ * alone vanished the moment an operator un-stuck the very job the count exists to remember. The
+ * counter only ever increments (`park`, jobs/queue.ts), and — mirroring {@link countQuotaParks} —
+ * never the same increment as that one: `park()` and a quota `reschedule()` are disjoint call sites.
+ */
+export function countFailureParks(jobs: readonly FrictionJobRow[]): number {
+  return jobs.reduce((total, job) => total + (job.failureParkCount ?? 0), 0);
+}
+
+/** The one column the escalation counters read: the finding kind the row was raised from. */
+export interface FrictionEscalationRow {
+  /** `parked-run` | `stale-pr` | `dead-lease` | `exhausted-job` | `needs-human` | `autopilot-disarm`. */
+  kind?: string | null;
+}
+
+/** The escalation kind that IS a human gate — a wait only a person can end (`run-health.ts`). */
+const HUMAN_GATE_KIND = "needs-human";
+
+/**
+ * Every escalation raised against this scope — gates INCLUDED, because a gate is one of these rows.
+ *
+ * `needs-human` is a `kind` WITHIN the escalations table, not a separate source, so this total and
+ * {@link countHumanGates} overlap by construction. They are reported separately because they mean
+ * different things — anton stopped and asked a person, versus anton stopped for any reason — and the
+ * sum rule a sibling ticket composes subtracts the overlap rather than adding both (PR #311 review,
+ * which is where summing them double-counted every gate and inflated precisely the features that
+ * needed the most attention).
+ */
+export function countEscalations(escalations: readonly FrictionEscalationRow[]): number {
+  return escalations.length;
+}
+
+/**
+ * The escalations that are human GATES: an open ask only a person can answer. A strict SUBSET of
+ * {@link countEscalations} — see there for why that is stated rather than left to be inferred.
+ */
+export function countHumanGates(escalations: readonly FrictionEscalationRow[]): number {
+  return escalations.filter((e) => e.kind === HUMAN_GATE_KIND).length;
+}
+
+/**
+ * The escalations that are NOT gates — anton stopped for something nobody was asked to answer.
+ *
+ * The disjoint remainder of {@link countEscalations}, named rather than left implicit so
+ * {@link countHumanTouches} can add the gates back exactly once instead of summing two overlapping
+ * totals, and so a surface can show both halves of the escalation total without re-deriving them.
+ */
+export function countNonGateEscalations(escalations: readonly FrictionEscalationRow[]): number {
+  return escalations.filter((e) => e.kind !== HUMAN_GATE_KIND).length;
+}
+
+/** What a send-back count reads off a bead: its append-only notes blob, already split into entries. */
+export interface FrictionNote {
+  text: string;
+}
+
+/**
+ * How many times a human sent work in this scope BACK — a reopen with instructions, or a follow-up
+ * opened off a review.
+ *
+ * Counted from the notes a send-back writes rather than from the stage-label strip that accompanies
+ * it, because the strip is an ERASURE: `RUN_STAGE_LABELS` being absent now says nothing about how
+ * many times it was taken off, and a bead re-run after a send-back is wearing them again. The note is
+ * the only per-occurrence record on the board, and `rework-marks.ts` is where its phrasing lives so
+ * this predicate and the renderer cannot drift apart.
+ *
+ * ORIGIN-side notes only, so each send-back is worth exactly one even when the follow-up it created
+ * lands in this same feature — see `rework-marks.ts` for the two-sided write this deliberately reads
+ * half of.
+ */
+export function countSendBacks(notes: readonly FrictionNote[]): number {
+  return notes.filter((note) => isSendBackNote(note.text)).length;
+}
+
+/**
+ * How many times a PERSON had to touch this feature — the one number the friction counters exist to
+ * produce, and the only one that sums them (design §friction).
+ *
+ * ```
+ * humanTouches = nonGateEscalations + humanGates + sendBacks + cancels
+ * ```
+ *
+ * ## Why the escalation total is split before it is added
+ *
+ * `needs-human` is a KIND WITHIN the escalations table (`run-health.ts`), not a separate source. So
+ * `escalations + humanGates` counts every gate TWICE — and it does so worst on the features that
+ * needed the most attention, which biases every cohort comparison toward whichever prompt raised
+ * more gates (PR #311 review). Splitting first and adding the disjoint halves makes the overlap
+ * impossible to reintroduce: a lone `needs-human` is one escalation that is also one gate, and it
+ * lands here as 1. {@link countEscalations} and {@link countHumanGates} stay reported separately
+ * because they answer different questions; they are just never added to each other.
+ *
+ * ## Why quota parks are not in the sum at all
+ *
+ * A usage limit is not a human intervention and not anton failing — nobody was asked anything, and
+ * the runner resumes on its own. Folding {@link countQuotaParks} in would make this number grow
+ * every time anton is used MORE, degrading precisely as the tool succeeds, which is the opposite of
+ * what it is for. It is reported alongside, never inside — as is {@link countFailureParks}, which IS
+ * anton failing but is still not a person touching anything.
+ *
+ * Review rounds and PR-fix rounds are likewise excluded: a review round is the system working, and
+ * both are anton's own passes rather than a human's.
+ *
+ * Still a PROXY, like every counter it sums — see this section's header. Four touches says a feature
+ * took four interruptions, not that it was done badly.
+ */
+export function countHumanTouches(scope: {
+  escalations?: readonly FrictionEscalationRow[];
+  notes?: readonly FrictionNote[];
+  jobs?: readonly FrictionJobRow[];
+}): number {
+  const { escalations = [], notes = [], jobs = [] } = scope;
+  return (
+    countNonGateEscalations(escalations) +
+    countHumanGates(escalations) +
+    countSendBacks(notes) +
+    countCancels(jobs)
+  );
+}
+
+/**
+ * One scope's friction, composed — every counter above read off its own source in one shape.
+ *
+ * ## Each field is an observed SIGNAL, and no surface may render it as a quality score
+ *
+ * The rule the whole section is written under (design §D3), restated on the type because this is
+ * what a caller actually holds: these are proxies for how much attention a feature took, not
+ * measurements of how well it was done. Three review rounds may mean a weak implementation, an
+ * ambitious scope or a strict reviewer, and nothing recorded tells them apart. A surface renders
+ * them labelled as what was observed.
+ *
+ * ## Zero here means "nothing happened", never "nothing was measured"
+ *
+ * Every field is a plain number, so a feature that sailed through and a feature nobody has run yet
+ * both read 0. The ledger's own {@link LedgerTotals.recorded} is what tells those apart — see the
+ * section header for why that distinction stays one level up rather than turning these into
+ * `undefined`s each caller would have to re-handle.
+ */
+export interface LedgerFriction {
+  /**
+   * Rounds the self-review took to reach a clean verdict — the cheapest quality SIGNAL anton has,
+   * and still only a signal ({@link countReviewRounds}). Not a person's doing: excluded from
+   * {@link humanTouches}.
+   */
+  reviewRounds: number;
+  /**
+   * Times a PR had to be corrected after it opened ({@link countPrFixRounds}). anton's own pass, so
+   * likewise outside {@link humanTouches}.
+   */
+  prFixRounds: number;
+  /**
+   * Every escalation raised against the scope, gates INCLUDED ({@link countEscalations}) — anton
+   * stopped and said something, for any reason. Overlaps {@link humanGates} by construction; the two
+   * are never added to each other.
+   */
+  escalations: number;
+  /**
+   * The escalations that were human GATES — an open ask only a person could answer
+   * ({@link countHumanGates}). A strict SUBSET of {@link escalations}.
+   */
+  humanGates: number;
+  /**
+   * The disjoint remainder: escalations that asked nobody anything
+   * ({@link countNonGateEscalations}). Reported so both halves of the total are readable without
+   * re-deriving them, and so the sum below can add each gate exactly once.
+   */
+  nonGateEscalations: number;
+  /**
+   * Times a human sent work in this scope back ({@link countSendBacks}) — a reopen with
+   * instructions, or a follow-up opened off a review. Read from free-text notes, so a proxy in the
+   * strongest sense: a founder can write the phrase by hand.
+   */
+  sendBacks: number;
+  /**
+   * Jobs an operator terminally killed ({@link countCancels}) — the one counter here that rests on
+   * no heuristic, since no durability path reaches `cancelled`.
+   */
+  cancels: number;
+  /**
+   * Times the scope's work paused on an exhausted usage limit ({@link countQuotaParks}). Reported
+   * beside {@link humanTouches} and deliberately never inside it: a quota window is not a person
+   * intervening, and folding it in would degrade the metric every time anton is used MORE.
+   */
+  quotaParks: number;
+  /**
+   * Parks a human has to clear ({@link countFailureParks}) — the other half of the park split, and
+   * the one that IS anton failing. Still not a person touching anything, so also outside the sum.
+   */
+  failureParks: number;
+  /**
+   * How many times a PERSON had to touch this feature ({@link countHumanTouches}) — the one figure
+   * that sums the others, and the only one that does. Four touches says four interruptions, not
+   * that the work was done badly.
+   */
+  humanTouches: number;
+}
+
+/**
+ * Fold one scope's four friction sources into {@link LedgerFriction}.
+ *
+ * Pure, like the rest of this module: the caller resolves the rows (review rounds off the run
+ * target's comment thread, jobs by payload, escalations by bead, notes off the board) and this
+ * composes them. Each source is optional because they are read independently and a scope can be
+ * missing any of them — an unreviewed target has no thread, a feature nobody escalated has no rows.
+ */
+export function ledgerFriction(scope: {
+  rounds?: readonly FrictionReviewRound[];
+  jobs?: readonly FrictionJobRow[];
+  escalations?: readonly FrictionEscalationRow[];
+  notes?: readonly FrictionNote[];
+}): LedgerFriction {
+  const { rounds = [], jobs = [], escalations = [], notes = [] } = scope;
+  return {
+    reviewRounds: countReviewRounds(rounds),
+    prFixRounds: countPrFixRounds(jobs),
+    escalations: countEscalations(escalations),
+    humanGates: countHumanGates(escalations),
+    nonGateEscalations: countNonGateEscalations(escalations),
+    sendBacks: countSendBacks(notes),
+    cancels: countCancels(jobs),
+    quotaParks: countQuotaParks(jobs),
+    failureParks: countFailureParks(jobs),
+    humanTouches: countHumanTouches({ escalations, notes, jobs }),
   };
 }

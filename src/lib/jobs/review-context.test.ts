@@ -154,6 +154,19 @@ describe("reviewContext", () => {
     expect(out).toContain("## Reporting format (required)");
   });
 
+  // anton-0b1d: the report format must demand the unreviewed-paths field on a truncated review, and
+  // leave a complete review's required shape exactly as it was before the field existed.
+  it("requires `unreviewedPaths` in the report shape only when the diff is truncated", () => {
+    const untruncated = reviewContext({ target: epic, tickets: [ticket], diff });
+    expect(untruncated).not.toContain("unreviewedPaths");
+
+    const truncated = reviewContext({ target: epic, tickets: [ticket], diff: { ...diff, truncated: true } });
+    expect(truncated).toContain('"unreviewedPaths":["<path you could not fully review>"');
+    expect(truncated).toContain("`unreviewedPaths` is MANDATORY too");
+    expect(truncated).toContain("omits this");
+    expect(truncated).toContain("claims full coverage is a protocol violation");
+  });
+
   it("marks beads with no Goal/Acceptance rather than rendering them blank", () => {
     const bare: Bead = { id: "anton-x2", title: "Bare", status: "open", issue_type: "task" };
     const out = reviewContext({ target: bare, tickets: [bare], diff });
@@ -574,6 +587,48 @@ describe("reviewContext", () => {
       expect(out).not.toContain("confirmed evidence covers");
     },
   );
+
+  // anton-0b1d: 9 of 40 PRs hit truncation and carried 68% of all findings — "read the worktree" was
+  // never enough on its own, so the cut is named and the exact unreviewed paths are computed and
+  // listed, not left for the reviewer to notice on its own.
+  it("names the changed files the truncated patch carries no hunk for at all", () => {
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: {
+        files: ["src/a.ts", "src/b.ts", "src/c.ts"],
+        // Only a.ts's header survived the cut — b.ts and c.ts are in the file list but never appear.
+        patch: "diff --git a/src/a.ts b/src/a.ts\n+const a = 1;\n… [patch truncated at 200000 chars]",
+        truncated: true,
+      },
+    });
+
+    expect(out).toContain("2 of the 3 changed file(s) above carry NO hunk in it at");
+    expect(out).toContain("all — the cut removed them entirely:");
+    expect(out).toContain("- src/b.ts");
+    expect(out).toContain("- src/c.ts");
+    // a.ts DID get a hunk, so it is not named as unreviewed surface.
+    expect(out).not.toMatch(/carry NO hunk[\s\S]*- src\/a\.ts/);
+    expect(out).toContain("under `unreviewedPaths` in your final report");
+  });
+
+  it("still flags the truncation when every changed file carries at least one hunk", () => {
+    // A single huge file can exhaust the budget after every file's header already appeared — the cut
+    // still lost content (that file's later hunks), so the notice must not silently disappear.
+    const out = reviewContext({
+      target: epic,
+      tickets: [ticket],
+      diff: {
+        files: ["src/widget.tsx"],
+        patch: "diff --git a/src/widget.tsx b/src/widget.tsx\n+export const Widget = () => null;\n… [cut]",
+        truncated: true,
+      },
+    });
+
+    expect(out).toContain("The patch below is truncated");
+    expect(out).toContain("Every changed file above has at least one hunk in it");
+    expect(out).not.toContain("carry NO hunk in it at all");
+  });
 
   it("repeats a truncated patch's deletions, which the worktree cannot show", () => {
     // "Read the files in the worktree" is impossible for a file the run removed, and the reviewer has
@@ -1605,6 +1660,92 @@ describe("parseReviewFindings", () => {
     expect(parseReviewFindings(`${block('{"score":9,"rationale":"clean","findings":[]}')}\n\n   \n`)).toMatchObject({
       ok: true,
       score: 9,
+    });
+  });
+
+  // anton-0b1d: a truncated review that claims full coverage without naming anything is a protocol
+  // violation, distinct from a plain missing score/rationale — anton cannot otherwise tell a
+  // genuinely clean review from one that silently skipped the part of the diff it never saw.
+  describe("coverage of a truncated diff", () => {
+    const clean = '{"score":9,"rationale":"clean","findings":[]}';
+
+    it("accepts a truncated review that names the paths it could not review", () => {
+      const json =
+        '{"score":7,"rationale":"one nit, rest unreadable","findings":[],' +
+        '"unreviewedPaths":["src/b.ts","src/c.ts"]}';
+      expect(parseReviewFindings(block(json), { truncated: true })).toEqual({
+        ok: true,
+        score: 7,
+        rationale: "one nit, rest unreadable",
+        findings: [],
+        unreviewedPaths: ["src/b.ts", "src/c.ts"],
+      });
+    });
+
+    it("rejects a truncated review with no `unreviewedPaths` field, as a distinct violation", () => {
+      expect(parseReviewFindings(block(clean), { truncated: true })).toEqual({
+        ok: false,
+        violation: "missing-coverage",
+        findings: [],
+      });
+    });
+
+    it("rejects a truncated review whose `unreviewedPaths` is an empty array", () => {
+      const json = '{"score":9,"rationale":"clean","findings":[],"unreviewedPaths":[]}';
+      expect(parseReviewFindings(block(json), { truncated: true })).toEqual({
+        ok: false,
+        violation: "missing-coverage",
+        findings: [],
+      });
+    });
+
+    it("rejects a truncated review whose `unreviewedPaths` is unusable (wrong type, blank entries)", () => {
+      for (const json of [
+        '{"score":9,"rationale":"clean","findings":[],"unreviewedPaths":"src/b.ts"}',
+        '{"score":9,"rationale":"clean","findings":[],"unreviewedPaths":[null]}',
+        '{"score":9,"rationale":"clean","findings":[],"unreviewedPaths":["  "]}',
+      ]) {
+        expect(parseReviewFindings(block(json), { truncated: true })).toEqual({
+          ok: false,
+          violation: "missing-coverage",
+          findings: [],
+        });
+      }
+    });
+
+    it("trims each named path and drops blank entries rather than rejecting the whole array", () => {
+      const json = '{"score":8,"rationale":"clean bar one","findings":[],"unreviewedPaths":[" src/b.ts ",""]}';
+      expect(parseReviewFindings(block(json), { truncated: true })).toMatchObject({
+        ok: true,
+        unreviewedPaths: ["src/b.ts"],
+      });
+    });
+
+    it("does not require `unreviewedPaths` at all when the diff was not truncated", () => {
+      // Same report the untruncated tests above already accept — the parser never even looks for
+      // the field unless told the diff was cut, so an untruncated review's shape is unchanged.
+      expect(parseReviewFindings(block(clean))).toEqual({
+        ok: true,
+        score: 9,
+        rationale: "clean",
+        findings: [],
+      });
+      expect(parseReviewFindings(block(clean), { truncated: false })).toEqual({
+        ok: true,
+        score: 9,
+        rationale: "clean",
+        findings: [],
+      });
+    });
+
+    it("still checks score and rationale before coverage, on a truncated review", () => {
+      // Coverage is the last gate, not a replacement for the earlier ones — a truncated review with
+      // no rationale is still a `missing-rationale` violation, not `missing-coverage`.
+      expect(parseReviewFindings(block('{"score":9,"findings":[]}'), { truncated: true })).toEqual({
+        ok: false,
+        violation: "missing-rationale",
+        findings: [],
+      });
     });
   });
 });

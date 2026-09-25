@@ -24,6 +24,14 @@ export interface ThreadOutcome {
   reply?: string;
 }
 
+/**
+ * A "fixed" claim with nothing pushed behind it — a fabrication whether it's about to answer a
+ * thread reply (review-fix.ts's `applyThreadOutcomes`) or a PR-body round summary
+ * (review-fix-body.ts, anton-te6nr). Shared here so both readers exclude it the same way.
+ */
+export const fabricatedFix = (item: ThreadOutcome, pushed: boolean): boolean =>
+  item.outcome === "fixed" && !pushed;
+
 /** Value of a `prefix:value` label (e.g. the epic's `agent:` tag), or undefined if absent. */
 export function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
   const l = labels?.find((x) => x.startsWith(`${prefix}:`));

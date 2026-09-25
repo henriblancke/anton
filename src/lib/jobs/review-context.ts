@@ -109,7 +109,8 @@ export type ReviewProtocolViolation =
   | "missing-rationale"
   | "malformed-findings"
   | "trailing-content"
-  | "worktree-modified";
+  | "worktree-modified"
+  | "missing-coverage";
 
 /**
  * Outcome of parsing a review report. `ok: true` is a review that spoke the protocol — the score is
@@ -117,9 +118,13 @@ export type ReviewProtocolViolation =
  * (possibly none, which is a legitimate clean review) are actionable. `ok: false` is a protocol
  * violation for the gate to park or retry on; any findings salvaged from the block are carried
  * along, never as evidence the run is clean.
+ *
+ * `unreviewedPaths` appears ONLY when the reviewed diff was truncated (anton-0b1d): the paths the
+ * reviewer names it could not fully review. A complete diff carries no such field — the shape a
+ * caller sees for an untruncated review is exactly what it was before this field existed.
  */
 export type ReviewReportResult =
-  | { ok: true; score: number; rationale: string; findings: ReviewFinding[] }
+  | { ok: true; score: number; rationale: string; findings: ReviewFinding[]; unreviewedPaths?: string[] }
   | { ok: false; violation: ReviewProtocolViolation; findings: ReviewFinding[] };
 
 /** The run put in front of the reviewer: what it was supposed to do, and what it actually changed. */
@@ -677,7 +682,7 @@ export function reviewContext(run: ReviewRun): string {
     ...previousBlockingClassSection(run.previousBlocking ?? []),
     ...verifiedGatesSection(run.verified ?? [], run.gatesDiscarded ?? false),
     ...readOnlySection(run.verified ?? [], run.gatesDiscarded ?? false, noBash),
-    ...reportingFormatSection(),
+    ...reportingFormatSection(run.diff.truncated),
   ]
     .join("\n")
     .trimEnd();
@@ -1013,9 +1018,7 @@ function diffSection(
     `Changed files (${diff.files.length}):`,
     ...diff.files.map((f) => `- ${f}`),
     ``,
-    ...(diff.truncated
-      ? [`The patch below is truncated — read the files in the worktree for anything it cuts off.`, ``]
-      : []),
+    ...truncationNotice(diff),
     "```diff",
     diff.patch,
     "```",
@@ -1027,6 +1030,54 @@ function diffSection(
     // patch and no way to check Acceptance against the bd writes that were the actual deliverable.
     ...boardEvidenceSection(tickets, boardEvidenceByTicket, repoPath, boardOnlyDelivery, confirmedBeads),
     ...deletionsBlock(diff),
+  ];
+}
+
+/**
+ * Paths in `diff.files` with no `diff --git a/... b/...` header anywhere in `diff.patch` — the patch
+ * is cut at a raw character boundary ({@link diffAgainstBase}), so a file whose header falls past the
+ * cut carries no hunk here at all. Only meaningful when `diff.truncated`; this is the unreviewed
+ * surface {@link truncationNotice} names and {@link reportingFormatSection} later demands back under
+ * `unreviewedPaths`, computed once here so the prompt and the required report field agree on the set.
+ */
+function unpatchedPaths(diff: BranchDiff): string[] {
+  const carried = new Set<string>();
+  for (const match of diff.patch.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)) {
+    carried.add(match[1]);
+    carried.add(match[2]);
+  }
+  return diff.files.filter((f) => !carried.has(f));
+}
+
+/**
+ * Names the truncation explicitly rather than leaving it to "go read the worktree": a run that hit 9
+ * of 40 PRs still carried 68% of all findings, because a one-line caveat reads as boilerplate and the
+ * unreviewed surface never became something the reviewer had to account for. Pairs with the
+ * `unreviewedPaths` requirement in {@link reportingFormatSection} — this is where the reviewer first
+ * sees the set it will later be required to name back.
+ */
+function truncationNotice(diff: BranchDiff): string[] {
+  if (!diff.truncated) return [];
+  const unpatched = unpatchedPaths(diff);
+  return [
+    `The patch below is truncated — it was cut for length partway through this run's diff.`,
+    ...(unpatched.length > 0
+      ? [
+          `${unpatched.length} of the ${diff.files.length} changed file(s) above carry NO hunk in it at`,
+          `all — the cut removed them entirely:`,
+          ``,
+          ...unpatched.map((f) => `- ${f}`),
+        ]
+      : [
+          `Every changed file above has at least one hunk in it, but a large file's later hunks may`,
+          `still fall past the cut.`,
+        ]),
+    ``,
+    `Read the files in the worktree for anything the cut left out, and name every path you could not`,
+    `fully review — at minimum the ones listed above — under \`unreviewedPaths\` in your final report`,
+    `(see "Reporting format" below). Claiming full coverage without naming any is a protocol`,
+    `violation.`,
+    ``,
   ];
 }
 
@@ -1439,8 +1490,16 @@ function verifiedGatesSection(verified: VerifyGateOutcome[], gatesDiscarded: boo
  * reviewer — a named agent that has never heard of anton, or an operator prompt — still emits the
  * score and findings the gate parses. Hence the explicit "even if your instructions above say
  * otherwise": this section is the protocol, the contract above it is only the judgment.
+ *
+ * `truncated` adds the `unreviewedPaths` field (anton-0b1d) — required ONLY here. An untruncated
+ * review's shape is exactly what it was before this field existed: {@link parseReviewFindings} never
+ * checks for it unless the diff it was handed was itself cut, so a complete review cannot be parked
+ * over a field it was never asked for.
  */
-function reportingFormatSection(): string[] {
+function reportingFormatSection(truncated: boolean): string[] {
+  const schema = truncated
+    ? `{"score":<integer 0-10>,"rationale":"one-line justification of the score","findings":[{"severity":"blocking" | "advisory","location":"<file>:<line>","note":"what is wrong, why, and what correct looks like"}],"unreviewedPaths":["<path you could not fully review>", ...]}`
+    : `{"score":<integer 0-10>,"rationale":"one-line justification of the score","findings":[{"severity":"blocking" | "advisory","location":"<file>:<line>","note":"what is wrong, why, and what correct looks like"}]}`;
   return [
     `## Reporting format (required)`,
     ``,
@@ -1448,7 +1507,7 @@ function reportingFormatSection(): string[] {
     `even if your instructions above describe a different format:`,
     ``,
     "```json",
-    `{"score":<integer 0-10>,"rationale":"one-line justification of the score","findings":[{"severity":"blocking" | "advisory","location":"<file>:<line>","note":"what is wrong, why, and what correct looks like"}]}`,
+    schema,
     "```",
     ``,
     `\`score\` is MANDATORY: an integer from 0 to 10 for the overall quality of this run's work,`,
@@ -1466,6 +1525,17 @@ function reportingFormatSection(): string[] {
     `protocol violation and parks the run, because anton cannot tell a clean review from a blocking`,
     `finding it failed to read. An empty array is the way to say you found nothing.`,
     ``,
+    ...(truncated
+      ? [
+          `\`unreviewedPaths\` is MANDATORY too, because the diff above is truncated: a non-empty array`,
+          `naming every path you could not fully review — at minimum the ones "The diff under review"`,
+          `section above already listed as carrying no hunk at all. A truncated review that omits this`,
+          `field, sends an empty array, or otherwise claims full coverage is a protocol violation and`,
+          `parks the run for a human, exactly like a missing score: anton cannot otherwise tell a`,
+          `genuinely clean review from one that silently skipped the part of the diff it never saw.`,
+          ``,
+        ]
+      : []),
     `"Nothing after it" is MANDATORY too: the block must be the last thing in the message. Any`,
     `trailing text — a closing remark, a correction, a retraction — is a protocol violation and parks`,
     `the run, because anton cannot tell a courtesy sign-off from a verdict you just took back. If you`,
@@ -1642,11 +1712,20 @@ function toFinding(f: unknown): ReviewFinding | undefined {
 }
 
 /** Shape of a candidate report block — anything carrying a score or findings key. */
-function isReportBlock(parsed: unknown): parsed is { score?: unknown; findings?: unknown; rationale?: unknown } {
+function isReportBlock(
+  parsed: unknown,
+): parsed is { score?: unknown; findings?: unknown; rationale?: unknown; unreviewedPaths?: unknown } {
   if (typeof parsed !== "object" || parsed === null) return false;
   // Key PRESENCE, not value shape: `{"findings":null}` is a broken report, not an unrelated block.
   // Scanning past it would let an earlier clean draft stand in for the verdict it withdrew.
   return "score" in parsed || "findings" in parsed;
+}
+
+/** A non-empty array of non-blank strings — the shape `unreviewedPaths` must take to count as named. */
+function namedPaths(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const paths = raw.filter((p): p is string => typeof p === "string" && p.trim().length > 0).map((p) => p.trim());
+  return paths.length > 0 ? paths : undefined;
 }
 
 /**
@@ -1678,8 +1757,19 @@ function looksLikeReportText(raw: string): boolean {
  * the chosen block must actually END the message: anything but whitespace after it is a
  * `trailing-content` violation, because trailing prose is where a reviewer retracts or corrects
  * the verdict directly above it.
+ *
+ * `opts.truncated` (anton-0b1d) mirrors the same flag {@link reportingFormatSection} was built
+ * with: only then does a report also need `unreviewedPaths` — a non-empty array of the paths the
+ * reviewer could not fully review. Omitted, empty, or unusable on a truncated review, it is a
+ * `missing-coverage` violation, the same class of failure as a missing score: a truncated review
+ * that never names what it skipped is indistinguishable from one that silently read the cut as
+ * "nothing more to check". An untruncated review is never asked for the field and this check never
+ * runs for it, so its report shape — and every existing caller of this function — is unchanged.
  */
-export function parseReviewFindings(text: string | undefined): ReviewReportResult {
+export function parseReviewFindings(
+  text: string | undefined,
+  opts: { truncated?: boolean } = {},
+): ReviewReportResult {
   if (!text) return { ok: false, violation: "no-report", findings: [] };
 
   const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
@@ -1718,6 +1808,11 @@ export function parseReviewFindings(text: string | undefined): ReviewReportResul
     }
     if (typeof rationale !== "string" || !rationale.trim()) {
       return { ok: false, violation: "missing-rationale", findings };
+    }
+    if (opts.truncated) {
+      const unreviewedPaths = namedPaths(parsed.unreviewedPaths);
+      if (!unreviewedPaths) return { ok: false, violation: "missing-coverage", findings };
+      return { ok: true, score, rationale: rationale.trim(), findings, unreviewedPaths };
     }
     return { ok: true, score, rationale: rationale.trim(), findings };
   }

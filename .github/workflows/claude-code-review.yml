@@ -73,6 +73,12 @@ jobs:
       # session while an API request was being retried") — bumping to the latest available pin
       # picks up both. If this recurs, it's the upstream bug, not this PR's diff — check #1759's
       # status before re-bumping blindly.
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-24): same signature again on PR #321 —
+      # is_error:true, num_turns:1, total_cost_usd:0, ~400ms, no findings unrelated to this
+      # PR's own diff. Upstream (anthropics/claude-code-action#947) confirms this class of
+      # crash is still being reported against recent CLI builds, so this bump is the same
+      # documented mitigation as before, not a confirmed fix — if it recurs, bump further
+      # and check the changelog rather than assuming the PR's diff is at fault.
       # Bumped 2.1.281 -> 2.1.282 (2026-09-25): same signature on PR #326 —
       # is_error:true, num_turns:1, total_cost_usd:0, 425ms, no findings unrelated to this
       # PR's own diff. Following this comment's own instruction: bump before assuming it's
