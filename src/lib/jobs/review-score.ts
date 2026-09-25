@@ -56,6 +56,12 @@ export interface ReviewScoreEntry {
    * why a clean large diff still took extra rounds, not just that it did (anton-z8uv's 4th criterion).
    */
   churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
+  /**
+   * The paths this round's reviewer named as unable to fully review (anton-0b1d) — carried from
+   * `ReviewRound.unreviewedPaths` so the board states WHICH part of a large diff still has nobody's
+   * eyes on it, not just that it was truncated and the score capped.
+   */
+  unreviewedPaths?: string[];
 }
 
 /** Marks a comment as anton's score payload, so a reader can skip every other comment on the bead. */
@@ -95,6 +101,7 @@ function toEntries(rounds: ReviewRound[], final: ReviewRoundVerdict): ReviewScor
     ...(r.findings?.length ? { findings: r.findings } : {}),
     ...(r.scoreCap ? { scoreCap: r.scoreCap } : {}),
     ...(r.churnFloorApplied ? { churnFloorApplied: r.churnFloorApplied } : {}),
+    ...(r.unreviewedPaths?.length ? { unreviewedPaths: r.unreviewedPaths } : {}),
   }));
 }
 
@@ -115,6 +122,9 @@ export function formatReviewScoreComment(entry: ReviewScoreEntry): string {
           `large diff (${entry.churnFloorApplied.churnLines} lines ≥ ${entry.churnFloorApplied.thresholdLines}) — ` +
             `the churn floor requires ${entry.churnFloorApplied.minRounds} round(s) of review before a clean exit`,
         ]
+      : []),
+    ...(entry.unreviewedPaths?.length
+      ? [`unreviewed (truncated diff): ${entry.unreviewedPaths.join(", ")}`]
       : []),
     ...(entry.rationale ? ["", entry.rationale] : []),
     ...(entry.findings?.length ? ["", ...findingLines(entry.findings)] : []),

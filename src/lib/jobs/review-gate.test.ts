@@ -516,6 +516,7 @@ describe("runReviewGate — the truncated-diff score cap (anton-re02)", () => {
     expect(out.rounds[0].score).toBe(7);
     expect(out.rounds[0].scoreCap).toMatchObject({ reported: 9 });
     expect(out.rounds[0].scoreCap?.reason).toContain("truncated");
+    expect(out.rounds[0].unreviewedPaths).toEqual(["src/a.ts"]);
   });
 
   it("passes the same 9 through untouched on an untruncated diff", async () => {
@@ -525,6 +526,7 @@ describe("runReviewGate — the truncated-diff score cap (anton-re02)", () => {
     expect(out.score).toBe(9);
     expect(out.rounds[0].score).toBe(9);
     expect(out.rounds[0].scoreCap).toBeUndefined();
+    expect(out.rounds[0].unreviewedPaths).toBeUndefined();
   });
 });
 

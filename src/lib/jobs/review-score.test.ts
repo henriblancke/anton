@@ -96,6 +96,28 @@ describe("reviewScoreEntries", () => {
     expect(entry.score).toBeUndefined();
     expect(entry.verdict).toBe("protocol-violation");
   });
+
+  // anton-hk9z: the specific paths a truncated round's reviewer could not fully read have to survive
+  // onto the board entry — a founder reading the score history can otherwise only tell that SOME part
+  // of a large diff went unreviewed, never which part.
+  it("carries a truncated round's unreviewedPaths through to its entry", () => {
+    const [entry] = reviewScoreEntries(
+      result({
+        outcome: "clean",
+        rounds: [
+          {
+            round: 1,
+            reviewSessionId: "s1",
+            score: 7,
+            blocking: 0,
+            advisory: 0,
+            unreviewedPaths: ["src/a.ts", "src/b.ts"],
+          },
+        ],
+      }),
+    );
+    expect(entry.unreviewedPaths).toEqual(["src/a.ts", "src/b.ts"]);
+  });
 });
 
 describe("partialReviewScoreEntries", () => {
@@ -147,6 +169,18 @@ describe("formatReviewScoreComment", () => {
     });
     expect(text).toContain("large diff (500 lines ≥ 100)");
     expect(text).toContain("requires 2 round(s)");
+  });
+
+  it("names the paths a truncated round could not fully review", () => {
+    const text = formatReviewScoreComment({
+      round: 1,
+      score: 7,
+      blocking: 0,
+      advisory: 0,
+      verdict: "clean",
+      unreviewedPaths: ["src/a.ts", "src/b.ts"],
+    });
+    expect(text).toContain("unreviewed (truncated diff): src/a.ts, src/b.ts");
   });
 
   it("says so plainly when the round produced no score", () => {

@@ -2918,6 +2918,23 @@ suite("diffAgainstBase (real git)", () => {
     expect(diff.deletions).toContain("-export default () => null;");
   });
 
+  it("un-quotes a non-ASCII path in the patch's `diff --git` header too, to match diff.files", async () => {
+    // review-context.ts's `unpatchedPaths` matches `diff --git a/... b/...` headers in `diff.patch`
+    // against the plain paths in `diff.files` to find what a truncated patch cut entirely. Under the
+    // default `core.quotePath` the header would print C-quoted (`"src/caf\303\251.ts"`) and never
+    // match, wrongly reporting a fully-included file as carrying no hunk at all.
+    g(["config", "core.quotePath", "true"]); // git's default; pinned so the guard is what's tested
+    writeFileSync(join(repo, "café.ts"), "export const c = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "t1: add a non-ASCII path"]);
+
+    const diff = await diffAgainstBase(repo, "main");
+
+    expect(diff.files).toEqual(["café.ts"]);
+    expect(diff.patch).toContain("diff --git a/café.ts b/café.ts");
+    expect(diff.patch).not.toContain("caf\\303\\251");
+  });
+
   it("reports no changes for a branch that committed nothing", async () => {
     const diff = await diffAgainstBase(repo, "main");
     expect(diff).toEqual({ files: [], patch: "", truncated: false });

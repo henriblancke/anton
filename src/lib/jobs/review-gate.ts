@@ -93,6 +93,13 @@ export interface ReviewRound {
    * `fixed` would claim a repair that never happened.
    */
   churnFloorApplied?: { churnLines: number; thresholdLines: number; minRounds: number };
+  /**
+   * The paths this round's reviewer named as unable to fully review (anton-0b1d), carried through from
+   * `review.report.unreviewedPaths` so the board can say WHICH files still have nobody's eyes on them —
+   * not just that the diff was truncated and the score capped. Set only on a truncated round whose
+   * report passed the coverage check (`unreviewedPaths` is otherwise mandatory there).
+   */
+  unreviewedPaths?: string[];
 }
 
 /** Why and how much a round's score was capped — carried on {@link ReviewRound} and the board history it feeds. */
@@ -492,7 +499,14 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
       advisory: findings.length - blocking.length,
       findings,
       ...(review.report.ok
-        ? { score: roundScore, rationale: review.report.rationale, ...(scoreCap!.cap ? { scoreCap: scoreCap!.cap } : {}) }
+        ? {
+            score: roundScore,
+            rationale: review.report.rationale,
+            ...(scoreCap!.cap ? { scoreCap: scoreCap!.cap } : {}),
+            ...(review.report.unreviewedPaths?.length
+              ? { unreviewedPaths: review.report.unreviewedPaths }
+              : {}),
+          }
         : { violation: review.report.violation }),
     };
     rounds.push(entry);
