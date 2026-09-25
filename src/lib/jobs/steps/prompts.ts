@@ -12,7 +12,8 @@ import { humanNotesPromptBlock } from "../../beads/notes";
 import { shortSha } from "../../beads/satisfied-note";
 import type { BranchDiff, PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
-import { findingLines, type ReviewFinding } from "../review-context";
+import { findingLines, MAX_GATE_OUTPUT_CHARS, type ReviewFinding, tailLines } from "../review-context";
+import type { VerifyGateOutcome } from "../shell";
 import type { SatisfiedSettlement, StepContext } from "./context";
 import type { RunNarrative } from "./result";
 
@@ -21,6 +22,18 @@ export interface TicketPreserved {
   ticketId: string;
   commit: PreservedCommit;
 }
+
+/**
+ * A verify-gate failure from a previous attempt, recorded against the RUN so a re-attempt's prompt
+ * can open with it instead of starting blind (anton-q0lpo). Same fields the reviewer already reads
+ * off {@link VerifyGateOutcome} in `verifiedGatesSection` — this is the same evidence, shown one
+ * stage earlier.
+ *
+ * Named distinctly from `gate-failure-record.ts`'s `RecordedGateFailure` (the persisted shape,
+ * which also carries `beadId`/`stepId`): this is only the subset the prompt renders. The persisted
+ * record satisfies this structurally, so callers pass it straight through.
+ */
+export type PromptGateFailure = Pick<VerifyGateOutcome, "label" | "command" | "code" | "output">;
 
 /**
  * What the `step:claude` agent is working ON: the run target, the tickets in scope, and the worktree
@@ -150,16 +163,67 @@ export function truncateField(text: string): string {
  * `preserved` is the state of the BRANCH rather than of the bead (anton-16pq): a timed-out
  * attempt's work already committed here. It reads after the spec because it only means anything
  * once the agent knows what the ticket asks for.
+ *
+ * `recordedFailure` is a verify gate a previous attempt at this ticket left red, recorded against
+ * the RUN (anton-q0lpo). Same placement logic as `preserved`: it only means anything once the agent
+ * knows what the ticket asks for, so it reads after the spec too.
  */
-export function ticketPrompt(ticket: Bead, preserved?: PreservedCommit): string {
+export function ticketPrompt(
+  ticket: Bead,
+  preserved?: PreservedCommit,
+  recordedFailure?: PromptGateFailure,
+): string {
   return [
     `Implement this beads ticket in the current worktree:`,
     ``,
     `Ticket: ${ticket.id} — ${ticket.title}`,
     ...ticketSpecSections(ticket),
+    ...recordedFailureSection(recordedFailure),
     ...continuationSection(preserved),
     ``,
     ticketPromptClosing(ticket.id, preserved !== undefined),
+  ].join("\n");
+}
+
+/**
+ * A recorded gate failure, placed after the spec for the same reason as {@link continuationSection}
+ * (anton-16pq): it is a conditional block that only means anything once the agent knows what the
+ * ticket asks. Omitted entirely when nothing is recorded — a ticket with no gate history is
+ * unchanged.
+ */
+function recordedFailureSection(failure: PromptGateFailure | undefined): string[] {
+  if (!failure) return [];
+  return [``, recordedFailurePromptBlock(failure)];
+}
+
+/**
+ * Names the gate, its command, its exit code, and tails its output — the same discipline
+ * `verifiedGatesSection` in review-context.ts already gives the reviewer (label, command, exit
+ * code, output tailed and capped at {@link MAX_GATE_OUTPUT_CHARS}), shown one stage earlier so the
+ * next attempt isn't dispatched blind.
+ *
+ * It reports the class and the evidence and stops there (anton-4gnv: classes and facts travel,
+ * judgements do not). It never asserts THIS run's diff caused the failure — the previous attempt
+ * that hit it is not this attempt, and the failure may be pre-existing and untouched by either. The
+ * agent judges which; this block only asks it to say so in its report if that's what it finds.
+ */
+function recordedFailurePromptBlock(failure: PromptGateFailure): string {
+  return [
+    `## A gate failed on a previous attempt`,
+    ``,
+    `The **${failure.label}** gate failed on a previous attempt at this ticket: ` +
+      `\`${failure.command}\` exited ${failure.code ?? "?"}. anton recorded it against this run so ` +
+      `this attempt doesn't start blind.`,
+    ``,
+    `The tail of its output:`,
+    ``,
+    "```",
+    tailLines(failure.output, MAX_GATE_OUTPUT_CHARS),
+    "```",
+    ``,
+    `This failure may be PRE-EXISTING and untouched by this work. Figure out which before you ` +
+      `change anything — this block reports the gate and its output, not a verdict on why it ` +
+      `failed. If it turns out to be pre-existing, say so in your report.`,
   ].join("\n");
 }
 

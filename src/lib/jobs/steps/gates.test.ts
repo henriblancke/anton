@@ -5,9 +5,13 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { eq } from "drizzle-orm";
+
 import { schema } from "../../db";
+import { findRunGateFailureForBranch } from "../../runs";
+import { isVerifyGateFailedError } from "../errors";
 import type { ReviewGateResult } from "../review-gate";
-import { closeSandbox, openSandbox } from "./step.fixture";
+import { BRANCH, closeSandbox, openSandbox, target } from "./step.fixture";
 
 const runReviewGate = vi.hoisted(() => vi.fn());
 vi.mock("../review-gate", () => ({ runReviewGate }));
@@ -60,6 +64,108 @@ describe("step:verify", () => {
 
     const rows = await sandbox.tdb.db.select().from(schema.sessions);
     expect(rows[0].status).toBe("failed");
+  });
+
+  /** What the run row currently remembers about a red gate. */
+  const recordOf = async (): Promise<string | null> => {
+    const [row] = await sandbox.tdb.db
+      .select()
+      .from(schema.runs)
+      .where(eq(schema.runs.id, sandbox.runId));
+    return row.lastGateFailure;
+  };
+
+  const RECORD = JSON.stringify({
+    label: "tests",
+    command: "bun run test",
+    code: 1,
+    output: "FAIL",
+    beadId: "anton-8d0f",
+  });
+
+  const remember = async () =>
+    sandbox.tdb.db
+      .update(schema.runs)
+      .set({ lastGateFailure: RECORD })
+      .where(eq(schema.runs.id, sandbox.runId));
+
+  // The gate is green, so a failure the row still remembers describes a tree that no longer exists
+  // — and the next attempt would be sent after a bug that is already fixed (anton-vynb8).
+  it("forgets a recorded gate failure once the gates pass", async () => {
+    await remember();
+
+    await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
+
+    expect(await recordOf()).toBeNull();
+  });
+
+  // The reviewer's 3-attempt repro: attempt 1 records a red gate and settles `failed`; attempt 2 (a
+  // fresh row) passes the gate, then stops for some other reason. Attempt 3 must not be sent after
+  // the failure attempt 2 already fixed, and the stale record sits on attempt 1's row, not attempt 2's.
+  it("forgets a failure an EARLIER attempt on the branch recorded once the gates pass", async () => {
+    await sandbox.tdb.db.insert(schema.runs).values({
+      id: "attempt-1",
+      projectId: sandbox.projectId,
+      epicBeadId: target.id,
+      branch: BRANCH,
+      status: "failed",
+      lastGateFailure: RECORD,
+    });
+    const read = () => findRunGateFailureForBranch(sandbox.tdb.db, sandbox.projectId, target.id, BRANCH);
+    expect((await read())?.label).toBe("tests");
+
+    await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
+
+    expect(await read()).toBeUndefined();
+  });
+
+  it("never forgets a failure recorded on a different branch", async () => {
+    await sandbox.tdb.db.insert(schema.runs).values({
+      id: "other-branch",
+      projectId: sandbox.projectId,
+      epicBeadId: target.id,
+      branch: "anton/elsewhere",
+      status: "failed",
+      lastGateFailure: RECORD,
+    });
+
+    await verifyStep(sandbox.context({ settings: { testCommand: "exit 0" } }));
+
+    expect(
+      await findRunGateFailureForBranch(sandbox.tdb.db, sandbox.projectId, target.id, "anton/elsewhere"),
+    ).toBeDefined();
+  });
+
+  // Nothing proved anything green here, so the record is left for the settle/resume to carry.
+  it("leaves the record alone when the gate goes red", async () => {
+    await remember();
+
+    await expect(
+      verifyStep(sandbox.context({ settings: { testCommand: "exit 1" } })),
+    ).rejects.toSatisfy(isVerifyGateFailedError);
+
+    expect(await recordOf()).toBe(RECORD);
+  });
+
+  // A project that pins no gates proves nothing green either — the step returns before it could.
+  it("leaves the record alone when the project pins no gates", async () => {
+    await remember();
+
+    await verifyStep(sandbox.context());
+
+    expect(await recordOf()).toBe(RECORD);
+  });
+
+  // The record has to say WHERE it went red, or a re-attempt cannot act on it.
+  it("names the bead and the formula step the red gate ran under", async () => {
+    const e = await verifyStep(
+      sandbox.context({
+        settings: { testCommand: "exit 1" },
+        step: { id: "verify", labels: ["step:verify"] },
+      }),
+    ).catch((err: unknown) => err);
+
+    expect(isVerifyGateFailedError(e) && e.site).toEqual({ beadId: "anton-8d0f", stepId: "verify" });
   });
 });
 

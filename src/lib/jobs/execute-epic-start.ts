@@ -344,6 +344,11 @@ async function openRunRow(args: {
     // The resumed attempt drives the freshly resolved endpoint (anton-oom5). Rewrite the provenance
     // so a resume after the project's gateway setting changed isn't attributed to the old route.
     endpointHost,
+    // `lastGateFailure` is deliberately NOT in this list (anton-vynb8). Every other value here is
+    // scoped to the attempt that wrote it, which is why the resume clears them; a red gate is the
+    // one thing the NEXT attempt needs to inherit, and this clear is precisely what it has to
+    // survive. It is stale only when the gate goes green or the run finishes, and those two clear
+    // it themselves.
   });
   return { runId, existing };
 }
