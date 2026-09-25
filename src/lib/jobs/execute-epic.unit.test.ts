@@ -561,6 +561,20 @@ describe("ticketClaimFailure — why the ticket claim gate refused (anton-fude)"
     expect(error.message).toContain("issue not claimable: status blocked");
   });
 
+  it("parks on a deferred status too, naming the status rather than a foreign claim or a locked DB", () => {
+    const error = ticketClaimFailure(
+      "anton-od4",
+      "alice",
+      bdRefusal("Error claiming anton-od4: issue not claimable: status deferred"),
+    );
+
+    expect(error).toBeInstanceOf(PoisonEpic);
+    expect(error.message).toContain('status is "deferred"');
+    expect(error.message).toContain("bd update anton-od4 --status open");
+    expect(error.message).not.toMatch(/already claimed by another operator|beads DB is locked/);
+    expect(error.message).toContain("issue not claimable: status deferred");
+  });
+
   it("keeps the retryable answer for a foreign claim — an owner can still release it", () => {
     const error = ticketClaimFailure(
       "anton-od4",
