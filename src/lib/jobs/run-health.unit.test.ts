@@ -86,6 +86,8 @@ function job(id: string, o: Partial<JobRow> = {}): JobRow {
     leaseExpiresAt: null,
     attempts: 3,
     spentAttempts: 3,
+    quotaParkCount: 0,
+    failureParkCount: 0,
     lastError: null,
     outcome: null,
     outcomeNote: null,

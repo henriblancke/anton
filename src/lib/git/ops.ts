@@ -3701,7 +3701,16 @@ export async function diffAgainstBase(
   const files = await diffPaths(worktreePath, ["--name-only", "--no-renames", from, "HEAD"]);
 
   const max = opts.maxPatchChars ?? DEFAULT_DIFF_PATCH_CHARS;
-  const { text, truncated } = await gitBounded(worktreePath, ["diff", from, "HEAD"], max);
+  // `core.quotePath=false`: `files` above is read with `-z`, so it carries real unquoted paths. The
+  // `diff --git a/... b/...` headers below are matched against those paths (review-context.ts's
+  // `unpatchedPaths`) to find what a truncated patch cut entirely — without this flag a non-ASCII
+  // path is C-quoted in the header (`"src/caf\303\251.ts"`) and never matches, so a fully-included
+  // file would be wrongly reported to the reviewer as carrying no hunk at all.
+  const { text, truncated } = await gitBounded(
+    worktreePath,
+    ["-c", "core.quotePath=false", "diff", from, "HEAD"],
+    max,
+  );
   if (!truncated) return { files, patch: text.trim(), truncated: false };
 
   const { patch: deletions, incomplete, unshown } = await deletionPatch(
@@ -4070,6 +4079,57 @@ async function updatePullRequest(
   if (!target) return false;
   try {
     await execFileAsync(gh, ["pr", "edit", target, "--title", fields.title, "--body", fields.body], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read a PR's current body, best-effort — undefined when gh could not answer (network, auth, no
+ * such PR). A caller that owns one region of the body (anton-te6nr) reads this BEFORE writing, so
+ * it amends what is actually on GitHub rather than a copy it fetched at the start of a session that
+ * may have gone stale under a concurrent edit.
+ */
+export async function readPullRequestBody(
+  repoPath: string,
+  selector: string,
+): Promise<string | undefined> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  const target = selector.startsWith("gh-") ? selector.slice(3) : selector;
+  if (!target) return undefined;
+  try {
+    const { stdout } = await execFileAsync(gh, ["pr", "view", target, "--json", "body"], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return (JSON.parse(stdout) as { body?: string }).body ?? "";
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Overwrite only an existing PR's body, best-effort — returns whether gh confirmed the edit. A
+ * body-only SIBLING of {@link updatePullRequest}, not a widened version of it: a caller that owns
+ * one region of the body (anton-te6nr) must never carry a stale/default title along for the ride
+ * the way passing `updatePullRequest` an unrelated title would risk.
+ */
+export async function updatePullRequestBody(
+  repoPath: string,
+  selector: string,
+  body: string,
+): Promise<boolean> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  const target = selector.startsWith("gh-") ? selector.slice(3) : selector;
+  if (!target) return false;
+  try {
+    await execFileAsync(gh, ["pr", "edit", target, "--body", body], {
       cwd: repoPath,
       timeout: 120_000,
       maxBuffer: 4 * 1024 * 1024,

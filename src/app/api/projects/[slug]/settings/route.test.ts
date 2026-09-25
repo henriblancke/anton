@@ -1042,6 +1042,59 @@ describe("settings route — self-review settings (anton-of1m)", () => {
     expect("reviewLowScoreRounds" in persisted()).toBe(false);
   });
 
+  it("PATCH persists the churn threshold and round floor, including 0 as the off switch (anton-ecdl)", async () => {
+    const res = await PATCH(
+      patchReq({ reviewChurnThresholdLines: 8000, reviewChurnRoundFloor: 3 }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings).toMatchObject({
+      reviewChurnThresholdLines: 8000,
+      reviewChurnRoundFloor: 3,
+    });
+
+    // 0 is a VALUE here, not a clear: it is how the operator turns the churn floor off.
+    const off = await PATCH(patchReq({ reviewChurnRoundFloor: 0 }), ctx("tmp"));
+    expect((await off.json()).settings.reviewChurnRoundFloor).toBe(0);
+    expect(persisted().reviewChurnRoundFloor).toBe(0);
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    expect((await get.json()).settings).toMatchObject({
+      reviewChurnThresholdLines: 8000,
+      reviewChurnRoundFloor: 0,
+    });
+  });
+
+  it("PATCH rejects out-of-range or non-integer churn settings", async () => {
+    for (const bad of [0, 1_000_001, 4.5, "many", true]) {
+      const res = await PATCH(patchReq({ reviewChurnThresholdLines: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/reviewChurnThresholdLines/);
+    }
+    for (const bad of [-1, 6, 1.5]) {
+      const res = await PATCH(patchReq({ reviewChurnRoundFloor: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/reviewChurnRoundFloor/);
+    }
+    expect("reviewChurnThresholdLines" in persisted()).toBe(false);
+    expect("reviewChurnRoundFloor" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears the churn settings back to their defaults (keys removed)', async () => {
+    await PATCH(
+      patchReq({ reviewChurnThresholdLines: 9000, reviewChurnRoundFloor: 3 }),
+      ctx("tmp"),
+    );
+    expect(persisted()).toMatchObject({ reviewChurnThresholdLines: 9000, reviewChurnRoundFloor: 3 });
+    const res = await PATCH(
+      patchReq({ reviewChurnThresholdLines: null, reviewChurnRoundFloor: null }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect("reviewChurnThresholdLines" in persisted()).toBe(false);
+    expect("reviewChurnRoundFloor" in persisted()).toBe(false);
+  });
+
   it("round-trips the whole review block in one PATCH, alongside the agents allowlist", async () => {
     const res = await PATCH(
       patchReq({
