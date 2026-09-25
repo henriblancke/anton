@@ -86,6 +86,7 @@ import {
 } from "../git/pr";
 import {
   createWorktree,
+  warmWorktreeBestEffort,
   withWorktreeClaim,
   type Worktree,
 } from "../git/worktree";
@@ -96,6 +97,7 @@ import {
   resolveCommitTimeoutMs,
   resolvePushTimeoutMs,
   resolveVerifyGates,
+  resolveWarmConfig,
   type ProjectSettings,
 } from "../projects";
 import { captureVerifyGates } from "./shell";
@@ -121,7 +123,7 @@ import {
 } from "./execute-epic-board-evidence";
 import { defaultReadBoardFingerprint, defaultSyncBoard } from "./review-gate";
 import type { AntonDb, Clock } from "./queue";
-import { systemClock } from "./queue";
+import { reviewFixPrParkedAtHead, systemClock } from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
 
 // The per-thread report parser is a review-fix protocol concern; re-export so existing importers
@@ -420,14 +422,31 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   }
 
   let dispatched = 0;
+  // A target the dispatcher declined to (re-)dispatch even though it needs a fix (anton-bzm7s): a
+  // `parked` row for it already sits at this exact PR head, so a fresh attempt would just fail
+  // identically — counted apart from `dispatched` so an operator reading the pass's note can tell
+  // this suppressed target from a merely-idle one (a clean PR never reaches this loop's insides).
+  let suppressed = 0;
   let lastError: unknown = syncError;
   for (const target of targets) {
     await ctx.heartbeat();
     try {
-      if (!(await needsFix(repo, target, ctx.signal))) continue;
+      const triage = await needsFix(repo, target, ctx.signal);
+      if (!triage.needsFix) continue;
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
       // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
-      if (ctx.enqueueReviewFixPr(projectId, target.id)) dispatched += 1;
+      // The head SHA lets the runner's dedupe suppress a doomed retry — see `enqueueReviewFixPrIfAbsent`.
+      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha);
+      if (jobId) {
+        dispatched += 1;
+        continue;
+      }
+      if (triage.headSha && reviewFixPrParkedAtHead(db, projectId, target.id, triage.headSha)) {
+        suppressed += 1;
+        consoleLog.info(
+          `epic ${target.id}: suppressed — parked review-fix-pr at unchanged head ${triage.headSha}`,
+        );
+      }
     } catch (e) {
       // One unreadable PR must not cost the others their dispatch; the failure is surfaced below.
       // A prior sync failure is not overwritten — both are already logged, and either is enough to
@@ -444,30 +463,42 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   }
 
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
-  // nothing, and the two counts together are what an operator checks the poll against.
+  // nothing, and the counts together are what an operator checks the poll against.
+  const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
   return {
     changed: dispatched > 0 || recovered > 0,
     note:
-      `examined ${targets.length} PR(s) in review, dispatched ${dispatched}` +
+      `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}` +
       (recovered > 0 ? `, fenced ${recovered} stranded closure(s)` : ""),
   };
+}
+
+/** What one target's triage decided, and the PR head it decided it against (anton-bzm7s). */
+interface FixTriage {
+  needsFix: boolean;
+  /** The PR head's commit SHA — undefined only if the PR could not be identified. */
+  headSha?: string;
 }
 
 /**
  * Does this target need a fix job? MERGED (finalization is pending) or an actionable review —
  * anything else is a clean PR that costs nothing to leave alone. One `gh` read per target, the same
  * read `handleEpic` repeats when the dispatched job actually runs: PR state can change in between,
- * and the fix re-decides against what it finds rather than trusting this triage.
+ * and the fix re-decides against what it finds rather than trusting this triage. The head SHA rides
+ * along on the same read — it is what `enqueueReviewFixPrIfAbsent` keys its park suppression on.
  */
 async function needsFix(
   repo: string,
   target: Bead,
   signal: AbortSignal,
-): Promise<boolean> {
+): Promise<FixTriage> {
   const number = prNumberFromRef(beads.getPrRef(target));
-  if (number === undefined) return false;
+  if (number === undefined) return { needsFix: false };
   const pr = await getPrReview(repo, number, signal);
-  return pr.state === "MERGED" || classifyReview(pr).actionable;
+  return {
+    needsFix: pr.state === "MERGED" || classifyReview(pr).actionable,
+    headSha: pr.headSha || undefined,
+  };
 }
 
 /**
@@ -643,7 +674,7 @@ async function handleEpic(args: {
  * CONFLICTING — pre-merge the base so claude only has conflict markers to resolve. Every git step
  * is best-effort: a repo with no reachable origin still gets the review-comment flow.
  */
-async function prepareFixWorktree(args: {
+export async function prepareFixWorktree(args: {
   ctx: JobContext;
   repo: string;
   branch: string;
@@ -662,6 +693,9 @@ async function prepareFixWorktree(args: {
     repoPath: repo,
     branch,
     baseBranch: settings.baseBranch,
+    // Warmed explicitly below, once the worktree is confirmed to exist — createWorktree's own
+    // `warm: true` would run the install with no project config, silently ignoring an operator's
+    // pinned command or opt-out (see resolveWarmConfig below and worktree.ts:1601).
     warm: false,
     claimedBy: claimOwner,
   });
@@ -673,6 +707,11 @@ async function prepareFixWorktree(args: {
       `PR #${number}: worktree for ${branch} is missing after creation (${worktree.path}) — refusing to run claude against a non-existent cwd`,
     );
   }
+  // Reused checkouts land here with the lockfile already declaring modules `node_modules` never
+  // linked (verified on #1698) — `safe()` on top of `warmWorktreeBestEffort`'s own internal catch
+  // (belt and suspenders, matching every other best-effort step in this function) so a stuck install
+  // can never block the fix from proceeding.
+  await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
   await ctx.heartbeat();
 
   await safe(() =>

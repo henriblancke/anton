@@ -73,10 +73,14 @@ jobs:
       # session while an API request was being retried") — bumping to the latest available pin
       # picks up both. If this recurs, it's the upstream bug, not this PR's diff — check #1759's
       # status before re-bumping blindly.
+      # Bumped 2.1.281 -> 2.1.282 (2026-09-25): same signature on PR #326 —
+      # is_error:true, num_turns:1, total_cost_usd:0, 425ms, no findings unrelated to this
+      # PR's own diff. Following this comment's own instruction: bump before assuming it's
+      # the PR's fault.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.281'
+          CLAUDE_CODE_VERSION: '2.1.282'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"

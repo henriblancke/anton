@@ -994,3 +994,68 @@ export const claudeInvocations = sqliteTable(
     index("claude_invocations_bead_idx").on(table.beadId),
   ],
 );
+
+/**
+ * The per-ATTEMPT run record (anton-rnrdr): when each attempt on a run began, when it ended, and
+ * how it settled — one append-only row per attempt.
+ *
+ * It exists because `runs` is one row per RUN, not per attempt. A parked run resumes IN PLACE
+ * (`findOpenRunForEpic`), and that resume REWRITES `runs.attempt_started_at` — deliberately, because
+ * the repair weigher needs it to mean the CURRENT attempt's start (gardener/repair.ts). So a settled
+ * row carries the last attempt's start beside a final `ended_at`, and every earlier interval is
+ * already gone by the time anyone asks. Wall time including retries is not recoverable from it, which
+ * is why the feature ledger refuses to report `wallMs` at all (feature-ledger.ts).
+ *
+ * Shaped like `claude_invocations`, and for its reasons: rows are append-only FACTS, never revised,
+ * because the interval one carries is only true of the attempt that ran it — a resume writes a NEW
+ * row rather than touching the previous attempt's. `Σ (ended_at − started_at)` over a run's rows is
+ * therefore its wall time including retries, and for a run that never retried it is the single
+ * interval, equal to `ended_at − started_at` on the run row itself.
+ *
+ * Nothing here REDEFINES `runs.attempt_started_at`: this is a record beside it, so its current
+ * readers are untouched.
+ *
+ * The same never-fail-the-work rule as the spend ledger: a write that throws is swallowed
+ * (`recordAttemptStart`/`recordAttemptEnd`). A run that did the work must not fail because a meter
+ * could not be written, and a missing row loses only the interval.
+ */
+export const runAttempts = sqliteTable(
+  "run_attempts",
+  {
+    id: text("id").primaryKey(),
+    /**
+     * The run this attempt belongs to. NOT a foreign key, like `quota_attempts` and unlike most of
+     * this schema: an interval is recorded on a best-effort path, and a reference the writer cannot
+     * satisfy is one more way for a meter to reject a row about work that really happened.
+     */
+    runId: text("run_id").notNull(),
+    projectId: text("project_id"),
+    /**
+     * 1-based, per run: the ordinal of this attempt among the rows of its own run. Derived at insert
+     * from the count already recorded for the run, so it is dense and gapless even though
+     * `runs.attempts` counts the QUEUE's delivery attempts (`ctx.attempt`) and can differ.
+     */
+    attempt: integer("attempt").notNull(),
+    startedAt: ts("started_at").notNull(),
+    /**
+     * When this attempt stopped. Null while it is still running — and null FOREVER on an attempt
+     * whose process died before it could settle (a crash, a kill -9), which is a real gap and never a
+     * zero: a reader sums the intervals it has and says how many it could not close
+     * (`attemptWallMs`).
+     */
+    endedAt: ts("ended_at"),
+    /**
+     * How the attempt settled, in the run row's own vocabulary — `parked` | `done` | `failed`. Null
+     * while running, or on an attempt that never got to settle. Recorded per attempt because
+     * `runs.status` is the LATEST attempt's: a run that parked twice and then delivered shows `done`
+     * and says nothing about the two parks whose intervals sit beside it here.
+     */
+    outcome: text("outcome"),
+    recordedAt: ts("recorded_at").notNull().default(now),
+  },
+  (table) => [
+    // The only read this table has: one run's attempts, in order. Both halves of it — the fold over
+    // a settled run, and the open row `recordAttemptEnd` closes — seek on exactly this pair.
+    index("run_attempts_run_idx").on(table.runId, table.attempt),
+  ],
+);
