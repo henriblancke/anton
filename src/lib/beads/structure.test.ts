@@ -7,6 +7,7 @@ import {
   formatStructureViolations,
   structureGaps,
   validateBoardStructure,
+  type StructureOptions,
   type StructureRule,
 } from "./structure";
 
@@ -24,9 +25,16 @@ const feature = (id: string, parent?: string, over: Partial<Bead> = {}) =>
 const task = (id: string, parent?: string, over: Partial<Bead> = {}) =>
   bead(id, "task", { ...(parent ? { parent } : {}), ...over });
 
+/** A `blocks` edge, inlined the way `bd list --json` carries it: on the DEPENDENT's own record. */
+const blocks = (blockedId: string, blockerId: string) => ({
+  issue_id: blockedId,
+  depends_on_id: blockerId,
+  type: "blocks",
+});
+
 /** Rules broken by `id`, so an assertion names the rule rather than matching prose. */
-const rulesFor = (board: Bead[], id: string): StructureRule[] =>
-  validateBoardStructure(board)
+const rulesFor = (board: Bead[], id: string, options?: StructureOptions): StructureRule[] =>
+  validateBoardStructure(board, options)
     .filter((v) => v.id === id)
     .map((v) => v.rule);
 
@@ -73,6 +81,286 @@ describe("validateBoardStructure", () => {
       expect(rulesFor(board, "c1")).toEqual(["parentless-chore"]);
       expect(rulesFor(board, "t1")).toEqual([]);
       expect(rulesFor(board, "b1")).toEqual([]);
+    });
+  });
+
+  describe("blocks edges — the four mechanical ordering faults", () => {
+    it("faults a bead that blocks-depends on itself", () => {
+      const board = [...HEALTHY, task("stuck", "f1", { dependencies: [blocks("stuck", "stuck")] })];
+      expect(rulesFor(board, "stuck")).toEqual(["blocks-edge-self"]);
+      expect(validateBoardStructure(board).find((v) => v.id === "stuck")?.severity).toBe("blocking");
+    });
+
+    it("faults a blocks edge whose target is not on the board", () => {
+      const board = [...HEALTHY, task("stuck", "f1", { dependencies: [blocks("stuck", "ghost")] })];
+      expect(rulesFor(board, "stuck")).toEqual(["blocks-edge-dangling"]);
+      const [violation] = validateBoardStructure(board).filter((v) => v.id === "stuck");
+      expect(violation.message).toContain("ghost");
+      expect(violation.message).toContain("bd dep remove stuck ghost");
+    });
+
+    it("does not fault a blocks edge whose target is a CLOSED bead still on the board", () => {
+      // Closed is a resolved blocker, not a missing one — bd list --status all still carries it.
+      const board = [
+        ...HEALTHY,
+        task("done", "f1", { status: "closed" }),
+        task("waiter", "f1", { dependencies: [blocks("waiter", "done")] }),
+      ];
+      expect(rulesFor(board, "waiter")).toEqual([]);
+    });
+
+    it("does not fault a blocks edge whose target is a `gate` bead — the legitimate case", () => {
+      // Ad-hoc merge gates are a real `blocks` target (121 of them on this project's own board) —
+      // present in the board, just of pipeline type. Presence is all that matters here; type must
+      // never be used to treat a found bead as though it were missing.
+      const board = [
+        ...HEALTHY,
+        bead("gate1", "gate"),
+        task("waiter", "f1", { dependencies: [blocks("waiter", "gate1")] }),
+      ];
+      expect(rulesFor(board, "waiter")).toEqual([]);
+    });
+
+    it("does not fault a gate reparented under the ticket it blocks (P2 review on PR #274)", () => {
+      // An ad-hoc `bd gate create --blocks <bead>` gate can be reparented under the bead it gates
+      // (gate-molecule.integration.test.ts) — a supported shape, and the normal one for "wait on
+      // this human/timer step". The gate's `blocks` edge on `waiter` IS that wait, not a redundant
+      // echo of a tier the parent-child edge already orders — `bothDispatchedTickets` can never
+      // exempt it (a gate isn't a ticket type), so the exemption must come from pipeline-type alone.
+      const board = [
+        ...HEALTHY,
+        task("waiter", "f1", { dependencies: [blocks("waiter", "gate1")] }),
+        bead("gate1", "gate", { parent: "waiter" }),
+      ];
+      expect(rulesFor(board, "waiter")).toEqual([]);
+    });
+
+    it("faults a blocks edge on a pair already linked parent-child (parent waiting on its child)", () => {
+      const board = [epic("e1", { dependencies: [blocks("e1", "f1")] }), feature("f1", "e1")];
+      expect(rulesFor(board, "e1")).toEqual(["blocks-duplicates-parent"]);
+    });
+
+    it("faults the same duplicate in the other direction (child waiting on its parent)", () => {
+      const board = [epic("e1"), feature("f1", "e1", { dependencies: [blocks("f1", "e1")] })];
+      expect(rulesFor(board, "f1")).toContain("blocks-duplicates-parent");
+    });
+
+    it("allows a nested working ticket to wait on its parent ticket", () => {
+      const board = [
+        epic("e1"),
+        feature("f1", "e1"),
+        task("parent", "f1"),
+        task("subtask", "parent", { dependencies: [blocks("subtask", "parent")] }),
+      ];
+      expect(rulesFor(board, "subtask")).toEqual([]);
+    });
+
+    it("faults a ticket-type child of a PARENTLESS task/bug run target — same shape, not dispatched", () => {
+      // "parent" here is itself a run target (`isRunTarget` admits a parentless task/bug), but a
+      // standalone run of one — `selectRunTickets` executes `[target]` only, never a task's own
+      // children the way a feature groups its tickets. Same ticket-tier types on both ends of the
+      // edge as the exempt case above, but no card dispatches them together, so the child is dead.
+      const board = [
+        task("parent"),
+        task("subtask", "parent", { dependencies: [blocks("subtask", "parent")] }),
+      ];
+      expect(rulesFor(board, "subtask")).toEqual(["blocks-duplicates-parent"]);
+    });
+
+    it("does not fault an ordinary blocks edge between unrelated beads", () => {
+      const board = [
+        ...HEALTHY,
+        task("first", "f1"),
+        task("second", "f1", { dependencies: [blocks("second", "first")] }),
+      ];
+      expect(rulesFor(board, "second")).toEqual([]);
+    });
+
+    it("faults every bead bd reports on a blocks cycle", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "c")] }),
+        task("c", undefined, { dependencies: [blocks("c", "a")] }),
+      ];
+      const cycles = [{ ids: ["a", "b", "c"], raw: { cycle: ["a", "b", "c"] } }];
+      expect(rulesFor(board, "a", { cycles })).toEqual(["blocks-cycle"]);
+      expect(rulesFor(board, "b", { cycles })).toEqual(["blocks-cycle"]);
+      expect(rulesFor(board, "c", { cycles })).toEqual(["blocks-cycle"]);
+    });
+
+    it("recommends an edge from the reported cycle, not a different overlapping cycle", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "b"), blocks("a", "c")] }),
+        task("b", undefined, { dependencies: [blocks("b", "a")] }),
+        task("c", undefined, { dependencies: [blocks("c", "a")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [
+          { ids: ["a", "c"], raw: { cycle: ["a", "c"] } },
+          { ids: ["a", "b"], raw: { cycle: ["a", "b"] } },
+        ],
+      });
+      const aCycle = violations.find((violation) => violation.id === "a" && violation.rule === "blocks-cycle");
+      expect(aCycle?.message).toContain("bd dep remove a c");
+    });
+
+    it("recommends the reported loop's own edge over a chord into the same cycle (PR #274 review)", () => {
+      // Loop is a -> b -> c -> a; `a` also holds an unrelated chord straight to `c`. Recommending
+      // `bd dep remove a c` would leave the reported three-node loop fully intact — the fix must
+      // walk bd's own reported order (`ids`), not just treat the cycle as an unordered member set.
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "c"), blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "c")] }),
+        task("c", undefined, { dependencies: [blocks("c", "a")] }),
+      ];
+      const cycles = [{ ids: ["a", "b", "c"], raw: { cycle: ["a", "b", "c"] } }];
+      const violations = validateBoardStructure(board, { cycles });
+      const aCycle = violations.find((v) => v.id === "a" && v.rule === "blocks-cycle");
+      expect(aCycle?.message).toContain("bd dep remove a b");
+      expect(aCycle?.message).not.toContain("bd dep remove a c");
+    });
+
+    it("does not infer cycles when bd supplies no cycle evidence", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "a")] }),
+      ];
+      expect(validateBoardStructure(board, { cycles: [] })).toEqual([]);
+    });
+
+    it("blocks on an unreadable bd cycle record rather than treating it as clean", () => {
+      const violations = validateBoardStructure(HEALTHY, { cycles: [{ ids: [], raw: { unexpected: true } }] });
+      expect(violations).toEqual([
+        expect.objectContaining({ id: "board", rule: "blocks-cycle", severity: "blocking" }),
+      ]);
+      expect(violations[0].message).toContain("bd dep cycles");
+      expect(violations[0].message).toContain("bd dep remove");
+      expect(violations[0].message).toContain("bd dep add");
+    });
+
+    it("keeps partially parseable bd cycle evidence blocking for each mapped member and at board scope", () => {
+      const violations = validateBoardStructure(HEALTHY, {
+        cycles: [{ ids: ["t1", "unknown"], raw: { ids: ["t1", "unknown"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["t1", "blocks-cycle"],
+        ["board", "blocks-cycle"],
+      ]);
+    });
+
+    it("blocks each member of a cycle made entirely of pipeline artifacts (gates/molecules)", () => {
+      // isJudged excludes gate/molecule beads, so the per-bead loop above never reaches either of
+      // these ids' cycle-membership check — without this fallback, a loop wired entirely out of
+      // ad-hoc gates would report as a clean board despite bd's own detector finding it. Faulted at
+      // each member's own id (not a synthetic "board" id) so `structureGaps` subtree-scopes it like
+      // any other mapped cycle, rather than gating every run target on the board.
+      const board = [
+        bead("g1", "gate", { dependencies: [blocks("g1", "g2")] }),
+        bead("g2", "molecule", { dependencies: [blocks("g2", "g1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["g1", "g2"], raw: { cycle: ["g1", "g2"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule, v.severity])).toEqual([
+        ["g1", "blocks-cycle", "blocking"],
+        ["g2", "blocks-cycle", "blocking"],
+      ]);
+      expect(violations[0].message).toContain("g1");
+      expect(violations[0].message).toContain("g2");
+    });
+
+    it("ignores a cycle made entirely of closed (historical) beads (P2 review, PR #274)", () => {
+      // Neither `t1` nor `t2` is closed's live, so the per-bead loop skips both (`isJudged` is false
+      // for closed beads too) — but unlike the gates/molecules case above, there is no LIVE edge left
+      // on this loop to deadlock anything. A closed bead's `blocks` edge no longer holds anyone back.
+      const board = [
+        task("t1", undefined, { status: "closed", dependencies: [blocks("t1", "t2")] }),
+        task("t2", undefined, { status: "closed", dependencies: [blocks("t2", "t1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["t1", "t2"], raw: { cycle: ["t1", "t2"] } }],
+      });
+      expect(violations).toEqual([]);
+    });
+
+    it("still faults a cycle mixing a closed bead with a live gate (live edge remains)", () => {
+      const board = [
+        task("t1", undefined, { status: "closed", dependencies: [blocks("t1", "g1")] }),
+        bead("g1", "gate", { dependencies: [blocks("g1", "t1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["t1", "g1"], raw: { cycle: ["t1", "g1"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule, v.severity])).toEqual([
+        ["t1", "blocks-cycle", "blocking"],
+        ["g1", "blocks-cycle", "blocking"],
+      ]);
+    });
+
+    it("still faults the judged member, not the board, when only one side of the cycle is a gate", () => {
+      const board = [
+        task("t1", undefined, { dependencies: [blocks("t1", "g1")] }),
+        bead("g1", "gate", { dependencies: [blocks("g1", "t1")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["t1", "g1"], raw: { cycle: ["t1", "g1"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([["t1", "blocks-cycle"]]);
+    });
+
+    it("blocks mapped cycle members even when a raced board snapshot no longer carries their edges", () => {
+      const board = [task("a"), task("b")];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }],
+      });
+
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["a", "blocks-cycle"],
+        ["b", "blocks-cycle"],
+      ]);
+      expect(violations.every((v) => v.message.includes("bd dep remove"))).toBe(true);
+    });
+
+    it("does not fault a plain chain that merely converges, with no loop", () => {
+      const board = [
+        task("a", undefined, { dependencies: [blocks("a", "c")] }),
+        task("b", undefined, { dependencies: [blocks("b", "c")] }),
+        task("c"),
+      ];
+      expect(validateBoardStructure(board)).toEqual([]);
+    });
+
+    it("does not double-count a self-edge or a dangling edge as a cycle", () => {
+      const board = [
+        task("self", undefined, { dependencies: [blocks("self", "self")] }),
+        task("dangling", undefined, { dependencies: [blocks("dangling", "ghost")] }),
+      ];
+      expect(rulesFor(board, "self")).toEqual(["blocks-edge-self"]);
+      expect(rulesFor(board, "dangling")).toEqual(["blocks-edge-dangling"]);
+    });
+
+    it("faults a live gate/molecule's own dangling or self blocks-edge (PR #274 review)", () => {
+      // A gate/molecule fails `isJudged` (pipeline plumbing, judged by no tier rule), but a `blocks`
+      // edge it owns still has to resolve for whatever waits on it to ever become ready. Before this
+      // fix the per-bead loop's `isJudged` gate skipped these beads before the edge-validation loop
+      // ever ran, and an acyclic dangling edge is invisible to `bd dep cycles` too — so the fault
+      // never surfaced anywhere.
+      const board = [
+        bead("g1", "gate", { dependencies: [blocks("g1", "ghost")] }),
+        bead("m1", "molecule", { dependencies: [blocks("m1", "m1")] }),
+      ];
+      expect(rulesFor(board, "g1")).toEqual(["blocks-edge-dangling"]);
+      expect(rulesFor(board, "m1")).toEqual(["blocks-edge-self"]);
+    });
+
+    it("does not fault a closed or abandoned gate's dangling blocks-edge", () => {
+      // Closed/abandoned pipeline beads stay excluded from every rule, tier or graph-integrity —
+      // history, not live work that can stall a run.
+      const board = [
+        bead("g1", "gate", { status: "closed", dependencies: [blocks("g1", "ghost")] }),
+        bead("g2", "gate", { labels: ["abandoned"], dependencies: [blocks("g2", "ghost")] }),
+      ];
+      expect(validateBoardStructure(board)).toEqual([]);
     });
   });
 
@@ -222,6 +510,30 @@ describe("structureGaps", () => {
   it("terminates on a parent cycle", () => {
     const cyclic = [feature("a", "b"), feature("b", "a")];
     expect(() => structureGaps("a", cyclic)).not.toThrow();
+  });
+
+  it("blocks every target, not just one whose subtree holds the cycle, on an unreadable bd cycle record (review finding)", () => {
+    // The `blocks-cycle` fault bd's report couldn't be fully mapped to board ids lands on the
+    // synthetic "board" id, deliberately bypassing subtree scoping (tiers.mjs:360) — there is no
+    // subtree to scope it to, since anton cannot name the cycle's members. `f2` has no relationship
+    // to any bead bd might have meant, yet it still refuses: fail-safe over availability.
+    const gaps = structureGaps("f2", BOARD, { cycles: [{ ids: [], raw: { unexpected: true } }] });
+    expect(gaps.blocking.map((v) => v.id)).toEqual(["board"]);
+  });
+
+  it("scopes a fully-mapped pipeline cycle to the run target that owns it (review finding)", () => {
+    // Unlike the unreadable-record case above, a cycle of gates/molecules IS fully mapped to real
+    // board ids — so it must gate only the run target whose subtree contains those ids, not every
+    // target on the board. Approving f2 must not fail over a cycle that lives entirely under f1.
+    const board = [
+      ...BOARD,
+      bead("g1", "gate", { parent: "f1", dependencies: [blocks("g1", "g2")] }),
+      bead("g2", "molecule", { parent: "f1", dependencies: [blocks("g2", "g1")] }),
+    ];
+    const cycles = [{ ids: ["g1", "g2"], raw: { cycle: ["g1", "g2"] } }];
+
+    expect(structureGaps("f2", board, { cycles }).blocking).toEqual([]);
+    expect(structureGaps("f1", board, { cycles }).blocking.map((v) => v.id).sort()).toEqual(["g1", "g2"]);
   });
 });
 

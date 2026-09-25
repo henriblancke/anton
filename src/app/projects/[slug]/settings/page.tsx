@@ -6,6 +6,7 @@ import {
   resolvePickerApplyOverride,
 } from "@/lib/projects";
 import { allIssues } from "@/lib/beads/issues";
+import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
 import { discoverVocabulary } from "@/lib/policy/vocabulary";
 import { boardIssueTypes, calibratePolicy } from "@/lib/policy/calibrate";
@@ -47,7 +48,16 @@ export default async function ProjectSettingsPage({
     listSchedules(project.id),
     discoverAgents(project.repoPath).catch(() => []),
     bundledAgentIds().catch(() => []),
-    allIssues(project.repoPath, { blockOnPendingWrite: true }).then(
+    // The failure is CARRIED, not swallowed into an empty board: an unreadable board and a board with
+    // no work look identical downstream, and the work policy panel must not let an operator arm a
+    // fallback policy fitted to a read failure. `ok` is read-success only — it also gates the
+    // earned-autonomy `record` below, which has nothing to do with cycle evidence, so it must not
+    // flip on a `bd dep cycles` hiccup that leaves the bead read itself intact. `withCycles: true`
+    // still asks for authoritative evidence: `allIssues` best-effort-attaches it (a timeout is
+    // swallowed there and the call still resolves), so `policyCandidates` gets it when available and
+    // otherwise degrades per-candidate (`missingCycleEvidenceGap`, reported via `notStartable`)
+    // rather than the whole page reading as unavailable over a narrower failure.
+    allIssues(project.repoPath, { blockOnPendingWrite: true, withCycles: true }).then(
       (issues) => ({ issues, ok: true }),
       () => ({ issues: [] as Awaited<ReturnType<typeof allIssues>>, ok: false }),
     ),
@@ -78,6 +88,14 @@ export default async function ProjectSettingsPage({
   // of the open run targets arrive as a count the panel explains. Off the same snapshot — no extra
   // board call.
   const { candidates, notStartable } = policyCandidates(beads);
+  // `board.ok` is read-success only (see the comment above) and stays true on a `bd dep cycles`
+  // miss, so it cannot tell the policy panel why `candidates` came back empty. When evidence is
+  // missing, `missingCycleEvidenceGap` fails EVERY target's approval gate, so `policyCandidates`
+  // degrades to zero candidates and `notStartable` covers the whole board — a projection that looks
+  // exactly like "this board has no startable work" unless the panel is told the real cause. Kept
+  // separate from `boardUnavailable` on purpose: earned-autonomy above reads off `board.ok` alone,
+  // and a `bd dep cycles` hiccup that leaves the bead read intact must not lock that too.
+  const policyEvidenceUnavailable = board.ok && cycleEvidenceFor(beads) === undefined;
 
   // What this board's own settled proposals say about each kind (anton-m29g) — the second gate
   // arming needs, and the one no setting lifts. Derived here rather than in the form because the
@@ -151,6 +169,7 @@ export default async function ProjectSettingsPage({
       policyCandidates={candidates}
       policyNotStartable={notStartable}
       boardUnavailable={!board.ok}
+      policyEvidenceUnavailable={policyEvidenceUnavailable}
       earned={earned}
       pickerEarned={pickerEarned}
       quotaProjects={quotaProjects}

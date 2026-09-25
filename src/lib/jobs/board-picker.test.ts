@@ -33,6 +33,7 @@ import { LABELS } from "../beads/bd";
 import type { PrActivity } from "../git/pr";
 import type { Bead } from "../beads/types";
 import { loadAllIssues } from "../beads/issues";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import {
   invalidateIssueSnapshot,
   refreshIssueSnapshot,
@@ -56,7 +57,10 @@ const board = vi.hoisted(() => ({ current: [] as Bead[], calls: [] as unknown[][
 vi.mock("../beads/issues", () => ({
   loadAllIssues: vi.fn(async (...args: unknown[]) => {
     board.calls.push(args);
-    return board.current;
+    // The real `loadAllIssues` attaches authoritative `bd dep cycles` evidence when asked
+    // (`withCycles: true`); every caller here needs that promise, so the stub attaches nominal
+    // evidence (no cycles) to whatever board a case has set.
+    return attachCycleEvidence(board.current, []);
   }),
 }));
 
@@ -312,7 +316,7 @@ describe("makeBoardPickerHandler", () => {
 
   it("reads the board strictly, so a gate-less read retries instead of recording it as blocked", async () => {
     await makeBoardPickerHandler({ db: t.db, clock })(fakeCtx());
-    expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true }]);
+    expect(board.calls[0]).toEqual(["/tmp/p1", { strictGates: true, withCycles: true }]);
   });
 
   it("records an EMPTY plan on a board with nothing claimable", async () => {
@@ -690,7 +694,7 @@ describe("makeBoardPickerHandler", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     // The pass's own read stands; the RESTAMP's re-read is the one that falls over.
     vi.mocked(loadAllIssues)
-      .mockImplementationOnce(async () => board.current)
+      .mockImplementationOnce(async () => attachCycleEvidence(board.current, []))
       .mockImplementationOnce(async () => {
         throw new Error("bd is gone");
       });

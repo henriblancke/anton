@@ -134,11 +134,25 @@ describe("anton board-check (bd stubbed on PATH)", () => {
   const dirs = tempDirs();
   let repo: string;
 
-  /** A `bd` whose `list` serves BOARD, optionally refusing `--status all` the way lean builds do. */
-  async function fakeBd(board: unknown[], { rejectsStatusAll = false } = {}): Promise<string> {
+  /** A `bd` whose list and dependency-cycle output are configurable at the CLI boundary. */
+  async function fakeBd(
+    board: unknown[],
+    {
+      rejectsStatusAll = false,
+      cycles = [],
+      cycleExit = 0,
+      cycleOutput = JSON.stringify(cycles),
+    }: {
+      rejectsStatusAll?: boolean;
+      cycles?: unknown[];
+      cycleExit?: number;
+      cycleOutput?: string;
+    } = {},
+  ): Promise<string> {
     const bin = await dirs.make("anton-bdbin-");
     const open = board.filter((b) => (b as { status?: string }).status !== "closed");
     const closed = board.filter((b) => (b as { status?: string }).status === "closed");
+    const gates = board.filter((b) => (b as { issue_type?: string }).issue_type === "gate");
     writeFakeBd(
       bin,
       [
@@ -146,12 +160,24 @@ describe("anton board-check (bd stubbed on PATH)", () => {
         "const a = process.argv.slice(2);",
         `const open = ${JSON.stringify(JSON.stringify(open))};`,
         `const closed = ${JSON.stringify(JSON.stringify(closed))};`,
-        `const all = ${JSON.stringify(JSON.stringify(board))};`,
+        `const all = ${JSON.stringify(JSON.stringify(board.filter((b) => (b as { issue_type?: string }).issue_type !== "gate")))};`,
+        `const gates = ${JSON.stringify(JSON.stringify(gates))};`,
+        `const cycleOutput = ${JSON.stringify(cycleOutput)};`,
+        `const cycleExit = ${cycleExit};`,
+        'if (a.includes("dep") && a.includes("cycles")) {',
+        '  if (cycleExit !== 0) console.error(cycleOutput); else console.log(cycleOutput);',
+        "  process.exit(cycleExit);",
+        "}",
         'const i = a.indexOf("--status");',
         'const status = i >= 0 ? a[i + 1] : "";',
         `if (status === "all" && ${rejectsStatusAll}) {`,
         '  console.error("unknown value for --status: all");',
         "  process.exit(2);",
+        "}",
+        'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+        '  const gateBoard = JSON.parse(gates);',
+        '  console.log(JSON.stringify(status === "all" ? gateBoard : status === "closed" ? gateBoard.filter((b) => b.status === "closed") : gateBoard.filter((b) => b.status !== "closed")));',
+        "  process.exit(0);",
         "}",
         'console.log(status === "all" ? all : status === "closed" ? closed : open);',
         "process.exit(0);",
@@ -202,6 +228,135 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.status).toBe(1);
   });
 
+  // The four mechanical ordering faults (anton-5n57p) live in tiers.mjs and are unit-tested off
+  // literal boards there (structure.test.ts). What's under test here is the WIRING: board-check
+  // counts them into its blocking total, exits non-zero on them, and prints them apart from tier
+  // faults rather than interleaved in board order.
+  describe("ordering faults", () => {
+    const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+
+    it("counts a self-blocking edge as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "t3")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-edge-self]");
+      expect(r.stdout).toContain("t3");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks-edge to a nonexistent bead as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "ghost")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-edge-dangling]");
+      expect(r.stdout).toContain("ghost");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks-edge that duplicates the parent-child edge as blocking and exits non-zero", async () => {
+      const board = [...HEALTHY, { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "f1")] }];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-duplicates-parent]");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a cycle bd reports as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "a", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("a", "b")] },
+        { id: "b", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("b", "a")] },
+      ];
+      const r = runCheck(await fakeBd(board, { cycles: [{ cycle: ["a", "b"] }] }));
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    it("refuses an unreadable populated cycle report rather than calling the board clean", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycles: [{ unfamiliar: true }] }));
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.stdout).toContain("bd dep cycles");
+      expect(r.status).toBe(1);
+    });
+
+    it("hydrates gate records before judging a blocks target", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "open" },
+        { id: "waiter", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("waiter", "gate1")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+      expect(r.status).toBe(0);
+    });
+
+    it("hydrates gate records when bd wraps the gate listing in an { issues: [...] } envelope", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "open" },
+        { id: "waiter", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("waiter", "gate1")] },
+      ];
+      const open = board.filter((b) => b.status !== "closed" && b.issue_type !== "gate");
+      const gates = board.filter((b) => b.issue_type === "gate");
+      const bin = await dirs.make("anton-bdbin-envelope-");
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          "const a = process.argv.slice(2);",
+          `const open = ${JSON.stringify(JSON.stringify(open))};`,
+          `const gates = ${JSON.stringify(JSON.stringify(gates))};`,
+          'if (a.includes("dep") && a.includes("cycles")) { console.log("[]"); process.exit(0); }',
+          "// Same shape bd uses for `bd ready`/some `bd list` builds: `{ issues: [...] }` rather than a bare array.",
+          'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+          '  console.log(JSON.stringify({ issues: JSON.parse(gates) }));',
+          "  process.exit(0);",
+          "}",
+          "console.log(open);",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+      expect(r.status).toBe(0);
+    });
+
+    it("fails loud when bd's authoritative cycle output is malformed", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycleOutput: "not json" }));
+      expect(r.stderr).toContain("cycle output this build can't parse");
+      expect(r.status).toBe(1);
+    });
+
+    it("reports a non-zero cycle command with a usable fallback detail", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycleExit: 2, cycleOutput: "" }));
+      expect(r.stderr).toContain("bd dep cycles exited 2");
+      expect(r.status).toBe(1);
+    });
+
+    it("groups ordering faults apart from tier faults instead of interleaving them", async () => {
+      const board = [
+        ...HEALTHY,
+        STRAY, // a tier fault: ticket-under-container-epic
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "t3")] }, // an ordering fault
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.status).toBe(1);
+      const orderingHeader = r.stdout.indexOf("ordering faults:");
+      const tierHeader = r.stdout.indexOf("tier faults:");
+      const orderingLine = r.stdout.indexOf("[blocks-edge-self]");
+      const tierLine = r.stdout.indexOf("[ticket-under-container-epic]");
+      expect(orderingHeader).toBeGreaterThanOrEqual(0);
+      expect(tierHeader).toBeGreaterThan(orderingHeader);
+      // Every ordering line sits under its own header, before the tier header starts.
+      expect(orderingLine).toBeGreaterThan(orderingHeader);
+      expect(orderingLine).toBeLessThan(tierHeader);
+      expect(tierLine).toBeGreaterThan(tierHeader);
+    });
+  });
+
   // Some bd builds reject `--status all`; src/lib/beads/issues.ts already treats that as a supported
   // variation. Without the same fallback here, /shape's mandatory Phase 5 audit failed having
   // checked nothing at all on exactly those installs.
@@ -212,6 +367,23 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     // The closed bead is read (so container-ness sees the whole graph) but never judged: 5 live of 6.
     expect(r.stdout).toContain("5 live beads");
     expect(r.status).toBe(1);
+  });
+
+  it("hydrates gates through the fallback when bd rejects --status all", async () => {
+    const board = [
+      ...HEALTHY,
+      { id: "gate1", issue_type: "gate", status: "open" },
+      {
+        id: "waiter",
+        issue_type: "task",
+        status: "open",
+        parent: "f1",
+        dependencies: [{ issue_id: "waiter", depends_on_id: "gate1", type: "blocks" }],
+      },
+    ];
+    const r = runCheck(await fakeBd(board, { rejectsStatusAll: true }));
+    expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+    expect(r.status).toBe(0);
   });
 
   // The form rate belongs to `bun scripts/contract-report.ts` alone (anton-5ltn). board-check judges

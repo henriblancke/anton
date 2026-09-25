@@ -62,6 +62,7 @@ vi.mock("../beads/bd", async () => {
       // unstubbed it would shell out to a real `bd dolt push` from a unit suite.
       push: async () => "synced" as const,
       list: (...a: [string, string[]?]) => listMock(...a),
+      depCycles: async () => [],
       showWithComments: (...a: [string, string]) => showWithCommentsMock(...a),
       show: (...a: [string, string]) => showMock(...a),
       create: (cwd: string, opts: ProposalCreate) => {
@@ -714,9 +715,13 @@ describe("product-master pass · armed", () => {
     expect(dispatched?.prompt).toContain("anton-late");
   });
 
-  it("judges the board it read when tier 1 wrote nothing — no second read for a quiet tier", async () => {
+  it("judges the board it read when tier 1 wrote nothing — no second load for a quiet tier", async () => {
     // The re-read is bought by a WRITE, not by a tier running: a pass whose tier 1 found nothing
-    // pays for one board read, as it did before anything was armed.
+    // pays for exactly one `loadAllIssues` call, as it did before anything was armed. That one call
+    // costs a single `bd list` read here — `withCycles`'s consistency recheck (issues.ts) only pays
+    // for a second when the board actually carries a `blocks` edge, which this fixture doesn't — so
+    // the baseline is 1; the assertion after the pass finishes is what proves no ADDITIONAL load
+    // happened.
     const listCalls = () => listMock.mock.calls.length;
     let atDispatch = 0;
     duringSession = () => {
@@ -729,6 +734,7 @@ describe("product-master pass · armed", () => {
 
     expect(writes).toEqual(["create Product master: defer anton-a"]);
     expect(atDispatch).toBe(1);
+    expect(listCalls()).toBe(1);
   });
 
   it("keeps the pass green when an apply blows up, and leaves the ask standing", async () => {

@@ -9,6 +9,7 @@ import type { ScanHealth } from "./scan-health";
 import type { HygieneReport, Project } from "./types";
 
 const listMock = vi.fn();
+const cyclesMock = vi.fn();
 
 vi.mock("./beads/bd", async () => {
   const actual = await vi.importActual<typeof import("./beads/bd")>("./beads/bd");
@@ -17,6 +18,7 @@ vi.mock("./beads/bd", async () => {
     beads: {
       ...actual.beads,
       list: (...args: unknown[]) => listMock(...args),
+      depCycles: (...args: unknown[]) => cyclesMock(...args),
     },
   };
 });
@@ -194,6 +196,8 @@ const { stampBoard } = await import("./board-picker-plan");
 beforeEach(() => {
   resetIssueSnapshots();
   listMock.mockReset();
+  cyclesMock.mockReset();
+  cyclesMock.mockResolvedValue([]);
   hygieneReport = undefined;
   scanHealth = undefined;
   deferrals = new Map();
@@ -1056,7 +1060,12 @@ describe("hygiene report on the board (anton-uwal)", () => {
   }
 
   beforeEach(() => {
-    listMock.mockResolvedValue([makeBead({ id: "t-1", title: "Loose task" })]);
+    // A fresh array on every call, matching real `bd list` (always a new `JSON.parse` per spawn):
+    // several tests below call `resetIssueSnapshots()` mid-test to simulate a full reload, and
+    // `getBoard` always asks for cycle evidence — a REUSED array reference would let evidence
+    // attached to it on an earlier "load" (the WeakMap sidecar is identity-keyed, untouched by
+    // reset) silently carry over into a later one that never actually re-fetched it.
+    listMock.mockImplementation(async () => [makeBead({ id: "t-1", title: "Loose task" })]);
   });
 
   it("carries the latest patrol report in the board payload", async () => {
@@ -1560,6 +1569,34 @@ describe("the Up Next lane on the board (anton-t9m4)", () => {
       expect(served.upNextAbsence).toBe("policy-unreadable");
     });
 
+    it("names unavailable cycle evidence, rather than ranking as if every target were admitted", async () => {
+      // `bd dep cycles` timing out leaves the board without authoritative cycle evidence, and every
+      // target's approval gate fails closed on that absence (`missingCycleEvidenceGap`). Deriving
+      // anyway would rank nobody — indistinguishable from a board that is genuinely empty.
+      listMock.mockResolvedValue([feature()]);
+      cyclesMock.mockRejectedValue(new Error("bd dep cycles timed out"));
+
+      const served = await getBoard(project);
+      expect(served.upNext).toBeUndefined();
+      expect(served.upNextAbsence).toBe("cycles-unavailable");
+    });
+
+    it("never records the ranking it would have derived while cycle evidence is unavailable", async () => {
+      // The write below is what the finding is actually about: a `bd dep cycles` timeout must not
+      // reach `recordRanking` and persist an empty plan over a real one.
+      const board = [feature()];
+      listMock.mockResolvedValue(board);
+      pickerPlan = planOver(board, "f-1");
+      cyclesMock.mockRejectedValue(new Error("bd dep cycles timed out"));
+
+      const served = await getBoard(project);
+      expect(planWrites).toHaveLength(0);
+      expect(served.upNextAbsence).toBe("cycles-unavailable");
+      // The previously recorded plan's badge stays put — the auxiliary read failing is not a reason
+      // to retract a real decision a pass already made.
+      expect(served.columns.backlog[0]?.provenance).toBeDefined();
+    });
+
     it("withholds the RECORDED plan too, so no Backlog card offers a start beside that absence", async () => {
       // The plan row outlives the ranking otherwise (PR #226 review): its stamp is compared against
       // one taken with no policy, so an admit-all plan armed before the operator narrowed the policy
@@ -1970,7 +2007,10 @@ describe("the generation a drawn pick is named by (anton-f12y)", () => {
     // the veto routes different names for one pick — and move the freshness token, so no poll on a
     // quiet board would ever 304 again.
     const board = [feature()];
-    listMock.mockResolvedValue(board);
+    // A fresh array each call (mirrors real `bd list`): the reset below simulates a full reload, and
+    // a reused reference would let cycle evidence from the first load's WeakMap attachment (identity-
+    // keyed, untouched by reset) leak into the second load that never actually re-fetched it.
+    listMock.mockImplementation(async () => [...board]);
 
     const first = await getBoard(project);
     resetIssueSnapshots();

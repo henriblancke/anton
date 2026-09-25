@@ -14,6 +14,7 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { LABELS } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { REHOME_GUARDS } from "./home-guards";
 import { ORDER_GUARDS } from "./order-guards";
 import { START_GUARDS } from "./start-guards";
@@ -512,7 +513,11 @@ describe("detectionsFor", () => {
       claim({ kind: "start", bead, summary: "this is the work to run next" });
 
     it("turns a target the board would offer into an approve proposal", () => {
-      const { detections, rejected } = detectionsFor([start(ready.id)], [ready], NOW);
+      const { detections, rejected } = detectionsFor(
+        [start(ready.id)],
+        attachCycleEvidence([ready], []),
+        NOW,
+      );
       expect(rejected).toEqual([]);
       expect(detections.map((d) => [d.kind, d.move, d.subjects])).toEqual([
         ["withheld-approval", "approve", [ready.id]],

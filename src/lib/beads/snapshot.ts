@@ -1,3 +1,4 @@
+import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import type { Bead } from "./types";
 
 export const ISSUE_SNAPSHOT_MAX_AGE_MS = 30_000;
@@ -8,7 +9,7 @@ interface SnapshotEntry {
   version: number;
   generation: number;
   loadedAt: number;
-  refresh: Promise<Bead[]> | null;
+  refresh: Promise<SnapshotRead> | null;
   // A local write bumped the version but retained last-good beads. Full board reads must block on a
   // fresh post-write read (never serve the stale-but-version-stamped board); cleared once one lands.
   pendingWrite: boolean;
@@ -29,6 +30,13 @@ export interface SnapshotRead {
   /** The snapshot version these exact beads carry — captured in the same tick they were read, so a
    * concurrent background refresh can never advance the version past the data a caller returns. */
   version: number;
+  /** The generation these exact beads were retained under — captured in the same tick as `beads`,
+   * same reasoning as `version`. A caller that later re-checks {@link issueSnapshotGeneration} to
+   * decide whether `beads` is still the retained array must compare against THIS value, not a fresh
+   * read taken after the `await` that produced the snapshot: a concurrent refresh can land (and bump
+   * the generation) in the gap between this promise resolving and the caller's next synchronous line,
+   * which would otherwise pair a stale `beads` array with an already-advanced "current" generation. */
+  generation: number;
 }
 
 const SNAPSHOTS_KEY = Symbol.for("anton.beads.issueSnapshots");
@@ -146,6 +154,39 @@ export function issueSnapshotVersion(cwd: string): number {
 }
 
 /**
+ * Monotonic counter bumped whenever the retained board content actually changes — on every
+ * invalidation ({@link invalidateIssueSnapshot}) AND, below in {@link refreshIssueSnapshot}, on a
+ * TTL/probe refresh that discovers different content with no invalidation call in between (PR
+ * #274 review, round 8 on `issues.ts:213`). A shared-server board (`dolt_mode: server`) can move
+ * because ANOTHER machine wrote it — a change this repo only ever discovers by a plain TTL refresh
+ * noticing the graph differs, never through `invalidateIssueSnapshot`. Without the bump there,
+ * `attachCyclesBestEffort`'s shared-fetch key (`${cwd}::${generation}`) stays unchanged across that
+ * refresh, so an in-flight `bd dep cycles` call started against the OLD graph gets reused and
+ * stamped onto the REPLACED board as if it were current — a newly introduced cycle recorded as
+ * cycle-free, or a repaired one as still present, until some later change happens to bump it again.
+ * Callers that share an in-flight `bd dep cycles` fetch across concurrent readers use this counter
+ * to detect a snapshot replaced mid-fetch, so a result describing a stale graph is never attached
+ * to a newer one.
+ */
+export function issueSnapshotGeneration(cwd: string): number {
+  return entryFor(cwd).generation;
+}
+
+/**
+ * Bump the version alone — no content changed, no beads replaced, no generation advance — for a side
+ * channel that recovers independently of the bead data itself (PR #274 review, round 2 on
+ * `issues.ts:158`: a `bd dep cycles` retry landing evidence that a prior read couldn't get).
+ *
+ * The poll path's freshness token is sourced from this number and nothing else it can move on its
+ * own, so without this a `bd` hiccup on the first authoritative read would leave every later poll
+ * 304-ing the same "evidence unavailable" verdict until the bead content itself changed or a manual
+ * reload forced a read — never on `bd` simply recovering.
+ */
+export function markCycleEvidenceRecovered(cwd: string): void {
+  entryFor(cwd).version += 1;
+}
+
+/**
  * Mark cached data stale while retaining it so a background-refresh reader (the poll path) keeps
  * serving last-good data and never waits behind a Dolt sync. `localWrite` additionally bumps the
  * version (so clients detect the change), clears any in-flight loader — forcing a fresh read that
@@ -182,6 +223,24 @@ export function refreshIssueSnapshot(
   loader: () => Promise<Bead[]>,
   now = Date.now(),
 ): Promise<Bead[]> {
+  return refreshIssueSnapshotRead(cwd, loader, now).then((read) => read.beads);
+}
+
+/**
+ * Like {@link refreshIssueSnapshot} but returns the generation the resolved board was retained
+ * under, captured in the same synchronous step as `entry.beads` itself (PR #274 review,
+ * `issues.ts:317`). A caller that reads `beads` here and `issueSnapshotGeneration(cwd)`
+ * separately afterward has a gap: another consumer of this same single-flight promise can run
+ * its own continuation — including one that invalidates or hydrates the entry — before the
+ * caller's next line executes, advancing the generation past the board actually being handed
+ * back. Returning both from inside the resolving `.then` closes that gap the same way
+ * {@link SnapshotRead} does for {@link readIssueSnapshot}.
+ */
+export function refreshIssueSnapshotRead(
+  cwd: string,
+  loader: () => Promise<Bead[]>,
+  now = Date.now(),
+): Promise<SnapshotRead> {
   const entry = entryFor(cwd);
   if (entry.refresh) return entry.refresh;
   const generation = entry.generation;
@@ -190,13 +249,59 @@ export function refreshIssueSnapshot(
     .then((beads) => {
       // A write or sync invalidated this loader while it was running. Its result predates that
       // boundary and must never repopulate the current snapshot.
-      if (entry.generation !== generation) return entry.beads ?? beads;
+      if (entry.generation !== generation) {
+        // No retained board to fall back on: `beads` (this load's own result) is the only data we
+        // have, but it predates the invalidation that just bumped `entry.generation` — stamping it
+        // with that CURRENT generation would tell a caller comparing against
+        // `issueSnapshotGeneration` that it matches the post-write board, when it actually describes
+        // the one the write replaced (PR #274 review). Keep the ORIGINAL generation this load
+        // actually ran against so that comparison correctly flags it stale and retries instead.
+        if (!entry.beads) {
+          return { beads, version: entry.version, generation };
+        }
+        return { beads: entry.beads, version: entry.version, generation: entry.generation };
+      }
       const serialized = JSON.stringify(beads);
       // A cold entry has no board to differ FROM, so the first read of a repo sets the baseline
       // rather than announcing a move nobody made.
       const moved = entry.serialized !== null && entry.serialized !== serialized;
-      if (entry.serialized !== serialized) entry.version += 1;
-      entry.beads = beads;
+      // Identical graph content: keep the RETAINED array's identity instead of latching this fresh
+      // one (PR #274 review round 9 on this file). The cycle sidecar is WeakMap-keyed on array
+      // identity, so a concurrent cycle probe/attach racing this refresh (board/route.ts fires both
+      // on every poll) may already hold a reference to the retained array and attach its evidence to
+      // THAT object; swapping in a new-but-identical array here would silently discard that
+      // attachment, leaving the entry evidence-less even though the probe reported success and
+      // bumped the version. Reusing the retained array when nothing moved means any evidence
+      // attached to it — before, during, or after this refresh — stays visible through `entry.beads`.
+      const nextBeads = moved || !entry.beads ? beads : entry.beads;
+      const hadEvidence = entry.beads ? cycleEvidenceFor(entry.beads) !== undefined : false;
+      // This exact load may itself carry fresh evidence (a `withCycles` loader, e.g.
+      // `refreshAllIssues({ withCycles: true })`, attaches it to `beads` before this `.then` runs).
+      // When we kept the retained array's identity above, that evidence lives on a different, since-
+      // discarded object unless copied across — so back it onto `nextBeads` rather than silently
+      // dropping a fetch this very call paid for. Copy it even when `nextBeads` already carries
+      // evidence: that prior evidence can itself be stale (e.g. a racing `bd list`/`bd dep cycles`
+      // pair — `attachCyclesBestEffort` in issues.ts — that observed two different graph revisions),
+      // and this consistent, explicitly-requested refresh is the one path that can self-heal it. A
+      // `hadEvidence` guard here left a stale sidecar permanently stuck once content stopped
+      // changing (PR #274 review, round 10 on this file).
+      if (nextBeads !== beads) {
+        const freshEvidence = cycleEvidenceFor(beads);
+        if (freshEvidence !== undefined) attachCycleEvidence(nextBeads, freshEvidence);
+      }
+      // Evidence becoming available where the retained snapshot had none is also a reason to bump,
+      // even when the bead content itself is unchanged — a `withCycles` refresh that finally lands
+      // real evidence after a prior attempt degraded must give a stuck poller a fresh token, not
+      // wait for unrelated content to change too (mirrors `markCycleEvidenceRecovered`'s reasoning).
+      const evidenceRecovered = !hadEvidence && cycleEvidenceFor(nextBeads) !== undefined;
+      if (entry.serialized !== serialized || evidenceRecovered) entry.version += 1;
+      // Content actually differing is a graph change regardless of whether anything called
+      // `invalidateIssueSnapshot` — a shared-server board can move from another machine's write, and
+      // a plain TTL refresh is the only place that ever notices. Bump here too, or a cycle fetch
+      // in flight against the pre-refresh graph keeps coalescing onto the replaced board (see
+      // {@link issueSnapshotGeneration}).
+      if (moved) entry.generation += 1;
+      entry.beads = nextBeads;
       entry.serialized = serialized;
       entry.loadedAt = now;
       // This read started after (and its generation matches) the write, so it reflects it — the
@@ -204,13 +309,42 @@ export function refreshIssueSnapshot(
       entry.pendingWrite = false;
       // Announced AFTER the entry has taken the new board, so a listener that reads back sees it.
       if (moved) announceBoardChange(cwd);
-      return beads;
+      return { beads: nextBeads, version: entry.version, generation: entry.generation };
     })
     .finally(() => {
       if (entry.refresh === refresh) entry.refresh = null;
     });
   entry.refresh = refresh;
   return refresh;
+}
+
+/**
+ * Overwrite the retained board with `hydrated`, guarded by `generation` (PR #274 review,
+ * `issues.ts:294`). `refreshIssueSnapshot`'s single-flight loader is loader-blind: a concurrent
+ * refresh that never asked for `strictGates` can win the race and latch a gate-less board onto this
+ * entry before a `strictGates` caller re-fetches the missing gates and merges them into a NEW array
+ * downstream (`dedupeById` never mutates the retained one in place, unlike the cycle-evidence
+ * WeakMap attachment). Without writing that merged array back here, the entry stays on the degraded
+ * board it already cached, so every later reader of THIS snapshot (a subsequent `getBoard` in the
+ * same request, another page's poll) keeps seeing a `blocks` edge to a resolved gate as still
+ * dangling and open.
+ *
+ * `generation` must be read (via {@link issueSnapshotGeneration}) before the extra gate fetch that
+ * produced `hydrated` — a mismatch here means the entry moved (an invalidation, a newer refresh)
+ * while that fetch was in flight, so `hydrated` describes a graph this entry no longer represents
+ * and must not be stamped onto it.
+ */
+export function hydrateIssueSnapshot(cwd: string, hydrated: Bead[], generation: number): void {
+  const entry = entryFor(cwd);
+  if (entry.generation !== generation) return;
+  entry.beads = hydrated;
+  entry.serialized = JSON.stringify(hydrated);
+  entry.version += 1;
+  // This swaps the retained array's identity, same as a moved refresh — bump generation so an
+  // in-flight enrichment keyed on the pre-hydration generation (e.g. `attachCyclesBestEffort`'s
+  // shared fetch) fails its own guard and retries against `hydrated` instead of attaching its
+  // result to the now-retired array (PR #274 review).
+  entry.generation += 1;
 }
 
 /**
@@ -264,7 +398,7 @@ export async function readIssueSnapshot(
   if (retained) {
     if (entry.pendingWrite && blockOnPendingWrite) {
       await refreshIssueSnapshot(cwd, loader, now).catch(() => {});
-      return { beads: entry.beads ?? retained, version: entry.version };
+      return { beads: entry.beads ?? retained, version: entry.version, generation: entry.generation };
     }
     // Serve retained now, but a pending write or a stale TTL still needs a fresh read behind it.
     if (
@@ -273,13 +407,18 @@ export async function readIssueSnapshot(
     ) {
       void refreshIssueSnapshot(cwd, loader, now).catch(() => {});
     }
-    return { beads: retained, version: entry.version };
+    return { beads: retained, version: entry.version, generation: entry.generation };
   }
   // Take the loader's own result, not just the cache: when a write invalidates mid-flight the
   // generation guard refuses to repopulate the cache but still hands the loaded board back here —
-  // reading `entry.beads` alone would serve a successful load as an empty board.
-  const loaded = await refreshIssueSnapshot(cwd, loader, now);
-  return { beads: entry.beads ?? loaded, version: entry.version };
+  // reading `entry.beads` alone would serve a successful load as an empty board. Read via
+  // `refreshIssueSnapshotRead`, not `refreshIssueSnapshot` + a separate `entry.generation` read
+  // (PR #274 review, `snapshot.ts:253`): that wrapper discards the generation the loaded board was
+  // actually retained (or, on a cold discard, ORIGINALLY loaded) under, and a fresh `entry.generation`
+  // read here would instead pick up whatever an invalidation bumped it to in the meantime — pairing
+  // pre-write beads with a post-write generation a caller like `readAllIssues` trusts as current.
+  const read = await refreshIssueSnapshotRead(cwd, loader, now);
+  return { beads: read.beads, version: read.version, generation: read.generation };
 }
 
 /** Start a freshness probe without making the caller wait for embedded Dolt. */

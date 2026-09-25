@@ -12,7 +12,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { parseGardenerPlan, proposalFingerprint, REASK_AFTER_DAYS } from "./detections";
 import {
@@ -70,6 +70,7 @@ vi.mock("../beads/bd", async () => {
         return showBead(id);
       },
       list: (_cwd: string, extra: string[] = []) => listBoard(extra),
+      depCycles: async () => [],
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
@@ -936,6 +937,70 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/the board could not be re-read before withdrawing the approval/);
       expect(err.message).toContain("database is locked");
       // The ask stays open and the label stays on: a board anton cannot see whole authorises nothing.
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // PR #274 review (P1): `approvalGaps` fails an `unapprove` re-check closed on a `bd dep cycles`
+    // outage exactly as it does an `approve` — a nonempty gap list either way. But "no evidence" is
+    // not "still degraded", and withdrawing on it would strip a sound approval on nothing but a flaky
+    // auxiliary CLI read, contrary to the settling test above (repair preserves the label). Missing
+    // evidence must refuse instead, leaving the label untouched for a retry against fresh evidence.
+    it("refuses rather than strips a sound approval when cycle evidence is unavailable", async () => {
+      vi.spyOn(beads, "depCycles").mockRejectedValueOnce(new Error("bd dep cycles timed out"));
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), [
+        startable({ labels: [LABELS.approved] }),
+      ]).catch((e) => e)) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // The board-review finding this closes (PR #274, apply.ts:276): `withCycleEvidenceIfNeeded`
+    // fetched `bd dep cycles` and attached it to `board` unchecked, so a writer repairing a `blocks`
+    // edge between the caller's board read and that fetch settling could pair fresh cycle evidence
+    // with a board whose edges no longer describe it — exactly what `sameBlocksEdges` exists to
+    // catch everywhere else in this codebase (`attachCyclesBestEffort`, `ensureCycleEvidence`,
+    // `shadow.ts`'s own read). Refusing on the mismatch, same as a `depCycles` outage above, is what
+    // proves the guard is wired in rather than merely documented.
+    it("refuses rather than pair fresh cycle evidence with a board that already moved underneath it", async () => {
+      // The unrelated `blocks` edge is what makes the re-list run at all — an edge-free board has no
+      // cyclic pair that could be stale, so the guard has nothing to check without one.
+      const board = [startable({ labels: [LABELS.approved] }), blockedBy("anton-x", "anton-y")];
+      // The re-list `withCycleEvidenceIfNeeded` makes after `bd dep cycles` settles answers with a
+      // DIFFERENT edge set — as if another writer resolved that edge in the gap, on a shared-server
+      // board this apply has no way to see happen.
+      listByFlags(async () => [startable({ labels: [LABELS.approved] }), bead("anton-x")]);
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // P2 review (PR #274, round 23): the guard above used to skip the re-list entirely when `board`
+    // itself carried no `blocks` edge, reasoning an edge-free board has no cyclic pair that could be
+    // stale. That reasoning only describes the read that already happened — a writer can land the
+    // FIRST blocking edge in the gap between this board read and `bd dep cycles` settling, and the
+    // fresh cycle evidence would then get attached to a board that predates it. `shadow.ts` never
+    // took that shortcut; this proves `withCycleEvidenceIfNeeded` no longer does either.
+    it("refuses when the board gains its first blocks edge in the gap, even though it started edge-free", async () => {
+      const board = [startable({ labels: [LABELS.approved] }), bead("anton-x")];
+      listByFlags(async () => [startable({ labels: [LABELS.approved] }), blockedBy("anton-x", "anton-y"), bead("anton-y")]);
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
   });

@@ -86,10 +86,16 @@ jobs:
       # 425ms, no findings unrelated to that PR's own diff, still on 2.1.282. Following this
       # comment's own instruction: bump before assuming it's the PR's fault — but there is no
       # further changelog entry yet to bump to, so this one stays open.
+      # Bumped 2.1.282 -> 2.1.283 (2026-09-25): same signature recurred on PR #274 —
+      # is_error:true, num_turns:1, total_cost_usd:0, 412ms, no findings unrelated to this
+      # PR's own diff — on the SAME pin that was just bumped in for this exact failure
+      # shape, so 2.1.282 did not actually fix it. 2.1.283 published ~15 minutes after
+      # this run with no CHANGELOG entry yet (publish precedes changelog sync); bumping
+      # anyway per this comment's own instruction rather than waiting on a confirmed match.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
-          CLAUDE_CODE_VERSION: '2.1.282'
+          CLAUDE_CODE_VERSION: '2.1.283'
         run: |
           curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"
           echo "exe=$HOME/.local/bin/claude" >> "$GITHUB_OUTPUT"

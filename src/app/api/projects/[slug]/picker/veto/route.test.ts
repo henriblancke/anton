@@ -18,13 +18,14 @@ import {
   recordPickerAccept,
 } from "@/lib/picker-veto";
 import type { Bead } from "@/lib/beads/types";
+import { attachCycleEvidence } from "@/lib/beads/cycle-evidence";
 import type { Policy } from "@/lib/policy/types";
 
 let tdb: TestDb;
 let board: Bead[] = [];
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
-vi.mock("@/lib/beads/issues", () => ({ allIssues: async () => board }));
+vi.mock("@/lib/beads/issues", () => ({ allIssues: async () => attachCycleEvidence(board, []) }));
 
 const { POST } = await import("./route");
 
