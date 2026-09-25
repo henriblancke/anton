@@ -29,6 +29,7 @@ import { parseTicketNotes } from "./beads/notes";
 import type { PullRequestState } from "./git/ops";
 import type { ReviewFinding } from "./jobs/review-context";
 import { instructionCriteria } from "./rework-contract";
+import { FOLLOW_UP_ORIGIN_PHRASE, REOPEN_NOTE_HEAD } from "./rework-marks";
 import type { ReworkMode, ReworkPipeline } from "./types";
 
 /**
@@ -66,6 +67,9 @@ export function reworkNoteBody(args: {
  * REDIRECTED send-back says something the other two don't — the acceptance was not met, and the fix
  * runs here only because the work already merged — so it is rendered apart from an ordinary
  * follow-up, whose head asserts the opposite.
+ *
+ * The reopen head comes from `rework-marks.ts` because the friction counter matches on it — see that
+ * module for why a reword here would otherwise zero a ledger figure.
  */
 function reworkNoteHead(args: {
   mode: ReworkMode;
@@ -81,7 +85,7 @@ function reworkNoteHead(args: {
     );
   }
   return args.mode === "reopen"
-    ? `Rework — acceptance not met. Sent back from ${args.targetId}'s self-review: ${args.summary}`
+    ? `${REOPEN_NOTE_HEAD}${args.targetId}'s self-review: ${args.summary}`
     : `Follow-up on ${args.originId} — its acceptance stands; ${args.targetId}'s self-review ` +
         `prompted another pass: ${args.summary}`;
 }
@@ -618,14 +622,16 @@ function followUpProvenance(ticket: Bead, targetId: string, pipeline?: ReworkPip
  * all it gains is this pointer. A REDIRECTED send-back says something different on purpose — the
  * founder judged the acceptance unmet, and this bead is closed only because its work merged, so
  * claiming it stands would put words in their mouth.
+ *
+ * Both share one head, from `rework-marks.ts`: it is what the friction counter matches a follow-up
+ * on, and a redirect is still a send-back.
  */
 export function originNoteBody(followUpId: string, pipeline?: ReworkPipeline): string {
+  const head = `Follow-up ${followUpId}${FOLLOW_UP_ORIGIN_PHRASE}`;
   return pipeline?.redirected
-    ? `Follow-up ${followUpId} was opened from this ticket's review — the founder judged its ` +
-        `acceptance unmet, but ${pipeline.pr} had already merged, so the fix runs there as its ` +
-        `own target rather than reopening work that has shipped.`
-    : `Follow-up ${followUpId} was opened from this ticket's review — its acceptance stands; the ` +
-        `next iteration is tracked there.`;
+    ? `${head} — the founder judged its acceptance unmet, but ${pipeline.pr} had already merged, ` +
+        `so the fix runs there as its own target rather than reopening work that has shipped.`
+    : `${head} — its acceptance stands; the next iteration is tracked there.`;
 }
 
 /**

@@ -1,5 +1,5 @@
 /**
- * The gate-failure migration (drizzle/0054, anton-vynb8), asserted against the database that could
+ * The gate-failure migration (drizzle/0056, anton-vynb8), asserted against the database that could
  * go wrong: one that already holds runs from before the column existed.
  *
  * anton-gwn6g is why the executable-SQL assertion is here at all — a migration whose file carries no
@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0054_run_last_gate_failure.sql";
+const MIGRATION = "0056_run_last_gate_failure.sql";
 
 /** The reverse, read out of the migration's own header so the tested recipe is the documented one. */
 function reverseStatements(): string[] {

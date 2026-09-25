@@ -5,19 +5,22 @@
  * The spec is inlined so an agent can implement with an unreadable in-worktree beads DB (issue #46
  * root cause #3) — so "the section is present" is the assertion that matters, per section.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { Bead } from "../../beads/bd";
 import type { PreservedCommit } from "../../git/ops";
 import { ANTON_REPO_URL } from "../../repo";
 import type { SatisfiedSettlement } from "./context";
 import {
+  BODY_REGION_END,
+  BODY_REGION_START,
   narrativeFieldLines,
   prBody,
   type PromptGateFailure,
   stepTaskBlock,
   ticketPrompt,
   truncateField,
+  upsertBodyRegion,
 } from "./prompts";
 import type { RunNarrative } from "./result";
 import { target } from "./step.fixture";
@@ -675,5 +678,208 @@ describe("narrativeFieldLines", () => {
       "Look here.",
       "",
     ]);
+  });
+});
+
+describe("upsertBodyRegion (anton-gkjb6)", () => {
+  const body = prBody(target, [target]);
+
+  it("appends the region once into an unmarked body, above the anton footer", () => {
+    const result = upsertBodyRegion(body, "hello region");
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain(`${BODY_REGION_START}\nhello region\n${BODY_REGION_END}`);
+    expect(result.body.indexOf(BODY_REGION_START)).toBeLessThan(
+      result.body.indexOf("🤖 Generated with [anton]"),
+    );
+    expect(result.body.match(new RegExp(BODY_REGION_START, "g"))).toHaveLength(1);
+  });
+
+  it("replaces the region on a second render rather than duplicating it", () => {
+    const once = upsertBodyRegion(body, "first content").body;
+    const twice = upsertBodyRegion(once, "second content");
+
+    expect(twice.skipped).toBe(false);
+    expect(twice.body.match(new RegExp(BODY_REGION_START, "g"))).toHaveLength(1);
+    expect(twice.body.match(new RegExp(BODY_REGION_END, "g"))).toHaveLength(1);
+    expect(twice.body).toContain("second content");
+    expect(twice.body).not.toContain("first content");
+  });
+
+  it("leaves every byte outside the markers untouched across a refresh", () => {
+    const once = upsertBodyRegion(body, "first content").body;
+    const twice = upsertBodyRegion(once, "a totally different, longer replacement").body;
+
+    const before = (s: string) => s.slice(0, s.indexOf(BODY_REGION_START));
+    const after = (s: string) => s.slice(s.indexOf(BODY_REGION_END) + BODY_REGION_END.length);
+
+    expect(before(twice)).toBe(before(once));
+    expect(after(twice)).toBe(after(once));
+  });
+
+  it("skips and logs rather than guessing when both markers were hand-deleted but the region's visible content remains", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const handEdited = [
+      "Narrative.",
+      "",
+      "### Review-fix rounds",
+      "",
+      "- 2026-09-20: fixed A",
+      "",
+      body,
+    ].join("\n");
+    const content = "### Review-fix rounds\n\n- 2026-09-20: fixed A\n- 2026-09-23: fixed B";
+
+    const result = upsertBodyRegion(handEdited, content);
+
+    expect(result).toEqual({ body: handEdited, skipped: true });
+    expect(warn).toHaveBeenCalledOnce();
+    // The original history survives untouched — no second heading was appended above it.
+    expect(handEdited.match(/### Review-fix rounds/g)).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it("skips and logs rather than guessing when the closing marker was hand-deleted", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const halfMarked = `Some narrative.\n\n${BODY_REGION_START}\nold content\n\n${body}`;
+
+    const result = upsertBodyRegion(halfMarked, "new content");
+
+    expect(result).toEqual({ body: halfMarked, skipped: true });
+    expect(result.body).not.toContain("new content");
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("skips and logs rather than matching nested markers greedily", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const nested = [
+      "Narrative.",
+      BODY_REGION_START,
+      "outer",
+      BODY_REGION_START,
+      "inner",
+      BODY_REGION_END,
+      "still outer",
+      BODY_REGION_END,
+      body,
+    ].join("\n");
+
+    const result = upsertBodyRegion(nested, "new content");
+
+    expect(result).toEqual({ body: nested, skipped: true });
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("skips and logs on a duplicated pair of markers rather than guessing which one it owns", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const duplicated = [
+      "Narrative.",
+      BODY_REGION_START,
+      "first",
+      BODY_REGION_END,
+      "middle",
+      BODY_REGION_START,
+      "second",
+      BODY_REGION_END,
+      body,
+    ].join("\n");
+
+    const result = upsertBodyRegion(duplicated, "new content");
+
+    expect(result).toEqual({ body: duplicated, skipped: true });
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it("treats markers merely quoted in prose (not on their own line) as no markers at all", () => {
+    // A review comment discussing the marker mechanics can leave both marker strings sitting in
+    // the body as inline prose. A plain substring count would read that as a well-formed pair and
+    // let upsertBodyRegion rewrite the human-authored text between them (PR #321 review).
+    const quoted = `${body}\n\nAs discussed, the region uses ${BODY_REGION_START} and ${BODY_REGION_END} as markers.`;
+
+    const result = upsertBodyRegion(quoted, "new content");
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("As discussed, the region uses");
+    expect(result.body).toContain("new content");
+  });
+
+  it("truncates an oversized region rather than letting it grow unbounded", () => {
+    const huge = "x".repeat(10_000);
+
+    const result = upsertBodyRegion(body, huge);
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("[truncated]");
+    expect(result.body).not.toContain(huge);
+    const start = result.body.indexOf(BODY_REGION_START) + BODY_REGION_START.length + 1;
+    const end = result.body.indexOf(BODY_REGION_END);
+    expect(end - start).toBeLessThan(huge.length);
+  });
+
+  it("keeps the newest entries and drops the oldest when a line-structured region overflows", () => {
+    // Content accumulates oldest-first (mirrors review-fix-body's rendered rounds): a heading, then
+    // one ~100-char line per round. Past MAX_BODY_REGION_CHARS the OLDEST rounds must drop, not the
+    // newest — the newest round is the one a reviewer actually needs to see.
+    const lines = Array.from(
+      { length: 80 },
+      (_, i) => `- 2026-09-${String((i % 28) + 1).padStart(2, "0")}: round ${i + 1} ${"x".repeat(80)}`,
+    );
+    const content = ["### Review-fix rounds", "", ...lines].join("\n");
+    expect(content.length).toBeGreaterThan(4000);
+
+    const result = upsertBodyRegion(body, content);
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("### Review-fix rounds");
+    expect(result.body).toContain("round 80"); // newest round survives
+    expect(result.body).not.toContain("round 1 "); // oldest round is dropped, not the newest
+    const start = result.body.indexOf(BODY_REGION_START) + BODY_REGION_START.length + 1;
+    const end = result.body.indexOf(BODY_REGION_END);
+    expect(end - start).toBeLessThan(content.length);
+  });
+
+  it("hard-truncates an oversized newest round rather than dropping it entirely", () => {
+    // The newest (last) line alone is bigger than the whole budget — the tail-preserving loop
+    // breaks on its very first iteration with `kept` empty. The region must still carry a
+    // truncated fragment of that round, not just the heading and a marker (PR #321 review).
+    const oldRound = "- 2026-09-01: an earlier, unremarkable fix";
+    const newestRound = `- 2026-09-23: ${"x".repeat(5_000)}`;
+    const content = ["### Review-fix rounds", "", oldRound, newestRound].join("\n");
+
+    const result = upsertBodyRegion(body, content);
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("### Review-fix rounds");
+    expect(result.body).toContain("2026-09-23"); // newest round is represented, even if truncated
+    expect(result.body).not.toContain(oldRound);
+  });
+
+  it("ignores markers that appear standalone inside a fenced code example", () => {
+    // A PR description can show what anton's region looks like as a fenced example, putting each
+    // marker on its own line inside the fence. That must not read as a real owned span — otherwise
+    // the next refresh treats the example as anton's region and overwrites the human prose sitting
+    // between the two mentions (PR #321 review).
+    const fenced = [
+      body,
+      "",
+      "Here's what the region looks like:",
+      "```",
+      BODY_REGION_START,
+      "- 2026-01-01: example round",
+      BODY_REGION_END,
+      "```",
+      "",
+      "Please don't remove this note.",
+    ].join("\n");
+
+    const result = upsertBodyRegion(fenced, "new content");
+
+    expect(result.skipped).toBe(false);
+    expect(result.body).toContain("Please don't remove this note.");
+    expect(result.body).toContain("example round"); // the fenced example is left untouched
+    expect(result.body).toContain("new content");
   });
 });

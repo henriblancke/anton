@@ -1,5 +1,5 @@
 /**
- * The per-attempt record's migration (drizzle/0055), asserted against the database that can actually
+ * The per-attempt record's migration (drizzle/0054), asserted against the database that can actually
  * go wrong: an existing anton.db with a project and a run — including a run that already SETTLED
  * after resuming, which is exactly the row whose earlier intervals are unrecoverable.
  *
@@ -16,7 +16,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0055_run_attempts.sql";
+const MIGRATION = "0054_run_attempts.sql";
 
 /** The reverse, read out of the migration's own header so the tested recipe is the documented one. */
 function reverseStatements(): string[] {

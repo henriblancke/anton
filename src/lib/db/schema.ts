@@ -221,6 +221,12 @@ export const jobs = sqliteTable(
     // attribution reads the append-only `quota_attempts` ledger because one resumed job can spend
     // through more than one meter after an operator changes its routing.
     spentAttempts: integer("spent_attempts").notNull().default(0),
+    // Durable park counters (PR #322 review): `reschedule`/`park` clear `lastError` on the row's
+    // very next settle, so a friction reader off `status`/`lastError` alone sees at most the most
+    // recent pause and can fall back to zero as the job resumes — undercounting or losing history
+    // outright. These two only ever increment, mirroring `spentAttempts` above.
+    quotaParkCount: integer("quota_park_count").notNull().default(0),
+    failureParkCount: integer("failure_park_count").notNull().default(0),
     lastError: text("last_error"),
     // What the handler reported it actually DID, written when the job completes (anton-znoz).
     // `ok` = it changed something, `noop` = it ran and found nothing to do. A completed job with a

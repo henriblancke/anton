@@ -609,6 +609,194 @@ function satisfiedByLine(by: SatisfiedSettlement): string {
 }
 
 /**
+ * Stable HTML-comment markers around the one region of a PR body anton owns (anton-gkjb6). HTML
+ * comments render invisibly on GitHub, so they cost nothing to leave in a body a human reads, and
+ * they survive a body a human has otherwise edited by hand — everything outside them is the
+ * narrative, and a refresh must never touch it.
+ */
+export const BODY_REGION_START = "<!-- anton:region:start -->";
+export const BODY_REGION_END = "<!-- anton:region:end -->";
+
+/**
+ * Keeps one oversized region from bloating a PR body past what a reviewer will actually read.
+ * Exported so `review-fix-body.ts`'s `renderFixRounds` can pre-fit its own rounds to the same
+ * budget and drop the oldest ones itself, with an accurate count — instead of leaving the cut to
+ * this module's char-level {@link truncateRegion}, which has no notion of "one round" and cannot
+ * report how many were lost (PR #321 review).
+ */
+export const MAX_BODY_REGION_CHARS = 4000;
+
+/**
+ * Region content accumulates oldest-first (a heading line, then one entry per round), so a plain
+ * head-cut at the char cap keeps stale history and discards the newest round — the one entry a
+ * reviewer actually needs. Keep the heading, then fill the remaining budget from the tail backward
+ * so the newest entries survive and older ones drop first.
+ */
+function truncateRegion(content: string): string {
+  const trimmed = content.trim();
+  if (trimmed.length <= MAX_BODY_REGION_CHARS) return trimmed;
+
+  const marker = "… [earlier entries truncated]";
+  const [heading = "", ...rest] = trimmed.split("\n");
+  const budget = MAX_BODY_REGION_CHARS - heading.length - marker.length - 2;
+
+  const kept: string[] = [];
+  let used = 0;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const line = rest[i] ?? "";
+    const cost = line.length + 1;
+    if (used + cost > budget) break;
+    kept.unshift(line);
+    used += cost;
+  }
+
+  if (kept.length === rest.length) {
+    // No line boundary to cut at (e.g. one oversized line) — fall back to a hard char cut.
+    return `${trimmed.slice(0, MAX_BODY_REGION_CHARS)}\n… [truncated]`;
+  }
+
+  if (kept.length === 0 && rest.length > 0) {
+    // The newest line alone already exceeds the budget — hard-truncate it rather than emit a
+    // region with the heading and marker but no round data at all (PR #321 review).
+    const newest = rest[rest.length - 1] ?? "";
+    const cut = Math.max(0, budget - 1);
+    kept.push(cut > 0 ? `${newest.slice(0, cut)}…` : "…");
+  }
+
+  return [heading, marker, ...kept].join("\n");
+}
+
+function renderRegion(content: string): string {
+  return `${BODY_REGION_START}\n${truncateRegion(content)}\n${BODY_REGION_END}`;
+}
+
+/**
+ * A marker only counts when it occupies its own line — every marker anton itself ever writes does
+ * (see {@link renderRegion}). A body that merely mentions the marker string in prose or a quoted
+ * code example (e.g. discussing the marker mechanics in a review comment) must not be mistaken for
+ * a real owned span; a plain substring count would accept that quoted pair as well-formed and let
+ * `upsertBodyRegion` rewrite everything between two unrelated prose mentions (PR #321 review).
+ *
+ * A standalone line isn't authentication enough on its own: a fenced ```/~~~ code example quoting
+ * the markers (e.g. a PR description showing what the region looks like) puts each one on its own
+ * line too, so lines inside a fence are excluded from matching even when they'd otherwise qualify —
+ * otherwise the example reads as a real owned span and the next refresh overwrites the human prose
+ * between the two mentions (PR #321 review).
+ *
+ * Exported so `review-fix-body.ts`'s `extractFixRoundsRegion` can apply the same standalone-line
+ * rule when reading the region back — otherwise a body that quotes both marker strings inline
+ * (with unrelated dated-looking text between them) is misread as an existing, well-formed region
+ * (PR #321 review).
+ */
+export function markerLines(body: string, marker: string): number[] {
+  const indices: number[] = [];
+  let offset = 0;
+  let fence: { char: string; length: number } | null = null;
+  for (const line of body.split("\n")) {
+    const trimmedLine = line.trim();
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmedLine);
+    if (fenceMatch) {
+      const token = fenceMatch[1]!;
+      const char = token[0]!;
+      if (!fence) {
+        fence = { char, length: token.length };
+      } else if (char === fence.char && token.length >= fence.length && trimmedLine === token) {
+        fence = null;
+      }
+    } else if (!fence && trimmedLine === marker) {
+      indices.push(offset + line.indexOf(marker));
+    }
+    offset += line.length + 1;
+  }
+  return indices;
+}
+
+/**
+ * The region's first line — a heading like `### Review-fix rounds` — stays the same across every
+ * refresh even as the rest of `content` accumulates. It is the one part of a rendered region a
+ * marker-stripping edit would still leave recognisable.
+ */
+function headingLine(content: string): string | undefined {
+  return content.trim().split("\n")[0]?.trim() || undefined;
+}
+
+/** Whether `line` already appears verbatim as a whole line somewhere in `body`. */
+function bodyHasLine(body: string, line: string): boolean {
+  return body.split("\n").some((candidate) => candidate.trim() === line);
+}
+
+/** The line `prBody` appends last; a fresh region is inserted above it rather than at the very end. */
+const FOOTER_PREFIX = "🤖 Generated with [anton]";
+
+function appendRegion(body: string, content: string): string {
+  const region = renderRegion(content);
+  const lines = body.split("\n");
+  const footerIdx = lines.findIndex((line) => line.startsWith(FOOTER_PREFIX));
+  if (footerIdx === -1) return [body.replace(/\n+$/, ""), "", region].join("\n");
+  const before = lines.slice(0, footerIdx);
+  while (before[before.length - 1] === "") before.pop();
+  return [...before, "", region, "", ...lines.slice(footerIdx)].join("\n");
+}
+
+export interface BodyRegionUpdate {
+  body: string;
+  /** True when a malformed or partial marker pair made the region unsafe to touch. */
+  skipped: boolean;
+}
+
+/**
+ * Rewrites only the region of `body` anton owns, leaving every byte outside
+ * {@link BODY_REGION_START}/{@link BODY_REGION_END} untouched (anton-gkjb6). An unmarked body gets the
+ * region appended once, directly above the anton footer, so the first render and every refresh after
+ * it converge on one region rather than accumulating copies.
+ *
+ * A marker pair that is not exactly one well-formed `start … end` span — one of the two missing, more
+ * than one of either, or a stray `start` appearing again before the matching `end` (nested) — is left
+ * exactly as found. Matching the outermost pair greedily could swallow content a human placed between
+ * two unrelated marker-shaped strings, and re-marking a partially hand-edited body would silently
+ * discard whatever the edit was. `skipped: true` tells the caller to leave the PR body alone; this
+ * also logs once so a run doesn't quietly stop updating its own region forever.
+ *
+ * Zero markers is ambiguous by itself: it is both "this body has never had a region" (append) and
+ * "a human hand-deleted just the two marker comments, leaving the region's visible content behind"
+ * (skip — the markers are gone, so there is no safe span left to rewrite). The two are told apart by
+ * `content`'s heading line, which stays stable across refreshes even as the rest of the region's text
+ * accumulates: if that line is already sitting in `body` unmarked, the region was here before and its
+ * markers are the part that went missing, so the append branch is skipped in favour of leaving the
+ * body — and the orphaned heading — untouched, same as any other unsafe marker state.
+ */
+export function upsertBodyRegion(body: string, content: string): BodyRegionUpdate {
+  const starts = markerLines(body, BODY_REGION_START);
+  const ends = markerLines(body, BODY_REGION_END);
+  const startCount = starts.length;
+  const endCount = ends.length;
+
+  if (startCount === 0 && endCount === 0) {
+    const heading = headingLine(content);
+    if (heading && bodyHasLine(body, heading)) {
+      console.warn(
+        `[pr-body-region] no markers found, but the body already contains "${heading}" — leaving the body untouched rather than guessing where a hand-deleted region went`,
+      );
+      return { body, skipped: true };
+    }
+    return { body: appendRegion(body, content), skipped: false };
+  }
+
+  const startIdx = starts[0] ?? -1;
+  const endIdx = ends[0] ?? -1;
+  const wellFormed = startCount === 1 && endCount === 1 && startIdx < endIdx;
+  if (!wellFormed) {
+    console.warn(
+      `[pr-body-region] malformed marker pair (start=${startCount}, end=${endCount}) — leaving the body untouched`,
+    );
+    return { body, skipped: true };
+  }
+
+  const rewritten = body.slice(0, startIdx) + renderRegion(content) + body.slice(endIdx + BODY_REGION_END.length);
+  return { body: rewritten, skipped: false };
+}
+
+/**
  * The context appended beneath the describer's reasoning contract (anton-aucch): the run target,
  * every ticket with its contract, and the diff under description — plus the reporting format the
  * narrative is parsed back out of (`parseNarrativeReport` in `steps/describe.ts`).
