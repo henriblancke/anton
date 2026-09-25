@@ -4090,6 +4090,57 @@ async function updatePullRequest(
 }
 
 /**
+ * Read a PR's current body, best-effort — undefined when gh could not answer (network, auth, no
+ * such PR). A caller that owns one region of the body (anton-te6nr) reads this BEFORE writing, so
+ * it amends what is actually on GitHub rather than a copy it fetched at the start of a session that
+ * may have gone stale under a concurrent edit.
+ */
+export async function readPullRequestBody(
+  repoPath: string,
+  selector: string,
+): Promise<string | undefined> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  const target = selector.startsWith("gh-") ? selector.slice(3) : selector;
+  if (!target) return undefined;
+  try {
+    const { stdout } = await execFileAsync(gh, ["pr", "view", target, "--json", "body"], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return (JSON.parse(stdout) as { body?: string }).body ?? "";
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Overwrite only an existing PR's body, best-effort — returns whether gh confirmed the edit. A
+ * body-only SIBLING of {@link updatePullRequest}, not a widened version of it: a caller that owns
+ * one region of the body (anton-te6nr) must never carry a stale/default title along for the ride
+ * the way passing `updatePullRequest` an unrelated title would risk.
+ */
+export async function updatePullRequestBody(
+  repoPath: string,
+  selector: string,
+  body: string,
+): Promise<boolean> {
+  const gh = process.env[GH_BIN_ENV] ?? "gh";
+  const target = selector.startsWith("gh-") ? selector.slice(3) : selector;
+  if (!target) return false;
+  try {
+    await execFileAsync(gh, ["pr", "edit", target, "--body", body], {
+      cwd: repoPath,
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Convert a PR to a draft. Returns whether GitHub confirmed it, so a caller can say so rather than
  * assume it (a failure here leaves the PR mergeable, which is the thing worth reporting).
  *
