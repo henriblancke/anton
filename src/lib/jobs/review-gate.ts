@@ -14,6 +14,7 @@
  * wiring is what makes it unit-testable against a fake driver.
  */
 import { beads, labelValueOf, type Bead } from "../beads/bd";
+import { scrubBdServerEnv } from "../beads/bd-env";
 import { isServerMode } from "../beads/board-mode";
 import { metered, type ReasoningAttribution } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
@@ -356,6 +357,12 @@ export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit"
  * server-mode-board project — and is paid deliberately: `readOnlySection` (review-context.ts) tells the
  * reviewer explicitly it has no shell here and to judge from anton's own already-run gate results (or
  * their absence) instead of trying to reach for one.
+ *
+ * This function alone cannot be the only guard, though: `isServerMode` reads a missing/unreadable/
+ * malformed `.beads/metadata.json` as `embedded` (the safe default for sync — see board-mode.ts),
+ * which leaves `Bash` enabled for exactly the project this exists to protect. The caller pairs this
+ * with `scrubBdServerEnv` (bd-env.ts) unconditionally, so even a `Bash` left enabled here has no
+ * ambient `BEADS_DOLT_*` to reach a real server with.
  */
 export function reviewDeniedTools(repoPath: string | undefined): string[] {
   return repoPath && isServerMode(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
@@ -891,6 +898,11 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
               `DB, then resume the run.`,
           );
         }
+        // `target` is reused as-is for every remaining round's `runGateFixSession` call — mirror the
+        // release onto it now, or the next round's `readReviewGateBoardBaseline(target)` would still
+        // see this round's already-released baseline and mistake it for a fresh crash-recovered one
+        // (PR #284 review, "Refresh the target after releasing a recovered gate baseline").
+        beads.forgetReviewGateBoardBaseline(target);
       }
     }
 
@@ -1106,6 +1118,14 @@ async function runReviewSession(args: {
         routing: reviewRouting,
         permissionMode: settings.permissionMode ?? "bypassPermissions",
         disallowedTools: reviewDeniedTools(args.repoPath),
+        // Belt to `reviewDeniedTools`' suspenders (chatgpt-codex-connector, PR #284 review, "Fail
+        // closed when board mode cannot be read"): `isServerMode` reads a missing/unreadable/
+        // malformed metadata.json as `embedded` (the safe default for sync), which leaves `Bash`
+        // enabled here even on a project this run driving with ambient `BEADS_DOLT_SERVER_*` set
+        // would otherwise let reach a real shared server. Scrubbed unconditionally, not just when
+        // server mode is detected — this is the one guarantee that holds regardless of what
+        // metadata.json says.
+        envOverrides: scrubBdServerEnv(),
         settingSources: [...REVIEW_SETTING_SOURCES],
         // Outranks the `user` sources above, so the machine's own config cannot relax the sandbox
         // this session is contained by.
@@ -1789,17 +1809,19 @@ async function runGateFixSession(args: {
       // repair, reported no board delta, and stalled or repeated an already-landed fix.
       // `runReviewGate` releases this baseline itself, only once that confirmation is durably
       // synced.
-      if (
-        boardOnly &&
-        repoPath &&
-        !boardChanged &&
-        !(await releaseReviewGateBoardBaseline(repoPath, target.id))
-      ) {
-        throw new Error(
-          `the review fix for ${target.id} confirmed no board change for round ${round} but could ` +
-            `not release its own pre-dispatch baseline — a later round for this ticket could misread ` +
-            `it as still describing the current pre-dispatch state`,
-        );
+      if (boardOnly && repoPath && !boardChanged) {
+        if (!(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+          throw new Error(
+            `the review fix for ${target.id} confirmed no board change for round ${round} but could ` +
+              `not release its own pre-dispatch baseline — a later round for this ticket could misread ` +
+              `it as still describing the current pre-dispatch state`,
+          );
+        }
+        // Mirror the release onto `target` itself — it is the same object `runReviewGate` reuses for
+        // every later round, so leaving its in-memory metadata stale would make the next round's
+        // `readReviewGateBoardBaseline(target)` still see this round's already-released baseline (PR
+        // #284 review, "Refresh the target after releasing a recovered gate baseline").
+        beads.forgetReviewGateBoardBaseline(target);
       }
       return fixResult;
     } catch (e) {
@@ -1874,7 +1896,14 @@ async function runGateFixSession(args: {
             // Left standing deliberately (never released on this branch): this IS the recovery
             // snapshot a human's eventual resume needs to tell the just-parked write apart from
             // whatever the board looks like by the time anyone gets to it.
-          } else if (!(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+          } else if (await releaseReviewGateBoardBaseline(repoPath, target.id)) {
+            // Mirror the release onto `target` itself — it is the same object `runReviewGate` reuses
+            // for every later round, so leaving its in-memory metadata stale would make the next
+            // round's `readReviewGateBoardBaseline(target)` still see this round's already-released
+            // baseline (PR #284 review, "Refresh the target after releasing a recovered gate
+            // baseline").
+            beads.forgetReviewGateBoardBaseline(target);
+          } else {
             // No board change of its own — an ordinary retryable failure, EXCEPT the baseline this
             // round persisted before dispatch is now stale and could not be cleared. Left standing,
             // a LATER round for this same ticket would wrongly reuse it as its own pre-dispatch

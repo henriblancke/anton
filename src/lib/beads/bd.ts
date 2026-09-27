@@ -1740,6 +1740,19 @@ export const beads = {
     bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_GATE_BOARD_BASELINE_KEY]),
 
   /**
+   * Mirror a successful {@link clearReviewGateBoardBaseline} onto the in-memory bead itself.
+   * `runReviewGate` (review-gate.ts) holds one `target` object across every round of a gate, so a
+   * bare live-board release leaves {@link reviewGateBoardBaseline} still returning the field the
+   * live write just cleared — the next round then treats an already-released, already-confirmed
+   * baseline as still "recovered" and skips taking a fresh one, double-counting the released
+   * round's board delta (PR #284 review, "Refresh the target after releasing a recovered gate
+   * baseline"). Call this right after every successful {@link clearReviewGateBoardBaseline}.
+   */
+  forgetReviewGateBoardBaseline: (b: Bead): void => {
+    if (b.metadata) delete b.metadata[REVIEW_GATE_BOARD_BASELINE_KEY];
+  },
+
+  /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
    * which a plain close leaves blank. Deliberately NOT the abandon path: a reason here describes
    * work that landed, while a won't-do outcome goes through {@link beads.abandon}, which also labels

@@ -724,6 +724,85 @@ describe("runReviewGate — bounds", () => {
   );
 
   it(
+    "takes a FRESH board baseline for round 2 rather than reusing round 1's already-released " +
+      "recovered one (PR #284 review, \"Refresh the target after releasing a recovered gate " +
+      "baseline\") — `target` carries a crash-preserved baseline into round 1; once round 1's " +
+      "board-fix evidence is confirmed and that baseline released, round 2 must not still read it " +
+      "off the same in-memory `target` and mistake it for a fresh crash recovery",
+    async () => {
+      const boardOnlyTarget: Bead = {
+        ...target,
+        labels: ["delivery:board"],
+        // A prior, crashed attempt already preserved a pre-dispatch baseline for round 1 to recover
+        // — the shape `beads.setReviewGateBoardBaseline` writes, read back by `readReviewGateBoardBaseline`.
+        metadata: { reviewGateBoardBaseline: JSON.stringify({ [ticket.id]: "recovered-before" }) },
+      };
+      const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
+      const worktree = fakeWorktree();
+      let reads = 0;
+      const readBoardFingerprint = async () => {
+        reads += 1;
+        // Round 1 recovers its baseline from `target.metadata` (no read here for it), so the only
+        // call round 1 makes is its post-fix "after" read (#1) — reporting a change vs the
+        // recovered "before" so this round's evidence is confirmed and the baseline released.
+        //
+        // Round 2 must NOT recover: with the fix, `target`'s in-memory metadata was cleared when
+        // round 1 released, so round 2 takes a FRESH "before" read (#2), a stability check inside
+        // `persistReviewGateBoardBaseline`'s refresh loop (#3, matching #2 — no drift), and its own
+        // post-fix "after" read (#4). Without the fix, round 2 would still see the STALE
+        // "recovered-before" baseline on `target` and skip #2/#3 entirely, making only 2 calls
+        // total instead of 4.
+        if (reads === 1) return { beads: new Map([[boardOnlyTicket.id, "after1"]]) };
+        if (reads === 2 || reads === 3) return { beads: new Map([[boardOnlyTicket.id, "after1"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, "after2"]]) };
+      };
+      const { run } = fakeClaude([
+        report(4, [BLOCKING]),
+        "closed the bead via bd -C (round 1)",
+        // Scored above the default min (5), unlike round 1 — two consecutive low scores would trip
+        // the unrelated score-regression alarm (anton-i98r) and mask the outcome this test checks.
+        report(6, [BLOCKING]),
+        "closed the bead via bd -C (round 2)",
+        report(9, []),
+      ]);
+      const out = await runReviewGate({
+        db: tdb.db,
+        clock,
+        ctx,
+        projectId,
+        target: boardOnlyTarget,
+        tickets: [boardOnlyTicket],
+        settings: { reviewMaxRounds: 3 },
+        worktreePath: dir,
+        baseBranch: "main",
+        repoPath: "/repos/anton",
+        deps: {
+          runClaude: async (options) => {
+            worktree.onDispatch();
+            return run(options);
+          },
+          diff: async () => ({ files: [], patch: "", truncated: false }),
+          commit: async () => ({ committed: false }), // board-only: nothing ever staged
+          readState: worktree.readState,
+          restoreState: worktree.restoreState,
+          readBoardFingerprint,
+          syncBoard: async () => true, // both rounds' board writes are confirmed synced
+        },
+      });
+
+      expect(out.outcome).toBe("clean");
+      expect(out.rounds[0].fixCommitted).toBe(true);
+      expect(out.rounds[1].fixCommitted).toBe(true);
+      // 4 reads total (1 for round 1's recovered baseline + 3 for round 2's fresh one) proves round
+      // 2 took a fresh baseline. A regression here would settle at 2 (both rounds "recovering" the
+      // same stale metadata).
+      expect(reads).toBe(4);
+      // `target`'s in-memory metadata no longer carries either round's now-released baseline.
+      expect(boardOnlyTarget.metadata?.reviewGateBoardBaseline).toBeUndefined();
+    },
+  );
+
+  it(
     "still gives the fix session board-fix handling for a MIXED run — one ticket is `delivery:board`, " +
       "another is not (PR #284 review round 15) — so a fix to the board-only ticket isn't sent " +
       "against the worktree's frozen bd copy and a real bd-only repair isn't misread as a stall",

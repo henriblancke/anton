@@ -1402,3 +1402,64 @@ describe("runClaude routing (anton-72hj)", () => {
     expect(JSON.stringify(events)).not.toContain(TOKEN_VALUE);
   });
 });
+
+describe("runClaude envOverrides", () => {
+  /** Set an env var for one test and restore it. */
+  function withEnv(vars: Record<string, string | undefined>, body: () => Promise<void>): Promise<void> {
+    const saved = new Map(Object.keys(vars).map((k) => [k, process.env[k]]));
+    for (const [k, v] of Object.entries(vars)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    return body().finally(() => {
+      for (const [k, v] of saved) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    });
+  }
+
+  /** A fake that dumps `keys` from its own env to `dumpPath` (`null` for a deleted var) then succeeds. */
+  function writeFakeCustomEnvDumpClaude(name: string, dumpPath: string, keys: string[]): string {
+    const path = join(dir, name);
+    const body = [
+      "#!/usr/bin/env node",
+      "const fs = require('node:fs');",
+      `const keys = ${JSON.stringify(keys)};`,
+      "const env = {};",
+      "for (const k of keys) { env[k] = k in process.env ? process.env[k] : null; }",
+      `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(env));`,
+      "process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_id: 'sess-custom-env', result: 'ok' }) + '\\n');",
+      "",
+    ].join("\n");
+    writeFileSync(path, body, "utf8");
+    chmodSync(path, 0o755);
+    return path;
+  }
+
+  it("deletes an ambient var named by an undefined override, leaving others untouched (anton-fc5x)", async () => {
+    // This is exactly the contract `scrubBdServerEnv` relies on to keep the review gate's reviewer
+    // session from reaching a Dolt server through an ambient BEADS_DOLT_* var, regardless of what
+    // `.beads/metadata.json` says.
+    const dumpPath = join(dir, "env-overrides.json");
+    const bin = writeFakeCustomEnvDumpClaude("env-overrides-claude", dumpPath, [
+      "BEADS_DOLT_SERVER_HOST",
+      "KEEP_ME",
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+
+    await withEnv({ BEADS_DOLT_SERVER_HOST: "db.internal", KEEP_ME: "still-here" }, async () => {
+      const result = await runClaude({
+        cwd: dir,
+        prompt: "scrubbed",
+        routing: UNROUTED,
+        envOverrides: { BEADS_DOLT_SERVER_HOST: undefined },
+      });
+      expect(result.ok).toBe(true);
+    });
+
+    const childEnv = JSON.parse(readFileSync(dumpPath, "utf8")) as Record<string, string | null>;
+    expect(childEnv.BEADS_DOLT_SERVER_HOST).toBeNull();
+    expect(childEnv.KEEP_ME).toBe("still-here");
+  });
+});

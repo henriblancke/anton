@@ -15,6 +15,7 @@ import {
   buildBdEnv,
   passwordVarHint,
   scopedPasswordVar,
+  scrubBdServerEnv,
   serverScopedPasswordVar,
 } from "./bd-env";
 import { resetBoardModeCache } from "./board-mode";
@@ -234,5 +235,48 @@ describe("passwordVarHint", () => {
 
   it("names the shared var when metadata.json configures no user", () => {
     expect(passwordVarHint(serverRepo("planar"))).toBe("BEADS_DOLT_PASSWORD");
+  });
+});
+
+describe("scrubBdServerEnv", () => {
+  it("maps every BEADS_DOLT_* key in the given env to undefined, including dynamically-scoped ones", () => {
+    const scrub = scrubBdServerEnv({
+      NODE_ENV: "test",
+      BEADS_DOLT_SERVER_HOST: "db.internal",
+      BEADS_DOLT_SERVER_MODE: "server",
+      // Per-user / per-server password variants (scopedPasswordVar / serverScopedPasswordVar) are
+      // named dynamically and so cannot appear in PROJECT_SCOPED_BD_ENV's static list — this must
+      // still catch them by prefix alone.
+      BEADS_DOLT_PASSWORD_TRAMMEL: "shh",
+      BEADS_DOLT_PASSWORD_DB_INTERNAL_5432_TRAMMEL: "shh",
+      BEADS_DOLT_SERVER_TLS: "true",
+      OTHER_VAR: "keep-me",
+      PATH: "/usr/bin",
+    });
+
+    expect(scrub).toEqual({
+      BEADS_DOLT_SERVER_HOST: undefined,
+      BEADS_DOLT_SERVER_MODE: undefined,
+      BEADS_DOLT_PASSWORD_TRAMMEL: undefined,
+      BEADS_DOLT_PASSWORD_DB_INTERNAL_5432_TRAMMEL: undefined,
+      BEADS_DOLT_SERVER_TLS: undefined,
+    });
+    expect(scrub).not.toHaveProperty("OTHER_VAR");
+    expect(scrub).not.toHaveProperty("PATH");
+  });
+
+  it("returns an empty delta when the env carries no BEADS_DOLT_* var", () => {
+    expect(scrubBdServerEnv({ NODE_ENV: "test", OTHER_VAR: "keep-me" })).toEqual({});
+  });
+
+  it("defaults to process.env when called with no argument", () => {
+    const saved = process.env.BEADS_DOLT_SERVER_HOST;
+    process.env.BEADS_DOLT_SERVER_HOST = "ambient.example";
+    try {
+      expect(scrubBdServerEnv()).toHaveProperty("BEADS_DOLT_SERVER_HOST", undefined);
+    } finally {
+      if (saved === undefined) delete process.env.BEADS_DOLT_SERVER_HOST;
+      else process.env.BEADS_DOLT_SERVER_HOST = saved;
+    }
   });
 });

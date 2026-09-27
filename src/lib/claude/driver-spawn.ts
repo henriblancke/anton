@@ -165,18 +165,19 @@ export function buildClaudeArgs(opts: ClaudeCliOptions, systemPromptFile?: strin
 export function spawnClaude(
   bin: string,
   args: string[],
-  opts: { cwd: string; signal?: AbortSignal; routing: ClaudeRouting },
+  opts: { cwd: string; signal?: AbortSignal; routing: ClaudeRouting; envOverrides?: Record<string, string | undefined> },
 ): ChildProcess {
   return spawn(bin, args, {
     cwd: opts.cwd,
     signal: opts.signal,
-    // The child inherits anton's environment with the routing delta applied OVER it (anton-72hj):
-    // a routed project's gateway vars set, an unrouted project's cleared — rather than inheriting
-    // anton's ambient ANTHROPIC_* wholesale, which would misroute a project that never opted in. The
-    // token is read from anton's env HERE, at spawn time; a routed project whose named var is unset
-    // throws before spawn (fails the run loud). Node drops undefined-valued keys, so a cleared var
-    // never reaches the child.
-    env: { ...process.env, ...routingEnvDelta(opts.routing) },
+    // The child inherits anton's environment with `envOverrides` (a caller-scoped delta — e.g. the
+    // review gate's reviewer session scrubbing every ambient `BEADS_DOLT_*`, see `scrubBdServerEnv`)
+    // and then the routing delta applied OVER it (anton-72hj): a routed project's gateway vars set,
+    // an unrouted project's cleared — rather than inheriting anton's ambient ANTHROPIC_* wholesale,
+    // which would misroute a project that never opted in. The token is read from anton's env HERE, at
+    // spawn time; a routed project whose named var is unset throws before spawn (fails the run loud).
+    // Node drops undefined-valued keys, so a cleared var never reaches the child.
+    env: { ...process.env, ...opts.envOverrides, ...routingEnvDelta(opts.routing) },
     // On POSIX, make Claude the leader of a new process group. The stall watchdog must terminate
     // the shell commands/tests Claude spawned too; killing only Claude leaves the actual hung
     // wait-loop orphaned and lets every retry add another copy.
