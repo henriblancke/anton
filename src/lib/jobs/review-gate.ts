@@ -877,6 +877,20 @@ export async function runReviewGate(args: ReviewGateArgs): Promise<ReviewGateRes
               `DB${allPersisted ? " and the sync channel" : ""}, then resume the run.`,
           );
         }
+        // This round's board-fix evidence is now durably confirmed, so its pre-dispatch baseline
+        // no longer needs to survive a crash for that evidence to be recoverable (chatgpt-codex-
+        // connector, PR #284 review, "Retain the gate baseline until evidence IDs are durable") —
+        // released here, not by `runGateFixSession` itself, which defers exactly this release until
+        // the confirmation above lands. Releasing any earlier — the bug this closes — would clear
+        // the only recoverable snapshot before the confirmation write ever ran.
+        if (!(await releaseReviewGateBoardBaseline(repo, target.id))) {
+          throw new PoisonError(
+            `${target.id}'s board-fix evidence from review round ${round} was durably confirmed, but ` +
+              `its pre-dispatch board baseline could not be released — a later round for this ticket ` +
+              `could misread it as still describing the current pre-dispatch state. Check the beads ` +
+              `DB, then resume the run.`,
+          );
+        }
       }
     }
 
@@ -1497,7 +1511,7 @@ async function runGateFixSession(args: {
     // a fresh read (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline
     // before dispatch") — a fresh read after a crash mid-round would already contain whatever the
     // fixer wrote before this process died, permanently hiding that delta from every later diff.
-    const boardBefore = boardOnly && repoPath
+    let boardBefore = boardOnly && repoPath
       ? (readReviewGateBoardBaseline(target) ?? (await args.readBoardFingerprint(repoPath, target.id)))
       : undefined;
     // A board-only round is refused BEFORE dispatch when that baseline could not be read (PR #284
@@ -1524,18 +1538,28 @@ async function runGateFixSession(args: {
     // resumed attempt to diff against. Run unconditionally, including when `boardBefore` was just
     // reused from a preserved value above: the write is then a no-op, but the confirming push still
     // reconfirms it reached the remote.
-    if (
-      boardOnly &&
-      repoPath &&
-      boardBefore &&
-      !(await persistReviewGateBoardBaseline(repoPath, target.id, boardBefore))
-    ) {
-      throw new PoisonError(
-        `the review fix for ${target.id} read a board-only baseline before round ${round} but could ` +
-          `not persist it before dispatch — refusing to dispatch: without a durable copy, a crash ` +
-          `after the fixer's own board write could never be told apart from no progress. Resolve the ` +
-          `board write, then resume.`,
+    if (boardOnly && repoPath && boardBefore) {
+      // `persistReviewGateBoardBaseline`'s own confirming push can pull in a write from another
+      // machine with access to the same board between the read above and this persist
+      // (chatgpt-codex-connector, PR #284 review, "Refresh review baselines after confirming
+      // pulls") — its return value is the refreshed baseline that actually reached the remote,
+      // which every later read this round diffs against instead of the possibly-stale value read
+      // before the pull.
+      const persistedBaseline = await persistReviewGateBoardBaseline(
+        repoPath,
+        target.id,
+        boardBefore,
+        args.readBoardFingerprint,
       );
+      if (!persistedBaseline) {
+        throw new PoisonError(
+          `the review fix for ${target.id} read a board-only baseline before round ${round} but could ` +
+            `not persist it before dispatch — refusing to dispatch: without a durable copy, a crash ` +
+            `after the fixer's own board write could never be told apart from no progress. Resolve the ` +
+            `board write, then resume.`,
+        );
+      }
+      boardBefore = persistedBaseline;
     }
     // Flips once the gates have passed AND the work is committed: past that point the round's output
     // is verified, and the rollback below must not touch it however the session ends.
@@ -1752,14 +1776,25 @@ async function runGateFixSession(args: {
             `a verified fix — returning the fix's result anyway: ${String(finalizeError)}`,
         );
       }
-      // Released only now — after the board write (if any) is confirmed synced and this round's
-      // outcome is logged and settled (chatgpt-codex-connector, PR #284 review, "Persist the
-      // self-review board baseline before dispatch" / mirrors the PR-fix path's "Retain the PR-fix
-      // baseline until the repair is durable"). Releasing any earlier would leave a process/host
-      // death in that window with no durable snapshot for a resumed round to diff against.
-      if (boardOnly && repoPath && !(await releaseReviewGateBoardBaseline(repoPath, target.id))) {
+      // Released only when this round produced NO board evidence to hand off (chatgpt-codex-
+      // connector, PR #284 review, "Retain the gate baseline until evidence IDs are durable") — a
+      // `boardChanged` round's baseline is the ONLY recoverable snapshot standing between here and
+      // `runReviewGate` durably persisting `fixResult.boardEvidenceIds` into
+      // `boardEvidenceConfirmed`. Releasing it here unconditionally, as this used to, cleared that
+      // snapshot before that confirmation write ever ran: a process exit, a failed live-ticket/
+      // history read, a refused confirmation write, or a failed confirming push in that caller then
+      // lost BOTH the baseline and the ids, so a retry took a fresh baseline already containing the
+      // repair, reported no board delta, and stalled or repeated an already-landed fix.
+      // `runReviewGate` releases this baseline itself, only once that confirmation is durably
+      // synced.
+      if (
+        boardOnly &&
+        repoPath &&
+        !boardChanged &&
+        !(await releaseReviewGateBoardBaseline(repoPath, target.id))
+      ) {
         throw new Error(
-          `the review fix for ${target.id} confirmed its board evidence for round ${round} but could ` +
+          `the review fix for ${target.id} confirmed no board change for round ${round} but could ` +
             `not release its own pre-dispatch baseline — a later round for this ticket could misread ` +
             `it as still describing the current pre-dispatch state`,
         );
