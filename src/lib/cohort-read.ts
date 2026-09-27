@@ -83,6 +83,10 @@ async function cohortFeatureOf(
     delivered: deliveredAtMs !== undefined,
     ...(deliveredAtMs !== undefined ? { deliveredAtMs } : {}),
     usd: ledger?.totals.totals.usd,
+    // A defined `usd` beside a non-zero `unpricedRows` is still only a FLOOR for this feature — some
+    // of its rows priced and some didn't. Carrying the count through lets `promptSeries` mark the
+    // cohort average as partial instead of reading it as complete (PR #331 review).
+    unpricedRows: ledger?.totals.totals.unpricedRows,
     reviewRounds: ledger?.friction.reviewRounds,
     humanTouches: ledger?.friction.humanTouches,
     escalations: ledger?.friction.escalations,

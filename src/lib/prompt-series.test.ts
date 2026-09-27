@@ -490,6 +490,37 @@ describe("promptSeries: only DELIVERED features count toward n", () => {
     expect(cohort.basis.unpricedFeatures).toBe(1);
   });
 
+  it("treats a feature with a defined but partial usd as unpriced too", () => {
+    // Both features priced something (`usd` is defined on each), but "a" left rows unpriced — a gap
+    // that must still count toward `unpricedFeatures`, not just a fully-unpriced `usd: undefined`.
+    const series = promptSeries(
+      [
+        {
+          beadId: "a",
+          delivered: true,
+          deliveredAtMs: AUG_2,
+          usd: 6,
+          unpricedRows: 1,
+          rows: [{ promptDigest: OLD_PROMPT }],
+        },
+        {
+          beadId: "b",
+          delivered: true,
+          deliveredAtMs: AUG_2,
+          usd: 4,
+          rows: [{ promptDigest: OLD_PROMPT }],
+        },
+      ],
+      "prompt",
+    );
+
+    const cohort = series.cohorts[0]!;
+    // The floor still sums normally ($10 across two features)...
+    expect(cohort.metrics.usdPerFeature).toBe(5);
+    // ...but the partial feature must still mark the average as a floor, same as a fully-unpriced one.
+    expect(cohort.basis.unpricedFeatures).toBe(1);
+  });
+
   it("carries a window spanning only the DELIVERIES, never a gave-up run", () => {
     const series = promptSeries(
       [

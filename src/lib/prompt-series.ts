@@ -125,11 +125,12 @@ export interface CohortSample {
   antonVersions: readonly (string | null | undefined)[];
   metrics: CohortMetrics;
   /**
-   * Features anton could price nothing for — the sibling of {@link CohortBasis.unpricedFeatures}.
-   * Read by {@link cohortStanding} to decide whether a `usdPerFeature` delta may be drawn at all: a
-   * cohort's average is a FLOOR whenever this is non-zero, and a delta between two floors (or a floor
-   * and a total) is not a smaller finding than a delta between two totals, it is a different question
-   * answered as if it were the same one.
+   * Features whose own `usd` is a FLOOR rather than a total — anton could price none of their rows,
+   * or only some of them ({@link CohortFeature.unpricedRows}) — the sibling of
+   * {@link CohortBasis.unpricedFeatures}. Read by {@link cohortStanding} to decide whether a
+   * `usdPerFeature` delta may be drawn at all: a cohort's average is a FLOOR whenever this is
+   * non-zero, and a delta between two floors (or a floor and a total) is not a smaller finding than
+   * a delta between two totals, it is a different question answered as if it were the same one.
    */
   unpricedFeatures: number;
 }
@@ -406,9 +407,10 @@ export interface CohortBasis {
    */
   features: number;
   /**
-   * Features anton could price nothing for. Non-zero beside a present `usdPerFeature` makes that
-   * average a FLOOR — the same discipline `spend-breakdown` applies to a partly-priced group, and the
-   * reason the cohort reports this rather than folding an unpriced feature in as $0.
+   * Features whose OWN `usd` is a floor — anton could price none of their rows, or only some of
+   * them. Non-zero beside a present `usdPerFeature` makes that average a FLOOR too — the same
+   * discipline `spend-breakdown` applies to a partly-priced group, and the reason the cohort reports
+   * this rather than folding an unpriced or partly-priced feature in as if it were complete.
    */
   unpricedFeatures: number;
 }
@@ -514,6 +516,15 @@ export interface CohortFeature {
    * `spend-breakdown`'s rule. `LedgerTotals.totals.usd` answers this directly.
    */
   usd: number | undefined;
+  /**
+   * Rows this feature's own {@link usd} could not price (`LedgerTotals.totals.unpricedRows`).
+   * Optional, like the friction counters beside it — absent reads as 0. Read beside `usd` rather
+   * than folded into it: a feature can carry BOTH a defined `usd` and a non-zero count here when
+   * only some of its rows priced, and that combination still makes `usd` a FLOOR for this one
+   * feature, not a total — the same distinction `PhaseTotals.unpricedRows` draws at the ledger
+   * level, carried through so the cohort fold can draw it too (PR #331 review).
+   */
+  unpricedRows?: number;
   /** Rounds its self-review took to reach a clean verdict (`LedgerFriction.reviewRounds`). */
   reviewRounds?: number;
   /** Times a person had to touch it (`LedgerFriction.humanTouches`). */
@@ -679,8 +690,11 @@ function accumulate(into: CohortAccumulator, feature: CohortFeature): void {
   // Every numerator sums over EVERY attributed feature while only deliveries touch `n` below. That
   // asymmetry is the denominator rule (design §the denominator): drop a gave-up run's spend and the
   // prompt that gives up earliest reads as the cheapest.
-  if (feature.usd === undefined) into.unpricedFeatures += 1;
-  else into.usd = (into.usd ?? 0) + feature.usd;
+  if (feature.usd !== undefined) into.usd = (into.usd ?? 0) + feature.usd;
+  // A feature counts as unpriced whenever its OWN `usd` is a floor rather than a total — either it
+  // priced nothing at all, or it priced only some of its rows (`unpricedRows > 0`). Both leave the
+  // cohort average unable to say it covers everything folded into it (PR #331 review).
+  if (feature.usd === undefined || count(feature.unpricedRows) > 0) into.unpricedFeatures += 1;
   into.reviewRounds += count(feature.reviewRounds);
   into.humanTouches += count(feature.humanTouches);
   into.escalations += count(feature.escalations);
