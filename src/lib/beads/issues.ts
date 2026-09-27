@@ -828,6 +828,15 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
         `startability projections fail closed until the next successful read: ` +
         (e instanceof Error ? e.message : String(e)),
     );
+    // Reaching here means evidence was already missing-or-stale before this attempt (every caller
+    // only invokes this function under that condition), so a prior WeakMap entry left in place would
+    // keep `cycleEvidenceFor(board)` reporting an expired verdict as authoritative until some later
+    // call happens to succeed — including on a shared-server board where another writer introduced a
+    // gate-only cycle this failed refresh never got to see. Clear it and fail closed, mirroring
+    // `probeCycleEvidence`'s identical catch (issues.ts:1396).
+    const hadEvidence = cycleEvidenceFor(board) !== undefined;
+    clearCycleEvidence(board);
+    if (hadEvidence) markCycleEvidenceUnavailable(cwd);
   }
 }
 
@@ -881,16 +890,24 @@ export async function ensureCycleEvidence(
   board: Bead[],
   generation: number,
 ): Promise<Bead[]> {
-  if (cycleEvidenceFor(board) === undefined) {
+  // `cycleEvidenceMissingOrStale`, not a plain presence check (P2 review, PR #274,
+  // issues.ts:884): a retained board whose evidence is merely expired — not absent — would
+  // otherwise skip straight past this whole refresh, leaving `board` paired with a verdict from
+  // before a shared-server writer introduced a gate-only cycle. Mirrors the same fix already
+  // applied to every guard in {@link attachCyclesBestEffort}.
+  if (cycleEvidenceMissingOrStale(board)) {
     const cycles = await beads.depCycles(cwd);
     let consistent = boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
     // Recheck evidence AFTER the `sameBlocksEdges` await, not just before it, mirroring
     // `attachCyclesBestEffort`: a concurrent enrichment path sharing this same `board` array (evidence
-    // is keyed by array identity) may have already attached it while the re-list above was in flight.
+    // is keyed by array identity) may have already attached FRESH evidence while the re-list above
+    // was in flight. `cycleEvidenceMissingOrStale`, not a plain presence check — otherwise this
+    // recheck would treat the OLD stale evidence this call is trying to replace as "already handled"
+    // and fall through without ever attaching the freshly-fetched `cycles`.
     if (
       consistent &&
       issueSnapshotGeneration(cwd) === generation &&
-      cycleEvidenceFor(board) === undefined
+      cycleEvidenceMissingOrStale(board)
     ) {
       // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
       // gates blocking each other, nothing else pointing at either) — `board` never carried them, the
@@ -977,9 +994,12 @@ export async function ensureCycleEvidence(
         }
       }
       // Recheck evidence AFTER the hydration await too: the same race the outer check above guards
-      // against — a concurrent enrichment path attaching evidence, or the snapshot generation moving —
-      // can equally land while the gate listing was in flight.
-      if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+      // against — a concurrent enrichment path attaching FRESH evidence, or the snapshot generation
+      // moving — can equally land while the gate listing was in flight. `cycleEvidenceMissingOrStale`,
+      // not a plain presence check, for the same reason as the two guards above: this call's own
+      // freshly-fetched `cycles` must still be attached even if `board` already carries OLD, expired
+      // evidence from before this function ran.
+      if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceMissingOrStale(board)) {
         // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
         // and issues.ts:296) — otherwise this approval-path attach leaves `checkedAt` at its zero
         // default and the next poll reads this fresh evidence as already expired.

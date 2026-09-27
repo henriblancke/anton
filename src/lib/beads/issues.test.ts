@@ -660,6 +660,34 @@ describe("loadAllIssues", () => {
     }
   });
 
+  it("invalidates expired evidence when an ordinary read's staleness refresh itself fails (codex review, PR #274, issues.ts:825)", async () => {
+    // Same setup as the trust-window test above: evidence attached once, board content never
+    // moves, so only the age check notices it's due for a refresh. If THAT refresh throws, the old
+    // WeakMap entry must not survive it — otherwise a shared-server writer who introduced a
+    // gate-only cycle in the meantime keeps being masked by the expired "no cycles" verdict forever,
+    // since nothing else about this board's own content will ever change to trigger another check.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const first = await readAllIssues(REPO, { withCycles: true });
+    expect(cycleEvidenceFor(first.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      cyclesMock.mockRejectedValueOnce(new Error("bd dep cycles failed"));
+      const second = await readAllIssues(REPO, { withCycles: true });
+
+      expect(cycleEvidenceFor(second.beads)).toBeUndefined();
+      // Mirrors the probe path's present->missing bump: a poller that already matched `before` must
+      // still learn evidence became unavailable rather than keep 304-ing the stale verdict.
+      expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
   it("enriches a versioned board read before it reaches a policy projection", async () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
@@ -1258,13 +1286,29 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(issueSnapshotVersion(REPO)).toBe(before + 1);
   });
 
-  it("is a no-op when the board already carries evidence", async () => {
+  it("is a no-op when the board already carries fresh evidence", async () => {
     const board = [{ ...target, dependencies: [] }];
     attachCycleEvidence(board, []);
 
     await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
 
     expect(cyclesMock).not.toHaveBeenCalled();
+  });
+
+  it("refreshes and replaces evidence that's merely stale, not just missing (codex review, PR #274, issues.ts:884)", async () => {
+    // A presence-only guard would treat this board as already handled and skip `bd dep cycles`
+    // entirely — the exact gap that lets a shared-server writer introduce a gate-only cycle (one
+    // this board's own `blocks` edges never dangle toward) survive past the evidence's trust window
+    // undetected, since the board's own content has nothing to invalidate on.
+    const board = [{ ...target, dependencies: [] }];
+    attachCycleEvidence(board, [], Date.now() - ISSUE_SNAPSHOT_MAX_AGE_MS - 1);
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
   });
 
   it("still runs the re-list/compare when the board carries no blocks edge at all (matches loadAllIssues's own fix, issues.ts:307)", async () => {
