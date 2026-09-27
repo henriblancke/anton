@@ -75,7 +75,7 @@ export async function buildReviewFixPrompt(args: {
   const reasoning = override || (await loadSkill("review-fix"));
   const attribution: ReasoningAttribution = override
     ? { promptBodyDigest: textDigest(override) }
-    : { skillId: "review-fix", skillDigest: bundledSkillDigest("review-fix") };
+    : { skillId: "review-fix", skillDigest: bundledSkillDigest("review-fix"), skillIsDefault: true };
   const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, reasons, conflicts)].join("\n");
 
   return { prompt, appendSystemPrompt, attribution };

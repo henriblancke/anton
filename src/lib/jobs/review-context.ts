@@ -220,7 +220,7 @@ export async function resolveReviewerContract(
   return {
     reasoning: await loadSkill("review"),
     reviewer: { kind: "default" },
-    attribution: { skillId: "review", skillDigest: bundledSkillDigest("review") },
+    attribution: { skillId: "review", skillDigest: bundledSkillDigest("review"), skillIsDefault: true },
   };
 }
 

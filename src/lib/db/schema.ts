@@ -993,6 +993,15 @@ export const claudeInvocations = sqliteTable(
     skillId: text("skill_id"),
     skillDigest: text("skill_digest"),
     /**
+     * Whether `skill_id` named anton's own bundled default (the describe/review/review-fix/
+     * scan-triage fallback a resolver takes when a project configured no override) rather than
+     * something a project explicitly chose (PR #331 review). A project is free to name its own
+     * skill `review`, and its row must not be read as the scaffolding fallback just because the id
+     * collides — see `isScaffoldingFallback` in `prompt-series.ts`, the sole reader. Null on a row a
+     * resolver never marked either way, and on every row written before this column existed.
+     */
+    skillIsDefault: integer("skill_is_default", { mode: "boolean" }),
+    /**
      * The `prompt:<id>` a `step:claude` resolved — the sibling of `skill_id`, and mutually exclusive
      * with it by construction, since `loadStepReasoning` dispatches exactly one.
      */

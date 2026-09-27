@@ -47,7 +47,7 @@ describe("buildReviewFixPrompt — reasoning attribution", () => {
       settings,
       projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
     });
-    expect(attribution).toMatchObject({ skillId: "review-fix" });
+    expect(attribution).toMatchObject({ skillId: "review-fix", skillIsDefault: true });
     expect(attribution.skillDigest).toMatch(/^[0-9a-f]{12}$/);
     expect(attribution.promptBodyDigest).toBeUndefined();
   });
