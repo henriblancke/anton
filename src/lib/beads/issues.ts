@@ -397,13 +397,21 @@ async function recheckBlocksConsistency(
  * description, ancestors, or owner. Without these fields the two keys still compared equal, so
  * `boardStillMatchesCycles` waved the stale board through and the approval route could label/enqueue
  * a bead that is no longer a run target, or the picker could rank against stale policy inputs.
+ *
+ * Both `acceptance_criteria` and `acceptance` are in the key too (P2 review, PR #274,
+ * issues.ts:406): bd exposes a bead's acceptance text under either field name, and
+ * `contractReads`/`acceptanceBodies` (contract.ts) read both. A shared-server `bd update
+ * --acceptance` can land on whichever field the earlier bead used without touching `description`,
+ * status, labels, or ancestors — without both fields here the two keys still compared equal, so the
+ * locked approval/picker guard could approve and claim a target whose acceptance criteria had just
+ * been gutted.
  */
 function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
   const byId = new Map(list.map((bead) => [bead.id, bead]));
   return (id: string) => {
     const bead = byId.get(id);
     if (!bead) return undefined;
-    return `${bead.status}:${bead.issue_type}:${bead.priority}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${ownerOf(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
+    return `${bead.status}:${bead.issue_type}:${bead.priority}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${bead.acceptance_criteria ?? ""}:${bead.acceptance ?? ""}:${ownerOf(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
   };
 }
 
@@ -824,10 +832,16 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
                 // off an expired cycle set the refresh just disowned. Clear it and fail closed,
                 // mirroring the outer catch's identical clear-and-unavailable transition
                 // (issues.ts:844) — this rejection path never reached that catch (P2 review, PR #274,
-                // issues.ts:807).
-                const hadEvidence = cycleEvidenceFor(board) !== undefined;
-                clearCycleEvidence(board);
-                if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+                // issues.ts:807). Guarded by the same `staleCheckedAt` check as that catch and the
+                // initial-rejection branch above (P2 review, PR #274, issues.ts:830): a racing
+                // `ensureCycleEvidence`/`probeCycleEvidence` sharing this same retained board can
+                // attach a newer, successful result while this refresh was in flight, and that result
+                // must survive this call's rejection rather than being clobbered.
+                if (cycleEvidenceCheckedAtFor(board) === staleCheckedAt) {
+                  const hadEvidence = cycleEvidenceFor(board) !== undefined;
+                  clearCycleEvidence(board);
+                  if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+                }
               }
             }
           }
