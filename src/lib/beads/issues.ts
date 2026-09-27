@@ -1,5 +1,12 @@
 import { beads, type Bead, type DepCycle } from "./bd";
-import { attachCycleEvidence, clearCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
+import { runTargetResolver } from "../epic-graph";
+import {
+  attachCycleEvidence,
+  clearCycleEvidence,
+  cycleEvidenceCheckedAtFor,
+  cycleEvidenceFor,
+} from "./cycle-evidence";
+export { resetCycleEvidenceCheckedAt } from "./cycle-evidence";
 import {
   getBeadDescription,
   hydrateIssueSnapshot,
@@ -292,8 +299,9 @@ export async function loadAllIssues(
   // call reaches this path directly, without ever going through the probe. Leaving the
   // timestamp unset would make `probeCycleEvidence`'s freshness check read this evidence as
   // already expired (`checkedAt` defaults to 0), triggering an immediate redundant `bd dep
-  // cycles` on the very next poll.
-  cycleEvidenceCheckedAt().set(cwd, Date.now());
+  // cycles` on the very next poll. `attachCycleEvidence` stamps `board` itself (P2 review, PR
+  // #274, issues.ts:296) — not `cwd` — so an independent `loadAllIssues` call that never becomes
+  // the retained snapshot can't mark a DIFFERENT board's evidence as freshly checked.
   return attachCycleEvidence(board, cycles);
 }
 
@@ -435,13 +443,30 @@ function ancestorChain(id: string, list: Bead[]): string[] {
  * Comparing the whole {@link ancestorChain} instead of just the one link catches a reparent anywhere
  * along it, not only at the member itself. Every `sameBlocksEdges` gate that decides whether cycle
  * evidence is safe to attach must also check this.
+ *
+ * A closed blocker under a live feature `F` is a separate gap none of the above closes:
+ * `computeChildReadiness` (epic-graph.ts) resolves an external blocker through `runTargetOf`, so
+ * readiness gates on `F`'s stage, not the blocker bead's own. The blocker's status, abandoned label,
+ * and ancestor chain can all stay identical across both reads while `F` itself reopens between them
+ * — the key above would then see no drift and let a locked approval or picker path treat the
+ * dependency as shipped even though its owning feature is live again. Folding the resolved owner's
+ * own state into the key closes that gap: an id's key changes when EITHER the id or the run target
+ * that actually gates it moves.
  */
 function liveKeyOf(list: Bead[]): (id: string) => string | undefined {
   const byId = new Map(list.map((bead) => [bead.id, bead]));
-  return (id: string) => {
+  const runTargetOf = runTargetResolver(list);
+  const stateOf = (id: string): string | undefined => {
     const bead = byId.get(id);
     if (!bead) return undefined;
     return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${ancestorChain(id, list).join(">")}`;
+  };
+  return (id: string) => {
+    const own = stateOf(id);
+    if (own === undefined) return undefined;
+    const owner = runTargetOf(id);
+    const ownerState = owner && owner !== id ? stateOf(owner) : undefined;
+    return ownerState === undefined ? own : `${own}|owner:${owner}:${ownerState}`;
   };
 }
 
@@ -677,12 +702,11 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
         // Recheck generation and evidence AFTER the hydration await too, same reasoning as the
         // recheck above it guards against.
         if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+          // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
+          // and issues.ts:296) — otherwise a cold enrichment reaching this best-effort path leaves
+          // `checkedAt` at its zero default, so the very next poll reads this fresh evidence as
+          // already expired and launches a redundant `bd dep cycles`.
           attachCycleEvidence(board, cycles);
-          // Stamp verification time on every attach, not only `probeCycleEvidence`'s own (P2
-          // review, PR #274, issues.ts:673) — otherwise a cold enrichment reaching this
-          // best-effort path leaves `checkedAt` at its zero default, so the very next poll reads
-          // this fresh evidence as already expired and launches a redundant `bd dep cycles`.
-          cycleEvidenceCheckedAt().set(cwd, Date.now());
           markCycleEvidenceRecovered(cwd);
         }
       }
@@ -832,12 +856,10 @@ export async function ensureCycleEvidence(
       // against — a concurrent enrichment path attaching evidence, or the snapshot generation moving —
       // can equally land while the gate listing was in flight.
       if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+        // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
+        // and issues.ts:296) — otherwise this approval-path attach leaves `checkedAt` at its zero
+        // default and the next poll reads this fresh evidence as already expired.
         attachCycleEvidence(board, cycles);
-        // Stamp verification time on every attach, not only `probeCycleEvidence`'s own (P2
-        // review, PR #274, issues.ts:673) — otherwise this approval-path attach leaves
-        // `checkedAt` at its zero default and the next poll reads this fresh evidence as
-        // already expired.
-        cycleEvidenceCheckedAt().set(cwd, Date.now());
         markCycleEvidenceRecovered(cwd);
       }
     }
@@ -990,12 +1012,10 @@ export async function refreshAllIssuesRead(
       // actually fetched for.
       const cycles = await fetchCyclesShared(cwd, boardGeneration);
       if (issueSnapshotGeneration(cwd) === boardGeneration) {
+        // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
+        // and issues.ts:296) — otherwise this forced-refresh attach leaves `checkedAt` at its
+        // zero default and the next poll reads this fresh evidence as already expired.
         attachCycleEvidence(board, cycles);
-        // Stamp verification time on every attach, not only `probeCycleEvidence`'s own (P2
-        // review, PR #274, issues.ts:673) — otherwise this forced-refresh attach leaves
-        // `checkedAt` at its zero default and the next poll reads this fresh evidence as
-        // already expired.
-        cycleEvidenceCheckedAt().set(cwd, Date.now());
         markCycleEvidenceRecovered(cwd);
       }
     } catch (e) {
@@ -1042,9 +1062,13 @@ export async function refreshAllIssuesRead(
       // `dedupeById` allocates a new array, and the cycle sidecar is WeakMap-keyed on array identity
       // (cycle-evidence.ts) — so a caller combining `withCycles` and `strictGates` would otherwise
       // lose the evidence just attached to `board` above the moment this branch rebuilds it (PR #274
-      // review). Re-attach onto the rebuilt array before it's cached or returned.
+      // review). Re-attach onto the rebuilt array before it's cached or returned, carrying over
+      // `board`'s own checked-at stamp rather than defaulting to now: no new verification happened
+      // here, just a re-key onto a new array identity.
       const cycles = cycleEvidenceFor(board);
-      if (cycles !== undefined) attachCycleEvidence(hydrated, cycles);
+      if (cycles !== undefined) {
+        attachCycleEvidence(hydrated, cycles, cycleEvidenceCheckedAtFor(board) ?? Date.now());
+      }
       hydrateIssueSnapshot(cwd, hydrated, boardGeneration);
       // `hydrateIssueSnapshot` bumps the generation synchronously (no `await` between the call and
       // this read), so `issueSnapshotGeneration(cwd)` here is exactly the generation `hydrated` was
@@ -1089,29 +1113,6 @@ export function resetCycleProbes(): void {
  * stale-tolerant as the board content it rides alongside.
  */
 const CYCLE_EVIDENCE_MAX_AGE_MS = ISSUE_SNAPSHOT_MAX_AGE_MS;
-
-/**
- * Per-repo "last verified" timestamp for the cycle evidence attached to the CURRENTLY retained
- * snapshot, so {@link probeCycleEvidence} can tell "already checked recently" apart from "never
- * checked since this array was retained" without a per-board sidecar (cycle-evidence.ts's WeakMap
- * only records the `cycles` payload, not when it was last confirmed current). Repo-keyed, not
- * board-identity-keyed: a content-changing refresh replaces `entry.beads` with a new array anyway
- * (dropping any evidence that array doesn't carry forward), so the only case this timestamp needs to
- * survive is the one a content-based invalidation can't see — the retained array staying exactly the
- * same object across polls. Global-keyed for the same cross-module-registry reason as the other
- * registries in this file.
- */
-const CYCLE_EVIDENCE_CHECKED_AT_KEY = Symbol.for("anton.beads.cycleEvidenceCheckedAt");
-
-function cycleEvidenceCheckedAt(): Map<string, number> {
-  const global = globalThis as unknown as Record<symbol, Map<string, number> | undefined>;
-  return (global[CYCLE_EVIDENCE_CHECKED_AT_KEY] ??= new Map());
-}
-
-/** Test-only reset, mirroring {@link resetCycleProbes}. */
-export function resetCycleEvidenceCheckedAt(): void {
-  cycleEvidenceCheckedAt().clear();
-}
 
 /**
  * Nudge a stuck cycle-evidence gap toward recovery without making the caller wait (PR #274 review,
@@ -1161,7 +1162,7 @@ export function probeCycleEvidence(cwd: string): void {
         // window (P2 review, PR #274, issues.ts:830): a board whose own content never changes (the
         // gate-only-cycle case above) would otherwise keep this early return forever, since nothing
         // else in this function runs to notice the graph moved.
-        const checkedAt = cycleEvidenceCheckedAt().get(cwd) ?? 0;
+        const checkedAt = cycleEvidenceCheckedAtFor(board) ?? 0;
         if (cycleEvidenceFor(board) !== undefined && Date.now() - checkedAt < CYCLE_EVIDENCE_MAX_AGE_MS) {
           return;
         }
@@ -1252,7 +1253,6 @@ export function probeCycleEvidence(cwd: string): void {
           if (consistent && issueSnapshotGeneration(cwd) === generation) {
             const previousCycles = cycleEvidenceFor(board);
             attachCycleEvidence(board, cycles);
-            cycleEvidenceCheckedAt().set(cwd, Date.now());
             // Bump the shared version on the missing->present transition (the original recovery
             // case) AND whenever a staleness refresh actually turns up a different cycle set — a
             // poller who already matched the pre-refresh token must not keep 304-ing a verdict `bd
