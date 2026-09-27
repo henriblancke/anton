@@ -429,6 +429,43 @@ export async function releaseReviewFixBoardBaseline(repo: string, ticketId: stri
 }
 
 /**
+ * Roll back a dispatch-started marker {@link markReviewFixDispatchStarted} wrote LOCALLY but could
+ * not confirm reached the remote (chatgpt-codex-connector, PR #284 review, "Roll back unconfirmed
+ * PR-fix dispatch markers") — mirrors {@link abandonReviewGateDispatchStarted}, but unsets only
+ * {@link beads.clearReviewFixDispatchStarted}'s key, never the baseline itself: the baseline was
+ * already confirmed synced by {@link persistReviewFixBoardBaseline} before this marker was ever
+ * attempted, so it remains the correct value for a retry to dispatch against — only the
+ * dispatch-started flag is suspect.
+ *
+ * Throws (never returns `false`) when the rollback itself cannot be trusted: leaving a local-only
+ * marker in place would make a later {@link beads.reviewFixDispatchStarted} read `true` on a
+ * same-machine retry even though the fixer this attempt refused to dispatch never ran — a false
+ * "recovered" read that would skip the refresh loop below for board changes imported during this
+ * downtime, crediting a no-op fixer with progress it never made.
+ */
+async function abandonReviewFixDispatchStarted(repo: string, ticketId: string): Promise<void> {
+  const cleared = await mustPersist(() => beads.clearReviewFixDispatchStarted(repo, ticketId));
+  const synced = cleared
+    ? await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false)
+    : false;
+  if (!cleared || !synced) {
+    throw new PoisonEpic(
+      `${ticketId}'s PR-fix dispatch-started marker could not be safely rolled back after its ` +
+        `confirming push failed: the unset ${
+          cleared
+            ? "landed locally, but the confirming push could not verify it reached the remote"
+            : "could not be persisted locally (after retries)"
+        } — leaving a possibly-set marker for a later resume to trust unchecked risks skipping the ` +
+        `baseline refresh that exists to fold in board drift from this downtime, crediting a ` +
+        `subsequent no-op fixer with progress it never made. Check the beads DB${cleared ? " and the sync channel" : ""}, then resume the run.`,
+    );
+  }
+}
+
+/**
  * Durably mark that dispatch has actually begun against the PR-fix baseline
  * {@link persistReviewFixBoardBaseline} just confirmed (chatgpt-codex-connector, PR #284 review,
  * "Mark PR-fix dispatch before trusting recovered baselines") — {@link markReviewGateDispatchStarted}'s
@@ -438,10 +475,14 @@ export async function releaseReviewFixBoardBaseline(repo: string, ticketId: stri
  * plain pre-dispatch baseline that a resume cannot tell apart from one preserved AFTER a genuine
  * dispatch attempt — see {@link beads.reviewFixDispatchStarted}'s own docstring.
  *
- * Never throws: like {@link persistReviewFixBoardBaseline}, a persist or push failure returns `false`
- * so the caller can refuse to dispatch the same fail-closed way it already does for an unpersistable
- * baseline, rather than let the fixer run against a baseline whose dispatch-started state is not
- * itself durable.
+ * A persist failure returns `false` so the caller can refuse to dispatch the same fail-closed way it
+ * already does for an unpersistable baseline. A PUSH failure additionally rolls the local marker back
+ * via {@link abandonReviewFixDispatchStarted} (chatgpt-codex-connector, PR #284 review, "Roll back
+ * unconfirmed PR-fix dispatch markers", mirroring {@link markReviewGateDispatchStarted}'s own
+ * `abandonReviewGateDispatchStarted` call) before returning `false` — the local
+ * `setReviewFixDispatchStarted` write above already landed, so leaving it in place would let a
+ * same-machine retry read it as a genuine post-dispatch recovery and skip the refresh loop for a
+ * fixer that never ran.
  *
  * This function's OWN confirming push can pull in drift the same way `persistReviewFixBoardBaseline`'s
  * own confirming push already accounts for (chatgpt-codex-connector, PR #284 review, "Re-stabilize
@@ -450,8 +491,10 @@ export async function releaseReviewFixBoardBaseline(repo: string, ticketId: stri
  * caller's later post-fix diff would credit that drift to a no-op fixer. So once this push lands,
  * the SAME refresh loop `persistReviewFixBoardBaseline` runs (bounded at {@link
  * BASELINE_REFRESH_ROUNDS}) re-reads through `readBoardFingerprint` and folds in anything it finds,
- * returning the refreshed baseline the caller must use for every later read this session diffs
- * against.
+ * rolling the dispatch-started marker back the same way a push failure above already does if a round
+ * cannot be confirmed — a resumed attempt must never find `reviewFixDispatchStarted` set against a
+ * baseline this call could not itself finish stabilizing. Returns the refreshed baseline the caller
+ * must use for every later read this session diffs against.
  *
  * `isRecoveredBaseline` skips that refresh loop entirely, mirroring {@link
  * persistReviewFixBoardBaseline}'s own flag of the same name and passed the SAME value the caller
@@ -475,27 +518,41 @@ export async function markReviewFixDispatchStarted(
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
-  if (!synced) return false;
+  if (!synced) {
+    await abandonReviewFixDispatchStarted(repo, ticketId);
+    return false;
+  }
   if (isRecoveredBaseline) return baseline;
 
   let confirmed = baseline;
   for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
     const refreshed = await readBoardFingerprint(repo, ticketId);
-    if (!refreshed) return false;
+    if (!refreshed) {
+      await abandonReviewFixDispatchStarted(repo, ticketId);
+      return false;
+    }
     if (boardEvidence(confirmed, refreshed).length === 0) return confirmed;
     const refreshedPersisted = await mustPersist(() =>
       beads.setReviewFixBoardBaseline(repo, ticketId, serializeFingerprint(refreshed)),
     );
-    if (!refreshedPersisted) return false;
+    if (!refreshedPersisted) {
+      await abandonReviewFixDispatchStarted(repo, ticketId);
+      return false;
+    }
     const refreshedSynced = await beads
       .push(repo)
       .then((outcome) => outcome === "synced" || outcome === "shared-server")
       .catch(() => false);
-    if (!refreshedSynced) return false;
+    if (!refreshedSynced) {
+      await abandonReviewFixDispatchStarted(repo, ticketId);
+      return false;
+    }
     confirmed = refreshed;
   }
   // Every round found the board still drifting under its own confirming push — fail closed rather
-  // than hand the caller a baseline that may still omit a change landing right now.
+  // than leave the dispatch-started marker set against a baseline that may still omit a change
+  // landing right now.
+  await abandonReviewFixDispatchStarted(repo, ticketId);
   return false;
 }
 

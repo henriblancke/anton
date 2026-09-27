@@ -1762,6 +1762,13 @@ export const beads = {
   setReviewFixDispatchStarted: (cwd: string, id: string) =>
     bdWrite(cwd, ["update", id, "--set-metadata", `${REVIEW_FIX_DISPATCH_STARTED_KEY}=1`]),
 
+  /** Roll back a marker {@link setReviewFixDispatchStarted} wrote locally but could not confirm
+   * synced — unlike {@link clearReviewFixBoardBaseline}, this leaves the baseline itself untouched
+   * and unsets only the dispatch-started flag, since the baseline may already be confirmed synced
+   * and remains the correct value to retry dispatch against. */
+  clearReviewFixDispatchStarted: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_FIX_DISPATCH_STARTED_KEY]),
+
   /**
    * The self-review gate's own preserved pre-dispatch board fingerprint, parsed back off the
    * bead's metadata — `undefined` when none was ever preserved, or the stored value is unreadable
