@@ -354,6 +354,7 @@ function CostCell({ bucket, className }: { bucket: PhaseTotals; className?: stri
 function ActiveCell({ bucket, className }: { bucket: PhaseTotals; className?: string }) {
   const apiShare =
     bucket.activeMs > 0 ? ` · ${Math.round((bucket.apiMs / bucket.activeMs) * 100)}% in the API` : "";
+  const partial = bucket.timedRuns < bucket.runs;
 
   return (
     <td
@@ -361,9 +362,14 @@ function ActiveCell({ bucket, className }: { bucket: PhaseTotals; className?: st
         "px-1.5 py-2 text-right align-top font-mono text-[11.5px] tabular-nums whitespace-nowrap sm:px-2.5",
         className,
       )}
-      title={`What claude worked across ${bucket.runs} call${bucket.runs === 1 ? "" : "s"}${apiShare}. Not elapsed time — see the durations below.`}
+      title={`What claude worked across ${bucket.runs} call${bucket.runs === 1 ? "" : "s"}${apiShare}. Not elapsed time — see the durations below.${
+        partial
+          ? ` A FLOOR: only ${bucket.timedRuns} of ${bucket.runs} call${bucket.runs === 1 ? "" : "s"} reported a duration.`
+          : ""
+      }`}
     >
       {formatDuration(bucket.activeMs)}
+      {partial ? <span className="text-subtle"> +</span> : null}
     </td>
   );
 }

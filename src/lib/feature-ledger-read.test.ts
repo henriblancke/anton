@@ -64,13 +64,16 @@ async function seedInvocation(row: {
   recordedAt: Date;
   durationMs: number;
   modelReported?: string;
+  jobType?: string;
+  step?: string | null;
+  stepHandler?: string | null;
 }): Promise<void> {
   await t.db.insert(schema.claudeInvocations).values({
     id: row.id,
     projectId: t.projectId,
-    jobType: "execute-epic",
-    step: "implement",
-    stepHandler: "implement",
+    jobType: row.jobType ?? "execute-epic",
+    step: row.step === undefined ? "implement" : row.step,
+    stepHandler: row.stepHandler === undefined ? "implement" : row.stepHandler,
     runId: "r1",
     beadId: row.beadId,
     modelRequested: "claude-opus-5",
@@ -181,6 +184,34 @@ describe("featureLedger", () => {
     const ledger = await featureLedger(t.db, t.projectId, "feat-1");
 
     expect(ledger?.totals.recorded).toBe(false);
+  });
+
+  it("keeps a scheduled pass's duration out of the feature's own timing (PR #329 review)", async () => {
+    // `ledgerTotals` already reports overhead outside the feature's bill (design §D4); the timing
+    // half must agree, or the Unallocated section's claim that this time is excluded is a lie.
+    fakeBoard(BOARD);
+    await seedInvocation({
+      id: "i1",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 10 * 60_000,
+    });
+    await seedInvocation({
+      id: "i2",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:20:00Z"),
+      durationMs: 5 * 60_000,
+      jobType: "gardener",
+      step: null,
+      stepHandler: null,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.totals.overhead?.activeMs).toBe(5 * 60_000);
+    // Only the implement invocation's own 10 minutes — the gardener pass's 5 minutes never reach it.
+    expect(ledger?.timing.activeMs).toBe(10 * 60_000);
+    expect(ledger?.timing.invocations).toBe(1);
   });
 });
 

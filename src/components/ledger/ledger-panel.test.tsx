@@ -202,6 +202,26 @@ describe("a feature that went through every phase", () => {
     expect(screen.queryByText("Describe")).toBeNull();
     expect(screen.getByText("Implement")).toBeTruthy();
   });
+
+  it("marks a phase's active time as a floor when not every call in it reported a duration", () => {
+    render(
+      panel([
+        row({ stepHandler: "implement", durationMs: 60_000 }),
+        row({ stepHandler: "implement", durationMs: null }),
+      ]),
+    );
+
+    const cell = rowFor("Implement").querySelectorAll("td")[3]!;
+    expect(cell.textContent).toContain("+");
+    expect(cell.getAttribute("title")).toMatch(/only 1 of 2 calls reported a duration/);
+  });
+
+  it("says nothing about a floor when every call in the phase reported a duration", () => {
+    render(panel(EVERY_PHASE));
+
+    const cell = rowFor("Implement").querySelectorAll("td")[3]!;
+    expect(cell.textContent).not.toContain("+");
+  });
 });
 
 describe("the three durations", () => {

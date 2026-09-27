@@ -89,6 +89,7 @@ describe("per-phase totals", () => {
         "pricedRows",
         "rows",
         "runs",
+        "timedRuns",
         "tokens",
         "turns",
         "unpricedRows",
@@ -147,6 +148,7 @@ describe("per-phase totals", () => {
     ];
     expect(ledgerTotals(rows).phases.get("implement")).toMatchObject({
       runs: 2,
+      timedRuns: 1,
       activeMs: 10 * MINUTE,
       apiMs: 2 * MINUTE,
       turns: 5,
@@ -372,6 +374,25 @@ describe("rule 3 — cost is never split proportionally", () => {
     const { phases, unattributed } = ledgerTotals([row({ jobType: "sync-push" })]);
     expect(phases.size).toBe(0);
     expect(unattributed).toMatchObject({ runs: 1, usd: 30 });
+  });
+
+  it("keeps an overhead-only unpriced model out of the feature pricing warning (PR #329 review)", () => {
+    // The model appears ONLY on the gardener row — the feature's own phases are fully priced, so its
+    // total above the table must not read as a floor over a model it never actually used.
+    const rows = [
+      row({ invocationId: "i1", stepHandler: "implement" }),
+      row({
+        invocationId: "i2",
+        jobType: "gardener",
+        step: "gardener",
+        stepHandler: "gardener",
+        modelReported: "glm-4.6",
+        endpointHost: "gw.example.com",
+      }),
+    ];
+    const { unpricedModels, overhead } = ledgerTotals(rows);
+    expect(overhead?.unpricedRows).toBe(1);
+    expect(unpricedModels).toEqual([]);
   });
 
   it("keeps a scheduled pass's spend out of the feature's bill entirely (design D4)", () => {

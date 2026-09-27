@@ -245,6 +245,18 @@ export function ledgerPhase(row: LedgerPhaseRow): LedgerPhase | undefined {
 }
 
 /**
+ * Whether a row's phase is the project-level `overhead` bucket — the rows a FEATURE-scoped read
+ * (like {@link ledgerTiming}) must filter out first. `ledgerTotals` already keeps overhead out of a
+ * feature's bill at the bucket level (design §D4); a caller that folds the same rows through
+ * `ledgerTiming` without this filter would let a scheduled pass's paid time silently inflate the
+ * feature's own `activeMs`, contradicting the very section that reports overhead as excluded from it.
+ */
+export function isOverheadRow(row: LedgerPhaseRow): boolean {
+  const phase = ledgerPhase(row);
+  return phase !== undefined && isProjectLevelPhase(phase);
+}
+
+/**
  * The columns a timing fold reads: an invocation's own duration, plus the dimensions that say which
  * rows belong to ONE invocation. Structural, so a ledger row satisfies it without a mapper.
  */
@@ -596,6 +608,12 @@ export interface PhaseTotals {
   rows: number;
   /** What claude worked, summed over invocations. A floor when fewer reported a duration than `runs`. */
   activeMs: number;
+  /**
+   * How many invocations in {@link runs} actually reported a duration. Below `runs`, {@link activeMs}
+   * is a FLOOR rather than a total — the same discipline {@link LedgerTiming.timedInvocations} applies
+   * at the scope level, mirrored here so one phase's row can say so on its own.
+   */
+  timedRuns: number;
   /** How much of {@link activeMs} the driver reported as API time — the rest is tool and hook time. */
   apiMs: number;
   turns: number;
@@ -643,6 +661,11 @@ export interface LedgerTotals {
   /**
    * The distinct model ids anton has no price for, most-seen first — the actionable half of an
    * incomplete total, as in `spend-breakdown`: it names what to add to the price table.
+   *
+   * Scoped to {@link phases} and {@link unattributed} — the feature's own bill — and never to
+   * {@link overhead}. A model that appears only in a scheduled pass has no bearing on whether the
+   * feature total is a floor, and naming it here would send an operator to price a gap the feature
+   * itself never had (PR #329 review).
    */
   unpricedModels: string[];
 }
@@ -667,6 +690,7 @@ function emptyTotals(): PhaseTotals {
     pricedRows: 0,
     rows: 0,
     activeMs: 0,
+    timedRuns: 0,
     apiMs: 0,
     turns: 0,
     errors: 0,
@@ -694,10 +718,15 @@ function accumulate(
   into: PhaseTotals,
   fact: InvocationFact<LedgerTotalsRow>,
   gatewayPricing: GatewayPricing | undefined,
-  unpricedModels: Map<string, number>,
+  // `undefined` for a bucket whose models must not reach the feature-scoped list — overhead's own
+  // gaps are its own concern, not a reason to send an operator chasing a price the feature never
+  // needed (see the call site in {@link ledgerTotals}).
+  unpricedModels: Map<string, number> | undefined,
 ): void {
   into.runs += 1;
-  into.activeMs += count(invocationMeasure(fact.rows, "durationMs"));
+  const duration = invocationMeasure(fact.rows, "durationMs");
+  if (duration !== undefined) into.timedRuns += 1;
+  into.activeMs += count(duration);
   into.apiMs += count(invocationMeasure(fact.rows, "durationApiMs"));
   into.turns += count(invocationMeasure(fact.rows, "numTurns"));
   if (fact.outcome === "error") into.errors += 1;
@@ -715,7 +744,7 @@ function accumulate(
       // reporting back — a row with no model names nothing to add.
       const model = row.modelReported?.trim();
       if (model && isMissingPriceEntry(row.modelReported, row, row.endpointHost, gatewayPricing)) {
-        unpricedModels.set(model, (unpricedModels.get(model) ?? 0) + 1);
+        unpricedModels?.set(model, (unpricedModels.get(model) ?? 0) + 1);
       }
       continue;
     }
@@ -736,6 +765,7 @@ function mergeInto(into: PhaseTotals, from: PhaseTotals): void {
   into.pricedRows += from.pricedRows;
   into.rows += from.rows;
   into.activeMs += from.activeMs;
+  into.timedRuns += from.timedRuns;
   into.apiMs += from.apiMs;
   into.turns += from.turns;
   into.errors += from.errors;
@@ -768,15 +798,21 @@ export function ledgerTotals(
     // `claude-invocations.ts`), so the first row classifies the whole invocation.
     const phase = fact.rows[0] ? ledgerPhase(fact.rows[0]) : undefined;
     let bucket: PhaseTotals;
+    // Overhead's own price gaps are excluded from `unpricedModels` (undefined below): that list backs
+    // the feature pricing warning above the phase table, and a model that appears ONLY in the
+    // Unallocated bucket has no bearing on whether the feature total above it is a floor (PR #329
+    // review).
+    let overheadOnly = false;
     if (phase === undefined) {
       bucket = unattributed ??= emptyTotals();
     } else if (isProjectLevelPhase(phase)) {
       bucket = overhead ??= emptyTotals();
+      overheadOnly = true;
     } else {
       bucket = phases.get(phase) ?? emptyTotals();
       phases.set(phase, bucket);
     }
-    accumulate(bucket, fact, gatewayPricing, unpricedModels);
+    accumulate(bucket, fact, gatewayPricing, overheadOnly ? undefined : unpricedModels);
   }
 
   // The feature's own bill: its phases plus what could not be placed within them. Overhead stays

@@ -24,6 +24,7 @@ import { invocationsForBeads } from "./claude-invocations";
 import { getDb } from "./db";
 import { escalationsForBeads, type EscalationRow } from "./escalations";
 import {
+  isOverheadRow,
   lastDeliveryMs,
   ledgerFriction,
   ledgerTiming,
@@ -104,10 +105,15 @@ export async function featureLedger(
     reviewRoundsOf(project.repoPath, beadId),
   ]);
 
+  // Overhead is excluded before timing is folded, the same split `ledgerTotals` already applies at
+  // the bucket level (design §D4) — otherwise a scheduled pass attributed to this scope would
+  // silently inflate the feature's own `activeMs` (PR #329 review).
+  const timingRows = rows.filter((row) => !isOverheadRow(row));
+
   return {
     scope,
     totals: ledgerTotals(rows, gatewayPricing),
-    timing: ledgerTiming(rows, lastDeliveryMs(deliveries, scope.ids)),
+    timing: ledgerTiming(timingRows, lastDeliveryMs(deliveries, scope.ids)),
     friction: ledgerFriction({
       rounds,
       jobs,

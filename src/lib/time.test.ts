@@ -53,6 +53,13 @@ describe("formatDuration", () => {
     // markers can only mean something if a measured span never reads as zero.
     expect(formatDuration(400)).toBe("<1s");
     expect(formatDuration(0)).toBe("0s");
+    // The half of the sub-second range that rounding-before-checking used to carry up to "1s".
+    expect(formatDuration(500)).toBe("<1s");
+    expect(formatDuration(999)).toBe("<1s");
+  });
+
+  it("rounds a full second up only once the span reaches 1000ms", () => {
+    expect(formatDuration(1000)).toBe("1s");
   });
 
   it("clamps a negative span to zero rather than rendering a minus sign", () => {

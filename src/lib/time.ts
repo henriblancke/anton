@@ -78,9 +78,11 @@ export function formatCountdown(iso: string | null | undefined, now = Date.now()
  * rendered where that reason can be stated rather than flattened into a dash here.
  */
 export function formatDuration(ms: number): string {
-  const s = Math.max(0, Math.round(ms / 1000));
-  // A sub-second span is real work, so it reads as "some" rather than rounding down to nothing.
-  if (s === 0) return ms > 0 ? "<1s" : "0s";
+  // Checked before rounding: rounding first would carry 500-999ms up to "1s", losing half of the
+  // sub-second range this boundary exists to mark.
+  if (ms <= 0) return "0s";
+  if (ms < 1000) return "<1s";
+  const s = Math.round(ms / 1000);
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
