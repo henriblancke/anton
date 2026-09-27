@@ -27,25 +27,47 @@
 import { beads, type Bead } from "./beads/bd";
 import { listInvocations } from "./claude-invocations";
 import { getDb } from "./db";
+import { lastDeliveryMs } from "./feature-ledger";
 import { featureLedger } from "./feature-ledger-read";
-import { currentRunTargetOf } from "./feature-scope";
+import { ledgerScope } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { getProjectById } from "./projects";
 import type { CohortFeature } from "./prompt-series";
+import { listDeliveriesByBead } from "./runs";
 import { listAllBeads } from "./tickets";
+import { boardCards } from "./ticket-view";
 
 /**
  * The run targets `board` currently recognizes among the beads a project's invocations named in
- * the window — resolved through {@link currentRunTargetOf} so a ticket reparented since it ran
- * still lands on the feature that owns it NOW, the same "scope moves when the board does" rule
- * `feature-scope.ts` states for a single ledger.
+ * the window — resolved the same way `feature-scope.ts`'s `currentRunTargetOf` would (itself a
+ * ticket, or the card above it) so a ticket reparented since it ran still lands on the feature
+ * that owns it NOW, the "scope moves when the board does" rule that module states for a single
+ * ledger. The card index, id index and run-target check are each built ONCE and reused for every
+ * row rather than re-derived per row (PR #331 review): an all-time read over a project with
+ * hundreds of invocation rows would otherwise rebuild `boardCards(board)` — and repeat
+ * `beads.isRunTarget`'s own board scan — once per row instead of once per distinct target.
  *
- * A target still `in_progress` is excluded: it has no delivery yet, so {@link cohortFeatureOf}
- * would mark it undelivered and fold its partial spend and friction into a cohort's numerators
- * before the run's outcome — delivered, gave-up, or abandoned — is known. Only work that has
- * either delivered or genuinely finished (closed, or reserved-but-given-up) belongs in an outcome
- * cohort; a run still executing belongs in none of them yet.
+ * A target in a {@link LIVE_TARGET_STATUSES} status has no FINISHED outcome for its current
+ * attempt yet, so folding it in now would fold partial spend and friction into a cohort's
+ * numerators before the run's outcome — delivered, gave-up, or abandoned — is known. `blocked`
+ * carries the same risk as `in_progress`: a run can gate a target on a dependency mid-run and
+ * leave it `blocked` while it is still live (`execute-epic.gating.integration.test.ts` shows the
+ * target's own status doing exactly this), so excluding only `in_progress` missed a target a run
+ * had merely paused on, not finished with (PR #331 review).
+ *
+ * A target already holding a PRIOR delivery is kept regardless of its current status: reopening a
+ * delivered feature for another round leaves it live again, but the delivery that already
+ * happened is real evidence, not a premature outcome — dropping it would erase an already-shipped
+ * feature's whole history for as long as the rerun takes (PR #331 review). Only a target on its
+ * very first, still-live attempt — nothing delivered yet — has nothing to report.
  */
+/**
+ * Statuses a run can leave its target in while still genuinely executing — no finished outcome
+ * yet. `deferred` is deliberately left out: snoozed work is rare to have accrued fresh invocations
+ * against in the first place (PR #331 review).
+ */
+const LIVE_TARGET_STATUSES = new Set(["in_progress", "blocked"]);
+
 async function activeRunTargetIds(
   db: AntonDb,
   projectId: string,
@@ -53,14 +75,46 @@ async function activeRunTargetIds(
   since: Date | undefined,
 ): Promise<Set<string>> {
   const rows = await listInvocations(db, projectId, since ? { since } : {});
-  const ids = new Set<string>();
+  const byId = new Map(board.map((b) => [b.id, b]));
+  const cards = boardCards(board);
+  const runTargetCache = new Map<string, boolean>();
+  const isRunTargetCached = (bead: Bead): boolean => {
+    const cached = runTargetCache.get(bead.id);
+    if (cached !== undefined) return cached;
+    const result = beads.isRunTarget(bead, board);
+    runTargetCache.set(bead.id, result);
+    return result;
+  };
+
+  const candidates = new Map<string, Bead>();
   for (const row of rows) {
     if (!row.beadId) continue;
-    const targetId = currentRunTargetOf(board, row.beadId);
-    const target = board.find((b) => b.id === targetId);
-    if (target && beads.isRunTarget(target, board) && target.status !== "in_progress") {
-      ids.add(targetId);
+    const bead = byId.get(row.beadId);
+    if (!bead) continue;
+    const targetId = isRunTargetCached(bead) ? bead.id : cards.cardOf(bead) ?? bead.id;
+    const target = byId.get(targetId);
+    if (target && isRunTargetCached(target)) candidates.set(targetId, target);
+  }
+
+  const liveTargets = [...candidates.values()].filter((t) => LIVE_TARGET_STATUSES.has(t.status));
+  const priorDeliveries =
+    liveTargets.length === 0
+      ? new Map<string, number[]>()
+      : await listDeliveriesByBead(
+          db,
+          projectId,
+          liveTargets.flatMap((t) => ledgerScope(board, t.id).ids),
+          { includeLocalCommits: false },
+        );
+  const liveIds = new Set(liveTargets.map((t) => t.id));
+
+  const ids = new Set<string>();
+  for (const target of candidates.values()) {
+    if (liveIds.has(target.id)) {
+      const delivered = lastDeliveryMs(priorDeliveries, ledgerScope(board, target.id).ids) !== undefined;
+      if (!delivered) continue;
     }
+    ids.add(target.id);
   }
   return ids;
 }

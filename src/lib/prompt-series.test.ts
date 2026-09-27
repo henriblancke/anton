@@ -671,7 +671,7 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
   it("does not treat a feature's describe+review defaults as spanning two skills", () => {
     // A normal run stamps step:describe's and step:review's bundled fallback skill on every feature —
     // two distinct digests that name no opinion about which skill a project is trying out. Counting
-    // them would route nearly every delivered feature into `spanning` instead of a cohort.
+    // both would route nearly every delivered feature into `spanning` instead of a cohort.
     const feature = [
       {
         beadId: "a",
@@ -687,8 +687,9 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
 
     const series = promptSeries(feature, "skill");
     expect(series.spanning).toEqual({ delivered: 0, features: 0 });
-    // Nothing named a real skill, so the feature lands in the pre-instrumentation cohort.
-    expect(series.cohorts[0]?.key).toBeNull();
+    // No PROJECT skill named anything, but the bundled `review` default's own digest is kept as the
+    // key — it is the only signal left for "did editing the bundled skill help" (PR #331 review).
+    expect(series.cohorts[0]?.key).toBe("review-digest");
   });
 
   it("still attributes a feature to the specialist skill it ran alongside the scaffolding phases", () => {
@@ -749,7 +750,7 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
     expect(series.cohorts[0]?.key).toBe("project-review-digest");
   });
 
-  it("still discards the bundled fallback when a row explicitly marks it, not just by id", () => {
+  it("still recognizes the bundled fallback when a row explicitly marks it, not just by id", () => {
     const feature = [
       {
         beadId: "a",
@@ -760,6 +761,27 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
           { skillId: "describe", skillDigest: "describe-digest", skillIsDefault: true },
           { skillId: "review", skillDigest: "review-digest", skillIsDefault: true },
         ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    // Explicitly marked rather than id-inferred, but still the bundled review default — its digest
+    // is kept as the key for the same reason the id-inferred case above is.
+    expect(series.cohorts[0]?.key).toBe("review-digest");
+  });
+
+  it("falls back to the pre-instrumentation cohort when even the review default named no digest", () => {
+    // A row that ran under NO skill at all (no describe, no review, nothing) has nothing for
+    // featureKeys' fallback to pick up either — it must still land in the null cohort rather than
+    // throw or silently invent a key.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [{}],
       },
     ];
 

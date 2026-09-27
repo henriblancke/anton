@@ -566,8 +566,22 @@ export interface SpanningFeatures {
  * {@link CohortStampRow.skillIsDefault} existed (PR #331 review). A project is free to name its own
  * `.claude/skills/review` and have it run under `skill:review`; that row must still read as its own
  * digest, not fold into the unstamped cohort just because the id happens to match.
+ *
+ * Discarding every one of them from the "skill" dimension unconditionally, though, would make it
+ * impossible to ever answer whether editing the BUNDLED `review` skill's own text helped — every
+ * such row would read as no signal at all, before and after the edit alike. See
+ * {@link DEFAULT_REVIEW_SKILL_ID} and {@link featureKeys} for the one carve-out.
  */
 const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan-triage"]);
+
+/**
+ * anton's own bundled `review` skill id — the one scaffolding fallback {@link featureKeys} still
+ * reads a digest off, as a last resort, when nothing else named a "skill" key (PR #331 review).
+ * `stampValue` discards it same as every other default below; `describe`'s default carries no
+ * such carve-out because its composed text is structurally boilerplate (see
+ * {@link DESCRIBER_STEP_HANDLER}), never a project's own choice to iterate on.
+ */
+const DEFAULT_REVIEW_SKILL_ID = "review";
 
 /**
  * Whether a row's {@link CohortStampRow.skillId} is anton's own scaffolding fallback rather than a
@@ -636,6 +650,18 @@ function featureKeys(feature: CohortFeature, dimension: CohortDimension): string
   for (const row of feature.rows) {
     const value = stampValue(row, dimension);
     if (value !== undefined) keys.add(value);
+  }
+  if (keys.size === 0 && dimension === "skill") {
+    // Nothing named a project skill, so the only signal left is anton's own bundled `review`
+    // default — and its digest changing IS the "did editing the bundled skill help" question this
+    // dimension exists to answer (PR #331 review). Reached only when the loop above found no real
+    // skill at all: a feature that named one is never routed through here, so this cannot turn a
+    // real choice into a spanning feature by adding a second key alongside it.
+    for (const row of feature.rows) {
+      if (row.skillId !== DEFAULT_REVIEW_SKILL_ID || !isScaffoldingFallback(row)) continue;
+      const digest = row.skillDigest?.trim();
+      if (digest) keys.add(digest);
+    }
   }
   return [...keys];
 }

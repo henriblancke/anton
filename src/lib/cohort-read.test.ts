@@ -178,6 +178,40 @@ describe("cohortFeatures", () => {
     expect(features).toEqual([]);
   });
 
+  it("excludes a target that is blocked with no prior delivery — a run can gate on it mid-run (PR #331 review)", async () => {
+    // `blocked` carries the same premature-outcome risk as `in_progress`: a run can gate a target on
+    // a dependency mid-run and leave it in this status while it is still live.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "blocked" })]);
+    await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toEqual([]);
+  });
+
+  it("keeps a target's prior delivery while it is reopened and reruns (PR #331 review)", async () => {
+    // The target already delivered once; reopening it for another round leaves it `in_progress`
+    // again, but the delivery that already happened is real evidence and must not disappear from
+    // the cohort for as long as the rerun takes.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "in_progress" })]);
+    await seedInvocation({ id: "i-old", beadId: "feat-1", recordedAt: new Date("2026-08-01T00:00:00Z") });
+    await seedDelivery({ epicBeadId: "feat-1", endedAt: new Date("2026-08-01T00:10:00Z") });
+    // The rerun's own invocation — not yet concluded, but still inside the window so the target
+    // qualifies as a candidate at all.
+    await seedInvocation({ id: "i-new", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toHaveLength(1);
+    expect(features?.[0]?.beadId).toBe("feat-1");
+    expect(features?.[0]?.delivered).toBe(true);
+    expect(features?.[0]?.deliveredAtMs).toBe(new Date("2026-08-01T00:10:00Z").getTime());
+  });
+
   it("resolves every run target under bounded concurrency, none dropped", async () => {
     // cohortFeatureOf shells out to `bd` per target (reviewRoundsOf), so an all-time read with many
     // targets must not fire every call at once — this proves the bounded pool still returns all of
