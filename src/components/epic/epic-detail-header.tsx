@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { RotateCcwIcon } from "lucide-react";
+import { ReceiptTextIcon, RotateCcwIcon } from "lucide-react";
 
 import type { Epic, EpicCrumb, EpicDetail } from "@/lib/types";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -179,7 +179,7 @@ export function EpicDetailHeader({
   onCopyWorktree: (worktreePath: string) => void;
   onChanged: () => void;
 }) {
-  const { epic, run, parentEpic } = detail;
+  const { epic, run, parentEpic, runTarget } = detail;
 
   return (
     <header className="flex h-14 shrink-0 items-center gap-2.5 border-b border-border px-5 sm:px-6">
@@ -201,6 +201,19 @@ export function EpicDetailHeader({
             priority={epic.priority}
             onChanged={onChanged}
           />
+        )}
+        {/* What this target cost (anton-rpguq). Only a RUN TARGET has a ledger — a container epic's
+            features each own one — so the link follows the same judgement the route 404s on, and is
+            never offered where it would dead-end. */}
+        {runTarget && (
+          <Link
+            href={`/projects/${slug}/epics/${epic.id}/ledger`}
+            className={buttonVariants({ size: "sm", variant: "outline" })}
+            title={`What this ${summary.word} cost: phases, durations and friction`}
+          >
+            <ReceiptTextIcon aria-hidden="true" />
+            Ledger
+          </Link>
         )}
         <EpicRunActions
           slug={slug}
