@@ -522,6 +522,34 @@ export async function releaseReviewGateBoardBaseline(repo: string, ticketId: str
 }
 
 /**
+ * Durably mark that dispatch has actually begun against the self-review gate baseline
+ * {@link persistReviewGateBoardBaseline} just confirmed (chatgpt-codex-connector, PR #284 review,
+ * "Distinguish pre-dispatch review baselines from recovered ones") — {@link markDispatchStarted}'s
+ * analogue for `review-gate.ts`'s `runGateFixSession`. The caller calls this once, right before the
+ * fixer session starts and never before: without a durable record that dispatch began, a process/
+ * host death in the window right after the baseline is persisted (but before the fixer ever runs)
+ * leaves a plain pre-dispatch baseline that a resume cannot tell apart from one preserved AFTER a
+ * genuine dispatch attempt — see {@link beads.reviewGateDispatchStarted}'s own docstring.
+ *
+ * Never throws: like {@link persistReviewGateBoardBaseline}, a persist or push failure returns
+ * `false` so the caller can refuse to dispatch the same fail-closed way it already does for an
+ * unpersistable baseline, rather than let the fixer run against a baseline whose dispatch-started
+ * state is not itself durable. No rollback of the baseline itself on a failed push here (unlike
+ * {@link markDispatchStarted}'s `abandonDispatchBaseline` call): review-gate's baseline carries no
+ * separate locked/verified state for a half-confirmed marker to corrupt, so leaving it exactly as
+ * {@link persistReviewGateBoardBaseline} already confirmed it — un-marked — is enough for a retry to
+ * safely re-enter this same function.
+ */
+export async function markReviewGateDispatchStarted(repo: string, ticketId: string): Promise<boolean> {
+  const persisted = await mustPersist(() => beads.setReviewGateDispatchStarted(repo, ticketId));
+  if (!persisted) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
  * Durably persist `baseline` onto `ticket` BEFORE the agent is ever dispatched (PR #284 review,
  * "Persist the board baseline before dispatch") — closes the crash window `readBoardBaseline` alone
  * leaves open. On a shared-server board the agent's `bd -C <repo>` writes are globally visible the

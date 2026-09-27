@@ -41,6 +41,7 @@ import {
   boardEvidence,
   fingerprintBoard,
   hydrateDescriptions,
+  markReviewGateDispatchStarted,
   persistReviewGateBoardBaseline,
   readReviewGateBoardBaseline,
   releaseReviewGateBoardBaseline,
@@ -1532,6 +1533,14 @@ async function runGateFixSession(args: {
     // before dispatch") — a fresh read after a crash mid-round would already contain whatever the
     // fixer wrote before this process died, permanently hiding that delta from every later diff.
     const recoveredBoardBaseline = boardOnly && repoPath ? readReviewGateBoardBaseline(target) : undefined;
+    // A preserved baseline is only a genuine POST-dispatch recovery snapshot when a fixer session
+    // actually ran against it (chatgpt-codex-connector, PR #284 review, "Distinguish pre-dispatch
+    // review baselines from recovered ones") — `recoveredBoardBaseline` alone cannot tell that apart
+    // from a crash that happened between persisting the baseline below and the fixer ever starting,
+    // which leaves the exact same shape on the bead. See `beads.reviewGateDispatchStarted`'s own
+    // docstring for why treating that pre-dispatch case as recovered would skip the refresh loop
+    // that exists to fold in unrelated board drift from that downtime.
+    const recoveredAfterDispatch = Boolean(recoveredBoardBaseline) && beads.reviewGateDispatchStarted(target);
     let boardBefore = boardOnly && repoPath
       ? (recoveredBoardBaseline ?? (await args.readBoardFingerprint(repoPath, target.id)))
       : undefined;
@@ -1571,7 +1580,7 @@ async function runGateFixSession(args: {
         target.id,
         boardBefore,
         args.readBoardFingerprint,
-        Boolean(recoveredBoardBaseline),
+        recoveredAfterDispatch,
       );
       if (!persistedBaseline) {
         throw new PoisonError(
@@ -1582,6 +1591,22 @@ async function runGateFixSession(args: {
         );
       }
       boardBefore = persistedBaseline;
+      // Marked right before the fixer session starts and never before (chatgpt-codex-connector, PR
+      // #284 review, "Distinguish pre-dispatch review baselines from recovered ones") — durably
+      // records that dispatch actually began against `boardBefore`, so a resumed attempt's own
+      // `recoveredAfterDispatch` check above can tell this baseline apart from one a crash caught
+      // before the fixer ever ran. Refused fail-closed like every other baseline write here: without
+      // a durable record dispatch began, a resume could not tell this baseline apart from a
+      // never-dispatched one either, so it stays subject to the refresh loop the next persist runs
+      // — silently correct, but only by accident, and only until this ticket's next unrelated write.
+      if (!(await markReviewGateDispatchStarted(repoPath, target.id))) {
+        throw new PoisonError(
+          `the review fix for ${target.id} persisted a board-only baseline before round ${round} but ` +
+            `could not durably mark dispatch as started — refusing to dispatch: without that record, a ` +
+            `resumed attempt could not tell this baseline apart from one a crash caught before the ` +
+            `fixer ever ran. Resolve the board write, then resume.`,
+        );
+      }
     }
     // Flips once the gates have passed AND the work is committed: past that point the round's output
     // is verified, and the rollback below must not touch it however the session ends.

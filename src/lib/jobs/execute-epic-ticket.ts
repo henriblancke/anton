@@ -424,6 +424,18 @@ export async function runTicket(args: {
  * board write lands in between, the next attempt would diff that unrelated change against this same
  * stale baseline and credit a no-op agent with delivery it never produced. Retired via
  * {@link abandonDispatchBaseline} instead, so the next attempt takes a genuinely fresh baseline.
+ *
+ * `found: false` paired with `evidenceUnavailable: true` is NOT that conclusive case (chatgpt-codex-
+ * connector, PR #284 review, "Preserve the baseline when the failure audit is unreadable") — it means
+ * the post-run board read itself failed, so no comparison against the baseline was ever made (see
+ * {@link readBoardEvidence}'s own docstring). `readBoardEvidence` already persists and confirms synced
+ * a recovery baseline for exactly this shape, anchoring a resumed attempt's own retry of the
+ * comparison; that confirming push can itself publish this failed attempt's board write. Abandoning
+ * the baseline here as if the empty result were conclusive would discard that recovery snapshot before
+ * anything ever proved the board unchanged, and a resumed attempt's fresh baseline would then silently
+ * absorb the just-published write, permanently losing an idempotent agent's delivery. Left standing
+ * instead — the same "nothing conclusive yet, keep what's there" treatment as the unsafe-write branch
+ * above, just for a read failure rather than a persist failure.
  */
 async function auditBoardOnFailedTicket(
   run: Omit<StepContext, "tickets">,
@@ -464,6 +476,21 @@ async function auditBoardOnFailedTicket(
     );
   }
   if (!result.found) {
+    if (result.evidenceUnavailable) {
+      // Not a conclusive empty audit — the post-run read itself failed, so no comparison was ever
+      // made (see this function's own docstring and `readBoardEvidence`'s). `readBoardEvidence`
+      // already persisted and confirmed synced a recovery baseline for exactly this case; abandoning
+      // it now would discard that snapshot before a resumed attempt ever gets to retry the
+      // comparison, right after that same confirming push may have published this attempt's own
+      // board write for a resumed attempt's fresh baseline to silently absorb.
+      await appendSessionLog(
+        logPath,
+        `[board-audit] ${ticket.id} failed and this attempt's post-run board read could not be ` +
+          `completed — the pre-dispatch baseline was preserved for a resumed attempt to compare ` +
+          `against.\n`,
+      ).catch(() => {});
+      return;
+    }
     // Retire the locked, verified pre-dispatch baseline rather than leave it standing — see this
     // function's own docstring for why a stale one is unsafe to trust on a later reopen.
     await abandonDispatchBaseline(run.repoPath, ticket);

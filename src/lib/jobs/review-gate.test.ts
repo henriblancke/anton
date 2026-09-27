@@ -52,6 +52,12 @@ const boardHistoryMock = vi.fn<(repo: string, id: string) => Promise<import("../
 // `repoPath` a real `bd` can never succeed against.
 const setReviewGateBoardBaselineMock = vi.fn<(repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>>();
 const clearReviewGateBoardBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// The self-review gate's own dispatch-started marker (chatgpt-codex-connector, PR #284 review,
+// "Distinguish pre-dispatch review baselines from recovered ones") shells out to real `bd` via
+// `beads.setReviewGateDispatchStarted` — mocked here for the same reason the baseline persist above
+// is: every board-only fix test below dispatches at least once, and each dispatch now durably marks
+// that it began.
+const setReviewGateDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -66,6 +72,7 @@ vi.mock("../beads/bd", async () => {
       setReviewGateBoardBaseline: (...args: [string, string, Record<string, string>]) =>
         setReviewGateBoardBaselineMock(...args),
       clearReviewGateBoardBaseline: (...args: [string, string]) => clearReviewGateBoardBaselineMock(...args),
+      setReviewGateDispatchStarted: (...args: [string, string]) => setReviewGateDispatchStartedMock(...args),
     },
   };
 });
@@ -73,6 +80,7 @@ setBoardEvidenceConfirmedMock.mockResolvedValue("");
 boardPushMock.mockResolvedValue("synced");
 setReviewGateBoardBaselineMock.mockResolvedValue("");
 clearReviewGateBoardBaselineMock.mockResolvedValue("");
+setReviewGateDispatchStartedMock.mockResolvedValue("");
 boardShowMock.mockImplementation(async (_repo, id) => ({ id, status: "closed", title: "", issue_type: "task" }));
 // A single closed version by default — every fixture ticket above is already closed, and this is
 // what real `bd history` returns for an ordinary bead that went through open → closed once: at
@@ -734,8 +742,16 @@ describe("runReviewGate — bounds", () => {
         ...target,
         labels: ["delivery:board"],
         // A prior, crashed attempt already preserved a pre-dispatch baseline for round 1 to recover
-        // — the shape `beads.setReviewGateBoardBaseline` writes, read back by `readReviewGateBoardBaseline`.
-        metadata: { reviewGateBoardBaseline: JSON.stringify({ [ticket.id]: "recovered-before" }) },
+        // — the shape `beads.setReviewGateBoardBaseline` writes, read back by `readReviewGateBoardBaseline`
+        // — AND already marked dispatch as started against it, the shape `beads.setReviewGateDispatchStarted`
+        // writes: this fixture stands in for a crash AFTER that round's fixer session actually ran, the
+        // one case a preserved baseline is safe to trust as a recovered post-dispatch snapshot rather
+        // than re-verified through the refresh loop (chatgpt-codex-connector, PR #284 review,
+        // "Distinguish pre-dispatch review baselines from recovered ones").
+        metadata: {
+          reviewGateBoardBaseline: JSON.stringify({ [ticket.id]: "recovered-before" }),
+          reviewGateDispatchStarted: "1",
+        },
       };
       const boardOnlyTicket: Bead = { ...ticket, labels: ["delivery:board"] };
       const worktree = fakeWorktree();
@@ -797,8 +813,10 @@ describe("runReviewGate — bounds", () => {
       // 2 took a fresh baseline. A regression here would settle at 2 (both rounds "recovering" the
       // same stale metadata).
       expect(reads).toBe(4);
-      // `target`'s in-memory metadata no longer carries either round's now-released baseline.
+      // `target`'s in-memory metadata no longer carries either round's now-released baseline, or its
+      // dispatch-started marker.
       expect(boardOnlyTarget.metadata?.reviewGateBoardBaseline).toBeUndefined();
+      expect(boardOnlyTarget.metadata?.reviewGateDispatchStarted).toBeUndefined();
     },
   );
 
@@ -846,9 +864,9 @@ describe("runReviewGate — bounds", () => {
       // prompt was told about the live board, and the bd-only write counted as progress rather than
       // a stall.
       expect(calls[1]?.prompt).toContain("This run may deliver via the board");
-      // Shell-quoted, matching `shellQuotePath` (review-context.ts) — this assertion predated that
-      // and never followed the quoting change, failing every run regardless of this PR's own edits.
-      expect(calls[1]?.prompt).toContain(`bd -C '/repos/anton' update`);
+      // Shell-quoted, matching `shellQuotePath` (review-context.ts), and `close` — the fix prompt's
+      // board-write example (review-context.ts) only ever emits `close <id>`, never `update`.
+      expect(calls[1]?.prompt).toContain(`bd -C '/repos/anton' close <id>`);
       // chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for mixed
       // runs": this run mixes `boardOnlyTicket` with `plainTicket`, so the SYSTEM prompt must use the
       // softened mixed-run wording — never the unconditional "editing the tree is neither required
