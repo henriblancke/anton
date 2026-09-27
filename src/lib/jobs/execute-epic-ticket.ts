@@ -10,7 +10,7 @@
  * — with the judgement on a timed-out ticket's work in execute-epic-ticket-preserve.ts — and the
  * resilient claude driver its dispatching steps inherit in execute-epic-ticket-claude.ts.
  */
-import type { Bead } from "../beads/bd";
+import { beads, type Bead } from "../beads/bd";
 import { metered, type InvocationDimensions } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
@@ -101,7 +101,10 @@ export async function runTicket(args: {
   /** This ticket's wall-clock budget (anton-t1mo); `Infinity` leaves it unbounded. */
   timeoutMs: number;
 }): Promise<TicketOutcome> {
-  const { run, ticket, operator, timeoutMs } = args;
+  const { run, operator, timeoutMs } = args;
+  // Reassigned once, right after `ensureBoardBaselinePersisted` runs below, so every later use in
+  // this attempt sees any reopen-reset it applied on the remote (see the comment at that call site).
+  let ticket = args.ticket;
   const standalone = args.standalone ?? false;
   const { ctx, worktreePath } = run;
   const closeOnDone = args.closeOnDone ?? true;
@@ -163,10 +166,34 @@ export async function runTicket(args: {
     // success so `walkTicketSteps` and the failure-path audit below both measure against the board as it
     // stood after that one guaranteed pull, never the pre-pull read a pulled-in change would otherwise be
     // credited against.
+    // `ensureBoardBaselinePersisted` clears a stale `board-evidence-pending:*` label (and its
+    // reopen-reset companions) directly on the remote when — and only when — `ticket` itself already
+    // shows the "reopened after a completed cycle" shape it resets: a still-set `boardEvidenceConfirmed`
+    // or a closure-stamped pending marker (see that function's own docstring on `stalePendingClosure`).
+    // Computed from THIS pre-call snapshot, before dispatch can have written either marker itself.
+    const reopenedAfterCompletedCycle =
+      boardOnly && boardBaseline && (beads.boardEvidenceConfirmed(ticket) || beads.pendingBoardEvidenceClosure(ticket) !== undefined);
     const refreshedBoardBaseline =
       boardOnly && boardBaseline ? await ensureBoardBaselinePersisted(run.repoPath, ticket, boardBaseline) : null;
     const boardBaselinePersistFailed = boardOnly && boardBaseline ? !refreshedBoardBaseline : false;
     if (refreshedBoardBaseline) boardBaseline = refreshedBoardBaseline;
+    // `ticket` here is still the snapshot read BEFORE the call above, which — on the reopen path —
+    // still carries the now-stale `board-evidence-pending:*` label in its own metadata (chatgpt-codex-
+    // connector, PR #284 review, "Drop cleared pending IDs from the dispatch snapshot"). Left
+    // unpatched, `readBoardEvidence` below unions `beads.pendingBoardEvidence(ticket)` off that same
+    // stale snapshot into the new cycle's diff, crediting a no-op agent with the prior cycle's
+    // already-confirmed delivery. Re-read once the clear is confirmed synced — a precondition of
+    // `refreshedBoardBaseline` coming back non-null at all — so every remaining use of `ticket` this
+    // attempt (dispatch, the evidence gate, and the failure-path audit) sees the same reset state the
+    // remote now has. A failed re-read fails closed rather than dispatch against a snapshot this
+    // attempt can no longer trust.
+    if (reopenedAfterCompletedCycle && refreshedBoardBaseline) {
+      const freshTicket = await mustRead(run.repoPath, ticket.id);
+      if (!freshTicket) {
+        throw new NoDeliveryError(boardOnlyTicketRereadFailedMessage(ticket));
+      }
+      ticket = freshTicket;
+    }
     const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline, boardOnly);
     // A board-only ticket with no baseline is refused BEFORE dispatch, not just at the commit
     // step's evidence gate (PR #284 review round 12): letting the agent run anyway risks it making
@@ -840,6 +867,27 @@ function boardOnlyBaselineNotPersistedMessage(ticket: Bead): string {
     `writes landing before a process/host death, with no anchored baseline for a resumed attempt to ` +
     `compare against — a fresh read there would absorb those writes as pre-existing, and an idempotent ` +
     `retry would then diff as no evidence at all, permanently. Halting before dispatch instead: check ` +
+    `the beads DB and the sync channel, then resume the run — the ticket is left open (not blocked) so ` +
+    `that resume can reclaim it directly.`
+  );
+}
+
+/**
+ * Why a board-only ticket was never dispatched at all (chatgpt-codex-connector, PR #284 review,
+ * "Drop cleared pending IDs from the dispatch snapshot") — `ensureBoardBaselinePersisted` durably
+ * cleared a stale `board-evidence-pending:*` label left by a completed prior cycle, but the ticket
+ * could not be re-read afterward to pick up that reset before dispatch. Dispatching anyway would
+ * hand `readBoardEvidence` the pre-clear snapshot, which still carries the old label — unioning the
+ * prior cycle's already-confirmed ids into this cycle's evidence and crediting a no-op agent with
+ * delivery it never produced.
+ */
+function boardOnlyTicketRereadFailedMessage(ticket: Bead): string {
+  return (
+    `${ticket.id} was not dispatched: this ticket is marked \`delivery:board\`, whose deliverable is bd ` +
+    `writes to the board, not the git tree — a stale \`board-evidence-pending:*\` label from a completed ` +
+    `prior cycle was cleared on the remote, but the ticket could not be re-read afterward (after ` +
+    `retries) to pick up that reset before dispatch. Dispatching anyway risks a no-op agent being ` +
+    `credited with the prior cycle's already-confirmed delivery. Halting before dispatch instead: check ` +
     `the beads DB and the sync channel, then resume the run — the ticket is left open (not blocked) so ` +
     `that resume can reclaim it directly.`
   );

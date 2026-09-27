@@ -329,6 +329,113 @@ describe("runTicket — releases the board-evidence marker only once the handoff
 });
 
 /**
+ * chatgpt-codex-connector, PR #284 review (thread on execute-epic-board-evidence.ts:696), "Drop
+ * cleared pending IDs from the dispatch snapshot": a reopened ticket that still carries a prior
+ * cycle's `board-evidence-pending:*` label has that label cleared on the REMOTE by
+ * `ensureBoardBaselinePersisted`'s reopen-reset, but `runTicket`'s own `ticket` variable was left
+ * holding the pre-call snapshot — so the dispatch-time evidence check would still union the old
+ * cycle's ids into the new cycle's diff, crediting a no-op agent with delivery it never produced.
+ */
+describe("runTicket — refreshes a reopened ticket's snapshot after the reopen-reset clears its pending ids (PR #284 review, 'Drop cleared pending IDs from the dispatch snapshot')", () => {
+  function deliveredCommitStep(): ResolvedStep {
+    const facts: StepFacts = { committed: true, selfReport: { outcome: "delivered" } };
+    return {
+      step: { id: "commit" },
+      definition: {
+        name: "commit",
+        class: "git",
+        summary: "fake board-only commit",
+        producesDiff: false,
+        handler: async () => ({ ok: true, facts }),
+      },
+    } as unknown as ResolvedStep;
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
+    readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-new"], synced: true });
+    ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
+    markDispatchStartedMock.mockResolvedValue(true);
+    finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
+    clearBoardEvidencePendingMock.mockResolvedValue(undefined);
+    // Default for the (unrelated) post-transition marker-cleanup re-read every board-only success
+    // already performs — overridden per test where the assertion cares what it returns.
+    mustReadMock.mockResolvedValue({ ...ticket, labels: ["delivery:board"] } as Bead);
+    // Settlement is mocked to rethrow the triggering error, like the real `settleFailedTicket`
+    // eventually does, so a pre-dispatch failure's own message still reaches the assertion.
+    settleFailedTicketMock.mockImplementation(async (args: { e: unknown }) => {
+      throw args.e;
+    });
+  });
+
+  it("dispatches against the freshly re-read ticket, never the stale reopened snapshot that still names the prior cycle's pending ids", async () => {
+    // Reopened after a completed cycle: a closure-stamped pending marker naming the OLD cycle's ids.
+    const reopenedTicket = {
+      ...ticket,
+      labels: ["delivery:board", "board-evidence-pending:anton-old"],
+      metadata: { boardEvidencePendingClosure: "closure-1" },
+    } as Bead;
+    // What `ensureBoardBaselinePersisted`'s reopen-reset leaves on the remote once its clear is
+    // confirmed synced: no stale label, no closure stamp.
+    const freshTicket = { ...ticket, labels: ["delivery:board"] } as Bead;
+    mustReadMock.mockResolvedValue(freshTicket);
+
+    await runTicket({
+      run: run(),
+      steps: [deliveredCommitStep()],
+      ticket: reopenedTicket,
+      runTicketIds: [reopenedTicket.id],
+      timeoutMs: 5_000,
+    });
+
+    expect(readBoardEvidenceMock).toHaveBeenCalledWith("/tmp/anton", { beads: new Map() }, freshTicket);
+    expect(readBoardEvidenceMock).not.toHaveBeenCalledWith(
+      "/tmp/anton",
+      expect.anything(),
+      reopenedTicket,
+    );
+  });
+
+  it("fails closed rather than dispatch a reopened ticket whose post-reset re-read comes back empty", async () => {
+    const reopenedTicket = {
+      ...ticket,
+      labels: ["delivery:board", "board-evidence-pending:anton-old"],
+      metadata: { boardEvidencePendingClosure: "closure-1" },
+    } as Bead;
+    mustReadMock.mockResolvedValue(undefined);
+
+    await expect(
+      runTicket({
+        run: run(),
+        steps: [deliveredCommitStep()],
+        ticket: reopenedTicket,
+        runTicketIds: [reopenedTicket.id],
+        timeoutMs: 5_000,
+      }),
+    ).rejects.toThrow(/could not be re-read/);
+
+    expect(readBoardEvidenceMock).not.toHaveBeenCalled();
+  });
+
+  it("skips the extra re-read for a plain board-only ticket that was never reopened after a completed cycle", async () => {
+    const plainTicket = { ...ticket, labels: ["delivery:board"] } as Bead;
+
+    await runTicket({
+      run: run(),
+      steps: [deliveredCommitStep()],
+      ticket: plainTicket,
+      runTicketIds: [plainTicket.id],
+      timeoutMs: 5_000,
+    });
+
+    // The only `mustRead` call left is the unrelated post-transition marker cleanup re-read.
+    expect(mustReadMock).toHaveBeenCalledTimes(1);
+    expect(readBoardEvidenceMock).toHaveBeenCalledWith("/tmp/anton", { beads: new Map() }, plainTicket);
+  });
+});
+
+/**
  * PR #284 review, "Audit live-board mutations when ticket execution fails": a board-only ticket's
  * deliverable is bd writes the agent makes directly against the live board, so a write it made
  * before a LATER step failed (a verify gate here) is already live on the board by the time
