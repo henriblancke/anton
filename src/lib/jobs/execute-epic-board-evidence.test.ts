@@ -41,6 +41,13 @@ const setBoardEvidenceDispatchStartedMock = vi.fn<(repo: string, id: string) => 
 // reason the other board-evidence writes above are.
 const setReviewGateDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 const clearReviewGateDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// `markReviewGateDispatchStarted`'s own post-marker refresh loop (chatgpt-codex-connector, PR #284
+// review, "Re-stabilize the baseline after dispatch-marker sync") writes through the same
+// `bd update` review-gate.test.ts already mocks for `persistReviewGateBoardBaseline` — mocked here
+// for the same reason.
+const setReviewGateBoardBaselineMock = vi.fn<
+  (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
+>();
 // The cleanup-push retry obligation (PR #284 review, "retain a retry obligation after cleanup
 // push failure") shells out to `bd update` too — mocked for the same reason the baseline writes
 // above are.
@@ -82,6 +89,7 @@ vi.mock("../beads/bd", async () => {
       setBoardEvidenceDispatchStarted: setBoardEvidenceDispatchStartedMock,
       setReviewGateDispatchStarted: setReviewGateDispatchStartedMock,
       clearReviewGateDispatchStarted: clearReviewGateDispatchStartedMock,
+      setReviewGateBoardBaseline: setReviewGateBoardBaselineMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
       clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
       setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
@@ -126,6 +134,7 @@ unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceDispatchStartedMock.mockResolvedValue("");
 setReviewGateDispatchStartedMock.mockResolvedValue("");
 clearReviewGateDispatchStartedMock.mockResolvedValue("");
+setReviewGateBoardBaselineMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
@@ -1947,33 +1956,117 @@ describe(
       );
     });
 
-    it("persists and confirms synced", async () => {
+    it("persists and confirms synced, returning the baseline unchanged when its own confirming " +
+      "push's re-read finds nothing new", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
       setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("synced");
+      const readBoardFingerprint = vi.fn().mockResolvedValueOnce(baseline);
 
-      await expect(markReviewFixDispatchStarted("/repo", "t-dispatching")).resolves.toBe(true);
+      await expect(
+        markReviewFixDispatchStarted("/repo", "t-dispatching", baseline, readBoardFingerprint),
+      ).resolves.toEqual(baseline);
 
       expect(setReviewFixDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
+      expect(readBoardFingerprint).toHaveBeenCalledWith("/repo", "t-dispatching");
     });
 
     it("returns false, never throwing, when the write cannot be persisted after every retry", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
       setReviewFixDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setReviewFixDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setReviewFixDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       const pushCallsBefore = pushMock.mock.calls.length;
+      const readBoardFingerprint = vi.fn();
 
-      await expect(markReviewFixDispatchStarted("/repo", "t-dispatch-unpersisted")).resolves.toBe(false);
+      await expect(
+        markReviewFixDispatchStarted("/repo", "t-dispatch-unpersisted", baseline, readBoardFingerprint),
+      ).resolves.toBe(false);
 
       // Never reaches the confirming push at all — nothing landed locally to confirm.
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+      expect(readBoardFingerprint).not.toHaveBeenCalled();
     });
 
     it("returns false when the write lands locally but the confirming push never syncs", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
       setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("not-wired");
+      const readBoardFingerprint = vi.fn();
 
-      await expect(markReviewFixDispatchStarted("/repo", "t-dispatch-unconfirmed")).resolves.toBe(false);
+      await expect(
+        markReviewFixDispatchStarted("/repo", "t-dispatch-unconfirmed", baseline, readBoardFingerprint),
+      ).resolves.toBe(false);
+
+      expect(readBoardFingerprint).not.toHaveBeenCalled();
     });
+
+    it(
+      "refreshes and re-persists the baseline when its OWN confirming push's pull-first pass " +
+        "imported an unrelated write (chatgpt-codex-connector, PR #284 review, \"Re-stabilize the " +
+        "baseline after dispatch-marker sync\") — a writer publishing between " +
+        "`persistReviewFixBoardBaseline`'s last confirmed read and THIS push would otherwise leave " +
+        "the caller crediting that drift to a no-op fixer",
+      async () => {
+        const baseline = fingerprintBoard([bead("a")]);
+        const pulledIn = fingerprintBoard([bead("a"), bead("b")]);
+        setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // the marker's own confirming push, which pulled in "b"
+        setReviewFixBoardBaselineMock.mockResolvedValueOnce(""); // the refreshed persist
+        pushMock.mockResolvedValueOnce("synced"); // the refreshed persist's own confirming push
+        const readBoardFingerprint = vi
+          .fn()
+          .mockResolvedValueOnce(pulledIn) // first refresh read: still differs from `baseline`
+          .mockResolvedValueOnce(pulledIn); // second refresh read: matches the just-persisted refresh
+
+        await expect(
+          markReviewFixDispatchStarted("/repo", "t-dispatching", baseline, readBoardFingerprint),
+        ).resolves.toEqual(pulledIn);
+
+        expect(setReviewFixBoardBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-dispatching",
+          Object.fromEntries(pulledIn.beads),
+        );
+        expect(readBoardFingerprint).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    it("fails closed when the board keeps drifting under its own confirming push, never settling " +
+      "within the bounded refresh rounds", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValue("synced");
+      setReviewFixBoardBaselineMock.mockResolvedValue("");
+      const readBoardFingerprint = vi.fn().mockImplementation(async () =>
+        fingerprintBoard([bead("a"), bead(`drift-${readBoardFingerprint.mock.calls.length}`)]),
+      );
+
+      await expect(
+        markReviewFixDispatchStarted("/repo", "t-dispatching", baseline, readBoardFingerprint),
+      ).resolves.toBe(false);
+    });
+
+    it(
+      "skips the refresh loop entirely when `isRecoveredBaseline` is set (chatgpt-codex-connector, " +
+        "PR #284 review, \"Re-stabilize the baseline after dispatch-marker sync\") — a baseline " +
+        "recovered off a PRIOR attempt's preserved snapshot can legitimately differ from the live " +
+        "board because that same prior attempt's fixer already wrote to it before this process died, " +
+        "and re-stabilizing here would fold that crash-recovered delivery away as if it were unrelated " +
+        "drift",
+      async () => {
+        const recovered = fingerprintBoard([bead("a")]);
+        setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced");
+        const readBoardFingerprint = vi.fn();
+
+        await expect(
+          markReviewFixDispatchStarted("/repo", "t-dispatching", recovered, readBoardFingerprint, true),
+        ).resolves.toEqual(recovered);
+
+        expect(readBoardFingerprint).not.toHaveBeenCalled();
+      },
+    );
   },
 );
 
@@ -2988,33 +3081,116 @@ describe(
   "markDispatchStarted — durably records that dispatch began (chatgpt-codex-connector, PR #284 " +
     "review, \"Distinguish pre-dispatch locks from recovery baselines\")",
   () => {
-    it("persists and confirms synced", async () => {
+    it("persists and confirms synced, returning the baseline unchanged when its own confirming " +
+      "push's re-read finds nothing new", async () => {
+      const baseline = fingerprintBoard([bead("a")], "t-dispatching");
       setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("synced");
+      loadAllIssuesMock.mockResolvedValueOnce([bead("a")]);
 
-      await expect(markDispatchStarted("/repo", bead("t-dispatching"))).resolves.toBe(true);
+      await expect(
+        markDispatchStarted("/repo", bead("t-dispatching"), baseline),
+      ).resolves.toEqual(baseline);
 
       expect(setBoardEvidenceDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
     });
 
     it("returns false, never throwing, when the write cannot be persisted after every retry", async () => {
+      const baseline = fingerprintBoard([bead("a")], "t-dispatch-unpersisted");
       setBoardEvidenceDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidenceDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setBoardEvidenceDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       const pushCallsBefore = pushMock.mock.calls.length;
 
-      await expect(markDispatchStarted("/repo", bead("t-dispatch-unpersisted"))).resolves.toBe(false);
+      await expect(
+        markDispatchStarted("/repo", bead("t-dispatch-unpersisted"), baseline),
+      ).resolves.toBe(false);
 
       // Never reaches the confirming push at all — nothing landed locally to confirm.
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
     });
 
     it("returns false when the write lands locally but the confirming push never syncs", async () => {
+      const baseline = fingerprintBoard([bead("a")], "t-dispatch-unconfirmed");
       setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("not-wired");
 
-      await expect(markDispatchStarted("/repo", bead("t-dispatch-unconfirmed"))).resolves.toBe(false);
+      await expect(
+        markDispatchStarted("/repo", bead("t-dispatch-unconfirmed"), baseline),
+      ).resolves.toBe(false);
     });
+
+    it(
+      "re-locks and re-verifies a refreshed baseline when its OWN confirming push's pull-first " +
+        "pass imported an unrelated write (chatgpt-codex-connector, PR #284 review, \"Re-stabilize " +
+        "the baseline after dispatch-marker sync\") — a writer publishing between " +
+        "`lockDispatchBaseline`'s last verification read and THIS push would otherwise leave the " +
+        "caller crediting that drift to the dispatched agent",
+      async () => {
+        const baseline = fingerprintBoard([bead("a")], "t-dispatching");
+        const pulledIn = fingerprintBoard([bead("a"), bead("b")], "t-dispatching");
+        setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // the marker's own confirming push, which pulled in "b"
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a"), bead("b")]); // round 0's read: still drifted
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the tentative (unverified) re-lock
+        pushMock.mockResolvedValueOnce("synced"); // its confirming push
+        setBoardEvidenceBaselineMock.mockResolvedValueOnce(""); // the verified re-lock
+        pushMock.mockResolvedValueOnce("synced"); // its confirming push
+        loadAllIssuesMock.mockResolvedValueOnce([bead("a"), bead("b")]); // round 1's read: now stable
+
+        await expect(
+          markDispatchStarted("/repo", bead("t-dispatching"), baseline),
+        ).resolves.toEqual(pulledIn);
+
+        expect(setBoardEvidenceBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-dispatching",
+          Object.fromEntries(pulledIn.beads),
+          true,
+          true,
+        );
+      },
+    );
+
+    it("fails closed, abandoning the baseline, when the board keeps drifting under every re-lock's " +
+      "own confirming push, never settling within the bounded stability rounds", async () => {
+      const baseline = fingerprintBoard([bead("a")], "t-dispatching");
+      setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValue("synced");
+      setBoardEvidenceBaselineMock.mockResolvedValue("");
+      let round = 0;
+      loadAllIssuesMock.mockImplementation(async () => [bead("a"), bead(`drift-${round++}`)]);
+
+      await expect(
+        markDispatchStarted("/repo", bead("t-dispatching"), baseline),
+      ).resolves.toBe(false);
+
+      expect(clearBoardEvidenceBaselineMock).toHaveBeenCalledWith("/repo", "t-dispatching");
+    });
+
+    it(
+      "skips re-stabilization entirely when `ticket` already carries `boardEvidenceDispatchStarted` " +
+        "(chatgpt-codex-connector, PR #284 review, \"Re-stabilize the baseline after dispatch-marker " +
+        "sync\") — a genuine recovery, where `baseline` is a PRIOR attempt's pre-dispatch snapshot and " +
+        "the live board can legitimately differ from it because that same prior attempt's agent " +
+        "already ran and wrote to it before this process died; re-stabilizing here would read that " +
+        "live board, find that write as \"drift\", and fold it away as if it were unrelated churn",
+      async () => {
+        const recovered = fingerprintBoard([bead("a")], "t-dispatching");
+        const dispatchedTicket = bead("t-dispatching", {
+          metadata: { boardEvidenceDispatchStarted: "1" },
+        });
+        setBoardEvidenceDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced");
+        const readCallsBefore = loadAllIssuesMock.mock.calls.length;
+
+        await expect(
+          markDispatchStarted("/repo", dispatchedTicket, recovered),
+        ).resolves.toEqual(recovered);
+
+        expect(loadAllIssuesMock.mock.calls.length).toBe(readCallsBefore);
+      },
+    );
   },
 );
 
@@ -3023,28 +3199,38 @@ describe(
     'back the local marker on an unconfirmed push (chatgpt-codex-connector, PR #284 review, "Roll ' +
     'back an unconfirmed gate dispatch marker")',
   () => {
-    it("persists and confirms synced", async () => {
+    it("persists and confirms synced, returning the baseline unchanged when its own confirming " +
+      "push's re-read finds nothing new", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
       setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("synced");
+      const readBoardFingerprint = vi.fn().mockResolvedValueOnce(baseline);
 
-      await expect(markReviewGateDispatchStarted("/repo", "t-dispatching")).resolves.toBe(true);
+      await expect(
+        markReviewGateDispatchStarted("/repo", "t-dispatching", baseline, readBoardFingerprint),
+      ).resolves.toEqual(baseline);
 
       expect(setReviewGateDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
       expect(clearReviewGateDispatchStartedMock).not.toHaveBeenCalled();
     });
 
     it("returns false, never throwing, when the write cannot be persisted after every retry", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
       setReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       setReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
       const pushCallsBefore = pushMock.mock.calls.length;
+      const readBoardFingerprint = vi.fn();
 
-      await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unpersisted")).resolves.toBe(false);
+      await expect(
+        markReviewGateDispatchStarted("/repo", "t-dispatch-unpersisted", baseline, readBoardFingerprint),
+      ).resolves.toBe(false);
 
       // Never reaches the confirming push at all — nothing landed locally to confirm, so there is
       // nothing for a rollback to undo either.
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
       expect(clearReviewGateDispatchStartedMock).not.toHaveBeenCalled();
+      expect(readBoardFingerprint).not.toHaveBeenCalled();
     });
 
     it(
@@ -3052,13 +3238,18 @@ describe(
         "but the confirming push never syncs — otherwise a same-machine retry's `recoveredAfterDispatch` " +
         "would read the unsynced marker as a genuine post-dispatch recovery",
       async () => {
+        const baseline = fingerprintBoard([bead("a")]);
         setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
         pushMock.mockResolvedValueOnce("not-wired"); // the dispatch-started marker's own confirming push
         pushMock.mockResolvedValueOnce("synced"); // the rollback's own confirming push
+        const readBoardFingerprint = vi.fn();
 
-        await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unconfirmed")).resolves.toBe(false);
+        await expect(
+          markReviewGateDispatchStarted("/repo", "t-dispatch-unconfirmed", baseline, readBoardFingerprint),
+        ).resolves.toBe(false);
 
         expect(clearReviewGateDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatch-unconfirmed");
+        expect(readBoardFingerprint).not.toHaveBeenCalled();
       },
     );
 
@@ -3066,6 +3257,7 @@ describe(
       "throws rather than leaving an unsynced marker in place when the rollback itself cannot be " +
         "persisted after every retry",
       async () => {
+        const baseline = fingerprintBoard([bead("a")]);
         setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
         pushMock.mockResolvedValueOnce("not-wired"); // the dispatch-started marker's own confirming push
         clearReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
@@ -3073,9 +3265,9 @@ describe(
         clearReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
         const pushCallsBefore = pushMock.mock.calls.length;
 
-        await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unrollback")).rejects.toThrow(
-          /t-dispatch-unrollback/,
-        );
+        await expect(
+          markReviewGateDispatchStarted("/repo", "t-dispatch-unrollback", baseline, vi.fn()),
+        ).rejects.toThrow(/t-dispatch-unrollback/);
 
         // Never reaches the rollback's confirming push at all — nothing landed locally to confirm.
         expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 1);
@@ -3083,15 +3275,92 @@ describe(
     );
 
     it("throws rather than leaving an unsynced marker in place when the rollback's confirming push never syncs", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
       setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("not-wired"); // the dispatch-started marker's own confirming push
       clearReviewGateDispatchStartedMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("not-wired"); // the rollback's own confirming push never syncs either
 
-      await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unrollback-sync")).rejects.toThrow(
-        /t-dispatch-unrollback-sync/,
-      );
+      await expect(
+        markReviewGateDispatchStarted("/repo", "t-dispatch-unrollback-sync", baseline, vi.fn()),
+      ).rejects.toThrow(/t-dispatch-unrollback-sync/);
     });
+
+    it(
+      "refreshes and re-persists the baseline when its OWN confirming push's pull-first pass " +
+        "imported an unrelated write (chatgpt-codex-connector, PR #284 review, \"Re-stabilize the " +
+        "baseline after dispatch-marker sync\") — a writer publishing between " +
+        "`persistReviewGateBoardBaseline`'s last confirmed read and THIS push would otherwise leave " +
+        "the caller crediting that drift to a no-op fixer",
+      async () => {
+        const baseline = fingerprintBoard([bead("a")]);
+        const pulledIn = fingerprintBoard([bead("a"), bead("b")]);
+        setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced"); // the marker's own confirming push, which pulled in "b"
+        setReviewGateBoardBaselineMock.mockResolvedValueOnce(""); // the refreshed persist
+        pushMock.mockResolvedValueOnce("synced"); // the refreshed persist's own confirming push
+        const readBoardFingerprint = vi
+          .fn()
+          .mockResolvedValueOnce(pulledIn) // first refresh read: still differs from `baseline`
+          .mockResolvedValueOnce(pulledIn); // second refresh read: matches the just-persisted refresh
+        const clearCallsBefore = clearReviewGateDispatchStartedMock.mock.calls.length;
+
+        await expect(
+          markReviewGateDispatchStarted("/repo", "t-dispatching", baseline, readBoardFingerprint),
+        ).resolves.toEqual(pulledIn);
+
+        expect(setReviewGateBoardBaselineMock).toHaveBeenLastCalledWith(
+          "/repo",
+          "t-dispatching",
+          Object.fromEntries(pulledIn.beads),
+        );
+        // Succeeded fully — no rollback of the dispatch-started marker this attempt already earned.
+        expect(clearReviewGateDispatchStartedMock.mock.calls.length).toBe(clearCallsBefore);
+      },
+    );
+
+    it(
+      "rolls back the dispatch-started marker, rather than leaving it set, when the board keeps " +
+        "drifting under every refresh round's own confirming push, never settling within the " +
+        "bounded refresh rounds",
+      async () => {
+        const baseline = fingerprintBoard([bead("a")]);
+        setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValue("synced");
+        setReviewGateBoardBaselineMock.mockResolvedValue("");
+        clearReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+        const readBoardFingerprint = vi.fn().mockImplementation(async () =>
+          fingerprintBoard([bead("a"), bead(`drift-${readBoardFingerprint.mock.calls.length}`)]),
+        );
+
+        await expect(
+          markReviewGateDispatchStarted("/repo", "t-dispatching", baseline, readBoardFingerprint),
+        ).resolves.toBe(false);
+
+        expect(clearReviewGateDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
+      },
+    );
+
+    it(
+      "skips the refresh loop entirely when `isRecoveredBaseline` is set (chatgpt-codex-connector, " +
+        "PR #284 review, \"Re-stabilize the baseline after dispatch-marker sync\") — a baseline " +
+        "recovered off a PRIOR round's preserved snapshot can legitimately differ from the live board " +
+        "because that same prior round's fixer already wrote to it before this process died, and " +
+        "re-stabilizing here would fold that crash-recovered delivery away as if it were unrelated " +
+        "drift",
+      async () => {
+        const recovered = fingerprintBoard([bead("a")]);
+        setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("synced");
+        const readBoardFingerprint = vi.fn();
+
+        await expect(
+          markReviewGateDispatchStarted("/repo", "t-dispatching", recovered, readBoardFingerprint, true),
+        ).resolves.toEqual(recovered);
+
+        expect(readBoardFingerprint).not.toHaveBeenCalled();
+      },
+    );
   },
 );
 

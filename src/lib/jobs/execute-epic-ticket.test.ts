@@ -258,7 +258,7 @@ describe("runTicket — releases the board-evidence marker only once the handoff
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x1"], synced: true });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
-    markDispatchStartedMock.mockResolvedValue(true);
+    markDispatchStartedMock.mockResolvedValue({ beads: new Map() });
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -356,7 +356,7 @@ describe("runTicket — refreshes a reopened ticket's snapshot after the reopen-
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-new"], synced: true });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
-    markDispatchStartedMock.mockResolvedValue(true);
+    markDispatchStartedMock.mockResolvedValue({ beads: new Map() });
     finishTicketMock.mockResolvedValue({ closed: false, transitioned: true });
     clearBoardEvidencePendingMock.mockResolvedValue(undefined);
     // Default for the (unrelated) post-transition marker-cleanup re-read every board-only success
@@ -464,7 +464,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
     vi.resetAllMocks();
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
-    markDispatchStartedMock.mockResolvedValue(true);
+    markDispatchStartedMock.mockResolvedValue({ beads: new Map() });
     settleFailedTicketMock.mockImplementation(async () => {
       throw new Error("settled as a failure");
     });
@@ -643,7 +643,7 @@ describe(
       vi.resetAllMocks();
       dispatchMock.mockReset();
       readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
-      markDispatchStartedMock.mockResolvedValue(true);
+      markDispatchStartedMock.mockResolvedValue({ beads: new Map() });
       // A benign "nothing changed" default for tests below that DO reach dispatch and exercise the
       // catch-side audit (`auditBoardOnFailedTicket`) after a real step failure.
       readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });

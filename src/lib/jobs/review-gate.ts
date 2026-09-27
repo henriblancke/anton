@@ -1622,7 +1622,21 @@ async function runGateFixSession(args: {
       // a durable record dispatch began, a resume could not tell this baseline apart from a
       // never-dispatched one either, so it stays subject to the refresh loop the next persist runs
       // — silently correct, but only by accident, and only until this ticket's next unrelated write.
-      if (!(await markReviewGateDispatchStarted(repoPath, target.id))) {
+      //
+      // Its own confirming push can pull in drift the same way `persistReviewGateBoardBaseline`'s can
+      // (chatgpt-codex-connector, PR #284 review, "Re-stabilize the baseline after dispatch-marker
+      // sync") — the refreshed baseline it returns is what every later read this round diffs
+      // against, not the possibly-stale value read before this push. `recoveredAfterDispatch` is the
+      // SAME flag `persistReviewGateBoardBaseline` above was passed, so a genuine crash-recovered
+      // baseline is never mistaken for drift and folded away.
+      const dispatchStabilizedBaseline = await markReviewGateDispatchStarted(
+        repoPath,
+        target.id,
+        boardBefore,
+        args.readBoardFingerprint,
+        recoveredAfterDispatch,
+      );
+      if (!dispatchStabilizedBaseline) {
         throw new PoisonError(
           `the review fix for ${target.id} persisted a board-only baseline before round ${round} but ` +
             `could not durably mark dispatch as started — refusing to dispatch: without that record, a ` +
@@ -1630,6 +1644,7 @@ async function runGateFixSession(args: {
             `fixer ever ran. Resolve the board write, then resume.`,
         );
       }
+      boardBefore = dispatchStabilizedBaseline;
     }
     // Flips once the gates have passed AND the work is committed: past that point the round's output
     // is verified, and the rollback below must not touch it however the session ends.

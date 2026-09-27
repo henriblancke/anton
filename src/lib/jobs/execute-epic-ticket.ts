@@ -227,8 +227,19 @@ export async function runTicket(args: {
     // starts, keeps the ambiguity from ever reaching the board: dispatching without a durable record
     // that dispatch began would let a later resume trust this baseline untouched over board drift
     // that happened while nothing was actually running.
-    if (boardOnly && boardBaseline && !(await markDispatchStarted(run.repoPath, ticket))) {
-      throw new NoDeliveryError(boardOnlyDispatchNotMarkedMessage(ticket));
+    //
+    // `markDispatchStarted`'s own confirming push is itself a pull → commit → push pass
+    // (chatgpt-codex-connector, PR #284 review, "Re-stabilize the baseline after dispatch-marker
+    // sync") — it returns the refreshed baseline accounting for anything it pulled in, reassigned
+    // into `boardBaseline` so `walkTicketSteps` and the failure-path audit measure against the board
+    // as it stood after this guaranteed pull, never the pre-pull value a drifted change would
+    // otherwise be credited against.
+    if (boardOnly && boardBaseline) {
+      const dispatchLockedBaseline = await markDispatchStarted(run.repoPath, ticket, boardBaseline);
+      if (!dispatchLockedBaseline) {
+        throw new NoDeliveryError(boardOnlyDispatchNotMarkedMessage(ticket));
+      }
+      boardBaseline = dispatchLockedBaseline;
     }
     dispatchStarted = true;
     await walkTicketSteps({

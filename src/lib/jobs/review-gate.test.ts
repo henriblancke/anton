@@ -693,11 +693,12 @@ describe("runReviewGate — bounds", () => {
       const worktree = fakeWorktree();
       let reads = 0;
       // First read is the pre-fix baseline; the second is `persistReviewGateBoardBaseline`'s own
-      // refresh-stability check (finds no drift, so it reuses "before"); the third (post-fix)
-      // reports the bead changed.
+      // refresh-stability check (finds no drift, so it reuses "before"); the third is
+      // `markReviewGateDispatchStarted`'s own post-marker-push re-stabilization check (same reason,
+      // still "before"); the fourth (post-fix) reports the bead changed.
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
       const out = await runReviewGate({
@@ -758,18 +759,21 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        // Round 1 recovers its baseline from `target.metadata` (no read here for it), so the only
-        // call round 1 makes is its post-fix "after" read (#1) — reporting a change vs the
-        // recovered "before" so this round's evidence is confirmed and the baseline released.
+        // Round 1 recovers its baseline from `target.metadata` (no read here for it) — and
+        // `markReviewGateDispatchStarted` is passed the SAME `recoveredAfterDispatch` flag, so it
+        // skips its own post-marker-push stabilization read too — so the only call round 1 makes is
+        // its post-fix "after" read (#1) — reporting a change vs the recovered "before" so this
+        // round's evidence is confirmed and the baseline released.
         //
         // Round 2 must NOT recover: with the fix, `target`'s in-memory metadata was cleared when
         // round 1 released, so round 2 takes a FRESH "before" read (#2), a stability check inside
-        // `persistReviewGateBoardBaseline`'s refresh loop (#3, matching #2 — no drift), and its own
-        // post-fix "after" read (#4). Without the fix, round 2 would still see the STALE
-        // "recovered-before" baseline on `target` and skip #2/#3 entirely, making only 2 calls
-        // total instead of 4.
+        // `persistReviewGateBoardBaseline`'s refresh loop (#3, matching #2 — no drift),
+        // `markReviewGateDispatchStarted`'s own post-marker-push stabilization check (#4, matching
+        // #2/#3 — still no drift, since it is NOT recovered this round), and its own post-fix "after"
+        // read (#5). Without the fix, round 2 would still see the STALE "recovered-before" baseline
+        // on `target` and skip #2/#3/#4 entirely, making only 2 calls total instead of 5.
         if (reads === 1) return { beads: new Map([[boardOnlyTicket.id, "after1"]]) };
-        if (reads === 2 || reads === 3) return { beads: new Map([[boardOnlyTicket.id, "after1"]]) };
+        if (reads === 2 || reads === 3 || reads === 4) return { beads: new Map([[boardOnlyTicket.id, "after1"]]) };
         return { beads: new Map([[boardOnlyTicket.id, "after2"]]) };
       };
       const { run } = fakeClaude([
@@ -809,10 +813,10 @@ describe("runReviewGate — bounds", () => {
       expect(out.outcome).toBe("clean");
       expect(out.rounds[0].fixCommitted).toBe(true);
       expect(out.rounds[1].fixCommitted).toBe(true);
-      // 4 reads total (1 for round 1's recovered baseline + 3 for round 2's fresh one) proves round
+      // 5 reads total (1 for round 1's recovered baseline + 4 for round 2's fresh one) proves round
       // 2 took a fresh baseline. A regression here would settle at 2 (both rounds "recovering" the
       // same stale metadata).
-      expect(reads).toBe(4);
+      expect(reads).toBe(5);
       // `target`'s in-memory metadata no longer carries either round's now-released baseline, or its
       // dispatch-started marker.
       expect(boardOnlyTarget.metadata?.reviewGateBoardBaseline).toBeUndefined();
@@ -832,7 +836,7 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
       const out = await runReviewGate({
@@ -896,7 +900,7 @@ describe("runReviewGate — bounds", () => {
         let reads = 0;
         const readBoardFingerprint = async () => {
           reads += 1;
-          return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+          return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
         };
         const { run } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
         const result = runReviewGate({
@@ -956,7 +960,7 @@ describe("runReviewGate — bounds", () => {
         let reads = 0;
         const readBoardFingerprint = async () => {
           reads += 1;
-          return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+          return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
         };
         const { run } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
         const result = runReviewGate({
@@ -1025,7 +1029,7 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run } = fakeClaude([report(4, [BLOCKING]), "fixed it", report(9, [])]);
       await runReviewGate({
@@ -1075,7 +1079,7 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C", report(9, [])]);
       const out = await runReviewGate({
@@ -1213,10 +1217,12 @@ describe("runReviewGate — bounds", () => {
       const worktree = fakeWorktree();
       let reads = 0;
       // First read (pre-fix baseline) succeeds, as does `persistReviewGateBoardBaseline`'s own
-      // refresh-stability check (the second); the post-fix read (the third) exhausts its retries.
+      // refresh-stability check (the second) and `markReviewGateDispatchStarted`'s own
+      // post-marker-push re-stabilization check (the third); the post-fix read (the fourth)
+      // exhausts its retries.
       const readBoardFingerprint = async () => {
         reads += 1;
-        return reads <= 2 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+        return reads <= 3 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
       const error = await runReviewGate({
@@ -1267,7 +1273,7 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        return reads <= 2 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+        return reads <= 3 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "touched a file and wrote to bd"]);
       const error = await runReviewGate({
@@ -1319,9 +1325,10 @@ describe("runReviewGate — bounds", () => {
       const readBoardFingerprint = async () => {
         reads += 1;
         // The pre-fix baseline succeeds, as does `persistReviewGateBoardBaseline`'s own refresh-
-        // stability check; every read taken AFTER the fixer's own failure is unreadable —
+        // stability check and `markReviewGateDispatchStarted`'s own post-marker-push
+        // re-stabilization check; every read taken AFTER the fixer's own failure is unreadable —
         // `mustReadBoard` exhausted its retries on a genuinely contended board.
-        return reads <= 2 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
+        return reads <= 3 ? { beads: new Map([[boardOnlyTicket.id, "before"]]) } : undefined;
       };
       const { run, calls } = fakeClaude([
         report(4, [BLOCKING]),
@@ -1378,7 +1385,7 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "fixed it on a branch of my own, via bd -C"]);
       const error = await runReviewGate({
@@ -1428,7 +1435,7 @@ describe("runReviewGate — bounds", () => {
       let reads = 0;
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), "closed the bead via bd -C"]);
       const error = await runReviewGate({
@@ -1477,11 +1484,13 @@ describe("runReviewGate — bounds", () => {
       const worktree = fakeWorktree();
       let reads = 0;
       // First read is the pre-fix baseline; the second is `persistReviewGateBoardBaseline`'s own
-      // refresh-stability check (no drift yet); the third (from the catch block, after the fixer
-      // crashed) reports the bead already changed — the fixer's own `bd` write landed before it died.
+      // refresh-stability check (no drift yet); the third is `markReviewGateDispatchStarted`'s own
+      // post-marker-push re-stabilization check (same reason, still no drift); the fourth (from the
+      // catch block, after the fixer crashed) reports the bead already changed — the fixer's own
+      // `bd` write landed before it died.
       const readBoardFingerprint = async () => {
         reads += 1;
-        return { beads: new Map([[boardOnlyTicket.id, reads <= 2 ? "before" : "after"]]) };
+        return { beads: new Map([[boardOnlyTicket.id, reads <= 3 ? "before" : "after"]]) };
       };
       const { run, calls } = fakeClaude([report(4, [BLOCKING]), new Error("claude crashed after writing to bd")]);
       const error = await runReviewGate({

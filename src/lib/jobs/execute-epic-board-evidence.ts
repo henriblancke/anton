@@ -442,14 +442,61 @@ export async function releaseReviewFixBoardBaseline(repo: string, ticketId: stri
  * so the caller can refuse to dispatch the same fail-closed way it already does for an unpersistable
  * baseline, rather than let the fixer run against a baseline whose dispatch-started state is not
  * itself durable.
+ *
+ * This function's OWN confirming push can pull in drift the same way `persistReviewFixBoardBaseline`'s
+ * own confirming push already accounts for (chatgpt-codex-connector, PR #284 review, "Re-stabilize
+ * the baseline after dispatch-marker sync") — a writer publishing after that function's last
+ * confirmed read but before THIS push lands locally while `baseline` still predates it, and the
+ * caller's later post-fix diff would credit that drift to a no-op fixer. So once this push lands,
+ * the SAME refresh loop `persistReviewFixBoardBaseline` runs (bounded at {@link
+ * BASELINE_REFRESH_ROUNDS}) re-reads through `readBoardFingerprint` and folds in anything it finds,
+ * returning the refreshed baseline the caller must use for every later read this session diffs
+ * against.
+ *
+ * `isRecoveredBaseline` skips that refresh loop entirely, mirroring {@link
+ * persistReviewFixBoardBaseline}'s own flag of the same name and passed the SAME value the caller
+ * already computed for it: a baseline recovered off a PRIOR attempt's preserved snapshot can
+ * legitimately differ from the live board because that same prior attempt's fixer already ran and
+ * wrote to it before this process died — the exact delivery a resumed idempotent retry's post-fix
+ * diff exists to credit. Re-stabilizing here would read that live board, find "drift" against the
+ * recovered `baseline`, and fold it straight into a "refreshed" baseline, erasing the only
+ * pre-dispatch snapshot the resumed diff needs and silently discarding the crash-recovered progress.
  */
-export async function markReviewFixDispatchStarted(repo: string, ticketId: string): Promise<boolean> {
+export async function markReviewFixDispatchStarted(
+  repo: string,
+  ticketId: string,
+  baseline: BoardFingerprint,
+  readBoardFingerprint: (repo: string, ticketId: string) => Promise<BoardFingerprint | undefined>,
+  isRecoveredBaseline = false,
+): Promise<BoardFingerprint | false> {
   const persisted = await mustPersist(() => beads.setReviewFixDispatchStarted(repo, ticketId));
   if (!persisted) return false;
-  return beads
+  const synced = await beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
+  if (!synced) return false;
+  if (isRecoveredBaseline) return baseline;
+
+  let confirmed = baseline;
+  for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
+    const refreshed = await readBoardFingerprint(repo, ticketId);
+    if (!refreshed) return false;
+    if (boardEvidence(confirmed, refreshed).length === 0) return confirmed;
+    const refreshedPersisted = await mustPersist(() =>
+      beads.setReviewFixBoardBaseline(repo, ticketId, serializeFingerprint(refreshed)),
+    );
+    if (!refreshedPersisted) return false;
+    const refreshedSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!refreshedSynced) return false;
+    confirmed = refreshed;
+  }
+  // Every round found the board still drifting under its own confirming push — fail closed rather
+  // than hand the caller a baseline that may still omit a change landing right now.
+  return false;
 }
 
 /**
@@ -608,8 +655,35 @@ async function abandonReviewGateDispatchStarted(repo: string, ticketId: string):
  * `abandonDispatchBaseline` call) before returning `false` — the local `setReviewGateDispatchStarted`
  * write above already landed, so leaving it in place would let a same-machine retry's
  * `recoveredAfterDispatch` read it as `true` and skip the refresh loop for a fixer that never ran.
+ *
+ * The confirming push above can pull in drift the same way `persistReviewGateBoardBaseline`'s own
+ * confirming push already accounts for (chatgpt-codex-connector, PR #284 review, "Re-stabilize the
+ * baseline after dispatch-marker sync") — a writer publishing after that function's last confirmed
+ * read but before THIS push lands locally while `baseline` still predates it, and the caller's later
+ * post-fix diff would credit that drift to a no-op fixer. So once this push lands, the SAME refresh
+ * loop `persistReviewGateBoardBaseline` runs (bounded at {@link BASELINE_REFRESH_ROUNDS}) re-reads
+ * through `readBoardFingerprint` and folds in anything it finds, rolling the dispatch-started marker
+ * back the same way a push failure above already does if a round cannot be confirmed — a resumed
+ * attempt must never find `reviewGateDispatchStarted` set against a baseline this call could not
+ * itself finish stabilizing. Returns the refreshed baseline the caller must use for every later read
+ * this round diffs against.
+ *
+ * `isRecoveredBaseline` skips that refresh loop entirely, mirroring {@link
+ * persistReviewGateBoardBaseline}'s own flag of the same name and passed the SAME value the caller
+ * already computed for it: a baseline recovered off a PRIOR round's preserved snapshot can
+ * legitimately differ from the live board because that same prior round's fixer already ran and
+ * wrote to it before this process died — the exact delivery a resumed idempotent retry's post-fix
+ * diff exists to credit. Re-stabilizing here would read that live board, find "drift" against the
+ * recovered `baseline`, and fold it straight into a "refreshed" baseline, erasing the only
+ * pre-dispatch snapshot the resumed diff needs and silently discarding the crash-recovered progress.
  */
-export async function markReviewGateDispatchStarted(repo: string, ticketId: string): Promise<boolean> {
+export async function markReviewGateDispatchStarted(
+  repo: string,
+  ticketId: string,
+  baseline: BoardFingerprint,
+  readBoardFingerprint: (repo: string, ticketId: string) => Promise<BoardFingerprint | undefined>,
+  isRecoveredBaseline = false,
+): Promise<BoardFingerprint | false> {
   const persisted = await mustPersist(() => beads.setReviewGateDispatchStarted(repo, ticketId));
   if (!persisted) return false;
   const synced = await beads
@@ -620,7 +694,38 @@ export async function markReviewGateDispatchStarted(repo: string, ticketId: stri
     await abandonReviewGateDispatchStarted(repo, ticketId);
     return false;
   }
-  return true;
+  if (isRecoveredBaseline) return baseline;
+
+  let confirmed = baseline;
+  for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
+    const refreshed = await readBoardFingerprint(repo, ticketId);
+    if (!refreshed) {
+      await abandonReviewGateDispatchStarted(repo, ticketId);
+      return false;
+    }
+    if (boardEvidence(confirmed, refreshed).length === 0) return confirmed;
+    const refreshedPersisted = await mustPersist(() =>
+      beads.setReviewGateBoardBaseline(repo, ticketId, serializeFingerprint(refreshed)),
+    );
+    if (!refreshedPersisted) {
+      await abandonReviewGateDispatchStarted(repo, ticketId);
+      return false;
+    }
+    const refreshedSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!refreshedSynced) {
+      await abandonReviewGateDispatchStarted(repo, ticketId);
+      return false;
+    }
+    confirmed = refreshed;
+  }
+  // Every round found the board still drifting under its own confirming push — fail closed rather
+  // than leave the dispatch-started marker set against a baseline that may still omit a change
+  // landing right now.
+  await abandonReviewGateDispatchStarted(repo, ticketId);
+  return false;
 }
 
 /**
@@ -1178,8 +1283,39 @@ async function lockDispatchBaseline(
  * delivery. `abandonDispatchBaseline` clears baseline/locked/verified/dispatch-started together, the
  * same all-or-nothing rollback this module already uses for every other push-confirmation failure, so
  * a retry starts over from a genuinely fresh baseline instead of trusting this half-confirmed one.
+ *
+ * This function's OWN confirming push is, like every other one in this module, a pull → commit →
+ * push pass (chatgpt-codex-connector, PR #284 review, "Re-stabilize the baseline after
+ * dispatch-marker sync") — so a writer publishing after `lockDispatchBaseline`'s own final
+ * verification read but before THIS push pulls that content straight into the LOCAL board while
+ * `baseline` (the value `runTicket` is about to hold onto for its post-run diff) still predates it.
+ * Left uncorrected, that drift would land in the board unattributed to anything, and the post-run
+ * diff — still measured against the stale `baseline` — would credit it to the dispatched agent (or a
+ * no-op resume of it) as evidence it never produced. So once this push lands, the board is re-read
+ * and compared against `baseline`; a stable read costs nothing further, but a drifted one is folded
+ * in via {@link restabilizeDispatchBaseline} — the SAME re-lock/re-push/re-read dance
+ * `lockDispatchBaseline` already runs for the identical reason, bounded the same way. The refreshed
+ * baseline is returned to the caller, which must use it — not the value it passed in — for every
+ * later read this attempt diffs against.
+ *
+ * That re-stabilization is skipped entirely when `ticket` ALREADY carried `boardEvidenceDispatchStarted`
+ * before this call — a genuine recovery, the same shape `ensureBoardBaselinePersisted`'s own
+ * `recoveryBaseline` fast path already refuses to re-verify. `baseline` there is a PRIOR attempt's
+ * pre-dispatch snapshot, and the live board can legitimately differ from it because that same prior
+ * attempt's agent already ran and wrote to it before this process died — the exact delivery a
+ * resumed idempotent retry's post-run diff exists to credit. Re-stabilizing here would read that
+ * live board, find "drift" against the recovered `baseline`, and fold it straight into a "refreshed"
+ * baseline — erasing the only pre-dispatch snapshot the resumed diff needs, silently discarding the
+ * crash-recovered progress. A ticket reaching this call with the flag still unset has never been
+ * dispatched against `baseline` before, so nothing has landed yet that re-stabilization could
+ * mistake for its own recovered delivery.
  */
-export async function markDispatchStarted(repo: string, ticket: Bead): Promise<boolean> {
+export async function markDispatchStarted(
+  repo: string,
+  ticket: Bead,
+  baseline: BoardFingerprint,
+): Promise<BoardFingerprint | false> {
+  const recovering = beads.boardEvidenceDispatchStarted(ticket);
   const persisted = await mustPersist(() => beads.setBoardEvidenceDispatchStarted(repo, ticket.id));
   if (!persisted) return false;
   const synced = await beads
@@ -1190,7 +1326,75 @@ export async function markDispatchStarted(repo: string, ticket: Bead): Promise<b
     await abandonDispatchBaseline(repo, ticket);
     return false;
   }
-  return true;
+  if (recovering) return baseline;
+  return restabilizeDispatchBaseline(repo, ticket, baseline);
+}
+
+/**
+ * Re-verify `candidate` still matches the live board after {@link markDispatchStarted}'s own
+ * confirming push (chatgpt-codex-connector, PR #284 review, "Re-stabilize the baseline after
+ * dispatch-marker sync") — see that function's own docstring for the gap this closes. A stable read
+ * returns `candidate` untouched at the cost of one extra `mustReadBoard` — no write, since nothing
+ * needs correcting. A drifted read re-locks the drifted content the same tentative-then-verified way
+ * `lockDispatchBaseline` locks its own first candidate: written LOCKED-but-unverified and confirmed
+ * synced first, so a crash between that write and the verify write below leaves the ticket in a
+ * state `ensureBoardBaselinePersisted`'s `recoveryBaseline` check already refuses to trust blindly
+ * (it requires VERIFIED, not just locked); only once that first write's confirming push lands is the
+ * SAME content re-persisted VERIFIED and confirmed again. Bounded at {@link LOCK_STABILITY_ROUNDS}
+ * rounds for the identical reason that constant already bounds `lockDispatchBaseline`'s own loop:
+ * each write's confirming push can itself pull in further drift, so the loop keeps going until a
+ * round finds nothing new or the bound is spent — a board under continuous unrelated churn fails
+ * closed via {@link abandonDispatchBaseline} rather than chasing a moving target forever.
+ */
+async function restabilizeDispatchBaseline(
+  repo: string,
+  ticket: Bead,
+  baseline: BoardFingerprint,
+): Promise<BoardFingerprint | false> {
+  let candidate = baseline;
+  for (let round = 0; round < LOCK_STABILITY_ROUNDS; round += 1) {
+    const board = await mustReadBoard(repo);
+    const hydrated = board && (await hydrateDescriptions(repo, board));
+    if (!hydrated) {
+      await abandonDispatchBaseline(repo, ticket);
+      return false;
+    }
+    const refreshed = fingerprintBoard(hydrated, ticket.id);
+    if (boardEvidence(candidate, refreshed).length === 0) return candidate;
+    const persisted = await mustPersist(() =>
+      beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(refreshed), true, false),
+    );
+    if (!persisted) {
+      await abandonDispatchBaseline(repo, ticket);
+      return false;
+    }
+    const synced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!synced) {
+      await abandonDispatchBaseline(repo, ticket);
+      return false;
+    }
+    const verified = await mustPersist(() =>
+      beads.setBoardEvidenceBaseline(repo, ticket.id, serializeFingerprint(refreshed), true, true),
+    );
+    if (!verified) {
+      await abandonDispatchBaseline(repo, ticket);
+      return false;
+    }
+    const verifiedSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!verifiedSynced) {
+      await abandonDispatchBaseline(repo, ticket);
+      return false;
+    }
+    candidate = refreshed;
+  }
+  await abandonDispatchBaseline(repo, ticket);
+  return false;
 }
 
 /**
