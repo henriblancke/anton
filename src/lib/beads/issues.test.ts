@@ -269,6 +269,44 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
+  it("retries when a cycle member's ANCESTOR is reparented into a different run, even though the member's own immediate parent never moves (P2 review, PR #274, issues.ts:410)", async () => {
+    // t-1 sits below an intermediate ticket (`mid`), not directly below a run. Between the two reads,
+    // `mid` itself gets reparented from run-a's subtree into run-b's — t-1's own `parentOf` (`mid`)
+    // never changes, and neither does any `blocks` edge or status, so a check that only compares each
+    // member's immediate parent would wave this through even though `descendantsOf` walking down from
+    // run-a no longer reaches t-1 while walking down from run-b now does.
+    const mid: Bead = { id: "mid-1", title: "Intermediate", status: "open", issue_type: "task", parent: "run-a" };
+    const midReparented: Bead = { ...mid, parent: "run-b" };
+    const cyclicA: Bead = {
+      id: "t-1",
+      title: "A",
+      status: "open",
+      issue_type: "task",
+      parent: "mid-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const cyclicB: Bead = {
+      id: "t-2",
+      title: "B",
+      status: "open",
+      issue_type: "task",
+      dependencies: [{ issue_id: "t-2", depends_on_id: "t-1", type: "blocks" }],
+    };
+    listMock
+      .mockImplementationOnce(async () => [mid, cyclicA, cyclicB]) // this call's own work read — mid under run-a
+      .mockImplementationOnce(async () => [midReparented, cyclicA, cyclicB]) // recheck — mid moved to run-b
+      .mockImplementationOnce(async () => [midReparented, cyclicA, cyclicB]) // retry's work read — stable now
+      .mockImplementationOnce(async () => [midReparented, cyclicA, cyclicB]); // retry's recheck — converges
+    cyclesMock.mockResolvedValue([{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([midReparented, cyclicA, cyclicB]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
   it("fails closed instead of retrying forever when the graph keeps moving on every read (P2 review on PR #274)", async () => {
     // Every work read disagrees with the one before it, so `sameBlocksEdges` never converges —
     // simulating sustained shaping/concurrent writers on a shared-server board. Without a retry

@@ -384,20 +384,49 @@ export function sameBlocksEdges(a: Bead[], b: Bead[]): boolean {
 }
 
 /**
- * Whether every id `cycles` reports still carries the same live/abandoned status AND the same parent
- * in `b` as it does in `a`. `sameBlocksEdges` alone can't see either drift: a bead being reopened or
- * losing/gaining its `abandoned` label touches no `blocks` edge, yet `validateBoardStructure`'s cycle
- * rule (tiers.mjs's `isLive`/`isJudged`) decides whether a reported cycle faults at all purely off
- * those two fields (P2 review, PR #274, issues.ts:312) — a member reopened between the board read and
- * the `bd dep cycles` fetch can flip a cycle from "historical, no live member, quiet" to "live,
- * deadlocking" without moving a single edge. Reparenting a cycle member is the same kind of gap for a
- * different reader: `structureGaps` scopes a `blocks-cycle` fault to the TARGET's own subtree via
- * `descendantsOf`'s parent walk, so a member reparented out of the run that owns it in `a` and into a
- * different one between the two reads leaves both `blocks` edges and live/abandoned status unchanged
- * while the fault's rightful owner moves — the old target keeps a fault over a bead it no longer owns
- * and the new one is approved or executed without ever seeing the cycle it now contains (P2 review, PR
- * #274, issues.ts:419). Every `sameBlocksEdges` gate that decides whether cycle evidence is safe to
- * attach must also check this.
+ * A bead's own id followed by every ancestor reached by walking `parent-child` upward — `[id,
+ * parent, grandparent, ...]` — stopping at a bead missing from `list`, a bead with no parent, or a
+ * repeat (a parent cycle, cycle-safe the same way `descendantsOf` is downward).
+ */
+function ancestorChain(id: string, list: Bead[]): string[] {
+  const byId = new Map(list.map((bead) => [bead.id, bead]));
+  const chain = [id];
+  const seen = new Set(chain);
+  let current = byId.get(id);
+  while (current) {
+    const parentId = beads.parentOf(current);
+    if (!parentId || seen.has(parentId)) break;
+    chain.push(parentId);
+    seen.add(parentId);
+    current = byId.get(parentId);
+  }
+  return chain;
+}
+
+/**
+ * Whether every id `cycles` reports still carries the same live/abandoned status AND the same FULL
+ * ancestor chain in `b` as it does in `a`. `sameBlocksEdges` alone can't see either drift: a bead
+ * being reopened or losing/gaining its `abandoned` label touches no `blocks` edge, yet
+ * `validateBoardStructure`'s cycle rule (tiers.mjs's `isLive`/`isJudged`) decides whether a reported
+ * cycle faults at all purely off those two fields (P2 review, PR #274, issues.ts:312) — a member
+ * reopened between the board read and the `bd dep cycles` fetch can flip a cycle from "historical, no
+ * live member, quiet" to "live, deadlocking" without moving a single edge. Reparenting a cycle member
+ * is the same kind of gap for a different reader: `structureGaps` scopes a `blocks-cycle` fault to the
+ * TARGET's own subtree via `descendantsOf`'s parent walk, so a member reparented out of the run that
+ * owns it in `a` and into a different one between the two reads leaves both `blocks` edges and
+ * live/abandoned status unchanged while the fault's rightful owner moves — the old target keeps a
+ * fault over a bead it no longer owns and the new one is approved or executed without ever seeing the
+ * cycle it now contains (P2 review, PR #274, issues.ts:419).
+ *
+ * The member's OWN immediate parent is not enough (P2 review, PR #274, issues.ts:410): a member
+ * nested below an intermediate ticket keeps that same immediate parent even when the intermediate
+ * itself gets reparented from run A's subtree into run B's between the two reads — the member's
+ * `parentOf` never moves, only an ancestor's does. `descendantsOf` walks the full tree from the run
+ * root down, so that reparent changes which run's subtree actually contains the member even though
+ * every `blocks` edge, status, and the member's own parent link all stay byte-for-byte identical.
+ * Comparing the whole {@link ancestorChain} instead of just the one link catches a reparent anywhere
+ * along it, not only at the member itself. Every `sameBlocksEdges` gate that decides whether cycle
+ * evidence is safe to attach must also check this.
  */
 export function sameCycleMemberLiveness(cycles: DepCycle[], a: Bead[], b: Bead[]): boolean {
   const memberIds = new Set(cycles.flatMap((c) => c.ids));
@@ -407,7 +436,7 @@ export function sameCycleMemberLiveness(cycles: DepCycle[], a: Bead[], b: Bead[]
     return (id: string) => {
       const bead = byId.get(id);
       if (!bead) return undefined;
-      return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${beads.parentOf(bead) ?? ""}`;
+      return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${ancestorChain(id, list).join(">")}`;
     };
   };
   const [keyA, keyB] = [liveKey(a), liveKey(b)];
