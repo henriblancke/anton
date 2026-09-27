@@ -54,8 +54,11 @@ export function CohortTable({ cohorts, heading }: { cohorts: Cohort[]; heading: 
           </tr>
         </thead>
         <tbody>
-          {cohorts.map((cohort) => (
-            <CohortRow key={cohort.key ?? "__unstamped__"} cohort={cohort} />
+          {cohorts.map((cohort, index) => (
+            // `cohort.key` repeats for a restored stamp — A → B → A is two DISTINCT rows sharing one
+            // key (PR #331 review) — so the index (stable: `cohorts` is only ever appended to, never
+            // reordered, between renders) is what keeps each row's identity unique.
+            <CohortRow key={`${cohort.key ?? "__unstamped__"}-${index}`} cohort={cohort} />
           ))}
         </tbody>
       </table>

@@ -192,11 +192,18 @@ async function cohortFeatureOf(
 ): Promise<CohortFeature> {
   const ledger = await featureLedger(db, projectId, beadId, { board, asOfMs });
   const deliveredAtMs = ledger?.deliveredAtMs;
+  // The feature's last recorded activity regardless of outcome — what `promptSeries` places a
+  // feature that never delivered by, since it has no `deliveredAtMs` of its own (PR #331 review).
+  const activityAtMs = ledger?.rows.reduce<number | undefined>((latest, row) => {
+    const at = row.recordedAt?.getTime();
+    return at !== undefined && (latest === undefined || at > latest) ? at : latest;
+  }, undefined);
 
   return {
     beadId,
     delivered: deliveredAtMs !== undefined,
     ...(deliveredAtMs !== undefined ? { deliveredAtMs } : {}),
+    ...(activityAtMs !== undefined ? { activityAtMs } : {}),
     usd: ledger?.totals.totals.usd,
     // A defined `usd` beside a non-zero `unpricedRows` is still only a FLOOR for this feature — some
     // of its rows priced and some didn't. Carrying the count through lets `promptSeries` mark the

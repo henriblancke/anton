@@ -512,6 +512,15 @@ export interface CohortFeature {
    */
   deliveredAtMs?: number;
   /**
+   * When the feature last had ANY recorded activity, epoch ms — its rows' latest `recordedAt`,
+   * regardless of outcome. A feature that never delivered has no {@link deliveredAtMs} and so no
+   * place in the delivery order {@link promptSeries} sorts by, but it still ran at a real point in
+   * time; this is what lets the fold attribute it to the episode that was actually current WHEN it
+   * ran, rather than to whichever episode of its key happens to be the last one on record (PR #331
+   * review). Absent only when the feature carries no timed rows at all.
+   */
+  activityAtMs?: number;
+  /**
    * What the feature cost, or **undefined when anton could price none of its rows** — never 0, per
    * `spend-breakdown`'s rule. `LedgerTotals.totals.usd` answers this directly.
    */
@@ -786,6 +795,32 @@ function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
 }
 
 /**
+ * Which of a key's episodes (oldest first, per {@link promptSeries}'s `episodesByKey`) was open at
+ * `activityAtMs` — the last one whose window had already started by then, so an undated feature
+ * lands in the episode contemporaneous with it instead of always the newest (PR #331 review). Falls
+ * back to the EARLIEST episode when the activity predates all of them (a feature that ran before its
+ * key ever delivered), and to the LAST one when there is no activity timestamp to place it by at all
+ * — the same "no better evidence than the current era" reading a repeat delivery under an unchanged
+ * key already gets. `undefined` only when the key has formed no episode yet, so the caller opens one.
+ */
+function episodeFor(
+  candidates: CohortAccumulator[] | undefined,
+  activityAtMs: number | undefined,
+): CohortAccumulator | undefined {
+  if (!candidates || candidates.length === 0) return undefined;
+  if (activityAtMs === undefined || !Number.isFinite(activityAtMs)) {
+    return candidates[candidates.length - 1];
+  }
+  let current: CohortAccumulator | undefined;
+  for (const candidate of candidates) {
+    if (candidate.firstDeliveryMs !== undefined && candidate.firstDeliveryMs <= activityAtMs) {
+      current = candidate;
+    }
+  }
+  return current ?? candidates[0];
+}
+
+/**
  * Fold features into cohorts keyed on one dimension of the stamp tuple (anton-85y8j) — the read D2's
  * stamps were recorded for.
  *
@@ -826,9 +861,14 @@ function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
  * DELIVERED features are what decide episode boundaries, sorted by {@link CohortFeature.deliveredAtMs}
  * — the only field that says WHEN one happened; a feature that gave up records no such time and so
  * cannot be placed in that sequence at all. It still must land somewhere (every attributed feature's
- * spend stays in the numerators, per rule 1), so it joins the MOST RECENT episode its key has formed
- * so far, or opens a fresh one if that key has not delivered anything yet — the same "no better
- * evidence than the current era" reading a repeat delivery under an unchanged key already gets today.
+ * spend stays in the numerators, per rule 1), so it is folded into whichever of its key's episodes was
+ * open at its own {@link CohortFeature.activityAtMs} — the last one that had already started by then
+ * — falling back to the earliest episode for the key when its activity predates every one of them, or
+ * to the MOST RECENT episode when it carries no activity timestamp at all. Defaulting to "most recent"
+ * unconditionally (as this fold once did) mis-files a failed attempt from a stamp's FIRST run into its
+ * later, restored run whenever the stamp came back — A → B → A inflates the second A episode's cost
+ * with a failure that actually happened during the first, and can reverse B's own delta against it
+ * (PR #331 review). Opens a fresh episode only when the key has formed none yet.
  */
 export function promptSeries(
   features: readonly CohortFeature[],
@@ -864,24 +904,30 @@ export function promptSeries(
   dated.sort((a, b) => (a.feature.deliveredAtMs as number) - (b.feature.deliveredAtMs as number));
 
   const episodes: CohortAccumulator[] = [];
-  const latestEpisodeForKey = new Map<string | null, CohortAccumulator>();
+  // Every episode a key has formed so far, oldest first — {@link dated}'s own sort order, since a
+  // new episode is only ever appended, never inserted. What lets an undated feature below pick the
+  // one that was actually open at its own activity time instead of always the last.
+  const episodesByKey = new Map<string | null, CohortAccumulator[]>();
   let open: CohortAccumulator | undefined;
   for (const { feature, key } of dated) {
     if (!open || open.key !== key) {
       open = emptyAccumulator(key);
       episodes.push(open);
+      episodesByKey.set(key, [...(episodesByKey.get(key) ?? []), open]);
     }
     accumulate(open, feature);
-    latestEpisodeForKey.set(key, open);
   }
   for (const { feature, key } of undated) {
-    let episode = latestEpisodeForKey.get(key);
-    if (!episode) {
-      episode = emptyAccumulator(key);
-      episodes.push(episode);
-      latestEpisodeForKey.set(key, episode);
+    const candidates = episodesByKey.get(key);
+    const episode = episodeFor(candidates, feature.activityAtMs);
+    if (episode) {
+      accumulate(episode, feature);
+      continue;
     }
-    accumulate(episode, feature);
+    const fresh = emptyAccumulator(key);
+    episodes.push(fresh);
+    episodesByKey.set(key, [...(candidates ?? []), fresh]);
+    accumulate(fresh, feature);
   }
 
   const ordered = episodes.sort(byWindow);

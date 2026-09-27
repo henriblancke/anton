@@ -378,6 +378,32 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     });
   });
 
+  it("attributes a failed feature to the episode it ran in, not always the newest sharing its key (PR #331 review)", () => {
+    // Same A → B → A restoration, plus one A feature that never delivered. It ran during the FIRST
+    // A episode (its activity sits right after JUL_1) — folding it into the second A episode just
+    // because that is the last one on record for the key would inflate the LATER cohort's cost with
+    // a failure from the earlier period, potentially reversing its delta against B.
+    const series = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_PROMPT, at: JUL_1, usd: 2 }),
+        ...deliveries(5, { key: NEW_PROMPT, at: AUG_2, usd: 10 }),
+        ...deliveries(5, { key: OLD_PROMPT, at: SEP_4, usd: 100, bead: "old-again" }),
+        {
+          beadId: "failed-during-first-a",
+          delivered: false,
+          activityAtMs: JUL_1 + DAY,
+          usd: 1000,
+          rows: [{ promptDigest: OLD_PROMPT }],
+        },
+      ],
+      "prompt",
+    );
+
+    const [firstOld, , secondOld] = series.cohorts;
+    expect(firstOld.basis.features).toBe(6);
+    expect(secondOld.basis.features).toBe(5);
+  });
+
   it("measures each cohort against the one immediately before it in delivery order", () => {
     const series = promptSeries(
       [
