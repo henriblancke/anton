@@ -47,6 +47,7 @@ function sample(n: number, metrics: CohortMetrics, versions?: (string | null)[])
     n,
     antonVersions: versions ?? Array.from({ length: n }, () => "0.6.0"),
     metrics,
+    unpricedFeatures: 0,
   };
 }
 
@@ -121,7 +122,9 @@ describe("a healthy cohort", () => {
   it("counts how many cohorts may be read as a verdict at all", () => {
     render(<CohortView window="all" series={SERIES} />);
 
-    expect(screen.getByText("2 of 2")).toBeTruthy();
+    // The FIRST cohort clears the floor too, but it has no baseline to move against — its row draws
+    // no arrow, so it does not count as comparable even though it is not underpowered.
+    expect(screen.getByText("1 of 2")).toBeTruthy();
     // 11 + 7 delivered features across the series.
     expect(screen.getByText("18")).toBeTruthy();
   });

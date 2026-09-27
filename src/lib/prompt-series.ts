@@ -124,6 +124,14 @@ export interface CohortSample {
    */
   antonVersions: readonly (string | null | undefined)[];
   metrics: CohortMetrics;
+  /**
+   * Features anton could price nothing for — the sibling of {@link CohortBasis.unpricedFeatures}.
+   * Read by {@link cohortStanding} to decide whether a `usdPerFeature` delta may be drawn at all: a
+   * cohort's average is a FLOOR whenever this is non-zero, and a delta between two floors (or a floor
+   * and a total) is not a smaller finding than a delta between two totals, it is a different question
+   * answered as if it were the same one.
+   */
+  unpricedFeatures: number;
 }
 
 /** One metric's move against a baseline cohort — the arrow, and the number under it. */
@@ -259,6 +267,13 @@ export function metricDelta(
  * cohort has not measured enough to say anything, while a mixed one has measured plenty and merely
  * cannot attribute it. Suppressing the second would throw away a real finding; flagging it hands the
  * reader the ambiguity to resolve, which is the only place it can be resolved.
+ *
+ * `usdPerFeature` is the one metric this drops even when both cohorts clear the floor: whenever
+ * either side left a feature unpriced, that side's average is a FLOOR rather than a total (per
+ * {@link CohortSample.unpricedFeatures}), and a directional arrow drawn between a floor and anything
+ * else can point the wrong way — a cheaper-looking floor may in truth cost more once priced. That is
+ * not a smaller finding than a delta between two complete totals; it is no finding, the same reading
+ * {@link metricDelta} already gives a missing average.
  */
 export function cohortStanding(
   sample: CohortSample,
@@ -275,6 +290,12 @@ export function cohortStanding(
   const comparableBaseline = baseline && isComparable(baseline.n) ? baseline : undefined;
   const deltas = comparableBaseline
     ? COHORT_METRICS.flatMap((metric) => {
+        if (
+          metric === "usdPerFeature" &&
+          (sample.unpricedFeatures > 0 || comparableBaseline.unpricedFeatures > 0)
+        ) {
+          return [];
+        }
         const delta = metricDelta(metric, sample.metrics[metric], comparableBaseline.metrics[metric]);
         return delta ? [delta] : [];
       })
@@ -422,6 +443,11 @@ export interface CohortStampRow {
   antonVersion?: string | null;
   /** The ticket's resolved `agent:<tag>` — `agent`. */
   agentTag?: string | null;
+  /**
+   * The `skill:<id>` a step resolved to, read alongside {@link skillDigest} so a scaffolding
+   * fallback (see {@link SCAFFOLDING_SKILL_IDS}) can be told apart from a project's own choice.
+   */
+  skillId?: string | null;
   /** The digest of the skill text a step resolved — `skill`. */
   skillDigest?: string | null;
 }
@@ -500,6 +526,19 @@ export interface SpanningFeatures {
 }
 
 /**
+ * Bundled skill ids anton's own scaffolding phases fall back to when a project has named no
+ * override of its own — `step:describe`'s and `step:review`'s always-on defaults, and their
+ * siblings. Both phases run by default on essentially every feature (design §cohorts by agent and
+ * by skill's own review), so counting them as the feature's "skill" stamps nearly every delivered
+ * feature with TWO distinct skill digests — `describe`'s and `review`'s — and {@link featureKeys}
+ * would then read every such feature as spanning several skills, emptying the skill dimension into
+ * {@link SpanningFeatures} instead of a cohort. These ids carry no opinion about which skill a
+ * project is trying out; a row naming one is read as unstamped for the `skill` dimension, exactly
+ * like a row with no `skill_id` at all.
+ */
+const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan-triage"]);
+
+/**
  * One stamp value as a cohort key, or `undefined` for a row that recorded none.
  *
  * A blank or whitespace-only stamp is ABSENT rather than a distinct key, the same reading
@@ -507,6 +546,7 @@ export interface SpanningFeatures {
  * compute, and a cohort keyed on `""` would present that failure as a prompt.
  */
 function stampValue(row: CohortStampRow, dimension: CohortDimension): string | undefined {
+  if (dimension === "skill" && row.skillId && SCAFFOLDING_SKILL_IDS.has(row.skillId)) return undefined;
   const raw = row[DIMENSION_COLUMNS[dimension]];
   const value = typeof raw === "string" ? raw.trim() : "";
   return value || undefined;
@@ -707,5 +747,10 @@ export function promptSeries(
 
 /** One accumulator as the guardrails read it — the bridge from the fold to {@link cohortStanding}. */
 function sampleOf(from: CohortAccumulator): CohortSample {
-  return { n: from.n, antonVersions: from.antonVersions, metrics: cohortMetrics(from) };
+  return {
+    n: from.n,
+    antonVersions: from.antonVersions,
+    metrics: cohortMetrics(from),
+    unpricedFeatures: from.unpricedFeatures,
+  };
 }

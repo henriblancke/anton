@@ -165,6 +165,38 @@ describe("cohortFeatures", () => {
     expect(features?.[0]?.rows[0]?.agentTag).toBe("agent:nextjs");
   });
 
+  it("excludes a target still in_progress — its outcome is not known yet", async () => {
+    // A live run has no delivery yet, so folding it in now would count its partial spend and friction
+    // against an outcome (delivered, gave-up, abandoned) that has not happened.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "in_progress" })]);
+    await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toEqual([]);
+  });
+
+  it("resolves every run target under bounded concurrency, none dropped", async () => {
+    // cohortFeatureOf shells out to `bd` per target (reviewRoundsOf), so an all-time read with many
+    // targets must not fire every call at once — this proves the bounded pool still returns all of
+    // them rather than silently truncating.
+    const board = Array.from({ length: 12 }, (_, i) =>
+      bead({ id: `feat-${i}`, issue_type: "feature" }),
+    );
+    fakeBoard(board);
+    for (const b of board) {
+      await seedInvocation({ id: `i-${b.id}`, beadId: b.id, recordedAt: new Date("2026-09-25T00:00:00Z") });
+    }
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features?.map((f) => f.beadId).sort()).toEqual(board.map((b) => b.id).sort());
+  });
+
   it("never surfaces a bead that is not a run target on its own", async () => {
     // A parented ticket's own id is never a cohort's key — only the feature it rolls up into is.
     fakeBoard(BOARD);

@@ -39,6 +39,12 @@ import { listAllBeads } from "./tickets";
  * the window — resolved through {@link currentRunTargetOf} so a ticket reparented since it ran
  * still lands on the feature that owns it NOW, the same "scope moves when the board does" rule
  * `feature-scope.ts` states for a single ledger.
+ *
+ * A target still `in_progress` is excluded: it has no delivery yet, so {@link cohortFeatureOf}
+ * would mark it undelivered and fold its partial spend and friction into a cohort's numerators
+ * before the run's outcome — delivered, gave-up, or abandoned — is known. Only work that has
+ * either delivered or genuinely finished (closed, or reserved-but-given-up) belongs in an outcome
+ * cohort; a run still executing belongs in none of them yet.
  */
 async function activeRunTargetIds(
   db: AntonDb,
@@ -52,7 +58,9 @@ async function activeRunTargetIds(
     if (!row.beadId) continue;
     const targetId = currentRunTargetOf(board, row.beadId);
     const target = board.find((b) => b.id === targetId);
-    if (target && beads.isRunTarget(target, board)) ids.add(targetId);
+    if (target && beads.isRunTarget(target, board) && target.status !== "in_progress") {
+      ids.add(targetId);
+    }
   }
   return ids;
 }
@@ -83,6 +91,32 @@ async function cohortFeatureOf(
 }
 
 /**
+ * How many {@link cohortFeatureOf} calls may run at once. Each one shells out to `bd` for its
+ * review rounds ({@link reviewRoundsOf}), so an all-time read over a project with hundreds of run
+ * targets must not fire every call at the same instant — past the host's process limit, the spawn
+ * itself starts failing, and {@link reviewRoundsOf} swallows that failure into an empty round list
+ * rather than surfacing it, silently undercounting review friction instead of erroring the page.
+ */
+const COHORT_FEATURE_CONCURRENCY = 8;
+
+/** `items.map(fn)`, run at most {@link COHORT_FEATURE_CONCURRENCY} at a time, order preserved. */
+async function mapWithBoundedConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker() {
+    for (let i = next++; i < items.length; i = next++) {
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
  * Every run target a project's cohorts may fold over, or `undefined` when `projectId` names no
  * project on this anton.db.
  */
@@ -96,7 +130,9 @@ export async function cohortFeatures(
 
   const board = await listAllBeads(project);
   const targetIds = await activeRunTargetIds(db, projectId, board, opts.since);
-  return Promise.all([...targetIds].map((id) => cohortFeatureOf(db, projectId, board, id)));
+  return mapWithBoundedConcurrency([...targetIds], COHORT_FEATURE_CONCURRENCY, (id) =>
+    cohortFeatureOf(db, projectId, board, id),
+  );
 }
 
 /** UI/read path over the shared anton.db — see {@link cohortFeatures}. */

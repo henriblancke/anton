@@ -68,6 +68,7 @@ const sample = (n: number, over: Partial<CohortSample> = {}): CohortSample => ({
   n,
   antonVersions: Array.from({ length: n }, () => "0.4.0+abc123"),
   metrics: { usdPerFeature: 4, reviewRounds: 2, humanTouches: 1, escalations: 0.5 },
+  unpricedFeatures: 0,
   ...over,
 });
 
@@ -154,6 +155,24 @@ describe("cohortStanding at or above MIN_COHORT", () => {
     const standing = cohortStanding(
       sample(6, { metrics: { reviewRounds: 2 } }),
       sample(6, { metrics: { usdPerFeature: 5, reviewRounds: 3 } }),
+    );
+    expect(standing.comparable && standing.deltas.map((d) => d.metric)).toEqual(["reviewRounds"]);
+  });
+
+  it("drops the usdPerFeature delta when this cohort's average is only a floor", () => {
+    // A cohort with unpriced features could in truth cost more than its partial sum shows — a
+    // directional arrow drawn off it can point the wrong way, so it is not drawn at all.
+    const standing = cohortStanding(
+      sample(6, { metrics: { usdPerFeature: 1, reviewRounds: 2 }, unpricedFeatures: 2 }),
+      sample(6, { metrics: { usdPerFeature: 5, reviewRounds: 3 } }),
+    );
+    expect(standing.comparable && standing.deltas.map((d) => d.metric)).toEqual(["reviewRounds"]);
+  });
+
+  it("drops the usdPerFeature delta when the BASELINE's average is only a floor", () => {
+    const standing = cohortStanding(
+      sample(6, { metrics: { usdPerFeature: 5, reviewRounds: 3 } }),
+      sample(6, { metrics: { usdPerFeature: 1, reviewRounds: 2 }, unpricedFeatures: 1 }),
     );
     expect(standing.comparable && standing.deltas.map((d) => d.metric)).toEqual(["reviewRounds"]);
   });
@@ -614,6 +633,70 @@ describe("promptSeries: a feature spanning several values of the dimension", () 
     // A feature that stamped one prompt and left one row unstamped named exactly one prompt.
     expect(series.spanning.features).toBe(0);
     expect(series.cohorts[0]?.key).toBe(OLD_PROMPT);
+  });
+});
+
+describe("promptSeries: the skill dimension ignores anton's own scaffolding phases", () => {
+  it("does not treat a feature's describe+review defaults as spanning two skills", () => {
+    // A normal run stamps step:describe's and step:review's bundled fallback skill on every feature —
+    // two distinct digests that name no opinion about which skill a project is trying out. Counting
+    // them would route nearly every delivered feature into `spanning` instead of a cohort.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "describe", skillDigest: "describe-digest" },
+          { skillId: "review", skillDigest: "review-digest" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    // Nothing named a real skill, so the feature lands in the pre-instrumentation cohort.
+    expect(series.cohorts[0]?.key).toBeNull();
+  });
+
+  it("still attributes a feature to the specialist skill it ran alongside the scaffolding phases", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "describe", skillDigest: "describe-digest" },
+          { skillId: "review", skillDigest: "review-digest" },
+          { skillId: "nextjs", skillDigest: "nextjs-digest" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("nextjs-digest");
+  });
+
+  it("still treats two REAL specialist skills on one feature as spanning", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "nextjs", skillDigest: "nextjs-digest" },
+          { skillId: "supabase", skillDigest: "supabase-digest" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 1, features: 1 });
+    expect(series.cohorts).toEqual([]);
   });
 });
 

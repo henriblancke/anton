@@ -6,6 +6,7 @@ import {
   cohortDimension,
   type Cohort,
   type CohortSeries,
+  type SpanningFeatures,
 } from "@/lib/prompt-series";
 import { SPEND_WINDOWS, type SpendWindow } from "@/lib/spend-breakdown";
 import { CohortTable } from "./cohort-table";
@@ -54,7 +55,15 @@ export function CohortView({
   const windowLabel =
     SPEND_WINDOWS.find((option) => option.value === window)?.label.toLowerCase() ?? "this window";
   const caution = DIMENSION_CAUTIONS[series.dimension];
-  const comparable = series.cohorts.filter((cohort) => cohort.comparable).length;
+  // "Comparable" means the row actually shows a move, not merely that the cohort itself cleared the
+  // floor: a cohort can clear it and still draw no arrow, either because it is first in the series or
+  // because its immediate predecessor did not clear the floor (see `cohort-table.tsx`'s `CohortRow`,
+  // which only reads `deltas` off a `comparable` cohort). Counting cleared-floor cohorts instead of
+  // this would let a series report "2 of 3 comparable" while the table shows zero arrows.
+  const clearedFloor = series.cohorts.filter((cohort) => cohort.comparable).length;
+  const comparable = series.cohorts.filter(
+    (cohort) => cohort.comparable && cohort.deltas.length > 0,
+  ).length;
 
   return (
     <div className="flex flex-col gap-4">
@@ -62,7 +71,9 @@ export function CohortView({
         <>
           <CohortSummary
             cohorts={series.cohorts}
+            spanning={series.spanning}
             comparable={comparable}
+            clearedFloor={clearedFloor}
             windowLabel={windowLabel}
             dimensionLabel={dimension?.label ?? series.dimension}
           />
@@ -104,16 +115,23 @@ export function CohortView({
  */
 function CohortSummary({
   cohorts,
+  spanning,
   comparable,
+  clearedFloor,
   windowLabel,
   dimensionLabel,
 }: {
   cohorts: Cohort[];
+  spanning: SpanningFeatures;
+  /** Cohorts whose row actually shows a move — cleared the floor AND had a comparable predecessor. */
   comparable: number;
+  /** Cohorts that cleared n={@link MIN_COHORT} on their own, whether or not they drew an arrow. */
+  clearedFloor: number;
   windowLabel: string;
   dimensionLabel: string;
 }) {
-  const delivered = cohorts.reduce((sum, cohort) => sum + cohort.n, 0);
+  const cohorted = cohorts.reduce((sum, cohort) => sum + cohort.n, 0);
+  const delivered = cohorted + spanning.delivered;
   const mixed = cohorts.filter((cohort) => cohort.versions.mixed).length;
 
   return (
@@ -122,17 +140,21 @@ function CohortSummary({
         <Stat
           label="Cohorts"
           value={String(cohorts.length)}
-          hint={`Distinct ${dimensionLabel} values that delivered a feature ${windowLabel}`}
+          hint={`Distinct ${dimensionLabel} values with a delivered feature — features enter this comparison by Claude activity ${windowLabel}, but each cohort's own figures span its features' whole life, not just this window`}
         />
         <Stat
           label="Delivered"
           value={String(delivered)}
-          hint={`${delivered} delivered feature${delivered === 1 ? "" : "s"} across every cohort — only deliveries count toward the floor`}
+          hint={
+            spanning.delivered > 0
+              ? `${delivered} delivered features in scope — ${cohorted} counted in a cohort above, ${spanning.delivered} excluded as spanning more than one ${dimensionLabel} and counted in neither`
+              : `${delivered} delivered feature${delivered === 1 ? "" : "s"} across every cohort — only deliveries count toward the floor`
+          }
         />
         <Stat
           label="Comparable"
           value={`${comparable} of ${cohorts.length}`}
-          hint={`Cohorts at or above n=${MIN_COHORT}, the floor below which anton reports no verdict`}
+          hint={`Cohorts whose row shows a move against the cohort immediately before it — clearing n=${MIN_COHORT} alone is not enough, the predecessor must have cleared it too`}
         />
       </div>
 
@@ -149,11 +171,19 @@ function CohortSummary({
         significant.
       </p>
 
-      {comparable < 2 && cohorts.length > 1 ? (
+      {comparable === 0 && cohorts.length > 1 ? (
         <p role="status" className="text-[11px] leading-relaxed text-risk-med">
-          {comparable === 0
+          {clearedFloor === 0
             ? `No cohort has reached n=${MIN_COHORT} yet, so nothing here carries a verdict — the figures are real measurements, but none of them may be read as a move.`
-            : `Only one cohort has reached n=${MIN_COHORT}, and a move needs two: a comparison is only as sound as its weaker side, so a delta against an underpowered predecessor is not shown at all.`}
+            : `${clearedFloor} of ${cohorts.length} cohorts have reached n=${MIN_COHORT}, but none has a comparable cohort immediately before it: a move needs two ADJACENT cohorts that both cleared the floor, and this series does not have that pair yet.`}
+        </p>
+      ) : null}
+
+      {spanning.delivered > 0 ? (
+        <p role="status" className="text-[11px] leading-relaxed text-risk-med">
+          {spanning.delivered} delivered feature{spanning.delivered === 1 ? "" : "s"} named more than
+          one {dimensionLabel} and so belongs to no cohort above — left out rather than split across
+          cohorts or double-counted in both.
         </p>
       ) : null}
 
@@ -209,7 +239,7 @@ function NothingToCompare({
         <p className="max-w-md text-xs leading-relaxed text-subtle">
           {allTime
             ? `A cohort is the delivered features that ran under one ${dimensionLabel}, so this comparison accrues as features are DELIVERED — a run in flight, parked or abandoned contributes nothing to it.`
-            : `Nothing was delivered in this window, so there is no cohort to group. That is an empty comparison, not a flat one — try a wider window.`}
+            : `No run target had Claude activity in this window, so none entered this comparison — it is an activity window, not a delivery one, so a feature delivered here on activity outside it is not counted either. That is an empty comparison, not a flat one — try a wider window.`}
         </p>
         <ul className="mx-auto flex max-w-md flex-col gap-1 text-left text-[11px] leading-relaxed text-subtle">
           <li className="flex gap-1.5">
