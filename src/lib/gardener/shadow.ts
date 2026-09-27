@@ -19,7 +19,7 @@
  */
 import { beads, type Bead, type DepCycle } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
-import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness } from "../beads/issues";
+import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness, sameCycles } from "../beads/issues";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
   autonomyFor,
@@ -189,8 +189,39 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
         // an unreadable board-wide fault instead of the narrow refusal `planApply`'s authoritative
         // `withCycles` path (`loadAllIssues`) would reach once it hydrates the same gates in. Hydrate
         // whatever `cycles` names that `board` is still missing before attaching the evidence.
-        board = await hydrateCycleOnlyGates(input.repo, board, cycles);
-        attachCycleEvidence(board, cycles);
+        const hydratedBoard = await hydrateCycleOnlyGates(input.repo, board, cycles);
+        if (hydratedBoard === board) {
+          // Nothing missing — the consistency check above still describes this exact board.
+          attachCycleEvidence(hydratedBoard, cycles);
+          board = hydratedBoard;
+        } else {
+          // Hydration is its OWN `bd list --type gate` read, made after the consistency check above
+          // already passed — so it can itself land after another writer repairs the cycle `cycles`
+          // named and opens a DIFFERENT gate-only cycle under a different pair of gates (P2 review,
+          // PR #274, shadow.ts:193). `cycles` (fetched even earlier) would then still name only the
+          // repaired cycle while `hydratedBoard` reflects the newer graph, and `decide()` would pair
+          // a verdict with cycle evidence that no longer describes the board it was just attached to
+          // — an approve/unapprove shadow could then record a verdict the armed path's own locked
+          // reread would refuse. Re-fetch cycles and rebuild a comparably-hydrated fresh board — a
+          // plain `loadAllIssues` baseline structurally omits gate-only cycle members, the same
+          // asymmetry `issues.ts`'s own post-hydration recheck works around — before pairing.
+          const freshCycles = await beads.depCycles(input.repo);
+          const freshBase = await loadAllIssues(input.repo);
+          const freshHydratedBoard = await hydrateCycleOnlyGates(input.repo, freshBase, freshCycles);
+          const stillConsistent =
+            sameCycles(freshCycles, cycles) &&
+            sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
+            sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard);
+          if (stillConsistent) {
+            attachCycleEvidence(hydratedBoard, cycles);
+            board = hydratedBoard;
+          } else {
+            await write(
+              input,
+              "SHADOW board moved during gate hydration for cycle evidence — approve/unapprove verdicts fail closed",
+            );
+          }
+        }
       } else {
         await write(
           input,

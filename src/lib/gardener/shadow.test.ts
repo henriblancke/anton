@@ -539,6 +539,46 @@ describe("which proposals a pass shadows", () => {
     expect(listMock).toHaveBeenCalledWith(REPO, ["--status", "all", "--type", "gate"]);
     expect(records[0].outcome).toBe("settled");
   });
+
+  // P2 review (PR #274, shadow.ts:193): gate hydration is its OWN `bd list --type gate` read, made
+  // after the edge/liveness consistency check above already passed. On a shared-server board another
+  // writer can repair the cycle `cycles` named and open a DIFFERENT gate-only cycle while that read is
+  // in flight — this proves the re-fetch-and-compare added after hydration actually refuses on that
+  // drift instead of pairing the original (now stale) `cycles` with the newer gate graph.
+  it("re-verifies cycle evidence after hydrating gate-only cycle members, refusing when the graph moved during that read", async () => {
+    const unrelated = makeDetection({
+      kind: "degraded-approval",
+      move: "unapprove",
+      subjects: ["anton-a"],
+      summary: "anton-a's approval no longer holds",
+      evidence: ["anton-a's approval gap reopened"],
+    });
+    serve([bead("anton-a", { labels: ["approved"], acceptance_criteria: "- [ ] it works" })]);
+    const cycleA = [{ ids: ["gate1", "gate2"], raw: {} }];
+    const cycleB = [{ ids: ["gate3", "gate4"], raw: {} }];
+    depCyclesMock.mockResolvedValueOnce(cycleA).mockResolvedValueOnce(cycleB);
+    listMock
+      .mockResolvedValueOnce([
+        bead("gate1", { issue_type: "gate", status: "closed" }),
+        bead("gate2", { issue_type: "gate", status: "closed" }),
+      ])
+      .mockResolvedValueOnce([
+        bead("gate3", { issue_type: "gate", status: "open" }),
+        bead("gate4", { issue_type: "gate", status: "open" }),
+      ]);
+
+    const records = await shadow([filed(unrelated, "anton-p1")], {
+      policy: resolveProposalAutonomyPolicy({ "degraded-approval": "shadow" }),
+    });
+
+    expect(listMock).toHaveBeenCalledTimes(2);
+    expect(depCyclesMock).toHaveBeenCalledTimes(2);
+    expect(records[0].outcome).toBe("refuse");
+    expect(records[0].detail).toContain("authoritative `bd dep cycles` evidence is unavailable");
+    expect(recorded()).toContain(
+      "SHADOW board moved during gate hydration for cycle evidence — approve/unapprove verdicts fail closed",
+    );
+  });
 });
 
 describe("a shadow that cannot run", () => {

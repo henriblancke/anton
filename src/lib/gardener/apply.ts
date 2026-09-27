@@ -44,7 +44,7 @@
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
-import { loadAllIssues, sameBlocksEdges } from "../beads/issues";
+import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness } from "../beads/issues";
 import {
   notePrefix,
   planApply,
@@ -290,7 +290,13 @@ async function withCycleEvidenceIfNeeded(
   if (!CYCLE_AWARE_MOVES.has(plan.move)) return board;
   try {
     const cycles = await beads.depCycles(repo);
-    const consistent = sameBlocksEdges(board, await loadAllIssues(repo));
+    const freshBoard = await loadAllIssues(repo);
+    // `sameBlocksEdges` alone only proves the edges held steady — a cycle member can be reopened, or
+    // lose/gain its `abandoned` label, without moving an edge at all, and the approval gap this
+    // evidence feeds reads a cycle's blocking-ness off exactly that live/abandoned status (P2 review,
+    // PR #274, apply.ts:293). Check both, the same `boardStillMatchesCycles` pairing `loadAllIssues`
+    // itself runs.
+    const consistent = sameBlocksEdges(board, freshBoard) && sameCycleMemberLiveness(cycles, board, freshBoard);
     if (!consistent) {
       console.warn(
         `[gardener.apply] ${repo}: board moved between the board read and cycle evidence while ` +

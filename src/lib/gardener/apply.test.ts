@@ -1003,6 +1003,34 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/cycle-free/);
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
     });
+
+    // P2 review (PR #274): the guard above compared `blocks` edges alone. A cycle member can be
+    // reopened, or lose/gain its `abandoned` label, without moving an edge at all — and the
+    // approval-gap check this evidence feeds decides a cycle's blocking-ness purely off that
+    // live/abandoned status (`sameCycleMemberLiveness`). Same edges, different liveness, must still
+    // refuse rather than pair evidence with a board whose liveness it no longer describes.
+    it("refuses when a cycle member's live/abandoned status changes without moving an edge", async () => {
+      vi.spyOn(beads, "depCycles").mockResolvedValueOnce([
+        { ids: ["anton-x", "anton-y"], raw: { cycle: ["anton-x", "anton-y"] } },
+      ]);
+      const board = [startable({ labels: [LABELS.approved] }), blockedBy("anton-x", "anton-y"), bead("anton-y")];
+      // Same `blocks` edge (anton-x -> anton-y) both times — only anton-x's status moved, as if
+      // another writer closed or reopened it in the gap between the caller's read and this re-list.
+      listByFlags(async () => [
+        startable({ labels: [LABELS.approved] }),
+        blockedBy("anton-x", "anton-y", { status: "closed" }),
+        bead("anton-y"),
+      ]);
+
+      const err = (await applyWith(proposalFor(UNAPPROVE), board).catch(
+        (e) => e,
+      )) as InstanceType<typeof ProposalApplyError>;
+
+      expect(err.failure).toBe("refused");
+      expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
+      expect(err.message).toMatch(/cycle-free/);
+      expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
   });
 
   /**

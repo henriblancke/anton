@@ -290,7 +290,7 @@ export async function loadAllIssues(
 }
 
 /** Whether two `bd dep cycles` results name the same set of cycles (by member id set). */
-function sameCycles(a: DepCycle[], b: DepCycle[]): boolean {
+export function sameCycles(a: DepCycle[], b: DepCycle[]): boolean {
   const key = (c: DepCycle) => [...c.ids].sort().join(",");
   const toSet = (list: DepCycle[]) => new Set(list.map(key));
   const [setA, setB] = [toSet(a), toSet(b)];
@@ -596,8 +596,38 @@ export async function ensureCycleEvidence(
       issueSnapshotGeneration(cwd) === generation &&
       cycleEvidenceFor(board) === undefined
     ) {
-      attachCycleEvidence(board, cycles);
-      markCycleEvidenceRecovered(cwd);
+      // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
+      // gates blocking each other, nothing else pointing at either) — `board` never carried them, the
+      // same gap `loadAllIssues`'s own `withCycles` path hydrates (issues.ts:240). Left unhydrated,
+      // `structureGaps` can't map either id to a bead here and reports a synthetic, unscoped "board"
+      // fault instead of scoping it to the cycle's own subtree (P2 review, PR #274, issues.ts:599).
+      // Mutate `board` IN PLACE rather than rebuilding it, unlike `loadAllIssues`: this function's
+      // callers (the approve route) hold the exact array passed in and read it directly after this
+      // call returns — the returned value is often discarded — so a fresh array here would hydrate a
+      // copy nobody looks at.
+      const knownIds = new Set(board.map((bead) => bead.id));
+      const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
+      if (missingCycleIds.length > 0) {
+        const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
+        // Rebuilt from `board` AFTER the hydration await, not the `knownIds` captured before it: a
+        // concurrent caller sharing this same `board` array (evidence is keyed by identity) can have
+        // hydrated the same gates onto it while this listing was in flight, and pushing again would
+        // duplicate them.
+        const idsOnBoard = new Set(board.map((bead) => bead.id));
+        for (const gate of hydratedGates) {
+          if (!idsOnBoard.has(gate.id)) {
+            board.push(gate);
+            idsOnBoard.add(gate.id);
+          }
+        }
+      }
+      // Recheck evidence AFTER the hydration await too: the same race the outer check above guards
+      // against — a concurrent enrichment path attaching evidence, or the snapshot generation moving —
+      // can equally land while the gate listing was in flight.
+      if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+        attachCycleEvidence(board, cycles);
+        markCycleEvidenceRecovered(cwd);
+      }
     }
   }
   return board;

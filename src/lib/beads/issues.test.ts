@@ -1173,6 +1173,30 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(cycleEvidenceFor(board)).toBeUndefined();
     expect(issueSnapshotVersion(REPO)).toBe(before);
   });
+
+  it("hydrates gate-only cycle members into the board before attaching evidence (P2 review, PR #274, issues.ts:599)", async () => {
+    // Two gates blocking each other with no ordinary bead's edge dangling toward either: `board`
+    // carries no `blocks` edge of its own (the outer consistency check short-circuits without a
+    // re-list), so hydration is the only thing that lets a consumer of this evidence map either
+    // cycle member to a bead instead of reading a synthetic, unscoped "board" fault.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    const board = [solo];
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+    const generation = issueSnapshotGeneration(REPO);
+
+    const returned = await ensureCycleEvidence(REPO, board, generation);
+
+    // Mutated in place, not replaced: the approve route holds this exact array and reads it
+    // directly after the call, discarding the return value.
+    expect(returned).toBe(board);
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
 });
 
 describe("refreshAllIssuesRead", () => {
