@@ -64,3 +64,28 @@ export function formatCountdown(iso: string | null | undefined, now = Date.now()
   if (m > 0) return `${m}m`;
   return "<1m";
 }
+
+/**
+ * A measured elapsed span, compacted — `3d 4h`, `2h 15m`, `4m 32s`, `18s`.
+ *
+ * The backward-looking sibling of {@link formatCountdown}, over a DURATION rather than a timestamp:
+ * the ledger's active / lead / waiting figures are millisecond spans, and the three routinely differ
+ * by orders of magnitude within one feature (~20min active against ~14h lead when a run parks on a
+ * usage limit). Two units at most, largest first, so a table cell stays readable at either scale.
+ *
+ * Takes a number, never `undefined`. An absent duration is a fact about the MEASUREMENT — not
+ * delivered yet, or a span anton refuses to split — and only the caller knows which, so absence is
+ * rendered where that reason can be stated rather than flattened into a dash here.
+ */
+export function formatDuration(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  // A sub-second span is real work, so it reads as "some" rather than rounding down to nothing.
+  if (s === 0) return ms > 0 ? "<1s" : "0s";
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return h > 0 ? `${d}d ${h}h` : `${d}d`;
+  if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  if (m > 0) return s % 60 > 0 ? `${m}m ${s % 60}s` : `${m}m`;
+  return `${s}s`;
+}

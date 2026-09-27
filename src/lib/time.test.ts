@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatExactTime, formatRelativeTime } from "./time";
+import { formatDuration, formatExactTime, formatRelativeTime } from "./time";
 
 const NOW = Date.parse("2026-07-13T12:00:00Z");
 
@@ -31,5 +31,31 @@ describe("formatExactTime", () => {
   it("returns null for missing or unparseable input", () => {
     expect(formatExactTime(null)).toBeNull();
     expect(formatExactTime("nope")).toBeNull();
+  });
+});
+
+describe("formatDuration", () => {
+  it("reports at most two units, largest first", () => {
+    expect(formatDuration(18_000)).toBe("18s");
+    expect(formatDuration(272_000)).toBe("4m 32s");
+    expect(formatDuration(8_100_000)).toBe("2h 15m");
+    expect(formatDuration(275_400_000)).toBe("3d 4h");
+  });
+
+  it("drops a trailing zero unit rather than padding it", () => {
+    expect(formatDuration(120_000)).toBe("2m");
+    expect(formatDuration(7_200_000)).toBe("2h");
+    expect(formatDuration(172_800_000)).toBe("2d");
+  });
+
+  it("keeps a sub-second span visible instead of rounding it to nothing", () => {
+    // Real work that took a moment is not the same fact as no work at all, and the ledger's floor
+    // markers can only mean something if a measured span never reads as zero.
+    expect(formatDuration(400)).toBe("<1s");
+    expect(formatDuration(0)).toBe("0s");
+  });
+
+  it("clamps a negative span to zero rather than rendering a minus sign", () => {
+    expect(formatDuration(-5_000)).toBe("0s");
   });
 });
