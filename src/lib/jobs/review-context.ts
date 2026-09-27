@@ -11,7 +11,7 @@
  */
 import { acceptanceBody, goalBody, outOfScopeBody, verifyBody } from "../beads/contract";
 import { beads, type Bead } from "../beads/bd";
-import { isServerMode } from "../beads/board-mode";
+import { mayReachServerBoard } from "../beads/board-mode";
 import { loadAgentPrompt, stripFrontmatter, USER_AGENTS_DIR } from "../claude/agent-prompt";
 import { bundledSkillDigest, loadSkill } from "../claude/prompt";
 import { textDigest } from "../claude/skill-stamp.mjs";
@@ -334,7 +334,7 @@ export async function buildReviewPrompt(args: {
   // fetching on a server-backed board with confirmed ids to look up: a non-server board already hands
   // the reviewer a live `bd -C <repoPath>` read of its own, and a run with nothing confirmed has
   // nothing to fetch.
-  const serverMode = args.repoPath !== undefined && isServerMode(args.repoPath);
+  const serverMode = mayReachServerBoard(args.repoPath);
   const confirmedBoardEvidenceBeads =
     serverMode && args.repoPath && args.boardEvidenceByTicket && args.boardEvidenceByTicket.size > 0
       ? await fetchConfirmedBoardEvidenceBeads(args.repoPath, args.boardEvidenceByTicket)
@@ -667,7 +667,7 @@ function withoutCode(text: string): string {
  * Assembled from independent section builders so each stays testable in isolation.
  */
 export function reviewContext(run: ReviewRun): string {
-  const noBash = run.repoPath !== undefined && isServerMode(run.repoPath);
+  const noBash = mayReachServerBoard(run.repoPath);
   return [
     ...headerSection(run),
     ...beadsSection(run),
@@ -866,7 +866,7 @@ function boardEvidenceSection(
     .filter((e): e is { ticket: Bead; ids: string[] } => !!e.ids?.length)
     .map((e) => `- ${e.ticket.id}: ${e.ids.join(", ")}`);
   if (lines.length === 0 && !boardOnly) return [];
-  const serverMode = repoPath !== undefined && isServerMode(repoPath);
+  const serverMode = mayReachServerBoard(repoPath);
   const confirmedIds = [...new Set(tickets.flatMap((t) => boardEvidenceByTicket?.get(t.id) ?? []))];
   return [
     ...(lines.length > 0 ? [`The beads each ticket's confirmed evidence covers:`, ``, ...lines, ``] : []),

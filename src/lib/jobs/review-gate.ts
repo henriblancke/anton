@@ -13,12 +13,9 @@
  * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
  * wiring is what makes it unit-testable against a fake driver.
  */
-import { join } from "node:path";
 import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { scrubBdServerEnv } from "../beads/bd-env";
-import { isServerMode } from "../beads/board-mode";
-import { configYamlValue } from "../beads/config.mjs";
-import { readMetadataFile } from "../beads/server-mode.mjs";
+import { mayReachServerBoard } from "../beads/board-mode";
 import { metered, type ReasoningAttribution } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -371,30 +368,18 @@ export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit"
  * database and user into the COMMITTED `.beads/config.yaml`, so a clone with metadata.json missing or
  * unreadable can still have `bd` connect from that file alone — no env, no metadata.json needed
  * (bd's own precedence is env > metadata.json > config.yaml, so config.yaml is consulted whenever the
- * higher sources are silent). {@link boardConnectionUnproven} closes that gap: Bash is denied unless
- * metadata.json positively confirms embedded mode with an explicit `"dolt_mode": "embedded"` — an
- * absent, unreadable, or semantically incomplete file (e.g. `{}`, or an unrecognised `dolt_mode`,
- * both of which `readDoltMetadata`/`isServerMode` read as embedded by DEFAULT rather than by
- * declaration) is failed closed instead, by checking whether config.yaml declares any of the
- * connection fields a server switch would have written.
+ * higher sources are silent). {@link mayReachServerBoard} (board-mode.ts) closes that gap: Bash is
+ * denied unless metadata.json positively confirms embedded mode with an explicit
+ * `"dolt_mode": "embedded"` — an absent, unreadable, or semantically incomplete file (e.g. `{}`, or an
+ * unrecognised `dolt_mode`, both of which `readDoltMetadata`/`isServerMode` read as embedded by
+ * DEFAULT rather than by declaration) is failed closed instead, by checking whether config.yaml
+ * declares any of the connection fields a server switch would have written. Shared with
+ * `review-context.ts` (chatgpt-codex-connector, PR #284 review, "Use the fail-closed board mode when
+ * supplying review evidence") so the tool denial and the evidence this session is handed can never
+ * disagree about which boards count as reachable.
  */
-function boardConnectionUnproven(repoPath: string): boolean {
-  // metadata.json is per-directory truth and outranks config.yaml (bd's own precedence), but only an
-  // EXPLICIT "embedded" declaration counts as proof: `isServerMode`'s "embedded" answer is also what
-  // a missing/unrecognised `dolt_mode` reads as (readDoltMetadata's safe default), so a file that
-  // merely parsed — `{}`, `{"dolt_mode": "nonsense"}` — must not short-circuit this check the same
-  // way a real declaration does.
-  const meta = readMetadataFile(repoPath);
-  if (meta.status === "read" && meta.raw?.dolt_mode === "embedded") return false;
-  const beadsDir = join(repoPath, ".beads");
-  return ["dolt.host", "dolt.port", "dolt.database", "dolt.user"].some(
-    (key) => configYamlValue(beadsDir, key) !== undefined,
-  );
-}
-
 export function reviewDeniedTools(repoPath: string | undefined): string[] {
-  const mayReachServer = repoPath !== undefined && (isServerMode(repoPath) || boardConnectionUnproven(repoPath));
-  return mayReachServer ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
+  return mayReachServerBoard(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
 }
 
 /**
@@ -1554,6 +1539,18 @@ async function runGateFixSession(args: {
       `[review-fix] round ${round}/${maxRounds}: fixing ${findings.length} blocking finding(s)\n`,
     );
     const before = await args.readState(worktreePath);
+    // Resolved and admitted BEFORE the board-dispatch marker below is ever written (chatgpt-codex-
+    // connector, PR #284 review, "Mark dispatch only after the child actually starts"): both are
+    // synchronous/network bookkeeping with nothing left that can fail between the marker and the
+    // `claude(...)` call further down, so once the marker lands there is essentially nothing standing
+    // between it and the actual spawn. Previously these ran INSIDE the nested try below, after
+    // marking — a `ctx.claudeReached` failure there left a durable "dispatch started" marker for a
+    // fixer that never ran, which a resumed round would then trust as a genuine post-dispatch recovery
+    // and skip refreshing, letting unrelated board drift from that window get credited to a later
+    // no-op fixer as progress. A failure here now has nothing board-related to unwind yet, so the
+    // simpler outer catch below is sufficient.
+    const fixRouting = claudeRouting(settings);
+    await ctx.claudeReached(quotaMeterKey(settings));
     // The board's OWN "before", read alongside the tree's (PR #284 review round 13) — only for a
     // board-only run, whose fixer's actual deliverable is a bd write this worktree's git state can
     // never show. A prior, interrupted round's own persisted snapshot (see below) is preferred over
@@ -1656,8 +1653,6 @@ async function runGateFixSession(args: {
     let verified = false;
 
     try {
-      const fixRouting = claudeRouting(settings);
-      await ctx.claudeReached(quotaMeterKey(settings));
       const result = await claude({
         cwd: worktreePath,
         prompt,

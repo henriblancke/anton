@@ -32,7 +32,9 @@
 import { statSync } from "node:fs";
 import { join } from "node:path";
 
+import { configYamlValue } from "./config.mjs";
 import { readDoltMetadata } from "./config.mjs";
+import { readMetadataFile } from "./server-mode.mjs";
 
 export type BoardMode = "embedded" | "server";
 
@@ -140,4 +142,49 @@ export function readBoardMode(repoPath: string): BoardModeInfo {
 /** Convenience predicate for the many call sites that only branch on server-vs-not. */
 export function isServerMode(repoPath: string): boolean {
   return readBoardMode(repoPath).mode === "server";
+}
+
+/**
+ * Whether `repoPath`'s board connection is anything other than a PROVEN embedded board (originally
+ * `boardConnectionUnproven`, review-gate.ts, PR #284 review round 18, "Deny Bash instead of only the
+ * bd command prefix"; hoisted here so every fail-closed consumer — not just the review gate's tool
+ * denial — shares one classification).
+ *
+ * `isServerMode` alone is not enough for a caller that must fail closed: it reads a
+ * missing/unreadable/malformed `.beads/metadata.json` as `embedded` (the safe default for sync — see
+ * this module's own docstring), which is exactly wrong for a caller deciding whether it is safe to
+ * assume no server exists. Only an EXPLICIT `"dolt_mode": "embedded"` counts as proof; anything else
+ * — absent, unreadable, or a `{}`/unrecognised `dolt_mode` that `readDoltMetadata` also defaults to
+ * embedded — falls through to checking whether the COMMITTED `.beads/config.yaml` still declares a
+ * server connection. `configureServerMode`'s switch flow (server-mode.mjs, `publishedConfigWrites`)
+ * publishes the server's host, port, database and user into that file, so a clone with metadata.json
+ * missing or unreadable can still have `bd` connect from config.yaml alone (bd's own precedence is
+ * env > metadata.json > config.yaml, so config.yaml is consulted whenever the higher sources are
+ * silent).
+ */
+export function boardConnectionUnproven(repoPath: string): boolean {
+  const meta = readMetadataFile(repoPath);
+  if (meta.status === "read" && meta.raw?.dolt_mode === "embedded") return false;
+  const beadsDir = join(repoPath, ".beads");
+  return ["dolt.host", "dolt.port", "dolt.database", "dolt.user"].some(
+    (key) => configYamlValue(beadsDir, key) !== undefined,
+  );
+}
+
+/**
+ * The fail-closed predicate for anything that must not treat an unreadable/ambiguous board as safely
+ * embedded — a confirmed server, OR a connection this project's own files cannot prove is embedded.
+ * `undefined` (no repo to check) reads as "cannot reach a server", the same as every other
+ * `repoPath === undefined` guard in these call sites.
+ *
+ * One shared classification for every consumer that denies capability based on it: `reviewDeniedTools`
+ * (review-gate.ts) denying `Bash` outright, and `review-context.ts` deciding whether the reviewer gets
+ * a live `bd -C <repoPath>` instruction or anton's own host-side confirmed-bead snapshot. Two separate
+ * `isServerMode`-only checks answering that question drift apart the moment one of them is hardened —
+ * exactly what happened before this predicate existed (chatgpt-codex-connector, PR #284 review, "Use
+ * the fail-closed board mode when supplying review evidence"): `reviewDeniedTools` denied Bash while
+ * `boardEvidenceSection` still told a board-only reviewer to reach for the very tool it was denied.
+ */
+export function mayReachServerBoard(repoPath: string | undefined): boolean {
+  return repoPath !== undefined && (isServerMode(repoPath) || boardConnectionUnproven(repoPath));
 }

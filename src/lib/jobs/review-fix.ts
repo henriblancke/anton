@@ -963,6 +963,30 @@ async function runFixSession(args: {
       `[review-fix] PR #${number}: ${verdict.reasons.join("; ")}\n`,
     );
 
+    // Built, routed, and quota-admitted BEFORE the board-dispatch marker below is ever written
+    // (chatgpt-codex-connector, PR #284 review, "Mark dispatch only after the child actually
+    // starts"): everything from here down to the `metered(...)(runClaude)(...)` call is synchronous
+    // bookkeeping with nothing left that can fail, so once the marker lands there is essentially
+    // nothing standing between it and the actual spawn. The previous order ran this same
+    // prompt-build/routing/quota-admission work AFTER marking dispatch as started — a plain
+    // exception here (a git read failing, no host crash required) left a durable "dispatch started"
+    // marker for a fixer that never ran, which a resumed attempt would then trust as a genuine
+    // post-dispatch recovery and skip refreshing, letting unrelated board drift from that window get
+    // credited to a later no-op fixer as progress.
+    const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: verdict.reasons,
+      conflicts,
+      settings,
+      projectDir: worktree.path,
+      boardOnly,
+      mixedBoardOnly,
+      repoPath: repo,
+    });
+    const routing = claudeRouting(settings);
+    await ctx.claudeReached(quotaMeterKey(settings));
+
     // The board's OWN "before" (mirrors review-gate.ts's `runGateFixSession`, PR #284 review,
     // "Wire board-only handling into PR review fixes"): a board-only ticket's fix is a `bd` write to
     // the LIVE board at `repo`, not this worktree's own (separate, unsynced) copy, and this
@@ -1051,20 +1075,6 @@ async function runFixSession(args: {
       boardBefore = dispatchStabilizedBaseline;
     }
 
-    const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
-      epic,
-      pr,
-      reasons: verdict.reasons,
-      conflicts,
-      settings,
-      projectDir: worktree.path,
-      boardOnly,
-      mixedBoardOnly,
-      repoPath: repo,
-    });
-
-    const routing = claudeRouting(settings);
-    await ctx.claudeReached(quotaMeterKey(settings));
     const result = await metered(db, clock, {
       projectId,
       jobType: ctx.type,
