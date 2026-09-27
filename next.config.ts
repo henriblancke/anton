@@ -12,6 +12,15 @@ const nextConfig: NextConfig = {
   // Keep native addons as real external files (not bundled) so their compiled `.node` binaries are
   // traced into the standalone output intact.
   serverExternalPackages: ["better-sqlite3", "node-pty"],
+  // The off-thread build-identity reader (anton-fzarz) is started with `new Worker(<path>)` at run
+  // time, so nft cannot see it: webpack bundles `identity.mjs` into the server chunk and neither file
+  // survives as a real sibling in `.next/standalone`. Both are named because an include COPIES
+  // matches rather than re-tracing them — the worker alone would land beside no `./identity.mjs` to
+  // import, and die at module load. `scripts/build-bundle.mjs` stages the same two files for the
+  // release bundle, whose stage is assembled from the repo rather than from this output.
+  outputFileTracingIncludes: {
+    "/**": ["src/lib/build/identity-worker.mjs", "src/lib/build/identity.mjs"],
+  },
 };
 
 export default nextConfig;
