@@ -384,15 +384,20 @@ export function sameBlocksEdges(a: Bead[], b: Bead[]): boolean {
 }
 
 /**
- * Whether every id `cycles` reports still carries the same live/abandoned status in `b` as it does
- * in `a`. `sameBlocksEdges` alone can't see this drift: a bead being reopened or losing/gaining its
- * `abandoned` label touches no `blocks` edge, yet `validateBoardStructure`'s cycle rule (tiers.mjs's
- * `isLive`/`isJudged`) decides whether a reported cycle faults at all purely off those two fields
- * (P2 review, PR #274, issues.ts:312) — a member reopened between the board read and the `bd dep
- * cycles` fetch can flip a cycle from "historical, no live member, quiet" to "live, deadlocking"
- * without moving a single edge. An edge-only consistency check waves that pairing through with a
- * verdict computed against the stale, still-closed status, so every `sameBlocksEdges` gate that
- * decides whether cycle evidence is safe to attach must also check this.
+ * Whether every id `cycles` reports still carries the same live/abandoned status AND the same parent
+ * in `b` as it does in `a`. `sameBlocksEdges` alone can't see either drift: a bead being reopened or
+ * losing/gaining its `abandoned` label touches no `blocks` edge, yet `validateBoardStructure`'s cycle
+ * rule (tiers.mjs's `isLive`/`isJudged`) decides whether a reported cycle faults at all purely off
+ * those two fields (P2 review, PR #274, issues.ts:312) — a member reopened between the board read and
+ * the `bd dep cycles` fetch can flip a cycle from "historical, no live member, quiet" to "live,
+ * deadlocking" without moving a single edge. Reparenting a cycle member is the same kind of gap for a
+ * different reader: `structureGaps` scopes a `blocks-cycle` fault to the TARGET's own subtree via
+ * `descendantsOf`'s parent walk, so a member reparented out of the run that owns it in `a` and into a
+ * different one between the two reads leaves both `blocks` edges and live/abandoned status unchanged
+ * while the fault's rightful owner moves — the old target keeps a fault over a bead it no longer owns
+ * and the new one is approved or executed without ever seeing the cycle it now contains (P2 review, PR
+ * #274, issues.ts:419). Every `sameBlocksEdges` gate that decides whether cycle evidence is safe to
+ * attach must also check this.
  */
 export function sameCycleMemberLiveness(cycles: DepCycle[], a: Bead[], b: Bead[]): boolean {
   const memberIds = new Set(cycles.flatMap((c) => c.ids));
@@ -401,7 +406,8 @@ export function sameCycleMemberLiveness(cycles: DepCycle[], a: Bead[], b: Bead[]
     const byId = new Map(list.map((bead) => [bead.id, bead]));
     return (id: string) => {
       const bead = byId.get(id);
-      return bead ? `${bead.status}:${(bead.labels ?? []).includes("abandoned")}` : undefined;
+      if (!bead) return undefined;
+      return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${beads.parentOf(bead) ?? ""}`;
     };
   };
   const [keyA, keyB] = [liveKey(a), liveKey(b)];
@@ -410,10 +416,10 @@ export function sameCycleMemberLiveness(cycles: DepCycle[], a: Bead[], b: Bead[]
 
 /**
  * Whether `fresh` is still safe to pair `cycles` against, the way `board` was about to be: the same
- * `blocks` edges AND the same live/abandoned status for every id `cycles` reports. Either can drift
- * without the other moving — see {@link sameBlocksEdges} and {@link sameCycleMemberLiveness} — so
- * every consistency gate that decides whether to attach `cycles` to a board must check both, not
- * just the edges.
+ * `blocks` edges AND the same live/abandoned status AND parent for every id `cycles` reports. Any of
+ * these can drift without the others moving — see {@link sameBlocksEdges} and
+ * {@link sameCycleMemberLiveness} — so every consistency gate that decides whether to attach `cycles`
+ * to a board must check both, not just the edges.
  */
 function boardStillMatchesCycles(cycles: DepCycle[], board: Bead[], fresh: Bead[]): boolean {
   return sameBlocksEdges(board, fresh) && sameCycleMemberLiveness(cycles, board, fresh);

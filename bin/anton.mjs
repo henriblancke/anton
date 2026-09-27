@@ -1508,12 +1508,15 @@ function bdDepCycles(repo) {
 }
 
 /**
- * Whether every id `cycles` names carries the same live/abandoned status in both board snapshots.
- * `sameBlocksEdges` alone only proves the `blocks` EDGES held steady — another writer can reopen a
- * closed cycle member, or toggle its `abandoned` label, without touching any edge at all (P2 review,
- * PR #274). `validateBoardStructure` reads a cycle's blocking-ness off its members' live/abandoned
- * status, not off the edges, so that drift would pair fresh cycle evidence with stale liveness and
- * could pass a cycle that just went live, or fault one that just went dead. Mirrors
+ * Whether every id `cycles` names carries the same live/abandoned status AND the same parent in both
+ * board snapshots. `sameBlocksEdges` alone only proves the `blocks` EDGES held steady — another writer
+ * can reopen a closed cycle member, or toggle its `abandoned` label, without touching any edge at all
+ * (P2 review, PR #274). `validateBoardStructure` reads a cycle's blocking-ness off its members'
+ * live/abandoned status, not off the edges, so that drift would pair fresh cycle evidence with stale
+ * liveness and could pass a cycle that just went live, or fault one that just went dead. A reparent is
+ * the same kind of gap for `buildStructureReport`'s subtree-scoped fault attribution: moving a cycle
+ * member to a different parent between the two reads leaves edges and live/abandoned status alone
+ * while the fault's rightful owner moves (P2 review, PR #274, issues.ts:419). Mirrors
  * `src/lib/beads/issues.ts`'s `sameCycleMemberLiveness`, which this plain-Node launcher can't import
  * (that file is TS).
  */
@@ -1524,7 +1527,9 @@ function sameCycleMemberLiveness(cycles, a, b) {
     const byId = new Map(board.map((bead) => [bead.id, bead]));
     return (id) => {
       const bead = byId.get(id);
-      return bead ? `${bead.status}:${(bead.labels ?? []).includes("abandoned")}` : undefined;
+      if (!bead) return undefined;
+      const parent = bead.parent ?? bead.parent_id ?? "";
+      return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${parent}`;
     };
   };
   const [keyA, keyB] = [liveKey(a), liveKey(b)];

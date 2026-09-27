@@ -41,10 +41,10 @@
  * The module reads as composition (anton-ni1j): the DECISION lives in apply-plan.ts, the WRITES in
  * apply-steps.ts, and this file is what locks the proposal, asks the one for the other, and settles.
  */
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, type Bead, type DepCycle } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
-import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness } from "../beads/issues";
+import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness, sameCycles } from "../beads/issues";
 import {
   notePrefix,
   planApply,
@@ -282,6 +282,27 @@ export const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["ap
  * for their own, differently-shaped callers) would let a cycle that only exists because of that new
  * edge get attached to a board snapshot that predates it.
  */
+/**
+ * A cycle can be made entirely of gates no work bead's `blocks` edge dangles toward (two gates
+ * blocking each other, nothing else pointing at either) — `board` never carried them, so
+ * `cycleMembers` can't map either id to a bead and reads a real, narrowly-scoped cycle as an
+ * unreadable board-wide fault, refusing an unrelated approval and letting an unrelated `unapprove`
+ * treat that synthetic fault as confirmed degradation (P2 review, PR #274, apply.ts:309). Hydrate
+ * whatever `cycles` names that `board` is still missing before attaching, same as `loadAllIssues`'s
+ * own `withCycles` path and `shadow.ts`'s copy of this helper.
+ */
+async function hydrateCycleOnlyGates(repo: string, board: Bead[], cycles: DepCycle[]): Promise<Bead[]> {
+  const knownIds = new Set(board.map((bead) => bead.id));
+  const missingCycleIds = [...new Set(cycles.flatMap((cycle) => cycle.ids))].filter(
+    (id) => !knownIds.has(id),
+  );
+  if (missingCycleIds.length === 0) return board;
+  const gates = await beads.list(repo, ["--status", "all", "--type", "gate"]);
+  const byId = new Map(board.map((bead) => [bead.id, bead]));
+  for (const gate of gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+  return [...byId.values()];
+}
+
 async function withCycleEvidenceIfNeeded(
   repo: string,
   plan: GardenerPlan,
@@ -306,7 +327,31 @@ async function withCycleEvidenceIfNeeded(
       );
       return board;
     }
-    return attachCycleEvidence(board, cycles);
+    const hydratedBoard = await hydrateCycleOnlyGates(repo, board, cycles);
+    if (hydratedBoard === board) return attachCycleEvidence(hydratedBoard, cycles);
+    // Hydration is its OWN `bd list --type gate` read, made after the consistency check above already
+    // passed — so it can itself land after another writer repairs the cycle `cycles` named and opens a
+    // DIFFERENT gate-only cycle under a different pair of gates, the same gap `shadow.ts` guards
+    // against. Re-fetch cycles and rebuild a comparably-hydrated fresh board before pairing — a plain
+    // `loadAllIssues` baseline structurally omits gate-only cycle members, so it can't be reused as the
+    // comparison target.
+    const freshCycles = await beads.depCycles(repo);
+    const freshBase = await loadAllIssues(repo);
+    const freshHydratedBoard = await hydrateCycleOnlyGates(repo, freshBase, freshCycles);
+    const stillConsistent =
+      sameCycles(freshCycles, cycles) &&
+      sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
+      sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard);
+    if (!stillConsistent) {
+      console.warn(
+        `[gardener.apply] ${repo}: board moved during gate hydration for cycle evidence while ` +
+          `applying a "${plan.move}" proposal — proceeding without cycle evidence, so its own ` +
+          `approval-gap check fails closed on the missing evidence rather than pairing it with a ` +
+          `board it may no longer describe`,
+      );
+      return board;
+    }
+    return attachCycleEvidence(hydratedBoard, cycles);
   } catch (e) {
     console.warn(
       `[gardener.apply] ${repo}: dep cycles read failed while applying a "${plan.move}" proposal — ` +
