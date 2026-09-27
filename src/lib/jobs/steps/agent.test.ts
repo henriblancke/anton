@@ -362,7 +362,7 @@ describe("step:claude", () => {
       }),
     );
 
-    expect(metered[0]).toMatchObject({ step: "smoke", skillId: "smoke" });
+    expect(metered[0]).toMatchObject({ step: "smoke", skillId: "smoke", skillIsDefault: false });
     expect(metered[0].promptId).toBeUndefined();
     expect(metered[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
     expect(metered[0].promptBodyDigest).toBeUndefined();

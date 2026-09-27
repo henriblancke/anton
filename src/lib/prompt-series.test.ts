@@ -738,6 +738,66 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
   });
 });
 
+describe("promptSeries: the prompt dimension ignores the describer's own system prompt", () => {
+  it("does not treat an agent-run feature's describer digest as a second prompt", () => {
+    // `step:describe` composes base+seed only (no agent layer), so an agent-run feature's describer
+    // invocation records a DIFFERENT promptDigest than the implementer that actually did the work
+    // (PR #331 review). Counting it would throw nearly every agent-run delivered feature into
+    // `spanning` instead of the cohort its implementation ran under.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { promptDigest: "base-only-digest", stepHandler: "describe" },
+          { promptDigest: NEW_PROMPT, stepHandler: "implement" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "prompt");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe(NEW_PROMPT);
+  });
+
+  it("still treats two REAL implementation prompts on one feature as spanning", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { promptDigest: OLD_PROMPT, stepHandler: "implement" },
+          { promptDigest: NEW_PROMPT, stepHandler: "implement" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "prompt");
+    expect(series.spanning).toEqual({ delivered: 1, features: 1 });
+    expect(series.cohorts).toEqual([]);
+  });
+
+  it("still counts the describer's digest under every OTHER dimension", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [{ formulaDigest: "formula-digest", stepHandler: "describe" }],
+      },
+    ];
+
+    const series = promptSeries(feature, "formula");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("formula-digest");
+  });
+});
+
 describe("promptSeries: what the cohort reports about the antons it spans", () => {
   it("flags a cohort whose features ran under two antons", () => {
     const series = promptSeries(

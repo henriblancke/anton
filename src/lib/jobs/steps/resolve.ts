@@ -100,6 +100,14 @@ export interface StepReasoning {
   skillId?: string;
   /** Content digest of the skill directory that answered. Absent when it could not be taken. */
   skillDigest?: string;
+  /**
+   * Always `false` here: a `skill:<id>` LABEL is a project's own explicit choice, never anton's
+   * scaffolding fallback (which only `describe`/`review`/`review-fix`/`scan-triage` fall into when a
+   * project configures nothing at all). Stamped explicitly so `prompt-series.ts`'s
+   * `isScaffoldingFallback` never mistakes this row for the fallback just because `skillId` collides
+   * with one of those names (PR #331 review) — the bug its id-only heuristic exists to avoid.
+   */
+  skillIsDefault?: false;
 }
 
 /**
@@ -130,7 +138,9 @@ export async function loadStepReasoning(ctx: StepContext, stepId: string): Promi
   const skillId = labelValueOf(ctx.step?.labels, "skill");
   if (skillId) {
     const skill = await loadProjectSkill(ctx.worktreePath, skillId);
-    if (skill) return { text: skill.text, skillId, skillDigest: digestOf(skill.dir) };
+    if (skill) {
+      return { text: skill.text, skillId, skillDigest: digestOf(skill.dir), skillIsDefault: false };
+    }
     throw new PoisonEpic(
       `formula step "${stepId}" names \`skill:${skillId}\`, which resolves to no skill — add ` +
         `\`.claude/skills/${skillId}/SKILL.md\` to the project, or correct the label`,

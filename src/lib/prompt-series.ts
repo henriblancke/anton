@@ -460,6 +460,13 @@ export interface CohortStampRow {
    * those rather than treating "unmarked" as "explicit".
    */
   skillIsDefault?: boolean | null;
+  /**
+   * The resolved formula-step handler this row ran under (`claude-invocations.ts`'s `stepHandler`) —
+   * read only to tell `step:describe`'s own invocations apart from every other phase (PR #331
+   * review). Not a general phase classifier: the fold reads exactly one literal off it, named at
+   * {@link DESCRIBER_STEP_HANDLER}.
+   */
+  stepHandler?: string | null;
 }
 
 /**
@@ -563,6 +570,21 @@ function isScaffoldingFallback(row: CohortStampRow): boolean {
 }
 
 /**
+ * `step:describe`'s own formula-step handler (`resolve.ts`'s `stepName`, `feature-ledger.ts`'s
+ * `HANDLER_PHASES.describe`) — the one phase whose composed system prompt is structurally narrower
+ * than every other, by construction rather than by choice.
+ *
+ * `describe.ts` composes base+seed only (no `agentPrompt`), while `step:implement` and both PR-fix
+ * paths compose base+agent+seed (PR #331 review): a ticket carrying an `agent:` tag therefore runs
+ * its describer under a DIFFERENT `promptDigest` than the one that actually did the work, on every
+ * such feature. Reading that describer digest as a second "prompt" this feature ran under makes
+ * `featureKeys(feature, "prompt")` see two keys and throws the feature into {@link SpanningFeatures}
+ * instead of the cohort its implementation ran under — silently excluding nearly every agent-run
+ * delivered feature from the one dimension meant to measure it.
+ */
+const DESCRIBER_STEP_HANDLER = "describe";
+
+/**
  * One stamp value as a cohort key, or `undefined` for a row that recorded none.
  *
  * A blank or whitespace-only stamp is ABSENT rather than a distinct key, the same reading
@@ -571,6 +593,10 @@ function isScaffoldingFallback(row: CohortStampRow): boolean {
  */
 function stampValue(row: CohortStampRow, dimension: CohortDimension): string | undefined {
   if (dimension === "skill" && isScaffoldingFallback(row)) return undefined;
+  // The describer's own system prompt is scaffolding for THIS dimension only — see
+  // DESCRIBER_STEP_HANDLER. It still counts under every other dimension (formula, anton, agent,
+  // skill), where its composition carries no such asymmetry.
+  if (dimension === "prompt" && row.stepHandler === DESCRIBER_STEP_HANDLER) return undefined;
   const raw = row[DIMENSION_COLUMNS[dimension]];
   const value = typeof raw === "string" ? raw.trim() : "";
   return value || undefined;

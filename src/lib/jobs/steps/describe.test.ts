@@ -627,6 +627,25 @@ describe("step:describe", () => {
       }
     });
 
+    it("stamps skillIsDefault: false on a skill: label, even one colliding with a scaffolding name (PR #331 review)", async () => {
+      // A project is free to name its own `.claude/skills/review` — a real, explicit choice — and
+      // that row must not be misread by `prompt-series.ts`'s `isScaffoldingFallback` as the bundled
+      // describe/review/review-fix/scan-triage fallback just because the id collides.
+      commitFile(".claude/skills/review/SKILL.md", skillFile("review", "DESCRIBE AS THE PROJECT'S OWN REVIEW SKILL."));
+      const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
+
+      await describeStep(
+        ctx({
+          step: { id: "describe", labels: ["step:describe", "skill:review"] },
+          deps: { runClaude: claude.run },
+        }),
+      );
+
+      const [invocation] = await tdb.db.select().from(schema.claudeInvocations);
+      expect(invocation.skillId).toBe("review");
+      expect(invocation.skillIsDefault).toBe(false);
+    });
+
     it("falls through to the next tier when the named prompt resolves to nothing", async () => {
       const claude = fakeClaude(report(JSON.stringify({ narrative: { summary: "did stuff" } })));
 

@@ -27,6 +27,7 @@ import {
   type CohortMetrics,
   type CohortSample,
   type CohortSeries,
+  type SpanningFeatures,
 } from "@/lib/prompt-series";
 
 afterEach(cleanup);
@@ -69,8 +70,12 @@ function basisOf(current: CohortSample): CohortBasis {
   return { features: current.n, unpricedFeatures: 0 };
 }
 
-function series(cohorts: Cohort[], dimension: CohortDimension = "prompt"): CohortSeries {
-  return { dimension, cohorts, spanning: { delivered: 0, features: 0 } };
+function series(
+  cohorts: Cohort[],
+  dimension: CohortDimension = "prompt",
+  spanning: SpanningFeatures = { delivered: 0, features: 0 },
+): CohortSeries {
+  return { dimension, cohorts, spanning };
 }
 
 const rowFor = (key: string) => screen.getByText(key).closest("tr")!;
@@ -304,6 +309,29 @@ describe("no cohorts yet", () => {
 
     expect(screen.getByText(/No cohorts to compare last 7 days/)).toBeTruthy();
     expect(screen.getByText(/empty comparison, not a flat one/)).toBeTruthy();
+  });
+
+  // Every delivered feature in scope can still name more than one value of the dimension — zero
+  // cohorts with a nonzero spanning remainder is a different state than nothing having accrued, and
+  // this empty view must say so rather than reading as "no cohort data accrued" (PR #331 review).
+  it("says features spanned rather than reading as if nothing accrued, when every delivered feature spans", () => {
+    render(
+      <CohortView
+        window="all"
+        series={series([], "prompt", { delivered: 3, features: 4 })}
+      />,
+    );
+
+    expect(screen.getByText(/No cohorts to compare yet/)).toBeTruthy();
+    expect(
+      screen.getByText(/3 delivered features named more than one prompt in scope/),
+    ).toBeTruthy();
+  });
+
+  it("says nothing extra about spanning when nothing delivered spans", () => {
+    render(<CohortView window="all" series={series([])} />);
+
+    expect(screen.queryByText(/named more than one/)).toBeNull();
   });
 });
 

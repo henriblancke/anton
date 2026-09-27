@@ -100,6 +100,7 @@ export function CohortView({
           windowLabel={windowLabel}
           allTime={window === "all"}
           dimensionLabel={dimension?.label ?? series.dimension}
+          spanning={series.spanning}
         />
       )}
     </div>
@@ -217,15 +218,23 @@ function Stat({ label, value, hint }: { label: string; value: string; hint: stri
  * act on — that deliveries are the unit, how many of them a verdict needs, and that two cohorts are
  * needed for a comparison rather than one. A narrower window at least has a wider one to try, which
  * is the one case where the fix is on this page.
+ *
+ * `spanning` rides along even here (PR #331 review): `promptSeries` can return zero cohorts while
+ * `spanning.delivered` is nonzero — every delivered feature in scope named more than one value of
+ * this dimension. That is a different state than "nothing has accrued yet", and this view must not
+ * collapse the two: an operator reading "no cohorts to compare" with no further word would conclude
+ * anton has delivered nothing, when in truth it delivered plenty and none of it could be attributed.
  */
 function NothingToCompare({
   windowLabel,
   allTime,
   dimensionLabel,
+  spanning,
 }: {
   windowLabel: string;
   allTime: boolean;
   dimensionLabel: string;
+  spanning: SpanningFeatures;
 }) {
   return (
     <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border px-6 py-12 text-center">
@@ -266,6 +275,13 @@ function NothingToCompare({
             </span>
           </li>
         </ul>
+        {spanning.delivered > 0 ? (
+          <p role="status" className="max-w-md text-[11px] leading-relaxed text-risk-med">
+            {spanning.delivered} delivered feature{spanning.delivered === 1 ? "" : "s"} named more
+            than one {dimensionLabel} in scope and so belongs to no cohort — that is why this
+            comparison is empty, not because nothing has been delivered.
+          </p>
+        ) : null}
       </div>
     </div>
   );
