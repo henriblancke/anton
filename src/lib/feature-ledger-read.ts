@@ -20,7 +20,7 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import { parseTicketNotes } from "./beads/notes";
-import { invocationsForBeads } from "./claude-invocations";
+import { invocationsForBeads, type ClaudeInvocationRow } from "./claude-invocations";
 import { getDb } from "./db";
 import { escalationsForBeads, type EscalationRow } from "./escalations";
 import {
@@ -57,6 +57,14 @@ export interface FeatureLedger {
   timing: LedgerTiming;
   /** The intervention counters, every one a PROXY signal — see {@link LedgerFriction}. */
   friction: LedgerFriction;
+  /**
+   * The scope's raw `claude_invocations` rows, unfiltered — the same read `totals`/`timing` are
+   * folded from. Exposed so a caller that already needs this ledger (`cohort-read.ts`) does not
+   * re-run `invocationsForBeads` over the identical scope for its own copy of the rows.
+   */
+  rows: readonly ClaudeInvocationRow[];
+  /** The scope's last delivery, epoch ms — {@link lastDeliveryMs}, same value `timing.leadMs` ends at. */
+  deliveredAtMs: number | undefined;
 }
 
 /** What a caller can hand this read instead of letting it fetch — see {@link featureLedger}. */
@@ -109,17 +117,20 @@ export async function featureLedger(
   // the bucket level (design §D4) — otherwise a scheduled pass attributed to this scope would
   // silently inflate the feature's own `activeMs` (PR #329 review).
   const timingRows = rows.filter((row) => !isOverheadRow(row));
+  const deliveredAtMs = lastDeliveryMs(deliveries, scope.ids);
 
   return {
     scope,
     totals: ledgerTotals(rows, gatewayPricing),
-    timing: ledgerTiming(timingRows, lastDeliveryMs(deliveries, scope.ids)),
+    timing: ledgerTiming(timingRows, deliveredAtMs),
     friction: ledgerFriction({
       rounds,
       jobs,
       escalations: scopedEscalations(board, scope, escalations),
       notes: sendBackNotes(board, scope.ids),
     }),
+    rows,
+    deliveredAtMs,
   };
 }
 

@@ -15,24 +15,23 @@
  * first landed months earlier is not truncated to the window's slice of it; the alternative would
  * shrink `usdPerFeature` by whatever the window happened to clip.
  *
- * ## Composed from the same reads a single feature's ledger page already makes
+ * ## Composed from the one read a single feature's ledger page already makes
  *
  * `featureLedger` answers `usd` (`totals.totals.usd`) and the three friction counters exactly as
- * {@link CohortFeature}'s own field comments name them; `listDeliveriesByBead` is the same
- * evidence `feature-ledger-read.ts` uses for `leadMs`, read here for `delivered`/`deliveredAtMs`
- * instead. Nothing here re-derives what those modules already own — this module's only job is
- * picking WHICH run targets to ask them about and shaping the answer into what the pure fold reads.
+ * {@link CohortFeature}'s own field comments name them, and now also exposes the raw invocation
+ * `rows` and `deliveredAtMs` it already folded `totals`/`timing` from — so this module asks it
+ * ONCE per feature rather than re-running its invocation and delivery reads over the same scope.
+ * Nothing here re-derives what that module already owns — this module's only job is picking WHICH
+ * run targets to ask it about and shaping the answer into what the pure fold reads.
  */
 import { beads, type Bead } from "./beads/bd";
-import { invocationsForBeads, listInvocations } from "./claude-invocations";
+import { listInvocations } from "./claude-invocations";
 import { getDb } from "./db";
-import { lastDeliveryMs } from "./feature-ledger";
 import { featureLedger } from "./feature-ledger-read";
-import { currentRunTargetOf, ledgerScope } from "./feature-scope";
+import { currentRunTargetOf } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { getProjectById } from "./projects";
 import type { CohortFeature } from "./prompt-series";
-import { listDeliveriesByBead } from "./runs";
 import { listAllBeads } from "./tickets";
 
 /**
@@ -65,16 +64,11 @@ async function cohortFeatureOf(
   board: Bead[],
   beadId: string,
 ): Promise<CohortFeature> {
-  const scope = ledgerScope(board, beadId);
-  const [ledger, rows, deliveries] = await Promise.all([
-    featureLedger(db, projectId, beadId, { board }),
-    invocationsForBeads(db, projectId, scope.ids),
-    // A feature's delivery is not truncated to the invocation window — a review-fix push can land
-    // after the last claude call the window captured — so this reads the scope's whole history,
-    // exactly as `feature-ledger-read.ts`'s own `leadMs` does.
-    listDeliveriesByBead(db, projectId, scope.ids, { includeLocalCommits: false }),
-  ]);
-  const deliveredAtMs = lastDeliveryMs(deliveries, scope.ids);
+  // `featureLedger` already runs the scope's invocation and delivery reads to fold `totals`/`timing`
+  // — reusing its `rows`/`deliveredAtMs` instead of re-fetching keeps this a single pass over the
+  // scope rather than two (PR #331 review).
+  const ledger = await featureLedger(db, projectId, beadId, { board });
+  const deliveredAtMs = ledger?.deliveredAtMs;
 
   return {
     beadId,
@@ -84,7 +78,7 @@ async function cohortFeatureOf(
     reviewRounds: ledger?.friction.reviewRounds,
     humanTouches: ledger?.friction.humanTouches,
     escalations: ledger?.friction.escalations,
-    rows,
+    rows: ledger?.rows ?? [],
   };
 }
 
