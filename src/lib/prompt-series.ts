@@ -1083,7 +1083,7 @@ export function promptSeries(
   return {
     dimension,
     cohorts: ordered.map((cohort, index) => {
-      const previous = ordered[index - 1];
+      const previous = uniqueImmediatePredecessor(ordered, index);
       const baseline =
         previous && chronologicallyPrecedes(previous, cohort) ? sampleOf(previous) : undefined;
       const standing = cohortStanding(sampleOf(cohort), baseline);
@@ -1112,8 +1112,8 @@ export function promptSeries(
  * average already includes the t=4 delivery, which lands after every one of B's. Presenting that
  * average as "the cohort before B" is not a fact about what came before B — it can change or reverse
  * B's delta every time A delivers again, long after B's window closed (fresh review feedback, PR
- * #331). A tied `firstDeliveryMs` (two keys delivered in the same recorded second) has the same
- * problem one step further — see `byWindow`'s own header.
+ * #331). `previous` is never one half of a tied `firstDeliveryMs` group by the time it reaches here
+ * — see {@link uniqueImmediatePredecessor}, which is what its caller uses to find it.
  *
  * Requiring `previous`'s LAST delivery to strictly precede `cohort`'s FIRST is what actually proves
  * disjoint windows: every episodic-dimension pair already satisfies this (episodes are carved from
@@ -1125,6 +1125,30 @@ function chronologicallyPrecedes(previous: CohortAccumulator, cohort: CohortAccu
   const before = previous.lastDeliveryMs;
   const after = cohort.firstDeliveryMs;
   return before !== undefined && after !== undefined && before < after;
+}
+
+/**
+ * The cohort at `ordered[index - 1]` — but ONLY when it is the sole cohort tied to that
+ * `firstDeliveryMs`, i.e. `ordered[index - 2]` (if any) landed at a different instant.
+ *
+ * A tied `firstDeliveryMs` means the data cannot say which of the tied cohorts actually ran last
+ * before `ordered[index]`; `byWindow`'s key tie-break exists purely to give the DISPLAY order
+ * something to sort by (see its own header), not to assert a chronological fact. Reading its
+ * output as "the" predecessor here would let whichever tied key sorts last alphabetically become
+ * the delta baseline for whatever follows the whole tied group — reversible by nothing more than
+ * renaming that key (fresh review feedback, PR #331). Suppressing the baseline whenever the slot
+ * right before `index` was itself part of a tie removes that arbitrariness at its source, rather
+ * than leaving {@link chronologicallyPrecedes} to catch only the tied pair's OWN comparison.
+ */
+function uniqueImmediatePredecessor(
+  ordered: readonly CohortAccumulator[],
+  index: number,
+): CohortAccumulator | undefined {
+  if (index === 0) return undefined;
+  const previous = ordered[index - 1];
+  const tiedWithEarlier =
+    index - 2 >= 0 && ordered[index - 2].firstDeliveryMs === previous.firstDeliveryMs;
+  return tiedWithEarlier ? undefined : previous;
 }
 
 /** One accumulator as the guardrails read it — the bridge from the fold to {@link cohortStanding}. */

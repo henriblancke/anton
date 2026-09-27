@@ -419,6 +419,44 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     }
   });
 
+  it("draws no delta for the cohort AFTER a tied pair either, regardless of which tied key sorts last (PR #331 review)", () => {
+    // OLD_PROMPT and Z_PROMPT tie on AUG_2 — the data cannot say which actually preceded the other,
+    // so neither can be "the" cohort that preceded NEW_PROMPT's later, unambiguous delivery either.
+    // A comparator that only suppressed the comparison WITHIN the tied pair would still let NEW_PROMPT
+    // draw its baseline from whichever tied key `byWindow`'s alphabetical tie-break happens to sort
+    // last — reversible by nothing more than renaming the two tied prompts.
+    const Z_PROMPT = "zzzz9999";
+    const THIRD_PROMPT = "5555dddd";
+
+    const tiedFirst = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_PROMPT, at: AUG_2, usd: 1 }),
+        ...deliveries(5, { key: Z_PROMPT, at: AUG_2, usd: 100 }),
+        ...deliveries(5, { key: NEW_PROMPT, at: SEP_4, usd: 3 }),
+      ],
+      "prompt",
+    );
+    expect(tiedFirst.cohorts).toHaveLength(3);
+    const lastOfTiedFirst = tiedFirst.cohorts[2];
+    expect(lastOfTiedFirst?.key).toBe(NEW_PROMPT);
+    expect(lastOfTiedFirst?.comparable && lastOfTiedFirst.deltas).toEqual([]);
+
+    // Same shape, but the tied pair's alphabetical order is reversed (THIRD_PROMPT sorts before
+    // OLD_PROMPT) — the outcome for the trailing cohort must not change.
+    const tiedReversed = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_PROMPT, at: AUG_2, usd: 1 }),
+        ...deliveries(5, { key: THIRD_PROMPT, at: AUG_2, usd: 100 }),
+        ...deliveries(5, { key: NEW_PROMPT, at: SEP_4, usd: 3 }),
+      ],
+      "prompt",
+    );
+    expect(tiedReversed.cohorts).toHaveLength(3);
+    const lastOfTiedReversed = tiedReversed.cohorts[2];
+    expect(lastOfTiedReversed?.key).toBe(NEW_PROMPT);
+    expect(lastOfTiedReversed?.comparable && lastOfTiedReversed.deltas).toEqual([]);
+  });
+
   it("attributes a failed feature to the episode it ran in, not always the newest sharing its key (PR #331 review)", () => {
     // Same A → B → A restoration, plus one A feature that never delivered. It ran during the FIRST
     // A episode (its activity sits right after JUL_1) — folding it into the second A episode just
