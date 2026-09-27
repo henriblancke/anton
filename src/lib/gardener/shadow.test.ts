@@ -30,6 +30,8 @@ import type { ShadowInput, ShadowRecord } from "./shadow";
 
 /** The shadow's own `bd dep cycles` call — stubbed so a test controls it without shelling to bd. */
 const depCyclesMock = vi.fn<(cwd: string) => Promise<DepCycle[]>>();
+/** The shadow's own gate-only-cycle hydration read (`bd list --type gate`) — stubbed likewise. */
+const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 
 /**
  * Every bd seam call the shadow made that was addressed at a REPO — which is every call that would
@@ -52,11 +54,19 @@ vi.mock("../beads/bd", async () => {
         : value,
     ]),
   );
-  // Overridden after the tracking wrapper, so it resolves through a controllable stub instead of
-  // shelling out to the real `bd dep cycles` — tracked separately via `depCyclesMock.mock.calls`
-  // rather than `repoCalls`, since a shadow that targets an approve/unapprove move is now expected
-  // to make this call.
-  return { ...actual, beads: { ...beads, depCycles: (cwd: string) => depCyclesMock(cwd) } };
+  // Overridden after the tracking wrapper, so both resolve through a controllable stub instead of
+  // shelling out to the real bd — tracked separately via `depCyclesMock`/`listMock`'s own call
+  // records rather than `repoCalls`, since a shadow that targets an approve/unapprove move is now
+  // expected to make the cycles call, and one whose evidence names a gate-only cycle is expected to
+  // make the gate-listing call too.
+  return {
+    ...actual,
+    beads: {
+      ...beads,
+      depCycles: (cwd: string) => depCyclesMock(cwd),
+      list: (cwd: string, extra?: string[]) => listMock(cwd, extra),
+    },
+  };
 });
 
 const loadMock = vi.fn<(cwd: string, opts?: { withCycles?: boolean }) => Promise<Bead[]>>();
@@ -172,6 +182,7 @@ beforeEach(() => {
   log.mockResolvedValue(undefined);
   planApplyMock.mockImplementation(realPlanApply);
   depCyclesMock.mockResolvedValue([]);
+  listMock.mockResolvedValue([]);
   serve([bead("anton-a")]);
 });
 
@@ -450,6 +461,83 @@ describe("which proposals a pass shadows", () => {
     expect(recorded()).toContain(
       "SHADOW board moved between the board read and cycle evidence — approve/unapprove verdicts fail closed",
     );
+  });
+
+  // The bug the P2 review flagged on this file (shadow.ts:151): the consistency recheck above only
+  // compared `blocks` edges, so a cycle member being reopened (or losing/gaining `abandoned`) between
+  // the board read and the cycle-evidence recheck moved no edge at all and slipped past unnoticed —
+  // `planApply`'s cycle rule reads a cycle's blocking-ness off exactly that live/abandoned status, so
+  // the pairing would stamp fresh cycle evidence onto a board whose liveness the check never verified.
+  it("fails closed on approve when a cycle member's liveness moves between the board read and the cycle-evidence recheck", async () => {
+    const withheld = makeDetection({
+      kind: "withheld-approval",
+      move: "approve",
+      subjects: ["anton-b"],
+      summary: "anton-b is the board's next target and carries no approval",
+      evidence: ["anton-b ranks first among the run targets", "nothing on the board approves it"],
+    });
+    // No `blocks` edge ever moves — only `anton-a`'s status does, between the read and the recheck.
+    const initial = [
+      bead("anton-a", { status: "closed" }),
+      bead("anton-b", {
+        dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+      }),
+    ];
+    const reopened = [
+      bead("anton-a"),
+      bead("anton-b", {
+        dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+      }),
+    ];
+    loadMock.mockReset();
+    loadMock.mockResolvedValueOnce(initial).mockResolvedValueOnce(reopened);
+    served = initial;
+    servedBytes = JSON.stringify(initial);
+    depCyclesMock.mockResolvedValue([{ ids: ["anton-a", "anton-b"], raw: {} }]);
+
+    const records = await shadow([filed(withheld, "anton-p1")], {
+      policy: resolveProposalAutonomyPolicy({ "withheld-approval": "shadow" }),
+    });
+
+    expect(loadMock).toHaveBeenCalledTimes(2);
+    expect(records[0].outcome).toBe("refuse");
+    expect(records[0].detail).toContain("authoritative `bd dep cycles` evidence is unavailable");
+    expect(recorded()).toContain(
+      "SHADOW board moved between the board read and cycle evidence — approve/unapprove verdicts fail closed",
+    );
+  });
+
+  // The bug the P2 review flagged on this file (shadow.ts:153): a cycle can be made ENTIRELY of gates
+  // no ordinary bead's `blocks` edge dangles toward (two gates blocking each other, nothing else
+  // pointing at either) — the board read above never carries them. Left unhydrated, `planApply`'s
+  // cycle rule can't map either id and reads a real, fully-described (and here harmless — both
+  // members are closed) cycle as an unreadable, board-WIDE fault that reaches every target on the
+  // board, not just the cycle's own subtree — so an unrelated `unapprove` records `WOULD APPLY`
+  // (stripping a sound approval) instead of the `settled` the authoritative `withCycles` path (which
+  // hydrates the same gates) would reach.
+  it("hydrates gate-only cycle members before attaching cycle evidence, so an unrelated approval survives", async () => {
+    const unrelated = makeDetection({
+      kind: "degraded-approval",
+      move: "unapprove",
+      subjects: ["anton-a"],
+      summary: "anton-a's approval no longer holds",
+      evidence: ["anton-a's approval gap reopened"],
+    });
+    serve([bead("anton-a", { labels: ["approved"], acceptance_criteria: "- [ ] it works" })]);
+    // A cycle made entirely of gates the board read never carries — both closed, so once mapped it
+    // faults nothing.
+    depCyclesMock.mockResolvedValue([{ ids: ["gate1", "gate2"], raw: {} }]);
+    listMock.mockResolvedValue([
+      bead("gate1", { issue_type: "gate", status: "closed" }),
+      bead("gate2", { issue_type: "gate", status: "closed" }),
+    ]);
+
+    const records = await shadow([filed(unrelated, "anton-p1")], {
+      policy: resolveProposalAutonomyPolicy({ "degraded-approval": "shadow" }),
+    });
+
+    expect(listMock).toHaveBeenCalledWith(REPO, ["--status", "all", "--type", "gate"]);
+    expect(records[0].outcome).toBe("settled");
   });
 });
 

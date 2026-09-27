@@ -1550,6 +1550,18 @@ function sameBlocksEdges(a, b) {
   return setA.size === setB.size && [...setA].every((k) => setB.has(k));
 }
 
+/**
+ * Whether two `bd dep cycles` results name the same set of cycles (by member id set). Mirrors
+ * `src/lib/beads/issues.ts`'s `sameCycles`, which this plain-Node launcher can't import (that file
+ * is TS).
+ */
+function sameCycles(a, b) {
+  const key = (cycle) => [...cycle.ids].sort().join(",");
+  const toSet = (list) => new Set(list.map(key));
+  const [setA, setB] = [toSet(a), toSet(b)];
+  return setA.size === setB.size && [...setA].every((k) => setB.has(k));
+}
+
 /** Bound on `cmdBoardCheck`'s re-list-and-compare retry — mirrors `issues.ts`'s
  * `MAX_CYCLE_CONSISTENCY_RETRIES`, so a board under sustained shaping fails closed instead of
  * spawning `bd list`/`bd dep cycles` forever. */
@@ -1688,6 +1700,15 @@ function fetchGates(repo) {
  * `sameCycleMemberLiveness` retry `src/lib/beads/issues.ts`'s `loadAllIssues` runs, bounded by
  * `MAX_BOARD_CHECK_CYCLE_RETRIES` and failing closed on a graph that keeps moving faster than it
  * can be read consistently.
+ *
+ * The gate hydration below (for a cycle made entirely of gates no ordinary bead's `blocks` edge
+ * dangles toward) is its OWN live `bd list`, made after the checks above already passed — so it can
+ * itself land after another writer repairs the cycle `cycles` named and opens a DIFFERENT gate-only
+ * cycle under a different pair of gates (P2 review, PR #274). Left unrevalidated, `board` would
+ * carry the newer gate records while `cycles` still names only the repaired one, and the mandatory
+ * gate could exit clean despite the live cycle. Re-fetches `bd dep cycles` and re-reads the board
+ * after hydrating and retries the whole attempt on drift, the same `recheckCycleConsistency` +
+ * `recheckHydratedBlocksConsistency` pairing `loadAllIssues` runs post-hydration.
  */
 function cmdBoardCheck(args) {
   const paths = args.filter((a) => !a.startsWith("-"));
@@ -1701,7 +1722,18 @@ function cmdBoardCheck(args) {
     }
 
     let board, cycles;
-    for (let attempt = 0; ; attempt++) {
+    attempts: for (let attempt = 0; ; attempt++) {
+      const giveUp = () => {
+        console.error(
+          c.red(`bd dep cycles failed in ${repo}`) +
+            c.dim(
+              `\ndependency graph kept moving across ${MAX_BOARD_CHECK_CYCLE_RETRIES + 1} reads of ` +
+                "bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
+            ),
+        );
+        return 1;
+      };
+
       const read = readBoard(repo);
       if (read.error) {
         console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${read.error}`));
@@ -1727,43 +1759,90 @@ function cmdBoardCheck(args) {
         return 1;
       }
       if (
-        sameBlocksEdges(read.board, recheck.board) &&
-        sameCycleMemberLiveness(parsedCycles, read.board, recheck.board)
+        !sameBlocksEdges(read.board, recheck.board) ||
+        !sameCycleMemberLiveness(parsedCycles, read.board, recheck.board)
       ) {
-        board = read.board;
-        cycles = parsedCycles;
-        break;
+        if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
+        continue attempts;
       }
-      if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) {
-        console.error(
-          c.red(`bd dep cycles failed in ${repo}`) +
-            c.dim(
-              `\ndependency graph kept moving across ${MAX_BOARD_CHECK_CYCLE_RETRIES + 1} reads of ` +
-                "bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
-            ),
-        );
-        return 1;
-      }
-    }
 
-    // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
-    // gates blocking each other, nothing else pointing at either) — `readBoard`'s own dangling-edge
-    // check never fires, so `board` never carries them. Left alone, `cycleMembers` can't map any of
-    // those ids and reports the cycle as unreadable — a synthetic, unscoped "board" fault that blocks
-    // every target even when `validateBoardStructure` would otherwise ignore a cycle with no live
-    // member (P2 review, PR #274). Hydrate whatever the evidence names that `board` is still missing
-    // before building the report, the same as `src/lib/beads/issues.ts`'s `loadAllIssues`.
-    const knownIds = new Set(board.map((bead) => bead.id));
-    const missingCycleIds = [...new Set(cycles.flatMap((cycle) => cycle.ids))].filter((id) => !knownIds.has(id));
-    if (missingCycleIds.length > 0) {
-      const fetched = fetchGates(repo);
-      if (fetched.error) {
-        console.error(c.red(`bd list --type gate failed in ${repo}`) + c.dim(`\n${fetched.error}`));
-        return 1;
+      let hydratedBoard = read.board;
+      const hydratedCycles = parsedCycles;
+
+      // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
+      // gates blocking each other, nothing else pointing at either) — `readBoard`'s own dangling-edge
+      // check never fires, so `board` never carries them. Left alone, `cycleMembers` can't map any of
+      // those ids and reports the cycle as unreadable — a synthetic, unscoped "board" fault that blocks
+      // every target even when `validateBoardStructure` would otherwise ignore a cycle with no live
+      // member (P2 review, PR #274). Hydrate whatever the evidence names that `board` is still missing
+      // before building the report, the same as `src/lib/beads/issues.ts`'s `loadAllIssues`.
+      const knownIds = new Set(hydratedBoard.map((bead) => bead.id));
+      const missingCycleIds = [...new Set(hydratedCycles.flatMap((cycle) => cycle.ids))].filter(
+        (id) => !knownIds.has(id),
+      );
+      if (missingCycleIds.length > 0) {
+        const fetched = fetchGates(repo);
+        if (fetched.error) {
+          console.error(c.red(`bd list --type gate failed in ${repo}`) + c.dim(`\n${fetched.error}`));
+          return 1;
+        }
+        const byId = new Map(hydratedBoard.map((bead) => [bead.id, bead]));
+        for (const gate of fetched.gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+        hydratedBoard = [...byId.values()];
+
+        // Revalidate rather than trust the pairing: this hydration is its own `bd list`, made after
+        // the checks above already passed, so it can itself land after another writer repairs the
+        // cycle `hydratedCycles` named and opens a different gate-only cycle under a different pair
+        // of gates. Re-fetch `bd dep cycles` and require it still names the same cycles.
+        const cycleRecheckResult = bdDepCycles(repo);
+        if (cycleRecheckResult.error || cycleRecheckResult.status !== 0) {
+          const detail = cycleRecheckResult.error?.code === "ENOENT"
+            ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+            : cycleRecheckResult.error?.message || (cycleRecheckResult.stderr ?? "").trim() ||
+              `bd dep cycles exited ${cycleRecheckResult.status}`;
+          console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
+          return 1;
+        }
+        const freshCycles = parseDepCycles(cycleRecheckResult.stdout);
+        if (freshCycles === null) {
+          console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
+          return 1;
+        }
+        if (!sameCycles(hydratedCycles, freshCycles)) {
+          if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
+          continue attempts;
+        }
+
+        // Matching cycle sets only proves the CYCLIC pairs held steady — this hydration is a live
+        // `bd list` in its own right, and an ordinary ACYCLIC `blocks` edge can land or vanish during
+        // that gap without moving `bd dep cycles` at all. Rebuild the comparison the same way
+        // `hydratedBoard` itself was just built (a fresh board read plus a fresh full gate listing)
+        // and compare both edges and cycle-member liveness against it before trusting the pairing.
+        const freshRead = readBoard(repo);
+        if (freshRead.error) {
+          console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${freshRead.error}`));
+          return 1;
+        }
+        const freshGates = fetchGates(repo);
+        if (freshGates.error) {
+          console.error(c.red(`bd list --type gate failed in ${repo}`) + c.dim(`\n${freshGates.error}`));
+          return 1;
+        }
+        const freshById = new Map(freshRead.board.map((bead) => [bead.id, bead]));
+        for (const gate of freshGates.gates) if (!freshById.has(gate.id)) freshById.set(gate.id, gate);
+        const freshBoard = [...freshById.values()];
+        if (
+          !sameBlocksEdges(hydratedBoard, freshBoard) ||
+          !sameCycleMemberLiveness(hydratedCycles, hydratedBoard, freshBoard)
+        ) {
+          if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
+          continue attempts;
+        }
       }
-      const byId = new Map(board.map((bead) => [bead.id, bead]));
-      for (const gate of fetched.gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
-      board = [...byId.values()];
+
+      board = hydratedBoard;
+      cycles = hydratedCycles;
+      break attempts;
     }
 
     const report = buildStructureReport(board, { cycles });

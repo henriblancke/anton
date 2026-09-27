@@ -345,6 +345,68 @@ describe("anton board-check (bd stubbed on PATH)", () => {
       expect(r.status).toBe(0);
     });
 
+    // The bug the P2 review flagged (bin/anton.mjs:1759): the gate-only-cycle hydration above is its
+    // own live `bd list --type gate`, made AFTER the read/cycle/read consistency loop already passed
+    // — so it can land after another writer repairs the historical `gate1`/`gate2` cycle the first
+    // `bd dep cycles` named and opens a DIFFERENT, LIVE cycle under `gate3`/`gate4` in the same gap.
+    // `board` would then carry the newer gate records while the (unrevalidated) `cycles` still named
+    // only the repaired pair, so the mandatory check exits clean despite the live cycle. The stub's
+    // `bd dep cycles` names `gate1`/`gate2` only on the very first call and `gate3`/`gate4` (both
+    // open, genuinely blocking) on every call after — the shape of a repair-then-reopen landing
+    // mid-hydration — and its gate listing always answers with all four gates, live and historical
+    // alike, so hydration alone can't tell them apart without the revalidation this fix adds.
+    it("retries hydration instead of pairing a gate-only cycle with evidence that moved underneath it", async () => {
+      const bin = await dirs.make("anton-bdbin-gatecycle-drift-");
+      const depStateFile = join(bin, "dep-calls");
+      writeFileSync(depStateFile, "0");
+      const gates = [
+        { id: "gate1", issue_type: "gate", status: "closed" },
+        { id: "gate2", issue_type: "gate", status: "closed" },
+        {
+          id: "gate3",
+          issue_type: "gate",
+          status: "open",
+          dependencies: [{ type: "blocks", issue_id: "gate3", depends_on_id: "gate4" }],
+        },
+        {
+          id: "gate4",
+          issue_type: "gate",
+          status: "open",
+          dependencies: [{ type: "blocks", issue_id: "gate4", depends_on_id: "gate3" }],
+        },
+      ];
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          "const a = process.argv.slice(2);",
+          `const depStateFile = ${JSON.stringify(depStateFile)};`,
+          `const healthy = ${JSON.stringify(HEALTHY)};`,
+          `const gates = ${JSON.stringify(gates)};`,
+          'if (a.includes("dep") && a.includes("cycles")) {',
+          "  let n = Number(fs.readFileSync(depStateFile, 'utf8')) + 1;",
+          "  fs.writeFileSync(depStateFile, String(n));",
+          // Call 1: the historical, non-faulting pair. Every call after: the live pair a concurrent
+          // writer opened while this attempt's hydration was in flight.
+          "  const cycles = n === 1 ? [{ cycle: ['gate1', 'gate2'] }] : [{ cycle: ['gate3', 'gate4'] }];",
+          "  console.log(JSON.stringify(cycles));",
+          "  process.exit(0);",
+          "}",
+          'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+          "  console.log(JSON.stringify(gates));",
+          "  process.exit(0);",
+          "}",
+          "console.log(JSON.stringify(healthy));",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      // Converges on the live pairing instead of exiting clean on the repaired one it started with.
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
     it("hydrates gate records before judging a blocks target", async () => {
       const board = [
         ...HEALTHY,

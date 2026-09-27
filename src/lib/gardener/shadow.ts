@@ -17,9 +17,9 @@
  * proposal beads through the same emitter, so they shadow through the same code; a per-producer copy
  * would be two answers to "what would this have done" that drift.
  */
-import { beads, type Bead } from "../beads/bd";
+import { beads, type Bead, type DepCycle } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
-import { loadAllIssues, sameBlocksEdges } from "../beads/issues";
+import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness } from "../beads/issues";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
   autonomyFor,
@@ -104,6 +104,32 @@ function shadowable(
 }
 
 /**
+ * bd omits gate beads from every ordinary listing while carrying the `blocks` edge a gate puts on
+ * the bead it gates — the one case that trap misses is a cycle made ENTIRELY of gates (two gates
+ * blocking each other, with no ordinary bead's edge dangling toward either), which never triggers
+ * that carried-edge listing at all. Left unhydrated, `board` can't map either id in `cycles` to a
+ * bead, and `planApply`'s cycle rule reads that as an unreadable board-wide fault rather than the
+ * narrow, correctly-scoped refusal `loadAllIssues`'s own `withCycles` path reaches once it hydrates
+ * the same gates in (P2 review, PR #274) — a shadow record that overstates how unsafe the kind is
+ * to arm is the same failure mode as one that understates it. Deliberately left to propagate on
+ * failure rather than degrading to the unhydrated `board`: the caller's own try/catch already
+ * treats a `beads.*` read failing anywhere in this section as reason to fail closed on cycle
+ * evidence altogether (`SHADOW could not read cycle evidence`), the same as a `bd dep cycles`
+ * failure does — an incomplete hydration is no safer to pair with `cycles` than no read at all.
+ */
+async function hydrateCycleOnlyGates(repo: string, board: Bead[], cycles: DepCycle[]): Promise<Bead[]> {
+  const knownIds = new Set(board.map((bead) => bead.id));
+  const missingCycleIds = [...new Set(cycles.flatMap((cycle) => cycle.ids))].filter(
+    (id) => !knownIds.has(id),
+  );
+  if (missingCycleIds.length === 0) return board;
+  const gates = await beads.list(repo, ["--status", "all", "--type", "gate"]);
+  const byId = new Map(board.map((bead) => [bead.id, bead]));
+  for (const gate of gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+  return [...byId.values()];
+}
+
+/**
  * Shadow what this pass filed: decide each `shadow`-armed proposal against a FRESH board and record
  * the outcome. Writes nothing, and never throws — a shadow that cannot run is a line in the log.
  *
@@ -148,8 +174,22 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
       // read that already happened, not whether a writer added the first edge during this gap; a
       // cycle-blind target in this same batch still decides off the original `board` even when the
       // recheck fails, since it never consults cycle evidence at all.
-      const consistent = sameBlocksEdges(board, await loadAllIssues(input.repo));
+      //
+      // `sameBlocksEdges` alone only proves the edges held steady — a cycle member can be reopened,
+      // or lose/gain its `abandoned` label, without moving an edge at all, and `planApply`'s cycle
+      // rule reads a cycle's blocking-ness off exactly that live/abandoned status (P2 review, PR
+      // #274). Check both, the same `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
+      const freshBoard = await loadAllIssues(input.repo);
+      const consistent =
+        sameBlocksEdges(board, freshBoard) && sameCycleMemberLiveness(cycles, board, freshBoard);
       if (consistent) {
+        // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
+        // gates blocking each other, nothing else pointing at either) — `board` never carried them,
+        // so `decide()`'s cycle rule can't map either id and would read a real, fully-scoped cycle as
+        // an unreadable board-wide fault instead of the narrow refusal `planApply`'s authoritative
+        // `withCycles` path (`loadAllIssues`) would reach once it hydrates the same gates in. Hydrate
+        // whatever `cycles` names that `board` is still missing before attaching the evidence.
+        board = await hydrateCycleOnlyGates(input.repo, board, cycles);
         attachCycleEvidence(board, cycles);
       } else {
         await write(
