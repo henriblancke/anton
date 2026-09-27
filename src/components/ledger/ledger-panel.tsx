@@ -95,7 +95,7 @@ export function LedgerPanel({
 
   return (
     <div className="flex flex-col gap-4">
-      {hasOwnBill ? <PhaseTable totals={totals} /> : <NoCostRecorded />}
+      {hasOwnBill ? <PhaseTable totals={totals} /> : <NoCostRecorded friction={friction} />}
       {/* Below the table and outside its footer, because it is not this feature's bill (§D4) — shown
           whenever a scheduled pass touched this scope, even one with no bill of its own above it. */}
       {totals.overhead ? <UnallocatedSection overhead={totals.overhead} /> : null}
@@ -769,12 +769,19 @@ function FrictionGroup({
 }
 
 /**
- * The cost side alone, empty — a scope with friction to show (a cancel, an escalation, a send-back)
- * but no invocation rows behind it, so there is no bill to render above the Friction section that
- * follows. Distinct from {@link NothingRecorded}: that one covers a scope with nothing recorded at
- * all, which this component's caller has already ruled out.
+ * The cost side alone, empty — no invocation rows behind it, so there is no bill to render above
+ * the Friction section that follows. Distinct from {@link NothingRecorded}: that one covers a scope
+ * with nothing recorded at all, which this component's caller has already ruled out.
+ *
+ * Reached two different ways, so the copy branches on which: `frictionRecorded` true means a
+ * cancel, escalation, or send-back happened with no invocation behind it — this feature really did
+ * cost attention. `frictionRecorded` false means the only thing that made `totals.recorded` true was
+ * overhead — a project-level pass that touched this feature's beads without anton ever dispatching
+ * it — and every friction counter below is zero, so claiming attention was spent here would
+ * contradict the section it points to (PR #329 review).
  */
-function NoCostRecorded() {
+function NoCostRecorded({ friction }: { friction: LedgerFriction }) {
+  const costAttention = frictionRecorded(friction);
   return (
     <section
       aria-label="By phase"
@@ -782,8 +789,9 @@ function NoCostRecorded() {
     >
       <h2 className="text-[13px] font-medium text-foreground">By phase</h2>
       <p className="text-[11px] text-subtle">
-        No cost recorded — nothing was dispatched for this feature, though it still cost attention
-        (see Friction below).
+        {costAttention
+          ? "No cost recorded — nothing was dispatched for this feature, though it still cost attention (see Friction below)."
+          : "No cost recorded — nothing was dispatched for this feature."}
       </p>
     </section>
   );

@@ -522,6 +522,18 @@ describe("what could not be attributed or priced", () => {
       expect(screen.getByLabelText("Unallocated")).toBeTruthy();
     });
 
+    it("does not claim friction when the only invocation is overhead and every friction counter is zero", () => {
+      // Same shape as the case above, but with NO_FRICTION: nothing recorded a human touch, so the
+      // Friction section below renders all zeros. Pointing at it here would contradict it.
+      const overheadOnly = [
+        row({ jobType: "gardener", step: null, stepHandler: null, durationMs: 20_000 }),
+      ];
+      render(panel(overheadOnly, DELIVERED_AT, NO_FRICTION));
+
+      expect(screen.getByText("No cost recorded — nothing was dispatched for this feature.")).toBeTruthy();
+      expect(screen.queryByText(/cost attention/)).toBeNull();
+    });
+
     it("omits the section entirely when no scheduled pass touched the feature", () => {
       const featureOnly = EVERY_PHASE.filter((r) => r.jobType !== "gardener");
       expect(ledgerTotals(featureOnly).overhead).toBeUndefined();
