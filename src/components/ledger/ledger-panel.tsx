@@ -1,4 +1,4 @@
-import { GaugeIcon, HandIcon, TimerIcon } from "lucide-react";
+import { GaugeIcon, HandIcon, LayersIcon, TimerIcon } from "lucide-react";
 
 import {
   FEATURE_PHASES,
@@ -30,6 +30,24 @@ import { cn } from "@/lib/utils";
  * per phase puts the two figures being compared on different lines. This panel follows that table's
  * idioms deliberately (mono numerals, `tabular-nums`, the label's sub-line carrying the counts that
  * qualify the row) so the two spend surfaces read as one product.
+ *
+ * ## What could not be attributed or priced is shown, never hidden (anton-524h1)
+ *
+ * The fold deliberately refuses to invent numbers, and a renderer that quietly drops those refusals
+ * spends the honesty without buying anything with it. So each one has a place on the page:
+ *
+ *  - An unpriced bucket shows its TOKENS beside an explicit `no price` marker. Never `$0.00`, and
+ *    never a bare dash either — on a surface that already omits absent phases, a lone dash is
+ *    indistinguishable from "nothing here", and "unpriced" and "free" are the two readings this
+ *    whole feature exists to keep apart.
+ *  - The unattributed remainder is a ROW IN the table, inside the total it genuinely is part of
+ *    (see {@link LedgerTotals.totals}) and labelled as spend anton cannot place. Inside, because the
+ *    feature really did spend it; labelled, because a row that reads as a phase would claim anton
+ *    knows what it bought.
+ *  - Board overhead is a line BELOW the table, outside the feature's bill entirely (design §D4) —
+ *    visible and unallocated. Splitting a board-wide pass across the features it served would move
+ *    real money onto work that did not spend it, and the figures would still add up afterwards,
+ *    which is what makes the error unfindable. An unallocated remainder is a visible gap instead.
  *
  * ## Three durations, never merged into one
  *
@@ -67,6 +85,8 @@ export function LedgerPanel({
   return (
     <div className="flex flex-col gap-4">
       <PhaseTable totals={totals} />
+      {/* Below the table and outside its footer, because it is not this feature's bill (§D4). */}
+      {totals.overhead ? <UnallocatedSection overhead={totals.overhead} /> : null}
       <DurationsSection timing={timing} />
       <FrictionSection friction={friction} />
     </div>
@@ -144,6 +164,8 @@ function PhaseTable({ totals }: { totals: LedgerTotals }) {
           {phases.map(([phase, bucket]) => (
             <PhaseRow key={phase} phase={phase} bucket={bucket} />
           ))}
+          {/* Last, after the phases it could not be placed among — and only when there is some. */}
+          {totals.unattributed ? <UnattributedRow bucket={totals.unattributed} /> : null}
         </tbody>
         <tfoot>
           <tr className="border-t border-border">
@@ -162,6 +184,17 @@ function PhaseTable({ totals }: { totals: LedgerTotals }) {
           </tr>
         </tfoot>
       </table>
+
+      {/* Which models to add to the price table — the only part of an unpriced total an operator can
+          act on. Same line `spend-view` carries, for the same reason. */}
+      {totals.unpricedModels.length > 0 ? (
+        <p role="status" className="text-[11px] leading-relaxed text-risk-med">
+          anton has no verified price for{" "}
+          <span className="font-mono">{totals.unpricedModels.join(", ")}</span>, so every cost above
+          that covers one is a floor rather than a total. Their tokens are counted; their dollars are
+          not, and they are not free.
+        </p>
+      ) : null}
     </section>
   );
 }
@@ -176,12 +209,57 @@ function PhaseTable({ totals }: { totals: LedgerTotals }) {
  * this panel exists without.
  */
 function PhaseRow({ phase, bucket }: { phase: LedgerPhase; bucket: PhaseTotals }) {
+  return <BucketRow label={PHASE_LABELS[phase]} hint={PHASE_HINTS[phase]} bucket={bucket} />;
+}
+
+/**
+ * The remainder: spend this feature really made, on work anton cannot name.
+ *
+ * In the table and in the footer's total, because the money was genuinely this feature's — dropping
+ * it would understate the bill, which is the same failure as pricing an unpriced row at zero. But
+ * labelled, and labelled as an absence of knowledge rather than as a kind of work: a row that read
+ * like a sixth phase would claim anton knows what it bought. The alternative D4 rules out is
+ * dividing it across the phases above, where it would land on work that did not spend it and still
+ * add up afterwards.
+ */
+function UnattributedRow({ bucket }: { bucket: PhaseTotals }) {
+  return (
+    <BucketRow
+      label="Unattributed"
+      hint="Spend this feature made that classifies to no phase — a job type this anton no longer defines, or a call recorded before anton logged which step it served. Counted in the total, because the money was real; left unsplit, because anton cannot say what it bought."
+      bucket={bucket}
+      labelClassName="italic text-muted-foreground"
+    />
+  );
+}
+
+/**
+ * One row of the phase table: a label, the counts that qualify it, and the three figures.
+ *
+ * The sub-line under the label carries every count that QUALIFIES those figures — how many
+ * invocations produced them, how many turns those took, how many failed, and how many rows anton
+ * could not price. They belong under the label rather than in columns of their own because they are
+ * read only when a figure looks surprising, and four more columns is what would force the scroller
+ * this panel exists without.
+ */
+function BucketRow({
+  label,
+  hint,
+  bucket,
+  labelClassName,
+}: {
+  label: string;
+  hint: string;
+  bucket: PhaseTotals;
+  /** Set where the row is not a phase, so it cannot be read as one. */
+  labelClassName?: string;
+}) {
   return (
     <tr className="border-b border-border/60 last:border-b-0">
       <td className="px-1.5 py-2 align-top sm:px-2.5">
         <div className="flex min-w-0 flex-col gap-0.5">
-          <span className="text-[12px] text-foreground" title={PHASE_HINTS[phase]}>
-            {PHASE_LABELS[phase]}
+          <span className={cn("text-[12px] text-foreground", labelClassName)} title={hint}>
+            {label}
           </span>
           <span className="font-mono text-[10px] leading-relaxed text-subtle">
             {bucket.runs} call{bucket.runs === 1 ? "" : "s"}
@@ -215,11 +293,14 @@ function TokensCell({ tokens, className }: { tokens: LedgerTokens; className?: s
 
 /**
  * A bucket's dollars, in the three states `spend-table` already keeps apart: a complete figure, a
- * floor over a partly-priced bucket (`+`), and no figure at all (a dash — never `$0.00`, since a zero
- * is the reading that quietly understates a bill).
+ * floor over a partly-priced bucket (`+`), and no figure at all — a dash under an explicit `no price`
+ * marker, never `$0.00`, since a zero is the reading that quietly understates a bill.
  */
 function CostCell({ bucket, className }: { bucket: PhaseTotals; className?: string }) {
   const partial = bucket.usd !== undefined && bucket.unpricedRows > 0;
+  // Two different reasons for an absent figure, and only the first is a gap in the price table: a
+  // model anton cannot price, versus a crashed invocation that measured nothing to price.
+  const hasMeasuredTokens = totalTokens(bucket.tokens) > 0;
 
   return (
     <td
@@ -229,11 +310,22 @@ function CostCell({ bucket, className }: { bucket: PhaseTotals; className?: stri
       )}
     >
       {bucket.usd === undefined ? (
+        // A dash and a WORD, not a dash alone. This table omits the phases that recorded nothing, so
+        // a lone dash in a cost column reads as "no calls here" — while the tokens cell beside it
+        // says calls happened. The word is what makes the cell mean "unpriced" instead of "free" or
+        // "absent", and it survives the hover title being unreachable on a touch device.
         <span
-          className="text-subtle"
-          title="anton has no verified price for what served these calls, so their tokens are counted and their cost is not. Not free — unpriced."
+          className="flex flex-col items-end gap-0.5"
+          title={
+            hasMeasuredTokens
+              ? "anton has no verified price for what served these calls, so their tokens are counted and their cost is not. Not free — unpriced."
+              : "These calls reported no usage at all, so there is nothing to price."
+          }
         >
-          —
+          <span className="text-subtle">—</span>
+          <span className="text-[9.5px] leading-none font-normal text-risk-med">
+            {hasMeasuredTokens ? "no price" : "no usage"}
+          </span>
         </span>
       ) : (
         <span
@@ -273,6 +365,101 @@ function ActiveCell({ bucket, className }: { bucket: PhaseTotals; className?: st
     >
       {formatDuration(bucket.activeMs)}
     </td>
+  );
+}
+
+/**
+ * Board overhead: real money, spent on this project, deliberately NOT billed to this feature (§D4).
+ *
+ * The scheduled passes — gardener, product-master, board-picker, nightly-stringer — serve the whole
+ * board. Dividing their spend across the features they looked at would be a fabricated number, and
+ * the specific danger is that a fabricated split still ADDS UP: every feature's bill would be
+ * slightly wrong, all the totals would reconcile, and nothing afterwards could find the error. So
+ * the figure is shown whole, in one place, labelled as belonging to none of them.
+ *
+ * Below the table rather than a row in it, because a row inside the table is inside the footer's
+ * total — which is exactly the claim being refused. The alternative to this line is not a cleaner
+ * page; it is dropping the money silently, which is the failure `spend-breakdown`'s unpriced rule
+ * already rejected once.
+ */
+function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
+  return (
+    <section
+      aria-label="Unallocated"
+      className="flex flex-col gap-1.5 rounded-xl border border-dashed border-border px-3.5 py-3"
+    >
+      <h2 className="flex items-center gap-1.5 text-[13px] font-medium text-foreground">
+        <LayersIcon className="size-3 text-subtle" aria-hidden="true" />
+        Unallocated — not billed to this feature
+      </h2>
+
+      <dl className="flex flex-wrap items-baseline gap-x-5 gap-y-2">
+        <OverheadFigure
+          label="Cost"
+          value={formatUsd(overhead.usd)}
+          qualifier={
+            overhead.usd === undefined
+              ? "no price"
+              : overhead.unpricedRows > 0
+                ? "floor"
+                : undefined
+          }
+          hint={
+            overhead.usd === undefined
+              ? "anton has no verified price for what served these passes. Their tokens are counted; their cost is not."
+              : `What the scheduled passes touching this feature's beads cost the project${overhead.unpricedRows > 0 ? ` — a FLOOR: ${overhead.unpricedRows} of ${overhead.rows} rows could not be priced.` : "."}`
+          }
+        />
+        <OverheadFigure
+          label="Tokens"
+          value={formatTokens(totalTokens(overhead.tokens))}
+          hint={`${formatExactTokens(totalTokens(overhead.tokens))} tokens across ${overhead.runs} call${overhead.runs === 1 ? "" : "s"}.`}
+        />
+        <OverheadFigure
+          label="Active"
+          value={formatDuration(overhead.activeMs)}
+          hint="What claude worked in those passes. Outside this feature's own active time above."
+        />
+      </dl>
+
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        A scheduled pass — grooming the board, picking work, scanning the repo — served the whole
+        project while it touched this feature. That spend is reported here and{" "}
+        <span className="font-medium text-foreground">divided into no feature at all</span>: a split
+        would move real money onto work that did not spend it, and every total would still reconcile
+        afterwards, so nothing could find the error later.
+      </p>
+    </section>
+  );
+}
+
+/** One overhead figure. Same name/value/qualifier shape as {@link Stat}, at the smaller scale this
+ *  section's subordinate position calls for — it is context for the bill above, not a headline. */
+function OverheadFigure({
+  label,
+  value,
+  qualifier,
+  hint,
+}: {
+  label: string;
+  value: string;
+  qualifier?: string;
+  hint: string;
+}) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <dt className="font-mono text-[9.5px] tracking-[0.11em] text-subtle uppercase">{label}</dt>
+      <dd className="flex items-baseline gap-1.5">
+        <span className="font-mono text-[13px] tabular-nums text-foreground" title={hint}>
+          {value}
+        </span>
+        {qualifier ? (
+          <span className="font-mono text-[9.5px] text-risk-med" title={hint}>
+            {qualifier}
+          </span>
+        ) : null}
+      </dd>
+    </div>
   );
 }
 

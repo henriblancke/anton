@@ -185,7 +185,7 @@ describe("a feature that went through every phase", () => {
     expect(within(rowFor("Self-review")).getByText(/1 call\b/)).toBeTruthy();
   });
 
-  it("keeps board overhead and unattributable spend out of the feature's total", () => {
+  it("keeps board overhead out of the feature's total, but counts the unattributed row in it", () => {
     const totals = ledgerTotals(EVERY_PHASE);
     render(panel(EVERY_PHASE));
 
@@ -304,24 +304,183 @@ describe("friction", () => {
   });
 });
 
-describe("an unpriced model", () => {
+/**
+ * The four refusals (anton-524h1) — the cases where the fold declines to invent a number and the
+ * panel is the last place that can throw the refusal away.
+ *
+ * Each asserts the SHAPE of the honesty, not the wording: that a figure exists where tokens were
+ * measured, that the marker is not a zero, that the remainder is inside the bill and the overhead is
+ * outside it. A test pinned to a sentence would pass a rewrite that quietly dropped the meaning.
+ */
+describe("what could not be attributed or priced", () => {
   const UNKNOWN = "some-gateway/mistral-large";
 
-  it("shows a phase's tokens with a dash for cost, rather than reporting it as free", () => {
-    render(panel([row({ modelReported: UNKNOWN })]));
+  describe("unpriced tokens", () => {
+    it("renders the tokens with an explicit no-price marker, never $0", () => {
+      render(panel([row({ modelReported: UNKNOWN })]));
 
-    const cells = rowFor("Implement").querySelectorAll("td");
-    expect(cells[1].textContent).toBe("990K");
-    expect(cells[2].textContent).toBe("—");
-    expect(screen.queryByText("$0.00")).toBeNull();
+      const cells = rowFor("Implement").querySelectorAll("td");
+      // The tokens are still evidence that calls happened — this is not an absent row.
+      expect(cells[1].textContent).toBe("990K");
+      // And the cost says which kind of nothing it is. A bare dash would be indistinguishable from
+      // the phases this table omits entirely.
+      expect(cells[2].textContent).toContain("—");
+      expect(cells[2].textContent).toContain("no price");
+      expect(screen.queryByText("$0.00")).toBeNull();
+      expect(screen.queryByText("$0")).toBeNull();
+    });
+
+    it("distinguishes a model it cannot price from a call that measured nothing", () => {
+      // A crashed invocation: priced model, no counts. Not a gap in the price table, and saying
+      // "no price" here would send an operator to fix a table that is already correct.
+      // `null`, not 0: an absent count is what a crashed result writes, and `model-pricing` reads a
+      // zero as a measured free call — which is a third, genuinely different fact.
+      render(
+        panel([
+          row({
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadInputTokens: null,
+            cacheCreationInputTokens: null,
+            outcome: "error",
+          }),
+        ]),
+      );
+
+      const cells = rowFor("Implement").querySelectorAll("td");
+      expect(cells[2].textContent).toContain("no usage");
+      expect(cells[2].textContent).not.toContain("no price");
+    });
+
+    it("names the models it has no price for, so the total is actionable", () => {
+      render(panel([row(), row({ modelReported: UNKNOWN })]));
+
+      const note = screen.getByRole("status");
+      expect(note.textContent).toContain(UNKNOWN);
+      expect(note.textContent).toMatch(/floor rather than a total/);
+      expect(note.textContent).toMatch(/they are not free/);
+    });
+
+    it("marks a partly-priced phase as a floor rather than as a total", () => {
+      render(panel([row(), row({ modelReported: UNKNOWN })]));
+
+      const implement = within(rowFor("Implement"));
+      expect(implement.getByText(/1 unpriced/)).toBeTruthy();
+      expect(implement.getByTitle(/At least this/)).toBeTruthy();
+    });
+
+    it("says nothing about pricing when every row was priced", () => {
+      render(panel([row()]));
+
+      expect(screen.queryByRole("status")).toBeNull();
+    });
   });
 
-  it("marks a partly-priced phase as a floor rather than as a total", () => {
-    render(panel([row(), row({ modelReported: UNKNOWN })]));
+  describe("the unattributed bucket", () => {
+    it("renders as its own row when non-empty, labelled as spend anton cannot place", () => {
+      const totals = ledgerTotals(EVERY_PHASE);
+      expect(totals.unattributed).toBeDefined();
+      render(panel(EVERY_PHASE));
 
-    const implement = within(rowFor("Implement"));
-    expect(implement.getByText(/1 unpriced/)).toBeTruthy();
-    expect(implement.getByTitle(/At least this/)).toBeTruthy();
+      const unattributed = rowFor("Unattributed");
+      const cells = unattributed.querySelectorAll("td");
+      // Tokens and active time, like any bucket — it is real spend, not a placeholder.
+      expect(cells[1].textContent).toMatch(/^\d/);
+      expect(cells[3].textContent).toMatch(/^\d+[smhd]/);
+      expect(within(unattributed).getByText(/1 call\b/)).toBeTruthy();
+      // Labelled as an absence of knowledge, not as a sixth kind of work.
+      expect(screen.getByTitle(/classifies to no phase/)).toBeTruthy();
+    });
+
+    it("counts the remainder inside the feature's total rather than dropping it", () => {
+      const withRemainder = ledgerTotals(EVERY_PHASE);
+      const withoutRemainder = ledgerTotals(EVERY_PHASE.filter((r) => r.step !== "code-ticket"));
+
+      // Dropping unplaceable spend would understate the bill — the same failure as pricing an
+      // unpriced row at zero, one level up.
+      expect(withRemainder.totals.runs).toBe(withoutRemainder.totals.runs + 1);
+      expect(withRemainder.totals.usd!).toBeGreaterThan(withoutRemainder.totals.usd!);
+    });
+
+    it("is absent, not a zero row, when every call classified to a phase", () => {
+      const attributed = EVERY_PHASE.filter((r) => r.step !== "code-ticket");
+      expect(ledgerTotals(attributed).unattributed).toBeUndefined();
+      render(panel(attributed));
+
+      expect(screen.queryByText("Unattributed")).toBeNull();
+    });
+  });
+
+  describe("project-level overhead", () => {
+    it("shows the board pass as unallocated, outside the feature's bill", () => {
+      render(panel(EVERY_PHASE));
+
+      const unallocated = within(screen.getByLabelText("Unallocated"));
+      expect(screen.getByText(/Unallocated — not billed to this feature/)).toBeTruthy();
+      // Its own figures, so the money is visible rather than merely excluded.
+      expect(unallocated.getByText("Cost")).toBeTruthy();
+      expect(unallocated.getByText("Tokens")).toBeTruthy();
+      expect(unallocated.getByText(/divided into no feature at all/)).toBeTruthy();
+    });
+
+    it("is not folded into the feature's phases or its total", () => {
+      const totals = ledgerTotals(EVERY_PHASE);
+      render(panel(EVERY_PHASE));
+
+      // The gardener row is the only overhead in the fixture, and it reaches neither the phase map
+      // nor the footer — §D4's whole claim.
+      expect(totals.overhead!.runs).toBe(1);
+      expect(totals.totals.rows).toBe(EVERY_PHASE.length - 1);
+      expect([...totals.phases.keys()]).not.toContain("overhead");
+      // And it is not a row in the table either, where the footer would sum it.
+      expect(screen.queryByText("Overhead")).toBeNull();
+      const table = screen.getByRole("table");
+      expect(within(table).queryByText(/not billed to this feature/)).toBeNull();
+    });
+
+    it("omits the section entirely when no scheduled pass touched the feature", () => {
+      const featureOnly = EVERY_PHASE.filter((r) => r.jobType !== "gardener");
+      expect(ledgerTotals(featureOnly).overhead).toBeUndefined();
+      render(panel(featureOnly));
+
+      expect(screen.queryByLabelText("Unallocated")).toBeNull();
+    });
+  });
+
+  describe("an unrecorded scope", () => {
+    it("renders an empty state distinct from a measured zero", () => {
+      render(panel([], "undelivered"));
+
+      // The empty state, and NONE of the surfaces a zero total would render.
+      expect(screen.getByText(/Nothing recorded for this feature yet/)).toBeTruthy();
+      expect(screen.queryByRole("table")).toBeNull();
+      expect(screen.queryByLabelText("Unallocated")).toBeNull();
+      expect(screen.queryByLabelText("Durations")).toBeNull();
+      expect(screen.queryByText("Unattributed")).toBeNull();
+    });
+
+    it("reads differently from a scope that recorded a call costing nearly nothing", () => {
+      // The contrast the criterion is about: this feature WAS measured, and the meter's answer was
+      // a real, tiny number. It must not borrow the empty state's wording.
+      render(
+        panel([
+          row({
+            inputTokens: 1,
+            outputTokens: 1,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+          }),
+        ]),
+      );
+
+      expect(screen.queryByText(/Nothing recorded for this feature yet/)).toBeNull();
+      expect(screen.getByRole("table")).toBeTruthy();
+      // Priced, and shown as a fraction of a cent rather than rounded to $0.00 — `formatUsd`'s own
+      // rule, and the reason a measured near-zero is still distinguishable from an unpriced one.
+      const cost = rowFor("Implement").querySelectorAll("td")[2].textContent!;
+      expect(cost).toMatch(/^\$0\.\d+/);
+      expect(cost).not.toContain("no price");
+    });
   });
 });
 
