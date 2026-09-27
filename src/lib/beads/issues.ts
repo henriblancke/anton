@@ -339,6 +339,41 @@ async function recheckBlocksConsistency(
 }
 
 /**
+ * Full status + label set + ancestor chain for every id in `list` — a superset of {@link liveKeyOf}'s
+ * state, which only ever folds in the `abandoned` label. Used solely by
+ * {@link sameTargetEligibilityState}: `ineligibility` reads more than one label off a candidate
+ * (`abandoned`, `agent:human`, and whatever a future rule adds), so the comparison that stands in for
+ * "did this candidate's own eligibility change" has to compare all of them, not one named subset.
+ */
+function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
+  const byId = new Map(list.map((bead) => [bead.id, bead]));
+  return (id: string) => {
+    const bead = byId.get(id);
+    if (!bead) return undefined;
+    return `${bead.status}:${[...(bead.labels ?? [])].sort().join(",")}:${ancestorChain(id, list).join(">")}`;
+  };
+}
+
+/**
+ * Whether every id `board` carries still has the same status, full label set, and ancestor chain in
+ * `fresh`. Closes a gap none of {@link sameBlocksEdges}, {@link sameCycleMemberLiveness} or
+ * {@link sameBlockerLiveness} do: all three only ever look at ids `cycles` names or a `blocks` edge
+ * points at, so a CANDIDATE run target that is neither — the id `ineligibility`/`startGuard` is about
+ * to judge — can be labelled `agent:human`, deferred, or closed by a concurrent writer in the gap
+ * between `board` and `fresh` with none of the three seeing it. `boardStillMatchesCycles` would then
+ * wave the stale `board` through, and `startGuard` (picker-apply-claim.ts) re-checks `ineligibility`
+ * against exactly that stale copy — approving and claiming work that, on the board right now, needs a
+ * person (P2 review, PR #274, issues.ts:520).
+ *
+ * Checked over every id on `board`, not just the one a particular caller is about to gate: this
+ * function backs a generic board-loader consistency check with no notion of which id that is.
+ */
+export function sameTargetEligibilityState(board: Bead[], fresh: Bead[]): boolean {
+  const [keyBoard, keyFresh] = [eligibilityKeyOf(board), eligibilityKeyOf(fresh)];
+  return board.every((bead) => keyBoard(bead.id) === keyFresh(bead.id));
+}
+
+/**
  * Guard behind `loadAllIssues`'s post-hydration recheck: re-fetch `bd dep cycles` and compare it
  * against the evidence `board` is about to be paired with. Same return contract as
  * {@link recheckBlocksConsistency}.
@@ -507,17 +542,19 @@ export function sameBlockerLiveness(a: Bead[], b: Bead[]): boolean {
 
 /**
  * Whether `fresh` is still safe to pair `cycles` against, the way `board` was about to be: the same
- * `blocks` edges, the same live/abandoned status and ancestor chain for every id `cycles` reports,
- * AND the same for every ordinary (non-cycle) blocker. Any of these can drift without the others
- * moving — see {@link sameBlocksEdges}, {@link sameCycleMemberLiveness} and
- * {@link sameBlockerLiveness} — so every consistency gate that decides whether to attach `cycles` to
- * a board must check all three, not just the edges.
+ * `blocks` edges, the same live/abandoned status and ancestor chain for every id `cycles` reports, the
+ * same for every ordinary (non-cycle) blocker, AND the same status/labels/ancestor chain for every
+ * OTHER candidate on the board. Any of these can drift without the others moving — see
+ * {@link sameBlocksEdges}, {@link sameCycleMemberLiveness}, {@link sameBlockerLiveness} and
+ * {@link sameTargetEligibilityState} — so every consistency gate that decides whether to attach
+ * `cycles` to a board must check all four, not just the edges.
  */
 function boardStillMatchesCycles(cycles: DepCycle[], board: Bead[], fresh: Bead[]): boolean {
   return (
     sameBlocksEdges(board, fresh) &&
     sameCycleMemberLiveness(cycles, board, fresh) &&
-    sameBlockerLiveness(board, fresh)
+    sameBlockerLiveness(board, fresh) &&
+    sameTargetEligibilityState(board, fresh)
   );
 }
 
@@ -793,7 +830,17 @@ export async function ensureCycleEvidence(
       const knownIds = new Set(board.map((bead) => bead.id));
       const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
       if (missingCycleIds.length > 0) {
-        const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
+        // Strict, not the best-effort default `loadAllIssues` uses for an ordinary board read (P2
+        // review, PR #274, issues.ts:796): a swallowed failure here would return `[]`, leave
+        // `missingCycleIds` unhydrated, and fall straight through to the `attachCycleEvidence` below
+        // with `consistent` still true from the check above — pairing `cycles` (which names these
+        // ids) with a `board` that still can't resolve them. `structureGaps` then can't map the
+        // cycle to any bead and reports a synthetic, unscoped board-wide fault instead of scoping it
+        // to the cycle's own subtree, and because the evidence is attached, that false fault survives
+        // identical refreshes until it expires. This whole function already lets a failed `depCycles`
+        // reject rather than degrade (see the doc above); a failed gate listing must fail the same
+        // read rather than silently mispair evidence with an incomplete board.
+        const hydratedGates = await loadGateIssues(cwd, true, missingCycleIds);
         let addedAny = false;
         // Check generation BEFORE mutating `board`, not after (mirrors `attachCyclesBestEffort`,
         // issues.ts:564): `board` can be the retained snapshot array itself, and invalidation
@@ -846,7 +893,10 @@ export async function ensureCycleEvidence(
         if (addedAny) {
           const freshCycles = await beads.depCycles(cwd);
           const freshWork = await loadWorkIssues(cwd);
-          const freshGates = await loadGateIssues(cwd, false, missingCycleIds);
+          // Strict for the same reason as the hydration read above: a swallowed failure here would
+          // compare `board` against a `freshGates` silently missing the very ids this recheck exists
+          // to verify, so a real drift on one of them would read as consistent.
+          const freshGates = await loadGateIssues(cwd, true, missingCycleIds);
           consistent =
             sameCycles(cycles, freshCycles) &&
             boardStillMatchesCycles(cycles, board, dedupeById([...freshWork, ...freshGates]));
