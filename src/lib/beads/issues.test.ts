@@ -1184,6 +1184,50 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
     }
   });
 
+  it("preserves evidence a racing writer attached while this probe's own bd dep cycles call was in flight and then failed (P2 review, PR #274, issues.ts:1443)", async () => {
+    // Same staleness setup as the test above, but this time a concurrent caller sharing the same
+    // retained board (e.g. `ensureCycleEvidence`) successfully attaches fresh evidence WHILE this
+    // probe's own refresh is still awaiting its `bd dep cycles` call. Attaching evidence doesn't
+    // bump the snapshot generation, so nothing stops that race. When this probe's call then fails,
+    // it must not blindly clear whatever is on the board now — only clear if it's still the exact
+    // stale evidence this probe set out to refresh.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    const board = await allIssues(REPO);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      let rejectCycles!: (error: Error) => void;
+      cyclesMock.mockImplementationOnce(
+        () => new Promise((_resolve, reject) => { rejectCycles = reject; }),
+      );
+      probeCycleEvidence(REPO);
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+
+      // The race: a concurrent writer attaches fresh, successful evidence onto the same retained
+      // board while this probe's `bd dep cycles` call is still pending.
+      const freshCycles = [{ ids: [], raw: { cycle: [] } }];
+      attachCycleEvidence(board, freshCycles);
+      const versionAfterRace = issueSnapshotVersion(REPO);
+
+      rejectCycles(new Error("bd dep cycles failed"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The racing writer's fresh evidence must survive this probe's own failed attempt — not get
+      // wiped out just because this probe's own refresh didn't succeed.
+      expect(cycleEvidenceFor(await allIssues(REPO))).toEqual(freshCycles);
+      expect(issueSnapshotVersion(REPO)).toBe(versionAfterRace);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
   it("declines to attach empty cycle evidence to a retained board whose own edges are pre-repair (P2 review on PR #274, round 20)", async () => {
     // Same race as the `attachCyclesBestEffort` test above, but for the probe path: the retained
     // snapshot warms with a genuinely cyclic edge and no evidence. By the time the probe's `bd dep

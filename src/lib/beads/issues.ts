@@ -1305,6 +1305,13 @@ export function probeCycleEvidence(cwd: string): void {
       // Captured outside the try so the catch below can invalidate whatever evidence this attempt
       // was refreshing, even though the read that produces `board` is itself inside the try.
       let capturedBoard: readonly Bead[] | undefined;
+      // The checkedAt this probe observed when it decided evidence was missing/stale and committed
+      // to refreshing it. The catch below compares against this, not against whatever checkedAt
+      // happens to be on `capturedBoard` at throw time — a racing `ensureCycleEvidence` against the
+      // same retained board can attach fresher evidence while this probe's `bd dep cycles` call is
+      // in flight (attaching evidence doesn't bump the snapshot generation), and that newer result
+      // must survive this probe's own failure.
+      let staleCheckedAt: number | undefined;
       try {
         // Read via `readIssueSnapshot`, not `getIssueSnapshot` + a follow-up `issueSnapshotGeneration`
         // call: the two reads aren't atomic, so a concurrent refresh landing in the gap could hand back
@@ -1324,6 +1331,10 @@ export function probeCycleEvidence(cwd: string): void {
         if (!cycleEvidenceMissingOrStale(board)) {
           return;
         }
+        // Snapshot the checkedAt this probe is about to refresh, BEFORE the first await that can
+        // throw, so a later failure can tell "still the stale value I started with" apart from "a
+        // racing writer already replaced it".
+        staleCheckedAt = cycleEvidenceCheckedAtFor(board);
         const cycles = await fetchCyclesShared(cwd, generation);
         // Recheck generation: a write replacing the snapshot mid-fetch means `cycles` describes a
         // graph this board no longer represents, so it must not be stamped onto it as current (PR
@@ -1437,8 +1448,13 @@ export function probeCycleEvidence(cwd: string): void {
         // Reaching here means evidence already failed the freshness check above (the early return
         // only skips while within CYCLE_EVIDENCE_MAX_AGE_MS) — leaving a prior WeakMap entry in
         // place would keep `cycleEvidenceFor(board)` reporting it as authoritative indefinitely.
-        // Clear it so every consumer fails closed until the next successful refresh.
-        if (capturedBoard !== undefined) {
+        // Clear it so every consumer fails closed until the next successful refresh — but only if
+        // it's still the same stale evidence this probe set out to refresh. A concurrent
+        // `ensureCycleEvidence` sharing this same retained board can attach a fresh, successful
+        // result while this probe's own `bd dep cycles` call is still in flight (attaching evidence
+        // doesn't bump the snapshot generation this probe checks), and that newer result must not be
+        // clobbered just because this probe's attempt failed (P2 review, PR #274, issues.ts:1443).
+        if (capturedBoard !== undefined && cycleEvidenceCheckedAtFor(capturedBoard) === staleCheckedAt) {
           const hadEvidence = cycleEvidenceFor(capturedBoard) !== undefined;
           clearCycleEvidence(capturedBoard);
           // Bump the version on this present->missing transition, mirroring `markCycleEvidenceRecovered`
