@@ -128,16 +128,19 @@ const FRICTION: LedgerFriction = ledgerFriction({
   notes: [{ text: `${REOPEN_NOTE_HEAD}anton-bbbb: the acceptance criteria were not met.` }],
 });
 
-function panel(rows: LedgerTotalsRow[], deliveredAtMs: number | "undelivered" = DELIVERED_AT) {
+/** A scope with no intervention at all — distinct from {@link FRICTION}'s fixed nonzero counters. */
+const NO_FRICTION: LedgerFriction = ledgerFriction({});
+
+function panel(
+  rows: LedgerTotalsRow[],
+  deliveredAtMs: number | "undelivered" = DELIVERED_AT,
+  friction: LedgerFriction = FRICTION,
+) {
   // Not a default parameter: `panel(rows, undefined)` would fall back to it, and the undelivered case
   // is precisely the one that must reach the fold as absent.
   const deliveredAt = deliveredAtMs === "undelivered" ? undefined : deliveredAtMs;
   return (
-    <LedgerPanel
-      totals={ledgerTotals(rows)}
-      timing={ledgerTiming(rows, deliveredAt)}
-      friction={FRICTION}
-    />
+    <LedgerPanel totals={ledgerTotals(rows)} timing={ledgerTiming(rows, deliveredAt)} friction={friction} />
   );
 }
 
@@ -465,11 +468,70 @@ describe("what could not be attributed or priced", () => {
 
       expect(screen.queryByLabelText("Unallocated")).toBeNull();
     });
+
+    /** The overhead figure a label sits beside, the same shape `duration()`/`qualifier()` read. */
+    const overheadFigure = (label: string) =>
+      within(screen.getByLabelText("Unallocated")).getByText(label).nextElementSibling as HTMLElement;
+
+    it("marks overhead active time as a floor when not every scheduled pass reported a duration", () => {
+      render(
+        panel([
+          row({ stepHandler: "implement" }),
+          row({ jobType: "gardener", step: null, stepHandler: null, durationMs: 20_000 }),
+          row({ jobType: "gardener", step: null, stepHandler: null, durationMs: null }),
+        ]),
+      );
+
+      const active = overheadFigure("Active");
+      expect(active.children[1]?.textContent).toBe("floor");
+      expect(active.querySelector("span")?.getAttribute("title")).toMatch(
+        /only 1 of 2 calls reported a duration/,
+      );
+    });
+
+    it("says nothing about a floor when every scheduled pass reported a duration", () => {
+      render(panel(EVERY_PHASE));
+
+      expect(overheadFigure("Active").children[1]).toBeUndefined();
+    });
+
+    it("distinguishes an overhead call that measured nothing from a genuine price gap", () => {
+      render(
+        panel([
+          row({ stepHandler: "implement" }),
+          row({
+            jobType: "gardener",
+            step: null,
+            stepHandler: null,
+            inputTokens: null,
+            outputTokens: null,
+            cacheReadInputTokens: null,
+            cacheCreationInputTokens: null,
+            outcome: "error",
+          }),
+        ]),
+      );
+
+      const cost = overheadFigure("Cost");
+      expect(cost.textContent).toContain("no usage");
+      expect(cost.textContent).not.toContain("no price");
+    });
+
+    it("still says no price when a scheduled pass used a model anton cannot price", () => {
+      render(
+        panel([
+          row({ stepHandler: "implement" }),
+          row({ jobType: "gardener", step: null, stepHandler: null, modelReported: UNKNOWN }),
+        ]),
+      );
+
+      expect(overheadFigure("Cost").textContent).toContain("no price");
+    });
   });
 
   describe("an unrecorded scope", () => {
     it("renders an empty state distinct from a measured zero", () => {
-      render(panel([], "undelivered"));
+      render(panel([], "undelivered", NO_FRICTION));
 
       // The empty state, and NONE of the surfaces a zero total would render.
       expect(screen.getByText(/Nothing recorded for this feature yet/)).toBeTruthy();
@@ -506,7 +568,7 @@ describe("what could not be attributed or priced", () => {
 
 describe("a feature with nothing recorded", () => {
   it("renders an empty state rather than a wall of zeros", () => {
-    render(panel([], "undelivered"));
+    render(panel([], "undelivered", NO_FRICTION));
 
     expect(screen.getByText(/Nothing recorded for this feature yet/)).toBeTruthy();
     expect(screen.getByText(/empty ledger, not zero spend/)).toBeTruthy();
@@ -514,6 +576,30 @@ describe("a feature with nothing recorded", () => {
     expect(screen.queryByRole("table")).toBeNull();
     expect(screen.queryByText("$0.00")).toBeNull();
     expect(screen.queryByText("0s")).toBeNull();
+  });
+});
+
+/**
+ * A job cancelled (or escalated, or sent back) before its first dispatch: `totals.recorded` is false
+ * because no invocation ever ran, but the friction fold still counted the intervention. The bug this
+ * covers (PR #329 review): the panel used to fall back to the full "nothing recorded" empty state and
+ * silently drop that recorded human touch.
+ */
+describe("a scope with friction but no invocation rows", () => {
+  it("shows the friction section instead of the full empty state", () => {
+    render(panel([], "undelivered", FRICTION));
+
+    expect(screen.queryByText(/Nothing recorded for this feature yet/)).toBeNull();
+    expect(screen.getByLabelText("Friction")).toBeTruthy();
+    expect(screen.getByText("Human touches — 4")).toBeTruthy();
+  });
+
+  it("still reports the cost side as empty rather than inventing a bill", () => {
+    render(panel([], "undelivered", FRICTION));
+
+    expect(screen.getByText(/No cost recorded/)).toBeTruthy();
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByText("$0.00")).toBeNull();
   });
 });
 

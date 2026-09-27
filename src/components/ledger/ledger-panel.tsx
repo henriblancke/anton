@@ -79,17 +79,39 @@ export function LedgerPanel({
   friction: LedgerFriction;
 }) {
   // An unrecorded scope reads as EMPTY, never as a wall of zeros: "nothing was measured here" and
-  // "this cost nothing" are opposite facts, and the zero is the one that gets believed.
-  if (!totals.recorded) return <NothingRecorded />;
+  // "this cost nothing" are opposite facts, and the zero is the one that gets believed. But a job
+  // cancelled (or escalated, or sent back) before its first dispatch records friction with no
+  // invocation rows behind it — `totals.recorded` reflects invocation rows only, so falling back to
+  // the full empty state here would hide a recorded human touch and read the feature as untouched.
+  if (!totals.recorded && !frictionRecorded(friction)) return <NothingRecorded />;
 
   return (
     <div className="flex flex-col gap-4">
-      <PhaseTable totals={totals} />
-      {/* Below the table and outside its footer, because it is not this feature's bill (§D4). */}
-      {totals.overhead ? <UnallocatedSection overhead={totals.overhead} /> : null}
+      {totals.recorded ? (
+        <>
+          <PhaseTable totals={totals} />
+          {/* Below the table and outside its footer, because it is not this feature's bill (§D4). */}
+          {totals.overhead ? <UnallocatedSection overhead={totals.overhead} /> : null}
+        </>
+      ) : (
+        <NoCostRecorded />
+      )}
       <DurationsSection timing={timing} />
       <FrictionSection friction={friction} />
     </div>
+  );
+}
+
+/** Whether any friction counter recorded something — see the early return above. */
+function frictionRecorded(friction: LedgerFriction): boolean {
+  return (
+    friction.reviewRounds > 0 ||
+    friction.prFixRounds > 0 ||
+    friction.escalations > 0 ||
+    friction.sendBacks > 0 ||
+    friction.cancels > 0 ||
+    friction.quotaParks > 0 ||
+    friction.failureParks > 0
   );
 }
 
@@ -389,6 +411,13 @@ function ActiveCell({ bucket, className }: { bucket: PhaseTotals; className?: st
  * already rejected once.
  */
 function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
+  // Same distinction `CostCell` draws: an absent dollar figure is either a genuine price-table gap
+  // or a pass that measured no usage at all to price, and only the first is "no price" (PR #329 review).
+  const hasMeasuredTokens = totalTokens(overhead.tokens) > 0;
+  // Same floor discipline `ActiveCell` applies: fewer timed runs than runs means `activeMs` is a
+  // partial sum, not the exact total the plain duration otherwise implies (PR #329 review).
+  const partlyTimed = overhead.timedRuns < overhead.runs;
+
   return (
     <section
       aria-label="Unallocated"
@@ -405,14 +434,18 @@ function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
           value={formatUsd(overhead.usd)}
           qualifier={
             overhead.usd === undefined
-              ? "no price"
+              ? hasMeasuredTokens
+                ? "no price"
+                : "no usage"
               : overhead.unpricedRows > 0
                 ? "floor"
                 : undefined
           }
           hint={
             overhead.usd === undefined
-              ? "anton has no verified price for what served these passes. Their tokens are counted; their cost is not."
+              ? hasMeasuredTokens
+                ? "anton has no verified price for what served these passes. Their tokens are counted; their cost is not."
+                : "These passes reported no usage at all, so there is nothing to price."
               : `What the scheduled passes touching this feature's beads cost the project${overhead.unpricedRows > 0 ? ` — a FLOOR: ${overhead.unpricedRows} of ${overhead.rows} rows could not be priced.` : "."}`
           }
         />
@@ -424,7 +457,12 @@ function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
         <OverheadFigure
           label="Active"
           value={formatDuration(overhead.activeMs)}
-          hint="What claude worked in those passes. Outside this feature's own active time above."
+          qualifier={partlyTimed ? "floor" : undefined}
+          hint={`What claude worked in those passes. Outside this feature's own active time above.${
+            partlyTimed
+              ? ` A FLOOR: only ${overhead.timedRuns} of ${overhead.runs} call${overhead.runs === 1 ? "" : "s"} reported a duration.`
+              : ""
+          }`}
         />
       </dl>
 
@@ -704,6 +742,27 @@ function FrictionGroup({
         ))}
       </dl>
     </div>
+  );
+}
+
+/**
+ * The cost side alone, empty — a scope with friction to show (a cancel, an escalation, a send-back)
+ * but no invocation rows behind it, so there is no bill to render above the Friction section that
+ * follows. Distinct from {@link NothingRecorded}: that one covers a scope with nothing recorded at
+ * all, which this component's caller has already ruled out.
+ */
+function NoCostRecorded() {
+  return (
+    <section
+      aria-label="By phase"
+      className="flex flex-col gap-0.5 rounded-xl border border-dashed border-border px-3.5 py-3"
+    >
+      <h2 className="text-[13px] font-medium text-foreground">By phase</h2>
+      <p className="text-[11px] text-subtle">
+        No cost recorded — nothing was dispatched for this feature, though it still cost attention
+        (see Friction below).
+      </p>
+    </section>
   );
 }
 
