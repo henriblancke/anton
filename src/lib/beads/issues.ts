@@ -766,36 +766,25 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
           // failure throw instead routes it to this function's own outer catch, which already leaves
           // evidence unattached without failing the read that produced `board`.
           const hydratedGates = await loadGateIssues(cwd, true, missingCycleIds);
-          // Check generation BEFORE mutating `board`, not after (P2 review, PR #274,
-          // issues.ts:564 on an earlier version of this block): `board` can still be the
-          // entry's own retained array, so pushing onto it and only then checking left a write
-          // that invalidated the snapshot mid-`loadGateIssues` with its gate already applied to
-          // the array readers see, while the snapshot's serialized content/version stayed
-          // stamped for the pre-push content — an inconsistent pairing nothing downstream
-          // re-validates. No `await` between this check and the mutation below, so nothing can
-          // invalidate the snapshot in between; a mismatch here means `board` is already an
-          // orphaned copy and is left untouched rather than mutated for no reader to see.
+          // Check generation right after this await, not just before the actual `board` mutation
+          // further down (P2 review, PR #274, issues.ts:564 on an earlier version of this block):
+          // a mismatch here means `board` is already an orphaned copy nothing reads, so it's not
+          // even worth staging gates for. The real mutation is gated by its own, second generation
+          // check below, immediately after the fresh consistency recheck it depends on.
           if (issueSnapshotGeneration(cwd) === generation) {
             // Rebuilt from `board` AFTER the hydration await, not `knownIds` captured before it: a
             // concurrent caller sharing this same `board` array (evidence is keyed by identity) can
             // have hydrated the same gates onto it while this listing was in flight.
             const idsOnBoard = new Set(board.map((bead) => bead.id));
-            let addedAny = false;
-            for (const gate of hydratedGates) {
-              if (!idsOnBoard.has(gate.id)) {
-                board.push(gate);
-                idsOnBoard.add(gate.id);
-                addedAny = true;
-              }
-            }
-            if (addedAny) {
-              // Keep the retained snapshot's own bookkeeping (serialized content/version/generation)
-              // in sync with `board`, same requirement as `ensureCycleEvidence` (P2 review, PR #274,
-              // issues.ts:620) — pushing gates onto `board` changes its content without this. Safe to
-              // stamp unconditionally here: the generation check above and this push are both
-              // synchronous, so it still matches.
-              hydrateIssueSnapshot(cwd, board, generation);
-              generation = issueSnapshotGeneration(cwd);
+            const stagedGates = hydratedGates.filter((gate) => !idsOnBoard.has(gate.id));
+            if (stagedGates.length > 0) {
+              // Stage onto a throwaway copy rather than pushing straight onto `board` (P2 review, PR
+              // #274, issues.ts:788): `board` is the retained snapshot's own array, so mutating it —
+              // and stamping that mutation into the snapshot via `hydrateIssueSnapshot` — before the
+              // post-hydration recheck below runs would let a concurrent reader observe, and this call
+              // permanently serialize, gate records the recheck goes on to reject a few lines down.
+              // Retain them onto the real `board` only once that recheck actually passes.
+              const candidateBoard = [...board, ...stagedGates];
               // `loadGateIssues` above is its own live `bd list`, wide enough a gap for another
               // shared-server writer to repair the cycle `cycles` named while opening a DIFFERENT one
               // under a different pair of gates, or to move an ordinary acyclic edge — neither of
@@ -812,8 +801,22 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
               const freshGates = await loadGateIssues(cwd, false, missingCycleIds);
               consistent =
                 sameCycles(cycles, freshCycles) &&
-                boardStillMatchesCycles(cycles, board, dedupeById([...freshWork, ...freshGates]));
-              if (!consistent) {
+                boardStillMatchesCycles(cycles, candidateBoard, dedupeById([...freshWork, ...freshGates]));
+              if (consistent) {
+                // Only retain the staged gates onto the real `board`, and stamp the snapshot, once the
+                // recheck above confirms this exact pairing still holds. Gated on generation again —
+                // the awaits just above can have let another write replace the retained snapshot, in
+                // which case `board` is already an orphaned copy no reader sees, same reasoning as the
+                // generation guard before the sync push this replaced.
+                if (issueSnapshotGeneration(cwd) === generation) {
+                  for (const gate of stagedGates) board.push(gate);
+                  // Keep the retained snapshot's own bookkeeping (serialized content/version/generation)
+                  // in sync with `board`, same requirement as `ensureCycleEvidence` (P2 review, PR #274,
+                  // issues.ts:620) — pushing gates onto `board` changes its content without this.
+                  hydrateIssueSnapshot(cwd, board, generation);
+                  generation = issueSnapshotGeneration(cwd);
+                }
+              } else {
                 // This refresh explicitly REJECTED the board/evidence pairing — this call only runs
                 // against evidence `cycleEvidenceMissingOrStale` already found missing-or-stale, so
                 // leaving a stale sidecar attached here would still read as present to
@@ -1393,7 +1396,15 @@ export function probeCycleEvidence(cwd: string): void {
             const knownIds = new Set(board.map((bead) => bead.id));
             const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
             if (missingCycleIds.length > 0) {
-              const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
+              // Strict, not the degrade-to-`[]` mode `loadGateIssues` otherwise offers (P2 review,
+              // PR #274, issues.ts:1396): a swallowed failure here would leave these ids unhydrated
+              // while `consistent`/`addedAny` stay at their pre-hydration values, so the attach below
+              // (line 1446) would still fire and pair fresh `cycles` evidence with a board that can't
+              // map every named member — mirrors `attachCyclesBestEffort`'s identical fix (issues.ts:768).
+              // Letting the failure throw instead routes it to this probe's own outer catch, which
+              // already leaves evidence unattached (and clears any stale entry) without failing the
+              // read that produced `board`.
+              const hydratedGates = await loadGateIssues(cwd, true, missingCycleIds);
               // Check generation BEFORE mutating `board`, not after (P2 review, PR #274, round 22):
               // `board` can still be the entry's own retained array, so pushing onto it and only
               // checking afterward left a write that invalidated the snapshot mid-`loadGateIssues`
