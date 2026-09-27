@@ -1511,8 +1511,9 @@ async function runGateFixSession(args: {
     // a fresh read (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline
     // before dispatch") — a fresh read after a crash mid-round would already contain whatever the
     // fixer wrote before this process died, permanently hiding that delta from every later diff.
+    const recoveredBoardBaseline = boardOnly && repoPath ? readReviewGateBoardBaseline(target) : undefined;
     let boardBefore = boardOnly && repoPath
-      ? (readReviewGateBoardBaseline(target) ?? (await args.readBoardFingerprint(repoPath, target.id)))
+      ? (recoveredBoardBaseline ?? (await args.readBoardFingerprint(repoPath, target.id)))
       : undefined;
     // A board-only round is refused BEFORE dispatch when that baseline could not be read (PR #284
     // review round 15), the same fail-closed rule `execute-epic-ticket.ts` already applies before a
@@ -1550,6 +1551,7 @@ async function runGateFixSession(args: {
         target.id,
         boardBefore,
         args.readBoardFingerprint,
+        Boolean(recoveredBoardBaseline),
       );
       if (!persistedBaseline) {
         throw new PoisonError(

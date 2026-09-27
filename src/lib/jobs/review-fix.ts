@@ -971,8 +971,9 @@ async function runFixSession(args: {
     // already contain whatever the fixer wrote before this process died, permanently hiding that
     // delta from every later diff. Refused fail-closed when unreadable — dispatching anyway risks the
     // fixer making board writes this session could never tell apart from no progress at all.
+    const recoveredBoardBaseline = boardOnly ? readReviewFixBoardBaseline(epic) : undefined;
     boardBefore = boardOnly
-      ? (readReviewFixBoardBaseline(epic) ?? (await defaultReadBoardFingerprint(repo, epic.id)))
+      ? (recoveredBoardBaseline ?? (await defaultReadBoardFingerprint(repo, epic.id)))
       : undefined;
     if (boardOnly && !boardBefore) {
       throw new PoisonError(
@@ -1000,6 +1001,7 @@ async function runFixSession(args: {
         epic.id,
         boardBefore,
         defaultReadBoardFingerprint,
+        Boolean(recoveredBoardBaseline),
       );
       if (!persistedBaseline) {
         throw new PoisonError(

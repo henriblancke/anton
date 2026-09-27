@@ -350,12 +350,24 @@ export function readReviewFixBoardBaseline(ticket: Bead): BoardFingerprint | und
  * (`null`) rather than chasing a moving target forever. The refreshed baseline is returned to the
  * caller, which must use it — not the value it passed in — for every later read this session diffs
  * against.
+ *
+ * `isRecoveredBaseline` (chatgpt-codex-connector, PR #284 review, "Preserve recovered review
+ * baselines across retries") must be `true` when `baseline` came from {@link
+ * readReviewFixBoardBaseline} rather than a fresh read: that value already reflects a PRIOR
+ * attempt's pre-dispatch state, and the current board can legitimately differ from it because that
+ * same prior attempt's fixer already landed a repair before this process died — the exact repair the
+ * resumed attempt's post-run diff exists to credit. The refresh loop below cannot tell that apart
+ * from an unrelated concurrent write, so it would fold the repair straight into a "refreshed"
+ * baseline and the later diff would find nothing to credit, silently discarding the crash-recovered
+ * progress. Skipping the loop for a recovered baseline leaves it exactly as read — the confirming
+ * push above still reconfirms it reached the remote, but no read after that push can move it.
  */
 export async function persistReviewFixBoardBaseline(
   repo: string,
   ticketId: string,
   baseline: BoardFingerprint,
   readBoardFingerprint: (repo: string, ticketId: string) => Promise<BoardFingerprint | undefined>,
+  isRecoveredBaseline = false,
 ): Promise<BoardFingerprint | null> {
   const persisted = await mustPersist(() =>
     beads.setReviewFixBoardBaseline(repo, ticketId, serializeFingerprint(baseline)),
@@ -366,6 +378,7 @@ export async function persistReviewFixBoardBaseline(
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
   if (!synced) return null;
+  if (isRecoveredBaseline) return baseline;
 
   let confirmed = baseline;
   for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
@@ -444,12 +457,20 @@ export function readReviewGateBoardBaseline(ticket: Bead): BoardFingerprint | un
  * ensureBoardBaselinePersisted}'s own refresh loop for the exact same reason. The refreshed
  * baseline is returned to the caller, which must use it — not the value it passed in — for every
  * later read this round diffs against.
+ *
+ * `isRecoveredBaseline` (chatgpt-codex-connector, PR #284 review, "Preserve recovered review
+ * baselines across retries") mirrors {@link persistReviewFixBoardBaseline}'s own flag: pass `true`
+ * when `baseline` came from {@link readReviewGateBoardBaseline} rather than a fresh read, so a prior
+ * round's already-landed repair (persisted right before this process died) is never mistaken for
+ * unrelated drift and folded away by the refresh loop below — which would otherwise leave the
+ * resumed round's post-fix diff with nothing to credit.
  */
 export async function persistReviewGateBoardBaseline(
   repo: string,
   ticketId: string,
   baseline: BoardFingerprint,
   readBoardFingerprint: (repo: string, ticketId: string) => Promise<BoardFingerprint | undefined>,
+  isRecoveredBaseline = false,
 ): Promise<BoardFingerprint | null> {
   const persisted = await mustPersist(() =>
     beads.setReviewGateBoardBaseline(repo, ticketId, serializeFingerprint(baseline)),
@@ -460,6 +481,7 @@ export async function persistReviewGateBoardBaseline(
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
   if (!synced) return null;
+  if (isRecoveredBaseline) return baseline;
 
   let confirmed = baseline;
   for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {

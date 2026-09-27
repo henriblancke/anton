@@ -1821,6 +1821,22 @@ describe(
       expect(readBoardFingerprint).toHaveBeenCalledTimes(2);
     });
 
+    it("skips the refresh loop entirely for a recovered baseline (chatgpt-codex-connector, PR #284 " +
+      "review, \"Preserve recovered review baselines across retries\") — a prior attempt's own " +
+      "already-landed repair, read back off the bead as `baseline`, must never be mistaken for " +
+      "unrelated drift and folded away", async () => {
+      const recovered = fingerprintBoard([bead("a")]);
+      setReviewFixBoardBaselineMock.mockResolvedValueOnce(""); // the reconfirming persist
+      pushMock.mockResolvedValueOnce("synced"); // its confirming push — may have pulled in the repair
+      const readBoardFingerprint = vi.fn();
+
+      await expect(
+        persistReviewFixBoardBaseline("/repo", "t-1", recovered, readBoardFingerprint, true),
+      ).resolves.toEqual(recovered);
+
+      expect(readBoardFingerprint).not.toHaveBeenCalled();
+    });
+
     it("fails closed when the board keeps drifting under its own confirming push, never settling " +
       "within the bounded refresh rounds", async () => {
       const baseline = fingerprintBoard([bead("a")]);
