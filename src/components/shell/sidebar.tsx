@@ -12,6 +12,7 @@ import { UsagePill } from "@/components/usage/usage-pill";
 import { ShapingNudgePill } from "@/components/usage/shaping-nudge";
 import {
   BoardIcon,
+  CohortsIcon,
   DependenciesIcon,
   HealthIcon,
   JobsIcon,
@@ -34,6 +35,7 @@ function projectNav(slug: string): NavEntry[] {
     { label: "Tickets", href: `/projects/${slug}/tickets`, icon: TicketsIcon },
     { label: "Dependencies", href: `/projects/${slug}/dependencies`, icon: DependenciesIcon },
     { label: "Spend", href: `/projects/${slug}/spend`, icon: SpendIcon },
+    { label: "Cohorts", href: `/projects/${slug}/cohorts`, icon: CohortsIcon },
   ];
 }
 

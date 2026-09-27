@@ -303,6 +303,21 @@ describe("what a cohort could not measure", () => {
     expect(row.getByText("0.0")).toBeTruthy();
   });
 
+  it("marks a partially-priced cohort's $/feature as a floor rather than a complete figure", () => {
+    // 4 of 7 delivered features were priced — the fold still reports an average, but it must not
+    // read as a total the way a fully-priced cohort's does.
+    const partiallyPriced = {
+      ...cohort("partial1", sample(7, HEALTHY_METRICS)),
+      basis: { features: 7, unpricedFeatures: 3 },
+    };
+    render(<CohortView window="all" series={series([partiallyPriced])} />);
+
+    const row = within(rowFor("partial1"));
+    expect(row.getByText("$4.12")).toBeTruthy();
+    // The floor marker `spend-table.tsx` uses for the same situation.
+    expect(row.getByText("+")).toBeTruthy();
+  });
+
   it("labels the pre-instrumentation cohort rather than leaving its key blank", () => {
     const unstamped = sample(6, HEALTHY_METRICS, Array.from({ length: 6 }, () => null));
     render(

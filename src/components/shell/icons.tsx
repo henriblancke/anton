@@ -129,6 +129,28 @@ export function JobsIcon({ className }: { className?: string }) {
   );
 }
 
+/** Stacked, offset bars — cohorts read as successive groups compared one against the last. */
+export function CohortsIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.3}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="2" y="9.5" width="5.5" height="3.5" rx="1" />
+      <rect x="8.5" y="6.5" width="5.5" height="3.5" rx="1" />
+      <rect x="5.5" y="3" width="5.5" height="3.5" rx="1" />
+    </svg>
+  );
+}
+
 export function SpendIcon({ className }: { className?: string }) {
   return (
     <svg

@@ -306,6 +306,13 @@ export function cohortDimension(dimension: CohortDimension) {
   return COHORT_DIMENSIONS.find((option) => option.value === dimension);
 }
 
+/** A URL value → a dimension, falling back to the first of {@link COHORT_DIMENSIONS} rather than rejecting. */
+export function normalizeCohortDimension(raw: string | null | undefined): CohortDimension {
+  return COHORT_DIMENSIONS.some((option) => option.value === raw)
+    ? (raw as CohortDimension)
+    : COHORT_DIMENSIONS[0].value;
+}
+
 /**
  * The caution a dimension's cohorts must be read WITH, or `undefined` where the key names the only
  * thing that plausibly changed.

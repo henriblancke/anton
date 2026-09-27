@@ -2,6 +2,7 @@ import {
   COHORT_METRICS,
   MIN_COHORT,
   type Cohort,
+  type CohortBasis,
   type CohortMetric,
   type CohortWindow,
   type MetricDelta,
@@ -100,6 +101,7 @@ function CohortRow({ cohort }: { cohort: Cohort }) {
           value={cohort.metrics[metric]}
           delta={byMetric.get(metric)}
           comparable={cohort.comparable}
+          unpricedFeatures={metric === "usdPerFeature" ? cohort.basis.unpricedFeatures : 0}
         />
       ))}
     </tr>
@@ -167,22 +169,30 @@ const METRIC_FORMAT = new Intl.NumberFormat(DISPLAY_LOCALE, {
 /**
  * One metric's average, with its move under it where there is one to show.
  *
- * Three states, kept apart on purpose: a figure with a verdict, a figure without one (either the
- * cohort is underpowered or there was no comparable baseline to subtract), and no figure at all — a
- * dash, because a cohort anton could price none of has no `$ / feature`, which `spend-breakdown`'s
- * rule says is reported as missing and never as `0`.
+ * Four states for `usdPerFeature`, kept apart on purpose: a figure with a verdict, a figure without
+ * one (either the cohort is underpowered or there was no comparable baseline to subtract), a figure
+ * that is only a FLOOR because {@link CohortBasis.unpricedFeatures} is non-zero, and no figure at
+ * all — a dash, because a cohort anton could price none of has no `$ / feature`, which
+ * `spend-breakdown`'s rule says is reported as missing and never as `0`. A cohort partly priced is
+ * neither of the extremes: rendering its average as an ordinary, complete-looking number is exactly
+ * the failure `spend-table.tsx` refuses for its own groups — a partial figure that reads as a total.
  */
 function MetricCell({
   metric,
   value,
   delta,
   comparable,
+  unpricedFeatures = 0,
 }: {
   metric: CohortMetric;
   value: number | undefined;
   delta: MetricDelta | undefined;
   comparable: boolean;
+  /** Only meaningful for `usdPerFeature` — see {@link CohortBasis.unpricedFeatures}. */
+  unpricedFeatures?: CohortBasis["unpricedFeatures"];
 }) {
+  const partial = metric === "usdPerFeature" && value !== undefined && unpricedFeatures > 0;
+
   return (
     <td className="px-2.5 py-2 text-right align-top whitespace-nowrap">
       {value === undefined ? (
@@ -200,10 +210,16 @@ function MetricCell({
         <span
           className={cn(
             "font-mono text-[12px] tabular-nums",
-            comparable ? "text-foreground" : "text-muted-foreground",
+            comparable && !partial ? "text-foreground" : "text-muted-foreground",
           )}
+          title={
+            partial
+              ? `At least this — anton could not price ${unpricedFeatures} of this cohort's features. Unpriced, not free, so the average is a floor.`
+              : undefined
+          }
         >
           {metric === "usdPerFeature" ? formatUsd(value) : METRIC_FORMAT.format(value)}
+          {partial ? <span className="text-subtle"> +</span> : null}
         </span>
       )}
       {delta ? <DeltaBadge delta={delta} metric={metric} /> : null}
