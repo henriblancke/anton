@@ -585,6 +585,19 @@ function isScaffoldingFallback(row: CohortStampRow): boolean {
 const DESCRIBER_STEP_HANDLER = "describe";
 
 /**
+ * `review-gate.ts`'s own formula-step handler (`meter`'s `stepHandler: "review"`) — the phase whose
+ * `agentTag` names WHO REVIEWED, not who implemented.
+ *
+ * `review-gate.ts` stamps the review meter with the resolved `reviewAgent`, which a project is free
+ * to configure as a dedicated specialist distinct from the ticket's own `agent:` tag (PR #313
+ * review). Reading that reviewer tag as a second "agent" this feature ran under makes
+ * `featureKeys(feature, "agent")` see two keys and throws the feature into {@link SpanningFeatures}
+ * instead of the cohort its implementation ran under — a project with a dedicated reviewer would then
+ * see every reviewed feature excluded from every agent cohort.
+ */
+const REVIEWER_STEP_HANDLER = "review";
+
+/**
  * One stamp value as a cohort key, or `undefined` for a row that recorded none.
  *
  * A blank or whitespace-only stamp is ABSENT rather than a distinct key, the same reading
@@ -597,6 +610,10 @@ function stampValue(row: CohortStampRow, dimension: CohortDimension): string | u
   // DESCRIBER_STEP_HANDLER. It still counts under every other dimension (formula, anton, agent,
   // skill), where its composition carries no such asymmetry.
   if (dimension === "prompt" && row.stepHandler === DESCRIBER_STEP_HANDLER) return undefined;
+  // The reviewer's agent tag answers "who reviewed", not "who implemented" — see
+  // REVIEWER_STEP_HANDLER. It still counts under every other dimension, where the review row's own
+  // prompt/formula/anton/skill stamps carry no such asymmetry.
+  if (dimension === "agent" && row.stepHandler === REVIEWER_STEP_HANDLER) return undefined;
   const raw = row[DIMENSION_COLUMNS[dimension]];
   const value = typeof raw === "string" ? raw.trim() : "";
   return value || undefined;

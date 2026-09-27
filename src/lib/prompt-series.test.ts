@@ -798,6 +798,66 @@ describe("promptSeries: the prompt dimension ignores the describer's own system 
   });
 });
 
+describe("promptSeries: the agent dimension ignores the reviewer's own agent tag", () => {
+  it("does not treat a dedicated reviewAgent as a second agent on the feature", () => {
+    // `review-gate.ts` stamps the review meter with the resolved `reviewAgent`, which a project can
+    // configure as a specialist distinct from the ticket's own `agent:` tag. Counting it as a second
+    // "agent" this feature ran under would throw every reviewed feature into `spanning` instead of
+    // the cohort its implementation ran under (PR #331 review).
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { agentTag: "agent:nextjs", stepHandler: "implement" },
+          { agentTag: "agent:reviewer", stepHandler: "review" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "agent");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("agent:nextjs");
+  });
+
+  it("still treats two REAL implementation agent tags on one feature as spanning", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { agentTag: "agent:nextjs", stepHandler: "implement" },
+          { agentTag: "agent:alembic", stepHandler: "implement" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "agent");
+    expect(series.spanning).toEqual({ delivered: 1, features: 1 });
+    expect(series.cohorts).toEqual([]);
+  });
+
+  it("still counts the reviewer's agent tag under every OTHER dimension", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [{ formulaDigest: "formula-digest", agentTag: "agent:reviewer", stepHandler: "review" }],
+      },
+    ];
+
+    const series = promptSeries(feature, "formula");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("formula-digest");
+  });
+});
+
 describe("promptSeries: what the cohort reports about the antons it spans", () => {
   it("flags a cohort whose features ran under two antons", () => {
     const series = promptSeries(
