@@ -57,6 +57,37 @@ describe("launcher's src imports are all in the release bundle", () => {
       expect(covered, `${spec} is imported by bin/anton.mjs but missing from build-bundle.mjs`).toBe(true);
     }
   });
+
+  /**
+   * The off-thread build-identity reader (anton-fzarz) is loaded by PATH — `new Worker(join(appRoot,
+   * "src/lib/build/identity-worker.mjs"))` — not by import, so neither the assertion above nor Next's
+   * tracer can see it: the one covers `bin/anton.mjs`'s static imports, the other follows `import`.
+   * An install missing it still answers (drift.ts falls back to the blocking read) which is exactly
+   * why it needs a test: the bundle would silently return to stalling its own event loop on every
+   * display read, with nothing failing to say so.
+   *
+   * Both files are asserted. The worker imports `./identity.mjs` as a real sibling, so shipping it
+   * next to nothing resolves to ERR_MODULE_NOT_FOUND and the same silent fallback.
+   */
+  it("copies the off-thread identity worker and the module it imports", () => {
+    const bundled = bundledPaths();
+    for (const spec of ["src/lib/build/identity-worker.mjs", "src/lib/build/identity.mjs"]) {
+      expect(bundled, `${spec} is loaded by path at run time but missing from build-bundle.mjs`).toContain(spec);
+    }
+  });
+
+  /**
+   * The source-checkout half of the same requirement. `next.config.ts` is what puts those two files in
+   * `.next/standalone` — nft cannot trace a path handed to `new Worker` — and an install assembled
+   * from that output carries them only because the include names them.
+   */
+  it("traces the off-thread identity worker into the standalone output", () => {
+    const config = readFileSync(join(REPO_ROOT, "next.config.ts"), "utf8");
+    const includes = config.match(/outputFileTracingIncludes:\s*\{([\s\S]*?)\n\s*\},/)?.[1] ?? "";
+    for (const spec of ["src/lib/build/identity-worker.mjs", "src/lib/build/identity.mjs"]) {
+      expect(includes, `${spec} must be in next.config.ts outputFileTracingIncludes`).toContain(spec);
+    }
+  });
 });
 
 describe("fetchLatestRelease", () => {
