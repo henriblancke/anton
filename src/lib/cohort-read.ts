@@ -83,8 +83,18 @@ import { boardCards } from "./ticket-view";
  * the prior delivery: cutting at the delivery instead would also erase every settled attempt since
  * (PR #331 review, second round). The map this returns therefore carries a per-target cutoff — the
  * live attempt's own start (or the prior delivery, when no open run row exists to be more precise
- * with) for a target still live on a rerun, `undefined` (whole life, no bound) for every other
+ * with) for a target still live on a rerun, this function's own OWN read instant for every other
  * target — for {@link cohortFeatureOf} to cut the ledger at.
+ *
+ * That "every other target" cutoff is a real bound, not a stand-in for "unbounded": a target the
+ * live/status queries above found no evidence of being live is not thereby proven to stay that way
+ * for as long as {@link cohortFeatures}'s bounded-concurrency map takes to get around to reading it.
+ * A rerun that starts on it AFTER this function's snapshot but BEFORE {@link cohortFeatureOf} reads
+ * its ledger would, under an actually-unbounded cutoff, hand that brand-new unfinished attempt's
+ * rows to a delivery that already has an outcome (PR #331 review). Freezing one instant here and
+ * cutting every target at it — not just the ones already flagged live — closes that window: nothing
+ * recorded after this function returns can reach any read in the same batch, however later that read
+ * actually runs.
  */
 /**
  * Statuses a run CAN leave its target in while still genuinely executing — no finished outcome
@@ -108,6 +118,10 @@ async function activeRunTargetIds(
   board: Bead[],
   since: Date | undefined,
 ): Promise<Map<string, AsOfCutoff | undefined>> {
+  // Frozen once, before any of the queries below run, so every target this call resolves — live or
+  // not — is cut at the SAME instant. See this function's own header for the race a per-target "no
+  // bound at all" default would otherwise leave open.
+  const snapshotMs = Date.now();
   const rows = await listInvocations(db, projectId, since ? { since } : {});
   const byId = new Map(board.map((b) => [b.id, b]));
   const cards = boardCards(board);
@@ -196,7 +210,9 @@ async function activeRunTargetIds(
       });
       continue;
     }
-    ids.set(target.id, undefined);
+    // Not live, but still bounded — see this function's header note on why "unbounded" would leave a
+    // race open for a rerun that starts after `snapshotMs` but before this target's ledger is read.
+    ids.set(target.id, { ms: snapshotMs, exclusive: false });
   }
   return ids;
 }
@@ -211,17 +227,19 @@ interface AsOfCutoff {
 /**
  * One run target's {@link CohortFeature}, composed from the reads named in the header.
  *
- * `asOf` is the one exception to "whole life": for a target still live on a rerun of an
- * already-delivered feature ({@link activeRunTargetIds}), it is the currently open run's own
- * attempt start (`exclusive: true`) or the prior delivery (`exclusive: false`, when no open run
+ * `asOf` bounds every target {@link activeRunTargetIds} resolves, not only the ones it found live:
+ * for a target still live on a rerun of an already-delivered feature, it is the currently open run's
+ * own attempt start (`exclusive: true`) or the prior delivery (`exclusive: false`, when no open run
  * row exists to be more precise with), and everything recorded at-or-after it — invocations, jobs,
  * escalations, review rounds, send-back notes — belongs to that open attempt's own unfinished work.
  * No outcome yet, so none of it may inflate the delivered feature's cost or friction, or, worse,
  * change its stamp and throw an otherwise-clean cohort membership into {@link SpanningFeatures} (PR
  * #331 review). A SETTLED rerun between the delivery and the open attempt's start — a completed
  * failed attempt, say — already has an outcome and is cut IN, not out (PR #331 review, second
- * round). `undefined` for every other target, which reads as the module header's own rule: no bound
- * at all, the whole life. `featureLedger` owns the actual cut (`FeatureLedgerOptions.asOfMs` /
+ * round). Every other target still gets a cutoff — {@link activeRunTargetIds}'s own read instant,
+ * inclusive — rather than `undefined`, so a rerun that starts on it after that instant but before
+ * this call runs cannot smuggle unfinished rows into an already-settled delivery (PR #331 review,
+ * third round). `featureLedger` owns the actual cut (`FeatureLedgerOptions.asOfMs` /
  * `asOfExclusive`) — every source it folds into `totals`, `friction` and `rows` is cut at the same
  * instant and boundary, so nothing here can drift out of step with what it returns by re-deriving
  * one figure on its own.

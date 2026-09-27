@@ -928,13 +928,18 @@ function episodeClosesAt(
  * Falls back to the EARLIEST episode when the activity predates all of them (a feature that ran
  * before its key ever delivered), and to the LAST one when there is no activity timestamp to place it
  * by at all — the same "no better evidence than the current era" reading a repeat delivery under an
- * unchanged key already gets. `undefined` only when the key has formed no episode yet, so the caller
- * opens one.
+ * unchanged key already gets. `undefined` when the key has formed no episode yet, OR when its last
+ * known episode already closed strictly before `activityAtMs` with nothing recorded to replace it —
+ * a key restored after another version but whose every attempt under the restoration then FAILS
+ * before delivering never gets a second entry in `candidates` at all, so without this check the walk
+ * below would silently return that stale, already-closed episode instead of telling the caller to
+ * open the fresh one the restoration actually belongs to (PR #331 review, third round).
  */
 function episodeFor(
   candidates: CohortAccumulator[] | undefined,
   episodes: readonly CohortAccumulator[],
   activityAtMs: number | undefined,
+  episodic: boolean,
 ): CohortAccumulator | undefined {
   if (!candidates || candidates.length === 0) return undefined;
   if (activityAtMs === undefined || !Number.isFinite(activityAtMs)) {
@@ -945,6 +950,13 @@ function episodeFor(
     const closesAt = episodeClosesAt(candidates[i - 1], episodes);
     if (closesAt === undefined || activityAtMs < closesAt) break;
     current = candidates[i];
+  }
+  // Only an episodic dimension ever forms more than one episode per key, so only there can the LAST
+  // candidate itself have already closed with no later same-key episode on record to hand the
+  // activity to instead — an identity dimension's single accumulator per key never closes.
+  if (episodic) {
+    const closesAt = episodeClosesAt(current, episodes);
+    if (closesAt !== undefined && activityAtMs >= closesAt) return undefined;
   }
   return current;
 }
@@ -1091,7 +1103,7 @@ export function promptSeries(
   }
   for (const { feature, key } of undated) {
     const candidates = episodesByKey.get(key);
-    const episode = episodeFor(candidates, episodes, feature.activityAtMs);
+    const episode = episodeFor(candidates, episodes, feature.activityAtMs, episodic);
     if (episode) {
       accumulate(episode, feature);
       continue;

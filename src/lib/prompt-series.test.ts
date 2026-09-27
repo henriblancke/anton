@@ -533,6 +533,40 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     expect(secondOld.basis.features).toBe(6);
   });
 
+  it("opens a fresh episode for a restoration whose every attempt fails before delivering (PR #331 review)", () => {
+    // v1 delivers, v2 delivers, then v1 is restored but every attempt under the restoration fails —
+    // no delivery ever creates a second v1 episode. Without a check for "this key's only known
+    // episode already closed", the failure would silently fold into the ORIGINAL v1 cohort, inflating
+    // a period that finished before v2 even started with spend that happened after it.
+    const series = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_VERSION, at: JUL_1, usd: 2, dimension: "antonVersion" }),
+        ...deliveries(5, { key: NEW_VERSION, at: AUG_2, usd: 10, dimension: "antonVersion" }),
+        {
+          beadId: "failed-only-restoration",
+          delivered: false,
+          activityAtMs: SEP_4,
+          usd: 1000,
+          rows: [{ antonVersion: OLD_VERSION }],
+        },
+      ],
+      "anton",
+    );
+
+    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([
+      OLD_VERSION,
+      NEW_VERSION,
+      OLD_VERSION,
+    ]);
+    const [firstOld, , restoredOld] = series.cohorts;
+    // The original v1 cohort stays exactly what it delivered — untouched by a failure that happened
+    // after v2 had already taken over.
+    expect(firstOld.basis.features).toBe(5);
+    // The failed restoration gets its OWN cohort instead, carrying the failure and nothing else.
+    expect(restoredOld.basis.features).toBe(1);
+    expect(restoredOld.comparable).toBe(false);
+  });
+
   it("measures each cohort against the one immediately before it in delivery order", () => {
     const series = promptSeries(
       [
