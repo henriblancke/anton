@@ -36,6 +36,11 @@ const unverifyBoardEvidenceBaselineMock = vi.fn<(repo: string, id: string) => Pr
 // pre-dispatch locks from recovery baselines") shells out to `bd update` too — mocked for the same
 // reason the other board-evidence writes above are.
 const setBoardEvidenceDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// `markReviewGateDispatchStarted`'s own write and rollback (chatgpt-codex-connector, PR #284 review,
+// "Roll back an unconfirmed gate dispatch marker") shell out to `bd update` too — mocked for the same
+// reason the other board-evidence writes above are.
+const setReviewGateDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+const clearReviewGateDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // The cleanup-push retry obligation (PR #284 review, "retain a retry obligation after cleanup
 // push failure") shells out to `bd update` too — mocked for the same reason the baseline writes
 // above are.
@@ -75,6 +80,8 @@ vi.mock("../beads/bd", async () => {
       setReviewFixDispatchStarted: setReviewFixDispatchStartedMock,
       unverifyBoardEvidenceBaseline: unverifyBoardEvidenceBaselineMock,
       setBoardEvidenceDispatchStarted: setBoardEvidenceDispatchStartedMock,
+      setReviewGateDispatchStarted: setReviewGateDispatchStartedMock,
+      clearReviewGateDispatchStarted: clearReviewGateDispatchStartedMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
       clearBoardEvidenceCleanupUnsynced: clearBoardEvidenceCleanupUnsyncedMock,
       setBoardEvidenceConfirmed: setBoardEvidenceConfirmedMock,
@@ -98,6 +105,7 @@ const {
   isBoardOnlyRun,
   markDispatchStarted,
   markReviewFixDispatchStarted,
+  markReviewGateDispatchStarted,
   persistReviewFixBoardBaseline,
   readBoardBaseline,
   readBoardEvidence,
@@ -116,6 +124,8 @@ clearReviewFixBoardBaselineMock.mockResolvedValue("");
 setReviewFixDispatchStartedMock.mockResolvedValue("");
 unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceDispatchStartedMock.mockResolvedValue("");
+setReviewGateDispatchStartedMock.mockResolvedValue("");
+clearReviewGateDispatchStartedMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 clearBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
 setBoardEvidenceConfirmedMock.mockResolvedValue("");
@@ -3004,6 +3014,83 @@ describe(
       pushMock.mockResolvedValueOnce("not-wired");
 
       await expect(markDispatchStarted("/repo", bead("t-dispatch-unconfirmed"))).resolves.toBe(false);
+    });
+  },
+);
+
+describe(
+  "markReviewGateDispatchStarted — durably records that self-review-gate dispatch began, and rolls " +
+    'back the local marker on an unconfirmed push (chatgpt-codex-connector, PR #284 review, "Roll ' +
+    'back an unconfirmed gate dispatch marker")',
+  () => {
+    it("persists and confirms synced", async () => {
+      setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+
+      await expect(markReviewGateDispatchStarted("/repo", "t-dispatching")).resolves.toBe(true);
+
+      expect(setReviewGateDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
+      expect(clearReviewGateDispatchStartedMock).not.toHaveBeenCalled();
+    });
+
+    it("returns false, never throwing, when the write cannot be persisted after every retry", async () => {
+      setReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unpersisted")).resolves.toBe(false);
+
+      // Never reaches the confirming push at all — nothing landed locally to confirm, so there is
+      // nothing for a rollback to undo either.
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+      expect(clearReviewGateDispatchStartedMock).not.toHaveBeenCalled();
+    });
+
+    it(
+      "rolls back the local marker and confirms the rollback synced when the write lands locally " +
+        "but the confirming push never syncs — otherwise a same-machine retry's `recoveredAfterDispatch` " +
+        "would read the unsynced marker as a genuine post-dispatch recovery",
+      async () => {
+        setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("not-wired"); // the dispatch-started marker's own confirming push
+        pushMock.mockResolvedValueOnce("synced"); // the rollback's own confirming push
+
+        await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unconfirmed")).resolves.toBe(false);
+
+        expect(clearReviewGateDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatch-unconfirmed");
+      },
+    );
+
+    it(
+      "throws rather than leaving an unsynced marker in place when the rollback itself cannot be " +
+        "persisted after every retry",
+      async () => {
+        setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+        pushMock.mockResolvedValueOnce("not-wired"); // the dispatch-started marker's own confirming push
+        clearReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+        clearReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+        clearReviewGateDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+        const pushCallsBefore = pushMock.mock.calls.length;
+
+        await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unrollback")).rejects.toThrow(
+          /t-dispatch-unrollback/,
+        );
+
+        // Never reaches the rollback's confirming push at all — nothing landed locally to confirm.
+        expect(pushMock.mock.calls.length).toBe(pushCallsBefore + 1);
+      },
+    );
+
+    it("throws rather than leaving an unsynced marker in place when the rollback's confirming push never syncs", async () => {
+      setReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired"); // the dispatch-started marker's own confirming push
+      clearReviewGateDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired"); // the rollback's own confirming push never syncs either
+
+      await expect(markReviewGateDispatchStarted("/repo", "t-dispatch-unrollback-sync")).rejects.toThrow(
+        /t-dispatch-unrollback-sync/,
+      );
     });
   },
 );

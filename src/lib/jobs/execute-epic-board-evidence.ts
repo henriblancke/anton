@@ -556,6 +556,43 @@ export async function releaseReviewGateBoardBaseline(repo: string, ticketId: str
 }
 
 /**
+ * Roll back a dispatch-started marker {@link markReviewGateDispatchStarted} wrote LOCALLY but could
+ * not confirm reached the remote (chatgpt-codex-connector, PR #284 review, "Roll back an unconfirmed
+ * gate dispatch marker") — mirrors {@link abandonDispatchBaseline}, but unsets only
+ * {@link beads.clearReviewGateDispatchStarted}'s key, never the baseline itself: the baseline was
+ * already confirmed synced by {@link persistReviewGateBoardBaseline} before this marker was ever
+ * attempted, so it remains the correct value for a retry to dispatch against — only the
+ * dispatch-started flag is suspect.
+ *
+ * Throws (never returns `false`) when the rollback itself cannot be trusted: leaving a local-only
+ * marker in place would make a later {@link beads.reviewGateDispatchStarted} read `true` on a
+ * same-machine retry even though the fixer this attempt refused to dispatch never ran, which is
+ * exactly the false "recovered" read {@link markReviewGateDispatchStarted}'s caller relies on this
+ * flag to rule out — see `review-gate.ts`'s `recoveredAfterDispatch`.
+ */
+async function abandonReviewGateDispatchStarted(repo: string, ticketId: string): Promise<void> {
+  const cleared = await mustPersist(() => beads.clearReviewGateDispatchStarted(repo, ticketId));
+  const synced = cleared
+    ? await beads
+        .push(repo)
+        .then((outcome) => outcome === "synced" || outcome === "shared-server")
+        .catch(() => false)
+    : false;
+  if (!cleared || !synced) {
+    throw new PoisonEpic(
+      `${ticketId}'s review-gate dispatch-started marker could not be safely rolled back after its ` +
+        `confirming push failed: the unset ${
+          cleared
+            ? "landed locally, but the confirming push could not verify it reached the remote"
+            : "could not be persisted locally (after retries)"
+        } — leaving a possibly-set marker for a later resume to trust unchecked risks skipping the ` +
+        `baseline refresh that exists to fold in board drift from this downtime, crediting a ` +
+        `subsequent no-op fixer with progress it never made. Check the beads DB${cleared ? " and the sync channel" : ""}, then resume the run.`,
+    );
+  }
+}
+
+/**
  * Durably mark that dispatch has actually begun against the self-review gate baseline
  * {@link persistReviewGateBoardBaseline} just confirmed (chatgpt-codex-connector, PR #284 review,
  * "Distinguish pre-dispatch review baselines from recovered ones") — {@link markDispatchStarted}'s
@@ -565,22 +602,25 @@ export async function releaseReviewGateBoardBaseline(repo: string, ticketId: str
  * leaves a plain pre-dispatch baseline that a resume cannot tell apart from one preserved AFTER a
  * genuine dispatch attempt — see {@link beads.reviewGateDispatchStarted}'s own docstring.
  *
- * Never throws: like {@link persistReviewGateBoardBaseline}, a persist or push failure returns
- * `false` so the caller can refuse to dispatch the same fail-closed way it already does for an
- * unpersistable baseline, rather than let the fixer run against a baseline whose dispatch-started
- * state is not itself durable. No rollback of the baseline itself on a failed push here (unlike
- * {@link markDispatchStarted}'s `abandonDispatchBaseline` call): review-gate's baseline carries no
- * separate locked/verified state for a half-confirmed marker to corrupt, so leaving it exactly as
- * {@link persistReviewGateBoardBaseline} already confirmed it — un-marked — is enough for a retry to
- * safely re-enter this same function.
+ * A persist failure returns `false` so the caller can refuse to dispatch the same fail-closed way it
+ * already does for an unpersistable baseline. A PUSH failure additionally rolls the local marker back
+ * via {@link abandonReviewGateDispatchStarted} (mirroring {@link markDispatchStarted}'s
+ * `abandonDispatchBaseline` call) before returning `false` — the local `setReviewGateDispatchStarted`
+ * write above already landed, so leaving it in place would let a same-machine retry's
+ * `recoveredAfterDispatch` read it as `true` and skip the refresh loop for a fixer that never ran.
  */
 export async function markReviewGateDispatchStarted(repo: string, ticketId: string): Promise<boolean> {
   const persisted = await mustPersist(() => beads.setReviewGateDispatchStarted(repo, ticketId));
   if (!persisted) return false;
-  return beads
+  const synced = await beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
+  if (!synced) {
+    await abandonReviewGateDispatchStarted(repo, ticketId);
+    return false;
+  }
+  return true;
 }
 
 /**

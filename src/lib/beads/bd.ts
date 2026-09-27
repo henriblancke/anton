@@ -1842,6 +1842,13 @@ export const beads = {
   setReviewGateDispatchStarted: (cwd: string, id: string) =>
     bdWrite(cwd, ["update", id, "--set-metadata", `${REVIEW_GATE_DISPATCH_STARTED_KEY}=1`]),
 
+  /** Roll back a marker {@link setReviewGateDispatchStarted} wrote locally but could not confirm
+   * synced — unlike {@link clearReviewGateBoardBaseline}, this leaves the baseline itself untouched
+   * and unsets only the dispatch-started flag, since the baseline may already be confirmed synced
+   * and remains the correct value to retry dispatch against. */
+  clearReviewGateDispatchStarted: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_GATE_DISPATCH_STARTED_KEY]),
+
   /**
    * Close a bead as DONE. `reason` is bd's own close reason — the durable record of what settled it,
    * which a plain close leaves blank. Deliberately NOT the abandon path: a reason here describes
