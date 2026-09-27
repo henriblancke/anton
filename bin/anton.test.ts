@@ -282,6 +282,69 @@ describe("anton board-check (bd stubbed on PATH)", () => {
       expect(r.status).toBe(1);
     });
 
+    // P2 review, PR #274: `sameBlocksEdges` alone only proves the `blocks` EDGES held steady between
+    // the read and its recheck. Reopening a cycle member touches no edge at all, so without also
+    // comparing live/abandoned status the checker would accept a read taken BEFORE the reopen paired
+    // with cycle evidence that already reflects it — judging a now-live cycle by stale, closed status
+    // and calling the board clean. `t-1`/`t-2` start closed (a historical, non-faulting cycle); the
+    // stubbed bd reopens `t-1` starting on the SECOND `bd list` call (the consistency recheck) and
+    // stays reopened from then on, so the pairing only settles once both reads agree it's live.
+    it("retries a board read instead of pairing cycle evidence with a snapshot whose member liveness already drifted", async () => {
+      const bin = await dirs.make("anton-bdbin-liveness-");
+      const stateFile = join(bin, "calls");
+      writeFileSync(stateFile, "0");
+      const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+      const closedA = { id: "t-1", issue_type: "task", status: "closed", parent: "f1", dependencies: [dep("t-1", "t-2")] };
+      const closedB = { id: "t-2", issue_type: "task", status: "closed", parent: "f1", dependencies: [dep("t-2", "t-1")] };
+      const reopenedA = { ...closedA, status: "open" };
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          "const a = process.argv.slice(2);",
+          `const stateFile = ${JSON.stringify(stateFile)};`,
+          `const healthy = ${JSON.stringify(HEALTHY)};`,
+          `const closedA = ${JSON.stringify(closedA)};`,
+          `const closedB = ${JSON.stringify(closedB)};`,
+          `const reopenedA = ${JSON.stringify(reopenedA)};`,
+          'if (a.includes("dep") && a.includes("cycles")) {',
+          '  console.log(JSON.stringify([{ cycle: ["t-1", "t-2"] }]));',
+          "  process.exit(0);",
+          "}",
+          "let n = Number(fs.readFileSync(stateFile, 'utf8')) + 1;",
+          "fs.writeFileSync(stateFile, String(n));",
+          // Call 1 (this attempt's read): both closed. Call 2 (its recheck): A already reopened —
+          // the same drift `sameBlocksEdges` alone can't see. Call 3+ (the retried attempt): stable.
+          "const cycleMembers = n === 1 ? [closedA, closedB] : [reopenedA, closedB];",
+          "console.log(JSON.stringify([...healthy, ...cycleMembers]));",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      // Converges on the reopened, live pairing — a cycle with a live member faults.
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    // P2 review, PR #274: a cycle can be made ENTIRELY of gates no ordinary bead's `blocks` edge
+    // dangles toward (two gates blocking each other, nothing else pointing at either) — `readBoard`'s
+    // dangling-edge check never fires for that shape, so the gate listing is never fetched and the
+    // cycle's own ids never land on `board`. `validateBoardStructure` intentionally lets a cycle with
+    // no live member pass; without hydrating those gate ids in first, the checker can't tell the two
+    // closed gates apart from an unreadable record and refuses the whole board over dead history.
+    it("clears a cycle made entirely of closed gates nothing else points at, instead of an unreadable-cycle fault", async () => {
+      const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "closed", dependencies: [dep("gate1", "gate2")] },
+        { id: "gate2", issue_type: "gate", status: "closed", dependencies: [dep("gate2", "gate1")] },
+      ];
+      const r = runCheck(await fakeBd(board, { cycles: [{ cycle: ["gate1", "gate2"] }] }));
+      expect(r.stdout).not.toContain("[blocks-cycle]");
+      expect(r.status).toBe(0);
+    });
+
     it("hydrates gate records before judging a blocks target", async () => {
       const board = [
         ...HEALTHY,
