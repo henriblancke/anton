@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { TriangleAlertIcon } from "lucide-react";
+import { PackageXIcon, TriangleAlertIcon } from "lucide-react";
 
 import { DISPLAY_LOCALE } from "@/lib/time";
 import { cn } from "@/lib/utils";
@@ -18,10 +18,12 @@ import {
   isActiveRun,
   pickAttachSession,
   timelineOrder,
+  warmFailure,
   type RunDetail,
   type RunStatus,
   type SessionStatus,
   type SessionSummary,
+  type WarmFailure,
 } from "@/components/runs/run-view-utils";
 
 const RUN_STATUS_STYLE: Record<RunStatus, { dot: string; text: string; pulse?: boolean }> = {
@@ -161,6 +163,8 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
             </div>
           )}
 
+          <WarmFailureNotice failure={warmFailure(run)} />
+
           <section className="flex flex-col gap-2.5">
             <SectionLabel>Run</SectionLabel>
             <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
@@ -216,6 +220,43 @@ export function RunDetailView({ slug, runId }: { slug: string; runId: string }) 
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * A warm that failed, named where the run is read (anton-rqwy8). Amber, not rose: the install
+ * broke, the run still went ahead — it is a degraded run, and calling it an error would put it on
+ * equal footing with the failure that actually ended one. Renders nothing for every other outcome,
+ * so an ordinary run carries no line reporting that nothing went wrong.
+ */
+function WarmFailureNotice({ failure }: { failure: WarmFailure | null }) {
+  if (!failure) return null;
+  return (
+    // A live region because the view polls: on an active run the notice appears mid-read, and a
+    // warning that materializes silently is one a screen-reader user never learns about.
+    <div
+      role="status"
+      className="flex flex-col gap-1.5 rounded-lg border border-risk-med/28 bg-risk-med/10 p-3"
+    >
+      <div className="flex items-start gap-2">
+        <PackageXIcon className="mt-px size-3.5 shrink-0 text-risk-med" aria-hidden="true" />
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <span className="text-[11.5px] leading-relaxed font-medium text-risk-med">
+            Dependency warming failed — the run continued on a tree that may be missing packages.
+          </span>
+          {/* Warming can break before it resolves a command (see warmWorktreeBestEffort); saying so
+              beats an empty slot that reads as a missing value. */}
+          <span className="font-mono text-[11px] break-all text-foreground/90">
+            {failure.command ?? "no command resolved"}
+          </span>
+        </div>
+      </div>
+      {failure.detail && (
+        <pre className="max-h-40 overflow-auto rounded-md border border-border bg-background/60 p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-foreground/90">
+          {failure.detail}
+        </pre>
+      )}
     </div>
   );
 }
