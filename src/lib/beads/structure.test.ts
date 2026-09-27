@@ -249,11 +249,12 @@ describe("validateBoardStructure", () => {
     });
 
     it("blocks each member of a cycle made entirely of pipeline artifacts (gates/molecules)", () => {
-      // isJudged excludes gate/molecule beads, so the per-bead loop above never reaches either of
-      // these ids' cycle-membership check — without this fallback, a loop wired entirely out of
-      // ad-hoc gates would report as a clean board despite bd's own detector finding it. Faulted at
-      // each member's own id (not a synthetic "board" id) so `structureGaps` subtree-scopes it like
-      // any other mapped cycle, rather than gating every run target on the board.
+      // Cycle membership is checked against `isLive`, not `isJudged` — a gate/molecule is pipeline
+      // plumbing, exempt from the ticket/feature rules, but a live one stuck in a loop still deadlocks
+      // dispatch. Without that, a loop wired entirely out of ad-hoc gates would report as a clean
+      // board despite bd's own detector finding it. Faulted at each member's own id (not a synthetic
+      // "board" id) so `structureGaps` subtree-scopes it like any other mapped cycle, rather than
+      // gating every run target on the board.
       const board = [
         bead("g1", "gate", { dependencies: [blocks("g1", "g2")] }),
         bead("g2", "molecule", { dependencies: [blocks("g2", "g1")] }),
@@ -270,9 +271,9 @@ describe("validateBoardStructure", () => {
     });
 
     it("ignores a cycle made entirely of closed (historical) beads (P2 review, PR #274)", () => {
-      // Neither `t1` nor `t2` is closed's live, so the per-bead loop skips both (`isJudged` is false
-      // for closed beads too) — but unlike the gates/molecules case above, there is no LIVE edge left
-      // on this loop to deadlock anything. A closed bead's `blocks` edge no longer holds anyone back.
+      // Neither `t1` nor `t2` is live, so the loop's `allLive` never holds — and unlike the
+      // gates/molecules case above, there is no LIVE edge left on this loop to deadlock anything. A
+      // closed bead's `blocks` edge no longer holds anyone back.
       const board = [
         task("t1", undefined, { status: "closed", dependencies: [blocks("t1", "t2")] }),
         task("t2", undefined, { status: "closed", dependencies: [blocks("t2", "t1")] }),
@@ -283,7 +284,25 @@ describe("validateBoardStructure", () => {
       expect(violations).toEqual([]);
     });
 
-    it("still faults a cycle mixing a closed bead with a live gate (live edge remains)", () => {
+    it("clears a mixed ticket cycle once one member closes — a → b → a with a closed no longer deadlocks (P2 review, PR #274)", () => {
+      // The literal case the review named: `bd dep cycles` still reports `a → b → a`, but `a` closed
+      // already, so `b`'s wait on it is satisfied and the loop can't deadlock anymore. Before this fix
+      // the per-bead loop faulted `b` unconditionally (it is live and judged) without ever checking
+      // whether its own cycle partner had already resolved.
+      const board = [
+        task("a", undefined, { status: "closed", dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "a")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }],
+      });
+      expect(violations).toEqual([]);
+    });
+
+    it("clears a cycle mixing a closed bead with a live gate — the closed member already resolved its edge (P2 review, PR #274)", () => {
+      // `t1` is closed, so `g1`'s wait on it is already satisfied — the loop bd reported is really a
+      // plain chain now, not a deadlock. Faulting `g1` here over a harmless historical edge is exactly
+      // the false positive the review caught: cycle faults require the WHOLE loop to still be live.
       const board = [
         task("t1", undefined, { status: "closed", dependencies: [blocks("t1", "g1")] }),
         bead("g1", "gate", { dependencies: [blocks("g1", "t1")] }),
@@ -291,13 +310,13 @@ describe("validateBoardStructure", () => {
       const violations = validateBoardStructure(board, {
         cycles: [{ ids: ["t1", "g1"], raw: { cycle: ["t1", "g1"] } }],
       });
-      expect(violations.map((v) => [v.id, v.rule, v.severity])).toEqual([
-        ["t1", "blocks-cycle", "blocking"],
-        ["g1", "blocks-cycle", "blocking"],
-      ]);
+      expect(violations).toEqual([]);
     });
 
-    it("still faults the judged member, not the board, when only one side of the cycle is a gate", () => {
+    it("faults BOTH sides of a fully live cycle, ticket and gate alike (P2 review, PR #274)", () => {
+      // A live gate/molecule stuck in the same loop as a ticket deadlocks whatever depends on IT too —
+      // if only the ticket's id were faulted, `structureGaps` for a run target that owns only the gate
+      // (not the ticket) would come back clean despite its own tail being trapped in the cycle.
       const board = [
         task("t1", undefined, { dependencies: [blocks("t1", "g1")] }),
         bead("g1", "gate", { dependencies: [blocks("g1", "t1")] }),
@@ -305,7 +324,10 @@ describe("validateBoardStructure", () => {
       const violations = validateBoardStructure(board, {
         cycles: [{ ids: ["t1", "g1"], raw: { cycle: ["t1", "g1"] } }],
       });
-      expect(violations.map((v) => [v.id, v.rule])).toEqual([["t1", "blocks-cycle"]]);
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["t1", "blocks-cycle"],
+        ["g1", "blocks-cycle"],
+      ]);
     });
 
     it("blocks mapped cycle members even when a raced board snapshot no longer carries their edges", () => {
@@ -534,6 +556,21 @@ describe("structureGaps", () => {
 
     expect(structureGaps("f2", board, { cycles }).blocking).toEqual([]);
     expect(structureGaps("f1", board, { cycles }).blocking.map((v) => v.id).sort()).toEqual(["g1", "g2"]);
+  });
+
+  it("surfaces a mixed cycle to BOTH run targets it spans, not just the one with the judged half (P2 review, PR #274)", () => {
+    // `gate1` lives under f1's run, `t2` under f2's — a single loop straddling two run targets. Before
+    // this fix only the judged ticket (`t2`) was faulted, so f1's own gaps came back clean even though
+    // its gate is permanently stuck in the same cycle and anything waiting on it would never unblock.
+    const board = [
+      ...BOARD,
+      bead("gate1", "gate", { parent: "f1", dependencies: [blocks("gate1", "t2")] }),
+      task("t2b2", "f2", { dependencies: [blocks("t2b2", "gate1")] }),
+    ];
+    const cycles = [{ ids: ["gate1", "t2b2"], raw: { cycle: ["gate1", "t2b2"] } }];
+
+    expect(structureGaps("f1", board, { cycles }).blocking.map((v) => v.id)).toEqual(["gate1"]);
+    expect(structureGaps("f2", board, { cycles }).blocking.map((v) => v.id)).toEqual(["t2b2"]);
   });
 });
 

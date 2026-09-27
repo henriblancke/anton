@@ -115,11 +115,7 @@ function isJudged(bead) {
 export function validateBoardStructure(board, { cycles } = {}) {
   const byId = new Map(board.map((b) => [b.id, b]));
   const childrenOf = childIndex(board);
-  const {
-    memberships: cycleMemberships,
-    unreadable: unreadableCycles,
-    all: allCycles,
-  } = cycleMembers(byId, cycles);
+  const { memberships: cycleMemberships, unreadable: unreadableCycles } = cycleMembers(byId, cycles);
 
   const violations = [];
   const fault = (id, rule, severity, message) => violations.push({ id, rule, severity, message });
@@ -202,13 +198,19 @@ export function validateBoardStructure(board, { cycles } = {}) {
       }
     }
 
-    // Everything past this point is tier judgement, not graph integrity — cycle membership,
-    // dangling-parent, and the ticket/feature rules all stay pipeline-exempt. A cycle built entirely
-    // out of gates/molecules is still caught (see the `allCycles` fallback below); this cutoff only
-    // keeps a pipeline bead from being faulted twice for the same loop.
-    if (!isJudged(bead)) continue;
-
+    // Cycle membership is graph integrity, not tier judgement: a live gate/molecule stuck in a loop
+    // deadlocks whatever waits on it exactly like a ticket's cycle would (P2 review, PR #274). So this
+    // runs for every LIVE bead — pipeline types included — ahead of the `isJudged` cutoff below, which
+    // still exempts them from the ticket/feature-specific rules that follow it. Faulting the pipeline
+    // member here (not just its judged partner) is what lets `structureGaps` see the loop from EITHER
+    // run target it touches, instead of only the one whose ticket happens to be the judged half.
     for (const cycle of cycleMemberships.get(bead.id) ?? []) {
+      // Only when the WHOLE loop is still live: a closed (or abandoned) member has already resolved
+      // its blocking edge, which turns the single loop bd reports into a plain chain — nothing on it
+      // can deadlock anymore, so a stray historical edge must never block an approval (P2 review, PR
+      // #274). This also makes the old "cycle with no judged member" fallback redundant: every live
+      // member of a fully-live loop is faulted right here now, gate/molecule or not.
+      if (!cycle.allLive) continue;
       // Prefer the edge bd's own reported path actually walks (`next`), not just any `blocks` edge
       // into the cycle's member set: a bead can hold a chord into the same cycle (e.g. `a -> c` on
       // top of the real loop `a -> b -> c -> a`), and picking that chord names a `bd dep remove`
@@ -229,6 +231,10 @@ export function validateBoardStructure(board, { cycles } = {}) {
           `is actually correct (\`bd dep add <blocked> <blocker>\`).`,
       );
     }
+
+    // Everything past this point is tier judgement, not graph integrity — dangling-parent and the
+    // ticket/feature rules stay pipeline-exempt (a gate/molecule is plumbing, not a run target).
+    if (!isJudged(bead)) continue;
 
     // A parent id pointing at a bead this board doesn't contain — a bd-level inconsistency, not a
     // shape one (a re-parent that lost its target, a hand-edited export). The one rule here that
@@ -334,45 +340,6 @@ export function validateBoardStructure(board, { cycles } = {}) {
     }
   }
 
-  // A cycle whose every mapped member fails `isJudged` (closed, abandoned, or pipeline-typed —
-  // `gate`/`molecule`) never has its `blocks-cycle` fault raised above: the per-bead loop `continue`s
-  // past every one of those ids before it ever reaches the cycle-membership check at their `id`, so a
-  // loop built entirely out of ad-hoc gates/molecules produced no violation despite bd's own detector
-  // reporting it. Complete cycles only — an incomplete one is already covered by the unreadable-cycle
-  // fallback below, and double-reporting it would fault the same bd record twice.
-  //
-  // Gated on LIVE membership, not judged membership: a live gate/molecule is exactly the case this
-  // fallback exists to catch (its cycle is real — it still deadlocks dispatch), but it is `!isJudged`
-  // same as a closed or abandoned bead. Testing `isJudged` here would treat "no judged member" as
-  // "nothing live", so a cycle made entirely of CLOSED/abandoned beads — pure history, no live edge
-  // left to deadlock anything — would fault right alongside a live gates/molecules loop. Testing
-  // `isLive` instead keeps the live-pipeline case faulting while a historical-only cycle goes quiet.
-  //
-  // Faulted at EACH member's own id, not the synthetic "board" id: every member here is a mapped,
-  // known bead (that is what "complete" means), so — unlike the unreadable-cycle fallback below,
-  // which has no members to name — `structureGaps`'s subtree scoping can and should apply. Faulting
-  // "board" would put this in every target's gap set via the `v.id === "board"` branch, failing an
-  // unrelated run B that shares no subtree with the cycle simply because run A's gates/molecules loop.
-  for (const evidence of allCycles) {
-    if (!evidence.complete) continue;
-    const hasLiveMember = [...evidence.members].some((id) => isLive(byId.get(id)));
-    if (!hasLiveMember) continue;
-    const hasJudgedMember = [...evidence.members].some((id) => isJudged(byId.get(id)));
-    if (hasJudgedMember) continue;
-    for (const id of evidence.members) {
-      fault(
-        id,
-        "blocks-cycle",
-        "blocking",
-        `bd dep cycles reported a blocks cycle with no judged member (${[...evidence.members].join(", ")}) ` +
-          "— every id is a live pipeline gate/molecule (closed and abandoned ids in the same cycle " +
-          "carry no live edge), so no bead on it ever reaches the per-bead check, yet the loop still " +
-          "deadlocks whatever depends on it. Break one edge on it (`bd dep remove <blocked> <blocker>`), " +
-          "then restore the intended order (`bd dep add <blocked> <blocker>`).",
-      );
-    }
-  }
-
   // `bd dep cycles` may report a real graph cycle in an encoding whose bead ids this version of
   // anton cannot read. That is still blocking evidence, not an empty answer: put it on a stable
   // board-level id so the CLI refuses instead of silently calling the board healthy.
@@ -431,7 +398,6 @@ export function structureGaps(targetId, board, options) {
 function cycleMembers(byId, cycles) {
   const memberships = new Map();
   const unreadable = [];
-  const all = [];
   for (const cycle of cycles ?? []) {
     const ids = Array.isArray(cycle?.ids) ? cycle.ids.filter((id) => typeof id === "string") : [];
     const mapped = ids.filter((id) => byId.has(id));
@@ -449,8 +415,12 @@ function cycleMembers(byId, cycles) {
     // so member[i] blocks on member[i+1] and the last member blocks on the first" — confirming
     // this isn't an artifact of the current DFS implementation that a future bd could drop.
     const next = new Map(ids.map((id, i) => [id, ids[(i + 1) % ids.length]]));
-    const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length };
-    all.push(evidence);
+    // A closed (or abandoned) member has already resolved whatever waited on it, which breaks the
+    // single loop bd reports into a plain chain — nothing downstream of it can deadlock anymore
+    // (P2 review, PR #274). So the loop only still deadlocks when EVERY member remains live; one
+    // resolved link is enough to clear the whole cycle, not just the two beads next to it.
+    const allLive = mapped.length > 0 && mapped.every((id) => isLive(byId.get(id)));
+    const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length, allLive };
     for (const id of mapped) {
       const memberCycles = memberships.get(id);
       if (memberCycles) memberCycles.push(evidence);
@@ -460,7 +430,7 @@ function cycleMembers(byId, cycles) {
     // edge, each mapped member must block; only the missing members need a board-level fallback.
     if (!evidence.complete) unreadable.push(cycle?.raw ?? cycle);
   }
-  return { memberships, unreadable, all };
+  return { memberships, unreadable };
 }
 
 /** Keep unfamiliar authoritative metadata diagnosable without letting an unexpected value throw. */
