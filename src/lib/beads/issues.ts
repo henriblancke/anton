@@ -964,6 +964,13 @@ export async function ensureCycleEvidence(
   // before a shared-server writer introduced a gate-only cycle. Mirrors the same fix already
   // applied to every guard in {@link attachCyclesBestEffort}.
   if (cycleEvidenceMissingOrStale(board)) {
+    // Captured before the first await below, mirroring `attachCyclesBestEffort`'s identical
+    // `staleCheckedAt` guard (issues.ts:712): a racing `probeCycleEvidence`/`attachCyclesBestEffort`
+    // sharing this same retained board can attach a newer, successful result while this call's own
+    // `depCycles` fetch or consistency re-list is in flight — attaching evidence doesn't bump the
+    // snapshot generation this function checks, so that newer result must survive this call's own
+    // rejection rather than being clobbered by it (P2 review, PR #274, issues.ts:1084).
+    const staleCheckedAt = cycleEvidenceCheckedAtFor(board);
     const cycles = await beads.depCycles(cwd);
     let consistent = boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
     // Recheck evidence AFTER the `sameBlocksEdges` await, not just before it, mirroring
@@ -1051,10 +1058,15 @@ export async function ensureCycleEvidence(
               // attached here would still read as present to `cycleEvidenceFor`, and the approve route
               // could derive a verdict off an expired cycle set the refresh just disowned. Clear it and
               // fail closed, mirroring `attachCyclesBestEffort`'s identical rejection branch
-              // (issues.ts:819-831).
-              const hadEvidence = cycleEvidenceFor(board) !== undefined;
-              clearCycleEvidence(board);
-              if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+              // (issues.ts:819-831). Guarded by the same `staleCheckedAt` check as that branch: a racing
+              // `probeCycleEvidence`/`attachCyclesBestEffort` sharing this same retained board can
+              // attach a newer, successful result while the awaits above were in flight, and that
+              // result must survive this call's rejection rather than being clobbered.
+              if (cycleEvidenceCheckedAtFor(board) === staleCheckedAt) {
+                const hadEvidence = cycleEvidenceFor(board) !== undefined;
+                clearCycleEvidence(board);
+                if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+              }
             }
           }
         }
@@ -1072,16 +1084,27 @@ export async function ensureCycleEvidence(
         attachCycleEvidence(board, cycles);
         markCycleEvidenceRecovered(cwd);
       }
-    } else if (!consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) !== undefined) {
+    } else if (
+      !consistent &&
+      issueSnapshotGeneration(cwd) === generation &&
+      cycleEvidenceCheckedAtFor(board) === staleCheckedAt
+    ) {
       // The INITIAL consistency check above rejected the pairing, and `board` still carries an old
       // evidence entry — merely expired (that's why `cycleEvidenceMissingOrStale` sent us down this
       // path at all), not absent. Falling through here left that stale sidecar attached: the approve
       // route reads `cycleEvidenceFor(allBeads)` right after this call returns and would treat it as
       // authoritative, either 422-ing a since-repaired cycle or waving through a since-broken pairing.
       // Clear it and fail closed, mirroring `attachCyclesBestEffort`'s identical branch
-      // (issues.ts:853-863).
-      clearCycleEvidence(board);
-      markCycleEvidenceUnavailable(cwd);
+      // (issues.ts:853-863). Guarded by the same `staleCheckedAt` check as that branch (P2 review, PR
+      // #274, round 25 on this line): a racing `probeCycleEvidence`/`attachCyclesBestEffort` sharing
+      // this same retained board can attach a newer, successful result while this call's own
+      // consistency re-list was in flight — attaching evidence doesn't bump the snapshot generation
+      // this checks — and that newer result must survive this call's rejection rather than being
+      // clobbered.
+      if (cycleEvidenceFor(board) !== undefined) {
+        clearCycleEvidence(board);
+        markCycleEvidenceUnavailable(cwd);
+      }
     }
   }
   return board;
