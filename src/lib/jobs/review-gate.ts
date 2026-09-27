@@ -372,15 +372,20 @@ export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit"
  * unreadable can still have `bd` connect from that file alone — no env, no metadata.json needed
  * (bd's own precedence is env > metadata.json > config.yaml, so config.yaml is consulted whenever the
  * higher sources are silent). {@link boardConnectionUnproven} closes that gap: Bash is denied unless
- * metadata.json positively confirms embedded mode by actually being read — an absent or unreadable
- * file is failed closed instead, by checking whether config.yaml declares any of the connection
- * fields a server switch would have written.
+ * metadata.json positively confirms embedded mode with an explicit `"dolt_mode": "embedded"` — an
+ * absent, unreadable, or semantically incomplete file (e.g. `{}`, or an unrecognised `dolt_mode`,
+ * both of which `readDoltMetadata`/`isServerMode` read as embedded by DEFAULT rather than by
+ * declaration) is failed closed instead, by checking whether config.yaml declares any of the
+ * connection fields a server switch would have written.
  */
 function boardConnectionUnproven(repoPath: string): boolean {
-  // metadata.json is per-directory truth and outranks config.yaml (bd's own precedence): once it is
-  // actually read, `isServerMode`'s answer off the same file is authoritative and this check adds
-  // nothing. Only its ABSENCE or unreadability is the gap this function exists to close.
-  if (readMetadataFile(repoPath).status === "read") return false;
+  // metadata.json is per-directory truth and outranks config.yaml (bd's own precedence), but only an
+  // EXPLICIT "embedded" declaration counts as proof: `isServerMode`'s "embedded" answer is also what
+  // a missing/unrecognised `dolt_mode` reads as (readDoltMetadata's safe default), so a file that
+  // merely parsed — `{}`, `{"dolt_mode": "nonsense"}` — must not short-circuit this check the same
+  // way a real declaration does.
+  const meta = readMetadataFile(repoPath);
+  if (meta.status === "read" && meta.raw?.dolt_mode === "embedded") return false;
   const beadsDir = join(repoPath, ".beads");
   return ["dolt.host", "dolt.port", "dolt.database", "dolt.user"].some(
     (key) => configYamlValue(beadsDir, key) !== undefined,

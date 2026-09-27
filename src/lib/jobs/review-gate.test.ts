@@ -1775,6 +1775,28 @@ describe("runReviewGate — sessions", () => {
     },
   );
 
+  it(
+    "denies `Bash` when metadata.json parses but never actually DECLARES embedded mode — " +
+      "`{}` and an unrecognised `dolt_mode` both read as embedded by `isServerMode`'s own safe " +
+      "default (readDoltMetadata), which used to short-circuit this check on the strength of the " +
+      "file merely having been read, leaving Bash enabled for exactly the project config.yaml's " +
+      "server fields say it should be denied for (chatgpt-codex-connector, PR #284 review round 2, " +
+      "\"Require positive embedded mode before allowing Bash\")",
+    () => {
+      for (const metadata of [{}, { dolt_mode: "nonsense" }]) {
+        const repo = mkdtempSync(join(tmpdir(), "anton-review-gate-config-yaml-"));
+        try {
+          mkdirSync(join(repo, ".beads"), { recursive: true });
+          writeFileSync(join(repo, ".beads", "metadata.json"), JSON.stringify(metadata));
+          writeFileSync(join(repo, ".beads", "config.yaml"), "dolt.host: dolt.example.dev\n");
+          expect(reviewDeniedTools(repo)).toEqual([...REVIEW_DENIED_TOOLS, "Bash"]);
+        } finally {
+          rmSync(repo, { recursive: true, force: true });
+        }
+      }
+    },
+  );
+
   it("loads the reviewer from the operator's settings only, never the branch's", async () => {
     // `.claude/settings.json` is source-controlled, so a diff that adds one would configure the
     // session judging it — and settings register hooks, which run shell commands. The same flag

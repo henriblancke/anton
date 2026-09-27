@@ -860,6 +860,21 @@ export type RunTargetType = (typeof RUN_TARGET_TYPES)[number];
 const isRunTargetType = (t: string | undefined): t is RunTargetType =>
   RUN_TARGET_TYPES.includes(t as RunTargetType);
 
+/**
+ * Whether `value` is a serialized {@link BoardFingerprint} — a plain id→hash record — rather than
+ * merely `typeof value === "object"` (chatgpt-codex-connector, PR #284 review, "Reject malformed
+ * fingerprint object shapes"): valid JSON like `[]` or `{"id":null}` passes that looser check, and a
+ * baseline that isn't really one is worse than none — recovery treats it as an unchanged prior state,
+ * so comparing it against the real board reports every bead as changed and a no-op resumed agent can
+ * pass as a board delivery. Used by every fingerprint-baseline parser below
+ * ({@link beads.boardEvidenceBaseline}, {@link beads.reviewFixBoardBaseline},
+ * {@link beads.reviewGateBoardBaseline}).
+ */
+function isFingerprintRecord(value: unknown): value is Record<string, string> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return Object.values(value).every((v) => typeof v === "string");
+}
+
 export const beads = {
   /**
    * Truly claimable work (excludes in_progress/blocked/deferred). `--limit 0` = unlimited:
@@ -1364,8 +1379,8 @@ export const beads = {
     const raw = b.metadata?.[BOARD_EVIDENCE_BASELINE_KEY];
     if (typeof raw !== "string" || !raw) return undefined;
     try {
-      const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+      const parsed: unknown = JSON.parse(raw);
+      return isFingerprintRecord(parsed) ? parsed : undefined;
     } catch {
       return undefined;
     }
@@ -1706,8 +1721,8 @@ export const beads = {
     const raw = b.metadata?.[REVIEW_FIX_BOARD_BASELINE_KEY];
     if (typeof raw !== "string" || !raw) return undefined;
     try {
-      const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+      const parsed: unknown = JSON.parse(raw);
+      return isFingerprintRecord(parsed) ? parsed : undefined;
     } catch {
       return undefined;
     }
@@ -1779,8 +1794,8 @@ export const beads = {
     const raw = b.metadata?.[REVIEW_GATE_BOARD_BASELINE_KEY];
     if (typeof raw !== "string" || !raw) return undefined;
     try {
-      const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? (parsed as Record<string, string>) : undefined;
+      const parsed: unknown = JSON.parse(raw);
+      return isFingerprintRecord(parsed) ? parsed : undefined;
     } catch {
       return undefined;
     }

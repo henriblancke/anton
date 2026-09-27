@@ -1324,6 +1324,51 @@ function recordingExec(stdout: string) {
   };
 }
 
+describe("board fingerprint baseline parsers reject malformed shapes (PR #284 review, \"Reject malformed fingerprint object shapes\")", () => {
+  const cases: Array<{
+    name: string;
+    parse: (b: Bead) => Record<string, string> | undefined;
+    key: string;
+  }> = [
+    { name: "beads.boardEvidenceBaseline", parse: beads.boardEvidenceBaseline, key: "boardEvidenceBaseline" },
+    { name: "beads.reviewFixBoardBaseline", parse: beads.reviewFixBoardBaseline, key: "reviewFixBoardBaseline" },
+    { name: "beads.reviewGateBoardBaseline", parse: beads.reviewGateBoardBaseline, key: "reviewGateBoardBaseline" },
+  ];
+
+  for (const { name, parse, key } of cases) {
+    describe(name, () => {
+      it("accepts a real fingerprint — a plain id-to-hash record", () => {
+        const b = bead({ metadata: { [key]: JSON.stringify({ a: "1111111111111111" }) } });
+        expect(parse(b)).toEqual({ a: "1111111111111111" });
+      });
+
+      it("accepts an empty record", () => {
+        const b = bead({ metadata: { [key]: "{}" } });
+        expect(parse(b)).toEqual({});
+      });
+
+      it("rejects an array — valid JSON, wrong shape", () => {
+        const b = bead({ metadata: { [key]: "[]" } });
+        expect(parse(b)).toBeUndefined();
+      });
+
+      it("rejects a record with a non-string value", () => {
+        const b = bead({ metadata: { [key]: JSON.stringify({ id: null }) } });
+        expect(parse(b)).toBeUndefined();
+      });
+
+      it("rejects a bare scalar", () => {
+        const b = bead({ metadata: { [key]: "1" } });
+        expect(parse(b)).toBeUndefined();
+      });
+
+      it("returns undefined when unset", () => {
+        expect(parse(bead({}))).toBeUndefined();
+      });
+    });
+  }
+});
+
 describe("chunkLabelFlags (PR #284 review, \"Bound the total pending-label argument vector\")", () => {
   it("keeps every flag in ONE group when the total is under budget", () => {
     const flags: [string, string][] = [
