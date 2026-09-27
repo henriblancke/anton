@@ -651,6 +651,33 @@ describe("loadAllIssues", () => {
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
 
+  it("declines to attach evidence when gate hydration reveals the named cycle was repaired and a different one opened (best-effort path)", async () => {
+    // The gate-only cycle hydration below is its own live `bd list`, wide enough a gap for another
+    // shared-server writer to repair the cycle `cycles` named (g-1/g-2) while opening a DIFFERENT one
+    // (g-3/g-4) under a different pair of gates. Without a post-hydration recheck, this best-effort
+    // attach would stamp the board with the stale, already-repaired cycle and miss the new one.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    listMock.mockResolvedValueOnce([solo]); // warm the snapshot, no evidence yet
+    await allIssues(REPO);
+
+    cyclesMock
+      .mockResolvedValueOnce([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]) // initial fetch: cycle A
+      .mockResolvedValueOnce([{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }]); // post-hydration recheck: A repaired, B opened
+    // `board` (`[solo]`) carries no `blocks` edge, so the outer consistency check short-circuits
+    // without a re-list (`attachCyclesBestEffort`'s own edge-free fast path) — the first `bd list`
+    // this call spends is the gate hydration read below.
+    listMock
+      .mockImplementationOnce(async () => [gateA, gateB]) // gate hydration for cycle A's members
+      .mockImplementationOnce(async () => [solo]) // post-hydration recheck work read
+      .mockImplementationOnce(async () => [gateA, gateB]); // post-hydration recheck gate read — A still resolved-looking here
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
   it("coalesces concurrent best-effort enrichments into one dep-cycles call and one version bump (PR #274 review, round 6)", async () => {
     // Warm the snapshot with no evidence first, matching several cold page renders sharing one load.
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
@@ -1060,6 +1087,34 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
     expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
     expect(cycleEvidenceFor(board)).toBeUndefined();
   });
+
+  it("hydrates gate-only cycle members into the retained board before attaching evidence", async () => {
+    // A cycle made entirely of gates no work bead's `blocks` edge dangles toward — the probe's own
+    // `loadAllIssues(cwd)` re-list never carries them, the same gap `attachCyclesBestEffort` and
+    // `ensureCycleEvidence` both hydrate. Left unhydrated, `cycleMembers` can't map either id to a
+    // bead here and reports a synthetic, unscoped "board" fault instead of scoping it to the
+    // cycle's own subtree.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    await allIssues(REPO); // warm the snapshot, no evidence yet
+
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    probeCycleEvidence(REPO);
+    // Two `bd dep cycles` calls: the initial fetch, then the post-hydration recheck the gate
+    // hydration's own live `bd list` requires (same as `attachCyclesBestEffort`/`ensureCycleEvidence`).
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+    // Give the probe's internal hydration + post-hydration recheck a tick to settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const board = await allIssues(REPO);
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
 });
 
 describe("ensureCycleEvidence (codex review, PR #274)", () => {
@@ -1086,13 +1141,18 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(cyclesMock).not.toHaveBeenCalled();
   });
 
-  it("skips the re-list/compare when the board carries no blocks edge at all", async () => {
+  it("still runs the re-list/compare when the board carries no blocks edge at all (matches loadAllIssues's own fix, issues.ts:307)", async () => {
+    // An earlier version of this check skipped the re-list whenever `board` itself had no `blocks`
+    // edge, mirroring a bug `loadAllIssues`'s own `recheckBlocksConsistency` was fixed for: an
+    // edge-free board is exactly what a shared-server writer's very first `blocks` edge lands into,
+    // and an acyclic edge never shows up in `cycles` for anything else to catch.
     const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([]);
 
     await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
 
-    expect(listMock).not.toHaveBeenCalled();
+    expect(listMock).toHaveBeenCalledTimes(1);
     expect(cycleEvidenceFor(board)).toEqual([]);
   });
 
@@ -1154,6 +1214,7 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     // `board` here and bumping the version would tell every poller the retained snapshot recovered
     // when it, in fact, was just swapped out from under this call and remains evidence-less.
     const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockImplementation(async () => {
       invalidateIssueSnapshot(REPO);
       return [{ ids: ["t-1"], raw: { cycle: ["t-1"] } }];
@@ -1175,6 +1236,7 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     // test exists to force: sampling fresh at the call site would trivially match itself and mask
     // exactly this staleness.
     const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     const staleGeneration = issueSnapshotGeneration(REPO);
     invalidateIssueSnapshot(REPO); // a concurrent refresh moves the retained snapshot on
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
@@ -1188,9 +1250,10 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
 
   it("hydrates gate-only cycle members into the board before attaching evidence (P2 review, PR #274, issues.ts:599)", async () => {
     // Two gates blocking each other with no ordinary bead's edge dangling toward either: `board`
-    // carries no `blocks` edge of its own (the outer consistency check short-circuits without a
-    // re-list), so hydration is the only thing that lets a consumer of this evidence map either
-    // cycle member to a bead instead of reading a synthetic, unscoped "board" fault.
+    // carries no `blocks` edge of its own, but the outer consistency re-list still runs and agrees
+    // (neither side has the gates yet), so hydration is the only thing that lets a consumer of this
+    // evidence map either cycle member to a bead instead of reading a synthetic, unscoped "board"
+    // fault.
     const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
     const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
     const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
@@ -1208,6 +1271,29 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(returned).toBe(board);
     expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
+
+  it("declines to attach evidence when gate hydration reveals the named cycle was repaired and a different one opened", async () => {
+    // Same drift as `attachCyclesBestEffort`'s equivalent test: the gate-only cycle hydration is its
+    // own live `bd list`, wide enough a gap for another shared-server writer to repair cycle A
+    // (g-1/g-2) while opening cycle B (g-3/g-4) under a different pair of gates.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    const board = [solo];
+    cyclesMock
+      .mockResolvedValueOnce([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]) // initial fetch: cycle A
+      .mockResolvedValueOnce([{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }]); // post-hydration recheck: A repaired, B opened
+    listMock
+      .mockImplementationOnce(async () => [solo]) // outer consistency re-list — unchanged
+      .mockImplementationOnce(async () => [gateA, gateB]) // gate hydration for cycle A's members
+      .mockImplementationOnce(async () => [solo]) // post-hydration recheck work read
+      .mockImplementationOnce(async () => [gateA, gateB]); // post-hydration recheck gate read
+    const generation = issueSnapshotGeneration(REPO);
+
+    await ensureCycleEvidence(REPO, board, generation);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
   });
 });
 

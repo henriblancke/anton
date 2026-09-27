@@ -512,13 +512,21 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
       // board that merged in gate beads is compared like-for-like instead of always mismatching on
       // their edges.
       //
-      // Gated on `board` actually carrying a `blocks` edge, same as `loadAllIssues`'s own
-      // `workHasBlocksEdge` clause: a board with zero `blocks` edges has no cyclic pair that could be
-      // stale, so this second full read would buy nothing — and every `getBoard`/`allIssues` caller
-      // hits this path on a cold read, so paying for it unconditionally breaks the documented
-      // at-most-one-`bd list` invariant for the common edge-free case.
+      // Gated on `board` actually carrying a `blocks` edge, unlike `loadAllIssues`'s own
+      // `recheckBlocksConsistency` (issues.ts:307), which this path otherwise mirrors: that gate spawns
+      // one extra `bd list` on EVERY `withCycles` read (paid once per approval-critical call), whereas
+      // this best-effort path backs `getBoard`'s ordinary board render — every cold page load pays for
+      // it, and `getBoard` has its own tested at-most-one-`bd-list` contract for the edge-free case
+      // (board.test.ts). Re-listing here to catch a writer's very first `blocks` edge landing mid-fetch
+      // wouldn't even close that gap: this comparison only decides whether to ATTACH cycle evidence, it
+      // never feeds the new edge back into `board` itself, so a caller relying on `board`'s raw edges
+      // (the dangling-blocker rule, etc.) would still miss it regardless. The only thing skipping this
+      // check risks is stamping an accurate "no cycles" result (a lone new edge can't itself be
+      // cyclic) onto a board that's stale for unrelated reasons — a cost already paid by every
+      // snapshot read, not one this recheck could fix. `ensureCycleEvidence` (the approve route's own
+      // gate, not a page-render hot path) pays this cost unconditionally instead.
       const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-      const consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
+      let consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
       // Re-check generation and evidence AFTER the `sameBlocksEdges` await, not just before it (PR
       // #274 review, round 19): that inner `loadAllIssues` call can itself take long enough for the
       // snapshot to be invalidated/replaced, or for a concurrent enrichment path to attach evidence to
@@ -562,10 +570,29 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
             hydrateIssueSnapshot(cwd, board, generation);
             generation = issueSnapshotGeneration(cwd);
           }
+          // `loadGateIssues` above is its own live `bd list`, wide enough a gap for another
+          // shared-server writer to repair the cycle `cycles` named while opening a DIFFERENT one
+          // under a different pair of gates, or to move an ordinary acyclic edge — neither of which
+          // the generation/evidence recheck below can see, since it only catches THIS process
+          // replacing its own snapshot. Only worth paying for when the hydration actually landed new
+          // beads (an id naming an ordinary elsewhere cycle changes nothing to recheck). Re-fetch `bd
+          // dep cycles` and require it still names the same cycles, then rebuild the comparison board
+          // the same way `board` was just built (fresh work + a fresh full gate listing) so an
+          // unrelated acyclic edge drift is caught too — mirrors `loadAllIssues`'s own
+          // `recheckCycleConsistency`/`recheckHydratedBlocksConsistency` pair, except a mismatch here
+          // just leaves evidence unattached rather than retrying, since this path has no retry budget.
+          if (addedAny) {
+            const freshCycles = await beads.depCycles(cwd);
+            const freshWork = await loadWorkIssues(cwd);
+            const freshGates = await loadGateIssues(cwd, false, missingCycleIds);
+            consistent =
+              sameCycles(cycles, freshCycles) &&
+              boardStillMatchesCycles(cycles, board, dedupeById([...freshWork, ...freshGates]));
+          }
         }
         // Recheck generation and evidence AFTER the hydration await too, same reasoning as the
         // recheck above it guards against.
-        if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+        if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
           attachCycleEvidence(board, cycles);
           markCycleEvidenceRecovered(cwd);
         }
@@ -596,12 +623,14 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
  * copy), so blindly attaching here would both pair a stale board with fresher evidence — the
  * pre-lock caller's own gate could then 422 a since-repaired board, or wave through a since-broken
  * one — AND publish that mismatched pairing to every other reader sharing the snapshot. Always
- * re-list and compare, same as `attachCyclesBestEffort`/`probeCycleEvidence`; gated on `board`
- * actually carrying a `blocks` edge, same as those siblings' own guard, since an edge-free board has
- * no cyclic pair that could be stale. An inconsistent board is left without evidence rather than
- * retried here — every consumer of `cycleEvidenceFor` already fails closed on `undefined`
- * (`missingCycleEvidenceGap`), and a caller that must not proceed on a stale pairing gets exactly
- * that by falling through to the same closed failure a genuinely missing read produces.
+ * re-list and compare, same as `attachCyclesBestEffort`/`probeCycleEvidence`; NOT gated on `board`
+ * already carrying a `blocks` edge (an earlier version of this check skipped in that case, mirroring
+ * a bug `loadAllIssues`'s own `recheckBlocksConsistency` fixed — issues.ts:307): an edge-free `board`
+ * is exactly what a shared-server writer's very first `blocks` edge lands into, and an acyclic edge
+ * never shows up in `cycles` for anything else to catch. An inconsistent board is left without
+ * evidence rather than retried here — every consumer of `cycleEvidenceFor` already fails closed on
+ * `undefined` (`missingCycleEvidenceGap`), and a caller that must not proceed on a stale pairing gets
+ * exactly that by falling through to the same closed failure a genuinely missing read produces.
  *
  * Also guarded by `generation` — rechecked against `issueSnapshotGeneration` after the `depCycles`
  * call AND after the `sameBlocksEdges` re-list (P2 badge review, PR #274, round 22): the
@@ -630,8 +659,7 @@ export async function ensureCycleEvidence(
 ): Promise<Bead[]> {
   if (cycleEvidenceFor(board) === undefined) {
     const cycles = await beads.depCycles(cwd);
-    const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-    const consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
+    let consistent = boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
     // Recheck evidence AFTER the `sameBlocksEdges` await, not just before it, mirroring
     // `attachCyclesBestEffort`: a concurrent enrichment path sharing this same `board` array (evidence
     // is keyed by array identity) may have already attached it while the re-list above was in flight.
@@ -685,11 +713,29 @@ export async function ensureCycleEvidence(
           hydrateIssueSnapshot(cwd, board, generation);
           generation = issueSnapshotGeneration(cwd);
         }
+        // `loadGateIssues` above is its own live `bd list`, wide enough a gap for another
+        // shared-server writer to repair the cycle `cycles` named while opening a DIFFERENT one under
+        // a different pair of gates, or to move an ordinary acyclic edge — neither of which the
+        // generation/evidence recheck below can see, since it only catches THIS process replacing its
+        // own snapshot. Only worth paying for when the hydration actually landed new beads. Re-fetch
+        // `bd dep cycles` and require it still names the same cycles, then rebuild the comparison
+        // board the same way `board` was just built (fresh work + a fresh full gate listing) so an
+        // unrelated acyclic edge drift is caught too — mirrors `attachCyclesBestEffort`'s equivalent
+        // post-hydration recheck; a mismatch here leaves evidence unattached, same as any other
+        // inconsistent pairing this function declines rather than retries.
+        if (addedAny) {
+          const freshCycles = await beads.depCycles(cwd);
+          const freshWork = await loadWorkIssues(cwd);
+          const freshGates = await loadGateIssues(cwd, false, missingCycleIds);
+          consistent =
+            sameCycles(cycles, freshCycles) &&
+            boardStillMatchesCycles(cycles, board, dedupeById([...freshWork, ...freshGates]));
+        }
       }
       // Recheck evidence AFTER the hydration await too: the same race the outer check above guards
       // against — a concurrent enrichment path attaching evidence, or the snapshot generation moving —
       // can equally land while the gate listing was in flight.
-      if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+      if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
         attachCycleEvidence(board, cycles);
         markCycleEvidenceRecovered(cwd);
       }
@@ -997,9 +1043,10 @@ export function probeCycleEvidence(cwd: string): void {
         // call: the two reads aren't atomic, so a concurrent refresh landing in the gap could hand back
         // a `board` and a `generation` describing two different graphs (PR #274 review, round 8) — the
         // same hazard `allIssues`/`readAllIssues` above were fixed for.
-        const { beads: board, generation } = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
+        const { beads: board, generation: initialGeneration } = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
           blockOnPendingWrite: false,
         });
+        let generation = initialGeneration;
         // Evidence already attached is only a reason to skip while it's still within its trust
         // window (P2 review, PR #274, issues.ts:830): a board whose own content never changes (the
         // gate-only-cycle case above) would otherwise keep this early return forever, since nothing
@@ -1023,10 +1070,65 @@ export function probeCycleEvidence(cwd: string): void {
           // Always re-list and compare before attaching, same as `attachCyclesBestEffort` (PR #274
           // review, round 20), then recheck generation again after that await — the re-list itself
           // can take long enough for another writer to land. Gated on `board` actually carrying a
-          // `blocks` edge, same as `attachCyclesBestEffort`'s own guard: an edge-free board has no
-          // cyclic pair that could be stale, so the re-list would buy nothing.
+          // `blocks` edge, same as `attachCyclesBestEffort`'s own guard and for the same reason: this
+          // poller backs the same best-effort, every-few-seconds board refresh `getBoard` does, so
+          // paying for an extra `bd list` on every edge-free poll (the common case) would multiply a
+          // cost `ensureCycleEvidence` — the approve route's own gate, not a polling hot path — pays
+          // unconditionally instead. The re-list also wouldn't fix what it's guarding against: it only
+          // decides whether to ATTACH cycle evidence, never feeds a concurrently-added edge back into
+          // `board` itself, so a caller reading `board`'s raw edges directly would miss a new blocker
+          // regardless of whether this check runs.
           const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-          const consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
+          let consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
+          if (consistent && issueSnapshotGeneration(cwd) === generation) {
+            // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward —
+            // this poll's `loadAllIssues(cwd)` board never carries them, the same gap
+            // `attachCyclesBestEffort`/`ensureCycleEvidence` both hydrate. Left unhydrated,
+            // `cycleMembers` can't map either id here and reports a synthetic, unscoped "board" fault
+            // that rejects every unrelated target instead of scoping it to the cycle's own subtree.
+            const knownIds = new Set(board.map((bead) => bead.id));
+            const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
+            if (missingCycleIds.length > 0) {
+              const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
+              // Rebuilt from `board` AFTER the hydration await, not `knownIds` captured before it: a
+              // concurrent caller sharing this same `board` array (evidence is keyed by identity) can
+              // have hydrated the same gates onto it while this listing was in flight.
+              const idsOnBoard = new Set(board.map((bead) => bead.id));
+              let addedAny = false;
+              for (const gate of hydratedGates) {
+                if (!idsOnBoard.has(gate.id)) {
+                  board.push(gate);
+                  idsOnBoard.add(gate.id);
+                  addedAny = true;
+                }
+              }
+              // Keep the retained snapshot's own bookkeeping in sync with `board`, same requirement as
+              // `attachCyclesBestEffort`/`ensureCycleEvidence` — pushing gates onto `board` changes its
+              // content without this. Only stamp it when the generation still matches; a mismatch means
+              // a concurrent write already replaced the entry, and this local `board` is an orphaned
+              // copy `hydrateIssueSnapshot`'s own guard correctly refuses to stamp.
+              if (addedAny && issueSnapshotGeneration(cwd) === generation) {
+                hydrateIssueSnapshot(cwd, board, generation);
+                generation = issueSnapshotGeneration(cwd);
+              }
+              // `loadGateIssues` above is its own live `bd list`, wide enough a gap for another writer
+              // to repair the cycle `cycles` named while opening a DIFFERENT one under a different pair
+              // of gates, or to move an ordinary acyclic edge. Re-fetch `bd dep cycles` and require it
+              // still names the same cycles, then rebuild the comparison board the same way `board` was
+              // just built (fresh work + a fresh full gate listing) — mirrors
+              // `attachCyclesBestEffort`/`ensureCycleEvidence`'s equivalent post-hydration recheck.
+              if (addedAny) {
+                const freshCycles = await beads.depCycles(cwd);
+                const freshWork = await loadWorkIssues(cwd);
+                const freshGates = await loadGateIssues(cwd, false, missingCycleIds);
+                consistent =
+                  sameCycles(cycles, freshCycles) &&
+                  boardStillMatchesCycles(cycles, board, dedupeById([...freshWork, ...freshGates]));
+              }
+            }
+          }
+          // Recheck generation AFTER the hydration await too, same reasoning as the recheck above it
+          // guards against.
           if (consistent && issueSnapshotGeneration(cwd) === generation) {
             const previousCycles = cycleEvidenceFor(board);
             attachCycleEvidence(board, cycles);

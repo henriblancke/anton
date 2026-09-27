@@ -716,12 +716,14 @@ describe("product-master pass · armed", () => {
   });
 
   it("judges the board it read when tier 1 wrote nothing — no second load for a quiet tier", async () => {
-    // The re-read is bought by a WRITE, not by a tier running: a pass whose tier 1 found nothing
-    // pays for exactly one `loadAllIssues` call, as it did before anything was armed. That one call
-    // costs a single `bd list` read here — `withCycles`'s consistency recheck (issues.ts) only pays
-    // for a second when the board actually carries a `blocks` edge, which this fixture doesn't — so
-    // the baseline is 1; the assertion after the pass finishes is what proves no ADDITIONAL load
-    // happened.
+    // The re-read that matters here is bought by a WRITE, not by a tier running: a pass whose tier 1
+    // found nothing pays for exactly the SAME `loadAllIssues` baseline it would have paid before
+    // anything was armed, and no more. That baseline is 2 `bd list` calls, not 1 — `loadAllIssues`'s
+    // own `withCycles` consistency recheck (issues.ts's `recheckBlocksConsistency`) always re-lists
+    // and compares before trusting `bd dep cycles` evidence, even when this fixture's board carries no
+    // `blocks` edge, since an edge-free board is exactly what a shared-server writer's very first edge
+    // could land into mid-read. The assertion after the pass finishes is what proves no ADDITIONAL
+    // load happened beyond that baseline.
     const listCalls = () => listMock.mock.calls.length;
     let atDispatch = 0;
     duringSession = () => {
@@ -733,8 +735,8 @@ describe("product-master pass · armed", () => {
     await expectJobStatus(t.db, await runPass(), "done");
 
     expect(writes).toEqual(["create Product master: defer anton-a"]);
-    expect(atDispatch).toBe(1);
-    expect(listCalls()).toBe(1);
+    expect(atDispatch).toBe(2);
+    expect(listCalls()).toBe(2);
   });
 
   it("keeps the pass green when an apply blows up, and leaves the ask standing", async () => {
