@@ -1112,12 +1112,20 @@ describe("the product master's moves", () => {
     });
 
     it("refuses a gate that broke between the decision and the write, under the bead's own lock", async () => {
-      // The snapshot shows a startable target; the read taken inside the write lock shows its
-      // Acceptance gone. Status, liveness, claim and the premise stamp are all as the plan found
-      // them, so nothing but the re-derived gate can catch it.
+      // The decision's own freshness check (`withCycleEvidenceIfNeeded`) still sees a startable
+      // target — only the read taken inside the write lock shows its Acceptance gone. Status,
+      // liveness, claim and the premise stamp are all as the plan found them, so nothing but the
+      // re-derived gate can catch it. Staged by list count rather than a bare `liveBeads.set` before
+      // `applyWith`: the decision's own consistency recheck (apply.ts `withCycleEvidenceIfNeeded`)
+      // now also re-lists the board before deciding, so setting the mutation too early makes IT the
+      // one to refuse — with a generic "evidence unavailable" gap that never says why — instead of
+      // the write-lock recheck this test means to isolate.
+      const proposal = proposalFor(APPROVE);
+      let lists = 0;
+      listByFlags(async () => (++lists === 1 ? [startable(), proposal] : liveBoard()));
       liveBeads.set("anton-a", cold("anton-a"));
 
-      const err = (await applyWith(proposalFor(APPROVE), [startable()]).catch(
+      const err = (await applyWith(proposal, [startable()]).catch(
         (e) => e,
       )) as InstanceType<typeof ProposalApplyError>;
 
