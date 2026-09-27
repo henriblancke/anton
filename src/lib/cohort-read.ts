@@ -107,7 +107,7 @@ async function activeRunTargetIds(
   projectId: string,
   board: Bead[],
   since: Date | undefined,
-): Promise<Map<string, number | undefined>> {
+): Promise<Map<string, AsOfCutoff | undefined>> {
   const rows = await listInvocations(db, projectId, since ? { since } : {});
   const byId = new Map(board.map((b) => [b.id, b]));
   const cards = boardCards(board);
@@ -167,7 +167,7 @@ async function activeRunTargetIds(
         });
   const liveIds = new Set(liveTargets.map((t) => t.id));
 
-  const ids = new Map<string, number | undefined>();
+  const ids = new Map<string, AsOfCutoff | undefined>();
   for (const target of candidates.values()) {
     if (liveIds.has(target.id)) {
       const deliveredAtMs = lastDeliveryMs(priorDeliveries, scopeOf(target.id));
@@ -183,7 +183,17 @@ async function activeRunTargetIds(
       }, undefined);
       // Clamped to never precede the delivery itself — a delivery is settled and always safe to
       // keep, so the cutoff only ever moves LATER than `deliveredAtMs`, never earlier.
-      ids.set(target.id, openStartMs === undefined ? deliveredAtMs : Math.max(openStartMs, deliveredAtMs));
+      //
+      // Whichever value wins decides whether the cutoff is exclusive: a cutoff that names the open
+      // attempt's OWN start must exclude anything stamped in that same second (both are whole-second
+      // precision, so a same-second collision is realistic), while a cutoff that falls back to the
+      // prior delivery's timestamp must stay inclusive to keep that delivery's own final event (PR
+      // #331 review, boundary follow-up).
+      const usesOpenStart = openStartMs !== undefined && openStartMs >= deliveredAtMs;
+      ids.set(target.id, {
+        ms: usesOpenStart ? openStartMs : deliveredAtMs,
+        exclusive: usesOpenStart,
+      });
       continue;
     }
     ids.set(target.id, undefined);
@@ -191,31 +201,43 @@ async function activeRunTargetIds(
   return ids;
 }
 
+/** A per-target ledger cutoff — see {@link activeRunTargetIds} and `FeatureLedgerOptions.asOfExclusive`. */
+interface AsOfCutoff {
+  ms: number;
+  /** Whether `ms` names an open attempt's own start (exclusive) or a settled delivery's (inclusive). */
+  exclusive: boolean;
+}
+
 /**
  * One run target's {@link CohortFeature}, composed from the reads named in the header.
  *
- * `asOfMs` is the one exception to "whole life": for a target still live on a rerun of an
+ * `asOf` is the one exception to "whole life": for a target still live on a rerun of an
  * already-delivered feature ({@link activeRunTargetIds}), it is the currently open run's own
- * attempt start (or the prior delivery, when no open run row exists to be more precise with), and
- * everything recorded strictly after it — invocations, jobs, escalations, review rounds, send-back
- * notes — belongs to that open attempt's own unfinished work. No outcome yet, so none of it may
- * inflate the delivered feature's cost or friction, or, worse, change its stamp and throw an
- * otherwise-clean cohort membership into {@link SpanningFeatures} (PR #331 review). A SETTLED rerun
- * between the delivery and the open attempt's start — a completed failed attempt, say — already has
- * an outcome and is cut IN, not out (PR #331 review, second round). `undefined` for every other
- * target, which reads as the module header's own rule: no bound at all, the whole life. `featureLedger`
- * owns the actual cut (`FeatureLedgerOptions.asOfMs`) — every source it folds into `totals`, `friction`
- * and `rows` is cut at the same instant, so nothing here can drift out of step with what it returns by
- * re-deriving one figure on its own.
+ * attempt start (`exclusive: true`) or the prior delivery (`exclusive: false`, when no open run
+ * row exists to be more precise with), and everything recorded at-or-after it — invocations, jobs,
+ * escalations, review rounds, send-back notes — belongs to that open attempt's own unfinished work.
+ * No outcome yet, so none of it may inflate the delivered feature's cost or friction, or, worse,
+ * change its stamp and throw an otherwise-clean cohort membership into {@link SpanningFeatures} (PR
+ * #331 review). A SETTLED rerun between the delivery and the open attempt's start — a completed
+ * failed attempt, say — already has an outcome and is cut IN, not out (PR #331 review, second
+ * round). `undefined` for every other target, which reads as the module header's own rule: no bound
+ * at all, the whole life. `featureLedger` owns the actual cut (`FeatureLedgerOptions.asOfMs` /
+ * `asOfExclusive`) — every source it folds into `totals`, `friction` and `rows` is cut at the same
+ * instant and boundary, so nothing here can drift out of step with what it returns by re-deriving
+ * one figure on its own.
  */
 async function cohortFeatureOf(
   db: AntonDb,
   projectId: string,
   board: Bead[],
   beadId: string,
-  asOfMs: number | undefined,
+  asOf: AsOfCutoff | undefined,
 ): Promise<CohortFeature> {
-  const ledger = await featureLedger(db, projectId, beadId, { board, asOfMs });
+  const ledger = await featureLedger(db, projectId, beadId, {
+    board,
+    asOfMs: asOf?.ms,
+    asOfExclusive: asOf?.exclusive,
+  });
   const deliveredAtMs = ledger?.deliveredAtMs;
   // The feature's last recorded activity regardless of outcome — what `promptSeries` places a
   // feature that never delivered by, since it has no `deliveredAtMs` of its own (PR #331 review).
@@ -281,8 +303,8 @@ export async function cohortFeatures(
 
   const board = await listAllBeads(project);
   const targets = await activeRunTargetIds(db, projectId, board, opts.since);
-  return mapWithBoundedConcurrency([...targets], COHORT_FEATURE_CONCURRENCY, ([id, asOfMs]) =>
-    cohortFeatureOf(db, projectId, board, id, asOfMs),
+  return mapWithBoundedConcurrency([...targets], COHORT_FEATURE_CONCURRENCY, ([id, asOf]) =>
+    cohortFeatureOf(db, projectId, board, id, asOf),
   );
 }
 

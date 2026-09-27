@@ -526,4 +526,35 @@ describe("featureLedger's friction half", () => {
     expect(ledger?.friction.cancels).toBe(0);
     expect(ledger?.friction.humanTouches).toBe(0);
   });
+
+  it("excludes an event stamped in the SAME instant as an exclusive asOfMs cutoff — the open-attempt boundary (PR #331 review, boundary follow-up)", async () => {
+    // Run starts and invocation timestamps are both whole-second precision, so an open rerun's own
+    // first invocation can land in the exact same second as the cutoff `cohort-read.ts` derives from
+    // that rerun's `attemptStartedAt`. An inclusive comparison there would keep that unfinished
+    // invocation in the preserved delivery it is cut for.
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-25T00:00:00Z");
+    await seedInvocation({ id: "i-boundary", beadId: "feat-1", recordedAt: cutoff, durationMs: 60_000 });
+
+    const inclusive = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+    expect(inclusive?.rows).toHaveLength(1);
+
+    const exclusive = await featureLedger(t.db, t.projectId, "feat-1", {
+      asOfMs: cutoff.getTime(),
+      asOfExclusive: true,
+    });
+    expect(exclusive?.rows).toHaveLength(0);
+  });
+
+  it("keeps an event stamped in the same instant as an INCLUSIVE asOfMs cutoff — the prior-delivery fallback must still capture the delivery's own final event", async () => {
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-25T00:00:00Z");
+    await seedInvocation({ id: "i-delivery", beadId: "feat-1", recordedAt: cutoff, durationMs: 60_000 });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", {
+      asOfMs: cutoff.getTime(),
+      asOfExclusive: false,
+    });
+    expect(ledger?.rows).toHaveLength(1);
+  });
 });

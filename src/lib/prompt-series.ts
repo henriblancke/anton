@@ -469,6 +469,13 @@ export interface CohortStampRow {
    * {@link DESCRIBER_STEP_HANDLER}.
    */
   stepHandler?: string | null;
+  /**
+   * The formula step's own id (`claude-invocations.ts`'s `step`) — read only to tell `review-gate.ts`'s
+   * REVIEW row apart from its own FIX row, since both share `stepHandler: "review"` and only `step`
+   * ("review" vs "review-fix") tells them apart (PR #331 review, boundary follow-up). Not a general
+   * step classifier: the fold reads exactly the one literal named at {@link REVIEW_FIX_STEP}.
+   */
+  step?: string | null;
 }
 
 /**
@@ -660,8 +667,29 @@ const DESCRIBER_STEP_HANDLER = "describe";
  * `featureKeys(feature, "agent")` see two keys and throws the feature into {@link SpanningFeatures}
  * instead of the cohort its implementation ran under — a project with a dedicated reviewer would then
  * see every reviewed feature excluded from every agent cohort.
+ *
+ * `review-gate.ts`'s `meter` stamps BOTH its review session and its fix session with this same
+ * `stepHandler` (they are only told apart by `step`, "review" vs "review-fix") — see
+ * {@link REVIEW_FIX_STEP} for why the exclusion below must not catch the fix row too.
  */
 const REVIEWER_STEP_HANDLER = "review";
+
+/**
+ * `review-gate.ts`'s own `meter("review-fix", ...)` call — the FIX session's `step`, distinct from
+ * the REVIEW session's `step: "review"` even though both share {@link REVIEWER_STEP_HANDLER} as their
+ * `stepHandler`.
+ *
+ * The fix session's `agentTag` is the TARGET's own resolved `agent:` tag (`labelValueOf(target.labels,
+ * "agent")`, per `review-gate.ts`'s own comment: "The FIX session really does run as the target's own
+ * agent repairing its own work") — exactly the implementer identity the "agent" dimension wants, not
+ * the reviewer's. Excluding every `stepHandler === REVIEWER_STEP_HANDLER` row without this carve-out
+ * silently dropped that tag too, which happened to be masked whenever it matched the main
+ * implementation row's own tag — but a ticket whose `agent:` label changes between the original
+ * implementation and a later review-fix round (escalated to a specialist mid-flight, say) then has its
+ * differing fix-round tag silently dropped instead of correctly reading as a feature that spans two
+ * agents (PR #331 review, boundary follow-up).
+ */
+const REVIEW_FIX_STEP = "review-fix";
 
 /**
  * One stamp value as a cohort key, or `undefined` for a row that recorded none.
@@ -678,8 +706,15 @@ function stampValue(row: CohortStampRow, dimension: CohortDimension): string | u
   if (dimension === "prompt" && row.stepHandler === DESCRIBER_STEP_HANDLER) return undefined;
   // The reviewer's agent tag answers "who reviewed", not "who implemented" — see
   // REVIEWER_STEP_HANDLER. It still counts under every other dimension, where the review row's own
-  // prompt/formula/anton/skill stamps carry no such asymmetry.
-  if (dimension === "agent" && row.stepHandler === REVIEWER_STEP_HANDLER) return undefined;
+  // prompt/formula/anton/skill stamps carry no such asymmetry. The FIX row shares the same
+  // `stepHandler` but carries the IMPLEMENTER's own tag (see REVIEW_FIX_STEP), so it is excluded from
+  // this exclusion rather than swept up by it.
+  if (
+    dimension === "agent" &&
+    row.stepHandler === REVIEWER_STEP_HANDLER &&
+    row.step !== REVIEW_FIX_STEP
+  )
+    return undefined;
   const raw = row[DIMENSION_COLUMNS[dimension]];
   const value = typeof raw === "string" ? raw.trim() : "";
   return value || undefined;

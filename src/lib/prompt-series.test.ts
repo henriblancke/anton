@@ -1133,6 +1133,54 @@ describe("promptSeries: the agent dimension ignores the reviewer's own agent tag
     expect(series.spanning).toEqual({ delivered: 0, features: 0 });
     expect(series.cohorts[0]?.key).toBe("formula-digest");
   });
+
+  it("does not drop a review-fix round's own agent tag just because it shares the review row's stepHandler (PR #331 review, boundary follow-up)", () => {
+    // `review-gate.ts`'s `meter` stamps BOTH the review session (`step: "review"`) and the fix
+    // session (`step: "review-fix"`) with the same `stepHandler: "review"` — only `step` tells them
+    // apart. The fix session's `agentTag` is the TARGET's own implementer tag, not the reviewer's, so
+    // excluding every `stepHandler === "review"` row indiscriminately silently dropped it too.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { agentTag: "agent:nextjs", stepHandler: "implement" },
+          { agentTag: "agent:reviewer", stepHandler: "review", step: "review" },
+          // Escalated to a different specialist mid-flight for the fix round.
+          { agentTag: "agent:alembic", stepHandler: "review", step: "review-fix" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "agent");
+    // The differing fix-round tag correctly flags this as a feature that spanned two agents — the
+    // exact misattribution this dimension exists to catch — rather than silently folding into
+    // "agent:nextjs" alone.
+    expect(series.spanning).toEqual({ delivered: 1, features: 1 });
+    expect(series.cohorts).toEqual([]);
+  });
+
+  it("still folds into one cohort when the review-fix round's agent tag matches the implementer's own", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { agentTag: "agent:nextjs", stepHandler: "implement" },
+          { agentTag: "agent:reviewer", stepHandler: "review", step: "review" },
+          { agentTag: "agent:nextjs", stepHandler: "review", step: "review-fix" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "agent");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("agent:nextjs");
+  });
 });
 
 describe("promptSeries: identity dimensions group across noncontiguous deliveries (P1, PR #331 review)", () => {

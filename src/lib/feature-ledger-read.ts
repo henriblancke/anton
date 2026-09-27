@@ -86,29 +86,43 @@ export interface FeatureLedgerOptions {
   /**
    * Cut every source at this instant rather than folding the scope's whole life — for a target still
    * live on a rerun of an already-delivered feature (`cohort-read.ts`'s `activeRunTargetIds`), the
-   * prior delivery's own timestamp. The rerun has no outcome yet, so its own invocations, jobs,
-   * escalations, review rounds and send-back notes must not reach a ledger read for the delivery that
-   * already happened (PR #331 review) — `undefined` (the default) folds the whole life, unbounded.
+   * open attempt's own start (or the prior delivery's own timestamp, when no open run row exists to
+   * be more precise with). The rerun has no outcome yet, so its own invocations, jobs, escalations,
+   * review rounds and send-back notes must not reach a ledger read for the delivery that already
+   * happened (PR #331 review) — `undefined` (the default) folds the whole life, unbounded.
    */
   asOfMs?: number;
+  /**
+   * `asOfMs` is an EXCLUSIVE cutoff — `ts < asOfMs` rather than `ts <= asOfMs`.
+   *
+   * Both run starts and invocation/friction timestamps are stored at whole-second precision, so an
+   * open attempt's own first invocation can land in the SAME SECOND as `asOfMs` when it names that
+   * attempt's `attemptStartedAt` — an inclusive cutoff would then keep that unfinished event in the
+   * preserved delivery it is cut for (PR #331 review, boundary follow-up). Set this whenever `asOfMs`
+   * names an open attempt's start; leave it `false` (the default) when `asOfMs` instead falls back to
+   * a prior delivery's own timestamp, which must stay inclusive to keep that delivery's own final
+   * event.
+   */
+  asOfExclusive?: boolean;
 }
 
 /**
- * `items` at or before `asOfMs`, or every item when `asOfMs` is `undefined` — the ordinary whole-life
- * read. An item whose own timestamp `at` cannot place (missing, or an unparseable string) is KEPT
- * rather than dropped: an unplaceable date is not evidence the item belongs to the unfinished rerun
- * this cutoff exists to exclude, and refusing to guess means erring toward the whole-life reading
- * every other source already gets when `asOfMs` is absent.
+ * `items` at or before `asOfMs` (strictly before when `exclusive`), or every item when `asOfMs` is
+ * `undefined` — the ordinary whole-life read. An item whose own timestamp `at` cannot place (missing,
+ * or an unparseable string) is KEPT rather than dropped: an unplaceable date is not evidence the item
+ * belongs to the unfinished rerun this cutoff exists to exclude, and refusing to guess means erring
+ * toward the whole-life reading every other source already gets when `asOfMs` is absent.
  */
 function cutAt<T>(
   items: readonly T[],
   asOfMs: number | undefined,
   at: (item: T) => number | undefined,
+  exclusive = false,
 ): T[] {
   if (asOfMs === undefined) return [...items];
   return items.filter((item) => {
     const ts = at(item);
-    return ts === undefined || ts <= asOfMs;
+    return ts === undefined || (exclusive ? ts < asOfMs : ts <= asOfMs);
   });
 }
 
@@ -127,7 +141,7 @@ export async function featureLedger(
   db: AntonDb,
   projectId: string,
   beadId: string,
-  { board: given, gatewayPricing, asOfMs }: FeatureLedgerOptions = {},
+  { board: given, gatewayPricing, asOfMs, asOfExclusive = false }: FeatureLedgerOptions = {},
 ): Promise<FeatureLedger | undefined> {
   const project = await getProjectById(db, projectId);
   if (!project) return undefined;
@@ -159,11 +173,11 @@ export async function featureLedger(
   // creation-time cutoff keeps it, and an operator cancelling that job before the rerun settles would
   // then read as this delivery's own cancel. `updatedAt` is the row's last mutation; requiring it at
   // or before `asOfMs` excludes any job touched after the cutoff, however old its `createdAt` is.
-  const rows = cutAt(rawRows, asOfMs, (row) => row.recordedAt.getTime());
-  const jobs = cutAt(rawJobs, asOfMs, (job) => job.updatedAt.getTime());
-  const escalations = cutAt(rawEscalations, asOfMs, (row) => row.raisedAt.getTime());
-  const rounds = cutAt(rawRounds, asOfMs, (round) => timestampOf(round.at));
-  const notes = cutAt(sendBackNotes(board, scope.ids), asOfMs, (note) => timestampOf(note.at));
+  const rows = cutAt(rawRows, asOfMs, (row) => row.recordedAt.getTime(), asOfExclusive);
+  const jobs = cutAt(rawJobs, asOfMs, (job) => job.updatedAt.getTime(), asOfExclusive);
+  const escalations = cutAt(rawEscalations, asOfMs, (row) => row.raisedAt.getTime(), asOfExclusive);
+  const rounds = cutAt(rawRounds, asOfMs, (round) => timestampOf(round.at), asOfExclusive);
+  const notes = cutAt(sendBackNotes(board, scope.ids), asOfMs, (note) => timestampOf(note.at), asOfExclusive);
 
   // Overhead is excluded before timing is folded, the same split `ledgerTotals` already applies at
   // the bucket level (design §D4) — otherwise a scheduled pass attributed to this scope would
