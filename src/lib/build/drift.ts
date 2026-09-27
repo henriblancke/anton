@@ -350,23 +350,40 @@ async function readIdentityOffThread(root: string): Promise<BuildIdentity> {
 /**
  * The read currently running off-thread, shared with every caller that arrives while it does.
  *
+ * Anchored on `globalThis`, not a module-local `let`, for the reason `onDiskCache` above is: the
+ * runner and the request graph are separate module registries, and a miss landing in both around the
+ * same moment must still share ONE worker — the property this exists for in the first place — rather
+ * than each registry spawning its own because its own copy of this variable was independently null.
+ *
  * Generation-tagged for the reason {@link inflightDrifts} is: sharing is only correct WITHIN one, so
  * a read that began before `checkoutMoved` fired is never handed to a caller arriving after it. That
  * tag is also what keeps concurrent display renders down to ONE worker rather than a thread per
  * request — the cost this indirection exists to avoid paying twice over.
  */
-let inflightOnDisk: { generation: number; identity: Promise<BuildIdentity> } | null = null;
+const ON_DISK_INFLIGHT_KEY = Symbol.for("anton.build.onDiskInflight");
+
+type OnDiskInflight = { generation: number; identity: Promise<BuildIdentity> };
+
+function inflightOnDisk(): OnDiskInflight | null {
+  return (globalThis as unknown as Record<symbol, OnDiskInflight | undefined>)[ON_DISK_INFLIGHT_KEY] ?? null;
+}
+
+function setInflightOnDisk(inflight: OnDiskInflight | null): void {
+  (globalThis as unknown as Record<symbol, OnDiskInflight | null>)[ON_DISK_INFLIGHT_KEY] = inflight;
+}
 
 /**
- * Whether this process has already said the off-thread read failed. Once per process: the failure
- * repeats on every cache miss for as long as the install stays as it is, and a line per miss would
- * bury the one that names the cause.
+ * Whether this process has already said the off-thread read failed. Once per process — not per
+ * registry, for the same reason `inflightOnDisk` above is anchored on `globalThis` — the failure
+ * repeats on every cache miss for as long as the install stays as it is, and a line per miss (or per
+ * registry) would bury the one that names the cause.
  */
-let warnedOffThread = false;
+const WARNED_OFF_THREAD_KEY = Symbol.for("anton.build.warnedOffThread");
 
 function warnOffThreadReadFailed(err: unknown): void {
-  if (warnedOffThread) return;
-  warnedOffThread = true;
+  const g = globalThis as unknown as Record<symbol, boolean | undefined>;
+  if (g[WARNED_OFF_THREAD_KEY]) return;
+  g[WARNED_OFF_THREAD_KEY] = true;
   console.warn(
     "[build/drift] off-thread build-identity read unavailable — falling back to a blocking read on " +
       "every display miss. Is src/lib/build/identity-worker.mjs present in this install?",
@@ -386,7 +403,8 @@ async function onDiskIdentityAsync(): Promise<BuildIdentity> {
   if (cached) return cached;
   const root = appRoot();
   if (!root) return storeOnDisk(generation, unreadableIdentity(), nextOnDiskSeq());
-  if (!inflightOnDisk || inflightOnDisk.generation !== generation) {
+  let inflight = inflightOnDisk();
+  if (!inflight || inflight.generation !== generation) {
     // Issued here, before the worker round trip — not in the `.then` below — so a synchronous
     // `fresh` gate read taken while this is in flight is stamped with a LATER seq than this one,
     // whichever of the two settles first (PR anton-fzarz review).
@@ -403,11 +421,12 @@ async function onDiskIdentityAsync(): Promise<BuildIdentity> {
       })
       .then((identity) => (cacheGeneration() === generation ? storeOnDisk(generation, identity, seq) : identity))
       .finally(() => {
-        if (inflightOnDisk?.generation === generation) inflightOnDisk = null;
+        if (inflightOnDisk()?.generation === generation) setInflightOnDisk(null);
       });
-    inflightOnDisk = { generation, identity };
+    inflight = { generation, identity };
+    setInflightOnDisk(inflight);
   }
-  return inflightOnDisk.identity;
+  return inflight.identity;
 }
 
 /**

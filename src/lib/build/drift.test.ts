@@ -67,11 +67,15 @@ const recordPath = () => join(dir, `server-build.${process.pid}.json`);
  * boot identity and the on-disk read cache are anchored on `globalThis` precisely so they survive a
  * registry reset (they have to cross Next's module registries), so those anchors are cleared too —
  * otherwise a case run earlier in this file leaves its cached on-disk read for a later case sharing
- * the same generation number to read back as its own.
+ * the same generation number to read back as its own. `warnedOffThread` is cleared for the same
+ * reason: it is process-wide by design (anton-fzarz review), so a case earlier in this file that hit
+ * the fallback path would otherwise suppress the warning assertion in a later one.
  */
 function unboot() {
   delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.bootedFrom")];
   delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.onDiskCache")];
+  delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.onDiskInflight")];
+  delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.warnedOffThread")];
 }
 
 function freshModule() {
