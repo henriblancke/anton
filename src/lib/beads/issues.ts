@@ -1497,7 +1497,12 @@ export function probeCycleEvidence(cwd: string): void {
             if (previousCycles === undefined || !sameCycles(previousCycles, cycles)) {
               markCycleEvidenceRecovered(cwd);
             }
-          } else if (!consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) !== undefined) {
+          } else if (
+            !consistent &&
+            issueSnapshotGeneration(cwd) === generation &&
+            cycleEvidenceFor(board) !== undefined &&
+            cycleEvidenceCheckedAtFor(board) === staleCheckedAt
+          ) {
             // A rejected pairing here means a refresh triggered by EXPIRED evidence (the early
             // return above only skips while within `CYCLE_EVIDENCE_MAX_AGE_MS`, so reaching this
             // far means the freshness check already failed, not that evidence was missing) failed
@@ -1506,7 +1511,11 @@ export function probeCycleEvidence(cwd: string): void {
             // shared-server board that moved between the `bd dep cycles` fetch and the re-list,
             // `cycleEvidenceFor(board)` would keep reporting the now-stale cycle set as
             // authoritative until some later probe happens to succeed. Clear it and fail closed,
-            // mirroring the catch block's present->missing transition below.
+            // mirroring the catch block's present->missing transition below. Guarded by the same
+            // `staleCheckedAt` check as that catch and `attachCyclesBestEffort`'s equivalent branch
+            // (P2 review, PR #274, issues.ts:867): a racing `ensureCycleEvidence`/`probeCycleEvidence`
+            // sharing this same retained board can attach a newer, successful result while this
+            // refresh was in flight, and that result must survive this rejection, not be clobbered.
             clearCycleEvidence(board);
             markCycleEvidenceUnavailable(cwd);
           }
