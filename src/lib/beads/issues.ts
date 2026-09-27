@@ -390,13 +390,20 @@ async function recheckBlocksConsistency(
  * this field the two keys still compared equal, so `loadAllIssues` returned the stale, still-shown-
  * unclaimed bead and `approveAndClaim` passed it to `cas(...)` as `current` — `claim.ts` then skips
  * its own `bd show` and can overwrite the newly landed owner instead of losing the CAS.
+ *
+ * `issue_type` and `priority` are in the key too (P2 review, PR #274, issues.ts:399): a
+ * shared-server writer can retype a target — a parentless task into a chore, say — or reprioritize
+ * it between the initial listing and the post-`depCycles` re-list without touching status, labels,
+ * description, ancestors, or owner. Without these fields the two keys still compared equal, so
+ * `boardStillMatchesCycles` waved the stale board through and the approval route could label/enqueue
+ * a bead that is no longer a run target, or the picker could rank against stale policy inputs.
  */
 function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
   const byId = new Map(list.map((bead) => [bead.id, bead]));
   return (id: string) => {
     const bead = byId.get(id);
     if (!bead) return undefined;
-    return `${bead.status}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${ownerOf(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
+    return `${bead.status}:${bead.issue_type}:${bead.priority}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${ownerOf(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
   };
 }
 
@@ -799,6 +806,19 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
               consistent =
                 sameCycles(cycles, freshCycles) &&
                 boardStillMatchesCycles(cycles, board, dedupeById([...freshWork, ...freshGates]));
+              if (!consistent) {
+                // This refresh explicitly REJECTED the board/evidence pairing — this call only runs
+                // against evidence `cycleEvidenceMissingOrStale` already found missing-or-stale, so
+                // leaving a stale sidecar attached here would still read as present to
+                // `cycleEvidenceFor`. `readAllIssues`/`getBoard` could then derive and persist picks
+                // off an expired cycle set the refresh just disowned. Clear it and fail closed,
+                // mirroring the outer catch's identical clear-and-unavailable transition
+                // (issues.ts:844) — this rejection path never reached that catch (P2 review, PR #274,
+                // issues.ts:807).
+                const hadEvidence = cycleEvidenceFor(board) !== undefined;
+                clearCycleEvidence(board);
+                if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+              }
             }
           }
         }

@@ -1556,6 +1556,35 @@ function sameBlocksEdges(a, b) {
 }
 
 /**
+ * Whether two FULL board reads agree on membership and every structural fact
+ * `validateBoardStructure` reads off a bead — status, parent, issue_type, and label set — for
+ * EVERY id either board carries, not just those a `blocks` edge or a reported cycle touches.
+ * `sameBlocksEdges` and `sameCycleMemberLiveness` only ever look at the graph `bd dep cycles`
+ * walks; a plain reparent that adds a board's first feature under a legacy epic touches neither —
+ * no `blocks` edge moves and no cycle member changes — so both existing checks pass while
+ * `cmdBoardCheck` would otherwise keep the STALE `read.board` that `buildStructureReport` runs
+ * against, silently missing the epic's newly-stranded pre-existing tickets (P2 review, PR #274,
+ * bin/anton.mjs:1769). Mirrors `src/lib/beads/issues.ts`'s `sameTargetEligibilityState`, which this
+ * plain-Node launcher can't import (that file is TS), generalized to every id on the board rather
+ * than one candidate.
+ */
+function sameBoardStructure(a, b) {
+  const key = (board) => {
+    const byId = new Map(board.map((bead) => [bead.id, bead]));
+    return (id) => {
+      const bead = byId.get(id);
+      if (!bead) return undefined;
+      const parent = bead.parent ?? bead.parent_id ?? "";
+      return `${bead.status}:${bead.issue_type}:${parent}:${[...(bead.labels ?? [])].sort().join(",")}`;
+    };
+  };
+  const [idsA, idsB] = [new Set(a.map((bead) => bead.id)), new Set(b.map((bead) => bead.id))];
+  if (idsA.size !== idsB.size) return false;
+  const [keyA, keyB] = [key(a), key(b)];
+  return [...idsA].every((id) => idsB.has(id) && keyA(id) === keyB(id));
+}
+
+/**
  * Whether two `bd dep cycles` results name the same set of cycles (by member id set). Mirrors
  * `src/lib/beads/issues.ts`'s `sameCycles`, which this plain-Node launcher can't import (that file
  * is TS).
@@ -1765,13 +1794,17 @@ function cmdBoardCheck(args) {
       }
       if (
         !sameBlocksEdges(read.board, recheck.board) ||
-        !sameCycleMemberLiveness(parsedCycles, read.board, recheck.board)
+        !sameCycleMemberLiveness(parsedCycles, read.board, recheck.board) ||
+        !sameBoardStructure(read.board, recheck.board)
       ) {
         if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
         continue attempts;
       }
 
-      let hydratedBoard = read.board;
+      // `recheck.board`, not `read.board`: the checks above only prove the two reads AGREE, not
+      // which is current, and `recheck.board` is the later of the two — evaluate the report against
+      // the newer board now that graph compatibility is established.
+      let hydratedBoard = recheck.board;
       const hydratedCycles = parsedCycles;
 
       // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
@@ -1838,11 +1871,15 @@ function cmdBoardCheck(args) {
         const freshBoard = [...freshById.values()];
         if (
           !sameBlocksEdges(hydratedBoard, freshBoard) ||
-          !sameCycleMemberLiveness(hydratedCycles, hydratedBoard, freshBoard)
+          !sameCycleMemberLiveness(hydratedCycles, hydratedBoard, freshBoard) ||
+          !sameBoardStructure(hydratedBoard, freshBoard)
         ) {
           if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
           continue attempts;
         }
+        // Same reasoning as the outer pairing above: the checks just proved agreement, not
+        // currency — carry forward `freshBoard`, the later of the two reads.
+        hydratedBoard = freshBoard;
       }
 
       board = hydratedBoard;
