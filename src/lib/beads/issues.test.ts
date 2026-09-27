@@ -1082,6 +1082,7 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
     await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
     const board = await allIssues(REPO);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
 
     const realNow = Date.now();
     const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
@@ -1092,6 +1093,10 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
 
       expect(cycleEvidenceFor(await allIssues(REPO))).toBeUndefined();
+      // The board poll route 304s on an unchanged version — without this bump, a poller that
+      // already matched the pre-failure token would keep 304-ing the stale ranked verdict instead
+      // of ever learning evidence became unavailable (P2 review, PR #274, issues.ts:1214).
+      expect(issueSnapshotVersion(REPO)).toBe(before + 1);
     } finally {
       dateSpy.mockRestore();
     }

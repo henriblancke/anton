@@ -7,6 +7,7 @@ import {
   issueSnapshotGeneration,
   issueSnapshotVersion,
   markCycleEvidenceRecovered,
+  markCycleEvidenceUnavailable,
   probeIssueSnapshot,
   readIssueSnapshot,
   refreshIssueSnapshotRead,
@@ -1211,7 +1212,15 @@ export function probeCycleEvidence(cwd: string): void {
         // only skips while within CYCLE_EVIDENCE_MAX_AGE_MS) — leaving a prior WeakMap entry in
         // place would keep `cycleEvidenceFor(board)` reporting it as authoritative indefinitely.
         // Clear it so every consumer fails closed until the next successful refresh.
-        if (capturedBoard !== undefined) clearCycleEvidence(capturedBoard);
+        if (capturedBoard !== undefined) {
+          const hadEvidence = cycleEvidenceFor(capturedBoard) !== undefined;
+          clearCycleEvidence(capturedBoard);
+          // Bump the version on this present->missing transition, mirroring `markCycleEvidenceRecovered`
+          // for the opposite direction (P2 review, PR #274, issues.ts:1214) — otherwise the board poll
+          // route's freshness check still matches the pre-failure token and 304s, leaving the browser on
+          // the stale Up Next lane instead of `cycles-unavailable` even though this failed closed.
+          if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+        }
       } finally {
         probes.delete(cwd);
       }

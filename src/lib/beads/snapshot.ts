@@ -187,6 +187,17 @@ export function markCycleEvidenceRecovered(cwd: string): void {
 }
 
 /**
+ * Same version-only bump as {@link markCycleEvidenceRecovered}, for the opposite transition:
+ * evidence that WAS attached is cleared after a failed refresh (P2 review, PR #274,
+ * `issues.ts:1214`). Without it, the board poll route's freshness check still matches the
+ * pre-failure token and keeps 304-ing the previously-ranked verdict, leaving the browser showing
+ * the stale Up Next lane instead of `cycles-unavailable` even though the server has failed closed.
+ */
+export function markCycleEvidenceUnavailable(cwd: string): void {
+  entryFor(cwd).version += 1;
+}
+
+/**
  * Mark cached data stale while retaining it so a background-refresh reader (the poll path) keeps
  * serving last-good data and never waits behind a Dolt sync. `localWrite` additionally bumps the
  * version (so clients detect the change), clears any in-flight loader — forcing a fresh read that
