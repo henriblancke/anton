@@ -1110,26 +1110,36 @@ export function probeCycleEvidence(cwd: string): void {
             const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
             if (missingCycleIds.length > 0) {
               const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
-              // Rebuilt from `board` AFTER the hydration await, not `knownIds` captured before it: a
-              // concurrent caller sharing this same `board` array (evidence is keyed by identity) can
-              // have hydrated the same gates onto it while this listing was in flight.
-              const idsOnBoard = new Set(board.map((bead) => bead.id));
+              // Check generation BEFORE mutating `board`, not after (P2 review, PR #274, round 22):
+              // `board` can still be the entry's own retained array, so pushing onto it and only
+              // checking afterward left a write that invalidated the snapshot mid-`loadGateIssues`
+              // with its gate already applied to the array readers see, while the snapshot's
+              // serialized content/version stayed stamped for the pre-push content — mirrors
+              // `attachCyclesBestEffort`'s identical guard (issues.ts:565). No `await` between this
+              // check and the mutation below, so nothing can invalidate the snapshot in between; a
+              // mismatch here means `board` is already an orphaned copy and is left untouched rather
+              // than mutated for no reader to see.
               let addedAny = false;
-              for (const gate of hydratedGates) {
-                if (!idsOnBoard.has(gate.id)) {
-                  board.push(gate);
-                  idsOnBoard.add(gate.id);
-                  addedAny = true;
+              if (issueSnapshotGeneration(cwd) === generation) {
+                // Rebuilt from `board` AFTER the hydration await, not `knownIds` captured before it: a
+                // concurrent caller sharing this same `board` array (evidence is keyed by identity) can
+                // have hydrated the same gates onto it while this listing was in flight.
+                const idsOnBoard = new Set(board.map((bead) => bead.id));
+                for (const gate of hydratedGates) {
+                  if (!idsOnBoard.has(gate.id)) {
+                    board.push(gate);
+                    idsOnBoard.add(gate.id);
+                    addedAny = true;
+                  }
                 }
-              }
-              // Keep the retained snapshot's own bookkeeping in sync with `board`, same requirement as
-              // `attachCyclesBestEffort`/`ensureCycleEvidence` — pushing gates onto `board` changes its
-              // content without this. Only stamp it when the generation still matches; a mismatch means
-              // a concurrent write already replaced the entry, and this local `board` is an orphaned
-              // copy `hydrateIssueSnapshot`'s own guard correctly refuses to stamp.
-              if (addedAny && issueSnapshotGeneration(cwd) === generation) {
-                hydrateIssueSnapshot(cwd, board, generation);
-                generation = issueSnapshotGeneration(cwd);
+                // Keep the retained snapshot's own bookkeeping in sync with `board`, same requirement
+                // as `attachCyclesBestEffort`/`ensureCycleEvidence` — pushing gates onto `board`
+                // changes its content without this. Safe to stamp unconditionally here: the generation
+                // check above and this push are both synchronous, so it still matches.
+                if (addedAny) {
+                  hydrateIssueSnapshot(cwd, board, generation);
+                  generation = issueSnapshotGeneration(cwd);
+                }
               }
               // `loadGateIssues` above is its own live `bd list`, wide enough a gap for another writer
               // to repair the cycle `cycles` named while opening a DIFFERENT one under a different pair
