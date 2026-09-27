@@ -30,3 +30,12 @@ export function attachCycleEvidence<T extends Bead[]>(board: T, cycles: DepCycle
 export function cycleEvidenceFor(board: readonly Bead[]): DepCycle[] | undefined {
   return cyclesByBoard().get(board);
 }
+
+/**
+ * Drop evidence that a refresh attempt just failed to renew, so `cycleEvidenceFor` reports it
+ * missing rather than keep handing back a verdict past its trust window (PR #274 review round
+ * 24: an empty catch around a failed re-check left the expired entry in place).
+ */
+export function clearCycleEvidence(board: readonly Bead[]): void {
+  cyclesByBoard().delete(board);
+}

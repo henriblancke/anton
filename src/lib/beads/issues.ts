@@ -1,5 +1,5 @@
 import { beads, type Bead, type DepCycle } from "./bd";
-import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
+import { attachCycleEvidence, clearCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   getBeadDescription,
   hydrateIssueSnapshot,
@@ -1087,6 +1087,9 @@ export function probeCycleEvidence(cwd: string): void {
   probes.set(
     cwd,
     (async () => {
+      // Captured outside the try so the catch below can invalidate whatever evidence this attempt
+      // was refreshing, even though the read that produces `board` is itself inside the try.
+      let capturedBoard: readonly Bead[] | undefined;
       try {
         // Read via `readIssueSnapshot`, not `getIssueSnapshot` + a follow-up `issueSnapshotGeneration`
         // call: the two reads aren't atomic, so a concurrent refresh landing in the gap could hand back
@@ -1095,6 +1098,7 @@ export function probeCycleEvidence(cwd: string): void {
         const { beads: board, generation: initialGeneration } = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, {
           blockOnPendingWrite: false,
         });
+        capturedBoard = board;
         let generation = initialGeneration;
         // Evidence already attached is only a reason to skip while it's still within its trust
         // window (P2 review, PR #274, issues.ts:830): a board whose own content never changes (the
@@ -1203,7 +1207,11 @@ export function probeCycleEvidence(cwd: string): void {
           }
         }
       } catch {
-        // Still unavailable — the next probe (or an explicit `withCycles` read) retries.
+        // Reaching here means evidence already failed the freshness check above (the early return
+        // only skips while within CYCLE_EVIDENCE_MAX_AGE_MS) — leaving a prior WeakMap entry in
+        // place would keep `cycleEvidenceFor(board)` reporting it as authoritative indefinitely.
+        // Clear it so every consumer fails closed until the next successful refresh.
+        if (capturedBoard !== undefined) clearCycleEvidence(capturedBoard);
       } finally {
         probes.delete(cwd);
       }

@@ -1068,6 +1068,35 @@ describe("probeCycleEvidence (PR #274 review, round 3)", () => {
     }
   });
 
+  it("invalidates expired evidence when the staleness refresh itself fails (codex review, PR #274)", async () => {
+    // Evidence attached once, then goes stale with the board's own content never moving (same
+    // setup as the "re-checks previously-attached evidence" test above). If the refresh triggered
+    // by that staleness then throws, the old WeakMap entry must not survive it — every consumer
+    // treats `cycleEvidenceFor(board) !== undefined` as authoritative, so leaving it in place would
+    // keep deriving/persisting picks off a verdict this process could no longer stand behind.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    const board = await allIssues(REPO);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      cyclesMock.mockRejectedValueOnce(new Error("bd dep cycles failed"));
+      probeCycleEvidence(REPO);
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(cycleEvidenceFor(await allIssues(REPO))).toBeUndefined();
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
   it("declines to attach empty cycle evidence to a retained board whose own edges are pre-repair (P2 review on PR #274, round 20)", async () => {
     // Same race as the `attachCyclesBestEffort` test above, but for the probe path: the retained
     // snapshot warms with a genuinely cyclic edge and no evidence. By the time the probe's `bd dep
