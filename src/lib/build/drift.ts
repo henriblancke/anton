@@ -225,7 +225,23 @@ function invalidateCaches(): void {
  */
 const ON_DISK_TTL_MS = 15_000;
 
-let onDiskCache: { at: number; generation: number; seq: number; identity: BuildIdentity } | null = null;
+type OnDiskCache = { at: number; generation: number; seq: number; identity: BuildIdentity };
+
+/**
+ * Anchored on `globalThis`, not a module-local `let`, for the reason `BOOT_KEY` above is: the
+ * runner and the request graph hold separate copies of this module, and the seq ordering below
+ * only means anything if both copies read and write the SAME cache slot and the SAME counter.
+ */
+const ON_DISK_CACHE_KEY = Symbol.for("anton.build.onDiskCache");
+const ON_DISK_SEQ_KEY = Symbol.for("anton.build.onDiskSeq");
+
+function onDiskCache(): OnDiskCache | null {
+  return (globalThis as unknown as Record<symbol, OnDiskCache | undefined>)[ON_DISK_CACHE_KEY] ?? null;
+}
+
+function setOnDiskCache(cache: OnDiskCache): void {
+  (globalThis as unknown as Record<symbol, OnDiskCache>)[ON_DISK_CACHE_KEY] = cache;
+}
 
 /**
  * Orders reads within one generation, since `checkoutMoved` is the only invalidation an EXTERNAL
@@ -235,13 +251,22 @@ let onDiskCache: { at: number; generation: number; seq: number; identity: BuildI
  * afterwards, even though the display read's worker round trip lands second. Without this, that
  * later-completing-but-earlier-issued read would overwrite the gate's correct, fresher store and
  * every render within the TTL would compare against the pre-pull identity again.
+ *
+ * Process-wide for the same reason the cache itself is: a seq minted in the runner's copy of this
+ * module must outrank a seq minted earlier in the request graph's copy, or the ordering this exists
+ * to guarantee only holds when both reads happen to land in the same module registry.
  */
-let onDiskSeq = 0;
+function nextOnDiskSeq(): number {
+  const seq = ((globalThis as unknown as Record<symbol, number | undefined>)[ON_DISK_SEQ_KEY] ?? 0) + 1;
+  (globalThis as unknown as Record<symbol, number>)[ON_DISK_SEQ_KEY] = seq;
+  return seq;
+}
 
 /** The cached read, when one still stands for this generation — the shared hit both paths take. */
 function cachedOnDisk(generation: number): BuildIdentity | null {
-  if (!onDiskCache || onDiskCache.generation !== generation) return null;
-  return Date.now() - onDiskCache.at < ON_DISK_TTL_MS ? onDiskCache.identity : null;
+  const cache = onDiskCache();
+  if (!cache || cache.generation !== generation) return null;
+  return Date.now() - cache.at < ON_DISK_TTL_MS ? cache.identity : null;
 }
 
 /** What a process with no resolvable runtime dir is running: nothing anything here can name. */
@@ -257,8 +282,9 @@ function unreadableIdentity(): BuildIdentity {
  * silence the seq ordering above exists to end.
  */
 function storeOnDisk(generation: number, identity: BuildIdentity, seq: number): BuildIdentity {
-  if (onDiskCache && onDiskCache.generation === generation && onDiskCache.seq > seq) return onDiskCache.identity;
-  onDiskCache = { at: Date.now(), generation, seq, identity };
+  const cache = onDiskCache();
+  if (cache && cache.generation === generation && cache.seq > seq) return cache.identity;
+  setOnDiskCache({ at: Date.now(), generation, seq, identity });
   return identity;
 }
 
@@ -269,7 +295,7 @@ function onDiskIdentity(fresh = false): BuildIdentity {
     if (cached) return cached;
   }
   const root = appRoot();
-  const seq = ++onDiskSeq;
+  const seq = nextOnDiskSeq();
   return storeOnDisk(generation, root ? (readBuildIdentity(root) as BuildIdentity) : unreadableIdentity(), seq);
 }
 
@@ -359,12 +385,12 @@ async function onDiskIdentityAsync(): Promise<BuildIdentity> {
   const cached = cachedOnDisk(generation);
   if (cached) return cached;
   const root = appRoot();
-  if (!root) return storeOnDisk(generation, unreadableIdentity(), ++onDiskSeq);
+  if (!root) return storeOnDisk(generation, unreadableIdentity(), nextOnDiskSeq());
   if (!inflightOnDisk || inflightOnDisk.generation !== generation) {
     // Issued here, before the worker round trip — not in the `.then` below — so a synchronous
     // `fresh` gate read taken while this is in flight is stamped with a LATER seq than this one,
     // whichever of the two settles first (PR anton-fzarz review).
-    const seq = ++onDiskSeq;
+    const seq = nextOnDiskSeq();
     const identity = readIdentityOffThread(root)
       // The fallback stands in the same place the worker would have: a thread this platform or
       // install cannot start must not leave a display surface with no verdict at all. Logged once
