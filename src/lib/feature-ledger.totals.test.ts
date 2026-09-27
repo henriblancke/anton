@@ -97,7 +97,7 @@ describe("per-phase totals", () => {
       ].sort(),
     );
     expect(Object.keys(totals.tokens).sort()).toEqual(
-      ["cacheRead", "cacheWrite", "input", "output", "thinking"].sort(),
+      ["cacheRead", "cacheWrite", "input", "output", "thinking", "webSearches"].sort(),
     );
   });
 
@@ -153,6 +153,15 @@ describe("per-phase totals", () => {
       apiMs: 2 * MINUTE,
       turns: 5,
     });
+  });
+
+  it("carries web-search requests in the bucket's tokens, separately from the scope total (PR #329 review)", () => {
+    // Not a token count, so it must not inflate anything a caller sums — it exists only so a bucket
+    // whose entire usage was search can be told apart from one that measured nothing at all.
+    const rows = [row({ invocationId: "i1", webSearchRequests: 5 })];
+    const { phases, totals } = ledgerTotals(rows);
+    expect(phases.get("implement")?.tokens.webSearches).toBe(5);
+    expect(totals.tokens.webSearches).toBe(5);
   });
 });
 

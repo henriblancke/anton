@@ -309,6 +309,14 @@ export interface LedgerTiming {
    * checks this and refuses to report a split rather than silently pick a side.
    */
   splitAmbiguous: boolean;
+  /**
+   * True when at least one invocation's active time was clipped or wholly excluded from
+   * {@link activeMs} because it ended after the scope's delivery. That invocation is still counted
+   * in {@link timedInvocations} — it genuinely reported a duration — so `timedInvocations ===
+   * invocations` no longer guarantees `activeMs` covers everything recorded. This is the caller's
+   * only signal that the figure is scoped to the delivery span rather than to everything anton did.
+   */
+  excludesPostDeliveryWork: boolean;
 }
 
 /**
@@ -450,6 +458,7 @@ export function ledgerTiming(
   let untethered = 0;
   let timed = 0;
   let splitAmbiguous = false;
+  let excludesPostDeliveryWork = false;
   for (const fact of facts) {
     const duration = invocationDuration(fact.rows);
     if (duration === undefined) continue;
@@ -477,6 +486,10 @@ export function ledgerTiming(
     if (deliveredAtMs !== undefined && endedAt !== undefined) {
       if (endedAt === deliveredAtMs) splitAmbiguous = true;
       else if (endedAt > deliveredAtMs) {
+        // Real work, but the caller must be told `activeMs` no longer covers it — whether this
+        // invocation is clipped to its pre-delivery portion below or dropped entirely (PR #329
+        // review).
+        excludesPostDeliveryWork = true;
         const startedAt = endedAt - duration;
         if (startedAt < deliveredAtMs) intervals.push({ start: startedAt, end: deliveredAtMs });
         continue;
@@ -498,6 +511,7 @@ export function ledgerTiming(
     timedInvocations: timed,
     leadMs: leadMs(firstInvocationStartMs(rows), deliveredAtMs),
     splitAmbiguous,
+    excludesPostDeliveryWork,
   };
 }
 
@@ -576,6 +590,12 @@ export interface LedgerTokens {
   thinking: number;
   cacheRead: number;
   cacheWrite: number;
+  /**
+   * Not a token count, and never added into a display total — kept beside the tokens so a bucket
+   * that measured ONLY search usage (no tokens at all) can still be told apart from one that
+   * measured nothing (see {@link PhaseTotals.usd}'s "no usage" reading, PR #329 review).
+   */
+  webSearches: number;
 }
 
 /**
@@ -684,7 +704,7 @@ export interface LedgerTotalsRow extends LedgerTimingRow, TokenCounts {
 function emptyTotals(): PhaseTotals {
   return {
     runs: 0,
-    tokens: { input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite: 0 },
+    tokens: { input: 0, output: 0, thinking: 0, cacheRead: 0, cacheWrite: 0, webSearches: 0 },
     usd: undefined,
     unpricedRows: 0,
     pricedRows: 0,
@@ -704,6 +724,7 @@ function addTokens(into: LedgerTokens, row: LedgerTotalsRow): void {
   into.thinking += count(row.thinkingTokens);
   into.cacheRead += count(row.cacheReadInputTokens);
   into.cacheWrite += count(row.cacheCreationInputTokens);
+  into.webSearches += count(row.webSearchRequests);
 }
 
 /**
@@ -761,6 +782,7 @@ function mergeInto(into: PhaseTotals, from: PhaseTotals): void {
   into.tokens.thinking += from.tokens.thinking;
   into.tokens.cacheRead += from.tokens.cacheRead;
   into.tokens.cacheWrite += from.tokens.cacheWrite;
+  into.tokens.webSearches += from.tokens.webSearches;
   into.unpricedRows += from.unpricedRows;
   into.pricedRows += from.pricedRows;
   into.rows += from.rows;

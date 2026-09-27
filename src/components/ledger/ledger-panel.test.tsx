@@ -277,6 +277,26 @@ describe("the three durations", () => {
       /only 1 of 2 calls reported a duration/,
     );
   });
+
+  it("labels active time as scoped to the delivery span when later work was excluded (PR #329 review)", () => {
+    // A review-fix session that answers feedback after the feature already delivered: real work,
+    // but `ledgerTiming` excludes it from `activeMs` while still counting it as timed — so
+    // `timedInvocations === invocations` alone would wrongly read as "this covers everything".
+    const deliveredAt = START + 30 * 60_000;
+    const rows = [
+      row({ recordedAt: new Date(START + 10 * 60_000), durationMs: 10 * 60_000 }),
+      row({
+        step: "review-fix",
+        recordedAt: new Date(START + 60 * 60_000),
+        durationMs: 20 * 60_000,
+      }),
+    ];
+
+    render(panel(rows, deliveredAt));
+
+    expect(qualifier("Active")).toBe("within delivery");
+    expect(duration("Active").getAttribute("title")).toMatch(/excluded here/);
+  });
 });
 
 describe("friction", () => {
@@ -397,6 +417,27 @@ describe("what could not be attributed or priced", () => {
 
       expect(screen.queryByRole("status")).toBeNull();
     });
+
+    it("says no price, not no usage, for a call whose only usage was a web search (PR #329 review)", () => {
+      // An unpriced model reporting ONLY search requests: no input/output/cache tokens at all, so
+      // testing tokens alone would misread this real, billable usage as nothing measured.
+      render(
+        panel([
+          row({
+            modelReported: UNKNOWN,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 5,
+          }),
+        ]),
+      );
+
+      const cost = rowFor("Implement").querySelectorAll("td")[2].textContent!;
+      expect(cost).toContain("no price");
+      expect(cost).not.toContain("no usage");
+    });
   });
 
   describe("the unattributed bucket", () => {
@@ -459,6 +500,26 @@ describe("what could not be attributed or priced", () => {
       expect(screen.queryByText("Overhead")).toBeNull();
       const table = screen.getByRole("table");
       expect(within(table).queryByText(/not billed to this feature/)).toBeNull();
+    });
+
+    it("shows no-cost-recorded rather than an empty phase table when only overhead touched the feature (PR #329 review)", () => {
+      // A scheduled pass (gardener, say) touched this feature's beads while anton never actually
+      // dispatched work for it: `totals.recorded` is true (a row exists) but there is no phase and no
+      // unattributed bucket — no bill of the feature's own to show.
+      const overheadOnly = [
+        row({ jobType: "gardener", step: null, stepHandler: null, durationMs: 20_000 }),
+      ];
+      const totals = ledgerTotals(overheadOnly);
+      expect(totals.recorded).toBe(true);
+      expect(totals.phases.size).toBe(0);
+      expect(totals.unattributed).toBeUndefined();
+
+      render(panel(overheadOnly));
+
+      expect(screen.getByText(/No cost recorded/)).toBeTruthy();
+      expect(screen.queryByRole("table")).toBeNull();
+      // The overhead spend is still visible — just not folded into a phantom bill above it.
+      expect(screen.getByLabelText("Unallocated")).toBeTruthy();
     });
 
     it("omits the section entirely when no scheduled pass touched the feature", () => {

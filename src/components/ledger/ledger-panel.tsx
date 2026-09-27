@@ -85,17 +85,20 @@ export function LedgerPanel({
   // the full empty state here would hide a recorded human touch and read the feature as untouched.
   if (!totals.recorded && !frictionRecorded(friction)) return <NothingRecorded />;
 
+  // `totals.recorded` is true the moment ANY row landed against this scope, including a
+  // project-level pass that touched its beads without anton ever dispatching the feature itself —
+  // `phases` empty, `unattributed` absent, `overhead` set. Gating the phase table on `recorded`
+  // alone would render it with no rows above a zeroed footer: the exact wall-of-zeros this
+  // component exists to refuse. Gate on whether the feature actually has its own bill instead
+  // (PR #329 review).
+  const hasOwnBill = totals.phases.size > 0 || totals.unattributed !== undefined;
+
   return (
     <div className="flex flex-col gap-4">
-      {totals.recorded ? (
-        <>
-          <PhaseTable totals={totals} />
-          {/* Below the table and outside its footer, because it is not this feature's bill (§D4). */}
-          {totals.overhead ? <UnallocatedSection overhead={totals.overhead} /> : null}
-        </>
-      ) : (
-        <NoCostRecorded />
-      )}
+      {hasOwnBill ? <PhaseTable totals={totals} /> : <NoCostRecorded />}
+      {/* Below the table and outside its footer, because it is not this feature's bill (§D4) — shown
+          whenever a scheduled pass touched this scope, even one with no bill of its own above it. */}
+      {totals.overhead ? <UnallocatedSection overhead={totals.overhead} /> : null}
       <DurationsSection timing={timing} />
       <FrictionSection friction={friction} />
     </div>
@@ -132,6 +135,16 @@ function recordedPhases(totals: LedgerTotals): [LedgerPhase, PhaseTotals][] {
  */
 function totalTokens(tokens: LedgerTokens): number {
   return tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
+}
+
+/**
+ * Whether a bucket measured ANY usage at all — tokens or web searches — as opposed to a crashed
+ * invocation that measured nothing to price. A bucket whose only usage is web search reports zero
+ * tokens (search requests are not a token count), so testing tokens alone misreads real, billable
+ * usage as "no usage" (PR #329 review).
+ */
+function hasMeasuredUsage(bucket: PhaseTotals): boolean {
+  return totalTokens(bucket.tokens) > 0 || bucket.tokens.webSearches > 0;
 }
 
 const PHASE_LABELS: Readonly<Record<LedgerPhase, string>> = {
@@ -322,7 +335,7 @@ function CostCell({ bucket, className }: { bucket: PhaseTotals; className?: stri
   const partial = bucket.usd !== undefined && bucket.unpricedRows > 0;
   // Two different reasons for an absent figure, and only the first is a gap in the price table: a
   // model anton cannot price, versus a crashed invocation that measured nothing to price.
-  const hasMeasuredTokens = totalTokens(bucket.tokens) > 0;
+  const measured = hasMeasuredUsage(bucket);
 
   return (
     <td
@@ -339,14 +352,14 @@ function CostCell({ bucket, className }: { bucket: PhaseTotals; className?: stri
         <span
           className="flex flex-col items-end gap-0.5"
           title={
-            hasMeasuredTokens
-              ? "anton has no verified price for what served these calls, so their tokens are counted and their cost is not. Not free — unpriced."
+            measured
+              ? "anton has no verified price for what served these calls, so their tokens (or search requests) are counted and their cost is not. Not free — unpriced."
               : "These calls reported no usage at all, so there is nothing to price."
           }
         >
           <span className="text-subtle">—</span>
           <span className="text-[9.5px] leading-none font-normal text-risk-med">
-            {hasMeasuredTokens ? "no price" : "no usage"}
+            {measured ? "no price" : "no usage"}
           </span>
         </span>
       ) : (
@@ -413,7 +426,7 @@ function ActiveCell({ bucket, className }: { bucket: PhaseTotals; className?: st
 function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
   // Same distinction `CostCell` draws: an absent dollar figure is either a genuine price-table gap
   // or a pass that measured no usage at all to price, and only the first is "no price" (PR #329 review).
-  const hasMeasuredTokens = totalTokens(overhead.tokens) > 0;
+  const measured = hasMeasuredUsage(overhead);
   // Same floor discipline `ActiveCell` applies: fewer timed runs than runs means `activeMs` is a
   // partial sum, not the exact total the plain duration otherwise implies (PR #329 review).
   const partlyTimed = overhead.timedRuns < overhead.runs;
@@ -434,7 +447,7 @@ function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
           value={formatUsd(overhead.usd)}
           qualifier={
             overhead.usd === undefined
-              ? hasMeasuredTokens
+              ? measured
                 ? "no price"
                 : "no usage"
               : overhead.unpricedRows > 0
@@ -443,8 +456,8 @@ function UnallocatedSection({ overhead }: { overhead: PhaseTotals }) {
           }
           hint={
             overhead.usd === undefined
-              ? hasMeasuredTokens
-                ? "anton has no verified price for what served these passes. Their tokens are counted; their cost is not."
+              ? measured
+                ? "anton has no verified price for what served these passes. Their tokens (or search requests) are counted; their cost is not."
                 : "These passes reported no usage at all, so there is nothing to price."
               : `What the scheduled passes touching this feature's beads cost the project${overhead.unpricedRows > 0 ? ` — a FLOOR: ${overhead.unpricedRows} of ${overhead.rows} rows could not be priced.` : "."}`
           }
@@ -517,6 +530,10 @@ function OverheadFigure({
 function DurationsSection({ timing }: { timing: LedgerTiming }) {
   const waiting = waitingMs(timing);
   const partlyTimed = timing.timedInvocations < timing.invocations;
+  // `timedInvocations` counts an invocation excluded here too — it genuinely reported a duration —
+  // so this is the only signal that Active is scoped to the delivery span rather than to
+  // everything recorded (PR #329 review).
+  const { excludesPostDeliveryWork } = timing;
 
   return (
     <section
@@ -538,11 +555,17 @@ function DurationsSection({ timing }: { timing: LedgerTiming }) {
         <Stat
           label="Active"
           value={formatDuration(timing.activeMs)}
-          qualifier={partlyTimed ? "floor" : undefined}
+          qualifier={partlyTimed ? "floor" : excludesPostDeliveryWork ? "within delivery" : undefined}
           hint={
             partlyTimed
-              ? `What claude worked — a FLOOR: only ${timing.timedInvocations} of ${timing.invocations} calls reported a duration.`
-              : `What claude worked, across ${timing.invocations} call${timing.invocations === 1 ? "" : "s"}.`
+              ? `What claude worked — a FLOOR: only ${timing.timedInvocations} of ${timing.invocations} calls reported a duration.${
+                  excludesPostDeliveryWork
+                    ? " Some recorded work also falls after this feature's delivery and is excluded here too."
+                    : ""
+                }`
+              : excludesPostDeliveryWork
+                ? `What claude worked within this feature's delivery span, across ${timing.invocations} call${timing.invocations === 1 ? "" : "s"} — later work (after delivery, such as a review-fix session that landed no new delivery) happened but is excluded here.`
+                : `What claude worked, across ${timing.invocations} call${timing.invocations === 1 ? "" : "s"}.`
           }
         />
         <Stat
