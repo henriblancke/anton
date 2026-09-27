@@ -695,6 +695,13 @@ function fetchCyclesShared(cwd: string, generation: number): Promise<DepCycle[]>
  * cycle result onto the old board.
  */
 async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: number): Promise<void> {
+  // Captured before the first await below, so the catch can tell "still the stale value this call
+  // started with" apart from "a racing `ensureCycleEvidence`/`probeCycleEvidence` call already
+  // attached fresher evidence to this same retained board while this call's own fetch or consistency
+  // re-list was in flight" — attaching evidence doesn't bump the snapshot generation this function
+  // checks, so that newer result must survive this call's own failure. Mirrors `probeCycleEvidence`'s
+  // identical `staleCheckedAt` guard (issues.ts:1337).
+  const staleCheckedAt = cycleEvidenceCheckedAtFor(board);
   try {
     const cycles = await fetchCyclesShared(cwd, generation);
     // A write replaced the snapshot while this fetch was in flight: `cycles` describes the graph
@@ -840,6 +847,16 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
             markCycleEvidenceRecovered(cwd);
           }
         }
+      } else if (!consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) !== undefined) {
+        // The INITIAL consistency check above rejected the pairing — not the deeper post-hydration
+        // reject path (issues.ts:809) or the outer catch below, which already clear on their own
+        // rejections. Falling through here (as before) left the old, expired sidecar attached:
+        // `getBoard` only tests whether `cycleEvidenceFor(board)` is defined, never whether it's
+        // still within its trust window, so it would keep deriving and persisting rankings off a
+        // cycle set this very check just found stale for a shared-server graph change. Clear it and
+        // fail closed, mirroring `probeCycleEvidence`'s identical branch (issues.ts:1433).
+        clearCycleEvidence(board);
+        markCycleEvidenceUnavailable(cwd);
       }
     }
   } catch (e) {
@@ -852,11 +869,18 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
     // only invokes this function under that condition), so a prior WeakMap entry left in place would
     // keep `cycleEvidenceFor(board)` reporting an expired verdict as authoritative until some later
     // call happens to succeed — including on a shared-server board where another writer introduced a
-    // gate-only cycle this failed refresh never got to see. Clear it and fail closed, mirroring
-    // `probeCycleEvidence`'s identical catch (issues.ts:1396).
-    const hadEvidence = cycleEvidenceFor(board) !== undefined;
-    clearCycleEvidence(board);
-    if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+    // gate-only cycle this failed refresh never got to see. Clear it and fail closed — but only if
+    // it's still the same stale evidence this call set out to refresh: a concurrent
+    // `ensureCycleEvidence`/`probeCycleEvidence` sharing this same retained board can attach a fresh,
+    // successful result while this call's own fetch or consistency re-list is still in flight
+    // (attaching evidence doesn't bump the snapshot generation this function checks), and that newer
+    // result must not be clobbered just because THIS call's attempt failed. Mirrors
+    // `probeCycleEvidence`'s identical catch (issues.ts:1457).
+    if (cycleEvidenceCheckedAtFor(board) === staleCheckedAt) {
+      const hadEvidence = cycleEvidenceFor(board) !== undefined;
+      clearCycleEvidence(board);
+      if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+    }
   }
 }
 
