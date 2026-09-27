@@ -370,7 +370,12 @@ const orderTickets = (tickets) => {
 const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
-  const tickets = orderTickets(runTickets(feature.id)).filter((t) => !isAbandoned(t));
+  // A feature with no children doesn't group them (beads.groupsChildren) — the runtime reads it as
+  // a standalone run and dispatches the feature itself (execute-epic-prepare.ts's
+  // `run.tickets = run.standaloneRun ? [target] : freshChildren`). Mirror that here, or a legitimate
+  // atomic feature prints only its header with an empty dispatch order below it.
+  const children = runTickets(feature.id);
+  const tickets = orderTickets(children.length > 0 ? children : [feature]).filter((t) => !isAbandoned(t));
   const held = heldIds(feature, tickets);
   const dispatchable = tickets.filter((t) => !held.has(t.id));
   for (const [index, ticket] of dispatchable.entries())
