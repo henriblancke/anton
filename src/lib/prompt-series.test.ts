@@ -378,6 +378,27 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     });
   });
 
+  it("keeps a whole-second delivery tie's same-key features contiguous regardless of input order (PR #331 review)", () => {
+    // Five features all deliver in the same second (AUG_2) — the timestamp comparator alone cannot
+    // order them, so a stable sort leaves ties exactly where `features` handed them in. Interleaving
+    // OLD/NEW/OLD/NEW/OLD reproduces the bug directly: a time-only sort would leave this order
+    // untouched, fragmenting OLD's three features into three separate single-feature episodes
+    // (each one bracketed by a NEW delivery) instead of the one three-feature cohort they belong to.
+    const series = promptSeries(
+      [
+        { beadId: "old-0", delivered: true, deliveredAtMs: AUG_2, usd: 1, rows: [{ promptDigest: OLD_PROMPT }] },
+        { beadId: "new-0", delivered: true, deliveredAtMs: AUG_2, usd: 1, rows: [{ promptDigest: NEW_PROMPT }] },
+        { beadId: "old-1", delivered: true, deliveredAtMs: AUG_2, usd: 1, rows: [{ promptDigest: OLD_PROMPT }] },
+        { beadId: "new-1", delivered: true, deliveredAtMs: AUG_2, usd: 1, rows: [{ promptDigest: NEW_PROMPT }] },
+        { beadId: "old-2", delivered: true, deliveredAtMs: AUG_2, usd: 1, rows: [{ promptDigest: OLD_PROMPT }] },
+      ],
+      "prompt",
+    );
+
+    expect(series.cohorts).toHaveLength(2);
+    expect(series.cohorts.map((cohort) => cohort.basis.features).sort()).toEqual([2, 3]);
+  });
+
   it("attributes a failed feature to the episode it ran in, not always the newest sharing its key (PR #331 review)", () => {
     // Same A → B → A restoration, plus one A feature that never delivered. It ran during the FIRST
     // A episode (its activity sits right after JUL_1) — folding it into the second A episode just

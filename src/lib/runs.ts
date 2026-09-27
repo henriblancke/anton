@@ -1078,6 +1078,53 @@ export async function listRunBeadIdsByStatus(
 }
 
 /**
+ * When each of `beadIds`' currently-OPEN run began its live attempt, epoch ms — `attemptStartedAt`
+ * (falling back to `startedAt` on rows predating that column), never `deliveredAtMs` (PR #331
+ * review, cohort-read.ts). A prior delivery only bounds a target that has nothing live to bound
+ * it more precisely with; a target with an actual open run can have SETTLED activity between that
+ * delivery and now — a completed failed rerun, say — that already has an outcome and belongs in
+ * the cohort's numerators. Cutting at the open attempt's own start keeps exactly that settled
+ * activity while still excluding the live attempt's own premature rows. Two open rows matching the
+ * same id (unusual, but not impossible mid-transition) take the EARLIER start, so the cutoff never
+ * drifts later than the oldest attempt still genuinely unsettled.
+ */
+export async function listOpenRunAttemptStartMs(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (beadIds.length === 0) return out;
+  const ids = [...new Set(beadIds)];
+  const wanted = new Set(ids);
+  const rows = await db
+    .select({
+      epicBeadId: schema.runs.epicBeadId,
+      ticketBeadId: schema.runs.ticketBeadId,
+      startedAt: schema.runs.startedAt,
+      attemptStartedAt: schema.runs.attemptStartedAt,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        inArray(schema.runs.status, [...ACTIVE_RUN_STATUSES]),
+        or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
+      ),
+    );
+  for (const row of rows) {
+    const startMs = (row.attemptStartedAt ?? row.startedAt)?.getTime();
+    if (startMs === undefined) continue;
+    for (const id of [row.epicBeadId, row.ticketBeadId]) {
+      if (id === null || !wanted.has(id)) continue;
+      const existing = out.get(id);
+      if (existing === undefined || startMs < existing) out.set(id, startMs);
+    }
+  }
+  return out;
+}
+
+/**
  * Every run of a project in the given statuses, oldest activity first (anton-4ks0). The read the
  * run-health sweep detects over — `updatedAt` on a settled run is when it settled, so ordering by
  * it puts the most-stalled work first. db-injectable; strictly read-only.

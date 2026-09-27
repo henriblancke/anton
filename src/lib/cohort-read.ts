@@ -34,7 +34,7 @@ import { ledgerScope } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { getProjectById } from "./projects";
 import type { CohortFeature } from "./prompt-series";
-import { listDeliveriesByBead, listRunBeadIdsByStatus } from "./runs";
+import { listDeliveriesByBead, listOpenRunAttemptStartMs, listRunBeadIdsByStatus } from "./runs";
 import { listAllBeads } from "./tickets";
 import { boardCards } from "./ticket-view";
 
@@ -76,11 +76,15 @@ import { boardCards } from "./ticket-view";
  * feature's whole history for as long as the rerun takes (PR #331 review). Only a target on its
  * very first, still-live attempt — nothing delivered yet — has nothing to report.
  *
- * Such a target's cohort figures still must not reach past that prior delivery: the rerun it is
- * live on has no outcome yet, so its rows are exactly as premature as a first attempt's would be
- * (PR #331 review). The map this returns therefore carries a per-target cutoff — the prior
- * delivery's own timestamp for a target still live on a rerun, `undefined` (whole life, no bound)
- * for every other target — for {@link cohortFeatureOf} to cut the ledger at.
+ * Such a target's cohort figures still must not reach into the CURRENTLY OPEN attempt: that
+ * attempt has no outcome yet, so its own rows are exactly as premature as a first attempt's would
+ * be (PR #331 review). A SETTLED rerun in between — a completed failed attempt, say — already has
+ * an outcome and stays in, which is why the cutoff is the open run's own attempt start rather than
+ * the prior delivery: cutting at the delivery instead would also erase every settled attempt since
+ * (PR #331 review, second round). The map this returns therefore carries a per-target cutoff — the
+ * live attempt's own start (or the prior delivery, when no open run row exists to be more precise
+ * with) for a target still live on a rerun, `undefined` (whole life, no bound) for every other
+ * target — for {@link cohortFeatureOf} to cut the ledger at.
  */
 /**
  * Statuses a run CAN leave its target in while still genuinely executing — no finished outcome
@@ -137,12 +141,13 @@ async function activeRunTargetIds(
 
   const maybeLive = [...candidates.values()].filter((t) => MAYBE_LIVE_TARGET_STATUSES.has(t.status));
   const maybeLiveScopeIds = maybeLive.flatMap((t) => scopeOf(t.id));
-  const [activeRunIds, failedRunIds] =
+  const [activeRunIds, failedRunIds, openAttemptStartMs] =
     maybeLiveScopeIds.length === 0
-      ? [new Set<string>(), new Set<string>()]
+      ? [new Set<string>(), new Set<string>(), new Map<string, number>()]
       : await Promise.all([
           listRunBeadIdsByStatus(db, projectId, maybeLiveScopeIds, ACTIVE_RUN_STATUSES),
           listRunBeadIdsByStatus(db, projectId, maybeLiveScopeIds, ["failed"]),
+          listOpenRunAttemptStartMs(db, projectId, maybeLiveScopeIds),
         ]);
   // A candidate's status is trusted UNLESS the `runs` table itself says its last known attempt
   // already failed with nothing still open behind it — see the note above
@@ -167,7 +172,18 @@ async function activeRunTargetIds(
     if (liveIds.has(target.id)) {
       const deliveredAtMs = lastDeliveryMs(priorDeliveries, scopeOf(target.id));
       if (deliveredAtMs === undefined) continue;
-      ids.set(target.id, deliveredAtMs);
+      // The open run's OWN attempt start, when there is one, cuts closer than the delivery ever
+      // could: a settled failed rerun between delivery and now already has an outcome and belongs
+      // in the numerators, and only the actually-live attempt's rows are premature (PR #331
+      // review). No open run row at all (bead status is the only signal) falls back to the
+      // delivery itself, same as before this cutoff existed.
+      const openStartMs = scopeOf(target.id).reduce<number | undefined>((earliest, id) => {
+        const at = openAttemptStartMs.get(id);
+        return at !== undefined && (earliest === undefined || at < earliest) ? at : earliest;
+      }, undefined);
+      // Clamped to never precede the delivery itself — a delivery is settled and always safe to
+      // keep, so the cutoff only ever moves LATER than `deliveredAtMs`, never earlier.
+      ids.set(target.id, openStartMs === undefined ? deliveredAtMs : Math.max(openStartMs, deliveredAtMs));
       continue;
     }
     ids.set(target.id, undefined);
@@ -179,15 +195,18 @@ async function activeRunTargetIds(
  * One run target's {@link CohortFeature}, composed from the reads named in the header.
  *
  * `asOfMs` is the one exception to "whole life": for a target still live on a rerun of an
- * already-delivered feature ({@link activeRunTargetIds}), it is that prior delivery's own
- * timestamp, and everything recorded strictly after it — invocations, jobs, escalations, review
- * rounds, send-back notes — belongs to the rerun's own unfinished attempt. No outcome yet, so none
- * of it may inflate the delivered feature's cost or friction, or, worse, change its stamp and throw
- * an otherwise-clean cohort membership into {@link SpanningFeatures} (PR #331 review). `undefined`
- * for every other target, which reads as the module header's own rule: no bound at all, the whole
- * life. `featureLedger` owns the actual cut (`FeatureLedgerOptions.asOfMs`) — every source it folds
- * into `totals`, `friction` and `rows` is cut at the same instant, so nothing here can drift out of
- * step with what it returns by re-deriving one figure on its own.
+ * already-delivered feature ({@link activeRunTargetIds}), it is the currently open run's own
+ * attempt start (or the prior delivery, when no open run row exists to be more precise with), and
+ * everything recorded strictly after it — invocations, jobs, escalations, review rounds, send-back
+ * notes — belongs to that open attempt's own unfinished work. No outcome yet, so none of it may
+ * inflate the delivered feature's cost or friction, or, worse, change its stamp and throw an
+ * otherwise-clean cohort membership into {@link SpanningFeatures} (PR #331 review). A SETTLED rerun
+ * between the delivery and the open attempt's start — a completed failed attempt, say — already has
+ * an outcome and is cut IN, not out (PR #331 review, second round). `undefined` for every other
+ * target, which reads as the module header's own rule: no bound at all, the whole life. `featureLedger`
+ * owns the actual cut (`FeatureLedgerOptions.asOfMs`) — every source it folds into `totals`, `friction`
+ * and `rows` is cut at the same instant, so nothing here can drift out of step with what it returns by
+ * re-deriving one figure on its own.
  */
 async function cohortFeatureOf(
   db: AntonDb,

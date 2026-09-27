@@ -931,7 +931,22 @@ export function promptSeries(
 
   // Oldest first, so a run of the same key found here is genuinely contiguous in delivery order —
   // the property {@link byWindow} needs the episodes it draws deltas across to actually have.
-  dated.sort((a, b) => (a.feature.deliveredAtMs as number) - (b.feature.deliveredAtMs as number));
+  //
+  // `deliveredAtMs` is whole-second precision, so two features delivered in the same second tie
+  // (PR #331 review): a bare timestamp comparator then falls back to `Array.sort`'s stability,
+  // which orders ties by whatever position `features` happened to arrive in — not a chronological
+  // fact this fold may treat as one. Left alone, that lets an unrelated key's tied delivery land
+  // BETWEEN two same-key ties, fragmenting one contiguous episode into several beneath the size
+  // floor purely because of incoming order. Breaking a tie on `key` instead keeps every same-key
+  // tie contiguous regardless of incoming order — deterministic and reproducible, where "whatever
+  // order the caller happened to hand features in" was neither.
+  dated.sort((a, b) => {
+    const byTime = (a.feature.deliveredAtMs as number) - (b.feature.deliveredAtMs as number);
+    if (byTime !== 0) return byTime;
+    const byKey = (a.key ?? "").localeCompare(b.key ?? "");
+    if (byKey !== 0) return byKey;
+    return a.feature.beadId.localeCompare(b.feature.beadId);
+  });
 
   const episodes: CohortAccumulator[] = [];
   // Every episode a key has formed so far, oldest first — {@link dated}'s own sort order, since a

@@ -331,6 +331,57 @@ describe("cohortFeatures", () => {
     expect((features?.[0]?.rows as unknown as { id: string }[]).map((r) => r.id)).toEqual(["i-old"]);
   });
 
+  it("retains a settled failed rerun between delivery and the currently open attempt (PR #331 review, second round)", async () => {
+    // Delivered once, then a rerun that ran to completion and FAILED, then a fresh rerun that is
+    // still open now. Cutting at the delivery timestamp (the old behavior) would drop the failed
+    // rerun's own rows too, even though that attempt is settled and belongs in the cohort's
+    // numerators — only the CURRENTLY OPEN attempt's rows are still premature.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "in_progress" })]);
+    await seedInvocation({ id: "i-old", beadId: "feat-1", recordedAt: new Date("2026-08-01T00:00:00Z") });
+    await seedDelivery({ epicBeadId: "feat-1", endedAt: new Date("2026-08-01T00:10:00Z") });
+    await seedInvocation({
+      id: "i-failed-rerun",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-08-15T00:02:00Z"),
+    });
+    await t.db.insert(schema.runs).values([
+      {
+        id: "run-feat-1-failed",
+        projectId: t.projectId,
+        epicBeadId: "feat-1",
+        branch: "anton/feat-1",
+        status: "failed",
+        startedAt: new Date("2026-08-15T00:00:00Z"),
+        endedAt: new Date("2026-08-15T00:05:00Z"),
+        updatedAt: new Date("2026-08-15T00:05:00Z"),
+      },
+      {
+        id: "run-feat-1-live",
+        projectId: t.projectId,
+        epicBeadId: "feat-1",
+        branch: "anton/feat-1",
+        status: "running",
+        startedAt: new Date("2026-09-01T00:00:00Z"),
+        updatedAt: new Date("2026-09-01T00:00:00Z"),
+      },
+    ]);
+    // The still-open rerun's own invocation — inside the window so the target qualifies as a
+    // candidate at all, but recorded after the live attempt started, so it must not come through.
+    await seedInvocation({ id: "i-live-rerun", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toHaveLength(1);
+    expect(features?.[0]?.delivered).toBe(true);
+    expect(features?.[0]?.deliveredAtMs).toBe(new Date("2026-08-01T00:10:00Z").getTime());
+    expect((features?.[0]?.rows as unknown as { id: string }[]).map((r) => r.id)).toEqual([
+      "i-old",
+      "i-failed-rerun",
+    ]);
+  });
+
   it("does not let the unfinished rerun's own stamp span a preserved delivery's skill cohort (PR #331 review)", async () => {
     // The completed attempt ran under one prompt digest; the still-live rerun already recorded a
     // DIFFERENT one before finishing. Folding the rerun's row in would make `featureKeys` see two
