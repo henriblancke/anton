@@ -22,6 +22,38 @@ import {
   type SnapshotReadOptions,
 } from "./snapshot";
 
+/**
+ * How long previously-attached cycle evidence is trusted before it's treated as missing, even
+ * though the retained snapshot's own content hasn't moved (P2 review, PR #274, issues.ts:830).
+ * Content-based invalidation (the generation bump `refreshIssueSnapshotRead` computes in
+ * snapshot.ts) only fires when a bead THIS process already loaded changes; a cycle introduced or
+ * repaired entirely among gates no work bead's `blocks` edge dangles toward never touches that
+ * content at all, so `board`'s array identity — and the evidence attached to it — would otherwise
+ * never move. Without an independent expiry, that once-attached result (even an empty "no cycles"
+ * one) would be trusted forever on a shared-server board: `getBoard`'s `cyclesKnown` stays true and
+ * keeps ranking and persisting picks against it until some unrelated, VISIBLE bead happens to change.
+ * Same cadence as the snapshot's own TTL (`ISSUE_SNAPSHOT_MAX_AGE_MS`) — evidence is exactly as
+ * stale-tolerant as the board content it rides alongside.
+ */
+const CYCLE_EVIDENCE_MAX_AGE_MS = ISSUE_SNAPSHOT_MAX_AGE_MS;
+
+/**
+ * Whether `board` needs a fresh `bd dep cycles` check: either it never got evidence, or its
+ * evidence outlived {@link CYCLE_EVIDENCE_MAX_AGE_MS}. Every best-effort enrichment gate
+ * (`allIssues`, `readAllIssues`, `refreshAllIssuesRead`, `probeCycleEvidence`) must treat expired
+ * evidence the same as missing evidence here — not just the background probe (P2 review, PR #274,
+ * issues.ts:966): an ordinary read reaching one of those functions after evidence has expired but
+ * with no versioned poll in flight to refresh it (e.g. the first page load after an idle period)
+ * would otherwise skip re-enrichment entirely, since a plain presence check still finds the expired
+ * WeakMap entry. `getBoard` then keeps deriving and persisting a ranking off that stale verdict
+ * until some later poll happens to call `probeCycleEvidence`.
+ */
+function cycleEvidenceMissingOrStale(board: readonly Bead[]): boolean {
+  if (cycleEvidenceFor(board) === undefined) return true;
+  const checkedAt = cycleEvidenceCheckedAtFor(board) ?? 0;
+  return Date.now() - checkedAt >= CYCLE_EVIDENCE_MAX_AGE_MS;
+}
+
 function dedupeById(beadList: Bead[]): Bead[] {
   const seen = new Set<string>();
   return beadList.filter((bead) => {
@@ -339,24 +371,31 @@ async function recheckBlocksConsistency(
 }
 
 /**
- * Full status + label set + ancestor chain for every id in `list` — a superset of {@link liveKeyOf}'s
- * state, which only ever folds in the `abandoned` label. Used solely by
+ * Full status + label set + description + ancestor chain for every id in `list` — a superset of
+ * {@link liveKeyOf}'s state, which only ever folds in the `abandoned` label. Used solely by
  * {@link sameTargetEligibilityState}: `ineligibility` reads more than one label off a candidate
  * (`abandoned`, `agent:human`, and whatever a future rule adds), so the comparison that stands in for
  * "did this candidate's own eligibility change" has to compare all of them, not one named subset.
+ *
+ * `description` is in the key too (P2 review, PR #274, issues.ts:353): a shared-server writer can
+ * edit a target or child's contract — dropping its Acceptance section, say — between the initial
+ * listing and the post-`depCycles` listing without touching status, labels, or ancestors at all.
+ * Without this field the two keys still compared equal, so `loadAllIssues` waved the stale board
+ * through and `startGuard` (picker-apply-claim.ts) could approve/claim work against a contract that
+ * had just been gutted.
  */
 function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
   const byId = new Map(list.map((bead) => [bead.id, bead]));
   return (id: string) => {
     const bead = byId.get(id);
     if (!bead) return undefined;
-    return `${bead.status}:${[...(bead.labels ?? [])].sort().join(",")}:${ancestorChain(id, list).join(">")}`;
+    return `${bead.status}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${ancestorChain(id, list).join(">")}`;
   };
 }
 
 /**
- * Whether every id `board` carries still has the same status, full label set, and ancestor chain in
- * `fresh`. Closes a gap none of {@link sameBlocksEdges}, {@link sameCycleMemberLiveness} or
+ * Whether every id `board` carries still has the same status, full label set, description, and
+ * ancestor chain in `fresh`. Closes a gap none of {@link sameBlocksEdges}, {@link sameCycleMemberLiveness} or
  * {@link sameBlockerLiveness} do: all three only ever look at ids `cycles` names or a `blocks` edge
  * points at, so a CANDIDATE run target that is neither — the id `ineligibility`/`startGuard` is about
  * to judge — can be labelled `agent:human`, deferred, or closed by a concurrent writer in the gap
@@ -370,7 +409,7 @@ function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
  *
  * Also checked the other direction: a bead `fresh` carries that `board` never saw at all — a child
  * added under one of `board`'s ids in the gap between the two reads — changes nothing the per-id key
- * comparison above looks at (status/labels/ancestors of ids `board` already has), so a brand-new
+ * comparison above looks at (status/labels/description/ancestors of ids `board` already has), so a brand-new
  * child with an invalid tier or incomplete contract would otherwise slip through unnoticed and the
  * stale `board` would still wave the pairing through (P2 review, PR #274, issues.ts:373).
  */
@@ -647,7 +686,10 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
     // A write replaced the snapshot while this fetch was in flight: `cycles` describes the graph
     // this generation's board no longer represents. Leave evidence unattached rather than stamp a
     // stale-graph result as current — the next probe or read retries against the new generation.
-    if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+    // `cycleEvidenceMissingOrStale`, not a plain presence check, so a caller that reached this
+    // function because ITS OWN evidence expired (see `cycleEvidenceMissingOrStale`'s doc) isn't
+    // immediately turned away by evidence that's merely present but past its trust window.
+    if (issueSnapshotGeneration(cwd) === generation && cycleEvidenceMissingOrStale(board)) {
       // Neither an empty NOR a non-empty `cycles` result proves `board`'s OWN `blocks` edges
       // (captured earlier, possibly by another process's snapshot load) still describe the graph
       // `cycles` was just computed against. On a shared-server board another machine can repair one
@@ -684,7 +726,7 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
       // or clobber evidence a racing caller already attached, while still bumping the version as if
       // this were the recovery — nothing downstream re-validates that pairing (`allIssues` has no
       // post-enrichment generation check), so a mismatched board would flow straight to consumers.
-      if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+      if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceMissingOrStale(board)) {
         // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward — an
         // `allIssues`/`readAllIssues` board reaching this best-effort path (rather than
         // `loadAllIssues({ withCycles: true })`) never carries them, the same gap `loadAllIssues`'s
@@ -748,13 +790,21 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
         }
         // Recheck generation and evidence AFTER the hydration await too, same reasoning as the
         // recheck above it guards against.
-        if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
+        if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceMissingOrStale(board)) {
           // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
           // and issues.ts:296) — otherwise a cold enrichment reaching this best-effort path leaves
           // `checkedAt` at its zero default, so the very next poll reads this fresh evidence as
           // already expired and launches a redundant `bd dep cycles`.
+          const previousCycles = cycleEvidenceFor(board);
           attachCycleEvidence(board, cycles);
-          markCycleEvidenceRecovered(cwd);
+          // Bump the shared version on the missing->present transition AND whenever a staleness
+          // refresh turns up a different cycle set — mirrors `probeCycleEvidence`'s identical
+          // conditional bump, needed now that this path also runs against merely-expired (not just
+          // absent) evidence: a poller who already matched the pre-refresh token must still see a
+          // fresh one when the refresh actually changes the verdict.
+          if (previousCycles === undefined || !sameCycles(previousCycles, cycles)) {
+            markCycleEvidenceRecovered(cwd);
+          }
         }
       }
     }
@@ -937,8 +987,10 @@ export async function allIssues(
   const { beads: board, generation } = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
   // The snapshot key is the repository, not every reader's projection needs. A warm page snapshot
   // may therefore predate an approval reader: enrich that exact array rather than treating absent
-  // evidence as an authoritative empty result.
-  if (opts?.withCycles && cycleEvidenceFor(board) === undefined) {
+  // evidence as an authoritative empty result. Expired evidence is treated the same as missing
+  // evidence (`cycleEvidenceMissingOrStale`), not just a presence check — otherwise a board whose
+  // content never moves keeps a long-expired verdict until some unrelated poll happens to refresh it.
+  if (opts?.withCycles && cycleEvidenceMissingOrStale(board)) {
     await attachCyclesBestEffort(cwd, board, generation);
   }
   return board;
@@ -962,8 +1014,13 @@ export async function readAllIssues(
 ): Promise<SnapshotRead> {
   const snapshot = await readIssueSnapshot(cwd, () => loadAllIssues(cwd), undefined, opts);
   // Keep evidence attached to the cached array itself: `SnapshotRead` is a wrapper and copying the
-  // board would lose the sidecar that pure approval projections consume.
-  if (opts?.withCycles && cycleEvidenceFor(snapshot.beads) === undefined) {
+  // board would lose the sidecar that pure approval projections consume. `cycleEvidenceMissingOrStale`,
+  // not a plain presence check (P2 review, PR #274, issues.ts:966): a retained snapshot whose content
+  // never changes can carry evidence that's still "present" but long past `CYCLE_EVIDENCE_MAX_AGE_MS`,
+  // and this is the read `getBoard` calls on every ordinary render — treating it as fresh here would
+  // let `getBoard` keep deriving `cyclesKnown: true` off a stale verdict until an unrelated poll
+  // happens to run `probeCycleEvidence`.
+  if (opts?.withCycles && cycleEvidenceMissingOrStale(snapshot.beads)) {
     // Read from the snapshot itself, not a fresh `issueSnapshotGeneration(cwd)` call: a concurrent
     // background refresh can land (and bump the generation) in the microtask gap between the `await
     // readIssueSnapshot` above resolving and this line running, which would otherwise pair the OLD
@@ -1054,7 +1111,7 @@ export async function refreshAllIssuesRead(
   // with none, so from its point of view nothing changed), so without this a poller stuck on missing
   // evidence would still never see a fresh token for the one recovery that happens to land through
   // this exact race.
-  if (opts.withCycles && cycleEvidenceFor(board) === undefined) {
+  if (opts.withCycles && cycleEvidenceMissingOrStale(board)) {
     // Best-effort, like every other cycles path in this file (`attachCyclesBestEffort`,
     // `probeCycleEvidence`) — NOT let a failed `bd dep cycles` reject this call (PR #274 review,
     // round 17): the comment above promises a caller "never loses the requested evidence", which
@@ -1159,20 +1216,6 @@ export function resetCycleProbes(): void {
   cycleProbes().clear();
 }
 
-/**
- * How long previously-attached cycle evidence is trusted before {@link probeCycleEvidence} re-checks
- * it even though the retained snapshot's own content hasn't moved (P2 review, PR #274,
- * issues.ts:830). Content-based invalidation (the generation bump `refreshIssueSnapshotRead` computes
- * in snapshot.ts) only fires when a bead THIS process already loaded changes; a cycle introduced or
- * repaired entirely among gates no work bead's `blocks` edge dangles toward never touches that
- * content at all, so `board`'s array identity — and the evidence attached to it — would otherwise
- * never move. Without an independent expiry, that once-attached result (even an empty "no cycles"
- * one) would be trusted forever on a shared-server board: `getBoard`'s `cyclesKnown` stays true and
- * keeps ranking and persisting picks against it until some unrelated, VISIBLE bead happens to change.
- * Same cadence as the snapshot's own TTL (`ISSUE_SNAPSHOT_MAX_AGE_MS`) — evidence is exactly as
- * stale-tolerant as the board content it rides alongside.
- */
-const CYCLE_EVIDENCE_MAX_AGE_MS = ISSUE_SNAPSHOT_MAX_AGE_MS;
 
 /**
  * Nudge a stuck cycle-evidence gap toward recovery without making the caller wait (PR #274 review,
@@ -1221,9 +1264,10 @@ export function probeCycleEvidence(cwd: string): void {
         // Evidence already attached is only a reason to skip while it's still within its trust
         // window (P2 review, PR #274, issues.ts:830): a board whose own content never changes (the
         // gate-only-cycle case above) would otherwise keep this early return forever, since nothing
-        // else in this function runs to notice the graph moved.
-        const checkedAt = cycleEvidenceCheckedAtFor(board) ?? 0;
-        if (cycleEvidenceFor(board) !== undefined && Date.now() - checkedAt < CYCLE_EVIDENCE_MAX_AGE_MS) {
+        // else in this function runs to notice the graph moved. Same `cycleEvidenceMissingOrStale`
+        // every other enrichment gate in this file uses now, so a poll and an ordinary read agree on
+        // when evidence has expired.
+        if (!cycleEvidenceMissingOrStale(board)) {
           return;
         }
         const cycles = await fetchCyclesShared(cwd, generation);

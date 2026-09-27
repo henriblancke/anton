@@ -634,6 +634,32 @@ describe("loadAllIssues", () => {
     expect(issueSnapshotVersion(REPO)).toBe(before + 1);
   });
 
+  it("re-checks evidence past its trust window on an ordinary read, not just the background probe (P2 review, PR #274, issues.ts:966)", async () => {
+    // The board's own content never changes across either read — the same "gate-only cycle" gap
+    // `probeCycleEvidence`'s staleness handling closes, but reached here via a plain `readAllIssues`
+    // with no poller involved (e.g. the first page load after an idle period).
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const first = await readAllIssues(REPO, { withCycles: true });
+    expect(cycleEvidenceFor(first.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      // The cycle resolved (or a different one opened) among gates no work bead's edge dangles
+      // toward — content-based invalidation never fires for it, so only the age check can catch it.
+      cyclesMock.mockResolvedValueOnce([]);
+      const second = await readAllIssues(REPO, { withCycles: true });
+
+      expect(cyclesMock).toHaveBeenCalledTimes(2);
+      expect(cycleEvidenceFor(second.beads)).toEqual([]);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
   it("enriches a versioned board read before it reaches a policy projection", async () => {
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
@@ -1441,5 +1467,19 @@ describe("sameTargetEligibilityState (P2 review, PR #274, issues.ts:373)", () =>
     const board = [epic];
 
     expect(sameTargetEligibilityState(board, [epic])).toBe(true);
+  });
+
+  it("flags drift when a target's description changes with status/labels/ancestors unchanged (P2 review, PR #274, issues.ts:353)", () => {
+    const withAcceptance: Bead = {
+      id: "t-1",
+      title: "Ship it",
+      status: "open",
+      issue_type: "task",
+      description: "## Acceptance\n- does the thing",
+    };
+    const board = [withAcceptance];
+    const contractGutted = { ...withAcceptance, description: "" };
+
+    expect(sameTargetEligibilityState(board, [contractGutted])).toBe(false);
   });
 });
