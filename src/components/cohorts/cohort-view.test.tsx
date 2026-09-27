@@ -436,10 +436,22 @@ describe("a dimension whose cohorts are confounded by the work they were given",
     expect(screen.getByRole("columnheader", { name: "Agent tag" })).toBeTruthy();
   });
 
-  it("carries no such caution on a prompt series, where the key is what changed", () => {
+  it("says so for a prompt series too — the composed digest carries the ticket's own agent layer (P1, PR #331 review)", () => {
     render(<CohortView window="all" series={series([cohort("a3f1c2", sample(7, HEALTHY_METRICS))])} />);
 
-    expect(screen.queryByText(/confounded by the work/)).toBeNull();
+    expect(screen.getByText(/confounded by more than an edit to the prompt text/)).toBeTruthy();
     expect(screen.getByRole("columnheader", { name: "Prompt digest" })).toBeTruthy();
+  });
+
+  it("carries no such caution on an anton-version series, where the key is what changed", () => {
+    render(
+      <CohortView
+        window="all"
+        series={series([cohort("0.6.0", sample(7, HEALTHY_METRICS))], "anton")}
+      />,
+    );
+
+    expect(screen.queryByText(/confounded by the work/)).toBeNull();
+    expect(screen.getByRole("columnheader", { name: "anton version" })).toBeTruthy();
   });
 });

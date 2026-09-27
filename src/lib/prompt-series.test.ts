@@ -24,6 +24,11 @@ const SEP_4 = Date.UTC(2026, 8, 4, 12);
 const OLD_PROMPT = "a3f1c2d4e5f6";
 const NEW_PROMPT = "9c2eddaabbcc";
 
+// `anton` is the only dimension still episodic (P1, PR #331 review, formula/prompt follow-up) — the
+// revision-splitting tests below exercise it instead of `prompt`, which now folds like `agent`/`skill`.
+const OLD_VERSION = "0.5.0";
+const NEW_VERSION = "0.6.0";
+
 /**
  * `n` delivered features that all ran under one stamp value. `key` is null for the
  * pre-instrumentation case — features whose rows recorded no stamp at all.
@@ -342,34 +347,40 @@ describe("promptSeries: grouping on the stamp tuple", () => {
   });
 
   it("splits a stamp used, replaced, and later restored into separate episodes (PR #331 review)", () => {
-    // Prompt A ran cheap, B ran expensive, then A came BACK — reverted, not merely a straggler
-    // delivery still inside A's own window. Pooling both A periods into one cohort (keyed only on
-    // the value) would average $2 and $100 into $51, and B's own delta would be drawn against that
-    // blend instead of the $2 A actually cost when B ran — reversing the arrow from "B got pricier"
-    // to "B got cheaper".
+    // anton v1 ran cheap, v2 ran expensive, then v1 came BACK — a rollback, not merely a straggler
+    // delivery still inside v1's own window. Pooling both v1 periods into one cohort (keyed only on
+    // the value) would average $2 and $100 into $51, and v2's own delta would be drawn against that
+    // blend instead of the $2 v1 actually cost when v2 ran — reversing the arrow from "v2 got
+    // pricier" to "v2 got cheaper".
     const series = promptSeries(
       [
-        ...deliveries(5, { key: OLD_PROMPT, at: JUL_1, usd: 2 }),
-        ...deliveries(5, { key: NEW_PROMPT, at: AUG_2, usd: 10 }),
-        ...deliveries(5, { key: OLD_PROMPT, at: SEP_4, usd: 100, bead: "old-again" }),
+        ...deliveries(5, { key: OLD_VERSION, at: JUL_1, usd: 2, dimension: "antonVersion" }),
+        ...deliveries(5, { key: NEW_VERSION, at: AUG_2, usd: 10, dimension: "antonVersion" }),
+        ...deliveries(5, {
+          key: OLD_VERSION,
+          at: SEP_4,
+          usd: 100,
+          bead: "old-again",
+          dimension: "antonVersion",
+        }),
       ],
-      "prompt",
+      "anton",
     );
 
-    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([OLD_PROMPT, NEW_PROMPT, OLD_PROMPT]);
+    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([OLD_VERSION, NEW_VERSION, OLD_VERSION]);
     const [firstOld, middle, secondOld] = series.cohorts;
     expect(firstOld.window).toEqual({ firstDeliveryMs: JUL_1, lastDeliveryMs: JUL_1 });
     expect(middle.window).toEqual({ firstDeliveryMs: AUG_2, lastDeliveryMs: AUG_2 });
     expect(secondOld.window).toEqual({ firstDeliveryMs: SEP_4, lastDeliveryMs: SEP_4 });
 
-    // B is measured against the $2 A actually cost right before it, not a blend polluted by A's
+    // v2 is measured against the $2 v1 actually cost right before it, not a blend polluted by v1's
     // later, pricier return.
     expect(middle.comparable && middle.deltas[0]).toMatchObject({
       metric: "usdPerFeature",
       delta: 8,
       direction: "worse",
     });
-    // A's second episode is measured against B, immediately before it — not folded back into its
+    // v1's second episode is measured against v2, immediately before it — not folded back into its
     // own first episode, and not left without a predecessor either.
     expect(secondOld.comparable && secondOld.deltas[0]).toMatchObject({
       metric: "usdPerFeature",
@@ -458,24 +469,30 @@ describe("promptSeries: grouping on the stamp tuple", () => {
   });
 
   it("attributes a failed feature to the episode it ran in, not always the newest sharing its key (PR #331 review)", () => {
-    // Same A → B → A restoration, plus one A feature that never delivered. It ran during the FIRST
-    // A episode (its activity sits right after JUL_1) — folding it into the second A episode just
-    // because that is the last one on record for the key would inflate the LATER cohort's cost with
-    // a failure from the earlier period, potentially reversing its delta against B.
+    // Same v1 → v2 → v1 restoration, plus one v1 feature that never delivered. It ran during the
+    // FIRST v1 episode (its activity sits right after JUL_1) — folding it into the second v1 episode
+    // just because that is the last one on record for the key would inflate the LATER cohort's cost
+    // with a failure from the earlier period, potentially reversing its delta against v2.
     const series = promptSeries(
       [
-        ...deliveries(5, { key: OLD_PROMPT, at: JUL_1, usd: 2 }),
-        ...deliveries(5, { key: NEW_PROMPT, at: AUG_2, usd: 10 }),
-        ...deliveries(5, { key: OLD_PROMPT, at: SEP_4, usd: 100, bead: "old-again" }),
+        ...deliveries(5, { key: OLD_VERSION, at: JUL_1, usd: 2, dimension: "antonVersion" }),
+        ...deliveries(5, { key: NEW_VERSION, at: AUG_2, usd: 10, dimension: "antonVersion" }),
+        ...deliveries(5, {
+          key: OLD_VERSION,
+          at: SEP_4,
+          usd: 100,
+          bead: "old-again",
+          dimension: "antonVersion",
+        }),
         {
           beadId: "failed-during-first-a",
           delivered: false,
           activityAtMs: JUL_1 + DAY,
           usd: 1000,
-          rows: [{ promptDigest: OLD_PROMPT }],
+          rows: [{ antonVersion: OLD_VERSION }],
         },
       ],
-      "prompt",
+      "anton",
     );
 
     const [firstOld, , secondOld] = series.cohorts;
@@ -484,25 +501,31 @@ describe("promptSeries: grouping on the stamp tuple", () => {
   });
 
   it("attributes a pre-delivery failure to the RESTORED episode once the intervening one has started (PR #331 review)", () => {
-    // Same A → B → A restoration, but the failed A attempt this time runs AFTER B has already
-    // started (AUG_2) and BEFORE the restored A cohort delivers anything (SEP_4). A's original
-    // episode closed the moment B opened, so this failure is pre-delivery work for the RESTORED
-    // episode, not a straggler from the first one — folding it into the first A cohort would inflate
-    // that cohort's cost and could reverse B's own delta against it.
+    // Same v1 → v2 → v1 restoration, but the failed v1 attempt this time runs AFTER v2 has already
+    // started (AUG_2) and BEFORE the restored v1 cohort delivers anything (SEP_4). v1's original
+    // episode closed the moment v2 opened, so this failure is pre-delivery work for the RESTORED
+    // episode, not a straggler from the first one — folding it into the first v1 cohort would inflate
+    // that cohort's cost and could reverse v2's own delta against it.
     const series = promptSeries(
       [
-        ...deliveries(5, { key: OLD_PROMPT, at: JUL_1, usd: 2 }),
-        ...deliveries(5, { key: NEW_PROMPT, at: AUG_2, usd: 10 }),
-        ...deliveries(5, { key: OLD_PROMPT, at: SEP_4, usd: 100, bead: "old-again" }),
+        ...deliveries(5, { key: OLD_VERSION, at: JUL_1, usd: 2, dimension: "antonVersion" }),
+        ...deliveries(5, { key: NEW_VERSION, at: AUG_2, usd: 10, dimension: "antonVersion" }),
+        ...deliveries(5, {
+          key: OLD_VERSION,
+          at: SEP_4,
+          usd: 100,
+          bead: "old-again",
+          dimension: "antonVersion",
+        }),
         {
           beadId: "failed-after-b-started",
           delivered: false,
           activityAtMs: AUG_2 + DAY,
           usd: 1000,
-          rows: [{ promptDigest: OLD_PROMPT }],
+          rows: [{ antonVersion: OLD_VERSION }],
         },
       ],
-      "prompt",
+      "anton",
     );
 
     const [firstOld, , secondOld] = series.cohorts;
@@ -1271,19 +1294,92 @@ describe("promptSeries: identity dimensions group across noncontiguous deliverie
     expect(series.cohorts.map((cohort) => cohort.key).sort()).toEqual(["agent:nextjs", "agent:supabase"]);
   });
 
-  it("still splits a revision dimension into separate episodes given the same alternating shape", () => {
-    // Same alternation, but on `prompt` — a genuine revision dimension — where a repeated value IS
-    // two distinct episodes rather than one bucket, so this must NOT collapse the way agent does.
+  it("folds an alternating prompt sequence into one cohort per prompt, not one per contiguous run (P1, PR #331 review, formula/prompt follow-up)", () => {
+    // A composed prompt's digest recurs whenever the ticket's own resolved agent layer recurs —
+    // alternating specialists walks OLD_PROMPT/NEW_PROMPT back and forth without either text ever
+    // having been edited. Reading that as a revision would open a fresh n=1 episode on every swap;
+    // grouping by key instead reunites each prompt's five deliveries into one comparable cohort.
     const series = promptSeries(
       [
         ...deliveries(1, { key: OLD_PROMPT, at: JUL_1, bead: "old-1" }),
-        ...deliveries(1, { key: NEW_PROMPT, at: AUG_2, bead: "new-1" }),
-        ...deliveries(1, { key: OLD_PROMPT, at: SEP_4, bead: "old-2" }),
+        ...deliveries(1, { key: NEW_PROMPT, at: JUL_1, bead: "new-1" }),
+        ...deliveries(1, { key: OLD_PROMPT, at: AUG_2, bead: "old-2" }),
+        ...deliveries(1, { key: NEW_PROMPT, at: AUG_2, bead: "new-2" }),
+        ...deliveries(1, { key: OLD_PROMPT, at: SEP_4, bead: "old-3" }),
+        ...deliveries(1, { key: NEW_PROMPT, at: SEP_4, bead: "new-3" }),
+        ...deliveries(1, { key: OLD_PROMPT, at: SEP_4 + DAY, bead: "old-4" }),
+        ...deliveries(1, { key: NEW_PROMPT, at: SEP_4 + DAY, bead: "new-4" }),
+        ...deliveries(1, { key: OLD_PROMPT, at: SEP_4 + 2 * DAY, bead: "old-5" }),
+        ...deliveries(1, { key: NEW_PROMPT, at: SEP_4 + 2 * DAY, bead: "new-5" }),
       ],
       "prompt",
     );
 
-    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([OLD_PROMPT, NEW_PROMPT, OLD_PROMPT]);
+    expect(series.cohorts).toHaveLength(2);
+    for (const cohort of series.cohorts) {
+      expect(cohort.basis.features).toBe(5);
+      expect(cohort.comparable).toBe(true);
+    }
+    expect(series.cohorts.map((cohort) => cohort.key).sort()).toEqual([NEW_PROMPT, OLD_PROMPT]);
+  });
+
+  it("folds an alternating formula sequence into one cohort per variant, not one per contiguous run (P1, PR #331 review, formula/prompt follow-up)", () => {
+    // `selectRunFormula` chooses the variant from the run target's own labels, so a project
+    // alternating risk:high and default tickets walks the same two variants back and forth without
+    // either variant's own file ever having changed.
+    const series = promptSeries(
+      [
+        ...deliveries(1, { key: "default", at: JUL_1, dimension: "formulaDigest", bead: "default-1" }),
+        ...deliveries(1, { key: "risk-high", at: JUL_1, dimension: "formulaDigest", bead: "high-1" }),
+        ...deliveries(1, { key: "default", at: AUG_2, dimension: "formulaDigest", bead: "default-2" }),
+        ...deliveries(1, { key: "risk-high", at: AUG_2, dimension: "formulaDigest", bead: "high-2" }),
+        ...deliveries(1, { key: "default", at: SEP_4, dimension: "formulaDigest", bead: "default-3" }),
+        ...deliveries(1, { key: "risk-high", at: SEP_4, dimension: "formulaDigest", bead: "high-3" }),
+        ...deliveries(1, {
+          key: "default",
+          at: SEP_4 + DAY,
+          dimension: "formulaDigest",
+          bead: "default-4",
+        }),
+        ...deliveries(1, { key: "risk-high", at: SEP_4 + DAY, dimension: "formulaDigest", bead: "high-4" }),
+        ...deliveries(1, {
+          key: "default",
+          at: SEP_4 + 2 * DAY,
+          dimension: "formulaDigest",
+          bead: "default-5",
+        }),
+        ...deliveries(1, {
+          key: "risk-high",
+          at: SEP_4 + 2 * DAY,
+          dimension: "formulaDigest",
+          bead: "high-5",
+        }),
+      ],
+      "formula",
+    );
+
+    expect(series.cohorts).toHaveLength(2);
+    for (const cohort of series.cohorts) {
+      expect(cohort.basis.features).toBe(5);
+      expect(cohort.comparable).toBe(true);
+    }
+    expect(series.cohorts.map((cohort) => cohort.key).sort()).toEqual(["default", "risk-high"]);
+  });
+
+  it("still splits the anton dimension into separate episodes given the same alternating shape", () => {
+    // Same alternation, but on `anton` — the one remaining genuine revision dimension — where a
+    // repeated value IS two distinct episodes rather than one bucket, so this must NOT collapse the
+    // way prompt/formula/agent/skill now do.
+    const series = promptSeries(
+      [
+        ...deliveries(1, { key: OLD_VERSION, at: JUL_1, bead: "old-1", dimension: "antonVersion" }),
+        ...deliveries(1, { key: NEW_VERSION, at: AUG_2, bead: "new-1", dimension: "antonVersion" }),
+        ...deliveries(1, { key: OLD_VERSION, at: SEP_4, bead: "old-2", dimension: "antonVersion" }),
+      ],
+      "anton",
+    );
+
+    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([OLD_VERSION, NEW_VERSION, OLD_VERSION]);
   });
 });
 

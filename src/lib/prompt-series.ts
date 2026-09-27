@@ -339,18 +339,28 @@ export function normalizeCohortDimension(raw: string | null | undefined): Cohort
  * The caution a dimension's cohorts must be read WITH, or `undefined` where the key names the only
  * thing that plausibly changed.
  *
- * Agent and skill both carry one, and it is not boilerplate: `agent:alembic` rides `risk:high`
- * migration work by convention, so its higher cost per feature says as much about the tickets it was
- * handed as about the specialist (design §cohorts by agent and by skill). The view reports the key
- * and the n; it never claims a specialist caused a difference.
+ * `anton` is the only clean one: a release version is decided by a deploy, not by any one ticket.
+ * Every other dimension is selected PER TICKET and carries a caution because of it — `agent` and
+ * `skill` ride the ticket kinds that route to them by convention (design §cohorts by agent and by
+ * skill), and `prompt`/`formula` are confounded the same way (P1, PR #331 review): a composed
+ * system prompt's digest includes the ticket's own resolved agent layer, and `selectRunFormula`
+ * chooses the formula variant from the run target's own labels. The view reports the key and the n;
+ * it never claims the dimension alone caused a difference.
  *
  * A `Record` over the union rather than a partial lookup, so a dimension added later must decide
  * whether it is confounded instead of silently inheriting "clean".
  */
 export const DIMENSION_CAUTIONS: Readonly<Record<CohortDimension, string | undefined>> =
   Object.freeze({
-    prompt: undefined,
-    formula: undefined,
+    prompt:
+      "A prompt cohort is confounded by more than an edit to the prompt text — the composed digest " +
+      "includes the ticket's own resolved agent layer, so alternating specialists (or risk-based " +
+      "routing that pulls in a different one) walks a different digest per ticket, not per revision. " +
+      "Read it as a description of what ran, never as a claim the prompt text alone moved the number.",
+    formula:
+      "A formula cohort is confounded by the work it was given — the run formula's own variant is " +
+      "chosen from the run target's labels (risk:high and similar), so a difference here describes " +
+      "which tickets got routed to that formula as much as the formula itself.",
     anton: undefined,
     agent:
       "An agent cohort is confounded by the work it was given — specialists ride the ticket kinds " +
@@ -498,21 +508,33 @@ export const DIMENSION_COLUMNS: Readonly<Record<CohortDimension, keyof CohortSta
 
 /**
  * Dimensions whose value is ONE thing the whole system runs under at a time, replaced wholesale when
- * it changes — prompt text, the compiled formula, anton's own release. A repeat value here (A → B →
- * A) is genuinely a reversion, so {@link promptSeries} gives each contiguous run its own episode:
- * comparing "A" against "B" must mean the A that ran immediately adjacent to B, not an average blended
- * with a later, unrelated return to A.
+ * it changes. `anton`'s own release is the only one left here: it is decided by a deploy, never by a
+ * run target's own labels, so every run in a window is genuinely on it. A repeat value here (v1 → v2
+ * → v1) is genuinely a rollback, so {@link promptSeries} gives each contiguous run its own episode:
+ * comparing v2 against "v1" must mean the v1 that ran immediately adjacent to v2, not an average
+ * blended with a later, unrelated rollback.
  *
- * `agent` and `skill` are deliberately absent. Both are resolved PER TICKET, not per era — a project
- * routing tickets to alternating specialists (nextjs, then supabase, then nextjs again) is not living
- * through three "versions" of its agent assignment, it is running one specialist alongside another the
- * whole time. Splitting on every transition the way a revision dimension does turns two agents with
- * five deliveries each into ten single-feature episodes, none of them ever reaching
- * {@link MIN_COHORT} — the agent tab would show no comparisons at all, and even repeated agent values
- * would count as separate cohorts (P1, PR #331 review). {@link promptSeries} instead folds every
- * delivery of an identity dimension's key into ONE cohort regardless of when it ran.
+ * `prompt`, `formula`, `agent` and `skill` are deliberately absent — all four are resolved PER
+ * TICKET, not per era. `agent` and `skill` are the original case: a project routing tickets to
+ * alternating specialists (nextjs, then supabase, then nextjs again) is not living through three
+ * "versions" of its agent assignment, it is running one specialist alongside another the whole time.
+ * Splitting on every transition the way a revision dimension does turns two agents with five
+ * deliveries each into ten single-feature episodes, none of them ever reaching {@link MIN_COHORT} —
+ * the agent tab would show no comparisons at all, and even repeated agent values would count as
+ * separate cohorts (P1, PR #331 review).
+ *
+ * `prompt` and `formula` used to live here too, but they have the identical problem (P1, PR #331
+ * review, fresh follow-up): `selectRunFormula` chooses a formula variant from the RUN TARGET's own
+ * labels (`run-formula.ts`), and a composed system prompt's digest includes the ticket's own resolved
+ * `agent:` layer (`system-prompt.ts`'s `composeSystemPrompt`) — both vary per ticket the same way
+ * `agentTag` does. A project alternating `risk:high` and default tickets, or two specialists, walks
+ * digests that recur as A → B → A → B without either configuration ever having been replaced;
+ * reading that as a revision opens a fresh episode on every transition instead of the two comparable
+ * cohorts it actually is. {@link promptSeries} instead folds every delivery of an identity
+ * dimension's key into ONE cohort regardless of when it ran — see {@link DIMENSION_CAUTIONS} for the
+ * reading caution all four of these carry as a result.
  */
-const REVISION_DIMENSIONS = new Set<CohortDimension>(["prompt", "formula", "anton"]);
+const REVISION_DIMENSIONS = new Set<CohortDimension>(["anton"]);
 
 /**
  * One feature as the fold receives it: what it delivered, what it cost, and the rows that say what
@@ -959,18 +981,19 @@ function episodeFor(
  *
  * **On a {@link REVISION_DIMENSIONS} dimension, a repeated stamp value gets a fresh cohort per
  * contiguous episode, not one merged bucket per value (PR #331 review).** A stamp used, replaced, and
- * later restored — prompt A → B → A — is two separate periods that happen to share a key, not one:
- * keying the fold on the value alone would pool both A periods into a cohort whose window (and whose
- * average) reaches past B's own delivery, so comparing B against "A" compares it against a figure that
- * includes deliveries B could not possibly have moved. Splitting by episode instead draws three
- * cohorts in the order they actually ran — A, then B, then A again — each measured only against what
- * came immediately before it.
+ * later restored — anton v1 → v2 → v1 — is two separate periods that happen to share a key, not one:
+ * keying the fold on the value alone would pool both v1 periods into a cohort whose window (and whose
+ * average) reaches past v2's own delivery, so comparing v2 against "v1" compares it against a figure
+ * that includes deliveries v2 could not possibly have moved. Splitting by episode instead draws three
+ * cohorts in the order they actually ran — v1, then v2, then v1 again — each measured only against
+ * what came immediately before it.
  *
- * **On every other dimension (agent, skill), every delivery of a key folds into ONE cohort regardless
- * of when it ran (P1, PR #331 review).** These are resolved per ticket, not per era, so a sequence
- * like agent A, B, A, B is two specialists alternating throughout, not four version episodes — treating
- * it as episodic turned two five-delivery agents into ten `n=1` cohorts, none of them ever reaching
- * {@link MIN_COHORT}. See {@link REVISION_DIMENSIONS} for the full reasoning.
+ * **On every other dimension (prompt, formula, agent, skill), every delivery of a key folds into ONE
+ * cohort regardless of when it ran (P1, PR #331 review).** These are resolved per ticket, not per
+ * era, so a sequence like agent A, B, A, B is two specialists alternating throughout, not four version
+ * episodes — treating it as episodic turned two five-delivery agents into ten `n=1` cohorts, none of
+ * them ever reaching {@link MIN_COHORT}. See {@link REVISION_DIMENSIONS} for the full reasoning,
+ * including why `prompt` and `formula` moved into this group too.
  *
  * DELIVERED features are what decide episode boundaries on a revision dimension, sorted by
  * {@link CohortFeature.deliveredAtMs} — the only field that says WHEN one happened; a feature that gave
@@ -1106,14 +1129,14 @@ export function promptSeries(
  *
  * `byWindow` places every cohort in SOME order so the series has one to render, but comparing only
  * `firstDeliveryMs` lets two OVERLAPPING windows read as a chronological predecessor pair. On an
- * identity dimension (`agent`, `skill`), a cohort is every delivery of that key across the feature's
- * WHOLE history — so alternating identities routinely overlap: agent A delivers at t=1 and t=4,
- * agent B at t=2 and t=3. `byWindow` sorts A before B on `firstDeliveryMs` (1 < 2), but A's own
- * average already includes the t=4 delivery, which lands after every one of B's. Presenting that
- * average as "the cohort before B" is not a fact about what came before B — it can change or reverse
- * B's delta every time A delivers again, long after B's window closed (fresh review feedback, PR
- * #331). `previous` is never one half of a tied `firstDeliveryMs` group by the time it reaches here
- * — see {@link uniqueImmediatePredecessor}, which is what its caller uses to find it.
+ * identity dimension (`prompt`, `formula`, `agent`, `skill`), a cohort is every delivery of that key
+ * across the feature's WHOLE history — so alternating identities routinely overlap: agent A delivers
+ * at t=1 and t=4, agent B at t=2 and t=3. `byWindow` sorts A before B on `firstDeliveryMs` (1 < 2),
+ * but A's own average already includes the t=4 delivery, which lands after every one of B's.
+ * Presenting that average as "the cohort before B" is not a fact about what came before B — it can
+ * change or reverse B's delta every time A delivers again, long after B's window closed (fresh review
+ * feedback, PR #331). `previous` is never one half of a tied `firstDeliveryMs` group by the time it
+ * reaches here — see {@link uniqueImmediatePredecessor}, which is what its caller uses to find it.
  *
  * Requiring `previous`'s LAST delivery to strictly precede `cohort`'s FIRST is what actually proves
  * disjoint windows: every episodic-dimension pair already satisfies this (episodes are carved from
