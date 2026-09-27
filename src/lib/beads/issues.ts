@@ -694,37 +694,44 @@ export async function ensureCycleEvidence(
       const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
       if (missingCycleIds.length > 0) {
         const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
-        // Rebuilt from `board` AFTER the hydration await, not the `knownIds` captured before it: a
-        // concurrent caller sharing this same `board` array (evidence is keyed by identity) can have
-        // hydrated the same gates onto it while this listing was in flight, and pushing again would
-        // duplicate them.
-        const idsOnBoard = new Set(board.map((bead) => bead.id));
         let addedAny = false;
-        for (const gate of hydratedGates) {
-          if (!idsOnBoard.has(gate.id)) {
-            board.push(gate);
-            idsOnBoard.add(gate.id);
-            addedAny = true;
+        // Check generation BEFORE mutating `board`, not after (mirrors `attachCyclesBestEffort`,
+        // issues.ts:564): `board` can be the retained snapshot array itself, and invalidation
+        // deliberately keeps that same array in place while only bumping the generation — pushing
+        // onto it before checking would mutate the live snapshot with pre-write gate data even
+        // though the later guard only gated the follow-up `hydrateIssueSnapshot` metadata sync, not
+        // this mutation. No `await` between this check and the mutation below, so nothing can
+        // invalidate the snapshot in between; a mismatch here means a concurrent write already
+        // replaced the entry, and this local `board` is an orphaned copy left untouched rather than
+        // mutated for no reader to see.
+        if (issueSnapshotGeneration(cwd) === generation) {
+          // Rebuilt from `board` AFTER the hydration await, not the `knownIds` captured before it: a
+          // concurrent caller sharing this same `board` array (evidence is keyed by identity) can have
+          // hydrated the same gates onto it while this listing was in flight, and pushing again would
+          // duplicate them.
+          const idsOnBoard = new Set(board.map((bead) => bead.id));
+          for (const gate of hydratedGates) {
+            if (!idsOnBoard.has(gate.id)) {
+              board.push(gate);
+              idsOnBoard.add(gate.id);
+              addedAny = true;
+            }
           }
-        }
-        // `board` is the retained snapshot array itself (see the doc above on why this hydrates in
-        // place instead of rebuilding), but pushing onto it doesn't touch the entry's own
-        // `serialized`/`version`/`generation` bookkeeping (P2 review, PR #274, issues.ts:620): left
-        // out of sync, a later ordinary refresh that still lists the same underlying work sees no
-        // content diff and never re-derives this hydration, and a cycle probe comparing against a
-        // fresh ordinary listing (which omits these cycle-only gates) can never converge — approval
-        // stays stuck on stale cycle evidence until an unrelated bead changes. `hydrateIssueSnapshot`
-        // is exactly the sync path `refreshAllIssuesRead`'s own strict-gate hydration uses; called
-        // with `board` itself (not a rebuilt copy) it re-serializes the just-mutated content in place
-        // without swapping the array identity callers already hold. Only stamp it when the generation
-        // still matches — checked synchronously, with no `await` since the loop above, so it cannot go
-        // stale between the check and the call: a mismatch means a concurrent write already replaced
-        // the entry, and this local `board` is an orphaned copy `hydrateIssueSnapshot`'s own guard
-        // correctly refuses to stamp. Don't resample the generation when that guard didn't fire, or
-        // the final check below would trivially match a board the entry no longer holds.
-        if (addedAny && issueSnapshotGeneration(cwd) === generation) {
-          hydrateIssueSnapshot(cwd, board, generation);
-          generation = issueSnapshotGeneration(cwd);
+          // `board` is the retained snapshot array itself (see the doc above on why this hydrates in
+          // place instead of rebuilding), but pushing onto it doesn't touch the entry's own
+          // `serialized`/`version`/`generation` bookkeeping (P2 review, PR #274, issues.ts:620): left
+          // out of sync, a later ordinary refresh that still lists the same underlying work sees no
+          // content diff and never re-derives this hydration, and a cycle probe comparing against a
+          // fresh ordinary listing (which omits these cycle-only gates) can never converge — approval
+          // stays stuck on stale cycle evidence until an unrelated bead changes. `hydrateIssueSnapshot`
+          // is exactly the sync path `refreshAllIssuesRead`'s own strict-gate hydration uses; called
+          // with `board` itself (not a rebuilt copy) it re-serializes the just-mutated content in place
+          // without swapping the array identity callers already hold. No `await` since the generation
+          // check above, so it cannot have gone stale between the check and this call.
+          if (addedAny) {
+            hydrateIssueSnapshot(cwd, board, generation);
+            generation = issueSnapshotGeneration(cwd);
+          }
         }
         // `loadGateIssues` above is its own live `bd list`, wide enough a gap for another
         // shared-server writer to repair the cycle `cycles` named while opening a DIFFERENT one under
