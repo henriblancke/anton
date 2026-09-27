@@ -771,6 +771,47 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
     expect(series.cohorts[0]?.key).toBe("review-digest");
   });
 
+  it("attributes a feature to the bundled review-fix skill when that's the only fallback it ran (PR #331 review)", () => {
+    // Restricting the fallback to `review` alone silently dropped any signal from editing the
+    // bundled `review-fix` skill's own text — a feature that only ran review-fix read as having
+    // named no skill at all instead of the bundled skill it actually ran under.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "describe", skillDigest: "describe-digest" },
+          { skillId: "review-fix", skillDigest: "review-fix-digest" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("review-fix-digest");
+  });
+
+  it("treats a feature that ran two distinct bundled fallbacks as spanning, not silently the first one", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "review", skillDigest: "review-digest" },
+          { skillId: "review-fix", skillDigest: "review-fix-digest" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 1, features: 1 });
+    expect(series.cohorts).toEqual([]);
+  });
+
   it("falls back to the pre-instrumentation cohort when even the review default named no digest", () => {
     // A row that ran under NO skill at all (no describe, no review, nothing) has nothing for
     // featureKeys' fallback to pick up either — it must still land in the null cohort rather than

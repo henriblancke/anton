@@ -568,20 +568,25 @@ export interface SpanningFeatures {
  * digest, not fold into the unstamped cohort just because the id happens to match.
  *
  * Discarding every one of them from the "skill" dimension unconditionally, though, would make it
- * impossible to ever answer whether editing the BUNDLED `review` skill's own text helped — every
- * such row would read as no signal at all, before and after the edit alike. See
- * {@link DEFAULT_REVIEW_SKILL_ID} and {@link featureKeys} for the one carve-out.
+ * impossible to ever answer whether editing a BUNDLED skill's own text helped — every such row
+ * would read as no signal at all, before and after the edit alike. See
+ * {@link SKILL_DIGEST_FALLBACK_IDS} and {@link featureKeys} for the one carve-out.
  */
 const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan-triage"]);
 
 /**
- * anton's own bundled `review` skill id — the one scaffolding fallback {@link featureKeys} still
- * reads a digest off, as a last resort, when nothing else named a "skill" key (PR #331 review).
- * `stampValue` discards it same as every other default below; `describe`'s default carries no
- * such carve-out because its composed text is structurally boilerplate (see
- * {@link DESCRIBER_STEP_HANDLER}), never a project's own choice to iterate on.
+ * The {@link SCAFFOLDING_SKILL_IDS} that still carry a digest signal worth reading as a last resort
+ * — every one of them except `describe`, whose composed prompt is structurally boilerplate (see
+ * {@link DESCRIBER_STEP_HANDLER}), never a project's own choice to iterate on. `review-fix` and
+ * `scan-triage` are real bundled skill files a project can edit the same way it can `review`'s, so
+ * restricting this set to `review` alone silently dropped any signal from editing either of the
+ * other two (PR #331 review) — a feature whose only fallback skill happened to be `review-fix` read
+ * as having named no skill at all, rather than the bundled skill it actually ran under. A feature
+ * that ran under two distinct ids from this set still reads as spanning once both digests land in
+ * {@link featureKeys}'s key set — the same call the "two real specialist skills" case makes, since
+ * it genuinely ran under two bundled skills a project could edit independently.
  */
-const DEFAULT_REVIEW_SKILL_ID = "review";
+const SKILL_DIGEST_FALLBACK_IDS = new Set(["review", "review-fix", "scan-triage"]);
 
 /**
  * Whether a row's {@link CohortStampRow.skillId} is anton's own scaffolding fallback rather than a
@@ -652,13 +657,16 @@ function featureKeys(feature: CohortFeature, dimension: CohortDimension): string
     if (value !== undefined) keys.add(value);
   }
   if (keys.size === 0 && dimension === "skill") {
-    // Nothing named a project skill, so the only signal left is anton's own bundled `review`
-    // default — and its digest changing IS the "did editing the bundled skill help" question this
-    // dimension exists to answer (PR #331 review). Reached only when the loop above found no real
-    // skill at all: a feature that named one is never routed through here, so this cannot turn a
-    // real choice into a spanning feature by adding a second key alongside it.
+    // Nothing named a project skill, so the only signal left is one of anton's own bundled
+    // fallbacks in {@link SKILL_DIGEST_FALLBACK_IDS} — and its digest changing IS the "did editing
+    // the bundled skill help" question this dimension exists to answer (PR #331 review). Reached
+    // only when the loop above found no real skill at all: a feature that named one is never routed
+    // through here. A feature that ran under two distinct fallback ids (e.g. `review` and
+    // `review-fix`) still ends up spanning once both digests land in `keys` — the same honest call
+    // the "two real specialist skills" branch above makes, not a bug this loop should paper over.
     for (const row of feature.rows) {
-      if (row.skillId !== DEFAULT_REVIEW_SKILL_ID || !isScaffoldingFallback(row)) continue;
+      if (!isScaffoldingFallback(row)) continue;
+      if (!row.skillId || !SKILL_DIGEST_FALLBACK_IDS.has(row.skillId)) continue;
       const digest = row.skillDigest?.trim();
       if (digest) keys.add(digest);
     }

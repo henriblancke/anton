@@ -225,6 +225,7 @@ describe("featureLedger's friction half", () => {
     lastError?: string;
     quotaParkCount?: number;
     failureParkCount?: number;
+    createdAt?: Date;
   }): Promise<void> {
     await t.db.insert(schema.jobs).values({
       id: row.id,
@@ -235,6 +236,7 @@ describe("featureLedger's friction half", () => {
       ...(row.lastError ? { lastError: row.lastError } : {}),
       ...(row.quotaParkCount ? { quotaParkCount: row.quotaParkCount } : {}),
       ...(row.failureParkCount ? { failureParkCount: row.failureParkCount } : {}),
+      ...(row.createdAt ? { createdAt: row.createdAt } : {}),
     });
   }
 
@@ -244,6 +246,7 @@ describe("featureLedger's friction half", () => {
     beadId?: string;
     epicBeadId?: string;
     status?: string;
+    raisedAt?: Date;
   }): Promise<void> {
     await t.db.insert(schema.escalations).values({
       id: row.id,
@@ -254,6 +257,7 @@ describe("featureLedger's friction half", () => {
       ...(row.beadId ? { beadId: row.beadId } : {}),
       ...(row.epicBeadId ? { epicBeadId: row.epicBeadId } : {}),
       status: row.status ?? "open",
+      ...(row.raisedAt ? { raisedAt: row.raisedAt } : {}),
     });
   }
 
@@ -420,5 +424,79 @@ describe("featureLedger's friction half", () => {
 
     expect(ledger?.friction.humanGates).toBe(1);
     expect(ledger?.friction.humanTouches).toBe(1);
+  });
+
+  it("cuts every friction source at asOfMs, on its OWN clock — a rerun's own jobs, escalations, review rounds and send-back notes must not reach a preserved delivery's figures (PR #331 review)", async () => {
+    // A target still live on a rerun of an already-delivered feature must report ONLY the completed
+    // attempt's friction (`cohort-read.ts`'s `activeRunTargetIds`) — the rerun has no outcome yet, so
+    // its own interventions are exactly as premature as its own invocations would be.
+    const cutoff = new Date("2026-08-01T00:10:00Z");
+    fakeBoard([
+      BOARD[0]!,
+      bead({
+        id: "task-1",
+        parent: "feat-1",
+        notes: [
+          formatHumanNote(
+            originNoteBody("anton-old-followup"),
+            "Henri Blancke",
+            new Date("2026-08-01T00:05:00Z"),
+          ),
+          formatHumanNote(
+            originNoteBody("anton-new-followup"),
+            "Henri Blancke",
+            new Date("2026-09-25T00:05:00Z"),
+          ),
+        ].join("\n"),
+      }),
+    ]);
+    vi.spyOn(beads, "showWithComments").mockImplementation(async (_cwd, id) => ({
+      ...bead({ id }),
+      comments: [
+        {
+          text: formatReviewScoreComment({ round: 1, blocking: 0, advisory: 0, verdict: "clean" }),
+          created_at: "2026-08-01T00:01:00.000Z",
+        },
+        {
+          text: formatReviewScoreComment({ round: 1, blocking: 0, advisory: 0, verdict: "clean" }),
+          created_at: "2026-09-25T00:01:00.000Z",
+        },
+      ],
+    }));
+    await seedJob({
+      id: "j-old",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "cancelled",
+      createdAt: new Date("2026-08-01T00:00:00Z"),
+    });
+    await seedJob({
+      id: "j-new",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "cancelled",
+      createdAt: new Date("2026-09-25T00:00:00Z"),
+    });
+    await seedEscalation({
+      id: "e-old",
+      kind: "needs-human",
+      beadId: "feat-1",
+      raisedAt: new Date("2026-08-01T00:00:00Z"),
+    });
+    await seedEscalation({
+      id: "e-new",
+      kind: "needs-human",
+      beadId: "feat-1",
+      raisedAt: new Date("2026-09-25T00:00:00Z"),
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+
+    // Only the OLD job, escalation, review round and send-back note — every one before the cutoff —
+    // count; the still-live rerun's own activity is invisible until it has an outcome.
+    expect(ledger?.friction.cancels).toBe(1);
+    expect(ledger?.friction.humanGates).toBe(1);
+    expect(ledger?.friction.reviewRounds).toBe(1);
+    expect(ledger?.friction.sendBacks).toBe(1);
   });
 });

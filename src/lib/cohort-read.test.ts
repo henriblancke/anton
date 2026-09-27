@@ -210,6 +210,64 @@ describe("cohortFeatures", () => {
     expect(features?.[0]?.beadId).toBe("feat-1");
     expect(features?.[0]?.delivered).toBe(true);
     expect(features?.[0]?.deliveredAtMs).toBe(new Date("2026-08-01T00:10:00Z").getTime());
+    // The rerun has no outcome yet, so its OWN row (`i-new`) must not reach the preserved delivery's
+    // figures — only `i-old`, the completed attempt the delivery actually covers, comes through
+    // (PR #331 review).
+    // `CohortFeature.rows` is typed to the stamp columns `promptSeries` reads (`CohortStampRow`), but
+    // the rows underneath are always the scope's full `ClaudeInvocationRow`s — `id` included.
+    expect((features?.[0]?.rows as unknown as { id: string }[]).map((r) => r.id)).toEqual(["i-old"]);
+  });
+
+  it("does not let the unfinished rerun's own stamp span a preserved delivery's skill cohort (PR #331 review)", async () => {
+    // The completed attempt ran under one prompt digest; the still-live rerun already recorded a
+    // DIFFERENT one before finishing. Folding the rerun's row in would make `featureKeys` see two
+    // distinct prompts and throw this already-delivered feature into `spanning` before the rerun even
+    // has an outcome.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "in_progress" })]);
+    await seedInvocation({
+      id: "i-old",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-08-01T00:00:00Z"),
+      promptDigest: "old-prompt",
+    });
+    await seedDelivery({ epicBeadId: "feat-1", endedAt: new Date("2026-08-01T00:10:00Z") });
+    await seedInvocation({
+      id: "i-new",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-25T00:00:00Z"),
+      promptDigest: "new-prompt",
+    });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features?.[0]?.rows.map((r) => r.promptDigest)).toEqual(["old-prompt"]);
+  });
+
+  it("does not let the unfinished rerun's own cancel inflate a preserved delivery's human touches (PR #331 review)", async () => {
+    // Cutting the ROWS at the prior delivery is not enough on its own: `cohortFeatureOf` also reads
+    // the target's friction, and an operator can cancel the rerun's own job before it has an outcome.
+    // That cancel belongs to the unfinished rerun, not to the delivery it must not reach.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "in_progress" })]);
+    await seedInvocation({ id: "i-old", beadId: "feat-1", recordedAt: new Date("2026-08-01T00:00:00Z") });
+    await seedDelivery({ epicBeadId: "feat-1", endedAt: new Date("2026-08-01T00:10:00Z") });
+    await seedInvocation({ id: "i-new", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+    await t.db.insert(schema.jobs).values({
+      id: "j-new",
+      type: "execute-epic",
+      projectId: t.projectId,
+      payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId: "feat-1" }),
+      status: "cancelled",
+      createdAt: new Date("2026-09-25T00:05:00Z"),
+    });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features?.[0]?.deliveredAtMs).toBe(new Date("2026-08-01T00:10:00Z").getTime());
+    expect(features?.[0]?.humanTouches).toBe(0);
   });
 
   it("resolves every run target under bounded concurrency, none dropped", async () => {

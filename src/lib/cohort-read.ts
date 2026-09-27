@@ -60,6 +60,12 @@ import { boardCards } from "./ticket-view";
  * happened is real evidence, not a premature outcome — dropping it would erase an already-shipped
  * feature's whole history for as long as the rerun takes (PR #331 review). Only a target on its
  * very first, still-live attempt — nothing delivered yet — has nothing to report.
+ *
+ * Such a target's cohort figures still must not reach past that prior delivery: the rerun it is
+ * live on has no outcome yet, so its rows are exactly as premature as a first attempt's would be
+ * (PR #331 review). The map this returns therefore carries a per-target cutoff — the prior
+ * delivery's own timestamp for a target still live on a rerun, `undefined` (whole life, no bound)
+ * for every other target — for {@link cohortFeatureOf} to cut the ledger at.
  */
 /**
  * Statuses a run can leave its target in while still genuinely executing — no finished outcome
@@ -73,7 +79,7 @@ async function activeRunTargetIds(
   projectId: string,
   board: Bead[],
   since: Date | undefined,
-): Promise<Set<string>> {
+): Promise<Map<string, number | undefined>> {
   const rows = await listInvocations(db, projectId, since ? { since } : {});
   const byId = new Map(board.map((b) => [b.id, b]));
   const cards = boardCards(board);
@@ -108,28 +114,41 @@ async function activeRunTargetIds(
         );
   const liveIds = new Set(liveTargets.map((t) => t.id));
 
-  const ids = new Set<string>();
+  const ids = new Map<string, number | undefined>();
   for (const target of candidates.values()) {
     if (liveIds.has(target.id)) {
-      const delivered = lastDeliveryMs(priorDeliveries, ledgerScope(board, target.id).ids) !== undefined;
-      if (!delivered) continue;
+      const deliveredAtMs = lastDeliveryMs(priorDeliveries, ledgerScope(board, target.id).ids);
+      if (deliveredAtMs === undefined) continue;
+      ids.set(target.id, deliveredAtMs);
+      continue;
     }
-    ids.add(target.id);
+    ids.set(target.id, undefined);
   }
   return ids;
 }
 
-/** One run target's whole-life {@link CohortFeature}, composed from the reads named in the header. */
+/**
+ * One run target's {@link CohortFeature}, composed from the reads named in the header.
+ *
+ * `asOfMs` is the one exception to "whole life": for a target still live on a rerun of an
+ * already-delivered feature ({@link activeRunTargetIds}), it is that prior delivery's own
+ * timestamp, and everything recorded strictly after it — invocations, jobs, escalations, review
+ * rounds, send-back notes — belongs to the rerun's own unfinished attempt. No outcome yet, so none
+ * of it may inflate the delivered feature's cost or friction, or, worse, change its stamp and throw
+ * an otherwise-clean cohort membership into {@link SpanningFeatures} (PR #331 review). `undefined`
+ * for every other target, which reads as the module header's own rule: no bound at all, the whole
+ * life. `featureLedger` owns the actual cut (`FeatureLedgerOptions.asOfMs`) — every source it folds
+ * into `totals`, `friction` and `rows` is cut at the same instant, so nothing here can drift out of
+ * step with what it returns by re-deriving one figure on its own.
+ */
 async function cohortFeatureOf(
   db: AntonDb,
   projectId: string,
   board: Bead[],
   beadId: string,
+  asOfMs: number | undefined,
 ): Promise<CohortFeature> {
-  // `featureLedger` already runs the scope's invocation and delivery reads to fold `totals`/`timing`
-  // — reusing its `rows`/`deliveredAtMs` instead of re-fetching keeps this a single pass over the
-  // scope rather than two (PR #331 review).
-  const ledger = await featureLedger(db, projectId, beadId, { board });
+  const ledger = await featureLedger(db, projectId, beadId, { board, asOfMs });
   const deliveredAtMs = ledger?.deliveredAtMs;
 
   return {
@@ -187,9 +206,9 @@ export async function cohortFeatures(
   if (!project) return undefined;
 
   const board = await listAllBeads(project);
-  const targetIds = await activeRunTargetIds(db, projectId, board, opts.since);
-  return mapWithBoundedConcurrency([...targetIds], COHORT_FEATURE_CONCURRENCY, (id) =>
-    cohortFeatureOf(db, projectId, board, id),
+  const targets = await activeRunTargetIds(db, projectId, board, opts.since);
+  return mapWithBoundedConcurrency([...targets], COHORT_FEATURE_CONCURRENCY, ([id, asOfMs]) =>
+    cohortFeatureOf(db, projectId, board, id, asOfMs),
   );
 }
 
