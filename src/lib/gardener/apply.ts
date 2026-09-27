@@ -50,6 +50,7 @@ import {
   sameBlocksEdges,
   sameCycleMemberLiveness,
   sameCycles,
+  sameTargetEligibilityState,
 } from "../beads/issues";
 import {
   notePrefix,
@@ -325,10 +326,15 @@ async function withCycleEvidenceIfNeeded(
     // (P2 review, PR #274, issues.ts:455): `cycles` never names an acyclic edge's target, so
     // `blockedGap` can be reading a since-reopened blocker's stale closed status straight off `board`.
     // Check all three, the same `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
+    // None of the three checks above look at a candidate target's OWN eligibility — only cycle
+    // members and blocker edges — so a target that gains `agent:human`, closes, or is deferred in
+    // this same gap slips through unless `sameTargetEligibilityState` is checked too (P2 review, PR
+    // #274, apply.ts:293).
     const consistent =
       sameBlocksEdges(board, freshBoard) &&
       sameCycleMemberLiveness(cycles, board, freshBoard) &&
-      sameBlockerLiveness(board, freshBoard);
+      sameBlockerLiveness(board, freshBoard) &&
+      sameTargetEligibilityState(board, freshBoard);
     if (!consistent) {
       console.warn(
         `[gardener.apply] ${repo}: board moved between the board read and cycle evidence while ` +
@@ -353,7 +359,8 @@ async function withCycleEvidenceIfNeeded(
       sameCycles(freshCycles, cycles) &&
       sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
       sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard) &&
-      sameBlockerLiveness(hydratedBoard, freshHydratedBoard);
+      sameBlockerLiveness(hydratedBoard, freshHydratedBoard) &&
+      sameTargetEligibilityState(hydratedBoard, freshHydratedBoard);
     if (!stillConsistent) {
       console.warn(
         `[gardener.apply] ${repo}: board moved during gate hydration for cycle evidence while ` +

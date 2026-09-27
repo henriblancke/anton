@@ -52,6 +52,7 @@ const {
   refreshAllIssuesRead,
   resetCycleEvidenceCheckedAt,
   resetCycleProbes,
+  sameTargetEligibilityState,
 } = await import("./issues");
 const { attachCycleEvidence, cycleEvidenceFor } = await import("./cycle-evidence");
 const {
@@ -1412,3 +1413,33 @@ describe("refreshAllIssuesRead", () => {
    await expect(loadAllIssues(REPO)).rejects.toThrow(message);
    expect(listMock).toHaveBeenCalledTimes(1);
  });
+
+describe("sameTargetEligibilityState (P2 review, PR #274, issues.ts:373)", () => {
+  const epic: Bead = { id: "e-1", title: "Epic", status: "open", issue_type: "epic" };
+
+  it("flags drift when fresh adds a child under a board id, even with every board id unchanged", () => {
+    const board = [epic];
+    const newChild: Bead = {
+      id: "c-1",
+      title: "New child",
+      status: "open",
+      issue_type: "task",
+      parent: "e-1",
+    };
+
+    expect(sameTargetEligibilityState(board, [epic, newChild])).toBe(false);
+  });
+
+  it("stays consistent when fresh only adds a bead unrelated to any board id", () => {
+    const board = [epic];
+    const unrelated: Bead = { id: "u-1", title: "Unrelated", status: "open", issue_type: "task" };
+
+    expect(sameTargetEligibilityState(board, [epic, unrelated])).toBe(true);
+  });
+
+  it("stays consistent when nothing changed", () => {
+    const board = [epic];
+
+    expect(sameTargetEligibilityState(board, [epic])).toBe(true);
+  });
+});

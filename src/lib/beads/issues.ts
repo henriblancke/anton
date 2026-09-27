@@ -367,10 +367,20 @@ function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
  *
  * Checked over every id on `board`, not just the one a particular caller is about to gate: this
  * function backs a generic board-loader consistency check with no notion of which id that is.
+ *
+ * Also checked the other direction: a bead `fresh` carries that `board` never saw at all — a child
+ * added under one of `board`'s ids in the gap between the two reads — changes nothing the per-id key
+ * comparison above looks at (status/labels/ancestors of ids `board` already has), so a brand-new
+ * child with an invalid tier or incomplete contract would otherwise slip through unnoticed and the
+ * stale `board` would still wave the pairing through (P2 review, PR #274, issues.ts:373).
  */
 export function sameTargetEligibilityState(board: Bead[], fresh: Bead[]): boolean {
   const [keyBoard, keyFresh] = [eligibilityKeyOf(board), eligibilityKeyOf(fresh)];
-  return board.every((bead) => keyBoard(bead.id) === keyFresh(bead.id));
+  if (!board.every((bead) => keyBoard(bead.id) === keyFresh(bead.id))) return false;
+  const boardIds = new Set(board.map((bead) => bead.id));
+  return fresh.every(
+    (bead) => boardIds.has(bead.id) || !ancestorChain(bead.id, fresh).some((id) => boardIds.has(id)),
+  );
 }
 
 /**

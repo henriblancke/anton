@@ -25,6 +25,7 @@ import {
   sameBlocksEdges,
   sameCycleMemberLiveness,
   sameCycles,
+  sameTargetEligibilityState,
 } from "../beads/issues";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
@@ -189,10 +190,15 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
       // a verdict with a since-reopened blocker's stale closed status. Check all three, the same
       // `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
       const freshBoard = await loadAllIssues(input.repo);
+      // None of the three checks above look at a candidate target's OWN eligibility — only cycle
+      // members and blocker edges — so a target that gains `agent:human`, closes, or is deferred in
+      // this same gap slips through unless `sameTargetEligibilityState` is checked too (P2 review, PR
+      // #274, shadow.ts:195).
       const consistent =
         sameBlocksEdges(board, freshBoard) &&
         sameCycleMemberLiveness(cycles, board, freshBoard) &&
-        sameBlockerLiveness(board, freshBoard);
+        sameBlockerLiveness(board, freshBoard) &&
+        sameTargetEligibilityState(board, freshBoard);
       if (consistent) {
         // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
         // gates blocking each other, nothing else pointing at either) — `board` never carried them,
@@ -223,7 +229,8 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
             sameCycles(freshCycles, cycles) &&
             sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
             sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard) &&
-            sameBlockerLiveness(hydratedBoard, freshHydratedBoard);
+            sameBlockerLiveness(hydratedBoard, freshHydratedBoard) &&
+            sameTargetEligibilityState(hydratedBoard, freshHydratedBoard);
           if (stillConsistent) {
             attachCycleEvidence(hydratedBoard, cycles);
             board = hydratedBoard;
