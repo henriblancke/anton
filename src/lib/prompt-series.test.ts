@@ -1110,6 +1110,72 @@ describe("promptSeries: the agent dimension ignores the reviewer's own agent tag
   });
 });
 
+describe("promptSeries: identity dimensions group across noncontiguous deliveries (P1, PR #331 review)", () => {
+  it("folds an alternating agent sequence into one cohort per agent, not one per contiguous run", () => {
+    // Two specialists alternate ticket-by-ticket — nextjs, supabase, nextjs, supabase — five
+    // deliveries apiece. Reading this the way a revision dimension does (a fresh episode on every
+    // key change) would produce four `n=1`-ish episodes, none reaching MIN_COHORT; grouping by key
+    // instead should reunite each agent's five deliveries into one comparable cohort.
+    const series = promptSeries(
+      [
+        ...deliveries(1, { key: "agent:nextjs", at: JUL_1, dimension: "agentTag", bead: "nextjs-1" }),
+        ...deliveries(1, { key: "agent:supabase", at: JUL_1, dimension: "agentTag", bead: "supabase-1" }),
+        ...deliveries(1, { key: "agent:nextjs", at: AUG_2, dimension: "agentTag", bead: "nextjs-2" }),
+        ...deliveries(1, { key: "agent:supabase", at: AUG_2, dimension: "agentTag", bead: "supabase-2" }),
+        ...deliveries(1, { key: "agent:nextjs", at: SEP_4, dimension: "agentTag", bead: "nextjs-3" }),
+        ...deliveries(1, { key: "agent:supabase", at: SEP_4, dimension: "agentTag", bead: "supabase-3" }),
+        ...deliveries(1, {
+          key: "agent:nextjs",
+          at: SEP_4 + DAY,
+          dimension: "agentTag",
+          bead: "nextjs-4",
+        }),
+        ...deliveries(1, {
+          key: "agent:supabase",
+          at: SEP_4 + DAY,
+          dimension: "agentTag",
+          bead: "supabase-4",
+        }),
+        ...deliveries(1, {
+          key: "agent:nextjs",
+          at: SEP_4 + 2 * DAY,
+          dimension: "agentTag",
+          bead: "nextjs-5",
+        }),
+        ...deliveries(1, {
+          key: "agent:supabase",
+          at: SEP_4 + 2 * DAY,
+          dimension: "agentTag",
+          bead: "supabase-5",
+        }),
+      ],
+      "agent",
+    );
+
+    expect(series.cohorts).toHaveLength(2);
+    for (const cohort of series.cohorts) {
+      expect(cohort.basis.features).toBe(5);
+      expect(cohort.comparable).toBe(true);
+    }
+    expect(series.cohorts.map((cohort) => cohort.key).sort()).toEqual(["agent:nextjs", "agent:supabase"]);
+  });
+
+  it("still splits a revision dimension into separate episodes given the same alternating shape", () => {
+    // Same alternation, but on `prompt` — a genuine revision dimension — where a repeated value IS
+    // two distinct episodes rather than one bucket, so this must NOT collapse the way agent does.
+    const series = promptSeries(
+      [
+        ...deliveries(1, { key: OLD_PROMPT, at: JUL_1, bead: "old-1" }),
+        ...deliveries(1, { key: NEW_PROMPT, at: AUG_2, bead: "new-1" }),
+        ...deliveries(1, { key: OLD_PROMPT, at: SEP_4, bead: "old-2" }),
+      ],
+      "prompt",
+    );
+
+    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([OLD_PROMPT, NEW_PROMPT, OLD_PROMPT]);
+  });
+});
+
 describe("promptSeries: what the cohort reports about the antons it spans", () => {
   it("flags a cohort whose features ran under two antons", () => {
     const series = promptSeries(

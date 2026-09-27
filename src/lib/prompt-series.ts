@@ -490,6 +490,24 @@ export const DIMENSION_COLUMNS: Readonly<Record<CohortDimension, keyof CohortSta
   });
 
 /**
+ * Dimensions whose value is ONE thing the whole system runs under at a time, replaced wholesale when
+ * it changes — prompt text, the compiled formula, anton's own release. A repeat value here (A → B →
+ * A) is genuinely a reversion, so {@link promptSeries} gives each contiguous run its own episode:
+ * comparing "A" against "B" must mean the A that ran immediately adjacent to B, not an average blended
+ * with a later, unrelated return to A.
+ *
+ * `agent` and `skill` are deliberately absent. Both are resolved PER TICKET, not per era — a project
+ * routing tickets to alternating specialists (nextjs, then supabase, then nextjs again) is not living
+ * through three "versions" of its agent assignment, it is running one specialist alongside another the
+ * whole time. Splitting on every transition the way a revision dimension does turns two agents with
+ * five deliveries each into ten single-feature episodes, none of them ever reaching
+ * {@link MIN_COHORT} — the agent tab would show no comparisons at all, and even repeated agent values
+ * would count as separate cohorts (P1, PR #331 review). {@link promptSeries} instead folds every
+ * delivery of an identity dimension's key into ONE cohort regardless of when it ran.
+ */
+const REVISION_DIMENSIONS = new Set<CohortDimension>(["prompt", "formula", "anton"]);
+
+/**
  * One feature as the fold receives it: what it delivered, what it cost, and the rows that say what
  * produced it.
  *
@@ -904,25 +922,34 @@ function episodeFor(
  * composing a board read can hand the same run target over twice and a doubled feature would inflate
  * both sides of the average.
  *
- * **A repeated stamp value gets a fresh cohort per contiguous episode, not one merged bucket per
- * value (PR #331 review).** A stamp used, replaced, and later restored — prompt A → B → A — is two
- * separate periods that happen to share a key, not one: keying the fold on the value alone would pool
- * both A periods into a cohort whose window (and whose average) reaches past B's own delivery, so
- * comparing B against "A" compares it against a figure that includes deliveries B could not possibly
- * have moved. Splitting by episode instead draws three cohorts in the order they actually ran — A,
- * then B, then A again — each measured only against what came immediately before it.
+ * **On a {@link REVISION_DIMENSIONS} dimension, a repeated stamp value gets a fresh cohort per
+ * contiguous episode, not one merged bucket per value (PR #331 review).** A stamp used, replaced, and
+ * later restored — prompt A → B → A — is two separate periods that happen to share a key, not one:
+ * keying the fold on the value alone would pool both A periods into a cohort whose window (and whose
+ * average) reaches past B's own delivery, so comparing B against "A" compares it against a figure that
+ * includes deliveries B could not possibly have moved. Splitting by episode instead draws three
+ * cohorts in the order they actually ran — A, then B, then A again — each measured only against what
+ * came immediately before it.
  *
- * DELIVERED features are what decide episode boundaries, sorted by {@link CohortFeature.deliveredAtMs}
- * — the only field that says WHEN one happened; a feature that gave up records no such time and so
- * cannot be placed in that sequence at all. It still must land somewhere (every attributed feature's
- * spend stays in the numerators, per rule 1), so it is folded into whichever of its key's episodes was
- * open at its own {@link CohortFeature.activityAtMs} — the last one that had already started by then
- * — falling back to the earliest episode for the key when its activity predates every one of them, or
- * to the MOST RECENT episode when it carries no activity timestamp at all. Defaulting to "most recent"
- * unconditionally (as this fold once did) mis-files a failed attempt from a stamp's FIRST run into its
- * later, restored run whenever the stamp came back — A → B → A inflates the second A episode's cost
- * with a failure that actually happened during the first, and can reverse B's own delta against it
- * (PR #331 review). Opens a fresh episode only when the key has formed none yet.
+ * **On every other dimension (agent, skill), every delivery of a key folds into ONE cohort regardless
+ * of when it ran (P1, PR #331 review).** These are resolved per ticket, not per era, so a sequence
+ * like agent A, B, A, B is two specialists alternating throughout, not four version episodes — treating
+ * it as episodic turned two five-delivery agents into ten `n=1` cohorts, none of them ever reaching
+ * {@link MIN_COHORT}. See {@link REVISION_DIMENSIONS} for the full reasoning.
+ *
+ * DELIVERED features are what decide episode boundaries on a revision dimension, sorted by
+ * {@link CohortFeature.deliveredAtMs} — the only field that says WHEN one happened; a feature that gave
+ * up records no such time and so cannot be placed in that sequence at all. It still must land somewhere
+ * (every attributed feature's spend stays in the numerators, per rule 1), so it is folded into
+ * whichever of its key's episodes was open at its own {@link CohortFeature.activityAtMs} — the last one
+ * that had already started by then — falling back to the earliest episode for the key when its
+ * activity predates every one of them, or to the MOST RECENT episode when it carries no activity
+ * timestamp at all. Defaulting to "most recent" unconditionally (as this fold once did) mis-files a
+ * failed attempt from a stamp's FIRST run into its later, restored run whenever the stamp came back —
+ * A → B → A inflates the second A episode's cost with a failure that actually happened during the
+ * first, and can reverse B's own delta against it (PR #331 review). Opens a fresh episode only when the
+ * key has formed none yet. On an identity dimension there is only ever one episode per key, so an
+ * undated feature always lands in it.
  */
 export function promptSeries(
   features: readonly CohortFeature[],
@@ -972,17 +999,35 @@ export function promptSeries(
     return a.feature.beadId.localeCompare(b.feature.beadId);
   });
 
+  const episodic = REVISION_DIMENSIONS.has(dimension);
   const episodes: CohortAccumulator[] = [];
   // Every episode a key has formed so far, oldest first — {@link dated}'s own sort order, since a
   // new episode is only ever appended, never inserted. What lets an undated feature below pick the
-  // one that was actually open at its own activity time instead of always the last.
+  // one that was actually open at its own activity time instead of always the last. On an identity
+  // dimension this holds at most one accumulator per key — see `episodic` below.
   const episodesByKey = new Map<string | null, CohortAccumulator[]>();
   let open: CohortAccumulator | undefined;
   for (const { feature, key } of dated) {
-    if (!open || open.key !== key) {
-      open = emptyAccumulator(key);
-      episodes.push(open);
-      episodesByKey.set(key, [...(episodesByKey.get(key) ?? []), open]);
+    if (episodic) {
+      // A key change opens a fresh episode — even a RETURN to a key already seen, since that is a
+      // reversion (see {@link REVISION_DIMENSIONS}), not a continuation of the earlier run.
+      if (!open || open.key !== key) {
+        open = emptyAccumulator(key);
+        episodes.push(open);
+        episodesByKey.set(key, [...(episodesByKey.get(key) ?? []), open]);
+      }
+    } else {
+      // Identity dimension: every delivery of this key folds into the one accumulator it has already
+      // formed, however far back — no reversion to detect, because the key was never "current" to
+      // begin with.
+      const existing = episodesByKey.get(key)?.[0];
+      if (existing) {
+        open = existing;
+      } else {
+        open = emptyAccumulator(key);
+        episodes.push(open);
+        episodesByKey.set(key, [open]);
+      }
     }
     accumulate(open, feature);
   }
