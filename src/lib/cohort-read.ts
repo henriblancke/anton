@@ -84,13 +84,19 @@ import { boardCards } from "./ticket-view";
  */
 /**
  * Statuses a run CAN leave its target in while still genuinely executing — no finished outcome
- * recorded on the bead itself. `deferred` is deliberately left out: snoozed work is rare to have
- * accrued fresh invocations against in the first place (PR #331 review).
+ * recorded on the bead itself.
+ *
+ * `deferred` belongs here too: an operator can defer a target AFTER its execute job has already
+ * started, and deferring only calls `beads.defer` — it never touches the job
+ * (`close-human.test.ts`'s "defer doesn't cancel it" case). A candidate only reaches this set at all
+ * because it already has fresh invocations in the window (the loop that builds `candidates` requires
+ * one), so "snoozed work rarely has fresh invocations" is not a reason to skip the check — it is
+ * exactly the case this set exists to catch.
  *
  * Only a candidate set: a status match here does not by itself mean live — see
  * {@link activeRunTargetIds}'s own note on why `blocked` needs the `runs` table to confirm it.
  */
-const MAYBE_LIVE_TARGET_STATUSES = new Set(["in_progress", "blocked"]);
+const MAYBE_LIVE_TARGET_STATUSES = new Set(["in_progress", "blocked", "deferred"]);
 
 async function activeRunTargetIds(
   db: AntonDb,

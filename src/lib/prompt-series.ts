@@ -795,29 +795,59 @@ function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
 }
 
 /**
- * Which of a key's episodes (oldest first, per {@link promptSeries}'s `episodesByKey`) was open at
- * `activityAtMs` — the last one whose window had already started by then, so an undated feature
- * lands in the episode contemporaneous with it instead of always the newest (PR #331 review). Falls
- * back to the EARLIEST episode when the activity predates all of them (a feature that ran before its
- * key ever delivered), and to the LAST one when there is no activity timestamp to place it by at all
- * — the same "no better evidence than the current era" reading a repeat delivery under an unchanged
- * key already gets. `undefined` only when the key has formed no episode yet, so the caller opens one.
+ * When `episode` stopped being the open one for ITS key — the first delivery timestamp of whichever
+ * episode (any key) opened immediately after it in {@link promptSeries}'s global `episodes` list,
+ * which is delivery-order because `episodes` is only ever appended to as {@link dated} is walked in
+ * that order. `undefined` when `episode` is still the newest thing on record — nothing has closed it.
+ */
+function episodeClosesAt(
+  episode: CohortAccumulator,
+  episodes: readonly CohortAccumulator[],
+): number | undefined {
+  const index = episodes.indexOf(episode);
+  if (index === -1) return undefined;
+  for (let i = index + 1; i < episodes.length; i++) {
+    const next = episodes[i].firstDeliveryMs;
+    if (next !== undefined) return next;
+  }
+  return undefined;
+}
+
+/**
+ * Which of a key's episodes (oldest first, per {@link promptSeries}'s `episodesByKey`) an undated
+ * feature at `activityAtMs` belongs to.
+ *
+ * Not simply "the last one whose OWN window had already started by then": once an intervening
+ * episode of a DIFFERENT key has opened, that key's own episode is closed for good, and any later
+ * activity for THIS key belongs to whatever comes next for it — even before that next episode has
+ * itself delivered anything. A → B → A restores the key, so a failed attempt that ran after B started
+ * but before the restored A's first delivery is pre-delivery work for the RESTORED episode, not a
+ * straggler from the original one (fresh boundary beyond the original episode-split fix, PR #331
+ * review) — walking {@link episodeClosesAt} forward through `candidates` is what tells the two apart,
+ * since a same-key-only view has no way to see B ever happened.
+ *
+ * Falls back to the EARLIEST episode when the activity predates all of them (a feature that ran
+ * before its key ever delivered), and to the LAST one when there is no activity timestamp to place it
+ * by at all — the same "no better evidence than the current era" reading a repeat delivery under an
+ * unchanged key already gets. `undefined` only when the key has formed no episode yet, so the caller
+ * opens one.
  */
 function episodeFor(
   candidates: CohortAccumulator[] | undefined,
+  episodes: readonly CohortAccumulator[],
   activityAtMs: number | undefined,
 ): CohortAccumulator | undefined {
   if (!candidates || candidates.length === 0) return undefined;
   if (activityAtMs === undefined || !Number.isFinite(activityAtMs)) {
     return candidates[candidates.length - 1];
   }
-  let current: CohortAccumulator | undefined;
-  for (const candidate of candidates) {
-    if (candidate.firstDeliveryMs !== undefined && candidate.firstDeliveryMs <= activityAtMs) {
-      current = candidate;
-    }
+  let current = candidates[0];
+  for (let i = 1; i < candidates.length; i++) {
+    const closesAt = episodeClosesAt(candidates[i - 1], episodes);
+    if (closesAt === undefined || activityAtMs < closesAt) break;
+    current = candidates[i];
   }
-  return current ?? candidates[0];
+  return current;
 }
 
 /**
@@ -919,7 +949,7 @@ export function promptSeries(
   }
   for (const { feature, key } of undated) {
     const candidates = episodesByKey.get(key);
-    const episode = episodeFor(candidates, feature.activityAtMs);
+    const episode = episodeFor(candidates, episodes, feature.activityAtMs);
     if (episode) {
       accumulate(episode, feature);
       continue;

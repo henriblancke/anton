@@ -255,6 +255,55 @@ describe("cohortFeatures", () => {
     expect(features).toEqual([]);
   });
 
+  it("excludes a deferred target whose execute job is still open — defer doesn't cancel it (PR #331 review)", async () => {
+    // `close-human.test.ts`'s "defer doesn't cancel it" case: an operator can defer a target AFTER
+    // its execute job has already started, and `setTicketDeferred` only calls `beads.defer` — it
+    // never touches the running job. Trusting the deferred status alone would admit the target with
+    // an unbounded ledger and count its unfinished spend/friction as a failed numerator.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "deferred" })]);
+    await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+    await t.db.insert(schema.runs).values({
+      id: "run-feat-1",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "running",
+      startedAt: new Date("2026-09-25T00:00:00Z"),
+      updatedAt: new Date("2026-09-25T00:00:00Z"),
+    });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toEqual([]);
+  });
+
+  it("includes a deferred target whose only run evidence is a terminated attempt (PR #331 review)", async () => {
+    // A deferred target with no open run behind it has nothing live to protect — its failed attempt's
+    // spend and friction belong in a cohort's numerators like any other terminated run.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "deferred" })]);
+    await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+    await t.db.insert(schema.runs).values({
+      id: "run-feat-1",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "failed",
+      startedAt: new Date("2026-09-25T00:00:00Z"),
+      endedAt: new Date("2026-09-25T00:05:00Z"),
+      updatedAt: new Date("2026-09-25T00:05:00Z"),
+    });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toHaveLength(1);
+    expect(features?.[0]?.beadId).toBe("feat-1");
+    expect(features?.[0]?.delivered).toBe(false);
+  });
+
   it("keeps a target's prior delivery while it is reopened and reruns (PR #331 review)", async () => {
     // The target already delivered once; reopening it for another round leaves it `in_progress`
     // again, but the delivery that already happened is real evidence and must not disappear from

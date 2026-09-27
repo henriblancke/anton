@@ -404,6 +404,33 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     expect(secondOld.basis.features).toBe(5);
   });
 
+  it("attributes a pre-delivery failure to the RESTORED episode once the intervening one has started (PR #331 review)", () => {
+    // Same A → B → A restoration, but the failed A attempt this time runs AFTER B has already
+    // started (AUG_2) and BEFORE the restored A cohort delivers anything (SEP_4). A's original
+    // episode closed the moment B opened, so this failure is pre-delivery work for the RESTORED
+    // episode, not a straggler from the first one — folding it into the first A cohort would inflate
+    // that cohort's cost and could reverse B's own delta against it.
+    const series = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_PROMPT, at: JUL_1, usd: 2 }),
+        ...deliveries(5, { key: NEW_PROMPT, at: AUG_2, usd: 10 }),
+        ...deliveries(5, { key: OLD_PROMPT, at: SEP_4, usd: 100, bead: "old-again" }),
+        {
+          beadId: "failed-after-b-started",
+          delivered: false,
+          activityAtMs: AUG_2 + DAY,
+          usd: 1000,
+          rows: [{ promptDigest: OLD_PROMPT }],
+        },
+      ],
+      "prompt",
+    );
+
+    const [firstOld, , secondOld] = series.cohorts;
+    expect(firstOld.basis.features).toBe(5);
+    expect(secondOld.basis.features).toBe(6);
+  });
+
   it("measures each cohort against the one immediately before it in delivery order", () => {
     const series = promptSeries(
       [
