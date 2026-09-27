@@ -341,6 +341,43 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     expect(series.cohorts[0]?.window).toEqual({ firstDeliveryMs: AUG_2, lastDeliveryMs: SEP_4 - DAY });
   });
 
+  it("splits a stamp used, replaced, and later restored into separate episodes (PR #331 review)", () => {
+    // Prompt A ran cheap, B ran expensive, then A came BACK — reverted, not merely a straggler
+    // delivery still inside A's own window. Pooling both A periods into one cohort (keyed only on
+    // the value) would average $2 and $100 into $51, and B's own delta would be drawn against that
+    // blend instead of the $2 A actually cost when B ran — reversing the arrow from "B got pricier"
+    // to "B got cheaper".
+    const series = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_PROMPT, at: JUL_1, usd: 2 }),
+        ...deliveries(5, { key: NEW_PROMPT, at: AUG_2, usd: 10 }),
+        ...deliveries(5, { key: OLD_PROMPT, at: SEP_4, usd: 100, bead: "old-again" }),
+      ],
+      "prompt",
+    );
+
+    expect(series.cohorts.map((cohort) => cohort.key)).toEqual([OLD_PROMPT, NEW_PROMPT, OLD_PROMPT]);
+    const [firstOld, middle, secondOld] = series.cohorts;
+    expect(firstOld.window).toEqual({ firstDeliveryMs: JUL_1, lastDeliveryMs: JUL_1 });
+    expect(middle.window).toEqual({ firstDeliveryMs: AUG_2, lastDeliveryMs: AUG_2 });
+    expect(secondOld.window).toEqual({ firstDeliveryMs: SEP_4, lastDeliveryMs: SEP_4 });
+
+    // B is measured against the $2 A actually cost right before it, not a blend polluted by A's
+    // later, pricier return.
+    expect(middle.comparable && middle.deltas[0]).toMatchObject({
+      metric: "usdPerFeature",
+      delta: 8,
+      direction: "worse",
+    });
+    // A's second episode is measured against B, immediately before it — not folded back into its
+    // own first episode, and not left without a predecessor either.
+    expect(secondOld.comparable && secondOld.deltas[0]).toMatchObject({
+      metric: "usdPerFeature",
+      delta: 90,
+      direction: "worse",
+    });
+  });
+
   it("measures each cohort against the one immediately before it in delivery order", () => {
     const series = promptSeries(
       [

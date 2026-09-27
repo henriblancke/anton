@@ -24,6 +24,7 @@
  * Nothing here re-derives what that module already owns — this module's only job is picking WHICH
  * run targets to ask it about and shaping the answer into what the pure fold reads.
  */
+import { ACTIVE_RUN_STATUSES } from "@/components/runs/run-view-utils";
 import { beads, type Bead } from "./beads/bd";
 import { listInvocations } from "./claude-invocations";
 import { getDb } from "./db";
@@ -33,7 +34,7 @@ import { ledgerScope } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { getProjectById } from "./projects";
 import type { CohortFeature } from "./prompt-series";
-import { listDeliveriesByBead } from "./runs";
+import { listDeliveriesByBead, listRunBeadIdsByStatus } from "./runs";
 import { listAllBeads } from "./tickets";
 import { boardCards } from "./ticket-view";
 
@@ -47,13 +48,27 @@ import { boardCards } from "./ticket-view";
  * hundreds of invocation rows would otherwise rebuild `boardCards(board)` — and repeat
  * `beads.isRunTarget`'s own board scan — once per row instead of once per distinct target.
  *
- * A target in a {@link LIVE_TARGET_STATUSES} status has no FINISHED outcome for its current
- * attempt yet, so folding it in now would fold partial spend and friction into a cohort's
- * numerators before the run's outcome — delivered, gave-up, or abandoned — is known. `blocked`
- * carries the same risk as `in_progress`: a run can gate a target on a dependency mid-run and
- * leave it `blocked` while it is still live (`execute-epic.gating.integration.test.ts` shows the
- * target's own status doing exactly this), so excluding only `in_progress` missed a target a run
- * had merely paused on, not finished with (PR #331 review).
+ * A target in a {@link MAYBE_LIVE_TARGET_STATUSES} status MIGHT have no FINISHED outcome for its
+ * current attempt yet, so folding it in now would risk folding partial spend and friction into a
+ * cohort's numerators before the run's outcome — delivered, gave-up, or abandoned — is known.
+ * `blocked` carries the same risk as `in_progress`: a run can gate a target on a dependency
+ * mid-run and leave it `blocked` while it is still live (`execute-epic.gating.integration.test.ts`
+ * shows the target's own status doing exactly this), so excluding only `in_progress` missed a
+ * target a run had merely paused on, not finished with (PR #331 review).
+ *
+ * But `blocked` is not ONLY that: an agent that self-reports `ANTON-RESULT: blocked` settles its
+ * run `status: "failed"` while leaving the ticket at `status: "blocked"` forever
+ * (`execute-epic.abandon-base.integration.test.ts`) — a terminated, failed attempt, not live work.
+ * Reading the bead's status alone cannot tell the two apart, so a status match here is only a
+ * CANDIDATE: {@link activeRunTargetIds} then asks the `runs` table itself whether the candidate's
+ * LAST known attempt actually failed with nothing still open behind it, and only then overrides the
+ * status-based default (PR #331 review). Absent from the `runs` table entirely — no row at all for
+ * the scope — the candidate's status is the only signal there is, and stays trusted as before; a
+ * genuinely still-open run (`ACTIVE_RUN_STATUSES`) always wins over a stale failed one, since a
+ * retry can leave both rows behind for the same target. A candidate whose only run evidence is a
+ * terminal failure falls through to the "not live" branch below — folded in at its whole life,
+ * `delivered: false`, so its spend and friction still land in a cohort's numerators as the failed
+ * attempt it is, instead of vanishing.
  *
  * A target already holding a PRIOR delivery is kept regardless of its current status: reopening a
  * delivered feature for another round leaves it live again, but the delivery that already
@@ -68,11 +83,14 @@ import { boardCards } from "./ticket-view";
  * for every other target — for {@link cohortFeatureOf} to cut the ledger at.
  */
 /**
- * Statuses a run can leave its target in while still genuinely executing — no finished outcome
- * yet. `deferred` is deliberately left out: snoozed work is rare to have accrued fresh invocations
- * against in the first place (PR #331 review).
+ * Statuses a run CAN leave its target in while still genuinely executing — no finished outcome
+ * recorded on the bead itself. `deferred` is deliberately left out: snoozed work is rare to have
+ * accrued fresh invocations against in the first place (PR #331 review).
+ *
+ * Only a candidate set: a status match here does not by itself mean live — see
+ * {@link activeRunTargetIds}'s own note on why `blocked` needs the `runs` table to confirm it.
  */
-const LIVE_TARGET_STATUSES = new Set(["in_progress", "blocked"]);
+const MAYBE_LIVE_TARGET_STATUSES = new Set(["in_progress", "blocked"]);
 
 async function activeRunTargetIds(
   db: AntonDb,
@@ -102,22 +120,46 @@ async function activeRunTargetIds(
     if (target && isRunTargetCached(target)) candidates.set(targetId, target);
   }
 
-  const liveTargets = [...candidates.values()].filter((t) => LIVE_TARGET_STATUSES.has(t.status));
+  const scopeCache = new Map<string, string[]>();
+  const scopeOf = (id: string): string[] => {
+    const cached = scopeCache.get(id);
+    if (cached) return cached;
+    const scope = ledgerScope(board, id).ids;
+    scopeCache.set(id, scope);
+    return scope;
+  };
+
+  const maybeLive = [...candidates.values()].filter((t) => MAYBE_LIVE_TARGET_STATUSES.has(t.status));
+  const maybeLiveScopeIds = maybeLive.flatMap((t) => scopeOf(t.id));
+  const [activeRunIds, failedRunIds] =
+    maybeLiveScopeIds.length === 0
+      ? [new Set<string>(), new Set<string>()]
+      : await Promise.all([
+          listRunBeadIdsByStatus(db, projectId, maybeLiveScopeIds, ACTIVE_RUN_STATUSES),
+          listRunBeadIdsByStatus(db, projectId, maybeLiveScopeIds, ["failed"]),
+        ]);
+  // A candidate's status is trusted UNLESS the `runs` table itself says its last known attempt
+  // already failed with nothing still open behind it — see the note above
+  // `MAYBE_LIVE_TARGET_STATUSES`. No run row at all for the scope leaves the status as the only
+  // signal, same as before this check existed.
+  const liveTargets = maybeLive.filter((t) => {
+    const scope = scopeOf(t.id);
+    const hasOpenRun = scope.some((id) => activeRunIds.has(id));
+    const hasFailedRun = scope.some((id) => failedRunIds.has(id));
+    return hasOpenRun || !hasFailedRun;
+  });
   const priorDeliveries =
     liveTargets.length === 0
       ? new Map<string, number[]>()
-      : await listDeliveriesByBead(
-          db,
-          projectId,
-          liveTargets.flatMap((t) => ledgerScope(board, t.id).ids),
-          { includeLocalCommits: false },
-        );
+      : await listDeliveriesByBead(db, projectId, liveTargets.flatMap((t) => scopeOf(t.id)), {
+          includeLocalCommits: false,
+        });
   const liveIds = new Set(liveTargets.map((t) => t.id));
 
   const ids = new Map<string, number | undefined>();
   for (const target of candidates.values()) {
     if (liveIds.has(target.id)) {
-      const deliveredAtMs = lastDeliveryMs(priorDeliveries, ledgerScope(board, target.id).ids);
+      const deliveredAtMs = lastDeliveryMs(priorDeliveries, scopeOf(target.id));
       if (deliveredAtMs === undefined) continue;
       ids.set(target.id, deliveredAtMs);
       continue;

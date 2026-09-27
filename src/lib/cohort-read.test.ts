@@ -191,6 +191,70 @@ describe("cohortFeatures", () => {
     expect(features).toEqual([]);
   });
 
+  it("includes a target whose blocked status is a TERMINATED attempt, not live work (PR #331 review)", async () => {
+    // `execute-epic.abandon-base.integration.test.ts` proves an agent-declared incomplete attempt
+    // settles its run `status: "failed"` while leaving the ticket `status: "blocked"` forever — a
+    // finished, failed outcome the bead's own status cannot distinguish from a target merely gated
+    // on a dependency mid-run. Its spend must land in a cohort's numerators as the failed attempt it
+    // is, not vanish the way a genuinely live target's does.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "blocked" })]);
+    await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+    await t.db.insert(schema.runs).values({
+      id: "run-feat-1",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "failed",
+      error: "self-reported blocked",
+      startedAt: new Date("2026-09-25T00:00:00Z"),
+      endedAt: new Date("2026-09-25T00:05:00Z"),
+      updatedAt: new Date("2026-09-25T00:05:00Z"),
+    });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toHaveLength(1);
+    expect(features?.[0]?.beadId).toBe("feat-1");
+    expect(features?.[0]?.delivered).toBe(false);
+    expect(features?.[0]?.rows).toHaveLength(1);
+  });
+
+  it("keeps treating a blocked target as live when a fresh run is still open behind the failed one (PR #331 review)", async () => {
+    // A retry can leave the OLD failed row behind while a new attempt is already running — the
+    // still-open row must win, or a retry in progress would be misread as terminated.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature", status: "blocked" })]);
+    await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
+    await t.db.insert(schema.runs).values([
+      {
+        id: "run-feat-1-old",
+        projectId: t.projectId,
+        epicBeadId: "feat-1",
+        branch: "anton/feat-1",
+        status: "failed",
+        startedAt: new Date("2026-09-24T00:00:00Z"),
+        endedAt: new Date("2026-09-24T00:05:00Z"),
+        updatedAt: new Date("2026-09-24T00:05:00Z"),
+      },
+      {
+        id: "run-feat-1-retry",
+        projectId: t.projectId,
+        epicBeadId: "feat-1",
+        branch: "anton/feat-1",
+        status: "running",
+        startedAt: new Date("2026-09-25T00:00:00Z"),
+        updatedAt: new Date("2026-09-25T00:00:00Z"),
+      },
+    ]);
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toEqual([]);
+  });
+
   it("keeps a target's prior delivery while it is reopened and reruns (PR #331 review)", async () => {
     // The target already delivered once; reopening it for another round leaves it `in_progress`
     // again, but the delivery that already happened is real evidence and must not disappear from

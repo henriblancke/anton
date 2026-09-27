@@ -814,14 +814,31 @@ function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
  * A feature appears at most once per cohort: repeated `beadId`s are folded once, since a caller
  * composing a board read can hand the same run target over twice and a doubled feature would inflate
  * both sides of the average.
+ *
+ * **A repeated stamp value gets a fresh cohort per contiguous episode, not one merged bucket per
+ * value (PR #331 review).** A stamp used, replaced, and later restored — prompt A → B → A — is two
+ * separate periods that happen to share a key, not one: keying the fold on the value alone would pool
+ * both A periods into a cohort whose window (and whose average) reaches past B's own delivery, so
+ * comparing B against "A" compares it against a figure that includes deliveries B could not possibly
+ * have moved. Splitting by episode instead draws three cohorts in the order they actually ran — A,
+ * then B, then A again — each measured only against what came immediately before it.
+ *
+ * DELIVERED features are what decide episode boundaries, sorted by {@link CohortFeature.deliveredAtMs}
+ * — the only field that says WHEN one happened; a feature that gave up records no such time and so
+ * cannot be placed in that sequence at all. It still must land somewhere (every attributed feature's
+ * spend stays in the numerators, per rule 1), so it joins the MOST RECENT episode its key has formed
+ * so far, or opens a fresh one if that key has not delivered anything yet — the same "no better
+ * evidence than the current era" reading a repeat delivery under an unchanged key already gets today.
  */
 export function promptSeries(
   features: readonly CohortFeature[],
   dimension: CohortDimension,
 ): CohortSeries {
-  const cohorts = new Map<string | null, CohortAccumulator>();
   const spanning: SpanningFeatures = { delivered: 0, features: 0 };
   const seen = new Set<string>();
+
+  const dated: { feature: CohortFeature; key: string | null }[] = [];
+  const undated: { feature: CohortFeature; key: string | null }[] = [];
 
   for (const feature of features) {
     if (seen.has(feature.beadId)) continue;
@@ -835,12 +852,39 @@ export function promptSeries(
     }
     // No stamp at all is the pre-instrumentation cohort, keyed null — see rule 2.
     const key = keys[0] ?? null;
-    const cohort = cohorts.get(key) ?? emptyAccumulator(key);
-    cohorts.set(key, cohort);
-    accumulate(cohort, feature);
+    const at = feature.deliveredAtMs;
+    (feature.delivered && at !== undefined && Number.isFinite(at) ? dated : undated).push({
+      feature,
+      key,
+    });
   }
 
-  const ordered = [...cohorts.values()].sort(byWindow);
+  // Oldest first, so a run of the same key found here is genuinely contiguous in delivery order —
+  // the property {@link byWindow} needs the episodes it draws deltas across to actually have.
+  dated.sort((a, b) => (a.feature.deliveredAtMs as number) - (b.feature.deliveredAtMs as number));
+
+  const episodes: CohortAccumulator[] = [];
+  const latestEpisodeForKey = new Map<string | null, CohortAccumulator>();
+  let open: CohortAccumulator | undefined;
+  for (const { feature, key } of dated) {
+    if (!open || open.key !== key) {
+      open = emptyAccumulator(key);
+      episodes.push(open);
+    }
+    accumulate(open, feature);
+    latestEpisodeForKey.set(key, open);
+  }
+  for (const { feature, key } of undated) {
+    let episode = latestEpisodeForKey.get(key);
+    if (!episode) {
+      episode = emptyAccumulator(key);
+      episodes.push(episode);
+      latestEpisodeForKey.set(key, episode);
+    }
+    accumulate(episode, feature);
+  }
+
+  const ordered = episodes.sort(byWindow);
   return {
     dimension,
     cohorts: ordered.map((cohort, index) => {
