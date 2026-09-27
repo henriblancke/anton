@@ -910,17 +910,6 @@ async function runFixSession(args: {
               `remote`,
           );
         }
-        // This shortcut never diffs a before/after baseline of its own, so any snapshot a PRIOR,
-        // interrupted attempt persisted (see `persistReviewFixBoardBaseline` below) is now orphaned —
-        // left standing, the next NORMAL dispatch round for this same PR would wrongly reuse it as
-        // its own pre-dispatch state instead of taking a fresh read.
-        if (!(await releaseReviewFixBoardBaseline(repo, epic.id))) {
-          throw new Error(
-            `the review fix for ${epic.id} resumed PR #${number} with its branch already ahead of ` +
-              `origin, but a leftover pre-dispatch board baseline from a prior attempt could not be ` +
-              `released`,
-          );
-        }
       }
       const pushed = await commitAndPushFix(
         repo,
@@ -948,6 +937,23 @@ async function runFixSession(args: {
         reasons: verdict.reasons,
       });
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
+      // Released only now — after the branch push and outcome are durable (mirrors the normal
+      // dispatch path's "Retain the PR-fix baseline until the repair is durable", PR #284 review).
+      // Releasing right after the board sync, before `commitAndPushFix` runs, left a process/host
+      // death in that window with neither the ahead commit (still only local) nor the baseline to
+      // resume against: another machine would read the already-published board repair as its fresh
+      // starting state and a no-op fixer could never recover the prior progress. This shortcut never
+      // diffs a before/after baseline of its own, so any snapshot a PRIOR, interrupted attempt
+      // persisted (see `persistReviewFixBoardBaseline` below) is now orphaned — left standing, the
+      // next NORMAL dispatch round for this same PR would wrongly reuse it as its own pre-dispatch
+      // state instead of taking a fresh read.
+      if (boardOnly && !(await releaseReviewFixBoardBaseline(repo, epic.id))) {
+        throw new Error(
+          `the review fix for ${epic.id} resumed PR #${number} with its branch already ahead of ` +
+            `origin, but a leftover pre-dispatch board baseline from a prior attempt could not be ` +
+            `released`,
+        );
+      }
       return pushed;
     }
 
