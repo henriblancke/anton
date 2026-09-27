@@ -277,3 +277,87 @@ export function cohortStanding(
     : [];
   return { ...base, comparable: true, deltas };
 }
+
+/* ────────────────────────────  what a view receives  ──────────────────────────── */
+
+/**
+ * Which stamp a series groups on. The fold keys on one of these; the view labels the column with it.
+ *
+ * `heading` names the COLUMN the key came from rather than a friendly synonym, because the key itself
+ * is an opaque digest on three of these dimensions — a reader who wants to know what `a3f1…` is has
+ * only the column name to go on.
+ */
+export const COHORT_DIMENSIONS = [
+  { value: "prompt", label: "prompt", heading: "Prompt digest" },
+  { value: "formula", label: "formula", heading: "Formula digest" },
+  { value: "anton", label: "anton version", heading: "anton version" },
+  { value: "agent", label: "agent", heading: "Agent tag" },
+  { value: "skill", label: "skill", heading: "Skill digest" },
+] as const;
+
+export type CohortDimension = (typeof COHORT_DIMENSIONS)[number]["value"];
+
+/** One dimension's display strings, or `undefined` for a key this module does not define. */
+export function cohortDimension(dimension: CohortDimension) {
+  return COHORT_DIMENSIONS.find((option) => option.value === dimension);
+}
+
+/**
+ * The caution a dimension's cohorts must be read WITH, or `undefined` where the key names the only
+ * thing that plausibly changed.
+ *
+ * Agent and skill both carry one, and it is not boilerplate: `agent:alembic` rides `risk:high`
+ * migration work by convention, so its higher cost per feature says as much about the tickets it was
+ * handed as about the specialist (design §cohorts by agent and by skill). The view reports the key
+ * and the n; it never claims a specialist caused a difference.
+ *
+ * A `Record` over the union rather than a partial lookup, so a dimension added later must decide
+ * whether it is confounded instead of silently inheriting "clean".
+ */
+export const DIMENSION_CAUTIONS: Readonly<Record<CohortDimension, string | undefined>> =
+  Object.freeze({
+    prompt: undefined,
+    formula: undefined,
+    anton: undefined,
+    agent:
+      "An agent cohort is confounded by the work it was given — specialists ride the ticket kinds " +
+      "that route to them by convention, so a difference here describes the tickets as much as the " +
+      "specialist. Read it as a description of that pairing, never as a claim the agent caused it.",
+    skill:
+      "A skill cohort is confounded by the work the skill was loaded for — a skill that only loads " +
+      "on one kind of ticket is measured over that kind of ticket, not against it.",
+  });
+
+/** When a cohort's delivered features landed — the span its averages are averages OVER. */
+export interface CohortWindow {
+  firstDeliveryMs: number;
+  lastDeliveryMs: number;
+}
+
+/**
+ * One cohort as the view receives it: a {@link CohortStanding} plus what identifies it.
+ *
+ * An intersection over the union rather than a wrapper object, so the discriminant stays at the top
+ * level and the type-level guardrail survives: `cohort.deltas` is still unreachable until
+ * `cohort.comparable` narrows it, which is the whole reason {@link UnderpoweredCohort} omits the
+ * field instead of emptying it.
+ */
+export type Cohort = CohortStanding & {
+  /**
+   * The stamp value, or **null for the features that recorded none** — the pre-instrumentation
+   * cohort, which is its own group rather than a blank mixed into a real one.
+   */
+  key: string | null;
+  /**
+   * Absent when no delivery in the cohort recorded a time. Optional rather than defaulted: a span
+   * anton cannot measure is a gap, and a plausible wrong one would silently date every figure in the
+   * row.
+   */
+  window: CohortWindow | undefined;
+};
+
+/** One dimension's cohorts, oldest first — each measured against the one before it. */
+export interface CohortSeries {
+  dimension: CohortDimension;
+  cohorts: Cohort[];
+}
