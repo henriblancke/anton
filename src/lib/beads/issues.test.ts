@@ -1411,6 +1411,30 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(issueSnapshotVersion(REPO)).toBe(before);
   });
 
+  it("clears a pre-existing, merely-expired evidence entry rather than leaving it attached when the initial consistency check rejects the pairing (P2 review, PR #274, issues.ts:947)", async () => {
+    // `board` already carries evidence from an earlier check — stale, not absent, which is what
+    // routes this call through the refresh path via `cycleEvidenceMissingOrStale` instead of the
+    // no-op short-circuit. If the re-list below then finds the board's own edges no longer match
+    // what a fresh `bd dep cycles` describes, falling through without clearing would leave that old
+    // entry readable via `cycleEvidenceFor` as if it were still authoritative.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const board = [
+      { ...target, dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" as const }] },
+      other,
+    ];
+    attachCycleEvidence(
+      board,
+      [{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }],
+      Date.now() - ISSUE_SNAPSHOT_MAX_AGE_MS - 1,
+    );
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }, other]); // the repair already landed
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]); // names an unrelated cycle
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
   it("still lets a failed depCycles call reject, unlike the best-effort paths", async () => {
     const board = [{ ...target, dependencies: [] }];
     cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
@@ -1508,6 +1532,10 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     await ensureCycleEvidence(REPO, board, generation);
 
     expect(cycleEvidenceFor(board)).toBeUndefined();
+    // The gates staged for the rejected pairing must not survive on the real board either (P2
+    // review, PR #274, issues.ts:1001) — otherwise a rejected recheck still permanently serializes
+    // gate records into the retained snapshot, leaving later readers with a mixed-revision board.
+    expect(board.map((b) => b.id)).toEqual(["t-3"]);
   });
 });
 
