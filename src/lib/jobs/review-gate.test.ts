@@ -1731,6 +1731,41 @@ describe("runReviewGate — sessions", () => {
     },
   );
 
+  it(
+    "denies `Bash` when metadata.json is absent but the committed config.yaml still names a shared " +
+      "server (chatgpt-codex-connector, PR #284 review, \"Deny Bash unless embedded board mode is " +
+      "positively known\") — a server switch publishes host/port/database/user straight into " +
+      "config.yaml (config.mjs `publishedConfigWrites`), so a clone missing metadata.json can still " +
+      "have `bd` connect from that file alone with no env and no metadata.json at all",
+    () => {
+      const repo = mkdtempSync(join(tmpdir(), "anton-review-gate-config-yaml-"));
+      try {
+        mkdirSync(join(repo, ".beads"), { recursive: true });
+        writeFileSync(join(repo, ".beads", "config.yaml"), "dolt.host: dolt.example.dev\n");
+        expect(reviewDeniedTools(repo)).toEqual([...REVIEW_DENIED_TOOLS, "Bash"]);
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it(
+    "leaves `Bash` allowed when metadata.json positively confirms embedded mode, even with a stale " +
+      "`dolt.host` left behind in config.yaml — metadata.json is bd's own per-directory truth and " +
+      "outranks config.yaml, so once it is actually read there is nothing left to fail closed on",
+    () => {
+      const repo = mkdtempSync(join(tmpdir(), "anton-review-gate-config-yaml-"));
+      try {
+        mkdirSync(join(repo, ".beads"), { recursive: true });
+        writeFileSync(join(repo, ".beads", "metadata.json"), JSON.stringify({ dolt_mode: "embedded" }));
+        writeFileSync(join(repo, ".beads", "config.yaml"), "dolt.host: stale.example.dev\n");
+        expect(reviewDeniedTools(repo)).toEqual(REVIEW_DENIED_TOOLS);
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("loads the reviewer from the operator's settings only, never the branch's", async () => {
     // `.claude/settings.json` is source-controlled, so a diff that adds one would configure the
     // session judging it — and settings register hooks, which run shell commands. The same flag

@@ -423,6 +423,24 @@ const BOARD_EVIDENCE_CONFIRMED_KEY = "boardEvidenceConfirmed";
 const REVIEW_FIX_BOARD_BASELINE_KEY = "reviewFixBoardBaseline";
 
 /**
+ * Metadata key marking that dispatch actually BEGAN against review-fix's currently preserved
+ * baseline above (chatgpt-codex-connector, PR #284 review, "Mark PR-fix dispatch before trusting
+ * recovered baselines") — {@link REVIEW_GATE_DISPATCH_STARTED_KEY}'s analogue for `review-fix.ts`'s
+ * PR-fix path. `persistReviewFixBoardBaseline` treats ANY baseline {@link beads.reviewFixBoardBaseline}
+ * finds on resume as a recovered POST-dispatch snapshot and skips its own refresh loop — correct only
+ * when a fixer session actually ran against it. A process/host death after that baseline is persisted
+ * and confirmed synced but BEFORE the fixer session itself ever starts leaves a plain pre-dispatch
+ * baseline that is indistinguishable, on its own, from one preserved after a real dispatch: without
+ * this key, a resume would skip the refresh loop for a baseline nothing has actually dispatched
+ * against, silently folding in whatever unrelated board write landed during that downtime and
+ * crediting it to whichever fixer eventually runs. Set once, by the caller, right before the fixer
+ * session starts and never before. Absent is read as "dispatch never started against this preserved
+ * baseline", which routes the caller back through `persistReviewFixBoardBaseline`'s own refresh loop
+ * instead of trusting it blind.
+ */
+const REVIEW_FIX_DISPATCH_STARTED_KEY = "reviewFixDispatchStarted";
+
+/**
  * Metadata key holding the pre-PR self-review gate's OWN recoverable pre-dispatch board snapshot
  * (chatgpt-codex-connector, PR #284 review, "Persist the self-review board baseline before
  * dispatch") — {@link REVIEW_FIX_BOARD_BASELINE_KEY}'s analogue for `review-gate.ts`'s
@@ -477,6 +495,7 @@ export const ANTON_METADATA_KEYS: readonly string[] = [
   BOARD_EVIDENCE_CONFIRMED_KEY,
   BOARD_EVIDENCE_PENDING_CLOSURE_KEY,
   REVIEW_FIX_BOARD_BASELINE_KEY,
+  REVIEW_FIX_DISPATCH_STARTED_KEY,
   REVIEW_GATE_BOARD_BASELINE_KEY,
   REVIEW_GATE_DISPATCH_STARTED_KEY,
 ];
@@ -1714,9 +1733,34 @@ export const beads = {
 
   /** Release the preserved baseline above once review-fix's own board evidence for this session has
    * been captured and confirmed synced, or a failure has been proven to have touched nothing on the
-   * board — see {@link REVIEW_FIX_BOARD_BASELINE_KEY}. */
+   * board — see {@link REVIEW_FIX_BOARD_BASELINE_KEY}. Unsets the dispatch-started marker alongside
+   * it (mirrors {@link beads.clearReviewGateBoardBaseline}): a released baseline carries no meaning
+   * for whether dispatch began, so a stale marker left behind would let the NEXT, freshly-read
+   * baseline for this ticket be mistaken for a recovered one when dispatch never started against
+   * it — see {@link REVIEW_FIX_DISPATCH_STARTED_KEY}. */
   clearReviewFixBoardBaseline: (cwd: string, id: string) =>
-    bdWrite(cwd, ["update", id, "--unset-metadata", REVIEW_FIX_BOARD_BASELINE_KEY]),
+    bdWrite(cwd, [
+      "update",
+      id,
+      "--unset-metadata",
+      REVIEW_FIX_BOARD_BASELINE_KEY,
+      "--unset-metadata",
+      REVIEW_FIX_DISPATCH_STARTED_KEY,
+    ]),
+
+  /** Whether dispatch actually began against review-fix's currently preserved PR-fix baseline — the
+   * one signal that tells a genuine post-dispatch recovery baseline apart from a plain pre-dispatch
+   * baseline a crash caught before the fixer session ever started. See
+   * {@link REVIEW_FIX_DISPATCH_STARTED_KEY}. */
+  reviewFixDispatchStarted: (b: Bead): boolean =>
+    b.metadata?.[REVIEW_FIX_DISPATCH_STARTED_KEY] !== undefined,
+
+  /** Durably mark that dispatch has begun against `id`'s currently preserved PR-fix baseline. Called
+   * once, by the caller, right before the fixer session starts and never before — see
+   * {@link REVIEW_FIX_DISPATCH_STARTED_KEY}. A single flag, so a plain `--set-metadata` is safe
+   * (unlike the fingerprint writes above, this never risks the argv `E2BIG` ceiling). */
+  setReviewFixDispatchStarted: (cwd: string, id: string) =>
+    bdWrite(cwd, ["update", id, "--set-metadata", `${REVIEW_FIX_DISPATCH_STARTED_KEY}=1`]),
 
   /**
    * The self-review gate's own preserved pre-dispatch board fingerprint, parsed back off the

@@ -120,6 +120,7 @@ import { finalizeMergedEpic, stampConfirmedClosures } from "./review-fix-finaliz
 import { isPoisonError, PoisonError } from "./errors";
 import {
   boardEvidence,
+  markReviewFixDispatchStarted,
   persistReviewFixBoardBaseline,
   readReviewFixBoardBaseline,
   releaseReviewFixBoardBaseline,
@@ -972,6 +973,14 @@ async function runFixSession(args: {
     // delta from every later diff. Refused fail-closed when unreadable — dispatching anyway risks the
     // fixer making board writes this session could never tell apart from no progress at all.
     const recoveredBoardBaseline = boardOnly ? readReviewFixBoardBaseline(epic) : undefined;
+    // A preserved baseline is only a genuine POST-dispatch recovery snapshot when a fixer session
+    // actually ran against it (chatgpt-codex-connector, PR #284 review, "Mark PR-fix dispatch before
+    // trusting recovered baselines") — `recoveredBoardBaseline` alone cannot tell that apart from a
+    // crash that happened between persisting the baseline below and the fixer ever starting, which
+    // leaves the exact same shape on the bead. See `beads.reviewFixDispatchStarted`'s own docstring
+    // for why treating that pre-dispatch case as recovered would skip the refresh loop that exists to
+    // fold in unrelated board drift from that downtime.
+    const recoveredAfterDispatch = Boolean(recoveredBoardBaseline) && beads.reviewFixDispatchStarted(epic);
     boardBefore = boardOnly
       ? (recoveredBoardBaseline ?? (await defaultReadBoardFingerprint(repo, epic.id)))
       : undefined;
@@ -1001,7 +1010,7 @@ async function runFixSession(args: {
         epic.id,
         boardBefore,
         defaultReadBoardFingerprint,
-        Boolean(recoveredBoardBaseline),
+        recoveredAfterDispatch,
       );
       if (!persistedBaseline) {
         throw new PoisonError(
@@ -1012,6 +1021,19 @@ async function runFixSession(args: {
         );
       }
       boardBefore = persistedBaseline;
+      // Marked right before the fixer session starts and never before (chatgpt-codex-connector, PR
+      // #284 review, "Mark PR-fix dispatch before trusting recovered baselines") — durably records
+      // that dispatch actually began against `boardBefore`, so a resumed attempt's own
+      // `recoveredAfterDispatch` check above can tell this baseline apart from one a crash caught
+      // before the fixer ever ran. Refused fail-closed like every other baseline write here.
+      if (!(await markReviewFixDispatchStarted(repo, epic.id))) {
+        throw new PoisonError(
+          `the review fix for ${epic.id} persisted a board-only baseline for PR #${number} but could ` +
+            `not durably mark dispatch as started — refusing to dispatch: without that record, a ` +
+            `resumed attempt could not tell this baseline apart from one a crash caught before the ` +
+            `fixer ever ran. Resolve the board write, then resume.`,
+        );
+      }
     }
 
     const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({

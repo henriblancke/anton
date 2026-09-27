@@ -13,9 +13,12 @@
  * keep grinding at — and proceeds with advisory ones. Keeping the converge loop free of execute-epic
  * wiring is what makes it unit-testable against a fake driver.
  */
+import { join } from "node:path";
 import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { scrubBdServerEnv } from "../beads/bd-env";
 import { isServerMode } from "../beads/board-mode";
+import { configYamlValue } from "../beads/config.mjs";
+import { readMetadataFile } from "../beads/server-mode.mjs";
 import { metered, type ReasoningAttribution } from "../claude-invocations";
 import { resolveModel } from "./model-routing";
 import { claudeRouting, runClaude, type ClaudeResult, type RunClaudeOptions } from "../claude/driver";
@@ -359,14 +362,34 @@ export const REVIEW_DENIED_TOOLS = ["Write", "Edit", "MultiEdit", "NotebookEdit"
  * reviewer explicitly it has no shell here and to judge from anton's own already-run gate results (or
  * their absence) instead of trying to reach for one.
  *
- * This function alone cannot be the only guard, though: `isServerMode` reads a missing/unreadable/
- * malformed `.beads/metadata.json` as `embedded` (the safe default for sync — see board-mode.ts),
- * which leaves `Bash` enabled for exactly the project this exists to protect. The caller pairs this
- * with `scrubBdServerEnv` (bd-env.ts) unconditionally, so even a `Bash` left enabled here has no
- * ambient `BEADS_DOLT_*` to reach a real server with.
+ * `isServerMode` alone is not enough here, though it is exactly right for the sync decisions it was
+ * built for: it reads a missing/unreadable/malformed `.beads/metadata.json` as `embedded` (the safe
+ * default for sync — see board-mode.ts's own docstring), which leaves `Bash` enabled for exactly the
+ * project this exists to protect. Nor is scrubbing `BEADS_DOLT_*` env (paired unconditionally via
+ * `scrubBdServerEnv`, bd-env.ts) enough on its own: `configureServerMode`'s switch flow
+ * (config.mjs:1590-1607, `publishedConfigWrites`) explicitly publishes the server's host, port,
+ * database and user into the COMMITTED `.beads/config.yaml`, so a clone with metadata.json missing or
+ * unreadable can still have `bd` connect from that file alone — no env, no metadata.json needed
+ * (bd's own precedence is env > metadata.json > config.yaml, so config.yaml is consulted whenever the
+ * higher sources are silent). {@link boardConnectionUnproven} closes that gap: Bash is denied unless
+ * metadata.json positively confirms embedded mode by actually being read — an absent or unreadable
+ * file is failed closed instead, by checking whether config.yaml declares any of the connection
+ * fields a server switch would have written.
  */
+function boardConnectionUnproven(repoPath: string): boolean {
+  // metadata.json is per-directory truth and outranks config.yaml (bd's own precedence): once it is
+  // actually read, `isServerMode`'s answer off the same file is authoritative and this check adds
+  // nothing. Only its ABSENCE or unreadability is the gap this function exists to close.
+  if (readMetadataFile(repoPath).status === "read") return false;
+  const beadsDir = join(repoPath, ".beads");
+  return ["dolt.host", "dolt.port", "dolt.database", "dolt.user"].some(
+    (key) => configYamlValue(beadsDir, key) !== undefined,
+  );
+}
+
 export function reviewDeniedTools(repoPath: string | undefined): string[] {
-  return repoPath && isServerMode(repoPath) ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
+  const mayReachServer = repoPath !== undefined && (isServerMode(repoPath) || boardConnectionUnproven(repoPath));
+  return mayReachServer ? [...REVIEW_DENIED_TOOLS, "Bash"] : REVIEW_DENIED_TOOLS;
 }
 
 /**

@@ -353,14 +353,24 @@ export function readReviewFixBoardBaseline(ticket: Bead): BoardFingerprint | und
  *
  * `isRecoveredBaseline` (chatgpt-codex-connector, PR #284 review, "Preserve recovered review
  * baselines across retries") must be `true` when `baseline` came from {@link
- * readReviewFixBoardBaseline} rather than a fresh read: that value already reflects a PRIOR
- * attempt's pre-dispatch state, and the current board can legitimately differ from it because that
- * same prior attempt's fixer already landed a repair before this process died — the exact repair the
- * resumed attempt's post-run diff exists to credit. The refresh loop below cannot tell that apart
- * from an unrelated concurrent write, so it would fold the repair straight into a "refreshed"
- * baseline and the later diff would find nothing to credit, silently discarding the crash-recovered
- * progress. Skipping the loop for a recovered baseline leaves it exactly as read — the confirming
- * push above still reconfirms it reached the remote, but no read after that push can move it.
+ * readReviewFixBoardBaseline} rather than a fresh read AND a fixer session actually ran against it —
+ * that is, only once {@link beads.reviewFixDispatchStarted} confirms it, never on the bare presence
+ * of a preserved baseline (chatgpt-codex-connector, PR #284 review, "Mark PR-fix dispatch before
+ * trusting recovered baselines"). A baseline preserved by a PRIOR attempt reflects that attempt's
+ * pre-dispatch state, and the current board can legitimately differ from it because that same prior
+ * attempt's fixer already landed a repair before this process died — the exact repair the resumed
+ * attempt's post-run diff exists to credit. But a process/host death can just as easily land in the
+ * window AFTER the baseline is persisted and confirmed synced but BEFORE the fixer session itself
+ * ever starts — a plain pre-dispatch baseline that looks identical to a genuine recovery on its own.
+ * Treating that case as recovered too would skip the refresh loop for a baseline nothing has actually
+ * dispatched against, silently folding in whatever unrelated board write landed during that downtime
+ * and crediting it to whichever fixer eventually runs. The refresh loop below cannot tell a genuine
+ * recovery apart from an unrelated concurrent write either, so for a genuine recovery it would fold
+ * the repair straight into a "refreshed" baseline and the later diff would find nothing to credit,
+ * silently discarding the crash-recovered progress. Skipping the loop for a recovered baseline leaves
+ * it exactly as read — the confirming push above still reconfirms it reached the remote, but no read
+ * after that push can move it. See {@link markReviewFixDispatchStarted}, which the caller must call
+ * right before dispatch to make a later `isRecoveredBaseline` determination trustworthy.
  */
 export async function persistReviewFixBoardBaseline(
   repo: string,
@@ -412,6 +422,30 @@ export async function persistReviewFixBoardBaseline(
 export async function releaseReviewFixBoardBaseline(repo: string, ticketId: string): Promise<boolean> {
   const cleared = await mustPersist(() => beads.clearReviewFixBoardBaseline(repo, ticketId));
   if (!cleared) return false;
+  return beads
+    .push(repo)
+    .then((outcome) => outcome === "synced" || outcome === "shared-server")
+    .catch(() => false);
+}
+
+/**
+ * Durably mark that dispatch has actually begun against the PR-fix baseline
+ * {@link persistReviewFixBoardBaseline} just confirmed (chatgpt-codex-connector, PR #284 review,
+ * "Mark PR-fix dispatch before trusting recovered baselines") — {@link markReviewGateDispatchStarted}'s
+ * analogue for `review-fix.ts`'s `runFixSession`. The caller calls this once, right before the fixer
+ * session starts and never before: without a durable record that dispatch began, a process/host
+ * death in the window right after the baseline is persisted (but before the fixer ever runs) leaves a
+ * plain pre-dispatch baseline that a resume cannot tell apart from one preserved AFTER a genuine
+ * dispatch attempt — see {@link beads.reviewFixDispatchStarted}'s own docstring.
+ *
+ * Never throws: like {@link persistReviewFixBoardBaseline}, a persist or push failure returns `false`
+ * so the caller can refuse to dispatch the same fail-closed way it already does for an unpersistable
+ * baseline, rather than let the fixer run against a baseline whose dispatch-started state is not
+ * itself durable.
+ */
+export async function markReviewFixDispatchStarted(repo: string, ticketId: string): Promise<boolean> {
+  const persisted = await mustPersist(() => beads.setReviewFixDispatchStarted(repo, ticketId));
+  if (!persisted) return false;
   return beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")

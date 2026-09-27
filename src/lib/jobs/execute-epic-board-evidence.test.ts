@@ -24,6 +24,10 @@ const setReviewFixBoardBaselineMock = vi.fn<
   (repo: string, id: string, fingerprint: Record<string, string>) => Promise<string>
 >();
 const clearReviewFixBoardBaselineMock = vi.fn<(repo: string, id: string) => Promise<string>>();
+// `markReviewFixDispatchStarted`'s own write (chatgpt-codex-connector, PR #284 review, "Mark PR-fix
+// dispatch before trusting recovered baselines") shells out to `bd update` too — mocked for the same
+// reason the other board-evidence writes above are.
+const setReviewFixDispatchStartedMock = vi.fn<(repo: string, id: string) => Promise<string>>();
 // The abandon-before-clear downgrade (chatgpt-codex-connector, PR #284 review, "Mark abandoned
 // baselines before clearing them") shells out to `bd update` too — mocked for the same reason the
 // other baseline writes above are.
@@ -68,6 +72,7 @@ vi.mock("../beads/bd", async () => {
       clearBoardEvidenceBaseline: clearBoardEvidenceBaselineMock,
       setReviewFixBoardBaseline: setReviewFixBoardBaselineMock,
       clearReviewFixBoardBaseline: clearReviewFixBoardBaselineMock,
+      setReviewFixDispatchStarted: setReviewFixDispatchStartedMock,
       unverifyBoardEvidenceBaseline: unverifyBoardEvidenceBaselineMock,
       setBoardEvidenceDispatchStarted: setBoardEvidenceDispatchStartedMock,
       setBoardEvidenceCleanupUnsynced: setBoardEvidenceCleanupUnsyncedMock,
@@ -92,13 +97,14 @@ const {
   fingerprintBoard,
   isBoardOnlyRun,
   markDispatchStarted,
+  markReviewFixDispatchStarted,
   persistReviewFixBoardBaseline,
   readBoardBaseline,
   readBoardEvidence,
   readReviewFixBoardBaseline,
   releaseReviewFixBoardBaseline,
 } = await import("./execute-epic-board-evidence");
-const { LABELS } = await import("../beads/bd");
+const { LABELS, beads } = await import("../beads/bd");
 
 // Every test below only cares whether the marker write HAPPENED and with what ids — never whether
 // the underlying `bd update` "succeeded" — so a resolved no-op is the right default throughout.
@@ -107,6 +113,7 @@ setBoardEvidenceBaselineMock.mockResolvedValue("");
 clearBoardEvidenceBaselineMock.mockResolvedValue("");
 setReviewFixBoardBaselineMock.mockResolvedValue("");
 clearReviewFixBoardBaselineMock.mockResolvedValue("");
+setReviewFixDispatchStartedMock.mockResolvedValue("");
 unverifyBoardEvidenceBaselineMock.mockResolvedValue("");
 setBoardEvidenceDispatchStartedMock.mockResolvedValue("");
 setBoardEvidenceCleanupUnsyncedMock.mockResolvedValue("");
@@ -1911,6 +1918,51 @@ describe(
       await expect(releaseReviewFixBoardBaseline("/repo", "t-1")).resolves.toBe(false);
 
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+  },
+);
+
+describe(
+  "markReviewFixDispatchStarted — durably records that PR-fix dispatch began (chatgpt-codex-connector, " +
+    "PR #284 review, \"Mark PR-fix dispatch before trusting recovered baselines\") — closes the same " +
+    "pre-dispatch-vs-recovered ambiguity `markReviewGateDispatchStarted` closes for the self-review path",
+  () => {
+    it("reads false off a bead with no dispatch-started marker", () => {
+      expect(beads.reviewFixDispatchStarted(bead("t-1"))).toBe(false);
+    });
+
+    it("reads true off a bead carrying the marker", () => {
+      expect(beads.reviewFixDispatchStarted(bead("t-1", { metadata: { reviewFixDispatchStarted: "1" } }))).toBe(
+        true,
+      );
+    });
+
+    it("persists and confirms synced", async () => {
+      setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("synced");
+
+      await expect(markReviewFixDispatchStarted("/repo", "t-dispatching")).resolves.toBe(true);
+
+      expect(setReviewFixDispatchStartedMock).toHaveBeenCalledWith("/repo", "t-dispatching");
+    });
+
+    it("returns false, never throwing, when the write cannot be persisted after every retry", async () => {
+      setReviewFixDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setReviewFixDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      setReviewFixDispatchStartedMock.mockRejectedValueOnce(new Error("dolt contention"));
+      const pushCallsBefore = pushMock.mock.calls.length;
+
+      await expect(markReviewFixDispatchStarted("/repo", "t-dispatch-unpersisted")).resolves.toBe(false);
+
+      // Never reaches the confirming push at all — nothing landed locally to confirm.
+      expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+    });
+
+    it("returns false when the write lands locally but the confirming push never syncs", async () => {
+      setReviewFixDispatchStartedMock.mockResolvedValueOnce("");
+      pushMock.mockResolvedValueOnce("not-wired");
+
+      await expect(markReviewFixDispatchStarted("/repo", "t-dispatch-unconfirmed")).resolves.toBe(false);
     });
   },
 );
