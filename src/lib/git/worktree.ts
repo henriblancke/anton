@@ -1607,8 +1607,11 @@ export async function createWorktree(opts: {
 }
 
 /**
- * {@link warmWorktree}, logged and swallowed rather than thrown — warming is an accelerator, never
- * a gate. Exported (not just `createWorktree`'s own inline `warm: true`) for a caller that must
+ * {@link warmWorktree}, logged and REPORTED rather than thrown — warming is an accelerator, never
+ * a gate. The returned {@link WarmOutcome} is what a caller persists (anton-jyrhf); nothing here
+ * throws, so a caller that only wants the acceleration can ignore it exactly as before.
+ *
+ * Exported (not just `createWorktree`'s own inline `warm: true`) for a caller that must
  * persist a refresh boundary before warming starts (anton-s55u, PR #279 review, P1): warming can
  * run for minutes, and a process killed during it would otherwise leave a rebased/merged branch
  * with no persisted record of the boundary it was mutated onto, so a resume after the crash
@@ -1624,14 +1627,18 @@ export async function warmWorktreeBestEffort(
   wt: Worktree,
   signal?: AbortSignal,
   warm?: WarmConfig,
-): Promise<void> {
+): Promise<WarmOutcome> {
   try {
-    await warmWorktree(wt, signal, warm);
+    return await warmWorktree(wt, signal, warm);
   } catch (err) {
+    const detail = warmFailureDetail(err);
     console.warn(
-      `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ` +
-        `${err instanceof Error ? err.message : String(err)}`,
+      `[worktree] warming ${wt.path} failed unexpectedly — continuing without it: ${detail}`,
     );
+    // `failed` with no command: warming broke before it could resolve one, so there is no label to
+    // name. Reported rather than swallowed — this path is as invisible to a later symptom as a
+    // failed install is, and just as worth having on the row.
+    return { outcome: "failed", error: detail };
   }
 }
 
@@ -1758,6 +1765,11 @@ export interface WarmCommand {
   label: string;
 }
 
+/** What warming resolved to: a command to run, or nothing — and which kind of nothing. */
+export type WarmPlan =
+  | { command: WarmCommand; reason?: undefined }
+  | { command: null; reason: "disabled" | "skipped" };
+
 /**
  * A project's warming decision, narrowed to what {@link resolveWarmCommand} needs. Declared here
  * rather than alongside the settings it comes from so the git layer owns its own seam and takes no
@@ -1768,6 +1780,23 @@ export interface WarmConfig {
   command?: string;
   /** False only when the operator explicitly turned warming off; absent stays ON. */
   enabled: boolean;
+}
+
+/**
+ * What warming did to a checkout, reported to the caller instead of only to a console (anton-jyrhf).
+ * The failure this exists for was invisible for minutes and then misattributed: a warm that died on
+ * an unresolvable dependency surfaced later as a git push error naming an unrelated subsystem, with
+ * nothing queryable recording the real cause at the moment it happened. A caller that outlives the
+ * process's stdout persists this onto its own record — see execute-epic-claim.ts and the
+ * `warmOutcome` column's own note.
+ */
+export interface WarmOutcome {
+  /** See `schema.runs.warmOutcome` for what each value means; the column stores these verbatim. */
+  outcome: "ok" | "failed" | "skipped" | "disabled";
+  /** The command's log label — present only when one actually ran (`ok` or `failed`). */
+  command?: string;
+  /** The bounded tail of what a failed install said. Present only on `failed`. */
+  error?: string;
 }
 
 /** The `off` spellings {@link WARM_ENV} recognizes. */
@@ -1810,6 +1839,17 @@ function resolveInstallCommand(
   return { file, args: [...install.args], label: `${install.bin} ${install.args.join(" ")}` };
 }
 
+/** The rungs that short-circuit before any lockfile detection — rungs 1-5 of {@link resolveWarmCommand}'s ladder. */
+function warmOverride(env: Record<string, string | undefined>, warm?: WarmConfig): WarmPlan | undefined {
+  if (warmDisabledByEnv(env)) return { command: null, reason: "disabled" };
+  if (warm?.enabled === false) return { command: null, reason: "disabled" };
+  const pinned = warm?.command?.trim() || env[WARM_COMMAND_ENV]?.trim();
+  if (pinned) return { command: shellWarmCommand(pinned) };
+  // Reported as `disabled` for the same reason the opt-outs are: nothing was even looked for.
+  if (env.VITEST) return { command: null, reason: "disabled" };
+  return undefined;
+}
+
 /**
  * The project-setup command `worktreePath` needs, or null when there is nothing to run. Null covers
  * every "no-op when nothing is needed" case: warming turned off, no recognized lockfile, a completed
@@ -1833,6 +1873,8 @@ function resolveInstallCommand(
  *
  * `warm` is last and optional so every caller that has no project config — and there is one until
  * anton-743gk threads it in — keeps behaving exactly as it did before rungs 2 and 3 existed.
+ *
+ * The command half of {@link resolveWarmPlan}, for a caller that doesn't care WHY there is nothing.
  */
 export function resolveWarmCommand(
   worktreePath: string,
@@ -1840,13 +1882,33 @@ export function resolveWarmCommand(
   isExec: (p: string) => boolean = isExecutableFile,
   warm?: WarmConfig,
 ): WarmCommand | null {
-  if (warmDisabledByEnv(env)) return null;
-  if (warm?.enabled === false) return null;
-  const pinned = warm?.command?.trim() || env[WARM_COMMAND_ENV]?.trim();
-  if (pinned) return shellWarmCommand(pinned);
-  if (env.VITEST) return null;
+  return resolveWarmPlan(worktreePath, env, isExec, warm).command;
+}
+
+/**
+ * Warming's whole decision for `worktreePath`: the command to run, or nothing — and which kind of
+ * nothing. `skipped` covers every "no-op when nothing is needed" case (no recognized lockfile, a
+ * completed install already newer than the lockfile, or no package manager on the search path);
+ * `disabled` means warming was turned off and nothing was even looked for.
+ *
+ * Those two are kept apart because the run row has to record the difference (anton-jyrhf) — a
+ * `disabled` warm explains a cold tree, a `skipped` one says the tree was already warm — and the
+ * decision belongs here, not re-derived from the environment by whoever persists the outcome.
+ *
+ * The single testable seam: the shell-out itself is a one-liner, and `env` and `isExec` are
+ * injectable so the decision can be tested without a machine's real toolchain.
+ */
+export function resolveWarmPlan(
+  worktreePath: string,
+  env: Record<string, string | undefined> = process.env,
+  isExec: (p: string) => boolean = isExecutableFile,
+  warm?: WarmConfig,
+): WarmPlan {
+  const override = warmOverride(env, warm);
+  if (override) return override;
   const install = detectedInstall(worktreePath);
-  return install ? (resolveInstallCommand(install, worktreePath, env, isExec) ?? null) : null;
+  const command = install ? resolveInstallCommand(install, worktreePath, env, isExec) : undefined;
+  return command ? { command } : { command: null, reason: "skipped" };
 }
 
 /**
@@ -1919,11 +1981,16 @@ export function warmChildEnv(parent: NodeJS.ProcessEnv = process.env): NodeJS.Pr
  * accelerator, not a gate — the verify gates still fail on the real error if the deps were genuinely
  * required, and an install anton can't complete (private registry, no network) must not be able to
  * lose an otherwise-good run.
+ *
+ * Returns what it did (anton-jyrhf) so the failure is queryable at the moment it occurs rather than
+ * three phases later as someone else's error. Reporting never changes control flow: every outcome,
+ * including `failed`, returns normally.
  */
-async function warmWorktree(wt: Worktree, signal?: AbortSignal, warm?: WarmConfig): Promise<void> {
-  const cmd = resolveWarmCommand(wt.path, process.env, isExecutableFile, warm);
-  if (!cmd) return;
+async function warmWorktree(wt: Worktree, signal?: AbortSignal, warm?: WarmConfig): Promise<WarmOutcome> {
+  const plan = resolveWarmPlan(wt.path, process.env, isExecutableFile, warm);
+  if (!plan.command) return { outcome: plan.reason };
 
+  const cmd = plan.command;
   try {
     await execFileAsync(cmd.file, cmd.args, {
       cwd: wt.path,
@@ -1935,14 +2002,30 @@ async function warmWorktree(wt: Worktree, signal?: AbortSignal, warm?: WarmConfi
       signal,
     });
     await stampWarmed(wt.path, cmd.label);
+    return { outcome: "ok", command: cmd.label };
   } catch (err) {
-    const e = err as { stderr?: string; message?: string };
-    const detail = (e.stderr?.trim() || e.message || String(err)).slice(-2000);
+    const detail = warmFailureDetail(err);
+    // Still loud (anton-jyrhf): the returned outcome is a durable record for whoever persists it,
+    // not a replacement for the log a human tailing the daemon reads.
     console.warn(
       `[worktree] warming ${wt.path} with \`${cmd.label}\` failed — the run continues, but its first ` +
         `step may fail on missing dependencies: ${detail}`,
     );
+    return { outcome: "failed", command: cmd.label, error: detail };
   }
+}
+
+/** How much of a failed install's output is worth keeping: enough for the real error, never a log. */
+const WARM_ERROR_TAIL_CHARS = 2000;
+
+/**
+ * The tail of what a failed warm said — stderr when it wrote any, else whatever threw. Bounded HERE,
+ * at the source, so a runaway installer can never grow a run row without limit (see the
+ * `warmError` column's own note).
+ */
+function warmFailureDetail(err: unknown): string {
+  const e = err as { stderr?: string; message?: string };
+  return (e.stderr?.trim() || e.message || String(err)).slice(-WARM_ERROR_TAIL_CHARS);
 }
 
 /**
