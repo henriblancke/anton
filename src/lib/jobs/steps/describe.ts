@@ -292,7 +292,7 @@ async function resolveDescribeContract(
   }
   return {
     reasoning: await loadSkill("describe"),
-    attribution: { skillId: "describe", skillDigest: bundledSkillDigest("describe") },
+    attribution: { skillId: "describe", skillDigest: bundledSkillDigest("describe"), skillIsDefault: true },
   };
 }
 

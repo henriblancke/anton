@@ -100,6 +100,19 @@ describe("a healthy cohort", () => {
     expect(row.getByText("0.4")).toBeTruthy();
   });
 
+  it("names the year when the whole window sits inside one past calendar year (PR #331 review)", () => {
+    // Real once the `all` window on an older project spans multiple years: a window entirely inside
+    // 2020 must not render as "Aug 2 – Sep 4" with no year, which reads as the current year.
+    const pastWindow = {
+      firstDeliveryMs: Date.UTC(2020, 7, 2, 12),
+      lastDeliveryMs: Date.UTC(2020, 8, 4, 12),
+    };
+    render(<CohortView window="all" series={series([cohort("a3f1c2", OLD, undefined, pastWindow)])} />);
+
+    const row = within(rowFor("a3f1c2"));
+    expect(row.getByText("Aug 2, 2020 – Sep 4, 2020")).toBeTruthy();
+  });
+
   it("draws the move on the cohort that cleared the floor against a baseline that did too", () => {
     render(<CohortView window="all" series={SERIES} />);
 

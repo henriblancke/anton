@@ -287,15 +287,19 @@ const WINDOW_FORMAT_WITH_YEAR = new Intl.DateTimeFormat(DISPLAY_LOCALE, {
  * The span the cohort's averages are averages OVER — "Aug 2 – Sep 4", per the design's sketch.
  *
  * A single-day cohort renders one date rather than "Sep 4 – Sep 4", which reads as a formatting
- * failure. The year is included only when the endpoints fall in different calendar years — the "all"
- * window has no fixed length, so a cohort can genuinely span "Dec 20 – Jan 5", which without a year
- * reads as reversed rather than as a turn-of-year span. A recent-window cohort never crosses a year
- * boundary, so it keeps the terser, year-free form.
+ * failure. The year is included whenever either endpoint isn't in the CURRENT calendar year, not just
+ * when the two endpoints disagree with each other (PR #331 review) — the "all" window has no fixed
+ * length, so a cohort can span "Dec 20 – Jan 5" (needs a year or it reads as reversed) or sit entirely
+ * within one past year like "Aug 2 – Sep 4, 2024" (needs a year or it reads as this year). A
+ * recent-window cohort never leaves the current year, so it keeps the terser, year-free form.
  */
 function formatCohortWindow(window: CohortWindow): string {
   const firstDate = new Date(window.firstDeliveryMs);
   const lastDate = new Date(window.lastDeliveryMs);
-  const format = firstDate.getFullYear() === lastDate.getFullYear() ? WINDOW_FORMAT : WINDOW_FORMAT_WITH_YEAR;
+  const currentYear = new Date().getFullYear();
+  const sameYear =
+    firstDate.getFullYear() === lastDate.getFullYear() && firstDate.getFullYear() === currentYear;
+  const format = sameYear ? WINDOW_FORMAT : WINDOW_FORMAT_WITH_YEAR;
   const first = format.format(firstDate);
   const last = format.format(lastDate);
   return first === last ? first : `${first} – ${last}`;

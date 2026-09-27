@@ -698,6 +698,44 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
     expect(series.spanning).toEqual({ delivered: 1, features: 1 });
     expect(series.cohorts).toEqual([]);
   });
+
+  it("keeps a project's explicitly-configured skill even when it shares a scaffolding id (PR #331 review)", () => {
+    // `resolveDescribeContract` permits `skill:review`, loading the PROJECT's own `.claude/skills/
+    // review` — a legitimate choice that must not be discarded just because its id collides with the
+    // bundled review fallback's. `skillIsDefault: false` is what tells the two apart.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [{ skillId: "review", skillDigest: "project-review-digest", skillIsDefault: false }],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("project-review-digest");
+  });
+
+  it("still discards the bundled fallback when a row explicitly marks it, not just by id", () => {
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "describe", skillDigest: "describe-digest", skillIsDefault: true },
+          { skillId: "review", skillDigest: "review-digest", skillIsDefault: true },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBeNull();
+  });
 });
 
 describe("promptSeries: what the cohort reports about the antons it spans", () => {

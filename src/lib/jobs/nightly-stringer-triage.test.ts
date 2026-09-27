@@ -82,6 +82,6 @@ it("tells the caller's meter the /scan-triage skill's identity, since the dispat
     },
   });
 
-  expect(attribution).toMatchObject({ skillId: "scan-triage" });
+  expect(attribution).toMatchObject({ skillId: "scan-triage", skillIsDefault: true });
   expect(attribution?.skillDigest).toMatch(/^[0-9a-f]{12}$/);
 });

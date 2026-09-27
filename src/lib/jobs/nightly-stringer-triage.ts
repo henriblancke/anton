@@ -98,7 +98,11 @@ export async function runTriage(opts: {
     settings,
     boardSection,
   });
-  opts.setAttribution?.({ skillId: "scan-triage", skillDigest: bundledSkillDigest("scan-triage") });
+  opts.setAttribution?.({
+    skillId: "scan-triage",
+    skillDigest: bundledSkillDigest("scan-triage"),
+    skillIsDefault: true,
+  });
 
   const routing = claudeRouting(settings);
   await opts.claudeReached(quotaMeterKey(settings));

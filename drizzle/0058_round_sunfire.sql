@@ -1,0 +1,13 @@
+-- Whether `skill_id` named anton's own bundled default rather than a project's explicit `skill:<id>`
+-- choice (PR #331 review). `prompt-series.ts`'s skill-dimension fold reads the four scaffolding ids
+-- (describe/review/review-fix/scan-triage) as unstamped so their always-on defaults don't make every
+-- delivered feature look like it spans several skills — but a project is free to name its own skill
+-- `review`, and that row must not be discarded just because the id collides with the fallback's.
+--
+-- Nullable and NOT backfilled: NULL means "not marked either way", which covers every row written
+-- before this column existed. `isScaffoldingFallback` (prompt-series.ts) falls back to the id-only
+-- heuristic for those, so a legacy row reads exactly as it did before this column existed.
+--
+-- Reverse:
+--   ALTER TABLE `claude_invocations` DROP COLUMN `skill_is_default`;
+ALTER TABLE `claude_invocations` ADD `skill_is_default` integer;

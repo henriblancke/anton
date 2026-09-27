@@ -450,6 +450,16 @@ export interface CohortStampRow {
   skillId?: string | null;
   /** The digest of the skill text a step resolved — `skill`. */
   skillDigest?: string | null;
+  /**
+   * Whether {@link skillId} named anton's own bundled default (no `prompt:`/`skill:` override and
+   * no project setting configured it) rather than something a project explicitly chose — stamped by
+   * the resolver at write time (PR #331 review), since a project is free to name its own skill
+   * `review` or `describe` and that row must not be read as the scaffolding fallback just because the
+   * id collides. `null`/`undefined` on a row written before this column existed, or on any row a
+   * resolver never marked either way; {@link stampValue} falls back to the id-only heuristic for
+   * those rather than treating "unmarked" as "explicit".
+   */
+  skillIsDefault?: boolean | null;
 }
 
 /**
@@ -533,10 +543,24 @@ export interface SpanningFeatures {
  * feature with TWO distinct skill digests — `describe`'s and `review`'s — and {@link featureKeys}
  * would then read every such feature as spanning several skills, emptying the skill dimension into
  * {@link SpanningFeatures} instead of a cohort. These ids carry no opinion about which skill a
- * project is trying out; a row naming one is read as unstamped for the `skill` dimension, exactly
- * like a row with no `skill_id` at all.
+ * project is trying out — PROVIDED the row is actually the fallback: {@link isScaffoldingFallback}
+ * is what a row is tested against, this set is only its last resort for rows written before
+ * {@link CohortStampRow.skillIsDefault} existed (PR #331 review). A project is free to name its own
+ * `.claude/skills/review` and have it run under `skill:review`; that row must still read as its own
+ * digest, not fold into the unstamped cohort just because the id happens to match.
  */
 const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan-triage"]);
+
+/**
+ * Whether a row's {@link CohortStampRow.skillId} is anton's own scaffolding fallback rather than a
+ * project's explicit choice. Trusts {@link CohortStampRow.skillIsDefault} when the resolver stamped
+ * it; falls back to the id-only heuristic ({@link SCAFFOLDING_SKILL_IDS}) only for a row written
+ * before that column existed, since "unmarked" there means "we don't know", not "explicit".
+ */
+function isScaffoldingFallback(row: CohortStampRow): boolean {
+  if (row.skillIsDefault !== undefined && row.skillIsDefault !== null) return row.skillIsDefault;
+  return !!row.skillId && SCAFFOLDING_SKILL_IDS.has(row.skillId);
+}
 
 /**
  * One stamp value as a cohort key, or `undefined` for a row that recorded none.
@@ -546,7 +570,7 @@ const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan
  * compute, and a cohort keyed on `""` would present that failure as a prompt.
  */
 function stampValue(row: CohortStampRow, dimension: CohortDimension): string | undefined {
-  if (dimension === "skill" && row.skillId && SCAFFOLDING_SKILL_IDS.has(row.skillId)) return undefined;
+  if (dimension === "skill" && isScaffoldingFallback(row)) return undefined;
   const raw = row[DIMENSION_COLUMNS[dimension]];
   const value = typeof raw === "string" ? raw.trim() : "";
   return value || undefined;
