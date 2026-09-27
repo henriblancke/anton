@@ -982,13 +982,28 @@ async function runFixSession(args: {
     // reused from a preserved value above: the write is then a no-op, but the confirming push still
     // reconfirms it reached the remote, the same reconfirm-on-retry `readBoardBaseline`'s own callers
     // already rely on.
-    if (boardOnly && boardBefore && !(await persistReviewFixBoardBaseline(repo, epic.id, boardBefore))) {
-      throw new PoisonError(
-        `the review fix for ${epic.id} read a board-only baseline for PR #${number} but could not ` +
-          `persist it before dispatch — refusing to dispatch: without a durable copy, a crash after ` +
-          `the fixer's own board write could never be told apart from no progress. Resolve the board ` +
-          `write, then resume.`,
+    //
+    // `persistReviewFixBoardBaseline`'s own confirming push can pull in a write from another
+    // embedded-board writer between the read above and this persist (chatgpt-codex-connector, PR
+    // #284 review, "Refresh the PR-fix baseline after the confirming pull") — its return value is the
+    // refreshed baseline that actually reached the remote, which every later read this session diffs
+    // against instead of the possibly-stale value read before the pull.
+    if (boardOnly && boardBefore) {
+      const persistedBaseline = await persistReviewFixBoardBaseline(
+        repo,
+        epic.id,
+        boardBefore,
+        defaultReadBoardFingerprint,
       );
+      if (!persistedBaseline) {
+        throw new PoisonError(
+          `the review fix for ${epic.id} read a board-only baseline for PR #${number} but could not ` +
+            `persist it before dispatch — refusing to dispatch: without a durable copy, a crash after ` +
+            `the fixer's own board write could never be told apart from no progress. Resolve the board ` +
+            `write, then resume.`,
+        );
+      }
+      boardBefore = persistedBaseline;
     }
 
     const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({

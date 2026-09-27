@@ -1774,12 +1774,16 @@ describe(
       expect(readReviewFixBoardBaseline(ticket)).toEqual({ beads: new Map(Object.entries(preserved)) });
     });
 
-    it("persists the baseline and confirms it synced", async () => {
+    it("persists the baseline, confirms it synced, and returns it unchanged when the confirming " +
+      "push's own re-read finds nothing new", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       setReviewFixBoardBaselineMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("synced");
+      const readBoardFingerprint = vi.fn().mockResolvedValueOnce(baseline);
 
-      await expect(persistReviewFixBoardBaseline("/repo", "t-1", baseline)).resolves.toBe(true);
+      await expect(
+        persistReviewFixBoardBaseline("/repo", "t-1", baseline, readBoardFingerprint),
+      ).resolves.toEqual(baseline);
 
       expect(setReviewFixBoardBaselineMock).toHaveBeenCalledWith(
         "/repo",
@@ -1787,6 +1791,48 @@ describe(
         Object.fromEntries(baseline.beads),
       );
       expect(pushMock).toHaveBeenCalledWith("/repo");
+      expect(readBoardFingerprint).toHaveBeenCalledWith("/repo", "t-1");
+    });
+
+    it("refreshes and re-persists the baseline when the confirming push's pull-first pass imported " +
+      "an unrelated write (chatgpt-codex-connector, PR #284 review, \"Refresh the PR-fix baseline " +
+      "after the confirming pull\") — otherwise the later post-fix diff would credit that imported " +
+      "change to a no-op fixer as its own repair", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      const pulledIn = fingerprintBoard([bead("a"), bead("b")]);
+      setReviewFixBoardBaselineMock.mockResolvedValueOnce(""); // the initial persist
+      pushMock.mockResolvedValueOnce("synced"); // its confirming push, which pulled in bead "b"
+      setReviewFixBoardBaselineMock.mockResolvedValueOnce(""); // the refreshed persist
+      pushMock.mockResolvedValueOnce("synced"); // the refreshed persist's own confirming push
+      const readBoardFingerprint = vi
+        .fn()
+        .mockResolvedValueOnce(pulledIn) // first refresh read: still differs from `baseline`
+        .mockResolvedValueOnce(pulledIn); // second refresh read: matches the just-persisted refresh
+
+      await expect(
+        persistReviewFixBoardBaseline("/repo", "t-1", baseline, readBoardFingerprint),
+      ).resolves.toEqual(pulledIn);
+
+      expect(setReviewFixBoardBaselineMock).toHaveBeenLastCalledWith(
+        "/repo",
+        "t-1",
+        Object.fromEntries(pulledIn.beads),
+      );
+      expect(readBoardFingerprint).toHaveBeenCalledTimes(2);
+    });
+
+    it("fails closed when the board keeps drifting under its own confirming push, never settling " +
+      "within the bounded refresh rounds", async () => {
+      const baseline = fingerprintBoard([bead("a")]);
+      setReviewFixBoardBaselineMock.mockResolvedValue("");
+      pushMock.mockResolvedValue("synced");
+      const readBoardFingerprint = vi.fn().mockImplementation(async () =>
+        fingerprintBoard([bead("a"), bead(`drift-${readBoardFingerprint.mock.calls.length}`)]),
+      );
+
+      await expect(
+        persistReviewFixBoardBaseline("/repo", "t-1", baseline, readBoardFingerprint),
+      ).resolves.toBeNull();
     });
 
     it("fails closed — never claiming success — when the persist itself cannot be written after retries", async () => {
@@ -1795,19 +1841,27 @@ describe(
       setReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
       setReviewFixBoardBaselineMock.mockRejectedValueOnce(new Error("bd refused"));
       const pushCallsBefore = pushMock.mock.calls.length;
+      const readBoardFingerprint = vi.fn();
 
-      await expect(persistReviewFixBoardBaseline("/repo", "t-1", baseline)).resolves.toBe(false);
+      await expect(
+        persistReviewFixBoardBaseline("/repo", "t-1", baseline, readBoardFingerprint),
+      ).resolves.toBeNull();
 
       // Never even attempts the confirming push once the local write itself is unconfirmed.
       expect(pushMock.mock.calls.length).toBe(pushCallsBefore);
+      expect(readBoardFingerprint).not.toHaveBeenCalled();
     });
 
     it("fails closed when the write lands locally but the confirming push cannot verify it reached the remote", async () => {
       const baseline = fingerprintBoard([bead("a")]);
       setReviewFixBoardBaselineMock.mockResolvedValueOnce("");
       pushMock.mockResolvedValueOnce("not-wired");
+      const readBoardFingerprint = vi.fn();
 
-      await expect(persistReviewFixBoardBaseline("/repo", "t-1", baseline)).resolves.toBe(false);
+      await expect(
+        persistReviewFixBoardBaseline("/repo", "t-1", baseline, readBoardFingerprint),
+      ).resolves.toBeNull();
+      expect(readBoardFingerprint).not.toHaveBeenCalled();
     });
 
     it("releases the preserved baseline and confirms the release synced", async () => {

@@ -327,26 +327,65 @@ export function readReviewFixBoardBaseline(ticket: Bead): BoardFingerprint | und
  * the fixer's own live board write but before this session reads it back (or its catch-block audit
  * runs) leaves a resumed attempt with only a FRESH read to diff against — one that already contains
  * the repair — so the delta the repair produced could never be told apart from no progress at all.
- * Confirmed synced like every other board-evidence write in this module; returns `false` (never
+ * Confirmed synced like every other board-evidence write in this module; returns `null` (never
  * throws) on persist or push failure so the caller can fail closed the same way an unreadable
  * baseline already does. Safe to call every attempt, including one reusing a baseline
  * {@link readReviewFixBoardBaseline} already found preserved — the write is then a no-op and the
  * confirming push simply reconfirms it, the same reconfirm-on-retry `readBoardBaseline`'s own caller
  * relies on.
+ *
+ * The confirming push is a pull → commit → push pass (`runDoltSync`), so it can pull in a write from
+ * another embedded-board writer with access to the same board — a sibling run, a gardener pass,
+ * another machine on a shared-server board — landing between the caller's own read and this call,
+ * which `baseline` does not reflect (chatgpt-codex-connector, PR #284 review, "Refresh the PR-fix
+ * baseline after the confirming pull"). Left uncorrected, `runFixSession`'s later post-fix diff —
+ * still measured against the stale `baseline` this returned — would credit that imported, unrelated
+ * change to a no-op fixer as its own repair, resolving a board-only review thread without the
+ * requested fix ever landing. So once the confirming push lands, this mirrors {@link
+ * persistReviewGateBoardBaseline}'s own bounded refresh loop exactly: re-read the board through
+ * `readBoardFingerprint` (the SAME read the caller uses for its own pre/post reads, so a resumed
+ * attempt and a fresh one see identical semantics) and, as long as that read still differs from the
+ * last baseline confirmed, persist and confirm a REFRESHED baseline taken after it, looping bounded
+ * at {@link BASELINE_REFRESH_ROUNDS} rounds so a board under continuous unrelated churn fails closed
+ * (`null`) rather than chasing a moving target forever. The refreshed baseline is returned to the
+ * caller, which must use it — not the value it passed in — for every later read this session diffs
+ * against.
  */
 export async function persistReviewFixBoardBaseline(
   repo: string,
   ticketId: string,
   baseline: BoardFingerprint,
-): Promise<boolean> {
+  readBoardFingerprint: (repo: string, ticketId: string) => Promise<BoardFingerprint | undefined>,
+): Promise<BoardFingerprint | null> {
   const persisted = await mustPersist(() =>
     beads.setReviewFixBoardBaseline(repo, ticketId, serializeFingerprint(baseline)),
   );
-  if (!persisted) return false;
-  return beads
+  if (!persisted) return null;
+  const synced = await beads
     .push(repo)
     .then((outcome) => outcome === "synced" || outcome === "shared-server")
     .catch(() => false);
+  if (!synced) return null;
+
+  let confirmed = baseline;
+  for (let round = 0; round < BASELINE_REFRESH_ROUNDS; round += 1) {
+    const refreshed = await readBoardFingerprint(repo, ticketId);
+    if (!refreshed) return null;
+    if (boardEvidence(confirmed, refreshed).length === 0) return confirmed;
+    const refreshedPersisted = await mustPersist(() =>
+      beads.setReviewFixBoardBaseline(repo, ticketId, serializeFingerprint(refreshed)),
+    );
+    if (!refreshedPersisted) return null;
+    const refreshedSynced = await beads
+      .push(repo)
+      .then((outcome) => outcome === "synced" || outcome === "shared-server")
+      .catch(() => false);
+    if (!refreshedSynced) return null;
+    confirmed = refreshed;
+  }
+  // Every round found the board still drifting under its own confirming push — fail closed rather
+  // than hand the caller a baseline that may still omit a change landing right now.
+  return null;
 }
 
 /**
