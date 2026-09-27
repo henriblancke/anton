@@ -1,4 +1,4 @@
-import { beads, type Bead, type DepCycle } from "./bd";
+import { beads, ownerOf, type Bead, type DepCycle } from "./bd";
 import { runTargetResolver } from "../epic-graph";
 import {
   attachCycleEvidence,
@@ -383,13 +383,20 @@ async function recheckBlocksConsistency(
  * Without this field the two keys still compared equal, so `loadAllIssues` waved the stale board
  * through and `startGuard` (picker-apply-claim.ts) could approve/claim work against a contract that
  * had just been gutted.
+ *
+ * {@link ownerOf}'s normalized assignee is in the key too (P1 review, PR #274, issues.ts:392): on a
+ * shared-server board another worker can claim the target itself between the initial listing and
+ * the post-`depCycles` re-list without touching status, labels, description, or ancestors. Without
+ * this field the two keys still compared equal, so `loadAllIssues` returned the stale, still-shown-
+ * unclaimed bead and `approveAndClaim` passed it to `cas(...)` as `current` — `claim.ts` then skips
+ * its own `bd show` and can overwrite the newly landed owner instead of losing the CAS.
  */
 function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
   const byId = new Map(list.map((bead) => [bead.id, bead]));
   return (id: string) => {
     const bead = byId.get(id);
     if (!bead) return undefined;
-    return `${bead.status}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${ancestorChain(id, list).join(">")}`;
+    return `${bead.status}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${ownerOf(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
   };
 }
 
@@ -737,7 +744,14 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
         const knownIds = new Set(board.map((bead) => bead.id));
         const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
         if (missingCycleIds.length > 0) {
-          const hydratedGates = await loadGateIssues(cwd, false, missingCycleIds);
+          // Strict, not the degrade-to-`[]` mode `loadGateIssues` otherwise offers (P1 review, PR
+          // #274, issues.ts:740): a swallowed failure here would leave these ids unhydrated while
+          // `consistent` stays true from the check above, attaching `cycles` evidence to a board that
+          // can't map every named member — `cycleMembers` then reports a synthetic, unscoped fault
+          // that rejects unrelated targets instead of scoping to the cycle's own subtree. Letting the
+          // failure throw instead routes it to this function's own outer catch, which already leaves
+          // evidence unattached without failing the read that produced `board`.
+          const hydratedGates = await loadGateIssues(cwd, true, missingCycleIds);
           // Check generation BEFORE mutating `board`, not after (P2 review, PR #274,
           // issues.ts:564 on an earlier version of this block): `board` can still be the
           // entry's own retained array, so pushing onto it and only then checking left a write
