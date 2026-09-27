@@ -58,6 +58,24 @@ export interface FeatureLedger {
   friction: LedgerFriction;
 }
 
+/** What a caller can hand this read instead of letting it fetch — see {@link featureLedger}. */
+export interface FeatureLedgerOptions {
+  /**
+   * The board snapshot the caller already holds, passed in rather than re-fetched.
+   *
+   * Same discipline `feature-scope.ts` states for `ledgerScope` itself, extended one level out: a
+   * surface that resolves a feature before asking for its ledger has ALREADY read the board to do
+   * it, and the two reads must agree. Fetching a second one here leaves the page's 404 decision and
+   * the scope the money is summed over resolved against boards that a concurrent bd write can put
+   * out of step — a ledger rendered under a title from a different snapshot.
+   *
+   * Omitted, the read fetches its own (a CLI or a job holding no board).
+   */
+  board?: Bead[];
+  /** Gateway prices for models `model-pricing` has no direct rate for. */
+  gatewayPricing?: GatewayPricing;
+}
+
 /**
  * What `beadId` — plus its working-layer children (`ledgerScope`) — cost and how long it took,
  * folded from rows anton already writes. `undefined` when `projectId` names no project.
@@ -66,12 +84,12 @@ export async function featureLedger(
   db: AntonDb,
   projectId: string,
   beadId: string,
-  gatewayPricing?: GatewayPricing,
+  { board: given, gatewayPricing }: FeatureLedgerOptions = {},
 ): Promise<FeatureLedger | undefined> {
   const project = await getProjectById(db, projectId);
   if (!project) return undefined;
 
-  const board = await listAllBeads(project);
+  const board = given ?? (await listAllBeads(project));
   const scope = ledgerScope(board, beadId);
   const [rows, deliveries, jobs, escalations, rounds] = await Promise.all([
     invocationsForBeads(db, projectId, scope.ids),
@@ -167,7 +185,7 @@ function sendBackNotes(board: readonly Bead[], ids: readonly string[]): Friction
 export function projectFeatureLedger(
   projectId: string,
   beadId: string,
-  gatewayPricing?: GatewayPricing,
+  opts?: FeatureLedgerOptions,
 ): Promise<FeatureLedger | undefined> {
-  return featureLedger(getDb(), projectId, beadId, gatewayPricing);
+  return featureLedger(getDb(), projectId, beadId, opts);
 }
