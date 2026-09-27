@@ -220,15 +220,16 @@ describe("loadAllIssues", () => {
     listMock
       .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
       .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
-      .mockImplementationOnce(async () => [repaired, other]); // retry's work read — no blocks edge left,
-    // so the retry's own recheck is skipped (nothing cyclic in this snapshot could be stale)
+      .mockImplementationOnce(async () => [repaired, other]) // retry's work read — no blocks edge left
+      .mockImplementationOnce(async () => [repaired, other]); // retry's own recheck — no longer skipped
+    // just because this snapshot carries no edge (P2 review, PR #274, issues.ts:315) — stable
     cyclesMock.mockResolvedValue([]);
 
     const board = await loadAllIssues(REPO, { withCycles: true });
 
     expect(board).toEqual([repaired, other]);
     expect(cycleEvidenceFor(board)).toEqual([]);
-    expect(listMock).toHaveBeenCalledTimes(3);
+    expect(listMock).toHaveBeenCalledTimes(4);
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
@@ -286,13 +287,18 @@ describe("loadAllIssues", () => {
     expect(listMock.mock.calls.length).toBeLessThan(20);
   });
 
-  it("skips the recheck when `work` carries no `blocks` edge at all, regardless of the cycles result", async () => {
+  it("still runs the recheck when `work` carries no `blocks` edge at all (P2 review, PR #274, issues.ts:315)", async () => {
+    // A board that reads as edge-free is exactly what a shared-server writer's very FIRST `blocks`
+    // edge lands into, in the gap between this call's own work read and `bd dep cycles` settling. An
+    // acyclic edge never shows up in `cycles`, so only a re-list — not the cycle evidence itself —
+    // can catch it; skipping the recheck here (a prior version of this test locked that in) let a
+    // newly added blocker go unnoticed by both the cycle check and `structureGaps`' raw-edge rules.
     listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
-    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    cyclesMock.mockResolvedValue([]);
 
     await loadAllIssues(REPO, { withCycles: true });
 
-    expect(listMock).toHaveBeenCalledTimes(1);
+    expect(listMock).toHaveBeenCalledTimes(2);
   });
 
   it("still retries on a non-empty cycles result when it doesn't cover a stale blocks edge in the earlier board (P2 review round 18 on PR #274)", async () => {
@@ -311,6 +317,8 @@ describe("loadAllIssues", () => {
       .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
       .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
       .mockImplementationOnce(async () => [repaired, other]) // retry's work read — no blocks edge left
+      .mockImplementationOnce(async () => [repaired, other]) // retry's own recheck — no longer skipped
+      // just because this snapshot carries no edge (P2 review, PR #274, issues.ts:315) — stable
       .mockImplementationOnce(async () => []); // retry's gate hydration read — t-9 isn't a gate either
     cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
 
@@ -318,7 +326,7 @@ describe("loadAllIssues", () => {
 
     expect(board).toEqual([repaired, other]);
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
-    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(listMock).toHaveBeenCalledTimes(5);
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
@@ -393,8 +401,10 @@ describe("loadAllIssues", () => {
     const cycleB = [{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }];
     listMock
       .mockImplementationOnce(async () => [solo]) // attempt 0's own work read
+      .mockImplementationOnce(async () => [solo]) // attempt 0's pre-hydration recheck re-list — unchanged
       .mockImplementationOnce(async () => [gateA, gateB]) // attempt 0's gate hydration — still cycle A
       .mockImplementationOnce(async () => [solo]) // attempt 1's own work read
+      .mockImplementationOnce(async () => [solo]) // attempt 1's pre-hydration recheck re-list — unchanged
       .mockImplementationOnce(async () => [gateC, gateD]) // attempt 1's gate hydration — now cycle B
       .mockImplementationOnce(async () => [solo]) // attempt 1's post-hydration edge recheck work read
       .mockImplementationOnce(async () => [gateC, gateD]); // attempt 1's post-hydration edge recheck gate read — stable
@@ -408,7 +418,7 @@ describe("loadAllIssues", () => {
 
     expect(board.map((b) => b.id).sort()).toEqual(["g-3", "g-4", "t-3"]);
     expect(cycleEvidenceFor(board)).toEqual(cycleB);
-    expect(listMock).toHaveBeenCalledTimes(6);
+    expect(listMock).toHaveBeenCalledTimes(8);
     expect(cyclesMock).toHaveBeenCalledTimes(4);
   });
 
@@ -445,10 +455,12 @@ describe("loadAllIssues", () => {
     const cycleA = [{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }];
     listMock
       .mockImplementationOnce(async () => [solo]) // this call's own work read
+      .mockImplementationOnce(async () => [solo]) // pre-hydration recheck re-list — unchanged
       .mockImplementationOnce(async () => [gateABefore, gateB]) // gate hydration — t-6 edge still present
       .mockImplementationOnce(async () => [solo]) // post-hydration edge recheck work read
       .mockImplementationOnce(async () => [gateAAfter, gateB]) // post-hydration edge recheck gate read — t-6 edge just resolved
       .mockImplementationOnce(async () => [solo]) // retry's own work read
+      .mockImplementationOnce(async () => [solo]) // retry's pre-hydration recheck re-list — unchanged
       .mockImplementationOnce(async () => [gateAAfter, gateB]) // retry's gate hydration — stable
       .mockImplementationOnce(async () => [solo]) // retry's post-hydration edge recheck work read
       .mockImplementationOnce(async () => [gateAAfter, gateB]); // retry's post-hydration edge recheck gate read — stable
@@ -459,7 +471,7 @@ describe("loadAllIssues", () => {
     expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
     expect(board.find((b) => b.id === "g-1")?.dependencies).toEqual(gateAAfter.dependencies);
     expect(cycleEvidenceFor(board)).toEqual(cycleA);
-    expect(listMock).toHaveBeenCalledTimes(8);
+    expect(listMock).toHaveBeenCalledTimes(10);
     expect(cyclesMock).toHaveBeenCalledTimes(4);
   });
 
