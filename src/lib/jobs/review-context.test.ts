@@ -1318,12 +1318,12 @@ describe("buildFindingsFixPrompt", () => {
 
       expect(prompt).toContain("This run may deliver via the board");
       expect(prompt).toContain("is NOT evidence you made no progress");
-      expect(prompt).toContain("bd -C '/repos/anton' update <id>");
+      expect(prompt).toContain("bd -C '/repos/anton' close <id>");
       // The system prompt must carry the same carve-out (PR #284 review round 16): without it, the
       // fixer's base contract still forbids reporting `delivered` on an unchanged tree, contradicting
       // the human-turn prompt above.
       expect(appendSystemPrompt).toContain("## This ticket is board-only");
-      expect(appendSystemPrompt).toContain("bd -C '/repos/anton' update <id>");
+      expect(appendSystemPrompt).toContain("bd -C '/repos/anton' close <id>");
     },
   );
 

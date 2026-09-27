@@ -89,7 +89,7 @@ describe("composeSystemPrompt", () => {
   // non-server board. The carve-out must tell the agent to point writes at the live board explicitly.
   it("tells a board-only agent to redirect bd writes at the live repo path via -C", () => {
     const out = composeSystemPrompt({ base, boardOnly: true, repoPath: "/live/repo" });
-    expect(out).toContain("bd -C '/live/repo' update <id> --status done");
+    expect(out).toContain("bd -C '/live/repo' close <id>");
     expect(out.toLowerCase()).toContain("separate, unsynced copy");
   });
 
@@ -104,7 +104,7 @@ describe("composeSystemPrompt", () => {
   // by the agent's shell into multiple arguments, silently misdirecting the `-C` flag.
   it("shell-quotes a repo path containing whitespace in the -C example", () => {
     const out = composeSystemPrompt({ base, boardOnly: true, repoPath: "/tmp/Repo One" });
-    expect(out).toContain("bd -C '/tmp/Repo One' update <id> --status done");
+    expect(out).toContain("bd -C '/tmp/Repo One' close <id>");
   });
 
   // chatgpt-codex-connector, PR #284 review, "Avoid the board-only system contract for mixed runs":
@@ -130,7 +130,7 @@ describe("composeSystemPrompt", () => {
 
   it("keeps the live-board -C redirect instruction in the mixed-run wording too", () => {
     const out = composeSystemPrompt({ base, boardOnly: true, mixedBoardOnly: true, repoPath: "/live/repo" });
-    expect(out).toContain("bd -C '/live/repo' update <id> --status done");
+    expect(out).toContain("bd -C '/live/repo' close <id>");
   });
 });
 

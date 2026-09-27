@@ -1654,7 +1654,7 @@ export async function buildFindingsFixPrompt(args: {
                 `copy — pass \`bd\`'s own directory flag rather than relying on your cwd, e.g.:`,
                 ``,
                 "```",
-                `bd -C ${shellQuotePath(repoPath)} update <id> --status done`,
+                `bd -C ${shellQuotePath(repoPath)} close <id>`,
                 "```",
               ]
             : []),

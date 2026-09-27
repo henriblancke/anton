@@ -156,7 +156,7 @@ function boardOnlySection(repoPath?: string, mixed?: boolean): string {
             "copy — pass `bd`'s own directory flag rather than relying on where you happen to be, e.g.:",
           "",
           "```",
-          `bd -C ${shellQuotePath(repoPath)} update <id> --status done`,
+          `bd -C ${shellQuotePath(repoPath)} close <id>`,
           "```",
           "",
           "This worktree's embedded beads database is a separate, unsynced copy on a non-server board: " +
