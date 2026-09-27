@@ -1075,11 +1075,18 @@ describe("off-thread identity reads", () => {
     expect(serverBuildDrift({ fresh: true })?.state).toBe("outdated"); // the gate, issued after, stores 0.4.1
 
     worker.deliver?.({ version: "0.4.0", revision: null }); // the slower read finally answers, with the STALE identity
-    await displayRead;
+    const drifts = await displayRead;
 
     // A render inside the window must still see the fresher, gate-stored identity — not the stale one
     // the slower read delivered second, which would otherwise compare equal to "running" and go silent.
     expect(serverBuildDrift()?.state).toBe("outdated");
+
+    // The IN-FLIGHT render's own resolved value must carry the same, fresher verdict — not the stale
+    // identity the worker delivered — since `serverBuildDrifts` caches whatever this promise resolves
+    // to for the next 15s. A losing read that returned its own stale value here would compare
+    // "0.4.0 running" against "0.4.0 stale disk" as current, banner nothing, and freeze that silence
+    // in the cache for the rest of the window (anton-fzarz review).
+    expect(drifts.find((d) => d.self)?.drift.state).toBe("outdated");
 
     // Restore the real, counted worker for every case after this one — `vi.doUnmock` would instead
     // revert to the unmocked module, silently dropping later cases' worker counts to zero.

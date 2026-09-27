@@ -251,11 +251,13 @@ function unreadableIdentity(): BuildIdentity {
 
 /**
  * Stores a read as the cache's answer for `generation`, unless a read ISSUED later already won that
- * slot — the caller still gets what it read, but a stale read cannot evict a fresher one that beat
- * it into the cache.
+ * slot — in which case the CALLER is handed that winning identity too (anton-fzarz review), not the
+ * stale one it read: a loser that returned its own read would still hand a post-pull consumer (a
+ * verdict computed from it, then cached again downstream) the pre-pull disk, which is the exact
+ * silence the seq ordering above exists to end.
  */
 function storeOnDisk(generation: number, identity: BuildIdentity, seq: number): BuildIdentity {
-  if (onDiskCache && onDiskCache.generation === generation && onDiskCache.seq > seq) return identity;
+  if (onDiskCache && onDiskCache.generation === generation && onDiskCache.seq > seq) return onDiskCache.identity;
   onDiskCache = { at: Date.now(), generation, seq, identity };
   return identity;
 }
