@@ -75,17 +75,17 @@ jobs:
       # crash is still being reported against recent CLI builds, so this bump is the same
       # documented mitigation as before, not a confirmed fix — if it recurs, bump further
       # and check the changelog rather than assuming the PR's diff is at fault.
-      # Recurred again on PR #325 (2026-09-25) — is_error:true, num_turns:1, total_cost_usd:0,
-      # 350ms, no findings unrelated to this PR's own diff. 2.1.282's changelog has no entry
-      # naming this exact shape; already on latest per the standing instruction above, since
-      # 2.1.281's "unrecoverable interface error" fix evidently didn't cover every path into
-      # this crash. If this still recurs on 2.1.282, the fix is likely upstream of what
-      # changelog entries alone can diagnose — consider turning on `show_full_output: true`
-      # to capture the real crash detail next time.
-      # Recurred again on PR #326, same run — is_error:true, num_turns:1, total_cost_usd:0,
-      # 425ms, no findings unrelated to that PR's own diff, still on 2.1.282. Following this
-      # comment's own instruction: bump before assuming it's the PR's fault — but there is no
-      # further changelog entry yet to bump to, so this one stays open.
+      # Same signature again (2026-09-25) on PR #323, PR #325, and PR #326 — is_error:true,
+      # num_turns:1, total_cost_usd:0, ~350-425ms, before the first model turn, no findings
+      # unrelated to any PR's own diff. No single 2.1.282 changelog line names this crash shape
+      # explicitly, so this is the same standing remedy repeated, not a fix verified against a
+      # specific changelog entry this time — 2.1.281's "unrecoverable interface error" fix
+      # evidently didn't cover every path into this crash. Following this comment's own
+      # instruction: bump before assuming it's the PR's fault — version stays at 2.1.282,
+      # already the latest pinned-good release, and there is no further changelog entry yet to
+      # bump to, so this one stays open. If it recurs again on 2.1.282, the fix is likely
+      # upstream of what changelog entries alone can diagnose — consider turning on
+      # `show_full_output: true` to capture the real crash detail next time.
       - name: Install Claude Code (pinned)
         id: claude-install
         env:
