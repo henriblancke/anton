@@ -681,7 +681,20 @@ export async function stampConfirmedClosures(repo: string, closedBeads: readonly
         beads.confirmedBoardEvidenceClosure(live) !== undefined ||
         beads.confirmedBoardEvidenceOrigin(live) !== read.priorClosure
       ) {
-        return true;
+        // Neither branch is settled just by being true (chatgpt-codex-connector, PR #284 review,
+        // "Revalidate replaced confirmations before finalizing"): a mismatched origin means a
+        // NEWER confirmation replaced this one and has yet to be fenced on its own cycle — reporting
+        // that as fenced would let `closeFinalized` drop `stage:in-review` while the newer cycle is
+        // still open. An already-stamped closure could likewise be stale if it was written for a
+        // cycle this bead has since moved past. Both are trusted only against a fresh read: the
+        // closure must still be live right now, AND the bead must still be closed.
+        const recheck = await mustReadClosureVersion(repo, b.id);
+        return (
+          recheck.read &&
+          live.status === "closed" &&
+          beads.confirmedBoardEvidenceClosure(live) !== undefined &&
+          beads.confirmedBoardEvidenceClosure(live) === recheck.closure
+        );
       }
       // Revalidated again, right before the write (chatgpt-codex-connector, PR #284 review,
       // "Revalidate the closure cycle before stamping confirmation" round 2): a reopen-and-reclose

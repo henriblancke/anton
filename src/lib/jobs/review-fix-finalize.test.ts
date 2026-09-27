@@ -402,7 +402,34 @@ describe("finalizeMergedEpic", () => {
         metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
       } as Bead;
       // The live bead was already fenced by a concurrent review-fix pass between the snapshot and
-      // this call.
+      // this call, against the SAME closure this pass's own fresh history read finds live right
+      // now — a genuinely settled fence, not a stale one.
+      statuses.set("target-1", "closed");
+      metadataById.set("target-1", {
+        boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "new-close-sha" }),
+      });
+      historyMock.mockResolvedValue([{ hash: "new-close-sha", at: "2026-01-01T00:00:00Z", status: "closed" }]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+    },
+  );
+
+  it(
+    "does not trust an already-stamped closure fence that no longer matches the live closure " +
+      '(chatgpt-codex-connector, PR #284 review, "Revalidate replaced confirmations before ' +
+      'finalizing") — a stale stamp from a cycle this bead has since moved past must not let ' +
+      "this pass declare the fence complete",
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }) },
+      } as Bead;
+      // The stamped closure on the live bead ("already-fenced-sha") does not match the closure
+      // this pass's own fresh history read finds right now ("new-close-sha").
+      statuses.set("target-1", "closed");
       metadataById.set("target-1", {
         boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "already-fenced-sha" }),
       });
@@ -411,7 +438,41 @@ describe("finalizeMergedEpic", () => {
       await finalize(target, []);
 
       expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
-      expect(untagMock).toHaveBeenCalledWith("/repo", "target-1", ["stage:in-review"]);
+      // Not trusted as fenced — `stage:in-review` has to stay so a later sweep re-checks it.
+      expect(untagMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "does not treat a confirmation replaced by a whole new, still-unfenced cycle as already " +
+      'fenced (chatgpt-codex-connector, PR #284 review, "Revalidate replaced confirmations ' +
+      'before finalizing") — an origin mismatch on the live re-read means a newer cycle owns ' +
+      "this confirmation now, and that cycle has not been fenced yet",
+    async () => {
+      const target = {
+        ...bead("target-1"),
+        metadata: { boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], origin: "prior-A" }) },
+      } as Bead;
+      // Between the snapshot and this call, another writer reopened, reconfirmed, and reclosed
+      // this bead for a WHOLE NEW cycle — the live confirmation's origin now points at the
+      // closure that just landed ("close-sha-A"), not the one this pass's snapshot was written
+      // against ("prior-A"), and that new cycle's own confirmation has no closure fence yet.
+      statuses.set("target-1", "closed");
+      metadataById.set("target-1", {
+        boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb9"], origin: "close-sha-A" }),
+      });
+      historyMock.mockResolvedValue([
+        { hash: "close-sha-A", at: "2026-02-01T00:00:00Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-01-15T00:00:00Z", status: "open" },
+        { hash: "prior-A", at: "2026-01-02T00:00:00Z", status: "closed" },
+        { hash: "create-sha", at: "2026-01-01T00:00:00Z", status: "open" },
+      ]);
+
+      await finalize(target, []);
+
+      expect(setBoardEvidenceConfirmedMock).not.toHaveBeenCalled();
+      // Not trusted as fenced — the newer cycle's confirmation still needs its own fence.
+      expect(untagMock).not.toHaveBeenCalled();
     },
   );
 
