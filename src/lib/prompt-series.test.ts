@@ -491,6 +491,31 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     });
   });
 
+  it("draws no delta between two identity cohorts whose delivery windows overlap (fresh review feedback, PR #331)", () => {
+    // An identity dimension (agent/skill) aggregates EVERY delivery of a key across the feature's
+    // whole history into one cohort — so alternating identities routinely overlap instead of
+    // handing off cleanly like a prompt/formula/anton revision does. Agent A delivers at JUL_1 and
+    // again at SEP_4; agent B delivers in between, at AUG_2. `byWindow` still sorts A first (its
+    // FIRST delivery is earliest), but A's own average already includes the SEP_4 batch — which
+    // lands strictly after every one of B's deliveries. Presenting that blended average as "the
+    // cohort before B" would let A's later deliveries keep changing (or reversing) a delta already
+    // shown as B's baseline, long after B's own window closed.
+    const series = promptSeries(
+      [
+        ...deliveries(3, { key: "agent:a", at: JUL_1, usd: 2, dimension: "agentTag" }),
+        ...deliveries(5, { key: "agent:b", at: AUG_2, usd: 10, dimension: "agentTag" }),
+        ...deliveries(2, { key: "agent:a", at: SEP_4, usd: 100, bead: "a-again", dimension: "agentTag" }),
+      ],
+      "agent",
+    );
+
+    expect(series.cohorts.map((cohort) => cohort.key)).toEqual(["agent:a", "agent:b"]);
+    const [a, b] = series.cohorts;
+    // A is one cohort (identity dimension: no reversion split), spanning both its episodes.
+    expect(a.window).toEqual({ firstDeliveryMs: JUL_1, lastDeliveryMs: SEP_4 });
+    expect(b.comparable && b.deltas).toEqual([]);
+  });
+
   it("folds a repeated bead once, so a doubled feature cannot inflate an average", () => {
     const one = { beadId: "anton-1", delivered: true, deliveredAtMs: AUG_2, usd: 4, rows: [{ promptDigest: OLD_PROMPT }] };
     const series = promptSeries([one, one], "prompt");

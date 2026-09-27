@@ -1067,18 +1067,27 @@ export function promptSeries(
 }
 
 /**
- * Whether `previous` genuinely delivered before `cohort` — strictly, not merely "sorts earlier".
+ * Whether `previous` genuinely delivered before `cohort` — WHOLLY, not merely "started earlier".
  *
- * `byWindow` places every cohort in SOME order so the series has one to render, but a tied
- * `firstDeliveryMs` (two keys delivered in the same recorded second) is not evidence either ran
- * first — see `byWindow`'s own header. Presenting a tied `previous` as the baseline anyway lets an
- * arbitrary tie-break (a digest string's lexical order) decide which cohort's metrics read as the
- * delta baseline for the other (fresh review feedback, PR #331). Requiring a STRICT ordering here,
- * rather than trusting adjacency in `ordered`, is what keeps that arbitrary choice from leaking into
- * a directional claim neither cohort earned.
+ * `byWindow` places every cohort in SOME order so the series has one to render, but comparing only
+ * `firstDeliveryMs` lets two OVERLAPPING windows read as a chronological predecessor pair. On an
+ * identity dimension (`agent`, `skill`), a cohort is every delivery of that key across the feature's
+ * WHOLE history — so alternating identities routinely overlap: agent A delivers at t=1 and t=4,
+ * agent B at t=2 and t=3. `byWindow` sorts A before B on `firstDeliveryMs` (1 < 2), but A's own
+ * average already includes the t=4 delivery, which lands after every one of B's. Presenting that
+ * average as "the cohort before B" is not a fact about what came before B — it can change or reverse
+ * B's delta every time A delivers again, long after B's window closed (fresh review feedback, PR
+ * #331). A tied `firstDeliveryMs` (two keys delivered in the same recorded second) has the same
+ * problem one step further — see `byWindow`'s own header.
+ *
+ * Requiring `previous`'s LAST delivery to strictly precede `cohort`'s FIRST is what actually proves
+ * disjoint windows: every episodic-dimension pair already satisfies this (episodes are carved from
+ * `dated`'s own chronological walk, so one episode's deliveries are exhausted before the next one's
+ * begin), so this only ever removes a baseline from an identity-dimension pair whose windows overlap
+ * — it never changes an episodic series output.
  */
 function chronologicallyPrecedes(previous: CohortAccumulator, cohort: CohortAccumulator): boolean {
-  const before = previous.firstDeliveryMs;
+  const before = previous.lastDeliveryMs;
   const after = cohort.firstDeliveryMs;
   return before !== undefined && after !== undefined && before < after;
 }

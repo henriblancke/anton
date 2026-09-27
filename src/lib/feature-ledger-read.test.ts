@@ -226,6 +226,7 @@ describe("featureLedger's friction half", () => {
     quotaParkCount?: number;
     failureParkCount?: number;
     createdAt?: Date;
+    updatedAt?: Date;
   }): Promise<void> {
     await t.db.insert(schema.jobs).values({
       id: row.id,
@@ -237,6 +238,7 @@ describe("featureLedger's friction half", () => {
       ...(row.quotaParkCount ? { quotaParkCount: row.quotaParkCount } : {}),
       ...(row.failureParkCount ? { failureParkCount: row.failureParkCount } : {}),
       ...(row.createdAt ? { createdAt: row.createdAt } : {}),
+      ...(row.updatedAt ? { updatedAt: row.updatedAt } : {}),
     });
   }
 
@@ -469,6 +471,7 @@ describe("featureLedger's friction half", () => {
       epicBeadId: "feat-1",
       status: "cancelled",
       createdAt: new Date("2026-08-01T00:00:00Z"),
+      updatedAt: new Date("2026-08-01T00:00:00Z"),
     });
     await seedJob({
       id: "j-new",
@@ -476,6 +479,7 @@ describe("featureLedger's friction half", () => {
       epicBeadId: "feat-1",
       status: "cancelled",
       createdAt: new Date("2026-09-25T00:00:00Z"),
+      updatedAt: new Date("2026-09-25T00:00:00Z"),
     });
     await seedEscalation({
       id: "e-old",
@@ -498,5 +502,28 @@ describe("featureLedger's friction half", () => {
     expect(ledger?.friction.humanGates).toBe(1);
     expect(ledger?.friction.reviewRounds).toBe(1);
     expect(ledger?.friction.sendBacks).toBe(1);
+  });
+
+  it("excludes a live rerun's job cancelled after the cutoff even though it was CREATED before it (PR #331 review, P2 follow-up)", async () => {
+    // An open rerun's execute job is necessarily enqueued before the run's own `attemptStartedAt` —
+    // so `asOfMs` (which sits at-or-after that start) can land AFTER the job's `createdAt` while the
+    // job is still live. If an operator then cancels it before the rerun settles, a creation-time
+    // cutoff would keep the row and its now-`cancelled` status would bill this preserved delivery for
+    // an interruption that belongs to the still-outcome-less rerun.
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-25T00:10:00Z");
+    await seedJob({
+      id: "j-live",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "cancelled",
+      createdAt: new Date("2026-09-25T00:00:00Z"),
+      updatedAt: new Date("2026-09-25T00:20:00Z"),
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+
+    expect(ledger?.friction.cancels).toBe(0);
+    expect(ledger?.friction.humanTouches).toBe(0);
   });
 });

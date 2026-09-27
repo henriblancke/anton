@@ -147,13 +147,20 @@ export async function featureLedger(
     reviewRoundsOf(project.repoPath, beadId),
   ]);
 
-  // Every friction source is cut at `asOfMs` on its OWN clock — a job's `createdAt`, an escalation's
-  // `raisedAt`, a review round's comment timestamp, a send-back note's header — rather than inferred
-  // from the invocation rows. Folding the rerun's jobs/escalations/rounds/notes into a preserved
-  // delivery's friction is exactly as premature as folding its invocations would be (PR #331 review):
-  // both are evidence of an attempt that has not reached an outcome yet.
+  // Every friction source is cut at `asOfMs` on its OWN clock — a job's last mutation, an
+  // escalation's `raisedAt`, a review round's comment timestamp, a send-back note's header — rather
+  // than inferred from the invocation rows. Folding the rerun's jobs/escalations/rounds/notes into a
+  // preserved delivery's friction is exactly as premature as folding its invocations would be (PR
+  // #331 review): both are evidence of an attempt that has not reached an outcome yet.
+  //
+  // Jobs cut on `updatedAt`, not `createdAt` (PR #331 review, P2 follow-up): a job row is mutable
+  // and carries no history, so `createdAt <= asOfMs` alone proves nothing about its CURRENT status —
+  // an open rerun's own execute job is necessarily created before the run's `attemptStartedAt`, so a
+  // creation-time cutoff keeps it, and an operator cancelling that job before the rerun settles would
+  // then read as this delivery's own cancel. `updatedAt` is the row's last mutation; requiring it at
+  // or before `asOfMs` excludes any job touched after the cutoff, however old its `createdAt` is.
   const rows = cutAt(rawRows, asOfMs, (row) => row.recordedAt.getTime());
-  const jobs = cutAt(rawJobs, asOfMs, (job) => job.createdAt.getTime());
+  const jobs = cutAt(rawJobs, asOfMs, (job) => job.updatedAt.getTime());
   const escalations = cutAt(rawEscalations, asOfMs, (row) => row.raisedAt.getTime());
   const rounds = cutAt(rawRounds, asOfMs, (round) => timestampOf(round.at));
   const notes = cutAt(sendBackNotes(board, scope.ids), asOfMs, (note) => timestampOf(note.at));
