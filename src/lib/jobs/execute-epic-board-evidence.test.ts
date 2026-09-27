@@ -277,6 +277,19 @@ describe("fingerprintBoard / boardEvidence (anton-fc5x)", () => {
     },
   );
 
+  it(
+    "ignores reviewGateDispatchStarted churn on top of unchanged content metadata — " +
+      "runGateFixSession sets this marker mid-round for a board-only self-review fixer, and it must " +
+      "not itself register as a ticket-authored change (chatgpt-codex-connector, PR #284 review)",
+    () => {
+      const before = fingerprintBoard([bead("a", { metadata: { owner: "team-a" } })]);
+      const after = fingerprintBoard([
+        bead("a", { metadata: { owner: "team-a", reviewGateDispatchStarted: "1" } }),
+      ]);
+      expect(boardEvidence(before, after)).toEqual([]);
+    },
+  );
+
   it("catches a content label change — a board-only ticket may exist to relabel/reparent (anton-fc5x review round 1)", () => {
     const before = fingerprintBoard([bead("a", { labels: ["domain:eng"] })]);
     const after = fingerprintBoard([bead("a", { labels: ["domain:eng", "size:M"] })]);
