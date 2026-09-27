@@ -114,9 +114,13 @@ export interface CohortSample {
   /** DELIVERED features in the cohort. Only deliveries count toward the floor — see the epic. */
   n: number;
   /**
-   * The `anton_version` each delivered feature recorded, one entry per feature, null or undefined for
-   * a feature that recorded none. Passed per feature rather than pre-deduplicated so
-   * {@link CohortVersions.versions} can order by how often each was seen.
+   * The `anton_version`s the cohort's features ran under: one entry per (feature, DISTINCT version it
+   * recorded), and a single null for a feature that recorded none. So a feature that spans two antons
+   * contributes both — which is what makes {@link CohortVersions.mixed} true of a cohort holding one
+   * such feature, correctly: that feature moved for two candidate reasons on its own.
+   *
+   * Per feature rather than pre-deduplicated so {@link CohortVersions.versions} can order by how many
+   * FEATURES saw each, and so {@link CohortVersions.unstamped} counts features rather than rows.
    */
   antonVersions: readonly (string | null | undefined)[];
   metrics: CohortMetrics;
@@ -354,10 +358,347 @@ export type Cohort = CohortStanding & {
    * row.
    */
   window: CohortWindow | undefined;
+  /** What the averages were computed FROM, and where they are incomplete. */
+  basis: CohortBasis;
 };
+
+/**
+ * What a cohort's figures rest on — the counts that say whether an average is a total or a FLOOR.
+ *
+ * Required rather than optional, for {@link UnderpoweredCohort}'s reason one level down: a cohort that
+ * can omit whether its cost figure covers everything in it is a cohort that reads as complete by
+ * default, and `spend-breakdown`'s rule is that a partial figure must be able to say it is partial.
+ */
+export interface CohortBasis {
+  /**
+   * Features whose spend and friction went into the numerators — **deliveries and gave-ups alike**.
+   * Above {@link CohortBase.n} whenever the cohort ran work that did not deliver, which is the
+   * denominator rule made visible: a prompt that mostly gave up reports a HIGHER cost per delivered
+   * feature, not a lower one (design §the denominator).
+   */
+  features: number;
+  /**
+   * Features anton could price nothing for. Non-zero beside a present `usdPerFeature` makes that
+   * average a FLOOR — the same discipline `spend-breakdown` applies to a partly-priced group, and the
+   * reason the cohort reports this rather than folding an unpriced feature in as $0.
+   */
+  unpricedFeatures: number;
+}
 
 /** One dimension's cohorts, oldest first — each measured against the one before it. */
 export interface CohortSeries {
   dimension: CohortDimension;
   cohorts: Cohort[];
+  /**
+   * Delivered features this dimension could not attribute to any one of its values, and so that no
+   * cohort holds. Reported rather than dropped silently — see {@link promptSeries}'s third rule.
+   */
+  spanning: SpanningFeatures;
+}
+
+/* ────────────────────────────────  the fold  ──────────────────────────────── */
+
+/**
+ * The stamp columns a cohort keys on — one per {@link CohortDimension}, each null when the invocation
+ * recorded none.
+ *
+ * Structural, so a `claude_invocations` row satisfies it without a mapper (the same reason
+ * `LedgerTimingRow` is structural), and every field optional so a fixture naming one dimension does
+ * not have to spell the other four.
+ */
+export interface CohortStampRow {
+  /** The composed SYSTEM prompt's digest — `prompt`. */
+  promptDigest?: string | null;
+  /** The cooked pipeline's digest — `formula`. */
+  formulaDigest?: string | null;
+  /** The release + revision that ran it — `anton`. */
+  antonVersion?: string | null;
+  /** The ticket's resolved `agent:<tag>` — `agent`. */
+  agentTag?: string | null;
+  /** The digest of the skill text a step resolved — `skill`. */
+  skillDigest?: string | null;
+}
+
+/**
+ * Which column each dimension keys on. This table IS "the same fold, keyed differently" (design
+ * §cohorts by agent and by skill) — agent and skill are two more dimensions of the stamp tuple, so
+ * they are a different lookup here rather than machinery of their own.
+ *
+ * A `Record` over the union for {@link METRIC_IMPROVES}'s reason: a dimension added to
+ * {@link COHORT_DIMENSIONS} fails typecheck until it names the column it reads, instead of silently
+ * folding every feature into one cohort keyed on `undefined`.
+ */
+export const DIMENSION_COLUMNS: Readonly<Record<CohortDimension, keyof CohortStampRow>> =
+  Object.freeze({
+    prompt: "promptDigest",
+    formula: "formulaDigest",
+    anton: "antonVersion",
+    agent: "agentTag",
+    skill: "skillDigest",
+  });
+
+/**
+ * One feature as the fold receives it: what it delivered, what it cost, and the rows that say what
+ * produced it.
+ *
+ * The caller resolves all of this — `featureLedger` already answers every field — so this module
+ * stays pure. One entry per FEATURE, never per run: a feature's cost is the cost of every run that
+ * worked on it, which is the unit the whole comparison is per.
+ */
+export interface CohortFeature {
+  /** The feature's run target. Identity only — it is what keeps a feature from being folded twice. */
+  beadId: string;
+  /**
+   * Whether the feature DELIVERED. Only deliveries count toward `n` (ticket §acceptance) while a
+   * gave-up feature's spend and attention stay in the numerators — see {@link promptSeries}.
+   */
+  delivered: boolean;
+  /**
+   * When it last delivered, epoch ms. Absent for a feature that did not deliver, and absent for one
+   * that delivered without a recorded time — which is why {@link CohortWindow} is optional rather
+   * than defaulted.
+   */
+  deliveredAtMs?: number;
+  /**
+   * What the feature cost, or **undefined when anton could price none of its rows** — never 0, per
+   * `spend-breakdown`'s rule. `LedgerTotals.totals.usd` answers this directly.
+   */
+  usd: number | undefined;
+  /** Rounds its self-review took to reach a clean verdict (`LedgerFriction.reviewRounds`). */
+  reviewRounds?: number;
+  /** Times a person had to touch it (`LedgerFriction.humanTouches`). */
+  humanTouches?: number;
+  /** Escalations raised against it, gates included (`LedgerFriction.escalations`). */
+  escalations?: number;
+  /**
+   * The feature's `claude_invocations` rows — what it is keyed BY. Only the stamp columns are read,
+   * so a caller passes the rows it already holds.
+   */
+  rows: readonly CohortStampRow[];
+}
+
+/**
+ * Features the fold could attribute to no single value of the dimension, and so left out of every
+ * cohort. The visible remainder — see {@link promptSeries} for why they are not split.
+ */
+export interface SpanningFeatures {
+  /**
+   * DELIVERED features excluded. What closes the arithmetic: `Σ cohort.n + delivered` is every
+   * delivered feature the fold was handed, so a surface summing the cohorts can say what it is
+   * missing rather than quietly under-reporting the series.
+   */
+  delivered: number;
+  /** Every excluded feature, delivered or not — the spend that left the fold with them. */
+  features: number;
+}
+
+/**
+ * One stamp value as a cohort key, or `undefined` for a row that recorded none.
+ *
+ * A blank or whitespace-only stamp is ABSENT rather than a distinct key, the same reading
+ * {@link cohortVersions} gives it: the never-fail-a-run rule writes a null on a digest it could not
+ * compute, and a cohort keyed on `""` would present that failure as a prompt.
+ */
+function stampValue(row: CohortStampRow, dimension: CohortDimension): string | undefined {
+  const raw = row[DIMENSION_COLUMNS[dimension]];
+  const value = typeof raw === "string" ? raw.trim() : "";
+  return value || undefined;
+}
+
+/** The distinct values a feature's rows named for one dimension, in first-seen order. */
+function featureKeys(feature: CohortFeature, dimension: CohortDimension): string[] {
+  const keys = new Set<string>();
+  for (const row of feature.rows) {
+    const value = stampValue(row, dimension);
+    if (value !== undefined) keys.add(value);
+  }
+  return [...keys];
+}
+
+/** The distinct antons a feature ran under, or `[null]` for one that recorded none. */
+function featureVersions(feature: CohortFeature): (string | null)[] {
+  const versions = featureKeys(feature, "anton");
+  return versions.length > 0 ? versions : [null];
+}
+
+/** A cohort mid-fold: the running numerators, and the denominator they will be divided by. */
+interface CohortAccumulator {
+  key: string | null;
+  /** DELIVERED features — the denominator, and the `n` the floor is read against. */
+  n: number;
+  features: number;
+  unpricedFeatures: number;
+  /** Σ usd over every attributed feature, or undefined while none has been priced. */
+  usd: number | undefined;
+  reviewRounds: number;
+  humanTouches: number;
+  escalations: number;
+  antonVersions: (string | null)[];
+  firstDeliveryMs: number | undefined;
+  lastDeliveryMs: number | undefined;
+}
+
+function emptyAccumulator(key: string | null): CohortAccumulator {
+  return {
+    key,
+    n: 0,
+    features: 0,
+    unpricedFeatures: 0,
+    usd: undefined,
+    reviewRounds: 0,
+    humanTouches: 0,
+    escalations: 0,
+    antonVersions: [],
+    firstDeliveryMs: undefined,
+    lastDeliveryMs: undefined,
+  };
+}
+
+/** A reported non-negative figure, or 0 — the reading `feature-ledger` and `spend-breakdown` share. */
+function count(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/** One feature folded into its cohort. Mutates; the fold owns the accumulator. */
+function accumulate(into: CohortAccumulator, feature: CohortFeature): void {
+  into.features += 1;
+  // Every numerator sums over EVERY attributed feature while only deliveries touch `n` below. That
+  // asymmetry is the denominator rule (design §the denominator): drop a gave-up run's spend and the
+  // prompt that gives up earliest reads as the cheapest.
+  if (feature.usd === undefined) into.unpricedFeatures += 1;
+  else into.usd = (into.usd ?? 0) + feature.usd;
+  into.reviewRounds += count(feature.reviewRounds);
+  into.humanTouches += count(feature.humanTouches);
+  into.escalations += count(feature.escalations);
+  into.antonVersions.push(...featureVersions(feature));
+
+  if (!feature.delivered) return;
+  into.n += 1;
+  const at = feature.deliveredAtMs;
+  if (at === undefined || !Number.isFinite(at)) return;
+  if (into.firstDeliveryMs === undefined || at < into.firstDeliveryMs) into.firstDeliveryMs = at;
+  if (into.lastDeliveryMs === undefined || at > into.lastDeliveryMs) into.lastDeliveryMs = at;
+}
+
+/**
+ * A cohort's per-DELIVERED-feature averages.
+ *
+ * Empty when the cohort delivered nothing: there is no per-delivered-feature figure when no feature
+ * was delivered, and reporting the raw sums there would label a gave-up cohort's whole spend as the
+ * cost of one delivery. `usdPerFeature` is likewise absent — never 0 — when anton could price none of
+ * the cohort's features, per `spend-breakdown`'s rule.
+ */
+function cohortMetrics(from: CohortAccumulator): CohortMetrics {
+  if (from.n === 0) return {};
+  return {
+    ...(from.usd === undefined ? {} : { usdPerFeature: from.usd / from.n }),
+    reviewRounds: from.reviewRounds / from.n,
+    humanTouches: from.humanTouches / from.n,
+    escalations: from.escalations / from.n,
+  };
+}
+
+/** A cohort's window, or `undefined` when no delivery in it recorded a time. */
+function cohortWindow(from: CohortAccumulator): CohortWindow | undefined {
+  return from.firstDeliveryMs === undefined || from.lastDeliveryMs === undefined
+    ? undefined
+    : { firstDeliveryMs: from.firstDeliveryMs, lastDeliveryMs: from.lastDeliveryMs };
+}
+
+/**
+ * Cohorts oldest first — the order the deltas are then drawn along.
+ *
+ * Keyed on the FIRST delivery rather than the last, so a cohort still accruing does not overtake the
+ * one it succeeded. A cohort with no window at all sorts last (it delivered nothing, or nothing
+ * timed), and ties break on the key so a read is stable rather than dependent on encounter order.
+ */
+function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
+  const left = a.firstDeliveryMs;
+  const right = b.firstDeliveryMs;
+  if (left !== right) {
+    if (left === undefined) return 1;
+    if (right === undefined) return -1;
+    return left - right;
+  }
+  return (a.key ?? "").localeCompare(b.key ?? "");
+}
+
+/**
+ * Fold features into cohorts keyed on one dimension of the stamp tuple (anton-85y8j) — the read D2's
+ * stamps were recorded for.
+ *
+ * Three rules decide what lands where, and each of them is about a way this fold could lie:
+ *
+ *  - **Only DELIVERED features count toward `n`, while every attributed feature's spend and
+ *    attention stay in the numerators.** A cohort is "what did this prompt cost us per feature it
+ *    actually shipped", so a cohort that burned six runs to deliver one reports six runs' cost
+ *    against `n=1` — the figure a cheap-because-it-gave-up cohort would otherwise read as its best
+ *    (design §the denominator). {@link CohortBasis.features} beside `n` is where that shows.
+ *  - **Features that recorded NO value form their own cohort, keyed `null`.** Pre-instrumentation
+ *    work is real delivery and stays countable, but it is not evidence about any prompt — folding it
+ *    into a named cohort would attribute a period nothing was stamped in to whatever ran next.
+ *  - **A feature naming SEVERAL values of the dimension is attributed to none of them.** A grouped
+ *    run whose tickets used two specialists genuinely belongs to neither agent's cohort, and both
+ *    ways of forcing it into one are wrong: counting it in both double-counts the delivery, and
+ *    awarding it to the value that ran most is a proportional split of exactly the kind
+ *    `feature-ledger`'s third rule refuses. It leaves the fold and is counted in
+ *    {@link CohortSeries.spanning} — a visible remainder instead of an invisible error.
+ *
+ * Each cohort is measured against the one immediately before it in delivery order. Not against the
+ * nearest COMPARABLE predecessor: skipping an underpowered cohort would draw an arrow across a period
+ * the row does not name, so a series with a thin cohort in the middle reports no move there rather
+ * than one spanning both sides of it. {@link cohortStanding} then owns the floor.
+ *
+ * A feature appears at most once per cohort: repeated `beadId`s are folded once, since a caller
+ * composing a board read can hand the same run target over twice and a doubled feature would inflate
+ * both sides of the average.
+ */
+export function promptSeries(
+  features: readonly CohortFeature[],
+  dimension: CohortDimension,
+): CohortSeries {
+  const cohorts = new Map<string | null, CohortAccumulator>();
+  const spanning: SpanningFeatures = { delivered: 0, features: 0 };
+  const seen = new Set<string>();
+
+  for (const feature of features) {
+    if (seen.has(feature.beadId)) continue;
+    seen.add(feature.beadId);
+
+    const keys = featureKeys(feature, dimension);
+    if (keys.length > 1) {
+      spanning.features += 1;
+      if (feature.delivered) spanning.delivered += 1;
+      continue;
+    }
+    // No stamp at all is the pre-instrumentation cohort, keyed null — see rule 2.
+    const key = keys[0] ?? null;
+    const cohort = cohorts.get(key) ?? emptyAccumulator(key);
+    cohorts.set(key, cohort);
+    accumulate(cohort, feature);
+  }
+
+  const ordered = [...cohorts.values()].sort(byWindow);
+  return {
+    dimension,
+    cohorts: ordered.map((cohort, index) => {
+      const previous = ordered[index - 1];
+      const standing = cohortStanding(sampleOf(cohort), previous ? sampleOf(previous) : undefined);
+      return {
+        ...standing,
+        key: cohort.key,
+        window: cohortWindow(cohort),
+        basis: {
+          features: cohort.features,
+          unpricedFeatures: cohort.unpricedFeatures,
+        },
+      };
+    }),
+    spanning,
+  };
+}
+
+/** One accumulator as the guardrails read it — the bridge from the fold to {@link cohortStanding}. */
+function sampleOf(from: CohortAccumulator): CohortSample {
+  return { n: from.n, antonVersions: from.antonVersions, metrics: cohortMetrics(from) };
 }

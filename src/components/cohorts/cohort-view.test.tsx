@@ -22,6 +22,7 @@ import {
   MIN_COHORT,
   cohortStanding,
   type Cohort,
+  type CohortBasis,
   type CohortDimension,
   type CohortMetrics,
   type CohortSample,
@@ -59,11 +60,16 @@ function cohort(
     lastDeliveryMs: SEP_4,
   },
 ): Cohort {
-  return { ...cohortStanding(current, baseline), key, window };
+  return { ...cohortStanding(current, baseline), key, window, basis: basisOf(current) };
+}
+
+/** A basis for a cohort that delivered everything it ran and priced all of it — the plain case. */
+function basisOf(current: CohortSample): CohortBasis {
+  return { features: current.n, unpricedFeatures: 0 };
 }
 
 function series(cohorts: Cohort[], dimension: CohortDimension = "prompt"): CohortSeries {
-  return { dimension, cohorts };
+  return { dimension, cohorts, spanning: { delivered: 0, features: 0 } };
 }
 
 const rowFor = (key: string) => screen.getByText(key).closest("tr")!;
@@ -299,7 +305,14 @@ describe("what a cohort could not measure", () => {
 
   it("labels the pre-instrumentation cohort rather than leaving its key blank", () => {
     const unstamped = sample(6, HEALTHY_METRICS, Array.from({ length: 6 }, () => null));
-    render(<CohortView window="all" series={series([{ ...cohortStanding(unstamped), key: null, window: undefined }])} />);
+    render(
+      <CohortView
+        window="all"
+        series={series([
+          { ...cohortStanding(unstamped), key: null, window: undefined, basis: basisOf(unstamped) },
+        ])}
+      />,
+    );
 
     expect(screen.getByText("Unstamped")).toBeTruthy();
     // No window recorded is stated, not defaulted to a plausible wrong span.
