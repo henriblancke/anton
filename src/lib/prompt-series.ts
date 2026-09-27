@@ -793,9 +793,21 @@ interface CohortAccumulator {
   antonVersions: (string | null)[];
   firstDeliveryMs: number | undefined;
   lastDeliveryMs: number | undefined;
+  /**
+   * When this episode was OPENED — the timestamp that justified starting it, whether or not it ever
+   * delivered. For a `dated`-loop episode this is its first feature's `deliveredAtMs` (same instant
+   * `firstDeliveryMs` records). For a fresh episode opened in the `undated` loop for a FAILED
+   * restoration, it is that feature's own `activityAtMs` instead — the one timestamp such an episode
+   * has, since a feature that never delivered leaves `firstDeliveryMs` permanently `undefined`.
+   *
+   * {@link episodeClosesAt} reads this, not `firstDeliveryMs`, so a later failure on a DIFFERENT key
+   * can still see that this key's restoration attempt already opened and treat its own predecessor as
+   * closed — the boundary a failed-only episode must still draw (PR #331 review, third round follow-up).
+   */
+  openedAtMs: number | undefined;
 }
 
-function emptyAccumulator(key: string | null): CohortAccumulator {
+function emptyAccumulator(key: string | null, openedAtMs?: number): CohortAccumulator {
   return {
     key,
     n: 0,
@@ -808,6 +820,7 @@ function emptyAccumulator(key: string | null): CohortAccumulator {
     antonVersions: [],
     firstDeliveryMs: undefined,
     lastDeliveryMs: undefined,
+    openedAtMs,
   };
 }
 
@@ -894,10 +907,17 @@ function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
 }
 
 /**
- * When `episode` stopped being the open one for ITS key — the first delivery timestamp of whichever
- * episode (any key) opened immediately after it in {@link promptSeries}'s global `episodes` list,
- * which is delivery-order because `episodes` is only ever appended to as {@link dated} is walked in
- * that order. `undefined` when `episode` is still the newest thing on record — nothing has closed it.
+ * When `episode` stopped being the open one for ITS key — the {@link CohortAccumulator.openedAtMs} of
+ * whichever episode (any key) opened immediately after it in {@link promptSeries}'s global `episodes`
+ * list, which is open-order because `episodes` is only ever appended to as {@link dated} and
+ * {@link promptSeries}'s `undated` loop are walked. `undefined` when `episode` is still the newest
+ * thing on record — nothing has closed it.
+ *
+ * Reads `openedAtMs`, not `firstDeliveryMs`: a fresh episode the `undated` loop opens for a FAILED
+ * restoration never delivers, so `firstDeliveryMs` stays `undefined` forever — using it here would
+ * make that episode invisible as a boundary, letting a later failure on a DIFFERENT key skip straight
+ * past it to an even earlier episode and fold into a cohort that had already been superseded twice
+ * over (PR #331 review, third round follow-up).
  */
 function episodeClosesAt(
   episode: CohortAccumulator,
@@ -906,7 +926,7 @@ function episodeClosesAt(
   const index = episodes.indexOf(episode);
   if (index === -1) return undefined;
   for (let i = index + 1; i < episodes.length; i++) {
-    const next = episodes[i].firstDeliveryMs;
+    const next = episodes[i].openedAtMs;
     if (next !== undefined) return next;
   }
   return undefined;
@@ -1021,6 +1041,45 @@ function episodeFor(
  * key has formed none yet. On an identity dimension there is only ever one episode per key, so an
  * undated feature always lands in it.
  */
+
+/**
+ * One whole-second tied group from {@link promptSeries}'s `dated`, reordered so its own key-change
+ * transitions read from real chronology instead of the tied entries' key spelling (PR #331 review):
+ * two versions delivered in the same recorded second carry no evidence of which came first, so
+ * `dated`'s own lexical tie-break — needed purely for a deterministic sort — cannot be trusted to
+ * decide how many episodes the tie forms.
+ *
+ * Entries matching `openKey` (the episode already open going into this group) sort first, so they
+ * extend it rather than reading as a reopen once a differently-keyed tied entry is processed ahead of
+ * them. Entries matching `nextKey` (the key of the next STRICTLY LATER delivery, i.e. what the group
+ * hands off to) sort last, so the group closes on that key and the next delivery continues its episode
+ * instead of opening a needless duplicate. Anything matching neither sorts in between as its own
+ * single-instant episode, in a deterministic order that plays no part in the episode count either way.
+ *
+ * When `openKey` and `nextKey` are the same value with a different key tied between them, the shared
+ * key's entries sort first (never last) — the entries opened this episode, so they never need to close
+ * it again for this group to remain internally consistent; whether the SAME key reopens once the group
+ * ends is a genuine, unavoidable ambiguity this reorder cannot resolve, since a real, untied delivery
+ * of that key already existed before the tie. What it removes is the arbitrary, spelling-dependent
+ * component of that ambiguity — not the ambiguity a true three-way tie cannot settle at all.
+ */
+function orderTiedGroup<T extends { key: string | null }>(
+  group: readonly T[],
+  openKey: string | null | undefined,
+  nextKey: string | null | undefined,
+): T[] {
+  const rank = (key: string | null): 0 | 1 | 2 => {
+    if (openKey !== undefined && key === openKey) return 0;
+    if (nextKey !== undefined && key === nextKey) return 2;
+    return 1;
+  };
+  return [...group].sort((a, b) => {
+    const byRank = rank(a.key) - rank(b.key);
+    if (byRank !== 0) return byRank;
+    return (a.key ?? "").localeCompare(b.key ?? "");
+  });
+}
+
 export function promptSeries(
   features: readonly CohortFeature[],
   dimension: CohortDimension,
@@ -1077,29 +1136,46 @@ export function promptSeries(
   // dimension this holds at most one accumulator per key — see `episodic` below.
   const episodesByKey = new Map<string | null, CohortAccumulator[]>();
   let open: CohortAccumulator | undefined;
-  for (const { feature, key } of dated) {
-    if (episodic) {
-      // A key change opens a fresh episode — even a RETURN to a key already seen, since that is a
-      // reversion (see {@link REVISION_DIMENSIONS}), not a continuation of the earlier run.
-      if (!open || open.key !== key) {
-        open = emptyAccumulator(key);
-        episodes.push(open);
-        episodesByKey.set(key, [...(episodesByKey.get(key) ?? []), open]);
+  if (episodic) {
+    // A key change opens a fresh episode — even a RETURN to a key already seen, since that is a
+    // reversion (see {@link REVISION_DIMENSIONS}), not a continuation of the earlier run. Processed
+    // whole-second TIE GROUPS at a time, not item by item: two keys tied on the same recorded second
+    // carry no evidence of which delivered first, so deciding transitions from `dated`'s own lexical
+    // tie-break would make the episode count depend on the version strings' spelling rather than on
+    // timing (fresh review feedback, PR #331) — {@link orderTiedGroup} resolves each group instead
+    // from what was open going in and what key resumes right after it.
+    let i = 0;
+    while (i < dated.length) {
+      let j = i + 1;
+      while (j < dated.length && dated[j].feature.deliveredAtMs === dated[i].feature.deliveredAtMs) {
+        j++;
       }
-    } else {
-      // Identity dimension: every delivery of this key folds into the one accumulator it has already
-      // formed, however far back — no reversion to detect, because the key was never "current" to
-      // begin with.
+      const group = orderTiedGroup(dated.slice(i, j), open?.key, dated[j]?.key);
+      for (const { feature, key } of group) {
+        if (!open || open.key !== key) {
+          open = emptyAccumulator(key, feature.deliveredAtMs);
+          episodes.push(open);
+          episodesByKey.set(key, [...(episodesByKey.get(key) ?? []), open]);
+        }
+        accumulate(open, feature);
+      }
+      i = j;
+    }
+  } else {
+    // Identity dimension: every delivery of this key folds into the one accumulator it has already
+    // formed, however far back — no reversion to detect, because the key was never "current" to
+    // begin with.
+    for (const { feature, key } of dated) {
       const existing = episodesByKey.get(key)?.[0];
       if (existing) {
         open = existing;
       } else {
-        open = emptyAccumulator(key);
+        open = emptyAccumulator(key, feature.deliveredAtMs);
         episodes.push(open);
         episodesByKey.set(key, [open]);
       }
+      accumulate(open, feature);
     }
-    accumulate(open, feature);
   }
   for (const { feature, key } of undated) {
     const candidates = episodesByKey.get(key);
@@ -1108,7 +1184,11 @@ export function promptSeries(
       accumulate(episode, feature);
       continue;
     }
-    const fresh = emptyAccumulator(key);
+    // This feature never delivered, so it leaves no `firstDeliveryMs` for `episodeClosesAt` to read —
+    // `openedAtMs` carries its `activityAtMs` instead, the one timestamp this episode has, so a LATER
+    // failure on another key can still see that this restoration attempt happened and treat whatever
+    // it replaced as closed (PR #331 review, third round follow-up).
+    const fresh = emptyAccumulator(key, feature.activityAtMs);
     episodes.push(fresh);
     episodesByKey.set(key, [...(candidates ?? []), fresh]);
     accumulate(fresh, feature);

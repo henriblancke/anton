@@ -134,6 +134,31 @@ function timestampOf(at: string | undefined): number | undefined {
 }
 
 /**
+ * `deliveries` (epoch SECONDS, `runs.listDeliveriesByBead`'s own unit) cut at `asOfMs` the same as
+ * every other friction/timing source — a delivery is exactly the kind of event this cutoff exists to
+ * exclude when it lands on a target's open rerun (PR #331 review): if that rerun completes between
+ * `activeRunTargetIds` choosing this cutoff and this read running, its rows/jobs/friction are already
+ * excluded above but an uncut `deliveries` map would still hand `lastDeliveryMs` the new delivery's
+ * timestamp, dating and ordering the feature by an attempt whose cost it never counted.
+ */
+function cutDeliveries(
+  deliveries: ReadonlyMap<string, readonly number[]>,
+  asOfMs: number | undefined,
+  exclusive: boolean,
+): Map<string, readonly number[]> {
+  if (asOfMs === undefined) return new Map(deliveries);
+  const out = new Map<string, readonly number[]>();
+  for (const [beadId, seconds] of deliveries) {
+    const kept = seconds.filter((s) => {
+      const ms = s * 1000;
+      return exclusive ? ms < asOfMs : ms <= asOfMs;
+    });
+    if (kept.length > 0) out.set(beadId, kept);
+  }
+  return out;
+}
+
+/**
  * What `beadId` — plus its working-layer children (`ledgerScope`) — cost and how long it took,
  * folded from rows anton already writes. `undefined` when `projectId` names no project.
  */
@@ -183,7 +208,7 @@ export async function featureLedger(
   // the bucket level (design §D4) — otherwise a scheduled pass attributed to this scope would
   // silently inflate the feature's own `activeMs` (PR #329 review).
   const timingRows = rows.filter((row) => !isOverheadRow(row));
-  const deliveredAtMs = lastDeliveryMs(deliveries, scope.ids);
+  const deliveredAtMs = lastDeliveryMs(cutDeliveries(deliveries, asOfMs, asOfExclusive), scope.ids);
 
   return {
     scope,

@@ -557,4 +557,39 @@ describe("featureLedger's friction half", () => {
     });
     expect(ledger?.rows).toHaveLength(1);
   });
+
+  it("cuts delivery timestamps at asOfMs too — a rerun that completes between the cutoff and this read must not date or reorder a preserved delivery by its own new delivery (PR #331 review)", async () => {
+    // The preserved delivery actually finished at `preservedAt`. A concurrent rerun of the same target
+    // then completes AFTER `asOfMs` was chosen but its `endedAt` still lands before this read runs —
+    // exactly the race `asOfMs` exists to guard against for rows/jobs/friction. `deliveredAtMs` must
+    // stay pinned to the preserved delivery, not jump to the rerun's later, uncounted one.
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-01T00:00:00Z");
+    const preservedAt = new Date("2026-08-01T00:00:00Z");
+    const rerunDeliveredAt = new Date("2026-09-10T00:00:00Z");
+    await t.db.insert(schema.runs).values({
+      id: "r-preserved",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "done",
+      startedAt: new Date("2026-07-31T23:00:00Z"),
+      endedAt: preservedAt,
+      updatedAt: preservedAt,
+    });
+    await t.db.insert(schema.runs).values({
+      id: "r-rerun",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "done",
+      startedAt: new Date("2026-09-09T23:00:00Z"),
+      endedAt: rerunDeliveredAt,
+      updatedAt: rerunDeliveredAt,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+
+    expect(ledger?.deliveredAtMs).toBe(preservedAt.getTime());
+  });
 });

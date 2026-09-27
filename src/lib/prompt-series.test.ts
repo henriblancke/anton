@@ -567,6 +567,78 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     expect(restoredOld.comparable).toBe(false);
   });
 
+  it("lets a failed-only restoration close the episode before it, so a LATER failure on the original key opens its own restored episode instead of polluting the first one (PR #331 review, third round follow-up)", () => {
+    // v1 delivers, v2 delivers, then a failed v1 restoration attempt runs (forming its own,
+    // never-delivered episode per the test above). A SECOND failure — this time back on v2's own key —
+    // runs after that failed v1 attempt. The failed v1 episode never delivered, so it must still count
+    // as a boundary: without one, this v2 failure would silently fold into the ORIGINAL v2 cohort
+    // instead of opening a restored v2 episode of its own.
+    const series = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_VERSION, at: JUL_1, usd: 2, dimension: "antonVersion" }),
+        ...deliveries(5, { key: NEW_VERSION, at: AUG_2, usd: 10, dimension: "antonVersion" }),
+        {
+          beadId: "failed-v1-restoration",
+          delivered: false,
+          activityAtMs: AUG_2 + DAY,
+          usd: 1000,
+          rows: [{ antonVersion: OLD_VERSION }],
+        },
+        {
+          beadId: "failed-v2-restoration",
+          delivered: false,
+          activityAtMs: AUG_2 + 2 * DAY,
+          usd: 2000,
+          rows: [{ antonVersion: NEW_VERSION }],
+        },
+      ],
+      "anton",
+    );
+
+    const v2Episodes = series.cohorts.filter((cohort) => cohort.key === NEW_VERSION);
+    expect(v2Episodes).toHaveLength(2);
+    // The original v2 cohort — delivered features only — stays untouched by a failure that ran after
+    // an intervening v1 restoration attempt.
+    const originalV2 = v2Episodes.find((cohort) => cohort.basis.features === 5);
+    expect(originalV2).toBeDefined();
+    // The second failure gets its OWN restored-v2 episode instead of inflating the original one.
+    const restoredV2 = v2Episodes.find((cohort) => cohort.basis.features === 1);
+    expect(restoredV2).toBeDefined();
+    expect(restoredV2?.comparable).toBe(false);
+  });
+
+  it("keeps a same-second revision tie's recurring key in one contiguous episode, regardless of which key sorts first lexically (PR #331 review)", () => {
+    // Both versions deliver in the SAME recorded second (AUG_2) — the data cannot say which came
+    // first. OLD_VERSION also delivers again, unambiguously, at SEP_4. A tie-break that decides the
+    // episode split from the two versions' spelling would fragment OLD_VERSION into two one-feature
+    // episodes whenever it happens to sort before the other tied key, and merge it into one whenever
+    // it sorts after — purely a fact about the strings, not the timing.
+    const runTiedScenario = (firstKey: string, secondKey: string) =>
+      promptSeries(
+        [
+          ...deliveries(1, { key: firstKey, at: AUG_2, bead: "first-tied", dimension: "antonVersion" }),
+          ...deliveries(1, { key: secondKey, at: AUG_2, bead: "second-tied", dimension: "antonVersion" }),
+          ...deliveries(1, { key: firstKey, at: SEP_4, bead: "first-again", dimension: "antonVersion" }),
+        ],
+        "anton",
+      );
+
+    for (const [firstKey, secondKey] of [
+      [OLD_VERSION, NEW_VERSION],
+      // Same shape, but `firstKey` now sorts AFTER `secondKey` lexically — the outcome must not flip.
+      [NEW_VERSION, OLD_VERSION],
+    ]) {
+      const series = runTiedScenario(firstKey, secondKey);
+      const firstKeyEpisodes = series.cohorts.filter((cohort) => cohort.key === firstKey);
+      expect(firstKeyEpisodes).toHaveLength(1);
+      expect(firstKeyEpisodes[0]?.basis.features).toBe(2);
+
+      const secondKeyEpisodes = series.cohorts.filter((cohort) => cohort.key === secondKey);
+      expect(secondKeyEpisodes).toHaveLength(1);
+      expect(secondKeyEpisodes[0]?.basis.features).toBe(1);
+    }
+  });
+
   it("measures each cohort against the one immediately before it in delivery order", () => {
     const series = promptSeries(
       [
