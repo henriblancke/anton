@@ -44,7 +44,13 @@
 import { beads, LABELS, type Bead, type DepCycle } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
-import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness, sameCycles } from "../beads/issues";
+import {
+  loadAllIssues,
+  sameBlockerLiveness,
+  sameBlocksEdges,
+  sameCycleMemberLiveness,
+  sameCycles,
+} from "../beads/issues";
 import {
   notePrefix,
   planApply,
@@ -315,9 +321,14 @@ async function withCycleEvidenceIfNeeded(
     // `sameBlocksEdges` alone only proves the edges held steady — a cycle member can be reopened, or
     // lose/gain its `abandoned` label, without moving an edge at all, and the approval gap this
     // evidence feeds reads a cycle's blocking-ness off exactly that live/abandoned status (P2 review,
-    // PR #274, apply.ts:293). Check both, the same `boardStillMatchesCycles` pairing `loadAllIssues`
-    // itself runs.
-    const consistent = sameBlocksEdges(board, freshBoard) && sameCycleMemberLiveness(cycles, board, freshBoard);
+    // PR #274, apply.ts:293). An ORDINARY (non-cycle) blocker is the same gap for a different reader
+    // (P2 review, PR #274, issues.ts:455): `cycles` never names an acyclic edge's target, so
+    // `blockedGap` can be reading a since-reopened blocker's stale closed status straight off `board`.
+    // Check all three, the same `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
+    const consistent =
+      sameBlocksEdges(board, freshBoard) &&
+      sameCycleMemberLiveness(cycles, board, freshBoard) &&
+      sameBlockerLiveness(board, freshBoard);
     if (!consistent) {
       console.warn(
         `[gardener.apply] ${repo}: board moved between the board read and cycle evidence while ` +
@@ -341,7 +352,8 @@ async function withCycleEvidenceIfNeeded(
     const stillConsistent =
       sameCycles(freshCycles, cycles) &&
       sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
-      sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard);
+      sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard) &&
+      sameBlockerLiveness(hydratedBoard, freshHydratedBoard);
     if (!stillConsistent) {
       console.warn(
         `[gardener.apply] ${repo}: board moved during gate hydration for cycle evidence while ` +

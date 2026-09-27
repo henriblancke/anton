@@ -429,30 +429,64 @@ function ancestorChain(id: string, list: Bead[]): string[] {
  * along it, not only at the member itself. Every `sameBlocksEdges` gate that decides whether cycle
  * evidence is safe to attach must also check this.
  */
+function liveKeyOf(list: Bead[]): (id: string) => string | undefined {
+  const byId = new Map(list.map((bead) => [bead.id, bead]));
+  return (id: string) => {
+    const bead = byId.get(id);
+    if (!bead) return undefined;
+    return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${ancestorChain(id, list).join(">")}`;
+  };
+}
+
 export function sameCycleMemberLiveness(cycles: DepCycle[], a: Bead[], b: Bead[]): boolean {
   const memberIds = new Set(cycles.flatMap((c) => c.ids));
   if (memberIds.size === 0) return true;
-  const liveKey = (list: Bead[]) => {
-    const byId = new Map(list.map((bead) => [bead.id, bead]));
-    return (id: string) => {
-      const bead = byId.get(id);
-      if (!bead) return undefined;
-      return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${ancestorChain(id, list).join(">")}`;
-    };
-  };
-  const [keyA, keyB] = [liveKey(a), liveKey(b)];
+  const [keyA, keyB] = [liveKeyOf(a), liveKeyOf(b)];
   return [...memberIds].every((id) => keyA(id) === keyB(id));
+}
+
+/** Every id that is the BLOCKER side (`to`) of a `blocks` edge in `list` — cycle or not. */
+function blockerIds(list: Bead[]): Set<string> {
+  return new Set(beads.edgesOf(list).filter((e) => e.type === "blocks").map((e) => e.to));
+}
+
+/**
+ * Whether every ORDINARY blocker — the `to` side of any `blocks` edge in `a` or `b`, cycle member or
+ * not — carries the same live/abandoned status and ancestor chain in `b` as in `a`.
+ *
+ * {@link sameCycleMemberLiveness} only ever checks ids `cycles` itself reports (P2 review, PR #274,
+ * issues.ts:455): `bd dep cycles` never names an ACYCLIC edge's target, so an ordinary external
+ * blocker with no cycle through it can be reopened, closed, or (un)abandoned between the `work` read
+ * and a later re-list without moving the `blocks` edge that points at it (`sameBlocksEdges` sees no
+ * change) and without ever showing up in `cycles`. `blockedGap` (approval-gate.ts) and the epic-graph
+ * rollup it feeds read that blocker's status straight off the board, so a stale reading there lets a
+ * locked guard (`approveAndClaim`, the gardener's shadow/apply re-checks) approve or claim a target a
+ * concurrent writer just put back in the way — the runner only discovers the block once it tries to
+ * dispatch. Every consistency gate that pairs a board with graph evidence must check this alongside
+ * {@link sameBlocksEdges} and {@link sameCycleMemberLiveness} — none of the three catches what either
+ * of the others does.
+ */
+export function sameBlockerLiveness(a: Bead[], b: Bead[]): boolean {
+  const ids = new Set([...blockerIds(a), ...blockerIds(b)]);
+  if (ids.size === 0) return true;
+  const [keyA, keyB] = [liveKeyOf(a), liveKeyOf(b)];
+  return [...ids].every((id) => keyA(id) === keyB(id));
 }
 
 /**
  * Whether `fresh` is still safe to pair `cycles` against, the way `board` was about to be: the same
- * `blocks` edges AND the same live/abandoned status AND parent for every id `cycles` reports. Any of
- * these can drift without the others moving — see {@link sameBlocksEdges} and
- * {@link sameCycleMemberLiveness} — so every consistency gate that decides whether to attach `cycles`
- * to a board must check both, not just the edges.
+ * `blocks` edges, the same live/abandoned status and ancestor chain for every id `cycles` reports,
+ * AND the same for every ordinary (non-cycle) blocker. Any of these can drift without the others
+ * moving — see {@link sameBlocksEdges}, {@link sameCycleMemberLiveness} and
+ * {@link sameBlockerLiveness} — so every consistency gate that decides whether to attach `cycles` to
+ * a board must check all three, not just the edges.
  */
 function boardStillMatchesCycles(cycles: DepCycle[], board: Bead[], fresh: Bead[]): boolean {
-  return sameBlocksEdges(board, fresh) && sameCycleMemberLiveness(cycles, board, fresh);
+  return (
+    sameBlocksEdges(board, fresh) &&
+    sameCycleMemberLiveness(cycles, board, fresh) &&
+    sameBlockerLiveness(board, fresh)
+  );
 }
 
 /**

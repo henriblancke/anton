@@ -19,7 +19,13 @@
  */
 import { beads, type Bead, type DepCycle } from "../beads/bd";
 import { attachCycleEvidence } from "../beads/cycle-evidence";
-import { loadAllIssues, sameBlocksEdges, sameCycleMemberLiveness, sameCycles } from "../beads/issues";
+import {
+  loadAllIssues,
+  sameBlockerLiveness,
+  sameBlocksEdges,
+  sameCycleMemberLiveness,
+  sameCycles,
+} from "../beads/issues";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
   autonomyFor,
@@ -178,10 +184,15 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
       // `sameBlocksEdges` alone only proves the edges held steady — a cycle member can be reopened,
       // or lose/gain its `abandoned` label, without moving an edge at all, and `planApply`'s cycle
       // rule reads a cycle's blocking-ness off exactly that live/abandoned status (P2 review, PR
-      // #274). Check both, the same `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
+      // #274). An ORDINARY (non-cycle) blocker is the same gap for a different reader (P2 review, PR
+      // #274, issues.ts:455): `cycles` never names an acyclic edge's target, so `decide()` could pair
+      // a verdict with a since-reopened blocker's stale closed status. Check all three, the same
+      // `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
       const freshBoard = await loadAllIssues(input.repo);
       const consistent =
-        sameBlocksEdges(board, freshBoard) && sameCycleMemberLiveness(cycles, board, freshBoard);
+        sameBlocksEdges(board, freshBoard) &&
+        sameCycleMemberLiveness(cycles, board, freshBoard) &&
+        sameBlockerLiveness(board, freshBoard);
       if (consistent) {
         // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
         // gates blocking each other, nothing else pointing at either) — `board` never carried them,
@@ -211,7 +222,8 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
           const stillConsistent =
             sameCycles(freshCycles, cycles) &&
             sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
-            sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard);
+            sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard) &&
+            sameBlockerLiveness(hydratedBoard, freshHydratedBoard);
           if (stillConsistent) {
             attachCycleEvidence(hydratedBoard, cycles);
             board = hydratedBoard;

@@ -269,6 +269,33 @@ describe("loadAllIssues", () => {
     expect(cyclesMock).toHaveBeenCalledTimes(2);
   });
 
+  it("retries when an ORDINARY (non-cycle) blocker is reopened between reads, even though `bd dep cycles` never names it (P2 review, PR #274, issues.ts:455)", async () => {
+    // t-9 blocks t-1 with no cycle through it, so `cycles` never reports either id — only a re-list
+    // can catch t-9 being reopened, the same way it catches a reported cycle member's drift above.
+    // Without `sameBlockerLiveness`, `sameCycleMemberLiveness` skips t-9 (not a cycle member) and
+    // `sameBlocksEdges` sees no change (the edge itself never moved), so this would wave a stale
+    // CLOSED reading of t-9 through — exactly what `blockedGap` (approval-gate.ts) reads to decide
+    // whether t-1 is still blocked.
+    const closedBlocker: Bead = { id: "t-9", title: "Blocker", status: "closed", issue_type: "task" };
+    const reopenedBlocker: Bead = { ...closedBlocker, status: "open" };
+    const blocked: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-9", type: "blocks" }],
+    };
+    listMock
+      .mockImplementationOnce(async () => [blocked, closedBlocker]) // this call's own work read — blocker closed
+      .mockImplementationOnce(async () => [blocked, reopenedBlocker]) // the recheck — blocker reopened, edge unchanged
+      .mockImplementationOnce(async () => [blocked, reopenedBlocker]) // retry's own work read — stable now
+      .mockImplementationOnce(async () => [blocked, reopenedBlocker]); // retry's recheck — converges
+    cyclesMock.mockResolvedValue([]); // acyclic edge — `bd dep cycles` never names it
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([blocked, reopenedBlocker]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
   it("retries when a cycle member's ANCESTOR is reparented into a different run, even though the member's own immediate parent never moves (P2 review, PR #274, issues.ts:410)", async () => {
     // t-1 sits below an intermediate ticket (`mid`), not directly below a run. Between the two reads,
     // `mid` itself gets reparented from run-a's subtree into run-b's — t-1's own `parentOf` (`mid`)
