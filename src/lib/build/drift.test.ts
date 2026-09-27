@@ -34,8 +34,14 @@ function liveWorkers(): number {
   return openWorkers;
 }
 
-vi.mock("node:worker_threads", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:worker_threads")>();
+/**
+ * Named so a case that swaps this module out for a controllable fake (a race it must drive by hand
+ * rather than by timing) can restore it afterwards with the SAME factory — `vi.doUnmock` reverts to
+ * the real, uncounted module instead of this one, which would silently drop every later case back to
+ * an unmocked `Worker` (anton-fzarz review).
+ */
+async function countedWorkerThreadsMock(importOriginal: () => Promise<typeof import("node:worker_threads")>) {
+  const actual = await importOriginal();
   class CountedWorker extends actual.Worker {
     constructor(path: string | URL, options?: WorkerOptions) {
       spawnedWorkers.push(String(path));
@@ -45,7 +51,9 @@ vi.mock("node:worker_threads", async (importOriginal) => {
     }
   }
   return { ...actual, Worker: CountedWorker };
-});
+}
+
+vi.mock("node:worker_threads", countedWorkerThreadsMock);
 
 let dir: string;
 const realDb = process.env.ANTON_DB;
@@ -1023,6 +1031,59 @@ describe("off-thread identity reads", () => {
     expect(serverBuildDrift({ fresh: true })).toBeNull();
 
     expect(workerPaths()).toHaveLength(0);
+  });
+
+  // The race the ordering fix in `storeOnDisk` closes: an external `git pull` fires no
+  // `checkoutMoved`, so a display read the health page started BEFORE the pull and the gate's
+  // synchronous `fresh` read the pull's own caller takes AFTER it share one generation. Landing
+  // second in real time but issued first, the display read must lose the cache slot — or the gate's
+  // correct, post-pull store gets overwritten and every render inside the TTL reports the running
+  // server current again.
+  it("does not let a display read started before a pull overwrite the gate's post-pull store", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+
+    // A property, not a bare `let`: TS's control-flow narrowing sees this reassigned only inside the
+    // fake worker's `once` closure, never in this function's own linear flow, and would otherwise keep
+    // treating it as statically `null` right through the calls between the assignment and its use.
+    const worker: { deliver: ((value: unknown) => void) | null } = { deliver: null };
+    vi.doMock("node:worker_threads", () => ({
+      Worker: class {
+        once(event: string, cb: (value: unknown) => void) {
+          if (event === "message") worker.deliver = cb;
+        }
+        terminate() {
+          return Promise.resolve();
+        }
+      },
+    }));
+
+    const { recordServerBuild, serverBuildDrift, serverBuildDrifts } = await import("./drift");
+    recordServerBuild({ runner: true }); // stamps "running" at 0.4.0 and fills the cache with it
+
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000); // past the TTL, so the render below must actually read
+
+    const displayRead = serverBuildDrifts(); // issued first — the worker is spawned, `deliver` is set
+
+    onDisk = { version: "0.4.1", revision: null }; // the external pull; nothing calls checkoutMoved
+    expect(serverBuildDrift({ fresh: true })?.state).toBe("outdated"); // the gate, issued after, stores 0.4.1
+
+    worker.deliver?.({ version: "0.4.0", revision: null }); // the slower read finally answers, with the STALE identity
+    await displayRead;
+
+    // A render inside the window must still see the fresher, gate-stored identity — not the stale one
+    // the slower read delivered second, which would otherwise compare equal to "running" and go silent.
+    expect(serverBuildDrift()?.state).toBe("outdated");
+
+    // Restore the real, counted worker for every case after this one — `vi.doUnmock` would instead
+    // revert to the unmocked module, silently dropping later cases' worker counts to zero.
+    vi.doMock("node:worker_threads", countedWorkerThreadsMock);
   });
 
   // An install whose worker file is missing — or a platform that refuses a thread — must still get a

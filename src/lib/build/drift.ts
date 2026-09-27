@@ -225,7 +225,18 @@ function invalidateCaches(): void {
  */
 const ON_DISK_TTL_MS = 15_000;
 
-let onDiskCache: { at: number; generation: number; identity: BuildIdentity } | null = null;
+let onDiskCache: { at: number; generation: number; seq: number; identity: BuildIdentity } | null = null;
+
+/**
+ * Orders reads within one generation, since `checkoutMoved` is the only invalidation an EXTERNAL
+ * `git pull` is guaranteed to trigger and a caller doing its own pull may skip it (anton-fzarz
+ * review). Assigned when a read is ISSUED, not when it settles: the off-thread display read that
+ * started before such a pull must lose to the synchronous `fresh` gate read the pull's caller takes
+ * afterwards, even though the display read's worker round trip lands second. Without this, that
+ * later-completing-but-earlier-issued read would overwrite the gate's correct, fresher store and
+ * every render within the TTL would compare against the pre-pull identity again.
+ */
+let onDiskSeq = 0;
 
 /** The cached read, when one still stands for this generation — the shared hit both paths take. */
 function cachedOnDisk(generation: number): BuildIdentity | null {
@@ -238,8 +249,14 @@ function unreadableIdentity(): BuildIdentity {
   return { version: null, revision: null, worktree: null, source: null, env: null };
 }
 
-function storeOnDisk(generation: number, identity: BuildIdentity): BuildIdentity {
-  onDiskCache = { at: Date.now(), generation, identity };
+/**
+ * Stores a read as the cache's answer for `generation`, unless a read ISSUED later already won that
+ * slot — the caller still gets what it read, but a stale read cannot evict a fresher one that beat
+ * it into the cache.
+ */
+function storeOnDisk(generation: number, identity: BuildIdentity, seq: number): BuildIdentity {
+  if (onDiskCache && onDiskCache.generation === generation && onDiskCache.seq > seq) return identity;
+  onDiskCache = { at: Date.now(), generation, seq, identity };
   return identity;
 }
 
@@ -250,7 +267,8 @@ function onDiskIdentity(fresh = false): BuildIdentity {
     if (cached) return cached;
   }
   const root = appRoot();
-  return storeOnDisk(generation, root ? (readBuildIdentity(root) as BuildIdentity) : unreadableIdentity());
+  const seq = ++onDiskSeq;
+  return storeOnDisk(generation, root ? (readBuildIdentity(root) as BuildIdentity) : unreadableIdentity(), seq);
 }
 
 /**
@@ -339,8 +357,12 @@ async function onDiskIdentityAsync(): Promise<BuildIdentity> {
   const cached = cachedOnDisk(generation);
   if (cached) return cached;
   const root = appRoot();
-  if (!root) return storeOnDisk(generation, unreadableIdentity());
+  if (!root) return storeOnDisk(generation, unreadableIdentity(), ++onDiskSeq);
   if (!inflightOnDisk || inflightOnDisk.generation !== generation) {
+    // Issued here, before the worker round trip — not in the `.then` below — so a synchronous
+    // `fresh` gate read taken while this is in flight is stamped with a LATER seq than this one,
+    // whichever of the two settles first (PR anton-fzarz review).
+    const seq = ++onDiskSeq;
     const identity = readIdentityOffThread(root)
       // The fallback stands in the same place the worker would have: a thread this platform or
       // install cannot start must not leave a display surface with no verdict at all. Logged once
@@ -351,7 +373,7 @@ async function onDiskIdentityAsync(): Promise<BuildIdentity> {
         warnOffThreadReadFailed(err);
         return readBuildIdentity(root) as BuildIdentity;
       })
-      .then((identity) => (cacheGeneration() === generation ? storeOnDisk(generation, identity) : identity))
+      .then((identity) => (cacheGeneration() === generation ? storeOnDisk(generation, identity, seq) : identity))
       .finally(() => {
         if (inflightOnDisk?.generation === generation) inflightOnDisk = null;
       });
