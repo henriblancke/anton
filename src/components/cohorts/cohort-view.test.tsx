@@ -168,6 +168,26 @@ describe("a healthy cohort", () => {
 
     expect(within(rowFor("same11")).getAllByText("no change")).toHaveLength(4);
   });
+
+  // A failed/abandoned feature that spans more than one dimension value still leaves the fold with
+  // its spend and friction, exactly like a spanning delivered feature does — but it never bumps
+  // `spanning.delivered`. Gating this warning on `spanning.delivered` alone silently dropped that
+  // remainder from the summary, even though the panel says failed runs stay in the numerator
+  // (PR #331 review).
+  it("names both the delivered and failed/abandoned share of the spanning remainder", () => {
+    render(
+      <CohortView
+        window="all"
+        series={{ ...SERIES, spanning: { delivered: 2, features: 3 } }}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        /3 features named more than one prompt.*\(2 delivered, 1 failed or abandoned before delivery\)/,
+      ),
+    ).toBeTruthy();
+  });
 });
 
 describe("an underpowered cohort", () => {
@@ -324,8 +344,31 @@ describe("no cohorts yet", () => {
 
     expect(screen.getByText(/No cohorts to compare yet/)).toBeTruthy();
     expect(
-      screen.getByText(/3 delivered features named more than one prompt in scope/),
+      screen.getByText(
+        /4 features in scope named more than one prompt.*\(3 delivered, 1 failed or abandoned before delivery\)/,
+      ),
     ).toBeTruthy();
+  });
+
+  // A feature that failed or was abandoned before delivery still spans the fold's dimension, and
+  // `promptSeries` still excludes it from every cohort — it just never bumps `spanning.delivered`.
+  // Gating the warning on `spanning.delivered` alone hid this remainder entirely (PR #331 review).
+  it("names the spanning remainder even when none of it was ever delivered", () => {
+    render(
+      <CohortView
+        window="all"
+        series={series([], "prompt", { delivered: 0, features: 2 })}
+      />,
+    );
+
+    expect(screen.getByText(/No cohorts to compare yet/)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /2 features in scope named more than one prompt.*\(0 delivered, 2 failed or abandoned before delivery\)/,
+      ),
+    ).toBeTruthy();
+    // Nothing was delivered, so the message must not claim delivery is why the comparison is empty.
+    expect(screen.queryByText(/not because nothing has been delivered/)).toBeNull();
   });
 
   it("says nothing extra about spanning when nothing delivered spans", () => {

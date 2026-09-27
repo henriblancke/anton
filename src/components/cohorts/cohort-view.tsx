@@ -134,6 +134,9 @@ function CohortSummary({
   const cohorted = cohorts.reduce((sum, cohort) => sum + cohort.n, 0);
   const delivered = cohorted + spanning.delivered;
   const mixed = cohorts.filter((cohort) => cohort.versions.mixed).length;
+  // `features` also counts failed/abandoned spanning work that never reaches `delivered` — gating
+  // this warning on `delivered` alone hid that remainder entirely (PR #331 review).
+  const spanningNonDelivered = spanning.features - spanning.delivered;
 
   return (
     <section className="flex flex-col gap-2.5 rounded-xl border border-border bg-card/40 px-3.5 py-3">
@@ -180,11 +183,15 @@ function CohortSummary({
         </p>
       ) : null}
 
-      {spanning.delivered > 0 ? (
+      {spanning.features > 0 ? (
         <p role="status" className="text-[11px] leading-relaxed text-risk-med">
-          {spanning.delivered} delivered feature{spanning.delivered === 1 ? "" : "s"} named more than
-          one {dimensionLabel} and so belongs to no cohort above — left out rather than split across
-          cohorts or double-counted in both.
+          {spanning.features} feature{spanning.features === 1 ? "" : "s"} named more than one{" "}
+          {dimensionLabel} and so belongs to no cohort above — left out rather than split across
+          cohorts or double-counted in both
+          {spanningNonDelivered > 0
+            ? ` (${spanning.delivered} delivered, ${spanningNonDelivered} failed or abandoned before delivery)`
+            : ""}
+          .
         </p>
       ) : null}
 
@@ -236,6 +243,10 @@ function NothingToCompare({
   dimensionLabel: string;
   spanning: SpanningFeatures;
 }) {
+  // Same remainder as `CohortSummary` — `features` also counts failed/abandoned spanning work that
+  // never reaches `delivered`, and gating on `delivered` alone hid it (PR #331 review).
+  const spanningNonDelivered = spanning.features - spanning.delivered;
+
   return (
     <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-border px-6 py-12 text-center">
       <span className="flex size-11 items-center justify-center rounded-xl border border-dashed border-border">
@@ -275,11 +286,16 @@ function NothingToCompare({
             </span>
           </li>
         </ul>
-        {spanning.delivered > 0 ? (
+        {spanning.features > 0 ? (
           <p role="status" className="max-w-md text-[11px] leading-relaxed text-risk-med">
-            {spanning.delivered} delivered feature{spanning.delivered === 1 ? "" : "s"} named more
-            than one {dimensionLabel} in scope and so belongs to no cohort — that is why this
-            comparison is empty, not because nothing has been delivered.
+            {spanning.features} feature{spanning.features === 1 ? "" : "s"} in scope named more
+            than one {dimensionLabel} and so belongs to no cohort
+            {spanningNonDelivered > 0
+              ? ` (${spanning.delivered} delivered, ${spanningNonDelivered} failed or abandoned before delivery)`
+              : ""}
+            {spanning.delivered > 0
+              ? " — that is why this comparison is empty, not because nothing has been delivered."
+              : "."}
           </p>
         ) : null}
       </div>
