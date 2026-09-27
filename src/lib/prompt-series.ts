@@ -579,7 +579,7 @@ export interface SpanningFeatures {
  * Discarding every one of them from the "skill" dimension unconditionally, though, would make it
  * impossible to ever answer whether editing a BUNDLED skill's own text helped — every such row
  * would read as no signal at all, before and after the edit alike. See
- * {@link SKILL_DIGEST_FALLBACK_IDS} and {@link featureKeys} for the one carve-out.
+ * {@link SKILL_DIGEST_FALLBACK_PRIORITY} and {@link featureKeys} for the one carve-out.
  */
 const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan-triage"]);
 
@@ -590,12 +590,21 @@ const SCAFFOLDING_SKILL_IDS = new Set(["describe", "review", "review-fix", "scan
  * `scan-triage` are real bundled skill files a project can edit the same way it can `review`'s, so
  * restricting this set to `review` alone silently dropped any signal from editing either of the
  * other two (PR #331 review) — a feature whose only fallback skill happened to be `review-fix` read
- * as having named no skill at all, rather than the bundled skill it actually ran under. A feature
- * that ran under two distinct ids from this set still reads as spanning once both digests land in
- * {@link featureKeys}'s key set — the same call the "two real specialist skills" case makes, since
- * it genuinely ran under two bundled skills a project could edit independently.
+ * as having named no skill at all, rather than the bundled skill it actually ran under.
+ *
+ * Ordered most-specific phase first, not a plain set: {@link featureKeys} reads down this list and
+ * stops at the first phase that recorded a digest, rather than unioning every phase's digest into
+ * one key set. `review-fix` only ever runs as `review`'s own correction round on the SAME feature —
+ * a feature that exercised both did not ambiguously run under two competing skills, it ran review,
+ * got sent back, and ran review-fix; reading review-fix's digest ahead of review's is the deeper,
+ * more specific signal once it exists. Unioning both (the earlier fallback-skill fix's reading) threw
+ * every fix-round feature into `spanning`, which emptied the one cohort meant to measure editing
+ * `review-fix` itself — the exact bundled file this carve-out exists to keep visible (fresh review
+ * feedback, PR #331). A phase that recorded two DIFFERENT digests for ITSELF (its own bundled file
+ * changed mid-feature) still reads as spanning, once {@link featureKeys} finds more than one — that
+ * is genuine ambiguity within one phase, not a pairing across two.
  */
-const SKILL_DIGEST_FALLBACK_IDS = new Set(["review", "review-fix", "scan-triage"]);
+const SKILL_DIGEST_FALLBACK_PRIORITY: readonly string[] = ["review-fix", "review", "scan-triage"];
 
 /**
  * Whether a row's {@link CohortStampRow.skillId} is anton's own scaffolding fallback rather than a
@@ -667,17 +676,22 @@ function featureKeys(feature: CohortFeature, dimension: CohortDimension): string
   }
   if (keys.size === 0 && dimension === "skill") {
     // Nothing named a project skill, so the only signal left is one of anton's own bundled
-    // fallbacks in {@link SKILL_DIGEST_FALLBACK_IDS} — and its digest changing IS the "did editing
-    // the bundled skill help" question this dimension exists to answer (PR #331 review). Reached
-    // only when the loop above found no real skill at all: a feature that named one is never routed
-    // through here. A feature that ran under two distinct fallback ids (e.g. `review` and
-    // `review-fix`) still ends up spanning once both digests land in `keys` — the same honest call
-    // the "two real specialist skills" branch above makes, not a bug this loop should paper over.
-    for (const row of feature.rows) {
-      if (!isScaffoldingFallback(row)) continue;
-      if (!row.skillId || !SKILL_DIGEST_FALLBACK_IDS.has(row.skillId)) continue;
-      const digest = row.skillDigest?.trim();
-      if (digest) keys.add(digest);
+    // fallbacks — and its digest changing IS the "did editing the bundled skill help" question this
+    // dimension exists to answer (PR #331 review). Reached only when the loop above found no real
+    // skill at all: a feature that named one is never routed through here.
+    //
+    // Walk {@link SKILL_DIGEST_FALLBACK_PRIORITY} most-specific phase first and stop at the first one
+    // that recorded a digest, rather than unioning every phase's digest into `keys` — see that
+    // constant for why `review` and `review-fix` on the same feature is the expected shape of a fix
+    // round, not two competing skills.
+    for (const phase of SKILL_DIGEST_FALLBACK_PRIORITY) {
+      for (const row of feature.rows) {
+        if (!isScaffoldingFallback(row)) continue;
+        if (row.skillId !== phase) continue;
+        const digest = row.skillDigest?.trim();
+        if (digest) keys.add(digest);
+      }
+      if (keys.size > 0) break;
     }
   }
   return [...keys];
@@ -777,11 +791,21 @@ function cohortWindow(from: CohortAccumulator): CohortWindow | undefined {
 }
 
 /**
- * Cohorts oldest first — the order the deltas are then drawn along.
+ * Cohorts oldest first — the DISPLAY order, and the order deltas are drawn along.
  *
  * Keyed on the FIRST delivery rather than the last, so a cohort still accruing does not overtake the
  * one it succeeded. A cohort with no window at all sorts last (it delivered nothing, or nothing
  * timed), and ties break on the key so a read is stable rather than dependent on encounter order.
+ *
+ * That key tie-break is for STABILITY only — it makes repeated reads of the same input agree with
+ * each other, not with the clock. `deliveredAtMs` is whole-second precision (see {@link
+ * promptSeries}'s `dated.sort`), so two different keys tied here genuinely delivered in the same
+ * recorded second: nothing in the data says which ran first. Treating this order as chronology
+ * anyway is exactly the bug the earlier tie-order fix introduced (fresh review feedback, PR #331):
+ * reversing two digest strings would then reverse which cohort's metrics get presented as the delta
+ * baseline for the other, even though the underlying timestamps never said so. The delta computation
+ * in {@link promptSeries} guards against this directly — see `chronologicallyPrecedes` — rather than
+ * this comparator pretending the tie has a direction.
  */
 function byWindow(a: CohortAccumulator, b: CohortAccumulator): number {
   const left = a.firstDeliveryMs;
@@ -980,7 +1004,9 @@ export function promptSeries(
     dimension,
     cohorts: ordered.map((cohort, index) => {
       const previous = ordered[index - 1];
-      const standing = cohortStanding(sampleOf(cohort), previous ? sampleOf(previous) : undefined);
+      const baseline =
+        previous && chronologicallyPrecedes(previous, cohort) ? sampleOf(previous) : undefined;
+      const standing = cohortStanding(sampleOf(cohort), baseline);
       return {
         ...standing,
         key: cohort.key,
@@ -993,6 +1019,23 @@ export function promptSeries(
     }),
     spanning,
   };
+}
+
+/**
+ * Whether `previous` genuinely delivered before `cohort` — strictly, not merely "sorts earlier".
+ *
+ * `byWindow` places every cohort in SOME order so the series has one to render, but a tied
+ * `firstDeliveryMs` (two keys delivered in the same recorded second) is not evidence either ran
+ * first — see `byWindow`'s own header. Presenting a tied `previous` as the baseline anyway lets an
+ * arbitrary tie-break (a digest string's lexical order) decide which cohort's metrics read as the
+ * delta baseline for the other (fresh review feedback, PR #331). Requiring a STRICT ordering here,
+ * rather than trusting adjacency in `ordered`, is what keeps that arbitrary choice from leaking into
+ * a directional claim neither cohort earned.
+ */
+function chronologicallyPrecedes(previous: CohortAccumulator, cohort: CohortAccumulator): boolean {
+  const before = previous.firstDeliveryMs;
+  const after = cohort.firstDeliveryMs;
+  return before !== undefined && after !== undefined && before < after;
 }
 
 /** One accumulator as the guardrails read it — the bridge from the fold to {@link cohortStanding}. */

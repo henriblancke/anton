@@ -399,6 +399,26 @@ describe("promptSeries: grouping on the stamp tuple", () => {
     expect(series.cohorts.map((cohort) => cohort.basis.features).sort()).toEqual([2, 3]);
   });
 
+  it("draws no delta between two keys tied on the same delivered second, regardless of key spelling (fresh review feedback, PR #331)", () => {
+    // Both cohorts deliver entirely within the same recorded second (AUG_2) — nothing in the data
+    // says which ran first. `Z_PROMPT` sorts AFTER `OLD_PROMPT` lexically; a comparator that treats
+    // that tie-break as chronology would present one cohort's usd as a delta baseline for the
+    // other's, purely because of how the two digests happen to compare as strings.
+    const Z_PROMPT = "zzzz9999";
+    const series = promptSeries(
+      [
+        ...deliveries(5, { key: OLD_PROMPT, at: AUG_2, usd: 1 }),
+        ...deliveries(5, { key: Z_PROMPT, at: AUG_2, usd: 100 }),
+      ],
+      "prompt",
+    );
+
+    expect(series.cohorts).toHaveLength(2);
+    for (const cohort of series.cohorts) {
+      expect(cohort.comparable && cohort.deltas).toEqual([]);
+    }
+  });
+
   it("attributes a failed feature to the episode it ran in, not always the newest sharing its key (PR #331 review)", () => {
     // Same A → B → A restoration, plus one A feature that never delivered. It ran during the FIRST
     // A episode (its activity sits right after JUL_1) — folding it into the second A episode just
@@ -904,7 +924,12 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
     expect(series.cohorts[0]?.key).toBe("review-fix-digest");
   });
 
-  it("treats a feature that ran two distinct bundled fallbacks as spanning, not silently the first one", () => {
+  it("attributes a review-then-fix feature to review-fix's digest, not spanning the pair (PR #331 review)", () => {
+    // `review-fix` only ever runs as `review`'s own correction round on the SAME feature — this is
+    // the ordinary shape of a fix round, not a feature ambiguously running under two competing
+    // skills. Unioning both digests into `spanning` (the earlier fallback-skill fix's reading)
+    // dropped every fix-round feature from the one cohort meant to measure editing `review-fix`
+    // itself.
     const feature = [
       {
         beadId: "a",
@@ -914,6 +939,28 @@ describe("promptSeries: the skill dimension ignores anton's own scaffolding phas
         rows: [
           { skillId: "review", skillDigest: "review-digest" },
           { skillId: "review-fix", skillDigest: "review-fix-digest" },
+        ],
+      },
+    ];
+
+    const series = promptSeries(feature, "skill");
+    expect(series.spanning).toEqual({ delivered: 0, features: 0 });
+    expect(series.cohorts[0]?.key).toBe("review-fix-digest");
+  });
+
+  it("still treats two DIFFERENT digests within the SAME fallback phase as spanning", () => {
+    // Two `review-fix` rows disagreeing on digest means the bundled `review-fix` file itself
+    // changed mid-feature — that is genuine ambiguity within one phase, unlike the review/review-fix
+    // pairing above.
+    const feature = [
+      {
+        beadId: "a",
+        delivered: true,
+        deliveredAtMs: AUG_2,
+        usd: 1,
+        rows: [
+          { skillId: "review-fix", skillDigest: "review-fix-digest-1" },
+          { skillId: "review-fix", skillDigest: "review-fix-digest-2" },
         ],
       },
     ];
