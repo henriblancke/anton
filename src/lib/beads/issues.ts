@@ -287,6 +287,13 @@ export async function loadAllIssues(
       if (retryOnHydrationEdgeDrift) return retryOnHydrationEdgeDrift;
     }
   }
+  // Stamp the verification time here too, not only in `probeCycleEvidence`'s own attach (P2
+  // review, PR #274, issues.ts:673): a cold `allIssues({ withCycles: true })`/`readAllIssues`
+  // call reaches this path directly, without ever going through the probe. Leaving the
+  // timestamp unset would make `probeCycleEvidence`'s freshness check read this evidence as
+  // already expired (`checkedAt` defaults to 0), triggering an immediate redundant `bd dep
+  // cycles` on the very next poll.
+  cycleEvidenceCheckedAt().set(cwd, Date.now());
   return attachCycleEvidence(board, cycles);
 }
 
@@ -671,6 +678,11 @@ async function attachCyclesBestEffort(cwd: string, board: Bead[], generation: nu
         // recheck above it guards against.
         if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
           attachCycleEvidence(board, cycles);
+          // Stamp verification time on every attach, not only `probeCycleEvidence`'s own (P2
+          // review, PR #274, issues.ts:673) — otherwise a cold enrichment reaching this
+          // best-effort path leaves `checkedAt` at its zero default, so the very next poll reads
+          // this fresh evidence as already expired and launches a redundant `bd dep cycles`.
+          cycleEvidenceCheckedAt().set(cwd, Date.now());
           markCycleEvidenceRecovered(cwd);
         }
       }
@@ -821,6 +833,11 @@ export async function ensureCycleEvidence(
       // can equally land while the gate listing was in flight.
       if (consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) === undefined) {
         attachCycleEvidence(board, cycles);
+        // Stamp verification time on every attach, not only `probeCycleEvidence`'s own (P2
+        // review, PR #274, issues.ts:673) — otherwise this approval-path attach leaves
+        // `checkedAt` at its zero default and the next poll reads this fresh evidence as
+        // already expired.
+        cycleEvidenceCheckedAt().set(cwd, Date.now());
         markCycleEvidenceRecovered(cwd);
       }
     }
@@ -974,6 +991,11 @@ export async function refreshAllIssuesRead(
       const cycles = await fetchCyclesShared(cwd, boardGeneration);
       if (issueSnapshotGeneration(cwd) === boardGeneration) {
         attachCycleEvidence(board, cycles);
+        // Stamp verification time on every attach, not only `probeCycleEvidence`'s own (P2
+        // review, PR #274, issues.ts:673) — otherwise this forced-refresh attach leaves
+        // `checkedAt` at its zero default and the next poll reads this fresh evidence as
+        // already expired.
+        cycleEvidenceCheckedAt().set(cwd, Date.now());
         markCycleEvidenceRecovered(cwd);
       }
     } catch (e) {
@@ -1239,6 +1261,18 @@ export function probeCycleEvidence(cwd: string): void {
             if (previousCycles === undefined || !sameCycles(previousCycles, cycles)) {
               markCycleEvidenceRecovered(cwd);
             }
+          } else if (!consistent && issueSnapshotGeneration(cwd) === generation && cycleEvidenceFor(board) !== undefined) {
+            // A rejected pairing here means a refresh triggered by EXPIRED evidence (the early
+            // return above only skips while within `CYCLE_EVIDENCE_MAX_AGE_MS`, so reaching this
+            // far means the freshness check already failed, not that evidence was missing) failed
+            // its consistency recheck without throwing (P2 review, PR #274, issues.ts:1230).
+            // Falling through here would leave the old WeakMap entry in place, so on a
+            // shared-server board that moved between the `bd dep cycles` fetch and the re-list,
+            // `cycleEvidenceFor(board)` would keep reporting the now-stale cycle set as
+            // authoritative until some later probe happens to succeed. Clear it and fail closed,
+            // mirroring the catch block's present->missing transition below.
+            clearCycleEvidence(board);
+            markCycleEvidenceUnavailable(cwd);
           }
         }
       } catch {
