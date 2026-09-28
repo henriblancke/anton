@@ -463,7 +463,7 @@ describe("recording never fails the round", () => {
         prNumber: 331,
         state: "merged",
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
   });
 
   it("swallows a write against a table that vanished underneath it", async () => {

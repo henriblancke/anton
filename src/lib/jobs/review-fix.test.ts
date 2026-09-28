@@ -15,7 +15,7 @@ import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { GH_BIN_ENV } from "../git/ops";
-import { ANTON_MARK, type PrReview, type ReviewThread } from "../git/pr";
+import { ANTON_MARK, type PrActivity, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
 import {
   applyThreadOutcomes,
@@ -43,9 +43,15 @@ vi.mock("../beads/bd", async () => {
 
 /** The one `gh` read per target. `classifyReview` stays real — the verdict is what is under test. */
 const getPrReviewMock = vi.fn();
+/** The lighter state-only read orphaned-round reconciliation uses instead of `getPrReview`. */
+const getPrActivityMock = vi.fn();
 vi.mock("../git/pr", async () => {
   const actual = await vi.importActual<typeof import("../git/pr")>("../git/pr");
-  return { ...actual, getPrReview: (...a: unknown[]) => getPrReviewMock(...a) };
+  return {
+    ...actual,
+    getPrReview: (...a: unknown[]) => getPrReviewMock(...a),
+    getPrActivity: (...a: unknown[]) => getPrActivityMock(...a),
+  };
 });
 
 const resolveOperatorMock = vi.fn();
@@ -394,6 +400,15 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     ...over,
   });
 
+  const prActivity = (number: number, over: Partial<PrActivity> = {}): PrActivity => ({
+    number,
+    state: "OPEN",
+    url: `https://example.test/pull/${number}`,
+    updatedAtMs: 1_700_000_000_000,
+    isDraft: false,
+    ...over,
+  });
+
   let t: TestProjectDb;
   const clock: Clock = { now: () => 1_700_000_000_000 };
 
@@ -549,7 +564,7 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     it("stamps a null round whose target already left the board once GitHub confirms it merged", async () => {
       listMock.mockResolvedValue([]); // the epic that owned PR #9 already closed and dropped off
       insertUnsettledRound(9);
-      getPrReviewMock.mockResolvedValue(openPr(9, { state: "MERGED" }));
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "MERGED" }));
 
       const job = await getJob(t.db, await dispatch());
       expect(prStateOf(9)).toBe("merged");
@@ -561,8 +576,8 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
       listMock.mockResolvedValue([]);
       insertUnsettledRound(9);
       insertUnsettledRound(10);
-      getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
-        number === 9 ? openPr(9, { state: "CLOSED" }) : openPr(10, { state: "OPEN" }),
+      getPrActivityMock.mockImplementation(async (_repo: string, number: number) =>
+        number === 9 ? prActivity(9, { state: "CLOSED" }) : prActivity(10, { state: "OPEN" }),
       );
 
       await dispatch();
@@ -576,8 +591,10 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
       getPrReviewMock.mockResolvedValue(openPr(1, { state: "MERGED" }));
 
       await dispatch();
-      // One `gh` read for PR #1, not two — reconciliation must skip a PR the triage loop already read.
+      // Reconciliation must skip a PR the triage loop already read via `getPrReview` — it never
+      // falls through to the lighter `getPrActivity` reader for a PR that isn't orphaned.
       expect(getPrReviewMock).toHaveBeenCalledTimes(1);
+      expect(getPrActivityMock).not.toHaveBeenCalled();
     });
 
     // PR #335 review (src/lib/review-rounds.ts:259): a `closed` orphan row must stay eligible for
@@ -591,18 +608,54 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
         .set({ prState: "closed", prStateAt: new Date(clock.now()) })
         .where(eq(schema.reviewRounds.prNumber, 9))
         .run();
-      getPrReviewMock.mockResolvedValue(openPr(9, { state: "MERGED" }));
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "MERGED" }));
 
       await dispatch();
       expect(prStateOf(9)).toBe("merged");
     });
 
+    // PR #335 review (src/lib/jobs/review-fix.ts:350): an orphan already stamped `closed` has no
+    // OPEN branch in the state chain unless this reconciliation restores one — without it, a PR
+    // that reopens and closes again without merging would be read as a repeated poll of the first
+    // close, and the row would keep its stale first-close timestamp.
+    it("resets an already-closed orphan row back to unsettled when GitHub reports it reopened", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      t.db
+        .update(schema.reviewRounds)
+        .set({ prState: "closed", prStateAt: new Date(clock.now()) })
+        .where(eq(schema.reviewRounds.prNumber, 9))
+        .run();
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "OPEN" }));
+
+      await dispatch();
+      expect(prStateOf(9)).toBeNull();
+    });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:350): `unsettledPrNumbers` deliberately keeps
+    // returning an orphan stamped `closed` forever, so a repeated poll of a PR that stays closed
+    // must not keep incrementing `reconciled` — that would report `changed: true` and a fabricated
+    // reconciliation count on a pass that restamped nothing.
+    it("does not count a repeated poll of an already-closed orphan as reconciled", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      t.db
+        .update(schema.reviewRounds)
+        .set({ prState: "closed", prStateAt: new Date(clock.now()) })
+        .where(eq(schema.reviewRounds.prNumber, 9))
+        .run();
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "CLOSED" }));
+
+      const job = await getJob(t.db, await dispatch());
+      expect(prStateOf(9)).toBe("closed");
+      expect(job?.outcomeNote).toBe("nothing in review");
+      expect(job?.outcome).toBe("noop");
+    });
+
     it("never reconciles on a targeted single-epic run", async () => {
       listMock.mockResolvedValue([target("e-1", 1)]);
       insertUnsettledRound(9); // orphaned, but this run is scoped to epicBeadId "e-1"
-      getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
-        number === 1 ? openPr(1) : openPr(9, { state: "MERGED" }),
-      );
+      getPrReviewMock.mockResolvedValue(openPr(1));
 
       await driveJob({
         db: t.db,
@@ -615,6 +668,7 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
       });
       expect(prStateOf(9)).toBeNull();
       expect(getPrReviewMock).toHaveBeenCalledTimes(1); // only PR #1, never #9
+      expect(getPrActivityMock).not.toHaveBeenCalled();
     });
   });
 });

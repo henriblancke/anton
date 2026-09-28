@@ -72,6 +72,7 @@ import {
   ANTON_MARK,
   classifyReview,
   commentOnPr,
+  getPrActivity,
   getPrComments,
   getPrReview,
   prNumberFromRef,
@@ -332,6 +333,12 @@ async function dispatchInReview(args: {
   // for that this pass did NOT already triage above (those are already covered) by reading it
   // directly — one `gh` read per orphaned PR, which is rare by construction. Only on the untargeted,
   // whole-project sweep: a single-epic run (`epicBeadId` set) has no reason to scan every PR.
+  //
+  // Reads `getPrActivity` (state only), not `getPrReview` (reviews + CI rollup + paginated thread
+  // GraphQL): reconciliation only ever inspects `.state`, and a `closed` orphan is kept in
+  // `unsettledPrNumbers` indefinitely for a possible reopen/merge, so every recurring untargeted
+  // sweep would otherwise pay `getPrReview`'s full cost for every historical closed PR forever
+  // (PR #335 review).
   let reconciled = 0;
   if (!epicBeadId) {
     const triagedNumbers = new Set(
@@ -341,13 +348,21 @@ async function dispatchInReview(args: {
     for (const prNumber of orphaned) {
       await ctx.heartbeat();
       try {
-        const latest = await getPrReview(repo, prNumber, ctx.signal);
+        const latest = await getPrActivity(repo, prNumber, ctx.signal);
         if (latest.state === "MERGED") {
-          await recordPrTerminalState(db, clock, { projectId, prNumber, state: "merged" });
-          reconciled += 1;
+          if (await recordPrTerminalState(db, clock, { projectId, prNumber, state: "merged" })) {
+            reconciled += 1;
+          }
         } else if (latest.state === "CLOSED") {
-          await recordPrTerminalState(db, clock, { projectId, prNumber, state: "closed" });
-          reconciled += 1;
+          if (await recordPrTerminalState(db, clock, { projectId, prNumber, state: "closed" })) {
+            reconciled += 1;
+          }
+        } else if (latest.state === "OPEN") {
+          // The orphan's own counterpart to the per-target OPEN observation above (PR #335 review):
+          // an orphan stamped `closed` that GitHub now reports reopened has no null row for the next
+          // close to find (nothing here ever writes a fresh round), so without this the state chain
+          // has no OPEN branch and a second close reads as a repeated poll of the first.
+          await recordPrReopened(db, { projectId, prNumber });
         }
       } catch (e) {
         // One unreadable orphaned PR must not block reconciling the rest — it stays null and is

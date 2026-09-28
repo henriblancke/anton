@@ -208,12 +208,17 @@ export async function recordReviewRound(
  * recordPrReopened} is the counterpart observation that covers this: called wherever anton reads the
  * PR as OPEN, it unsettles the PR's already-`closed` rows back to null so this function's null-row
  * check finds real reopen evidence even when no round ran in between.
+ *
+ * Returns whether this call actually stamped a row — false for every no-op above (no rows for the
+ * PR, an already-final `merged` state, or a repeated poll of an already-settled `closed`) — so a
+ * caller reconciling PRs it does not otherwise track (PR #335 review) can count real transitions
+ * instead of every observation.
  */
 export async function recordPrTerminalState(
   db: AntonDb,
   clock: Clock,
   input: { projectId: string; prNumber: number; state: PrTerminalState },
-): Promise<void> {
+): Promise<boolean> {
   try {
     const forPr = and(
       eq(schema.reviewRounds.projectId, input.projectId),
@@ -221,25 +226,29 @@ export async function recordPrTerminalState(
     );
 
     if (input.state === "merged") {
-      await db
+      const written = await db
         .update(schema.reviewRounds)
         .set({ prState: "merged", prStateAt: secDate(clock.now()) })
-        .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))));
-      return;
+        .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))))
+        .returning({ prNumber: schema.reviewRounds.prNumber });
+      return written.length > 0;
     }
 
     const unsettled = await db
       .select({ n: count() })
       .from(schema.reviewRounds)
       .where(and(forPr, isNull(schema.reviewRounds.prState)));
-    if ((unsettled[0]?.n ?? 0) === 0) return;
+    if ((unsettled[0]?.n ?? 0) === 0) return false;
 
-    await db
+    const written = await db
       .update(schema.reviewRounds)
       .set({ prState: "closed", prStateAt: secDate(clock.now()) })
-      .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))));
+      .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))))
+      .returning({ prNumber: schema.reviewRounds.prNumber });
+    return written.length > 0;
   } catch {
     // Swallowed on purpose — see the contract above.
+    return false;
   }
 }
 
