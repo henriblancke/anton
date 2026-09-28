@@ -129,6 +129,37 @@ describe("parseOutcomes", () => {
     expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health"]);
   });
 
+  // PR #334 review: a genuine `## Outcomes` section may still contain a fenced example bullet
+  // (inside a ```` ``` ```` block, not an HTML comment) — it must render as code, not be offered
+  // as a real outcome, the same guarantee the HTML-comment case above already covers.
+  it("skips a fenced bullet rather than parsing it as a real outcome", () => {
+    const markdown = [
+      "## Outcomes",
+      "Add one bullet per outcome, in that exact form, e.g.:",
+      "```",
+      "- `example-id` — Example summary",
+      "```",
+      "- `real-id` — This one is outside the fence.",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "real-id"]);
+  });
+
+  // PR #334 review: a PRODUCT.md with `## Outcomes` declared twice (e.g. after a merge) used to
+  // only ever read the first occurrence, silently dropping ids declared solely in a later one.
+  it("collects bullets from every ## Outcomes occurrence, not just the first", () => {
+    const markdown = [
+      "## Outcomes",
+      "- `first` — Declared in the first section.",
+      "## Stack",
+      "Next.js.",
+      "## Outcomes",
+      "- `second` — Declared again later.",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "first", "second"]);
+  });
+
   it("lets a later bullet override the built-in codebase-health entry", () => {
     const markdown = ["## Outcomes", "- `codebase-health` — Custom summary for this project."].join("\n");
 

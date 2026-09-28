@@ -6,7 +6,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { renderedLines } from "./beads/markdown";
+import { renderedLines, type RenderedLine } from "./beads/markdown";
 import { AREA_SHAPE } from "./epic-patch";
 
 export interface ProjectOutcome {
@@ -33,23 +33,35 @@ const BULLET_PATTERN = /^-\s*`([^`]+)`\s*—\s*(.+)$/;
 const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
 
 /**
- * The `## Outcomes` section body, up to the next heading of any level — or undefined if absent.
- * Reads via {@link renderedLines} so HTML-comment content (the scaffolded template's embedded
- * example bullet) is masked out before scanning, the same way the contract parser's
- * `renderedText` does — otherwise an unedited PRODUCT.md's example bullet inside `<!-- ... -->`
- * would parse as a real outcome. Terminates on any rendered heading, ATX or Setext — a Setext
- * heading's text doesn't start with `#`, so re-checking its source spelling here would let a
- * later section's bullets leak into Outcomes.
+ * Every `## Outcomes` section's body lines, up to each one's next heading of any level — or
+ * undefined if the heading never appears. Reads via {@link renderedLines} so HTML-comment content
+ * (the scaffolded template's embedded example bullet) is masked out before scanning, the same way
+ * the contract parser's `renderedText` does — otherwise an unedited PRODUCT.md's example bullet
+ * inside `<!-- ... -->` would parse as a real outcome. Terminates each section on any rendered
+ * heading, ATX or Setext — a Setext heading's text doesn't start with `#`, so re-checking its
+ * source spelling here would let a later section's bullets leak into Outcomes.
+ *
+ * Collects EVERY occurrence rather than stopping at the first, mirroring
+ * {@link extractOutcomeIdsSection} in backlog.ts — a PRODUCT.md authored (or merged) with more than
+ * one `## Outcomes` heading must not have ids declared only in a later occurrence silently dropped.
+ * Lines stay {@link RenderedLine}s (not bare strings) so a caller can skip fenced ones — a fenced
+ * example bullet renders as code, not a real outcome, but source-level slicing here would have lost
+ * that distinction before the caller ever sees it.
  */
-function outcomesSection(markdown: string): string[] | undefined {
+function outcomesSections(markdown: string): RenderedLine[] | undefined {
   const lines = renderedLines(markdown);
-  const start = lines.findIndex((line) => line.heading && OUTCOMES_HEADING.test(line.text.trim()));
-  if (start === -1) return undefined;
-  const body: string[] = [];
-  for (let i = start + 1; i < lines.length && !lines[i].heading; i++) {
-    body.push(lines[i].text);
+  let found = false;
+  const body: RenderedLine[] = [];
+  let inSection = false;
+  for (const line of lines) {
+    if (line.heading) {
+      inSection = OUTCOMES_HEADING.test(line.text.trim());
+      if (inSection) found = true;
+      continue;
+    }
+    if (inSection) body.push(line);
   }
-  return body;
+  return found ? body : undefined;
 }
 
 function parseBullet(line: string): ProjectOutcome | undefined {
@@ -77,9 +89,10 @@ function parseBullet(line: string): ProjectOutcome | undefined {
  */
 export function parseOutcomes(markdown: string): ProjectOutcome[] {
   const outcomes = new Map<string, ProjectOutcome>([[BUILT_IN_OUTCOME.id, BUILT_IN_OUTCOME]]);
-  const section = outcomesSection(markdown);
+  const section = outcomesSections(markdown);
   for (const line of section ?? []) {
-    const outcome = parseBullet(line);
+    if (line.fenced) continue;
+    const outcome = parseBullet(line.text);
     if (!outcome) continue;
     if (outcome.id === BUILT_IN_OUTCOME.id) {
       outcomes.set(outcome.id, { ...outcome, retired: false });

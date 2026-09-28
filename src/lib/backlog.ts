@@ -252,13 +252,20 @@ export class DraftOutcomeError extends Error {
 }
 
 /** Split a free-text `## Outcome IDs` field (e.g. `outcome:reports-are-shareable,
- * outcome:report-sharng`) into its individual declared id tokens: comma/whitespace-separated
- * entries, each with an optional `outcome:` label prefix stripped. Shared by every check that
- * needs the full declared set, not just whether one particular id is among them. */
+ * outcome:report-sharng`) into its individual declared id tokens: comma/newline-separated
+ * entries, each with an optional `outcome:` label prefix stripped. Splits only on the structured
+ * separators, not on every space — a manually authored or legacy epic that pairs an id with
+ * explanatory prose on the same line (`outcome:trustworthy-board — primary outcome`) must not
+ * have that prose's own words (`primary`, `outcome`) split out as if they were their own declared
+ * tokens. Deliberately does NOT drop a token that fails id syntax ({@link AREA_SHAPE}): a caller
+ * building a founder-facing error (e.g. `assertOutcomeUsable`) needs the raw malformed token to
+ * name it; a caller about to propagate tokens onward as labels validates separately
+ * ({@link outcomeIdsOf}). Shared by every check that needs the full declared set, not just whether
+ * one particular id is among them. */
 export function outcomeIdTokens(outcomeIds: string): string[] {
   return outcomeIds
-    .split(/[,\s]+/)
-    .map((token) => token.trim().replace(/^outcome:/i, ""))
+    .split(/[,\n]+/)
+    .map((token) => token.trim().replace(/^outcome:/i, "").trim())
     .filter(Boolean);
 }
 
@@ -321,12 +328,21 @@ export function extractOutcomeIdsSection(description: string): { present: boolea
  * them as free text in its own `## Outcome IDs` section instead. Falling back to the label read alone
  * would make every standalone epic look like it predates outcome ids and silently drop its declared
  * outcomes wherever a caller derives them from the target.
+ *
+ * The free-text path's tokens are filtered to id syntax ({@link AREA_SHAPE}) before they're handed
+ * back — this is the one place every rework path (review-fix-followup.ts, rework-modes.ts) reads a
+ * target's outcome ids through before mapping them straight into a follow-up's `outcome:<id>`
+ * labels, so a manually authored or legacy `## Outcome IDs` section mixing an id with explanatory
+ * prose on the same line (`outcome:trustworthy-board — primary outcome`) must not have that prose
+ * propagate onward as fabricated labels. An already-set `outcome:` label needs no such filter — it
+ * was written by code that validated it (or is a founder's direct edit) at commit time, not parsed
+ * from free text now.
  */
 export function outcomeIdsOf(target: Bead): string[] {
   const labeled = labelValuesOf(target.labels, "outcome");
   if (labeled.length > 0) return labeled;
   const { present, body } = extractOutcomeIdsSection(target.description ?? "");
-  return present ? outcomeIdTokens(body) : [];
+  return present ? outcomeIdTokens(body).filter((id) => AREA_SHAPE.test(id)) : [];
 }
 
 /**

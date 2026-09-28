@@ -36,6 +36,7 @@ import {
   epicChoices,
   extractOutcomeIdsSection,
   knownAreas,
+  outcomeIdsOf,
   outcomeIdTokens,
 } from "./backlog";
 import { validateBeadContract } from "./beads/contract";
@@ -175,6 +176,47 @@ describe("extractOutcomeIdsSection", () => {
     expect(present).toBe(true);
     expect(body).toBe("outcome:a\n\noutcome:b");
     expect(outcomeIdTokens(body)).toEqual(["a", "b"]);
+  });
+
+  // PR #334 review: a manually authored or legacy epic pairing an id with explanatory prose on the
+  // same line used to have every whitespace-separated word treated as its own declared token —
+  // `outcome:trustworthy-board — primary outcome` split into `trustworthy-board`, `—`, `primary`,
+  // `outcome`. Splitting only on comma/newline keeps that whole line as one token instead (still
+  // returned raw here — a caller like `assertOutcomeUsable` needs the raw token to name it in an
+  // error; `outcomeIdsOf` below is where malformed tokens are actually dropped).
+  it("keeps explanatory prose sharing a line with a declared id as one raw token, not several", () => {
+    expect(outcomeIdTokens("outcome:trustworthy-board — primary outcome")).toEqual([
+      "trustworthy-board — primary outcome",
+    ]);
+  });
+
+  it("still splits a genuine comma-separated list on the same line", () => {
+    expect(outcomeIdTokens("outcome:a, outcome:b")).toEqual(["a", "b"]);
+  });
+});
+
+describe("outcomeIdsOf", () => {
+  // PR #334 review: `outcomeIdsOf` is the one place every rework path reads a target's outcome ids
+  // before mapping them straight into a follow-up's `outcome:<id>` labels — a manually authored or
+  // legacy `## Outcome IDs` section pairing an id with explanatory prose on the same line must not
+  // have that prose fabricated into bogus labels (`outcome:primary`, `outcome:outcome`) once it
+  // reaches those paths.
+  it("drops a token that fails outcome:<id> label syntax rather than propagating it", () => {
+    const target = bead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Outcome IDs\n\noutcome:trustworthy-board — primary outcome",
+    });
+    expect(outcomeIdsOf(target)).toEqual([]);
+  });
+
+  it("keeps a well-formed id declared alongside a malformed one", () => {
+    const target = bead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Outcome IDs\n\noutcome:trustworthy-board — primary outcome, outcome:real-id",
+    });
+    expect(outcomeIdsOf(target)).toEqual(["real-id"]);
   });
 });
 
