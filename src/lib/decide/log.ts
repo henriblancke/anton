@@ -28,7 +28,7 @@
  * the UI read path goes through the shared anton.db.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { getDb, schema } from "../db";
 import { toEpoch } from "../db/epoch";
 import type { AntonDb, Clock } from "../jobs/queue";
@@ -244,13 +244,16 @@ const isJudgmentEvidence = and(
  *
  * Also scoped to the CURRENT backend/model version: a row records both specifically to pin trust to
  * the model that earned it, so a point re-pointed at a new backend or model must be judged only on
- * what that one has produced, never on its predecessor's record. The active pair is read off the
- * newest ANSWERED row regardless of settlement — a model that just took over may have produced only
- * unsettled decisions yet, and gating this lookup on `isJudgmentEvidence` too would keep reading the
- * predecessor's backend/model as "active" for the whole window it takes the first new decision to
- * settle, which is exactly the stale-agreement window a promotion to `auto` must not be based on. A
- * hard rule has neither backend nor model (it is deterministic, not model trust), so a point
- * currently settled by a rule is left unscoped rather than filtered against nothing.
+ * what that one has produced, never on its predecessor's record. The cohort pair is read off the
+ * newest MODEL-ATTRIBUTED answered row (`backend` not null) regardless of settlement — a model that
+ * just took over may have produced only unsettled decisions yet, and gating this lookup on
+ * `isJudgmentEvidence` too would keep reading the predecessor's backend/model as "current" for the
+ * whole window it takes the first new decision to settle, which is exactly the stale-agreement
+ * window a promotion to `auto` must not be based on. A hard rule has neither backend nor model (it
+ * is deterministic, not model trust), so rule-produced rows are kept as evidence unconditionally —
+ * unscoped by cohort, never filtered out — while model-produced rows are still restricted to the
+ * current cohort; reading the cohort off the newest ANSWERED row of any kind would let an
+ * exceptional rule hit go unscoped instead and fold in a predecessor model's whole history.
  */
 export async function agreement(
   db: AntonDb,
@@ -263,17 +266,39 @@ export async function agreement(
     projectId === undefined ? undefined : eq(schema.decisions.projectId, projectId),
   );
   const scope = and(pointScope, isJudgmentEvidence);
-  // The id breaks a `decidedAt`/`settledAt` tie, as `pickerTrackRecord` does for its own
-  // second-resolution column: two decisions logged in the same second would otherwise leave the
-  // window's composition — and the counts read off it — up to SQLite's row order.
-  const orderNewestFirst = [desc(schema.decisions.settledAt), desc(schema.decisions.id)] as const;
+  // `decidedAt`/`settledAt` are whole-second values (`secDate`), so two decisions logged in the
+  // same second need a tiebreaker with real ordering. `id` is a `randomUUID()` — no chronological
+  // meaning at all — so ties use SQLite's append-only rowid instead, the same pattern
+  // `claude-invocations.ts` and `run-attempts.ts` use for their own second-resolution columns.
+  const rowidDesc = desc(sql`rowid`);
+  const orderNewestFirst = [desc(schema.decisions.settledAt), rowidDesc] as const;
 
-  const [active] = await db
+  // A hard rule's answer carries neither `backend` nor `modelVersion` (it is deterministic, not
+  // model trust). If the newest answer is a rule hit, the newest-answered row overall is that
+  // all-null row — but the cohort a MODEL-produced answer must be judged against is still
+  // whichever model most recently answered, not "unscoped". Reading the cohort off the newest
+  // MODEL-attributed row specifically (rather than the newest answered row of any kind, which a
+  // rule hit can null out) keeps that pinned even when a rule interleaves; the query below then
+  // keeps every rule row as evidence regardless of cohort, since a rule owes no model any credit
+  // or blame, and restricts model rows to that cohort alone.
+  const [modelCohort] = await db
     .select({ backend: schema.decisions.backend, modelVersion: schema.decisions.modelVersion })
     .from(schema.decisions)
-    .where(and(pointScope, isNotNull(schema.decisions.answer)))
-    .orderBy(desc(schema.decisions.decidedAt), desc(schema.decisions.id))
+    .where(
+      and(pointScope, isNotNull(schema.decisions.answer), isNotNull(schema.decisions.backend)),
+    )
+    .orderBy(desc(schema.decisions.decidedAt), rowidDesc)
     .limit(1);
+
+  const cohortFilter = modelCohort?.backend && modelCohort.modelVersion
+    ? or(
+        and(isNull(schema.decisions.backend), isNull(schema.decisions.modelVersion)),
+        and(
+          eq(schema.decisions.backend, modelCohort.backend),
+          eq(schema.decisions.modelVersion, modelCohort.modelVersion),
+        ),
+      )
+    : undefined;
 
   const rows = await db
     .select({
@@ -281,17 +306,7 @@ export async function agreement(
       operatorAnswer: schema.decisions.operatorAnswer,
     })
     .from(schema.decisions)
-    .where(
-      and(
-        scope,
-        active?.backend && active.modelVersion
-          ? and(
-              eq(schema.decisions.backend, active.backend),
-              eq(schema.decisions.modelVersion, active.modelVersion),
-            )
-          : undefined,
-      ),
-    )
+    .where(and(scope, cohortFilter))
     .orderBy(...orderNewestFirst)
     .limit(window);
   const agreed = rows.filter((row) => row.answer === row.operatorAnswer).length;
@@ -369,7 +384,7 @@ export async function listDecisions(
     .select()
     .from(schema.decisions)
     .where(eq(schema.decisions.point, point))
-    .orderBy(desc(schema.decisions.decidedAt), desc(schema.decisions.id))
+    .orderBy(desc(schema.decisions.decidedAt), desc(sql`rowid`))
     .limit(limit);
   return rows.map(toDecisionView);
 }

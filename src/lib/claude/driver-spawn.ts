@@ -34,7 +34,14 @@ export interface ClaudeCliOptions {
   model?: string;
   /** --permission-mode; default "bypassPermissions" for unattended autonomy. */
   permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
-  /** Restrict tools (--allowedTools), optional. */
+  /**
+   * Restrict tools (--allowedTools), optional. Unlike the other list options below, an explicit
+   * empty array is NOT the same as omitting the option: omitting it leaves Claude Code's own
+   * default tool set in force, while `[]` reaches argv as `--allowedTools ""` and permits nothing
+   * — the property a session with no legitimate tool use at all needs (decide()'s claude-local
+   * backend), one that survives a new tool being added to Claude Code without this option
+   * changing at all.
+   */
   allowedTools?: string[];
   /**
    * Hard-deny tools or command prefixes (--disallowedTools), e.g. `Bash(git:*)`. Deny rules are
@@ -145,13 +152,19 @@ export function buildClaudeArgs(opts: ClaudeCliOptions, systemPromptFile?: strin
   const optional: Array<[string, string | undefined]> = [
     ["--append-system-prompt-file", systemPromptFile],
     ["--model", opts.model],
-    ["--allowedTools", joinList(opts.allowedTools)],
     ["--disallowedTools", joinList(opts.disallowedTools)],
     ["--setting-sources", joinList(opts.settingSources)],
     ["--settings", opts.settingsJson],
   ];
   for (const [flag, value] of optional) {
     if (value) args.push(flag, value);
+  }
+
+  // Unlike the list above, `allowedTools` distinguishes "omitted" from "explicitly empty" — see
+  // its doc comment. `joinList` alone can't express that (it maps both to undefined), so this
+  // reaches argv whenever the caller passed the option at all, joined value or `""`.
+  if (opts.allowedTools !== undefined) {
+    args.push("--allowedTools", joinList(opts.allowedTools) ?? "");
   }
 
   // Resume an interrupted session in-place (anton-juar) — continue the same conversation rather than

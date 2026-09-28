@@ -33,28 +33,6 @@ import { narrowState, type AnswerValue, type DecisionPoint, type DecisionState, 
 const BACKEND = "claude-local";
 
 /**
- * Tools this session may never use. Unlike `PM_DENIED_TOOLS`/`REVIEW_DENIED_TOOLS`, which leave
- * reads open because those passes genuinely need to read board context or a diff, this backend's
- * whole input is already embedded in the prompt as quoted, inert data (`buildPrompt`) — it has no
- * legitimate reason to read a file or fetch a URL to answer one bounded question. Denying every
- * tool, not just the write-shaped ones, is what makes that a property of the dispatch rather than a
- * request an injected instruction in `stateFields` could still get a session to act on.
- */
-const DECIDE_DENIED_TOOLS = [
-  "Write",
-  "Edit",
-  "MultiEdit",
-  "NotebookEdit",
-  "Bash",
-  "Task",
-  "Read",
-  "Grep",
-  "Glob",
-  "WebFetch",
-  "WebSearch",
-];
-
-/**
  * How long one decision may run before it is abandoned as a fallback. Short on purpose: this answers
  * one bounded question, not a ticket, and a caller blocked on `decide()` (a review gate deciding
  * retry-or-park, say) needs the fallback promptly rather than after a ticket-length silence window.
@@ -306,7 +284,13 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
         model: config.model,
         routing: config.routing,
         permissionMode: "bypassPermissions",
-        disallowedTools: DECIDE_DENIED_TOOLS,
+        // An empty allow-list, not a deny-list: this session's whole input is already embedded
+        // in the prompt as quoted, inert data (`buildPrompt`), so it has no legitimate use for
+        // ANY tool. Unlike `PM_DENIED_TOOLS`/`REVIEW_DENIED_TOOLS` (which must enumerate what to
+        // deny and leave reads open for passes that genuinely need them), "permit nothing" is a
+        // property of the empty list itself — it doesn't need to be rediscovered every time
+        // Claude Code adds a new tool.
+        allowedTools: [],
         // A bounded judgment has no need of the worktree's own `.claude/settings.json` — reading it
         // would let a project's hooks run shell commands under a session dispatched to answer one
         // question, so this session is configured only by the machine anton runs on.

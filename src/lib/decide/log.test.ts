@@ -404,6 +404,33 @@ describe("replay — agreement(point)", () => {
     expect(await agreement(test.db, ruledPoint.id)).toMatchObject({ settled: 1, agreed: 1 });
   });
 
+  it("does not let a rule hit unscope the model cohort — a predecessor model's record must not bleed back in", async () => {
+    // The old model earned a poor record.
+    const oldId = await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    await settleDecision(test.db, clock, oldId, { operatorAnswer: "decline" });
+    nowMs += 60_000;
+
+    // The point is re-pointed at a new model, which agrees once.
+    const newId = await recordShadow(ANSWER({ modelVersion: "claude-5" }));
+    await settleDecision(test.db, clock, newId, { operatorAnswer: "fix" });
+    nowMs += 60_000;
+
+    // A conditional hard rule fires and becomes the newest ANSWERED row of any kind — but, unlike a
+    // model row, it carries no backend/modelVersion of its own.
+    const ruledPoint: DecisionPoint = {
+      ...POINT,
+      hardRules: [() => ({ value: "fix", reason: "always fix" })],
+    };
+    const result = await decide({ point: ruledPoint, state: {}, mode: "shadow", ask: async () => ANSWER() });
+    const ruleId = await recordDecision(test.db, clock, { result, point: ruledPoint, state: {} });
+    await settleDecision(test.db, clock, ruleId!, { operatorAnswer: "fix" });
+
+    // The rule row is counted (it is evidence, unscoped by cohort), but the rule hit nulling out
+    // "the newest answered row" must not also null out which model is current: claude-4's
+    // disagreement stays excluded.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 2, agreed: 2 });
+  });
+
   it("rolls the window — a point fixed lately is not judged by the record it replaced", async () => {
     // Older disagreements first, then a full window of agreement on top of them.
     await settleMany([false, false, false]);
@@ -431,5 +458,17 @@ describe("replay — agreement(point)", () => {
     await settleDecision(test.db, clock, first, { operatorAnswer: "decline" });
 
     expect(await agreement(test.db, POINT.id, 1)).toMatchObject({ settled: 1, agreed: 0 });
+  });
+
+  it("breaks a same-second settle tie by insertion order, never by the row's random id", async () => {
+    // Both rows settle on the same clock tick, so `settledAt` collides — only insertion order
+    // (SQLite's rowid) can tell newest from oldest, since `id` is an unordered randomUUID().
+    const first = await recordShadow();
+    const second = await recordShadow();
+    await settleDecision(test.db, clock, first, { operatorAnswer: "decline" });
+    await settleDecision(test.db, clock, second, { operatorAnswer: "fix" });
+
+    // `second` was inserted after `first`, so a window of one must hold ITS answer.
+    expect(await agreement(test.db, POINT.id, 1)).toMatchObject({ settled: 1, agreed: 1 });
   });
 });
