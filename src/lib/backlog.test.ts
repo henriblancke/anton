@@ -508,7 +508,7 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
   });
 
-  it("accepts a new epic's Outcome IDs unvalidated when PRODUCT.md has no ## Outcomes section", async () => {
+  it("accepts a new epic's Outcome IDs against PRODUCT.md's active set when it has no ## Outcomes section — syntax is still checked", async () => {
     const createGraph = graphLands();
 
     await expect(
@@ -521,6 +521,20 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
       }),
     ).resolves.toMatchObject({ epicCreated: true });
     expect(createGraph).toHaveBeenCalledTimes(1);
+  });
+
+  // The review flagged that the `configured` exemption skipped ALL checks on the declared ids,
+  // including whether they can survive as an `outcome:<id>` label at all (anton-cdeki PR #334) —
+  // that check must fire whether or not PRODUCT.md is configured.
+  it("refuses a new epic's Outcome IDs with label-unsafe syntax even when PRODUCT.md has no ## Outcomes section", async () => {
+    const rejection = await createDraftFeature(unconfiguredProject(), {
+      feature: FEATURE,
+      epic: {
+        kind: "new",
+        epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:bad!" },
+      },
+    }).catch((e) => e);
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
   });
 
   it("refuses an outcome PRODUCT.md marks retired", async () => {

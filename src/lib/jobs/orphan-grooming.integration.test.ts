@@ -8,7 +8,12 @@ import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { driveJob } from "@/lib/testing/jobs";
 import { beads } from "../beads/bd";
 import { getJob, type Clock } from "./queue";
-import { makeOrphanGroomingHandler, ORPHAN_EPIC_LABEL } from "./orphan-grooming";
+import {
+  makeOrphanGroomingHandler,
+  ORPHAN_EPIC_LABEL,
+  ORPHAN_EPIC_TITLE,
+  ORPHAN_EPIC_VARS,
+} from "./orphan-grooming";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 
 class FakeClock implements Clock {
@@ -172,5 +177,58 @@ describeBd("orphan-grooming e2e (real handler · real bd)", () => {
     } finally {
       link.mockRestore();
     }
+  });
+});
+
+describeBd("orphan-grooming e2e — reusing a legacy epic (anton-cdeki PR #334)", () => {
+  // A grooming epic created before outcome ids landed is found by its `source:orphan-grooming`
+  // label, not by contract shape, so it's reused as-is forever unless grooming reconciles it.
+  let bdRepo: BdRepo;
+  let repo: string;
+  let tdb: TestProjectDb;
+  let clock: FakeClock;
+  let projectId: string;
+  let legacyEpic: string;
+
+  beforeAll(async () => {
+    bdRepo = makeBdRepo({ initialCommit: true });
+    repo = bdRepo.repo;
+
+    // No `## Outcome IDs` section — the shape a pre-anton-cdeki grooming epic was left in.
+    legacyEpic = await beads.create(repo, {
+      title: ORPHAN_EPIC_TITLE,
+      type: "epic",
+      description: "## Goal\n\nBucket for orphaned tickets.\n\n## Success Criteria\n\n- [ ] x",
+    });
+    await beads.tag(repo, legacyEpic, [ORPHAN_EPIC_LABEL]);
+    createTicket(repo, "Loose legacy ticket");
+
+    tdb = makeProjectDb({ repoPath: repo });
+    clock = new FakeClock(1_700_000_000_000);
+    projectId = tdb.projectId;
+  });
+
+  afterAll(() => {
+    tdb?.close();
+    bdRepo.cleanup();
+  });
+
+  it("patches the reused epic's contract to add the missing Outcome IDs section", async () => {
+    await driveJob({
+      db: tdb.db,
+      clock,
+      type: "orphan-grooming",
+      handler: makeOrphanGroomingHandler,
+      projectId,
+    });
+
+    const board = await beads.list(repo, ["--status", "all"]);
+    const epic = board.find((b) => b.id === legacyEpic)!;
+    expect(epic.description ?? "").toMatch(/##\s*Outcome IDs/i);
+    expect(epic.description ?? "").toContain(ORPHAN_EPIC_VARS.outcome_ids);
+    // Reconciling the contract must not touch which epic loose tickets land under.
+    expect(board.find((b) => beads.isEpic(b) && b.labels?.includes(ORPHAN_EPIC_LABEL))?.id).toBe(
+      legacyEpic,
+    );
   });
 });

@@ -8,6 +8,7 @@
  * epic across runs (found by its `source:orphan-grooming` label) so repeated runs don't spawn a new
  * epic each time. Idempotent — a ticket already parented is no longer an orphan, so re-runs are safe.
  */
+import { extractOutcomeIdsSection } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { isTicketTier } from "../beads/contract";
 import { beadSkeleton } from "../beads/formula";
@@ -116,12 +117,23 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
     await ctx.heartbeat();
 
     // Reuse an open grooming epic if one exists, else create one.
-    let epicId = all.find(
+    const existing = all.find(
       (b) => beads.isEpic(b) && b.status !== "closed" && b.labels?.includes(ORPHAN_EPIC_LABEL),
-    )?.id;
+    );
 
+    let epicId: string;
     let createdEpic = false;
-    if (!epicId) {
+    if (existing) {
+      epicId = existing.id;
+      if (!extractOutcomeIdsSection(existing.description ?? "").present) {
+        // An epic from before outcome ids landed (anton-cdeki) is reused as-is on every subsequent
+        // sweep — it's found by its `source:orphan-grooming` label, never by contract shape, so its
+        // description would otherwise stay stuck missing `## Outcome IDs` forever. Patch it in
+        // place rather than leaving the gap for the next contract-gap sweep to flag.
+        const description = `${(existing.description ?? "").trimEnd()}\n\n## Outcome IDs\n\n${ORPHAN_EPIC_VARS.outcome_ids}`;
+        await safe(() => beads.update(repo, epicId, { description }, existing.labels ?? []));
+      }
+    } else {
       const skeleton = await orphanEpicSkeleton(repo);
       epicId = await beads.create(repo, {
         title: ORPHAN_EPIC_TITLE,

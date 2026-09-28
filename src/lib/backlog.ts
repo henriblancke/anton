@@ -5,6 +5,7 @@ import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, loadAllIssues } from "./beads/issues";
 import { scanMarkdown } from "./beads/markdown";
+import { AREA_SHAPE } from "./epic-patch";
 import {
   activeOutcomeIds,
   outcomesConfigured,
@@ -254,7 +255,7 @@ export class DraftOutcomeError extends Error {
  * outcome:report-sharng`) into its individual declared id tokens: comma/whitespace-separated
  * entries, each with an optional `outcome:` label prefix stripped. Shared by every check that
  * needs the full declared set, not just whether one particular id is among them. */
-function outcomeIdTokens(outcomeIds: string): string[] {
+export function outcomeIdTokens(outcomeIds: string): string[] {
   return outcomeIds
     .split(/[,\s]+/)
     .map((token) => token.trim().replace(/^outcome:/i, ""))
@@ -280,7 +281,7 @@ const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\s*$/i;
  * Uses `scanMarkdown`'s AST-aware heading metadata (`heading?.depth === 2`), not a raw `/^##\s+/`
  * text test, so a fenced example whose line merely reads `## Outcome IDs` isn't mistaken for the
  * genuine section. */
-function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
+export function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
   const lines = description.split("\n");
   const scanned = scanMarkdown(description);
   const body: string[] = [];
@@ -331,6 +332,15 @@ async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise
     if (!declared.includes(outcomeId)) {
       throw new DraftOutcomeError(
         `the new epic's Outcome IDs must include "${outcomeId}" — the feature's own outcome is one of the outcomes its epic serves`,
+      );
+    }
+    // Label syntax is checked unconditionally — even with no `.product/PRODUCT.md` configured, a
+    // declared id still has to survive as an `outcome:<id>` label, so a bare `,`-typo like
+    // `outcome:bad!` is refused before it ever lands on the board.
+    const malformed = declared.filter((id) => !AREA_SHAPE.test(id));
+    if (malformed.length > 0) {
+      throw new DraftOutcomeError(
+        `the new epic's Outcome IDs name ${malformed.map((id) => `"${id}"`).join(", ")}, which can't be an \`outcome:<id>\` label (letters, digits, . _ - only) — fix the syntax or remove it`,
       );
     }
     // Every declared id is a real commitment the epic makes, not just the one the feature happens
