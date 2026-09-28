@@ -284,7 +284,8 @@ const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\s*$/i;
 export function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
   const lines = description.split("\n");
   const scanned = scanMarkdown(description);
-  const body: string[] = [];
+  const occurrences: string[] = [];
+  let body: string[] = [];
   let inSection = false;
   let present = false;
   for (let i = 0; i < lines.length; i++) {
@@ -294,16 +295,23 @@ export function extractOutcomeIdsSection(description: string): { present: boolea
     // Any rendered heading at or above this section's own depth ends it — not just another `##`.
     // A `#` placed after `## Outcome IDs` still closes the document's own top-level grouping, and
     // leaving it in the body would let outcomeIdTokens tokenize the heading text and everything
-    // after it as declared ids.
+    // after it as declared ids. A repeated `## Outcome IDs` heading reopens the section rather than
+    // ending the read entirely — mirrors `sectionsOf` in beads/contract.ts, which every other
+    // contract reader concatenates repeated sections through; stopping at the first occurrence
+    // silently dropped ids declared only in a later one.
     if (depth !== undefined && depth <= 2) {
-      if (inSection) break;
+      if (inSection) {
+        occurrences.push(body.join("\n").trim());
+        body = [];
+      }
       inSection = depth === 2 && OUTCOME_IDS_HEADING.test(trimmed);
       if (inSection) present = true;
       continue;
     }
     if (inSection) body.push(line);
   }
-  return { present, body: body.join("\n").trim() };
+  if (inSection) occurrences.push(body.join("\n").trim());
+  return { present, body: occurrences.filter(Boolean).join("\n\n") };
 }
 
 /**

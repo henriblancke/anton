@@ -163,27 +163,37 @@ export function stripContractSections(description: string): string {
 }
 
 /**
- * Extract one `## <name>` block's body (heading through the line before the next `##`), or "" when
- * absent. The read half of {@link stripContractSections} for a section with no bd field home of
- * its own — unlike Goal/Acceptance, Why is never mirrored onto {@link TicketDetail}, so it can only
- * be read back out of the description markdown.
+ * Extract a `## <name>` section's body, or "" when absent. The read half of
+ * {@link stripContractSections} for a section with no bd field home of its own — unlike
+ * Goal/Acceptance, Why is never mirrored onto {@link TicketDetail}, so it can only be read back out
+ * of the description markdown.
+ *
+ * A repeated heading concatenates — mirrors `sectionsOf` in beads/contract.ts, which every OTHER
+ * contract reader uses. Stopping at the first occurrence (as this once did) let `stripContractSections`
+ * strip every authored `## Why` from `body` while this only ever recovered the first, so saving any
+ * other field edit silently dropped the later ones.
  */
 function extractSection(description: string, name: string): string {
   const lines = description.split(/\r?\n/);
   const scanned = scanMarkdown(description);
   const heading = sectionHeading(name);
-  const body: string[] = [];
+  const occurrences: string[] = [];
+  let body: string[] = [];
   let inSection = false;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     if (isSectionHeadingLine(scanned[i])) {
-      if (inSection) break;
+      if (inSection) {
+        occurrences.push(body.join("\n").trim());
+        body = [];
+      }
       inSection = heading.test(line.trim());
       continue;
     }
     if (inSection) body.push(line);
   }
-  return body.join("\n").trim();
+  if (inSection) occurrences.push(body.join("\n").trim());
+  return occurrences.filter(Boolean).join("\n\n");
 }
 
 /**

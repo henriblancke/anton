@@ -27,9 +27,22 @@ describe("SHAPE_UI_FRAMING", () => {
   });
 
   it("names every section the panel commits, so the assistant proposes text for each", () => {
-    for (const field of ["Goal", "Acceptance criteria", "Context", "Out of scope", "Verify"]) {
+    for (const field of [
+      "Goal",
+      "Why",
+      "Outcome",
+      "Acceptance criteria",
+      "Context",
+      "Out of scope",
+      "Verify",
+    ]) {
       expect(SHAPE_UI_FRAMING).toContain(`**${field}**`);
     }
+  });
+
+  it("marks Why, the feature's Outcome, and the new epic's Outcome IDs mandatory", () => {
+    expect(SHAPE_UI_FRAMING).toContain("**Outcome IDs**");
+    expect(SHAPE_UI_FRAMING.toLowerCase()).toContain("mandatory");
   });
 
   it("refuses a parentless feature rather than inventing an epic to silence the question", () => {

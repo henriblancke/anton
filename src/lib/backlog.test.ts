@@ -36,6 +36,7 @@ import {
   epicChoices,
   extractOutcomeIdsSection,
   knownAreas,
+  outcomeIdTokens,
 } from "./backlog";
 import { validateBeadContract } from "./beads/contract";
 import { projectBeadFormulaPath } from "./beads/formula";
@@ -162,6 +163,18 @@ describe("extractOutcomeIdsSection", () => {
     );
     expect(present).toBe(true);
     expect(body).toBe("outcome:a");
+  });
+
+  // anton-cdeki PR #334 review: an epic whose `## Outcome IDs` is authored twice used to only ever
+  // read the first occurrence — assertEpicEligible then rejected a feature whose outcome was
+  // declared solely in the later section, and outcomeIdsOf silently dropped those ids too.
+  it("collects every `## Outcome IDs` occurrence, not just the first", () => {
+    const { present, body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\noutcome:a\n\n## Notes\n\nsome unrelated prose\n\n## Outcome IDs\n\noutcome:b",
+    );
+    expect(present).toBe(true);
+    expect(body).toBe("outcome:a\n\noutcome:b");
+    expect(outcomeIdTokens(body)).toEqual(["a", "b"]);
   });
 });
 

@@ -117,6 +117,25 @@ describe("draftFromDetail", () => {
     expect(draft.body).toBe("## Why now\n\nNot the contract field");
   });
 
+  // anton-cdeki PR #334 review: a ticket with more than one authored `## Why` used to lose every
+  // occurrence past the first — `stripContractSections` stripped them all from `body`, but the old
+  // `extractSection` stopped reading at the first following heading, so only the first copy
+  // survived into the draft and saving any other field silently deleted the rest.
+  it("aggregates repeated `## Why` sections, matching how stripContractSections drops all of them", () => {
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description:
+        "## Goal\n\nDo it\n\n## Why\n\nServes outcome A\n\n## Context\n\nsome context\n\n## Why\n\nAlso serves outcome B",
+    });
+    expect(draft.why).toBe("Serves outcome A\n\nAlso serves outcome B");
+    expect(draft.body).toBe("## Context\n\nsome context");
+  });
+
   it("stops `## Why` at a shallower heading, leaving it and everything after it in body", () => {
     const draft = draftFromDetail({
       id: "x",

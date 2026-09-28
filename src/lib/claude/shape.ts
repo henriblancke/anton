@@ -24,14 +24,18 @@ NOT the write:
 
 - Run the shaping conversation below (forcing questions, research, CEO/eng/design lenses).
 - Converge on the feature's contract — the sections the panel commits: **Title**, **Goal**,
-  **Acceptance criteria**, **Context**, **Out of scope**, **Verify**. Propose concrete text for
-  each; the founder pastes or edits it in the panel.
+  **Why**, **Outcome**, **Acceptance criteria**, **Context**, **Out of scope**, **Verify**. All are
+  mandatory — the panel refuses to submit until every one is filled. **Why** is the forcing
+  question behind the outcome; **Outcome** is the \`.product/PRODUCT.md\` outcome id this feature
+  serves (becomes its \`outcome:<id>\` label) — set them together. Propose concrete text for each;
+  the founder pastes or edits it in the panel.
 - Name the **epic** it belongs to. The panel lists the epics already on the board; read them
   (\`bd list --type epic --json\`) and recommend the one this feature advances. If none honestly
   fits, propose a new epic — **Title**, **Outcome**, **Success criteria** (what several features
-  add up to, not this PR's checklist), one **Area** — which the panel can create alongside it.
-  Never leave the feature without an epic, and never mint a one-feature epic to dodge the
-  question: ask the founder.
+  add up to, not this PR's checklist), one **Area**, and **Outcome IDs** (also mandatory: which
+  \`.product/PRODUCT.md\` outcome id(s) the epic's features serve — must include the feature's own
+  **Outcome**) — which the panel can create alongside it. Never leave the feature without an epic,
+  and never mint a one-feature epic to dodge the question: ask the founder.
 - If the idea is bigger than one PR, say so plainly — that is an epic with several features, and
   the panel commits one feature at a time. Shape the first; list the rest for a later pass.
 - Do NOT run \`bd\` WRITES or create/modify beads yourself — the UI owns bead creation. Reading the
