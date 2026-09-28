@@ -220,10 +220,13 @@ process.exit(0);
     expect(review.threadsComplete).toBe(true);
   });
 
-  it("marks the read incomplete when a thread's own comments connection is truncated", async () => {
-    // One thread reports totalCount above what comments(first:50) actually returned — a >50-comment
-    // back-and-forth. The nodes fetched still survive, but the read must not be trusted as this
-    // thread's whole comment history (the finding behind PR #335's thread on this file).
+  it("excludes a thread whose own comments connection is truncated, but keeps a healthy sibling", async () => {
+    // RT_1 reports totalCount above what comments(first:50) actually returned — a >50-comment
+    // back-and-forth. Its last *fetched* comment is not its true latest, so classifyReview/
+    // threadsNeedingAttention/applyThreadOutcomes must never see it as up to date: it is dropped
+    // from the returned list entirely rather than kept with stale content (PR #335 review). RT_2
+    // is unaffected — page-level truncation of one thread must not cost every other thread on the
+    // same page.
     const fakeGh = join(binDir, "gh");
     writeFileSync(
       fakeGh,
@@ -241,7 +244,10 @@ if (a[0] === 'pr' && a[1] === 'view') {
 if (a[0] === 'api' && a[1] === 'graphql') {
   process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
     pageInfo: { hasNextPage: false, endCursor: null },
-    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 63, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 63, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'also fix this' }] } },
+    ],
   } } } } }));
   process.exit(0);
 }
@@ -251,7 +257,7 @@ process.exit(0);
     chmodSync(fakeGh, 0o755);
 
     const review = await getPrReview(sandbox, 7);
-    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
     expect(review.threadsComplete).toBe(false);
   });
 

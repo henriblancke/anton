@@ -359,7 +359,20 @@ async function dispatchInReview(args: {
     const triagedNumbers = new Set(
       targets.map((t) => prNumberFromRef(beads.getPrRef(t))).filter((n): n is number => n !== undefined),
     );
-    const orphaned = (await unsettledPrNumbers(db, projectId)).filter((n) => !triagedNumbers.has(n));
+    // `targets` already dropped any epic a DIFFERENT operator claimed (`ownedByOperator`, above) —
+    // that PR is still actively worked by its owner, not orphaned, and its round row commonly still
+    // has `pr_state` null while that work is in flight. Without excluding it too, every operator on
+    // a shared board would re-read every OTHER operator's in-review PR here on every pass, scaling
+    // with total shared-board activity instead of true orphans (PR #335 review).
+    const claimedByOtherOperator = new Set(
+      all
+        .filter((b) => !ownedByOperator(b, operator))
+        .map((b) => prNumberFromRef(beads.getPrRef(b)))
+        .filter((n): n is number => n !== undefined),
+    );
+    const orphaned = (await unsettledPrNumbers(db, projectId)).filter(
+      (n) => !triagedNumbers.has(n) && !claimedByOtherOperator.has(n),
+    );
     for (const prNumber of orphaned) {
       await ctx.heartbeat();
       try {
@@ -474,7 +487,7 @@ async function fixOnePr(args: {
   if (!epic) return { changed: false, note: `${epicBeadId} is no longer in review` };
 
   try {
-    const outcome = await handleEpic({
+    const { outcome, ledgerChanged } = await handleEpic({
       db,
       clock,
       ctx,
@@ -486,7 +499,13 @@ async function fixOnePr(args: {
       baseBranch: settings.baseBranch ?? project.defaultBranch,
       all,
     });
-    return { changed: outcome !== "clean", note: `${epic.id}: ${OUTCOME_NOTE[outcome]}` };
+    // A "clean" outcome (nothing to push) can still have stamped a terminal/reopen row below
+    // (PR #335 review) — that write is this pass's only effect, so `changed` must reflect it or
+    // automation history claims a job that moved the ledger did nothing.
+    return {
+      changed: outcome !== "clean" || ledgerChanged,
+      note: `${epic.id}: ${OUTCOME_NOTE[outcome]}`,
+    };
   } finally {
     // The claude session above may have written beads (notes, bd remember); push them. This job is
     // the writer now, so the sync moved here with the writes. Logged, not thrown — a sync hiccup
@@ -521,7 +540,7 @@ async function handleEpic(args: {
   /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
   baseBranch: string | undefined;
   all: Bead[];
-}): Promise<PrFixOutcome> {
+}): Promise<{ outcome: PrFixOutcome; ledgerChanged: boolean }> {
   const {
     db,
     clock,
@@ -535,7 +554,7 @@ async function handleEpic(args: {
     all,
   } = args;
   const number = prNumberFromRef(beads.getPrRef(epic));
-  if (number === undefined) return "clean";
+  if (number === undefined) return { outcome: "clean", ledgerChanged: false };
 
   const pr = await getPrReview(repo, number, ctx.signal);
   const branch = pr.headRefName || `${branchPrefix}/${epic.id}`;
@@ -557,7 +576,7 @@ async function handleEpic(args: {
       branch,
       all,
     });
-    return "merged";
+    return { outcome: "merged", ledgerChanged: true };
   }
 
   // A PR that CLOSED between the dispatch and now (anton-z5e3g). `classifyReview` below treats it as
@@ -565,8 +584,17 @@ async function handleEpic(args: {
   // the dispatcher, which re-reads every in-review target each pass, would be the only site to ever
   // record the close. Stamping here too means whichever job first reads the end is the one that
   // records it; the write is first-observation-wins, so the two sites cannot disagree.
+  //
+  // Both branches feed `ledgerChanged` (PR #335 review): a CLOSED PR always falls through to
+  // `!verdict.actionable` below and returns "clean", so without this a stamp that is this call's
+  // only effect would report `changed: false` and contradict the `JobEffect` contract.
+  let ledgerChanged = false;
   if (pr.state === "CLOSED") {
-    await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "closed" });
+    ledgerChanged = await recordPrTerminalState(db, clock, {
+      projectId,
+      prNumber: number,
+      state: "closed",
+    });
   }
 
   // The counterpart observation (PR #335 review), mirrored from the dispatcher's own OPEN branch: a
@@ -574,18 +602,18 @@ async function handleEpic(args: {
   // and the PR has since reopened. Without this, `recordPrTerminalState`'s null-row heuristic sees no
   // evidence of that reopen and a subsequent close silently preserves the stale first-close timestamp.
   if (pr.state === "OPEN") {
-    await recordPrReopened(db, { projectId, prNumber: number });
+    ledgerChanged = (await recordPrReopened(db, { projectId, prNumber: number })) || ledgerChanged;
   }
 
   const verdict = classifyReview(pr);
-  if (!verdict.actionable) return "clean"; // nothing to fix on this PR yet.
+  if (!verdict.actionable) return { outcome: "clean", ledgerChanged }; // nothing to fix on this PR yet.
 
   // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
   // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
   // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
   // the commit and push behind it.
   const claimOwner = claimOwnerFor(ctx.jobId);
-  return withWorktreeClaim(repo, branch, claimOwner, async () => {
+  const outcome = await withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
     const { worktree, conflicts, alreadyAhead } = await prepareFixWorktree({
@@ -617,6 +645,7 @@ async function handleEpic(args: {
     });
     return pushed ? "pushed" : "answered";
   });
+  return { outcome, ledgerChanged };
 }
 
 /**

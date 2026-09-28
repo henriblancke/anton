@@ -274,6 +274,10 @@ async function getReviewThreads(
   signal?: AbortSignal,
 ): Promise<{ threads: ReviewThread[]; threadsComplete: boolean }> {
   const allNodes: RawReviewThreadNode[] = [];
+  // Threads whose comment connection is truncated (see below) — excluded from the returned list
+  // entirely rather than kept with a stale last-fetched comment, so a caller never re-triages or
+  // replies against a thread it cannot see the true latest state of (PR #335 review).
+  const truncatedThreadIds = new Set<string>();
   let complete = true;
   try {
     const nwo = await nameWithOwner(repoPath, signal);
@@ -322,17 +326,24 @@ async function getReviewThreads(
       // everything past comment 50, including the most recent one. threadsNeedingAttention treats
       // the last *fetched* comment as authoritative, so a truncated thread can misreport an anton
       // reply (or a human follow-up after it) as never having happened. totalCount lets us detect
-      // that without a second, nested pagination loop — flag the read incomplete instead. A thread
-      // missing `comments`/`totalCount` entirely (malformed response) must also flag incomplete —
-      // defaulting both sides to 0 would make the comparison silently pass and lose the thread's
-      // comments (and reviewer attribution) from a round persisted as "complete".
-      if (
-        page.nodes.some((n) => {
-          if (!n.comments || typeof n.comments.totalCount !== "number") return true;
-          return n.comments.totalCount > (n.comments.nodes?.length ?? 0);
-        })
-      ) {
-        complete = false;
+      // that without a second, nested pagination loop — flag the read incomplete AND remember which
+      // thread it was, so that specific thread is dropped from the returned list below rather than
+      // being re-triaged, duplicate-replied to, or resolved against stale context (PR #335 review:
+      // flagging the whole read incomplete wasn't enough — every consumer still saw the thread with
+      // comment 50 as its latest). A thread missing `comments`/`totalCount` entirely is a DIFFERENT
+      // failure (a malformed response, not a real thread with excess comments) — it still flags the
+      // whole read incomplete so a caller never persists it as a genuinely thread-free/complete
+      // round, but the thread itself is kept (its handful of comments, however few, are real and
+      // there is no "true latest" being hidden behind a totalCount the response never reported).
+      for (const n of page.nodes) {
+        if (!n.comments || typeof n.comments.totalCount !== "number") {
+          complete = false;
+          continue;
+        }
+        if (n.comments.totalCount > (n.comments.nodes?.length ?? 0)) {
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+        }
       }
       if (!page.pageInfo) {
         // No pageInfo at all is a malformed response, not "last page" — pagination could not
@@ -360,7 +371,7 @@ async function getReviewThreads(
   }
 
   const threads = allNodes
-    .filter((n) => typeof n?.id === "string")
+    .filter((n) => typeof n?.id === "string" && !truncatedThreadIds.has(n.id))
     .map((n) => ({
       id: n.id!,
       isResolved: n.isResolved ?? false,

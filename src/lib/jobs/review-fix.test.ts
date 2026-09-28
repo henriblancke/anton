@@ -22,6 +22,7 @@ import {
   claimOwnerFor,
   inReviewEpics,
   makeReviewFixHandler,
+  makeReviewFixPrHandler,
   notifyGateParked,
   parseThreadReport,
   prepareFixWorktree,
@@ -36,9 +37,14 @@ import type { ProjectSettings } from "../projects";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
 const listMock = vi.fn();
+/** `fixOnePr`'s post-fix dolt sync — resolved by default so its `.catch` never sees `undefined`. */
+const syncMock = vi.fn().mockResolvedValue(undefined);
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
-  return { ...actual, beads: { ...actual.beads, list: (...a: unknown[]) => listMock(...a), sync: vi.fn() } };
+  return {
+    ...actual,
+    beads: { ...actual.beads, list: (...a: unknown[]) => listMock(...a), sync: (...a: unknown[]) => syncMock(...a) },
+  };
 });
 
 /** The one `gh` read per target. `classifyReview` stays real — the verdict is what is under test. */
@@ -692,6 +698,77 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
       expect(prStateOf(9)).toBeNull();
       expect(getPrReviewMock).toHaveBeenCalledTimes(1); // only PR #1, never #9
       expect(getPrActivityMock).not.toHaveBeenCalled();
+    });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:362): `targets` already excludes an epic another
+    // operator claimed (`ownedByOperator`), so its PR number never lands in `triagedNumbers` even
+    // though it is not actually orphaned — it is simply owned elsewhere. Without also excluding it
+    // here, this operator would re-read every other operator's in-review PR via `getPrActivity` on
+    // every pass, scaling with total shared-board activity instead of true orphans.
+    it("does not treat a target another operator claimed as an orphan", async () => {
+      listMock.mockResolvedValue([{ ...target("e-1", 9), assignee: "bob" }]); // claimed by bob, this pass is alice
+      insertUnsettledRound(9); // bob's fix job hasn't run yet — the round row is still null
+
+      await dispatch();
+      expect(getPrReviewMock).not.toHaveBeenCalled(); // excluded from `targets` by ownership
+      expect(getPrActivityMock).not.toHaveBeenCalled(); // must not be re-read as an "orphan" either
+      expect(prStateOf(9)).toBeNull();
+    });
+  });
+
+  describe("makeReviewFixPrHandler (the per-PR worker)", () => {
+    const fixDispatch = (epicBeadId: string) =>
+      driveJob({
+        db: t.db,
+        clock,
+        type: "review-fix-pr",
+        handler: makeReviewFixPrHandler,
+        projectId: t.projectId,
+        payload: { projectId: t.projectId, epicBeadId },
+        config: { leaseMs: 30_000 },
+      });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:570): a PR first observed CLOSED here stamps a
+    // terminal round row (the dispatcher's own re-read of the same target could already be a pass
+    // away), but `classifyReview` treats CLOSED as not-actionable, so `handleEpic` falls straight
+    // through to a "clean" outcome. Without propagating the stamp's own result, `fixOnePr` would
+    // report `changed: false` even though this call's only effect was moving the ledger.
+    it("reports changed when a CLOSED PR's terminal stamp is this run's only effect", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      t.db
+        .insert(schema.reviewRounds)
+        .values({ id: "round-1", projectId: t.projectId, prNumber: 1, round: 1 })
+        .run();
+      getPrReviewMock.mockResolvedValue(openPr(1, { state: "CLOSED" }));
+
+      const job = await getJob(t.db, await fixDispatch("e-1"));
+      const prState = t.db
+        .select({ prState: schema.reviewRounds.prState })
+        .from(schema.reviewRounds)
+        .where(eq(schema.reviewRounds.prNumber, 1))
+        .get()?.prState;
+      expect(prState).toBe("closed");
+      expect(job?.outcome).not.toBe("noop");
+      expect(job?.outcomeNote).toBe("e-1: nothing actionable on the PR");
+    });
+
+    it("reports unchanged when a CLOSED PR's round is already settled and nothing moves", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      t.db
+        .insert(schema.reviewRounds)
+        .values({
+          id: "round-1",
+          projectId: t.projectId,
+          prNumber: 1,
+          round: 1,
+          prState: "closed",
+          prStateAt: new Date(clock.now()),
+        })
+        .run();
+      getPrReviewMock.mockResolvedValue(openPr(1, { state: "CLOSED" }));
+
+      const job = await getJob(t.db, await fixDispatch("e-1"));
+      expect(job?.outcome).toBe("noop");
     });
   });
 });
