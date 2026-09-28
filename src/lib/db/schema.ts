@@ -1108,3 +1108,114 @@ export const runAttempts = sqliteTable(
     index("run_attempts_run_idx").on(table.runId, table.attempt),
   ],
 );
+
+/**
+ * The per-ROUND review record (anton-1pjo0): what each PR-fix round was handed by GitHub's reviewers
+ * and how anton answered it — one append-only row per round that actually dispatched claude.
+ *
+ * It exists because the review-fix job reads these counts and throws them away. A thread count is
+ * only observable while the PR is open and the threads are unresolved: once it merges, GitHub reports
+ * the end state, and "3 threads from 2 reviewers, 2 fixed and 1 left" is unreconstructable from it.
+ * Nothing else in anton.db carries it — `claude_invocations` meters the SPEND of a round and says
+ * nothing about what the round was for, and the self-review score is anton grading itself, which is
+ * the measure this record exists to check from outside.
+ *
+ * One row per ROUND, never per JOB, deliberately: most review-fix jobs are polling ticks that dispatch
+ * no claude at all (15,818 of them had spent zero tokens when this was measured), so a row per job
+ * would count the poller and drown the rounds that did work. A tick with nothing actionable writes
+ * NOTHING — absence of a row means "no review happened", which is exactly true of a poll.
+ *
+ * Shaped like `run_attempts` and `claude_invocations`, and for their reasons: rows are append-only
+ * FACTS about one round, never revised — a later round writes a NEW row rather than updating the
+ * previous one, so `Σ threads_*` over a PR's rows is its whole review history. The ONE exception is
+ * `pr_state`/`pr_state_at`, stamped across the PR's rows when finalize learns how it ended: a round
+ * cannot know its PR's fate while it is running, and the alternative (a second table keyed by PR)
+ * would be a join for one word.
+ *
+ * The same never-fail-the-work rule as the spend ledger: a write that throws is swallowed. A round
+ * that fixed the PR must not fail because a meter could not be written, and a lost write costs one
+ * round's counts — never the fix.
+ *
+ * No backfill: PRs that merged before this landed have no thread record, which reads as "not
+ * measured" and never as a PR that carried no review.
+ */
+export const reviewRounds = sqliteTable(
+  "review_rounds",
+  {
+    id: text("id").primaryKey(),
+    /**
+     * NOT a foreign key, like `run_attempts` and `quota_attempts`: a round is recorded on a
+     * best-effort path, and a reference the writer cannot satisfy is one more way for a meter to
+     * reject a row about review that really happened.
+     */
+    projectId: text("project_id"),
+    /**
+     * The run target bead the PR belongs to — the feature, so the feature ledger and the trend fold
+     * roll a PR's rounds up the same way they roll its invocations (`ledgerScope`, feature-scope.ts).
+     */
+    beadId: text("bead_id"),
+    /**
+     * The review-fix job that ran this round. The join to its own spend: `claude_invocations` keys on
+     * `job_id` too, and without it a round's counts and the tokens it cost share no column at all.
+     */
+    jobId: text("job_id"),
+    prNumber: integer("pr_number").notNull(),
+    /**
+     * 1-based, per PR: this round's ordinal among the rows already recorded for the same PR. Derived
+     * at insert rather than read off the PR body's rounds region — that region is capped and drops its
+     * oldest entries (`MAX_ROUNDS`, review-fix-body.ts), so it stops being a counter once a PR passes
+     * the cap.
+     */
+    round: integer("round").notNull(),
+    /** Every inline thread the PR carried when this round read it, resolved ones included. */
+    threadsSeen: integer("threads_seen").notNull().default(0),
+    threadsUnresolved: integer("threads_unresolved").notNull().default(0),
+    threadsOutdated: integer("threads_outdated").notNull().default(0),
+    /**
+     * The threads claude was actually handed — `threadsNeedingAttention` (git/pr.ts), which drops an
+     * unresolved thread whose last comment is already anton's. Kept beside `threads_unresolved`
+     * because the two diverge on every re-review, and without it the outcome counts below cannot be
+     * reconciled: an unresolved thread anton never answered and one it answered last round are the
+     * same number in `threads_unresolved` and different work.
+     */
+    threadsActionable: integer("threads_actionable").notNull().default(0),
+    /**
+     * How anton answered, in `ThreadOutcome`'s own vocabulary (review-fix-context.ts). Counted from
+     * the outcomes that SURVIVED triage, so a "fixed" claim with nothing pushed — a fabrication
+     * (`fabricatedFix`) — is not counted as a fix.
+     */
+    outcomesFixed: integer("outcomes_fixed").notNull().default(0),
+    outcomesLeft: integer("outcomes_left").notNull().default(0),
+    outcomesNeedsHuman: integer("outcomes_needs_human").notNull().default(0),
+    /**
+     * Threads per reviewer login, serialized (`{"<login>": <threads>}`) — the split that makes a bot's
+     * volume and a human's distinguishable, which is the whole point of measuring from outside anton.
+     * A blob rather than a child table: the read is "this PR's reviewers", never "this reviewer across
+     * projects", and a row carries a handful of logins.
+     */
+    byAuthorJson: text("by_author_json").notNull().default("{}"),
+    /**
+     * How the PR ENDED — `merged` | `closed` — stamped across the PR's rows by finalize, and null
+     * until then. Null forever on a PR that is still open, or one whose finalize never ran, which is a
+     * real gap and never "closed": a reader reports the rounds it has and how many PRs it could not
+     * settle.
+     */
+    prState: text("pr_state"),
+    /** When the terminal state above was stamped. Null while `pr_state` is. */
+    prStateAt: ts("pr_state_at"),
+    recordedAt: ts("recorded_at").notNull().default(now),
+  },
+  (table) => [
+    // The read every trend question starts from: one project's rounds over a window. `recorded_at`
+    // trails the project id for `claude_invocations`' reason — the project is always an equality
+    // predicate while the window is a range, and the reverse order would leave the seek to the range.
+    index("review_rounds_project_idx").on(table.projectId, table.recordedAt),
+    // Both of the PR-scoped writes: the ordinal derivation above counts a PR's rows, and finalize
+    // stamps `pr_state` across them. Neither should scan the table to find one PR's handful of rounds.
+    index("review_rounds_pr_idx").on(table.projectId, table.prNumber, table.round),
+    // The feature roll-up's seek: `bead_id IN (<the scope>)`, single-column like
+    // `claude_invocations_bead_idx` because a feature rolls up its WHOLE review history — there is no
+    // window to leave to the index, unlike the project read above.
+    index("review_rounds_bead_idx").on(table.beadId),
+  ],
+);
