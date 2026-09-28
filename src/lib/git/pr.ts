@@ -340,7 +340,15 @@ async function getReviewThreads(
           complete = false;
           continue;
         }
-        if (n.comments.totalCount > (n.comments.nodes?.length ?? 0)) {
+        if (!Array.isArray(n.comments.nodes)) {
+          // totalCount present but nodes isn't an array (null, missing, or malformed) — comments
+          // are claimed but unreadable, so treat this like truncation: drop the thread below
+          // rather than persisting it as a genuinely comment-free, complete thread.
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
+        if (n.comments.totalCount > n.comments.nodes.length) {
           complete = false;
           if (typeof n.id === "string") truncatedThreadIds.add(n.id);
         }
@@ -378,7 +386,7 @@ async function getReviewThreads(
       isOutdated: n.isOutdated ?? false,
       path: n.path ?? undefined,
       line: n.line ?? undefined,
-      comments: (n.comments?.nodes ?? [])
+      comments: (Array.isArray(n.comments?.nodes) ? n.comments.nodes : [])
         .filter((c) => typeof c?.databaseId === "number")
         .map((c) => ({
           id: c.databaseId!,
