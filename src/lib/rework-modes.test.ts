@@ -922,6 +922,38 @@ describe("applyFollowUp", () => {
     expect(updateMock.mock.calls[0]![2].description).toContain("## Acceptance Criteria\n- [ ] done");
   });
 
+  // The other half of the same gap: a completed follow-up that was parentless from the outset is a
+  // run target of its own just as surely as one `tagDetachedOutcome` reaches through the detachment
+  // branch, so it must pick up the target's `outcome:` label(s) too — not just its `## Why`.
+  it("tags a completed follow-up that was parentless from the outset with the target's outcomes", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature({ labels }), finishedTicket(), candidate("dup", { parent: undefined, description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+
+    const applied = await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "dup", labels);
+    expect(applied).toMatchObject({ reconciled: true });
+  });
+
+  it("refuses to resume an unlocked match that owes only the target's outcome labels, not a Why rewrite", async () => {
+    // `## Why` is already there, so `missingWhy` alone would miss this — the guard must also cover
+    // the outcome-label write, or it lands unserialized past a caller that never held the lock.
+    const labels = ["outcome:codebase-health"];
+    board(
+      feature({ labels }),
+      finishedTicket(),
+      candidate("dup", { parent: undefined, description: createdUnderFeat() }),
+    );
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUpHolding(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED, new Set()),
+    ).rejects.toThrow(ReworkConflictError);
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
+  });
+
   it("reads the match's parentage off the RE-READ, not the snapshot a rival may have moved", async () => {
     board(feature(), finishedTicket(), candidate("dup"));
     // The gardener reparented it between the two reads; the snapshot still says "under the target".
