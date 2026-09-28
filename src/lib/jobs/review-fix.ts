@@ -748,12 +748,18 @@ interface RunFixSessionResult {
  * and PR #338 review, chatgpt-codex-connector — the latter caught this check only firing when
  * `waitingIds` was empty, so a mixed round with both threads and a non-thread reason could report
  * every thread and never once be asked about the failing check/summary). Positive evidence is
- * `report` naming the {@link NON_THREAD_REPORT_ID} sentinel with a non-fabricated outcome — same
- * `fabricatedFix` rule `applyThreadOutcomes` applies to a real thread reply, so a claude run can't
- * claim "fixed" on the sentinel when nothing was actually pushed (PR #338 review,
- * chatgpt-codex-connector).
+ * `report` naming the {@link NON_THREAD_REPORT_ID} sentinel with a non-fabricated, non-`needs-human`
+ * outcome:
+ * - same `fabricatedFix` rule `applyThreadOutcomes` applies to a real thread reply, so a claude run
+ *   can't claim "fixed" on the sentinel when nothing was actually pushed (PR #338 review,
+ *   chatgpt-codex-connector).
+ * - `needs-human` never counts either: unlike a real thread (where a delivered "needs-human" reply
+ *   actually posts to the PR, which is what makes it safe to stop re-triaging), the sentinel id
+ *   matches no real GitHub thread, so `applyThreadOutcomes` skips it and nothing is ever posted
+ *   anywhere a human would see it. Crediting it as evidence would silently suppress a PR that is
+ *   genuinely waiting on a person's decision, forever (PR #338 review, chatgpt-codex-connector).
  */
-function allWaitingThreadsAnswered(
+export function allWaitingThreadsAnswered(
   waitingIds: ReadonlySet<string>,
   answeredIds: ReadonlySet<string>,
   report: ThreadOutcome[],
@@ -762,7 +768,7 @@ function allWaitingThreadsAnswered(
 ): boolean {
   if (hasNonThreadReasons) {
     const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
-    if (!sentinel || fabricatedFix(sentinel, pushed)) return false;
+    if (!sentinel || sentinel.outcome === "needs-human" || fabricatedFix(sentinel, pushed)) return false;
   }
   for (const id of waitingIds) {
     if (!answeredIds.has(id)) return false;
@@ -909,8 +915,17 @@ async function runFixSession(args: {
       });
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
       // This path never dispatches claude, so nothing here ever looked at (let alone replied to)
-      // any thread — an unpushed round can only be "fully answered" when nothing was waiting.
-      return { pushed, answeredAllThreads: pushed || waitingIds.size === 0 };
+      // any thread, nor reported the non-thread sentinel. Route the unpushed case through the same
+      // `allWaitingThreadsAnswered` the main path uses (with an empty report/answered set, since
+      // nothing was ever asked) rather than a hand-rolled `waitingIds.size === 0` check — that check
+      // alone ignored `hasNonThreadReasons` and could credit this fast path as "fully answered" for a
+      // failing check or reviewer summary nothing ever verified, if `pushed` ever came back false
+      // despite the branch being ahead (PR #338 review, @claude).
+      return {
+        pushed,
+        answeredAllThreads:
+          pushed || allWaitingThreadsAnswered(waitingIds, new Set(), [], hasNonThreadReasons, pushed),
+      };
     }
 
     await appendSessionLog(

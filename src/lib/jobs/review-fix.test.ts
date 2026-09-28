@@ -18,6 +18,7 @@ import { GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
 import {
+  allWaitingThreadsAnswered,
   applyThreadOutcomes,
   claimOwnerFor,
   inReviewEpics,
@@ -30,6 +31,7 @@ import {
   runTestGate,
   type ThreadOutcome,
 } from "./review-fix";
+import { NON_THREAD_REPORT_ID } from "./review-fix-context";
 import { LABELS, type Bead } from "../beads/bd";
 import { PoisonError } from "./errors";
 import type { ProjectSettings } from "../projects";
@@ -856,6 +858,54 @@ process.exit(0);
       true,
     );
     expect(answered.size).toBe(0);
+  });
+});
+
+/**
+ * `allWaitingThreadsAnswered` gates `recordReviewFixAnswered` in both the main dispatch path and the
+ * already-ahead fast path (PR #338 review, chatgpt-codex-connector + @claude): a round must not be
+ * recorded "answered" on anything less than real, delivered evidence for every reason it was
+ * actionable for, thread or not.
+ */
+describe("allWaitingThreadsAnswered", () => {
+  it("requires the non-thread sentinel when hasNonThreadReasons is true, even with no waiting threads", () => {
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), [], true, false)).toBe(false);
+  });
+
+  it("accepts a 'left' sentinel as real evidence for a non-thread reason", () => {
+    const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "left", reply: "flaky infra" }];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, false)).toBe(true);
+  });
+
+  it("rejects a 'fixed' sentinel when nothing was pushed — a fabricated claim", () => {
+    const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "fixed the build" }];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, false)).toBe(false);
+  });
+
+  it("rejects a 'needs-human' sentinel — nothing ever posts it anywhere a human would see it", () => {
+    const report: ThreadOutcome[] = [
+      { id: NON_THREAD_REPORT_ID, outcome: "needs-human", reply: "needs a product call" },
+    ];
+    // Even with a push, and even with every real thread answered, a needs-human sentinel must never
+    // count as evidence the non-thread reason was actually handled.
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(false);
+    expect(allWaitingThreadsAnswered(new Set(["RT_1"]), new Set(["RT_1"]), report, true, true)).toBe(
+      false,
+    );
+  });
+
+  it("a real thread's own delivered needs-human reply still counts — only the sentinel is rejected", () => {
+    // No non-thread reason here: `hasNonThreadReasons` is false, so only the per-thread evidence
+    // matters, and a delivered reply (whatever its outcome) satisfies it.
+    expect(allWaitingThreadsAnswered(new Set(["RT_1"]), new Set(["RT_1"]), [], false, false)).toBe(true);
+  });
+
+  it("ignores hasNonThreadReasons once something was pushed (caller only consults this when !pushed)", () => {
+    // The fast path in runFixSession only calls this to decide the unpushed case; it short-circuits
+    // on `pushed` itself before ever reaching here. This spec pins that this function alone does not
+    // — `pushed` here only feeds `fabricatedFix`'s own check on the sentinel.
+    const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "fixed it" }];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(true);
   });
 });
 
