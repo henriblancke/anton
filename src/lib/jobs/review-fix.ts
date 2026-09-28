@@ -124,6 +124,7 @@ import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import {
   recordReviewFixAnswered,
+  recordReviewFixAttempt,
   reviewFixPrAnsweredUnchanged,
   reviewFixPrParkedAtHead,
   systemClock,
@@ -506,6 +507,15 @@ async function handleEpic(args: {
 
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return "clean"; // nothing to fix on this PR yet.
+
+  // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
+  // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
+  // chatgpt-codex-connector). Best-effort: a write hiccup here must not fail a legitimate attempt.
+  try {
+    recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
+  } catch (e) {
+    consoleLog.error("recordReviewFixAttempt failed before PR fix", e);
+  }
 
   // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
   // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the

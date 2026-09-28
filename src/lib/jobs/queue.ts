@@ -780,6 +780,48 @@ export function recordReviewFixAnswered(
 }
 
 /**
+ * Refresh THIS `review-fix-pr` job's stored `headSha`/`fingerprint` to the fresh `classifyReview`
+ * verdict `handleEpic` just computed, before it attempts the fix. The payload written at enqueue
+ * time ({@link enqueueReviewFixPrIfAbsent}) is only a snapshot of whatever the dispatcher saw when
+ * it queued the job; by the time the worker actually runs, `handleEpic` re-fetches the PR and may
+ * see a different base tip or a newer reviewer reply. If this attempt then hits a `PoisonError` and
+ * parks, {@link parkedAtHead}'s next-pass match must compare against what was ACTUALLY attempted,
+ * not the stale enqueue-time snapshot — otherwise a base that advanced between enqueue and park
+ * never lifts the suppression (it still compares to the old base), and a base that later cycles
+ * back to the enqueue-time value wrongly suppresses a park that in fact ran against a different one
+ * (PR #338 review, chatgpt-codex-connector). Best-effort like {@link recordReviewFixAnswered}: a
+ * write hiccup here must not turn a legitimate fix attempt into a job failure.
+ */
+export function recordReviewFixAttempt(
+  db: AntonDb,
+  jobId: string,
+  headSha: string,
+  fingerprint: string[],
+): void {
+  db.transaction((tx) => {
+    const row = tx
+      .select({ payloadJson: schema.jobs.payloadJson })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, jobId))
+      .limit(1)
+      .all()[0];
+    if (!row) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payloadJson);
+    } catch {
+      payload = {};
+    }
+    payload.headSha = headSha;
+    payload.fingerprint = fingerprint;
+    tx.update(schema.jobs)
+      .set({ payloadJson: JSON.stringify(payload) })
+      .where(eq(schema.jobs.id, jobId))
+      .run();
+  });
+}
+
+/**
  * Enqueue one of the SCHEDULED job types (board-picker, nightly-stringer, …) for a project unless a
  * job of that type is already COVERING it under `coveredBy` — the same one-active-per-(type,
  * project) coalescing `Scheduler.tickOnce` and `runScheduleNow` (schedules.ts) already apply,
