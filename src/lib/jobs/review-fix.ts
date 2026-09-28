@@ -538,7 +538,13 @@ async function handleEpic(args: {
       // really did need a round of attention), but contributes zero to every anton-failing/
       // human-touch counter. The later suppression this enables (declining to re-dispatch at the
       // same head + reasons) creates no job row of its own, so it needs no counter beyond this one.
-      recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.reasons);
+      // Best-effort like the beads sync above: a write hiccup here must not turn a legitimately
+      // successful "answered, nothing to push" round into a job failure (anton-tuf4l).
+      try {
+        recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.reasons);
+      } catch (e) {
+        consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
+      }
     }
     return pushed ? "pushed" : "answered";
   });

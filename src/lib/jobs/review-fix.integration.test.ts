@@ -32,6 +32,20 @@ vi.mock("../git/ops", async () => {
   };
 });
 
+// Flips on for one test to prove `recordReviewFixAnswered` is best-effort (anton-091jr review
+// round 2): every other test delegates straight to the real implementation.
+let recordAnsweredThrows = false;
+vi.mock("./queue", async () => {
+  const actual = await vi.importActual<typeof import("./queue")>("./queue");
+  return {
+    ...actual,
+    recordReviewFixAnswered: (...args: Parameters<typeof actual.recordReviewFixAnswered>) => {
+      if (recordAnsweredThrows) throw new Error("simulated jobs table write failure");
+      return actual.recordReviewFixAnswered(...args);
+    },
+  };
+});
+
 import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
 import { resetOperatorCache } from "../operator";
@@ -406,6 +420,32 @@ process.exit(0);`,
       expect(readFileSync(hookLog, "utf8").trim().split("\n").pop()).toBe(branch);
     } finally {
       process.env.ANTON_CLAUDE_BIN = prev;
+    }
+  });
+
+  it("settles an 'answered, nothing to push' round `done` even when recordReviewFixAnswered throws (anton-091jr)", async () => {
+    // No prior unpushed commit and a no-op claude — the branch is already in sync with origin from
+    // the previous test, so this round genuinely has nothing to commit or push, landing on the
+    // `answered` outcome that calls `recordReviewFixAnswered`.
+    const noopClaude = writeBin(
+      binDir,
+      "claude-noop-answered",
+      `const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'nothing to change',is_error:false});
+process.exit(0);`,
+    );
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = noopClaude;
+    recordAnsweredThrows = true;
+    try {
+      const fixes = await runSweep();
+      expect(fixes).toHaveLength(1);
+      // A best-effort bookkeeping write throwing must not turn a legitimately successful round into
+      // a job failure/retry (anton-tuf4l's "recording never fails the work").
+      expect((await getJob(tdb.db, fixes[0]))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+      recordAnsweredThrows = false;
     }
   });
 
