@@ -1,5 +1,5 @@
 /**
- * The per-round review record's migration (drizzle/0059), asserted against the database that can
+ * The per-round review record's migration (drizzle/0062_review_rounds.sql), asserted against the database that can
  * actually go wrong: an existing anton.db with a project and a settled run whose PR already merged —
  * exactly the row whose thread counts are unrecoverable.
  *
