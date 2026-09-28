@@ -101,6 +101,11 @@ function threadsByAuthor(threads: readonly ReviewThread[]): Record<string, numbe
 /**
  * Record one round: the threads the PR carried, who left them, and how anton answered.
  *
+ * `input.report` must already be `applyThreadOutcomes`'s return value, not the raw model report —
+ * i.e. only the outcomes whose reply actually posted to GitHub (PR #335 review). Passing the raw
+ * report here would count a thread as fixed/left/needs-human when the reply that was meant to say
+ * so never reached the PR, leaving the row claiming a response GitHub has no record of.
+ *
  * Best-effort by contract — it NEVER throws. Call it only from a round that actually dispatched
  * claude and applied its outcomes: a session that FAILED replied to no thread, so its threads are
  * still waiting on anton and the retry's own row carries them. Recording both would count the same

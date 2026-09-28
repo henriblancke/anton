@@ -836,7 +836,19 @@ async function runFixSession(args: {
     sessionSettled = true;
 
     const report = parseThreadReport(result.text);
-    await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
+    // `delivered` is the subset of `report` whose reply actually posted (PR #335 review) — what
+    // both the round record and the PR body below must count, not the raw model report, since a
+    // GitHub failure mid-reply leaves that thread still waiting on anton regardless of what claude
+    // claimed.
+    const delivered = await applyThreadOutcomes({
+      repo,
+      number,
+      pr,
+      report,
+      pushed,
+      signal: ctx.signal,
+      logPath,
+    });
     // The round's own record (anton-z5e3g): what GitHub's reviewers handed this round and how anton
     // answered it, from the values already in hand. AFTER the outcomes are applied, and only on this
     // path — a session that threw replied to no thread, so its findings are still waiting on anton
@@ -848,7 +860,7 @@ async function runFixSession(args: {
       jobId: ctx.jobId,
       prNumber: number,
       pr,
-      report,
+      report: delivered,
       pushed,
     });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
@@ -857,7 +869,7 @@ async function runFixSession(args: {
     await refreshFixRoundsBody({
       repo,
       number,
-      report,
+      report: delivered,
       pushed,
       now: new Date(clock.now()),
       logPath,
@@ -1071,6 +1083,12 @@ interface ThreadReplyArgs {
  * threadsNeedingAttention); the reaction is the free calibration signal on top, not a substitute
  * for the reply. A "fixed" claim without a push is a fabrication — leave that thread untouched,
  * reply and reaction both.
+ *
+ * Returns only the outcomes whose reply actually reached the PR — the reply is the one side effect
+ * that makes a thread stop being actionable, so a GitHub failure there (rate limit, outage) must
+ * not report as delivered: the thread is still waiting on anton and would otherwise be counted as
+ * answered nowhere anyone can see it (PR #335 review). Callers that persist "what this round did"
+ * (`recordReviewRound`, `refreshFixRoundsBody`) must use this return value, not the raw report.
  */
 export async function applyThreadOutcomes(args: {
   repo: string;
@@ -1080,22 +1098,25 @@ export async function applyThreadOutcomes(args: {
   pushed: boolean;
   signal: AbortSignal;
   logPath: string;
-}): Promise<void> {
+}): Promise<ThreadOutcome[]> {
+  const delivered: ThreadOutcome[] = [];
   for (const { item, thread, anchor } of triageOutcomes(args.pr, args.report, args.pushed)) {
-    await recordThreadOutcome(args, thread, anchor.id, item);
+    if (await recordThreadOutcome(args, thread, anchor.id, item)) delivered.push(item);
   }
+  return delivered;
 }
 
-/** Reply on the thread, resolve it when the fix landed, and log what was said. */
+/** Reply on the thread, resolve it when the fix landed, and log what was said. Returns whether
+ * the reply itself posted — the reaction and resolve are best-effort extras on top of it. */
 async function recordThreadOutcome(
   args: ThreadReplyArgs,
   thread: ReviewThread,
   anchorId: number,
   item: ThreadOutcome,
-): Promise<void> {
+): Promise<boolean> {
   const { repo, number, signal, logPath } = args;
   const note = item.reply?.trim() || defaultReply(item.outcome);
-  await safe(() =>
+  const replied = await safe(() =>
     replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
   );
   await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
@@ -1105,6 +1126,7 @@ async function recordThreadOutcome(
     logPath,
     `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
   );
+  return replied;
 }
 
 /**

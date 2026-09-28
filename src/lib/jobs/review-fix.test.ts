@@ -539,10 +539,12 @@ describe("applyThreadOutcomes (reactions)", () => {
   let logFile: string;
   let prevGh: string | undefined;
   let prevFail: string | undefined;
+  let prevFailReplies: string | undefined;
 
   /** Fake gh: answers `repo view`, and logs every other invocation's argv as one JSON line. Fails
-   * any call touching `/reactions` when ANTON_TEST_FAIL_REACTIONS=1, so the "best-effort" contract
-   * can be proven without a real network failure. */
+   * any call touching `/reactions` when ANTON_TEST_FAIL_REACTIONS=1, or `/replies` when
+   * ANTON_TEST_FAIL_REPLIES=1, so the "best-effort" contract (and what counts as delivered) can be
+   * proven without a real network failure. */
   function installFakeGh(): void {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
@@ -553,6 +555,10 @@ const a = process.argv.slice(2);
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
 fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
 if (process.env.ANTON_TEST_FAIL_REACTIONS === '1' && a.some((x) => x.includes('/reactions'))) {
+  process.stderr.write('boom');
+  process.exit(1);
+}
+if (process.env.ANTON_TEST_FAIL_REPLIES === '1' && a.some((x) => x.includes('/replies'))) {
   process.stderr.write('boom');
   process.exit(1);
 }
@@ -617,9 +623,11 @@ process.exit(0);
     installFakeGh();
     prevGh = process.env[GH_BIN_ENV];
     prevFail = process.env.ANTON_TEST_FAIL_REACTIONS;
+    prevFailReplies = process.env.ANTON_TEST_FAIL_REPLIES;
     process.env[GH_BIN_ENV] = join(binDir, "gh");
     process.env.ANTON_TEST_GH_LOG = logFile;
     delete process.env.ANTON_TEST_FAIL_REACTIONS;
+    delete process.env.ANTON_TEST_FAIL_REPLIES;
   });
 
   afterEach(() => {
@@ -627,6 +635,8 @@ process.exit(0);
     else process.env[GH_BIN_ENV] = prevGh;
     if (prevFail === undefined) delete process.env.ANTON_TEST_FAIL_REACTIONS;
     else process.env.ANTON_TEST_FAIL_REACTIONS = prevFail;
+    if (prevFailReplies === undefined) delete process.env.ANTON_TEST_FAIL_REPLIES;
+    else process.env.ANTON_TEST_FAIL_REPLIES = prevFailReplies;
     delete process.env.ANTON_TEST_GH_LOG;
     rmSync(sandbox, { recursive: true, force: true });
   });
@@ -663,20 +673,31 @@ process.exit(0);
   });
 
   it("posts no reaction (and no reply) for a fabricated fix — claimed fixed with nothing pushed", async () => {
-    await run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], false);
+    const delivered = await run(
+      [{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }],
+      [thread()],
+      false,
+    );
 
     expect(ghCalls()).toEqual([]);
+    expect(delivered).toEqual([]);
   });
 
-  it("a reaction failure is best-effort — the reply still lands and the run stays green", async () => {
+  it("a reaction failure is best-effort — the reply still lands, counts as delivered, and the run stays green", async () => {
     process.env.ANTON_TEST_FAIL_REACTIONS = "1";
 
-    await expect(
-      run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], true),
-    ).resolves.toBeUndefined();
+    const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([item]);
 
     const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
     expect(reply).toBeDefined();
+  });
+
+  it("a reply failure is not counted as delivered, even though the run stays green", async () => {
+    process.env.ANTON_TEST_FAIL_REPLIES = "1";
+
+    const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([]);
   });
 });
 
