@@ -366,6 +366,16 @@ async function getReviewThreads(
         if (n.comments.totalCount > n.comments.nodes.length) {
           complete = false;
           if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
+        // nodes.length matches totalCount, but a node can still lack a numeric databaseId (e.g. a
+        // pending/draft comment) — the mapping below silently filters those out, so a thread that
+        // looks array-complete here can end up with a stale or empty comment list post-filter while
+        // `complete` stays true. Catch it here so the whole read (and this thread) is flagged
+        // incomplete rather than persisted as if the dropped comment never existed (PR #335 review).
+        if (n.comments.nodes.some((c) => typeof c?.databaseId !== "number")) {
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
         }
       }
       if (!page.pageInfo) {

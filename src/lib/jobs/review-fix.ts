@@ -382,7 +382,7 @@ async function dispatchInReview(args: {
         .map((b) => prNumberFromRef(beads.getPrRef(b)))
         .filter((n): n is number => n !== undefined),
     );
-    const orphaned = (await unsettledPrNumbers(db, projectId)).filter(
+    const orphaned = (await unsettledPrNumbers(db, projectId, clock)).filter(
       (n) => !triagedNumbers.has(n) && !claimedByOtherOperator.has(n),
     );
     for (const prNumber of orphaned) {

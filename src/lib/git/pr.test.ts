@@ -261,6 +261,46 @@ process.exit(0);
     expect(review.threadsComplete).toBe(false);
   });
 
+  // PR #335 review follow-up: a comment node without a numeric `databaseId` (e.g. a pending/draft
+  // review comment) passes the totalCount === nodes.length check below, so the array-level
+  // validation reported the read complete — but the mapping's `.filter((c) => typeof c?.databaseId
+  // === "number")` silently drops that node afterward, leaving a thread whose "true latest" comment
+  // vanished while `threadsComplete` still read true. Catch it at validation time instead.
+  it("marks the read incomplete when a comment node lacks a numeric databaseId, even though totalCount matches", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: null, author: { login: 'alice' }, body: 'please fix' }] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'also fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
   // PR #335 review (src/lib/git/pr.ts:339): a thread missing its `comments` connection (or
   // `totalCount`) entirely was flagged incomplete but kept, mapping to `comments: []` — so
   // threadsNeedingAttention saw an actionable thread with no anchor comment a triage outcome

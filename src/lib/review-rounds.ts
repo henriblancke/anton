@@ -21,11 +21,11 @@
  * connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, count, eq, isNull, or } from "drizzle-orm";
+import { and, count, eq, gte, isNull, or } from "drizzle-orm";
 import { schema } from "./db";
 import { threadsNeedingAttention, type PrReview, type ReviewThread } from "./git/pr";
+import { systemClock, type AntonDb, type Clock } from "./jobs/queue";
 import { triageOutcomes, type ThreadOutcome } from "./jobs/review-fix-context";
-import type { AntonDb, Clock } from "./jobs/queue";
 
 export type ReviewRoundRow = typeof schema.reviewRounds.$inferSelect;
 
@@ -258,30 +258,53 @@ export async function recordPrTerminalState(
 }
 
 /**
- * Every PR this project has a NON-FINAL round for (`pr_state IS NULL` or `'closed'`) — regardless of
- * whether its target is still on the board. A target that leaves the board (another instance's
- * `finalizeMergedTarget` closes the epic and clears `stage:in-review`) drops out of `inReviewEpics`
- * for good, so a null row a race left behind (PR #335 review: `getPrReview`'s own state read can
- * still be stale by the time it resolves, even on the post-insert freshness check) would otherwise
- * never be revisited by the per-target triage loop. A caller reconciles these independently of board
- * membership — orphaned or not, restamping is idempotent (`recordPrTerminalState`).
+ * How long an orphaned `closed` row stays eligible for reconciliation's `gh` read, counted from
+ * `prStateAt` (PR #335 review, follow-up). Past this a closed-and-abandoned PR is presumed dead: the
+ * default review-fix schedule sweeps every project on a 15-minute cadence (`src/lib/schedules.ts`),
+ * so without a bound every historical closed-but-unmerged PR a project ever had costs one `gh pr
+ * view` on every sweep forever — cost that grows without bound as a project ages. A late reopen past
+ * this window is missed, but `recordPrTerminalState`'s closed branch is already a no-op once
+ * `prStateAt` stops moving (it only restamps when a null row proves a reopen happened), so the
+ * window is exactly the same "stop watching" trade every other best-effort read on this table makes.
+ */
+const ORPHAN_CLOSED_RECONCILE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Every PR this project has a NON-FINAL round for (`pr_state IS NULL`, or `'closed'` within {@link
+ * ORPHAN_CLOSED_RECONCILE_WINDOW_MS} of its close) — regardless of whether its target is still on
+ * the board. A target that leaves the board (another instance's `finalizeMergedTarget` closes the
+ * epic and clears `stage:in-review`) drops out of `inReviewEpics` for good, so a null row a race left
+ * behind (PR #335 review: `getPrReview`'s own state read can still be stale by the time it resolves,
+ * even on the post-insert freshness check) would otherwise never be revisited by the per-target
+ * triage loop. A caller reconciles these independently of board membership — orphaned or not,
+ * restamping is idempotent (`recordPrTerminalState`).
  *
  * `closed` rows are included, not just `null`, because closed is not final the way merged is: GitHub
  * allows reopening a closed PR (never a merged one — see `recordPrReopened`). An orphaned PR stamped
  * `closed` by this same reconciliation has no target left in `inReviewEpics` to observe a later
- * reopen-and-merge via `recordPrReopened`/`recordPrTerminalState`, so excluding `closed` here would
- * strand that row at the wrong terminal state forever once GitHub moved on. `merged` rows are excluded
+ * reopen-and-merge via `recordPrReopened`/`recordPrTerminalState`, so excluding `closed` here entirely
+ * would strand that row at the wrong terminal state forever once GitHub moved on. But retaining EVERY
+ * closed row forever is unbounded polling cost for a benefit (catching a years-later reopen) nobody
+ * asked for, so eligibility itself is bounded by how recently it closed. `merged` rows are excluded
  * since they truly are final.
  */
-export async function unsettledPrNumbers(db: AntonDb, projectId: string): Promise<number[]> {
+export async function unsettledPrNumbers(
+  db: AntonDb,
+  projectId: string,
+  clock: Clock = systemClock,
+): Promise<number[]> {
   try {
+    const cutoff = new Date(clock.now() - ORPHAN_CLOSED_RECONCILE_WINDOW_MS);
     const rows = await db
       .selectDistinct({ prNumber: schema.reviewRounds.prNumber })
       .from(schema.reviewRounds)
       .where(
         and(
           eq(schema.reviewRounds.projectId, projectId),
-          or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed")),
+          or(
+            isNull(schema.reviewRounds.prState),
+            and(eq(schema.reviewRounds.prState, "closed"), gte(schema.reviewRounds.prStateAt, cutoff)),
+          ),
         ),
       );
     return rows.map((r) => r.prNumber);

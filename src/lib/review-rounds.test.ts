@@ -521,4 +521,50 @@ describe("recording never fails the round", () => {
   it("swallows a read against a broken db", async () => {
     await expect(unsettledPrNumbers(brokenDb(), PROJECT)).resolves.toEqual([]);
   });
+
+  // PR #335 review, follow-up: without a bound, every historical closed-but-unmerged PR a project
+  // ever had would cost one `gh` read on every recurring sweep forever. A row `closed` well within
+  // the reconciliation window is still an orphan worth polling for a reopen...
+  it("still includes a recently closed PR within the reconciliation window", async () => {
+    await recordReviewRound(t.db, clock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      pr: FIXTURE,
+      report: FIXTURE_REPORT,
+      pushed: true,
+    });
+    await recordPrTerminalState(t.db, clock, { projectId: PROJECT, prNumber: 331, state: "closed" });
+
+    const oneHourLater: Clock = { now: () => T0 + 60 * 60 * 1000 };
+    await expect(unsettledPrNumbers(t.db, PROJECT, oneHourLater)).resolves.toEqual([331]);
+  });
+
+  // ...but one closed long enough ago is presumed dead and dropped, so the sweep's cost stops
+  // growing with a project's whole closed-PR history instead of just its live orphans.
+  it("excludes a PR closed long enough ago that it falls outside the reconciliation window", async () => {
+    await recordReviewRound(t.db, clock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      pr: FIXTURE,
+      report: FIXTURE_REPORT,
+      pushed: true,
+    });
+    await recordPrTerminalState(t.db, clock, { projectId: PROJECT, prNumber: 331, state: "closed" });
+
+    const wayLater: Clock = { now: () => T0 + 30 * 24 * 60 * 60 * 1000 };
+    await expect(unsettledPrNumbers(t.db, PROJECT, wayLater)).resolves.toEqual([]);
+  });
+
+  it("always includes a still-unsettled (null pr_state) row regardless of age", async () => {
+    await recordReviewRound(t.db, clock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      pr: FIXTURE,
+      report: FIXTURE_REPORT,
+      pushed: true,
+    });
+
+    const wayLater: Clock = { now: () => T0 + 30 * 24 * 60 * 60 * 1000 };
+    await expect(unsettledPrNumbers(t.db, PROJECT, wayLater)).resolves.toEqual([331]);
+  });
 });
