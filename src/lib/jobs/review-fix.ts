@@ -583,7 +583,7 @@ async function handleEpic(args: {
       branch,
       number,
     });
-    if (!pushed && answeredAllThreads) {
+    if (!pushed && answeredAllThreads && refsSynced) {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
       // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz).
@@ -592,6 +592,11 @@ async function handleEpic(args: {
       // this round was actually asked about untouched must NOT be recorded as answered — that thread
       // is still genuinely waiting on anton, and marking the round "answered" would suppress a fresh
       // attempt at it forever (same head, same fingerprint) instead of a real reply ever reaching it.
+      // ALSO gated on `refsSynced` (PR #338 review, chatgpt-codex-connector, round 4): the earlier
+      // `invalidateReviewFixAttempt` above already cleared this job's enqueue-time identity for that
+      // exact reason — a delivered `answeredAllThreads` outcome must not write it right back with
+      // `pr.headSha`, which would let `parkedAtHead` suppress future feedback at a revision this
+      // attempt never actually saw synced.
       //
       // Friction classification (ADR-0001 clause 5, anton-tuf4l): this job settles `done`, not
       // parked or cancelled, so it is NOT anton failing and NOT a human touch — nobody was asked
@@ -616,6 +621,10 @@ async function handleEpic(args: {
       } catch (e) {
         consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
       }
+    } else if (!pushed && answeredAllThreads) {
+      consoleLog.info(
+        `PR #${number}: round answered all threads but refs were not synced — not recording answered fingerprint to avoid parking a suppression at an untested revision`,
+      );
     } else if (!pushed) {
       consoleLog.info(
         `PR #${number}: round left thread(s) unaddressed (no/incomplete report) — not recording answered`,
@@ -687,7 +696,12 @@ export async function prepareFixWorktree(args: {
    * here tells the caller the session below (if any) ran, and any gate it hit failed, against code
    * that was NOT what GitHub reports as the PR's current head or base — so persisting an attempt
    * fingerprint keyed on `expectedHeadSha`/`expectedBaseRefOid` would misrepresent that revision as
-   * tested (PR #338 review, chatgpt-codex-connector, rounds 2-3).
+   * tested (PR #338 review, chatgpt-codex-connector, rounds 2-3). Also `false` when the fetched refs
+   * DO match but `premergeBase` below fails outright partway through the merge (round 4 of the same
+   * review) — the advertised base tree never actually landed in the worktree the gates ran against,
+   * so that's just as untested as a stale fetch. A checkout that sits AHEAD of `expectedHeadSha`
+   * (contains it as an ancestor, e.g. unpushed operator/prior-attempt commits on a resumed branch)
+   * still counts as synced, not stale.
    */
   refsSynced: boolean;
 }> {
@@ -759,7 +773,16 @@ export async function prepareFixWorktree(args: {
     (s) => s.head,
     () => "",
   );
-  const headMatches = expectedHeadSha === "" || syncedHead === expectedHeadSha;
+  // A checkout that is a DESCENDANT of `expectedHeadSha` — not just equal to it — also counts as
+  // synced: the supported resume path leaves unpushed operator or prior-attempt commits on the
+  // local branch, so the ff-only merge above is a no-op against `origin/<branch>` and `syncedHead`
+  // legitimately sits ahead of what GitHub reports (PR #338 review, chatgpt-codex-connector, round
+  // 4). Treating that as unsynced deleted the job's attempt identity every single pass, so a parked
+  // gate could never be matched by a later sweep and kept re-dispatching against the same commits.
+  const headMatches =
+    expectedHeadSha === "" ||
+    syncedHead === expectedHeadSha ||
+    (await isAncestor(worktree.path, expectedHeadSha, syncedHead).catch(() => false));
 
   // Same check for the base ref `fetchOrigin` above also fetched (best-effort, just like the head
   // fetch above) — resolved directly via `rev-parse` rather than `readWorktreeState` since the
@@ -773,7 +796,10 @@ export async function prepareFixWorktree(args: {
     (await resolveCommitSha(worktree.path, `origin/${baseBranch}`).catch(() => "")) ===
       expectedBaseRefOid;
 
-  const refsSynced = headMatches && baseMatches;
+  // Refs matching GitHub is necessary but not sufficient — `premergeBase` below still has to
+  // actually land that base content in the tree the gates run against. Final `refsSynced` folds in
+  // its outcome too (see below).
+  const refsFetched = headMatches && baseMatches;
 
   // Snapshot "ahead of origin" right after the fast-forward sync above and BEFORE the premerge
   // below — the premerge's own auto-merge commit (see its "clean auto-merge" comment) would
@@ -796,8 +822,20 @@ export async function prepareFixWorktree(args: {
   // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
   // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
   // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
-  const { conflicts, merged } = await premergeBase(repo, worktree.path, baseBranch, number);
+  const { conflicts, merged, failed: baseMergeFailed } = await premergeBase(
+    repo,
+    worktree.path,
+    baseBranch,
+    number,
+  );
   await ctx.heartbeat();
+  // Folded in here, after `premergeBase` returns, rather than into `refsFetched` above: a fetched
+  // head/base that match GitHub exactly are still not "synced" if the merge landing that base
+  // content then fails outright (a transient git error, a hook failure) — without this, `refsSynced`
+  // stayed true and the caller recorded an attempt fingerprint for a tree that never actually got the
+  // base merged in, so a red gate parked a suppression that looked identical to a real, tested
+  // failure (PR #338 review, chatgpt-codex-connector, round 4).
+  const refsSynced = refsFetched && !baseMergeFailed;
   // A clean (conflict-free) base merge can change dependency metadata (lockfile, package.json)
   // without updating `node_modules`, which was warmed above BEFORE this merge landed — the verify
   // gates below would then fail solely because the install reflects the pre-merge tree (anton-091jr
@@ -833,24 +871,29 @@ async function premergeBase(
   worktreePath: string,
   baseBranch: string | undefined,
   number: number,
-): Promise<{ conflicts: string[]; merged: boolean }> {
-  if (!baseBranch) return { conflicts: [], merged: false };
+): Promise<{ conflicts: string[]; merged: boolean; failed: boolean }> {
+  if (!baseBranch) return { conflicts: [], merged: false, failed: false };
   const baseRef = `origin/${baseBranch}`;
   // Already caught up → no merge to do. Best-effort like every other git read on this path (see
   // prepareFixWorktree's doc): a failed read (origin/<base> didn't resolve, a transient git error)
   // reads as "can't confirm we're caught up" rather than aborting the premerge — the merge attempt
   // below tolerates a no-op fine on its own.
   const upToDate = await isAncestor(worktreePath, baseRef, "HEAD").catch(() => false);
-  if (upToDate) return { conflicts: [], merged: false };
+  if (upToDate) return { conflicts: [], merged: false, failed: false };
   const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
     ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
     : undefined;
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
-    return { conflicts: merge.conflicts, merged: true }; // clean auto-merge → a merge commit is pushed below
+    return { conflicts: merge.conflicts, merged: true, failed: false }; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
     consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
-    return { conflicts: [], merged: false };
+    // `failed: true` (not just `merged: false`, which also covers the ordinary "already caught up"
+    // case above) — this branch means the merge was actually attempted and blew up (transient git
+    // error, hook failure), so the base content the gates need never landed even though the refs
+    // fetched cleanly. The caller folds this into `refsSynced` so that failure can't be recorded as
+    // a tested attempt (PR #338 review, chatgpt-codex-connector, round 4).
+    return { conflicts: [], merged: false, failed: true };
   }
 }
 

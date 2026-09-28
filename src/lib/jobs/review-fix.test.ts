@@ -475,6 +475,79 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       expect(resolveCommitShaMock).not.toHaveBeenCalled();
     });
   });
+
+  // PR #338 review, chatgpt-codex-connector, round 4: the resume path (anton-2wklm) leaves unpushed
+  // operator/prior-attempt commits on the local branch, so the ff-only sync above is a no-op and
+  // `syncedHead` legitimately sits ahead of `expectedHeadSha` rather than equal to it. Treating that
+  // as unsynced deleted the job's attempt identity every pass, so a parked gate could never be
+  // matched by a later sweep.
+  describe("refsSynced treats a descendant checkout as synced, not just an exact match", () => {
+    // `readWorktreeState` is real (only `git/ops` functions named in the mock above are stubbed) and
+    // `worktreePath` is a plain temp dir, not a real git repo, so it always resolves to "" here —
+    // `isAncestorMock` is what stands in for "is the checkout ahead of `expectedHeadSha`".
+    const runWithHead = (expectedHeadSha: string) =>
+      prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha,
+        expectedBaseRefOid: undefined, // isolate the assertion to the head half of the check
+      });
+
+    it("is true when the checkout is a descendant of expectedHeadSha (not equal to it)", async () => {
+      isAncestorMock.mockResolvedValue(true); // stands in for both premergeBase's own check and this one
+
+      const result = await runWithHead("expected-head-sha");
+
+      expect(result.refsSynced).toBe(true);
+      expect(isAncestorMock).toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+    });
+
+    it("is false when the checkout is neither equal to nor a descendant of expectedHeadSha", async () => {
+      isAncestorMock.mockResolvedValue(false);
+
+      const result = await runWithHead("expected-head-sha");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("is false when the ancestry check itself fails outright", async () => {
+      isAncestorMock.mockRejectedValue(new Error("not a git repo"));
+
+      const result = await runWithHead("expected-head-sha");
+
+      expect(result.refsSynced).toBe(false);
+    });
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 4: a fetched head/base that both match GitHub
+  // exactly are still not "synced" if `premergeBase` then fails outright (a transient git error, a
+  // hook failure) — the advertised base tree never actually landed in the tree the gates ran
+  // against, so persisting an attempt fingerprint would misrepresent that revision as tested.
+  describe("refsSynced folds in a failed (not just conflicting) base premerge", () => {
+    it("is false when the base merge fails outright, even though the fetched refs matched", async () => {
+      isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
+      mergeIntoCurrentMock.mockRejectedValue(new Error("hook failed"));
+
+      const result = await run({} as ProjectSettings); // expectedHeadSha/BaseRefOid unset → trivially matched
+
+      expect(result.refsSynced).toBe(false);
+      expect(result.conflicts).toEqual([]);
+    });
+
+    it("stays true when the base merge succeeds cleanly", async () => {
+      isAncestorMock.mockResolvedValue(false);
+      mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] });
+
+      const result = await run({} as ProjectSettings);
+
+      expect(result.refsSynced).toBe(true);
+    });
+  });
 });
 
 /**

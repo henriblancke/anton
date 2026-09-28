@@ -112,14 +112,18 @@ describeBd(
       // Fake gh: CHANGES_REQUESTED with a reviewer summary but NO inline threads at all — the round
       // is actionable, yet `threadsNeedingAttention` is empty, exactly the vacuous-success shape.
       // `pr comment` is recorded so the test can assert the sentinel's explanation actually reaches
-      // the PR, not just the job's own payload.
+      // the PR, not just the job's own payload. `FAKE_BASE_REF_OID`, when set, reports a `baseRefOid`
+      // that a real `resolveCommitSha` against the fetched `origin/main` will never match — letting a
+      // test force `refsSynced` false without touching the head half of the check (PR #338 review,
+      // chatgpt-codex-connector, round 4).
       const fakeGh = writeBin(
         binDir,
         "gh",
         `const fs=require('fs');
 const a=process.argv.slice(2);
 if(a[0]==='pr'&&a[1]==='view'){
-  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'please double-check the rollout plan in the PR description'}],statusCheckRollup:[]}));
+  const base = process.env.FAKE_BASE_REF_OID ? {baseRefOid: process.env.FAKE_BASE_REF_OID} : {};
+  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,...base,url:'https://github.com/acme/repo/pull/7',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'please double-check the rollout plan in the PR description'}],statusCheckRollup:[]}));
   process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='comment'){
@@ -139,6 +143,7 @@ process.exit(0);`,
         "ANTON_SESSIONS_ROOT",
         "FAKE_BRANCH",
         "FAKE_GH_COMMENT_LOG",
+        "FAKE_BASE_REF_OID",
       ]);
       process.env.ANTON_GH_BIN = fakeGh;
       process.env.ANTON_WORKTREES_ROOT = join(sandbox, "worktrees");
@@ -249,6 +254,38 @@ process.exit(0);`,
       } finally {
         process.env.ANTON_CLAUDE_BIN = prevClaude;
         process.env.ANTON_GH_BIN = prevGh;
+      }
+    });
+
+    it("does NOT record the round answered when the base ref never actually synced (refsSynced=false)", async () => {
+      // Same acking claude as above, but GitHub reports a `baseRefOid` that a real fetch + resolve of
+      // `origin/main` will never produce — simulating a `fetchOrigin` that landed the head fine but
+      // silently failed for the base (PR #338 review round 3) or a base premerge that landed refs
+      // matching GitHub but then failed to actually merge (round 4). Either way, `refsSynced` is
+      // false, and a delivered `answeredAllThreads` outcome must not write `pr.headSha` back as
+      // tested — that would let `parkedAtHead` suppress future feedback at a revision this attempt
+      // never actually saw synced (PR #338 review, chatgpt-codex-connector, round 4).
+      const ackingClaude = writeBin(
+        binDir,
+        "claude-acking-stale-base",
+        `const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+const report=JSON.stringify({threads:[{id:${JSON.stringify(NON_THREAD_REPORT_ID)},outcome:'left',reply:'rollout plan already covered in the description; no change needed'}]});
+e({type:'result',subtype:'success',result:'looked at the rollout plan\\n\\n\`\`\`json\\n'+report+'\\n\`\`\`',is_error:false});
+process.exit(0);`,
+      );
+      const prevClaude = process.env.ANTON_CLAUDE_BIN;
+      process.env.ANTON_CLAUDE_BIN = ackingClaude;
+      process.env.FAKE_BASE_REF_OID = "sha-base-never-fetched";
+      try {
+        const fixes = await runSweep();
+        expect(fixes).toHaveLength(1);
+        const job = await getJob(tdb.db, fixes[0]);
+        expect(job?.status).toBe("done");
+        const payload = JSON.parse(job!.payloadJson);
+        expect(payload.answeredFingerprint).toBeUndefined();
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = prevClaude;
+        delete process.env.FAKE_BASE_REF_OID;
       }
     });
   },
