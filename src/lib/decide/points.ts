@@ -1,0 +1,122 @@
+/**
+ * The decision-point registry (anton-xi9lv): what decide() may be asked, and the shape of a safe
+ * answer to it. Nothing here calls a model or takes an action — a point is a declaration, validated
+ * once at {@link definePoint} time so a bad threshold or an escape hatch missing from its own option
+ * list fails at startup, not mid-decision.
+ *
+ * Three question shapes, chosen for what decide() exists to do (a pluggable decide() for BOUNDED
+ * choices, anton-528bw): a fixed set of options, a bounded score, or yes/no. A `choice` point's
+ * options always carry the human escape (or "unknown") — a bounded call with no way out is the one
+ * shape decide() must never produce. `score` and `yes-no` have no in-band escape value: their safety
+ * net is structural, decide() falls back to `answer: undefined` whenever a rule doesn't fire and the
+ * model can't be trusted, rather than inventing a number or boolean to stand in for "ask a human".
+ */
+
+export const DECISION_MODES = ["off", "shadow", "assist", "auto"] as const;
+export type DecisionMode = (typeof DECISION_MODES)[number];
+
+export const CONSEQUENCES = ["low", "med", "high"] as const;
+export type Consequence = (typeof CONSEQUENCES)[number];
+
+export interface ChoiceQuestion {
+  readonly kind: "choice";
+  readonly options: readonly string[];
+}
+
+export interface ScoreQuestion {
+  readonly kind: "score";
+  readonly min: number;
+  readonly max: number;
+}
+
+export interface YesNoQuestion {
+  readonly kind: "yes-no";
+}
+
+export type Question = ChoiceQuestion | ScoreQuestion | YesNoQuestion;
+
+/** What a hard rule or a model can answer with — checked against `question.kind` at decide()'s own
+ * boundary, never trusted from its shape alone. */
+export type AnswerValue = string | number | boolean;
+
+/** The state a decision point reads, narrowed by its own `stateFields` before anything leaves the
+ * process — deliberately untyped: each point's caller owns what shape it hands in. */
+export type DecisionState = Readonly<Record<string, unknown>>;
+
+export interface HardRuleOutcome {
+  readonly value: AnswerValue;
+  /** Why the rule fired — carried into the decision result so a decisions-table row explains itself. */
+  readonly reason: string;
+}
+
+/**
+ * A deterministic pre-model gate. Returns `undefined` to defer to the next rule (or the model);
+ * anything else decides outright, with `decidedBy: "rule"` and full confidence — no model call, no
+ * threshold check, whatever the mode.
+ */
+export type HardRule = (state: DecisionState) => HardRuleOutcome | undefined;
+
+export interface DecisionPoint {
+  readonly id: string;
+  readonly question: Question;
+  /** What a wrong answer costs. Informational today — no gate in this pipeline reads it yet, because
+   * nothing here is wired into a job (out of scope, anton-528bw); it exists so the Settings surface
+   * and the eventual backend can key off it without a registry shape change. */
+  readonly consequence: Consequence;
+  /** Confidence an `auto`-mode answer must clear to be acted on unattended. */
+  readonly threshold: number;
+  readonly defaultMode: DecisionMode;
+  /** Which `state` fields reach a model backend — the only path untrusted text may travel. */
+  readonly stateFields: readonly string[];
+  readonly hardRules: readonly HardRule[];
+  /** Required for, and only for, a `choice` question: must be one of `question.options`. */
+  readonly escapeValue?: string;
+}
+
+function validate(point: DecisionPoint): void {
+  if (!point.id) throw new Error("decide: a decision point needs an id");
+  if (!(point.threshold >= 0 && point.threshold <= 1)) {
+    throw new Error(`decide: "${point.id}" threshold must be within [0, 1], got ${point.threshold}`);
+  }
+  if (point.question.kind === "choice") {
+    if (point.question.options.length < 2) {
+      throw new Error(`decide: "${point.id}" is a choice with fewer than two options`);
+    }
+    if (point.escapeValue === undefined || !point.question.options.includes(point.escapeValue)) {
+      throw new Error(`decide: "${point.id}" needs an escapeValue that is one of its own options`);
+    }
+  } else if (point.escapeValue !== undefined) {
+    throw new Error(
+      `decide: "${point.id}" is a ${point.question.kind} question — escapeValue only applies to choice`,
+    );
+  }
+}
+
+const registry = new Map<string, DecisionPoint>();
+
+/**
+ * Validates and registers a decision point. Throws on a bad shape or a duplicate id — both are
+ * programmer errors caught at definition time, never something a caller is meant to recover from.
+ */
+export function definePoint(point: DecisionPoint): DecisionPoint {
+  validate(point);
+  if (registry.has(point.id)) {
+    throw new Error(`decide: duplicate decision point id "${point.id}"`);
+  }
+  registry.set(point.id, point);
+  return point;
+}
+
+export function getPoint(id: string): DecisionPoint | undefined {
+  return registry.get(id);
+}
+
+export function listPoints(): readonly DecisionPoint[] {
+  return [...registry.values()];
+}
+
+/** Test-only: the registry is a module-level singleton, so suites that define points need a way to
+ * clear it between runs instead of leaking into one another. */
+export function resetRegistryForTests(): void {
+  registry.clear();
+}
