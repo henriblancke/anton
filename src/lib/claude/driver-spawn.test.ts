@@ -26,13 +26,20 @@ describe("buildClaudeArgs", () => {
     expect(flag(args, "--permission-mode")).toBe("bypassPermissions");
   });
 
-  it("omits every optional flag whose value is unset or empty", () => {
-    const args = buildClaudeArgs({ allowedTools: [], disallowedTools: [], settingSources: [] });
+  it("omits every optional flag left unset, including allowedTools", () => {
+    const args = buildClaudeArgs({});
     expect(args).not.toContain("--model");
     expect(args).not.toContain("--allowedTools");
     expect(args).not.toContain("--disallowedTools");
     expect(args).not.toContain("--setting-sources");
     expect(args).not.toContain("--append-system-prompt-file");
+  });
+
+  it("omits allowedTools/disallowedTools/settingSources when passed as empty lists", () => {
+    const args = buildClaudeArgs({ allowedTools: [], disallowedTools: [], settingSources: [] });
+    expect(args).not.toContain("--allowedTools");
+    expect(args).not.toContain("--disallowedTools");
+    expect(args).not.toContain("--setting-sources");
   });
 
   it("joins list flags on commas and passes the system prompt as a file, never inline", () => {

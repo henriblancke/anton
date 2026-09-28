@@ -165,6 +165,14 @@ export interface StreamState {
    * ordinary message clears an earlier arm.
    */
   pendingYields: string[];
+  /**
+   * The `model` the SAME message reported (anton-528bw) — the model that actually authored
+   * {@link lastAssistantText}/the final result text, as opposed to `modelUsage`'s per-model spend
+   * map, which lists every model the session touched (including sidecars) in no meaningful order.
+   * Captured only alongside a text-bearing assistant message, so it always names the model that
+   * produced the text a caller goes on to parse, never a tool-only turn's model.
+   */
+  lastAssistantModel?: string;
 }
 
 export function createStreamState(): StreamState {
@@ -198,7 +206,14 @@ function captureEvents(
   if (parsed.type === "assistant") state.pendingYields = yieldingTools(messageBlocks(parsed));
   for (const event of toEvents(parsed)) {
     if (event.text) state.transcript += `${event.text}\n`;
-    if (event.type === "assistant" && event.text) state.lastAssistantText = event.text;
+    if (event.type === "assistant" && event.text) {
+      state.lastAssistantText = event.text;
+      const message = (parsed.message ?? undefined) as Record<string, unknown> | undefined;
+      // Set from THIS message, never left over from an earlier one: a model-less text-bearing
+      // message must not inherit a stale model an earlier message reported, or a caller (e.g.
+      // claudeLocalBackend's answeringModel) attributes the final text to the wrong model.
+      state.lastAssistantModel = typeof message?.model === "string" ? message.model : undefined;
+    }
     onEvent?.(event);
   }
 }

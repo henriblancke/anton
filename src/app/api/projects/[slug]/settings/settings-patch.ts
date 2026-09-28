@@ -29,6 +29,7 @@ import {
   REVIEW_MIN_SCORE_RANGE,
   REVIEW_FIX_CONCURRENCY_RANGE,
   budgetPolicySchema,
+  decisionModeOverridesSchema,
   formulaVariantsSchema,
   modelRoutesSchema,
   pickerAutonomySchema,
@@ -225,6 +226,14 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("scanSeverity", schemaValue(scanSeverityPolicySchema, pathDetail)),
     settingsField("proposalAutonomy", schemaValue(proposalAutonomySchema, pathDetail)),
     settingsField("repairAutonomy", schemaValue(repairAutonomySchema, pathDetail)),
+    // The parsed patch may carry `null` per point (a per-point delete) even though the stored
+    // field never does — mergeSettings resolves that before it lands in settingsJson.
+    settingsField(
+      "decisionModes",
+      schemaValue(decisionModeOverridesSchema, pathDetail) as FieldParser<
+        NonNullable<ProjectSettings["decisionModes"]>
+      >,
+    ),
     settingsField(
       "valueLabels",
       schemaValue(valueLabelsSchema, messageDetail("invalid label"), { clearOnEmptyArray: true }),

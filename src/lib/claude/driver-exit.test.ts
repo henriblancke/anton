@@ -322,6 +322,15 @@ describe("toClaudeResult", () => {
     ).toBeUndefined();
   });
 
+  it("carries the model that authored the last assistant text as answeringModel", () => {
+    expect(
+      toClaudeResult(
+        stream({ resultRaw: { type: "result", result: "done" }, lastAssistantModel: "claude-5-2026-09" }),
+      ).answeringModel,
+    ).toBe("claude-5-2026-09");
+    expect(toClaudeResult(stream({ resultRaw: { type: "result", result: "done" } })).answeringModel).toBeUndefined();
+  });
+
   it("falls back to the last assistant text only when the result field is absent", () => {
     expect(toClaudeResult(stream({ resultRaw: { type: "result" }, lastAssistantText: "ANTON-RESULT: delivered" })).text).toBe(
       "ANTON-RESULT: delivered",
