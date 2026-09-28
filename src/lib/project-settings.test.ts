@@ -101,6 +101,22 @@ describe("mergeSettings", () => {
     expect(next.decisionModes).toEqual({ "point-b": "assist" });
   });
 
+  // A point literally named "__proto__" must still land as an own property, not reassign the
+  // merged object's prototype via the inherited setter — which would silently drop the override.
+  // The computed key below (as opposed to a literal `__proto__:`) is required to actually produce
+  // an own "__proto__" property on the patch object rather than triggering the literal's own
+  // proto-setting special case.
+  it("stores an override for a point named __proto__ as an own property", () => {
+    const current: ProjectSettings = { decisionModes: { "point-a": "shadow" } };
+    const next = mergeSettings(
+      current,
+      { decisionModes: { ["__proto__"]: "auto" } } as unknown as Partial<ProjectSettings>,
+    );
+    expect(Object.prototype.hasOwnProperty.call(next.decisionModes, "__proto__")).toBe(true);
+    expect(next.decisionModes?.__proto__).toBe("auto");
+    expect(next.decisionModes).toEqual({ "point-a": "shadow", ["__proto__"]: "auto" });
+  });
+
   it("clears a nested object wholesale on an explicit undefined, not just its known knobs", () => {
     const current: ProjectSettings = { budgetPolicy: { daytimeReservePct: 25 } };
     const next = mergeSettings(current, { budgetPolicy: undefined });

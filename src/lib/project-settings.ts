@@ -1505,7 +1505,10 @@ export function mergeSettings(
     // (see decisionModeOverridesSchema) — so a selection equal to the point's own default clears
     // the override instead of pinning it as an explicit value.
     else if (k === "decisionModes") {
-      const merged: Record<string, DecisionMode> = { ...current.decisionModes };
+      // Prototype-free: a registered point named "__proto__" must land as an own property —
+      // assigning it on an ordinary object invokes the inherited prototype setter instead,
+      // which silently drops the override (the setter ignores a non-object/non-null value).
+      const merged: Record<string, DecisionMode> = Object.assign(Object.create(null), current.decisionModes);
       for (const [id, mode] of Object.entries(v as Record<string, DecisionMode | null>)) {
         if (mode === null) delete merged[id];
         else merged[id] = mode;
