@@ -1034,15 +1034,22 @@ async function runFixSession(args: {
       );
     }
 
-    // premergeBase left any base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for
-    // this same session to resolve alongside the review feedback. Commit that resolution NOW, before
-    // the gates run: a red gate below still throws and parks the branch, but the merge itself is
-    // already landed rather than sitting as an uncommitted resolution the next re-run's fresh
-    // worktree would simply discard (anton-vtex7). Nothing is pushed here — publication stays behind
-    // the gates. No conflicts to resolve → nothing to commit yet → this run is unchanged.
-    if (conflicts.length > 0) {
-      await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal);
-    }
+    // Commit the main round's own work NOW, before gates (and the possible gate-fix follow-up)
+    // touch the tree. This used to be gated on `conflicts.length > 0` — premergeBase leaves any
+    // base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for this same session to
+    // resolve, and that resolution needed landing before a red gate below could throw and park the
+    // branch (anton-vtex7) — but `commitFix` stages everything and only actually commits when the
+    // tree is dirty, so calling it unconditionally still no-ops for a conflict-free, nothing-to-fix
+    // round while ALSO covering the conflict case. Doing it unconditionally is what makes
+    // `preGateHead` below a real boundary: without it, a conflict-free round's own edits would sit
+    // uncommitted straight through the gate run, and the follow-up's commit (if any) would be
+    // indistinguishable from this round's. Nothing is pushed here — publication stays behind the
+    // gates.
+    await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal);
+    // Snapshot the boundary BEFORE gates/the follow-up round can touch anything — see
+    // `mainRoundProducedChange` below for why this, not `postSessionHead`, is what `report`'s own
+    // claims get checked against.
+    const { head: preGateHead } = await readWorktreeState(worktree.path);
 
     await runGatesWithFollowUp({
       db,
@@ -1082,12 +1089,20 @@ async function runFixSession(args: {
     // `pushed` alone is not proof this round's claude/gate-follow-up work produced anything: a clean
     // base premerge (see `prepareFixWorktree`'s `preSessionHead` doc) can already have HEAD ahead of
     // origin before claude ever ran, so `commitAndPushFix` returns `pushed: true` for that merge
-    // alone even when claude changed nothing. `fabricatedFix` must be told THIS, not raw `pushed` —
-    // otherwise a claude report that (incorrectly) claims a thread "fixed" gets accepted as real
-    // just because the ambient base sync happened to go out on the same push (PR #338 review,
-    // chatgpt-codex-connector).
+    // alone even when claude changed nothing. `sessionProducedChange` names whether ANYTHING beyond
+    // that ambient base sync went out this round (claude's own edits OR the gate-fix follow-up's) —
+    // good enough for `notifyReReview` below (a follow-up-only push still deserves a re-review ping)
+    // but NOT for `report`'s own claims (next).
     const { head: postSessionHead } = await readWorktreeState(worktree.path);
     const sessionProducedChange = postSessionHead !== preSessionHead;
+    // `report` is parsed from `result.text` — the main round's OWN final message, produced before
+    // gates (and any gate-fix follow-up) ever ran. Whether a "fixed" claim in it is real must be
+    // checked against what THAT round committed, not what the whole session ended up pushing: the
+    // follow-up's prompt carries the gate's failure output and nothing about review feedback, so its
+    // edits are evidence the *gate* got fixed, never evidence for any claim in this report. Using
+    // `sessionProducedChange` here let a gate-only follow-up validate a fabricated "fixed" claim on
+    // an inline thread the follow-up never looked at (PR #338 review, chatgpt-codex-connector).
+    const mainRoundProducedChange = preGateHead !== preSessionHead;
 
     const report = parseThreadReport(result.text);
     const answeredIds = await applyThreadOutcomes({
@@ -1095,20 +1110,21 @@ async function runFixSession(args: {
       number,
       pr,
       report,
-      pushed: sessionProducedChange,
+      pushed: mainRoundProducedChange,
       signal: ctx.signal,
       logPath,
     });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
     // no thread report (CI-only/conflict-only/no-inline-threads trigger). Gated on
-    // `sessionProducedChange`, not raw `pushed`, for the same reason as `applyThreadOutcomes` above —
-    // the "Review-fix rounds" region must not credit a base-sync-only push with a fix nobody made.
+    // `mainRoundProducedChange`, not `sessionProducedChange` or raw `pushed` — same reason as
+    // `applyThreadOutcomes` above: this region renders straight from `report`'s own claims, so it
+    // needs the same narrow evidence, not credit for a gate-only follow-up's unrelated edit.
     await refreshFixRoundsBody({
       repo,
       number,
       report,
-      pushed: sessionProducedChange,
+      pushed: mainRoundProducedChange,
       now: new Date(clock.now()),
       logPath,
       reasons: verdict.reasons,
