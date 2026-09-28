@@ -9,7 +9,7 @@ import { ledgerPhase } from "../../feature-ledger";
 import { UNROUTED, type ClaudeResult, type RunClaudeOptions } from "../../claude/driver";
 import { makeProjectDb, type TestProjectDb } from "../../testing/project";
 import type { Clock } from "../../jobs/queue";
-import { decide } from "../index";
+import { decide, ModelCallError } from "../index";
 import { claudeLocalBackend } from "./claude-local";
 import type { DecisionPoint } from "../points";
 
@@ -317,6 +317,29 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow(/no parseable/);
   });
 
+  it("attributes backend/modelVersion on the thrown error when the reply has no parseable report", async () => {
+    // Otherwise decide()'s fallback would log this attempt with no attribution at all, and
+    // agreement() would keep reading a predecessor model as "current" for as long as the replacement
+    // kept answering with no parseable report (PR #332 review).
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () =>
+        ok("sorry, I cannot help with that", { answeringModel: "claude-5-2026-09" }),
+      ),
+    });
+
+    const error = await ask(choicePoint(), { nitText: "x" }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelCallError);
+    expect((error as ModelCallError).backend).toBe("claude-local");
+    expect((error as ModelCallError).modelVersion).toBe("claude-5-2026-09");
+  });
+
   it("rejects a malformed final block rather than falling back to an earlier, valid one", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({
@@ -373,6 +396,29 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow(/reported an error/);
   });
 
+  it("attributes backend/modelVersion on the thrown error when the session itself failed", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () => ({
+        ok: false,
+        modelUsage: [],
+        text: "boom",
+        answeringModel: "claude-5-2026-09",
+      })),
+    });
+
+    const error = await ask(choicePoint(), { nitText: "x" }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelCallError);
+    expect((error as ModelCallError).backend).toBe("claude-local");
+    expect((error as ModelCallError).modelVersion).toBe("claude-5-2026-09");
+  });
+
   it("aborts and rejects once the timeout elapses, never hanging on a stuck dispatcher", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({
@@ -391,6 +437,32 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     });
 
     await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow();
+  });
+
+  it("attributes the backend (but no modelVersion) on a timeout, since no result ever came back", async () => {
+    // A timeout never produces a ClaudeResult, so there's no answeringModel to report — but the
+    // backend alone still lets recordDecision() attribute the attempt instead of logging it null.
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      timeoutMs: 20,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(
+        (options) =>
+          new Promise((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      ),
+    });
+
+    const error = await ask(choicePoint(), { nitText: "x" }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelCallError);
+    expect((error as ModelCallError).backend).toBe("claude-local");
+    expect((error as ModelCallError).modelVersion).toBeUndefined();
   });
 });
 
@@ -491,6 +563,34 @@ describe("claudeLocalBackend — through decide()", () => {
 
     expect(result).toMatchObject({ decidedBy: "fallback", acted: false });
     expect(result.answer).toBeUndefined();
+    // Still attributed to claude-local even though no answer ever came back — otherwise
+    // agreement()'s cohort lookup would keep reading a predecessor model as "current" for as long as
+    // the replacement kept timing out (PR #332 review).
+    expect(result.backend).toBe("claude-local");
+  });
+
+  it("falls back to a human, still attributed, when the session itself failed", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () => ({
+        ok: false,
+        modelUsage: [],
+        text: "boom",
+        answeringModel: "claude-5-2026-09",
+      })),
+    });
+
+    const result = await decide({ point: choicePoint(), state: { nitText: "x" }, mode: "auto", ask });
+
+    expect(result).toMatchObject({ decidedBy: "fallback", acted: false, reason: "model call failed" });
+    expect(result.answer).toBeUndefined();
+    expect(result.backend).toBe("claude-local");
+    expect(result.modelVersion).toBe("claude-5-2026-09");
   });
 
   it("falls back to a human when the answer breaks the point's own shape", async () => {

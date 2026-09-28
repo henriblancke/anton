@@ -36,6 +36,25 @@ export interface ModelAnswer {
  */
 export type ModelCaller = (point: DecisionPoint, state: DecisionState) => Promise<ModelAnswer>;
 
+/**
+ * What a {@link ModelCaller} may throw instead of resolving, when it knows which backend/model it was
+ * even though it has no trustworthy {@link ModelAnswer} to return (a timeout, a session error, a reply
+ * with no parseable report). decide() reads `backend`/`modelVersion` off this if present so the
+ * fallback still attributes the attempt — a plain `Error` still falls back the same way, just without
+ * attribution, so throwing one remains a valid (if less informative) `ModelCaller` failure.
+ */
+export class ModelCallError extends Error {
+  readonly backend?: string;
+  readonly modelVersion?: string;
+
+  constructor(message: string, attribution?: { backend?: string; modelVersion?: string }) {
+    super(message);
+    this.name = "ModelCallError";
+    this.backend = attribution?.backend;
+    this.modelVersion = attribution?.modelVersion;
+  }
+}
+
 export interface DecideInput {
   readonly point: DecisionPoint;
   readonly state: DecisionState;
@@ -142,8 +161,14 @@ export async function decide(input: DecideInput): Promise<DecideResult> {
   let modelAnswer: ModelAnswer;
   try {
     modelAnswer = await ask(point, narrowState(point, state));
-  } catch {
-    return fallback(point, mode, "model call failed");
+  } catch (error) {
+    // Same reasoning as the invalid-answer fallback below: a thrown `ModelCallError` may still know
+    // which backend/model it was (a timeout, a session error, an unparseable reply) even though it
+    // has no answer to return, and dropping that here would erase the attempt from the log the same
+    // way an unattributed invalid answer would (PR #332 review).
+    const attribution =
+      error instanceof ModelCallError ? { backend: error.backend, modelVersion: error.modelVersion } : undefined;
+    return fallback(point, mode, "model call failed", attribution);
   }
 
   if (!isValidConfidence(modelAnswer.confidence) || !isValidAnswer(point.question, modelAnswer.value)) {

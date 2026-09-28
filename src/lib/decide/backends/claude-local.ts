@@ -27,7 +27,7 @@
 import { metered, type InvocationDimensions } from "../../claude-invocations";
 import { runClaude, type ClaudeRouting } from "../../claude/driver";
 import type { AntonDb, Clock } from "../../jobs/queue";
-import type { ModelAnswer, ModelCaller } from "../index";
+import { ModelCallError, type ModelAnswer, type ModelCaller } from "../index";
 import { narrowState, type AnswerValue, type DecisionPoint, type DecisionState, type Question } from "../points";
 
 const BACKEND = "claude-local";
@@ -300,21 +300,38 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
         signal: controller.signal,
         stallTimeoutMs: timeoutMs,
       });
+      // `answeringModel` names the model that actually authored `result.text`; `modelUsage`'s key
+      // order is unspecified and can put an ordinary Haiku sidecar first, which would tag the
+      // decision with the wrong model and let `agreement()` carry a predecessor version's record
+      // across a model switch (anton-528bw PR #332 review). Computed before either failure branch
+      // below so a session that ran but errored, or answered with no parseable report, still throws
+      // with the model attributed — dropping it here would erase the attempt from decide()'s log and
+      // let agreement() keep reading a predecessor model as "current" for as long as this one keeps
+      // failing (anton-528bw PR #332 review).
+      const modelVersion = result.answeringModel ?? config.model ?? result.modelUsage[0]?.model ?? "unknown";
       if (!result.ok) {
-        throw new Error(`decide/claude-local: session for "${point.id}" reported an error`);
+        throw new ModelCallError(`decide/claude-local: session for "${point.id}" reported an error`, {
+          backend: BACKEND,
+          modelVersion,
+        });
       }
       const report = lastParsedJsonBlock(result.text);
       if (report === undefined) {
-        throw new Error(
+        throw new ModelCallError(
           `decide/claude-local: no parseable structured-output block for "${point.id}"`,
+          { backend: BACKEND, modelVersion },
         );
       }
-      // `answeringModel` names the model that actually authored `result.text` (the report parsed
-      // above); `modelUsage`'s key order is unspecified and can put an ordinary Haiku sidecar
-      // first, which would tag the decision with the wrong model and let `agreement()` carry a
-      // predecessor version's record across a model switch (anton-528bw PR #332 review).
-      const modelVersion = result.answeringModel ?? config.model ?? result.modelUsage[0]?.model ?? "unknown";
       return toModelAnswer(point.question, report, modelVersion);
+    } catch (error) {
+      // A driver-level failure (timeout/abort, quota, stall, a non-zero exit before any result
+      // shaped) never reaches the branches above, so it carries no modelVersion — but the backend is
+      // always known, and that alone is enough for recordDecision() to attribute the attempt rather
+      // than log a null-backend row (see the module doc's "TIMEOUT AND INVALID OUTPUT" note).
+      if (error instanceof ModelCallError) throw error;
+      throw new ModelCallError(error instanceof Error ? error.message : String(error), {
+        backend: BACKEND,
+      });
     } finally {
       clearTimeout(timer);
     }

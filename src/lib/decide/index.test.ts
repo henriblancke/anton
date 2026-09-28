@@ -5,7 +5,7 @@
  * them is the input the pipeline is supposed to react to.
  */
 import { describe, expect, it, vi } from "vitest";
-import { decide, type ModelAnswer, type ModelCaller } from "./index";
+import { decide, ModelCallError, type ModelAnswer, type ModelCaller } from "./index";
 import type { DecisionPoint, HardRule } from "./points";
 
 function choicePoint(overrides: Partial<DecisionPoint> = {}): DecisionPoint {
@@ -225,6 +225,22 @@ describe("fallback on a bad backend", () => {
     expect(result.answer).toBeUndefined();
     expect(result.acted).toBe(false);
     expect(result.reason).toBe("model call failed");
+  });
+
+  it("preserves backend/modelVersion when ask throws a ModelCallError, so a failed attempt still attributes", async () => {
+    // A backend that knows which model it was mid-failure (a timeout, a session error) can throw
+    // ModelCallError instead of a plain Error to carry that through. Dropping it here would erase the
+    // attempt from recordDecision()'s log and let agreement()'s cohort lookup keep reading a
+    // predecessor model as "current" for as long as the replacement kept failing (PR #332 review).
+    const ask: ModelCaller = vi
+      .fn()
+      .mockRejectedValue(new ModelCallError("session timed out", { backend: "claude-local", modelVersion: "claude-6" }));
+    const result = await decide({ point, state: {}, mode: "auto", ask });
+
+    expect(result.decidedBy).toBe("fallback");
+    expect(result.answer).toBeUndefined();
+    expect(result.backend).toBe("claude-local");
+    expect(result.modelVersion).toBe("claude-6");
   });
 
   it("falls back when the answer isn't one of the choice's options", async () => {
