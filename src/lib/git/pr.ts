@@ -308,7 +308,19 @@ async function getReviewThreads(
         break;
       }
       allNodes.push(...page.nodes ?? []);
-      if (!page.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      if (!page.pageInfo) {
+        // No pageInfo at all is a malformed response, not "last page" — pagination could not
+        // even be checked, so the read is incomplete.
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        // hasNextPage is true but no cursor to continue with — pagination can't proceed, so the
+        // nodes already fetched aren't the full picture.
+        complete = false;
+        break;
+      }
       cursor = page.pageInfo.endCursor;
     }
   } catch {
