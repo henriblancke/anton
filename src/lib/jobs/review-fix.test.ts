@@ -65,12 +65,19 @@ vi.mock("../claude/driver", () => ({ runClaude: (...a: unknown[]) => runClaudeMo
 
 // prepareFixWorktree's own git steps (sync + premerge) — none of them under test here, so they're
 // no-ops rather than hitting a real repo the mocked `createWorktree` above never actually made.
+// `isAncestor` defaults to true (already caught up with the base) so premergeBase is a no-op by
+// default — the mocked `worktreePath` below is a plain temp dir, not a real git repo, so the REAL
+// `isAncestor` would otherwise reject and premergeBase's own `.catch(() => false)` would read that
+// as "behind" and merge on every test regardless of what's actually under test.
+const isAncestorMock = vi.fn();
+const mergeIntoCurrentMock = vi.fn();
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
     ...actual,
     fetchOrigin: vi.fn().mockResolvedValue(undefined),
-    mergeIntoCurrent: vi.fn().mockResolvedValue({ conflicts: [] }),
+    mergeIntoCurrent: (...a: unknown[]) => mergeIntoCurrentMock(...a),
+    isAncestor: (...a: unknown[]) => isAncestorMock(...a),
     branchAheadOfRemote: vi.fn().mockResolvedValue(false),
     needsHooksPathOverrideForMerge: vi.fn().mockResolvedValue(false),
     resolveHooksPathOverrideForMerge: vi.fn().mockResolvedValue(undefined),
@@ -298,6 +305,10 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       repoPath: "/repo",
     } satisfies Worktree);
     warmWorktreeBestEffortMock.mockResolvedValue(undefined);
+    // Already caught up with the base by default — see the mock's own doc comment. Individual tests
+    // that care about the premerge itself override this.
+    isAncestorMock.mockResolvedValue(true);
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] });
   });
 
   afterEach(() => {
@@ -343,6 +354,46 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
     const [, , warmConfig] = warmWorktreeBestEffortMock.mock.calls[0]!;
     expect(warmConfig).toEqual({ command: undefined, enabled: false });
+  });
+
+  // anton-091jr review round 2 (chatgpt-codex-connector): a MERGEABLE-but-behind base commit can
+  // change dependency metadata without `node_modules` reflecting it, because warming ran BEFORE the
+  // base premerge landed. Re-warming after a clean (conflict-free) premerge closes that gap.
+  it("re-warms after a clean base premerge lands, so the gates see the merged tree's dependencies", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] }); // clean auto-merge, no conflicts
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(2);
+    for (const call of warmWorktreeBestEffortMock.mock.calls) {
+      expect(call[0]).toMatchObject({ path: worktreePath });
+      expect(call[2]).toEqual({ command: "pnpm install --frozen-lockfile", enabled: true });
+    }
+  });
+
+  it("does NOT re-warm when the base premerge lands conflicts still needing resolution", async () => {
+    isAncestorMock.mockResolvedValue(false);
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: ["src/a.ts"] });
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    const result = await run(settings);
+
+    expect(result.conflicts).toEqual(["src/a.ts"]);
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT re-warm when the branch is already caught up with the base (no merge to do)", async () => {
+    isAncestorMock.mockResolvedValue(true);
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+    // The one `mergeIntoCurrent` call is the unconditional origin/<branch> sync; premergeBase's own
+    // merge is never attempted once `isAncestor` says the base is already caught up.
+    expect(mergeIntoCurrentMock).toHaveBeenCalledTimes(1);
   });
 });
 

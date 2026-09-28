@@ -809,7 +809,10 @@ process.exit(0);`,
 
       // The round answers the review feedback but pushes no commit — simulated directly (what
       // actually decides push-vs-answer, `runFixSession`, is exercised by the push-path e2e test
-      // above; only the dispatcher's read of the settled state is under test here).
+      // above; only the dispatcher's read of the settled state is under test here). The fingerprint
+      // is keyed on the requesting review's own identity, not the display reason text (anton-091jr
+      // review round 2) — this fixture's review carries neither `id` nor `submittedAt`, so
+      // `classifyReview` falls back to `review:?:<author>`.
       tdb.db
         .update(schema.jobs)
         .set({
@@ -818,7 +821,7 @@ process.exit(0);`,
             projectId,
             epicBeadId: answerEpic,
             headSha: "sha-answer",
-            answeredFingerprint: ["changes requested by a reviewer (1 review(s))"],
+            answeredFingerprint: ["review:?:alice"],
           }),
         })
         .where(eq(schema.jobs.id, answeredId))

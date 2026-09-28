@@ -25,6 +25,16 @@ export interface ThreadOutcome {
 }
 
 /**
+ * Sentinel `ThreadOutcome.id` for a round with NO inline threads but still actionable (a failing
+ * check, a merge conflict, or a reviewer summary with no inline comments) — reuses the same
+ * `{"threads":[...]}` report shape so `parseThreadReport` needs no new parsing path. Its presence in
+ * the parsed report is the positive evidence review-fix.ts requires before treating such a round as
+ * "answered": a successful claude run that never mentions it must NOT be mistaken for one that
+ * actually handled the reason (anton-091jr review round 2, chatgpt-codex-connector).
+ */
+export const NON_THREAD_REPORT_ID = "non-thread-reasons";
+
+/**
  * A "fixed" claim with nothing pushed behind it — a fabrication whether it's about to answer a
  * thread reply (review-fix.ts's `applyThreadOutcomes`) or a PR-body round summary
  * (review-fix-body.ts, anton-te6nr). Shared here so both readers exclude it the same way.
@@ -120,7 +130,7 @@ export function reviewFixContext(
     ...failingChecksSection(pr),
     ...conflictsSection(conflicts),
     ...gateFailureSection(gateFailure),
-    ...reportingFormatSection(threads),
+    ...reportingFormatSection(threads, reasons),
   ]
     .join("\n")
     .trimEnd();
@@ -227,20 +237,38 @@ function gateFailureSection(gateFailure: GateFailure | undefined): string[] {
   ];
 }
 
-function reportingFormatSection(threads: ReviewThread[]): string[] {
-  if (threads.length === 0) return [];
+function reportingFormatSection(threads: ReviewThread[], reasons: string[]): string[] {
+  if (threads.length > 0) {
+    return [
+      `## Reporting format (required)`,
+      ``,
+      `End your final message with a fenced json block reporting each thread listed above:`,
+      ``,
+      "```json",
+      `{"threads":[{"id":"<thread id>","outcome":"fixed" | "left" | "needs-human","reply":"one-line note for the reviewer"}]}`,
+      "```",
+      ``,
+      `Use "fixed" only for threads you actually changed code for, "left" for findings you`,
+      `deliberately did not act on, "needs-human" when a decision is required. The reply is posted`,
+      `on the thread verbatim.`,
+    ];
+  }
+  // No inline threads, but the round is still actionable (a failing check, a merge conflict, or a
+  // reviewer summary with no inline comments — see "Why this needs action" above). Without an
+  // explicit report, a claude run that touches nothing looks identical to one that genuinely
+  // resolved the reason — and would get recorded as "answered" on nothing but that resemblance
+  // (anton-091jr review round 2, chatgpt-codex-connector). Reuses the thread-report shape (one entry
+  // keyed on the sentinel id) so parseThreadReport needs no separate parsing path.
+  if (reasons.length === 0) return [];
   return [
     `## Reporting format (required)`,
     ``,
-    `End your final message with a fenced json block reporting each thread listed above:`,
+    `There are no inline review threads here, but this round is still actionable. End your final`,
+    `message with a fenced json block naming what you did about it:`,
     ``,
     "```json",
-    `{"threads":[{"id":"<thread id>","outcome":"fixed" | "left" | "needs-human","reply":"one-line note for the reviewer"}]}`,
+    `{"threads":[{"id":"${NON_THREAD_REPORT_ID}","outcome":"fixed" | "left","reply":"one-line summary of what you changed, or why nothing needed to change"}]}`,
     "```",
-    ``,
-    `Use "fixed" only for threads you actually changed code for, "left" for findings you`,
-    `deliberately did not act on, "needs-human" when a decision is required. The reply is posted`,
-    `on the thread verbatim.`,
   ];
 }
 

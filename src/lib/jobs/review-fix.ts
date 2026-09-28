@@ -111,6 +111,7 @@ import type { ClaudeEvent } from "../claude/driver";
 import {
   buildReviewFixPrompt,
   fabricatedFix,
+  NON_THREAD_REPORT_ID,
   parseThreadReport,
   type ThreadOutcome,
 } from "./review-fix-context";
@@ -667,8 +668,17 @@ export async function prepareFixWorktree(args: {
   // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
   // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
   // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
-  const conflicts = await premergeBase(repo, worktree.path, baseBranch, number);
+  const { conflicts, merged } = await premergeBase(repo, worktree.path, baseBranch, number);
   await ctx.heartbeat();
+  // A clean (conflict-free) base merge can change dependency metadata (lockfile, package.json)
+  // without updating `node_modules`, which was warmed above BEFORE this merge landed — the verify
+  // gates below would then fail solely because the install reflects the pre-merge tree (anton-091jr
+  // review round 2, chatgpt-codex-connector). Skipped when conflicts remain: claude resolves those
+  // first, and warming against unresolved conflict markers would install nonsense.
+  if (merged && conflicts.length === 0) {
+    await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
+    await ctx.heartbeat();
+  }
   return { worktree, conflicts, alreadyAhead };
 }
 
@@ -685,24 +695,24 @@ async function premergeBase(
   worktreePath: string,
   baseBranch: string | undefined,
   number: number,
-): Promise<string[]> {
-  if (!baseBranch) return [];
+): Promise<{ conflicts: string[]; merged: boolean }> {
+  if (!baseBranch) return { conflicts: [], merged: false };
   const baseRef = `origin/${baseBranch}`;
   // Already caught up → no merge to do. Best-effort like every other git read on this path (see
   // prepareFixWorktree's doc): a failed read (origin/<base> didn't resolve, a transient git error)
   // reads as "can't confirm we're caught up" rather than aborting the premerge — the merge attempt
   // below tolerates a no-op fine on its own.
   const upToDate = await isAncestor(worktreePath, baseRef, "HEAD").catch(() => false);
-  if (upToDate) return [];
+  if (upToDate) return { conflicts: [], merged: false };
   const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
     ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
     : undefined;
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
-    return merge.conflicts; // clean auto-merge → a merge commit is pushed below
+    return { conflicts: merge.conflicts, merged: true }; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
     consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
-    return [];
+    return { conflicts: [], merged: false };
   }
 }
 
@@ -728,13 +738,23 @@ interface RunFixSessionResult {
  * `fabricatedFix` "fixed" claim never reaches that set (same rule `applyThreadOutcomes` uses to
  * skip replying to it), and neither does a thread whose reply call failed — a report entry alone
  * isn't enough, since `replyToReviewComment` failing is swallowed by `safe()` and must not read as
- * "answered" (anton-091jr review, chatgpt-codex-connector). Vacuously true when nothing was waiting.
+ * "answered" (anton-091jr review, chatgpt-codex-connector).
+ *
+ * When nothing was waiting (no inline threads — the round was actionable only via a failing check,
+ * a merge conflict, or a reviewer summary), this is NOT vacuously true: a claude run that finished
+ * without error is not evidence it actually handled that reason, and treating it as such would let
+ * `recordReviewFixAnswered` suppress a genuinely still-broken PR at this head+fingerprint forever
+ * (anton-091jr review round 2, chatgpt-codex-connector). Positive evidence is `report` naming the
+ * {@link NON_THREAD_REPORT_ID} sentinel — `reportingFormatSection` asks for it specifically in that
+ * situation, so its presence means claude actually addressed the reporting contract for this round
+ * rather than the report simply being empty (no threads → nothing to report by default).
  */
 function allWaitingThreadsAnswered(
   waitingIds: ReadonlySet<string>,
   answeredIds: ReadonlySet<string>,
+  report: ThreadOutcome[],
 ): boolean {
-  if (waitingIds.size === 0) return true;
+  if (waitingIds.size === 0) return report.some((r) => r.id === NON_THREAD_REPORT_ID);
   for (const id of waitingIds) {
     if (!answeredIds.has(id)) return false;
   }
@@ -1001,7 +1021,10 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      return { pushed: false, answeredAllThreads: allWaitingThreadsAnswered(waitingIds, answeredIds) };
+      return {
+        pushed: false,
+        answeredAllThreads: allWaitingThreadsAnswered(waitingIds, answeredIds, report),
+      };
     }
 
     await notifyReReview({

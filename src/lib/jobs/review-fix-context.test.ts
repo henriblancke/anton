@@ -8,6 +8,7 @@ import {
   buildReviewFixPrompt,
   CLUSTERED_FINDINGS_THRESHOLD,
   labelValue,
+  NON_THREAD_REPORT_ID,
   parseThreadReport,
   reviewFixContext,
 } from "./review-fix-context";
@@ -156,9 +157,19 @@ describe("reviewFixContext", () => {
     expect(out).toContain('{"threads":[{"id":"<thread id>"');
   });
 
-  it("omits the reporting format when there are no threads", () => {
+  // anton-091jr review round 2 (chatgpt-codex-connector): a round with no inline threads is still
+  // actionable (CI-only, conflict-only, or a reviewer summary with no inline comments) and must
+  // still ask for a report — the sentinel entry is what proves claude actually addressed the
+  // reason, rather than a successful-but-silent run being mistaken for one that did.
+  it("asks for a sentinel-keyed report when there are no threads but the round is still actionable", () => {
     const out = reviewFixContext(epic, makePr({ failingChecks: ["build"] }), ["failing checks: build"]);
     expect(out).toContain("Failing CI checks: build.");
+    expect(out).toContain("## Reporting format (required)");
+    expect(out).toContain(NON_THREAD_REPORT_ID);
+  });
+
+  it("omits the reporting format entirely when there are no threads and no reasons", () => {
+    const out = reviewFixContext(epic, makePr({ failingChecks: [] }), []);
     expect(out).not.toContain("## Reporting format (required)");
   });
 

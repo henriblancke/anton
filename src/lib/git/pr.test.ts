@@ -169,9 +169,52 @@ describe("classifyReview", () => {
     expect(after.fingerprint).toContain("check:build@https://ci/run/2");
   });
 
+  // anton-091jr review round 2 (chatgpt-codex-connector): a CI provider can reuse the same
+  // detailsUrl/targetUrl across reruns — the fingerprint must still change on the timestamp so a
+  // check that goes green and fails again at the same head isn't matched against a stale row.
+  it("changes fingerprint when only the timestamp differs and the check URL is reused", () => {
+    const before = classifyReview(
+      pr({
+        failingChecks: ["build"],
+        failingCheckAttempts: ["build@https://ci/run/1|2026-01-01T00:00:00Z"],
+      }),
+    );
+    const after = classifyReview(
+      pr({
+        failingChecks: ["build"],
+        failingCheckAttempts: ["build@https://ci/run/1|2026-01-02T00:00:00Z"],
+      }),
+    );
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+  });
+
   it("check fingerprint falls back to the plain name when no attempt identity is available", () => {
     const v = classifyReview(pr({ failingChecks: ["build", "lint"] }));
     expect(v.fingerprint).toEqual(["check:build", "check:lint"]);
+  });
+
+  // anton-091jr review round 2 (chatgpt-codex-connector): a dismissed review followed by a
+  // DIFFERENT reviewer requesting changes at the same head can return the same count — the
+  // fingerprint must key on the requesting review's own identity, not just how many there are.
+  it("changes fingerprint (but not the count in reasons) when a different reviewer requests changes", () => {
+    const first = classifyReview(
+      pr({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [
+          { author: "alice", state: "CHANGES_REQUESTED", body: "fix", id: "PRR_1", submittedAt: "2026-01-01T00:00:00Z" },
+        ],
+      }),
+    );
+    const second = classifyReview(
+      pr({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [
+          { author: "bob", state: "CHANGES_REQUESTED", body: "also fix", id: "PRR_2", submittedAt: "2026-01-02T00:00:00Z" },
+        ],
+      }),
+    );
+    expect(first.reasons).toEqual(second.reasons);
+    expect(first.fingerprint).not.toEqual(second.fingerprint);
   });
 });
 
@@ -353,5 +396,43 @@ process.exit(0);
     const review = await getPrReview(sandbox, 7);
     expect(review.failingChecks).toEqual(["build"]);
     expect(review.failingCheckAttempts).toEqual(["build@https://ci/run/42"]);
+  });
+
+  // anton-091jr review round 2 (chatgpt-codex-connector): a provider that reuses the same
+  // detailsUrl across reruns still changes completedAt — both must ride in the attempt id, not
+  // just whichever of the two happens to come first in the `||` chain.
+  it("composes detailsUrl and completedAt in failingCheckAttempts rather than picking one", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [],
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://ci/run/42', completedAt: '2026-01-01T00:00:00Z' },
+    ],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.failingCheckAttempts).toEqual([
+      "build@https://ci/run/42|2026-01-01T00:00:00Z",
+    ]);
   });
 });

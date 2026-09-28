@@ -69,7 +69,7 @@ export interface PrReview {
   headSha: string;
   url: string;
   /** Submitted reviews (latest state per reviewer as gh reports them). */
-  reviews: Array<{ author: string; state: string; body: string }>;
+  reviews: Array<{ author: string; state: string; body: string; id?: string; submittedAt?: string }>;
   /** Failing checks, by name (display text — a name alone repeats across reruns, see `failingCheckAttempts`). */
   failingChecks: string[];
   /**
@@ -94,7 +94,13 @@ interface GhPrView {
   baseRefName?: string;
   headRefOid?: string;
   url: string;
-  reviews?: Array<{ author?: { login?: string }; state?: string; body?: string }>;
+  reviews?: Array<{
+    author?: { login?: string };
+    state?: string;
+    body?: string;
+    id?: string;
+    submittedAt?: string;
+  }>;
   statusCheckRollup?: Array<{
     __typename?: string;
     name?: string;
@@ -128,11 +134,17 @@ function isPending(c: NonNullable<GhPrView["statusCheckRollup"]>[number]): boole
  * Stable identity of THIS check's attempt, not just its name — a rerun of the same check keeps the
  * same name but gets a fresh `detailsUrl`/`completedAt`, which is exactly what distinguishes "the
  * failure a prior round already answered" from "a fresh failure at the same head" (anton-091jr
- * review, chatgpt-codex-connector). Falls back to "unknown" only when `gh` reports neither — at
- * that point the name is genuinely all there is.
+ * review, chatgpt-codex-connector). Composes every available signal rather than picking the first
+ * truthy one (anton-091jr review round 2, chatgpt-codex-connector): a provider that reuses the same
+ * `targetUrl`/`detailsUrl` across reruns still changes `completedAt`/`createdAt`, and selecting only
+ * the URL would discard that and let a check that goes green then fails again at the same head match
+ * a stale answered row. Falls back to "unknown" only when `gh` reports none of the four.
  */
 function checkAttemptId(c: NonNullable<GhPrView["statusCheckRollup"]>[number]): string {
-  return c.detailsUrl || c.targetUrl || c.completedAt || c.createdAt || "unknown";
+  const parts = [c.detailsUrl, c.targetUrl, c.completedAt, c.createdAt].filter(
+    (p): p is string => Boolean(p),
+  );
+  return parts.length > 0 ? parts.join("|") : "unknown";
 }
 
 /**
@@ -169,6 +181,8 @@ export async function getPrReview(
     author: r.author?.login ?? "unknown",
     state: r.state ?? "",
     body: r.body ?? "",
+    id: r.id,
+    submittedAt: r.submittedAt,
   }));
 
   return {
@@ -396,13 +410,25 @@ export function classifyReview(pr: PrReview): Actionable {
     // enqueueReviewFixPrIfAbsent's answered-unchanged suppression (anton-dfuvz) would keep treating
     // a repeat review as already-answered. Omitted when zero (fixtures that set reviewDecision
     // without a matching reviews entry) to keep the plain form for those.
-    const changesRequestedCount = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED").length;
+    const changesRequested = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED");
     const reason =
-      changesRequestedCount > 0
-        ? `changes requested by a reviewer (${changesRequestedCount} review(s))`
+      changesRequested.length > 0
+        ? `changes requested by a reviewer (${changesRequested.length} review(s))`
         : "changes requested by a reviewer";
     reasons.push(reason);
-    fingerprint.push(reason);
+    // Keyed on each requesting review's own identity, not the count (anton-091jr review round 2,
+    // chatgpt-codex-connector): if an answered review is dismissed and a DIFFERENT reviewer then
+    // requests changes at the same head, the count alone can return to the same value and match a
+    // stale answered row even though the actual requester changed. `id` is gh's stable review node
+    // id; `submittedAt` is the fallback for a caller-built fixture that omits it.
+    if (changesRequested.length > 0) {
+      const ids = changesRequested
+        .map((r) => `${r.id ?? r.submittedAt ?? "?"}:${r.author}`)
+        .sort();
+      for (const id of ids) fingerprint.push(`review:${id}`);
+    } else {
+      fingerprint.push(reason);
+    }
   }
   if (pr.failingChecks.length > 0) {
     reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
