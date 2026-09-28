@@ -176,15 +176,25 @@ export async function applyFollowUp(
   const match = await existingFollowUp(repo, all, ticket.id, request.summary, context.body);
   if (!match) return createFollowUp(context, all);
   const detachment = owedDetachment(context, match.bead);
+  // A parentless-from-the-outset match that owes no detachment still writes when it is missing its
+  // `## Why` (resumeFollowUp's legacy-repair branch) — a write the guard below must cover exactly
+  // like the detachment and half-created cases, or it lands unserialized past a caller that never
+  // held this bead's lock.
+  const missingWhy =
+    !detachment &&
+    !match.partial &&
+    beads.parentOf(match.bead) === undefined &&
+    missingWhyOwed(context, match.bead);
   // A match the caller did not lock became a candidate between its snapshot and its locks. The lock
-  // guards WRITES to that bead — finishing a half-made one, or detaching a stranded one — so only a
-  // resume that owes one is refused: writing unserialized is the lost update the lock exists to
-  // prevent, and the answer is the one every other moved-board race gets (409): look again, and the
-  // retry snapshots — and locks — the bead it will resume. A match that is DONE, and owes nothing, is
-  // read and reported without a write, so it needs no lock. That is exactly what the loser of two
-  // identical requests sees: both snapshot an empty candidate set, the winner creates the follow-up
-  // under the ticket lock, and the loser's re-read finds it — the documented no-op, not a conflict.
-  if ((match.partial || detachment) && !lockedFollowUps.has(match.bead.id)) {
+  // guards WRITES to that bead — finishing a half-made one, detaching a stranded one, or repairing a
+  // legacy parentless one's `## Why` — so only a resume that owes one is refused: writing
+  // unserialized is the lost update the lock exists to prevent, and the answer is the one every
+  // other moved-board race gets (409): look again, and the retry snapshots — and locks — the bead it
+  // will resume. A match that is DONE and owes nothing is read and reported without a write, so it
+  // needs no lock. That is exactly what the loser of two identical requests sees: both snapshot an
+  // empty candidate set, the winner creates the follow-up under the ticket lock, and the loser's
+  // re-read finds it — the documented no-op, not a conflict.
+  if ((match.partial || detachment || missingWhy) && !lockedFollowUps.has(match.bead.id)) {
     throw new ReworkConflictError(
       `${match.bead.id} became ${ticket.id}'s follow-up while this send-back was being decided — ` +
         `look again and send it back`,
@@ -232,6 +242,7 @@ async function resumeFollowUp(
 ): Promise<AppliedRework> {
   const { target, ticket, body } = context;
   const existing = match.bead;
+  let wroteMissingWhy = false;
   if (detachment) {
     if (!detachment.recorded) {
       await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
@@ -254,8 +265,10 @@ async function resumeFollowUp(
     // doc comment). But a match that was created parentless to begin with — its target had already
     // shipped, or it stood alone from the start — is a run target the contract gate checks same as
     // any other, and a legacy one predating the Why requirement never passes through the branch
-    // above to pick it up. This is the only other pass that ever will.
-    await reconcileMissingWhy(context, existing);
+    // above to pick it up. This is the only other pass that ever will — and the guard in
+    // applyFollowUp already required this bead's lock before letting this write happen, so
+    // `reconciled` below must report it the same as the detachment branch's writes.
+    wroteMissingWhy = await reconcileMissingWhy(context, existing);
   }
   if (match.partial) {
     const parentId = detachment ? undefined : beads.parentOf(existing);
@@ -283,7 +296,7 @@ async function resumeFollowUp(
     // Read off the bead the winner actually created — as reconciled above — so the repeat that
     // finishes a half-applied send-back retires on exactly the condition that holds now.
     runsUnderTarget: context.shippedPr === undefined && beads.parentOf(existing) === target.id,
-    reconciled: detachment !== undefined,
+    reconciled: detachment !== undefined || wroteMissingWhy,
   };
 }
 
@@ -353,15 +366,29 @@ async function tagDetachedOutcome(context: FollowUpContext, existing: Bead): Pro
 }
 
 /**
- * Add a missing `## Why` to a completed follow-up being detached ({@link resumeFollowUp}). Never
- * touches Acceptance or the run-location line — only {@link reconcileHalfCreatedContract} owns
- * rewriting those, and only for a still-partial bead.
+ * Add a missing `## Why` to a completed follow-up being detached, or to one that was already
+ * parentless ({@link resumeFollowUp}). Never touches Acceptance or the run-location line — only
+ * {@link reconcileHalfCreatedContract} owns rewriting those, and only for a still-partial bead.
+ * Returns whether it wrote, so the caller can report the write ({@link AppliedRework.reconciled}).
  */
-async function reconcileMissingWhy(context: FollowUpContext, existing: Bead): Promise<void> {
+async function reconcileMissingWhy(context: FollowUpContext, existing: Bead): Promise<boolean> {
   const { repo, ticket, target } = context;
   const current = existing.description ?? "";
   const description = reconcileFollowUpWhy(current, ticket, outcomeIdsOf(target));
-  if (description !== current) await beads.update(repo, existing.id, { description });
+  if (description === current) return false;
+  await beads.update(repo, existing.id, { description });
+  return true;
+}
+
+/**
+ * Whether {@link reconcileMissingWhy} would write if run against `existing` right now — the same
+ * pure check, read-only, so {@link applyFollowUp} can require this bead's lock ({@link
+ * lockedFollowUps}) before the parentless-legacy-repair branch of {@link resumeFollowUp} is allowed
+ * to write it, instead of discovering after the fact that an unlocked write happened.
+ */
+function missingWhyOwed(context: FollowUpContext, existing: Bead): boolean {
+  const current = existing.description ?? "";
+  return reconcileFollowUpWhy(current, context.ticket, outcomeIdsOf(context.target)) !== current;
 }
 
 /**

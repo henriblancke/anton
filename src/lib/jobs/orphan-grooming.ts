@@ -10,6 +10,7 @@
  */
 import { extractOutcomeIdsSection } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { isTicketTier } from "../beads/contract";
 import { beadSkeleton } from "../beads/formula";
 import { unterminatedCloser } from "../beads/markdown";
@@ -126,12 +127,17 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
     let createdEpic = false;
     if (existing) {
       epicId = existing.id;
-      if (!extractOutcomeIdsSection(existing.description ?? "").present) {
+      // Locked, and re-read inside the lock: `existing` is a snapshot from the `all` read above, and
+      // a founder editing this epic's description between that read and this patch must not have
+      // their edit silently discarded by `beads.update` replacing the whole field with the stale one.
+      await withBeadWriteLock(repo, epicId, async () => {
+        const fresh = await beads.show(repo, epicId);
+        if (extractOutcomeIdsSection(fresh.description ?? "").present) return;
         // An epic from before outcome ids landed (anton-cdeki) is reused as-is on every subsequent
         // sweep — it's found by its `source:orphan-grooming` label, never by contract shape, so its
         // description would otherwise stay stuck missing `## Outcome IDs` forever. Patch it in
         // place rather than leaving the gap for the next contract-gap sweep to flag.
-        const kept = (existing.description ?? "").trimEnd();
+        const kept = (fresh.description ?? "").trimEnd();
         const closer = unterminatedCloser(kept);
         const description = [
           kept,
@@ -141,7 +147,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
           ``,
           ORPHAN_EPIC_VARS.outcome_ids,
         ].join("\n");
-        const patched = await safe(() => beads.update(repo, epicId, { description }, existing.labels ?? []));
+        const patched = await safe(() => beads.update(repo, epicId, { description }, fresh.labels ?? []));
         // Thrown BEFORE any linking below: once an orphan is parented here it stops being an orphan,
         // so a sweep with nothing left to bucket returns early (`orphans.length === 0`) and never
         // revisits this epic — a swallowed failure here would leave it missing `## Outcome IDs`
@@ -149,7 +155,7 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
         if (!patched) {
           throw new Error(`orphan-grooming: failed to add Outcome IDs to reused epic ${epicId}`);
         }
-      }
+      });
     } else {
       const skeleton = await orphanEpicSkeleton(repo);
       epicId = await beads.create(repo, {
