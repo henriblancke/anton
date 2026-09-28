@@ -492,6 +492,14 @@ async function handleEpic(args: {
     await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "closed" });
   }
 
+  // The counterpart observation (PR #335 review), mirrored from the dispatcher's own OPEN branch: a
+  // job queued while the PR was open can run after a later dispatcher pass already stamped a close
+  // and the PR has since reopened. Without this, `recordPrTerminalState`'s null-row heuristic sees no
+  // evidence of that reopen and a subsequent close silently preserves the stale first-close timestamp.
+  if (pr.state === "OPEN") {
+    await recordPrReopened(db, { projectId, prNumber: number });
+  }
+
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return "clean"; // nothing to fix on this PR yet.
 
@@ -868,6 +876,18 @@ async function runFixSession(args: {
       report: delivered,
       pushed,
     });
+    // Recheck the terminal state right after the insert above, against a FRESH read rather than the
+    // `pr` snapshot fetched before this session's claude dispatch (PR #335 review). On a shared board,
+    // a second anton instance (its own local review_rounds db) can observe MERGED/CLOSED and move the
+    // target out of in-review while this session was still running — this instance then never revisits
+    // the PR (it has left in-review), so the row just inserted would otherwise be the last one this
+    // instance ever writes for it and would permanently miss the terminal stamp.
+    const latest = await getPrReview(repo, number, ctx.signal).catch((): undefined => undefined);
+    if (latest?.state === "MERGED") {
+      await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "merged" });
+    } else if (latest?.state === "CLOSED") {
+      await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "closed" });
+    }
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
     // no thread report (CI-only/conflict-only/no-inline-threads trigger).
