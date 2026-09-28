@@ -57,13 +57,21 @@ function parseBullet(line: string): ProjectOutcome | undefined {
  * Reads `## Outcomes` bullets of the form `` - `id` — summary``, an optional trailing `(retired)`
  * marking one no longer offered for new work. Never throws: a missing section or a malformed bullet
  * just falls back to (or skips past) the built-in {@link BUILT_IN_OUTCOME}.
+ *
+ * A `codebase-health` bullet may only override the built-in's summary — scan triage always files
+ * new scan-produced work against it, so it can never be retired even via a `(retired)` override.
  */
 export function parseOutcomes(markdown: string): ProjectOutcome[] {
   const outcomes = new Map<string, ProjectOutcome>([[BUILT_IN_OUTCOME.id, BUILT_IN_OUTCOME]]);
   const section = outcomesSection(markdown);
   for (const line of section ?? []) {
     const outcome = parseBullet(line);
-    if (outcome) outcomes.set(outcome.id, outcome);
+    if (!outcome) continue;
+    if (outcome.id === BUILT_IN_OUTCOME.id) {
+      outcomes.set(outcome.id, { ...outcome, retired: false });
+    } else {
+      outcomes.set(outcome.id, outcome);
+    }
   }
   return [...outcomes.values()];
 }

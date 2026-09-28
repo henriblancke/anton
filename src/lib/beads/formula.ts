@@ -286,6 +286,13 @@ function descriptionShadowsAcceptance(skeleton: BeadSkeleton): boolean {
  * `ensureBeadFormula` already performs for `anton init` — and retry once before giving up. A
  * formula that still discards the var after resyncing (the bundled asset itself is missing the
  * placeholder) is a real bug, not staleness, so that error is left to propagate.
+ *
+ * Two concurrent submissions can both read the stale copy before either syncs it: the first sees
+ * `"replaced"`, but the second's sync then finds the copy already matches the bundled asset and
+ * reports `"already"` (or, if the file vanished between the read and the sync, `"installed"`) —
+ * not a failure to resync, just a resync someone else already did. Retry on all three statuses;
+ * only `"unsafe-dest"`/`"missing-asset"`/`"no-workspace"`/`"failed"` mean the resync itself didn't
+ * happen and the original error should propagate.
  */
 export async function beadSkeleton(
   repoPath: string,
@@ -301,7 +308,9 @@ export async function beadSkeleton(
       throw err;
     }
     const synced = ensureBeadFormula(join(repoPath, ".beads"), bundledBeadFormulaPath());
-    if (synced.status !== "replaced") throw err;
+    if (synced.status !== "replaced" && synced.status !== "already" && synced.status !== "installed") {
+      throw err;
+    }
     const refreshed = parseBeadFormula(await readFile(path, "utf8"), path);
     return renderBeadSkeleton(refreshed, tier, vars);
   }
