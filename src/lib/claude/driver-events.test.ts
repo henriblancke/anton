@@ -118,6 +118,22 @@ describe("consumeLine", () => {
     expect(state.lastAssistantModel).toBe("claude-5-2026-09");
   });
 
+  it("clears the last assistant model when a later text-bearing message omits it", () => {
+    const state = createStreamState();
+    const feed = (raw: unknown) => consumeLine(state, JSON.stringify(raw));
+
+    feed({
+      type: "assistant",
+      message: { model: "claude-haiku-4-5", content: [{ type: "text", text: "first" }] },
+    });
+    // Same message replaces the text but reports no model — must not keep attributing the new
+    // text to the earlier message's model.
+    feed({ type: "assistant", message: { content: [{ type: "text", text: "second" }] } });
+
+    expect(state.lastAssistantText).toBe("second");
+    expect(state.lastAssistantModel).toBeUndefined();
+  });
+
   it("ignores blank lines and non-JSON noise rather than failing the run", () => {
     const state = createStreamState();
     const events: ClaudeEvent[] = [];

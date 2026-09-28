@@ -152,7 +152,10 @@ function captureEvents(
     if (event.type === "assistant" && event.text) {
       state.lastAssistantText = event.text;
       const message = (parsed.message ?? undefined) as Record<string, unknown> | undefined;
-      if (typeof message?.model === "string") state.lastAssistantModel = message.model;
+      // Set from THIS message, never left over from an earlier one: a model-less text-bearing
+      // message must not inherit a stale model an earlier message reported, or a caller (e.g.
+      // claudeLocalBackend's answeringModel) attributes the final text to the wrong model.
+      state.lastAssistantModel = typeof message?.model === "string" ? message.model : undefined;
     }
     onEvent?.(event);
   }
