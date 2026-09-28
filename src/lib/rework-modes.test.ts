@@ -621,8 +621,10 @@ describe("applyFollowUp", () => {
     await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
 
     expect(tagMock).toHaveBeenCalledWith("/repo", "half", labels);
-    // After the reparent — the label describes the bead's parentless shape, which the reparent creates.
-    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(tagMock.mock.invocationCallOrder[0]!);
+    // Before the reparent — the irreversible write `owedDetachment` reads to decide whether anything
+    // is still owed. Tagging first means a retry that only loses the reparent still finds the label
+    // applied; the other way round, a tag that failed after a landed reparent could never be retried.
+    expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
   });
 
   it("keeps the detachment recorded when the half-created Context rewrite fails after it", async () => {
@@ -784,7 +786,9 @@ describe("applyFollowUp", () => {
     await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
 
     expect(tagMock).toHaveBeenCalledWith("/repo", "dup", labels);
-    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(tagMock.mock.invocationCallOrder[0]!);
+    // Before the reparent, same reason as the half-created case above: retryable if only the
+    // reparent fails, never stranded if the tag itself does.
+    expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
   });
 
   // A bead already carrying one of the outcome labels (a retried resume) must not get it re-added.

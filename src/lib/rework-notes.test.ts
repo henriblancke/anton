@@ -620,8 +620,13 @@ describe("reconcileFollowUpDescription", () => {
     ]) {
       expect(reconciled).toContain(kept);
     }
-    // The section boundary is the contract judge's: the rest of the description is byte-for-byte.
-    expect(reconciled.split("\n\n## Context")[1]).toBe(authored.split("\n\n## Context")[1]);
+    // The section boundary is the contract judge's: the rest of the description is byte-for-byte,
+    // up to the `## Why` this reconcile appends since `authored` carries none of its own.
+    const contextRest = authored.split("\n\n## Context")[1]!;
+    expect(reconciled.split("\n\n## Context")[1]!.startsWith(contextRest)).toBe(true);
+    expect(reconciled.trimEnd().endsWith(
+      "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.",
+    )).toBe(true);
   });
 
   it("keeps a Setext-underlined Acceptance heading whole — the underline is the heading, not its body", () => {
@@ -840,7 +845,11 @@ describe("reconcileFollowUpDescription", () => {
     const reconciled = reconcileFollowUpDescription(handMade, edited);
     expect(reconciled.startsWith("## Goal\nharden the retry\n\n## Context\nMade by hand.")).toBe(true);
     expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
-    expect(reconciled.trimEnd().endsWith("or answered with why they don't apply")).toBe(true);
+    expect(reconciled).toContain("or answered with why they don't apply");
+    // The hand-made bead also carries no `## Why` — reconciled onto the end.
+    expect(reconciled.trimEnd().endsWith(
+      "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.",
+    )).toBe(true);
   });
 
   it("closes a fence the hand-made description ends inside before appending — a heading in a fence is literal code to the judge", () => {
@@ -1187,7 +1196,10 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toContain("### Grouped");
     expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
     expect(reconciled).toContain("\n\n## Context\nKept.\n\n## Verify\nKept too.");
-    expect(reconciled.endsWith("Kept too.")).toBe(true);
+    // `repeated` carries no `## Why` of its own, so this reconcile appends one after Verify.
+    expect(reconciled.trimEnd().endsWith(
+      "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.",
+    )).toBe(true);
     // What the contract judge reads as this bead's acceptance is exactly the request's boxes.
     expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
       [

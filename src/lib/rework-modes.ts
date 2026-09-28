@@ -234,8 +234,13 @@ async function resumeFollowUp(
     if (!detachment.recorded) {
       await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
     }
-    await beads.reparent(context.repo, existing.id, "");
+    // Tag BEFORE the reparent, which is the write that settles the detachment (owedDetachment
+    // reads it off the parent edge, not a label). Ordered the other way round, a tag that failed
+    // after a landed reparent could never be retried: the next pass reads the bead as already
+    // parentless, decides nothing is owed, and the outcome label is gone for good. Tagging twice
+    // is harmless — it only adds labels the bead doesn't already carry.
     await tagDetachedOutcome(context, existing);
+    await beads.reparent(context.repo, existing.id, "");
   }
   if (match.partial) {
     await reconcileHalfCreatedContract(

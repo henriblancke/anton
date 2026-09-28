@@ -7,7 +7,8 @@
  * these tickets live now — and because every step of it is a guarded write against a board other
  * operators share. Nothing here decides WHICH tickets move; see review-fix-rehome.ts for that.
  */
-import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
+import { beads, LABELS, labelValuesOf, ownerOf, type Bead } from "../beads/bd";
+import { beadSkeleton } from "../beads/formula";
 import { olderOf, tryList, type ReadBead } from "./review-fix-board";
 import { safe } from "./safe";
 
@@ -224,15 +225,27 @@ async function createFollowUp(
 /**
  * The follow-up bead itself. Deliberately NOT `approved`: approval is the founder's gate, and
  * re-running work a run already failed to deliver — after a timeout, possibly needing re-scoping
- * first — is exactly the decision that gate exists for. It carries the epic-tier contract (an
- * outcome and Success Criteria) so the approve route and execute-epic's own gate admit it rather
- * than refusing a target anton wrote.
+ * first — is exactly the decision that gate exists for. It carries the full epic-tier contract
+ * (an outcome, Success Criteria, and Outcome IDs) so the approve route and execute-epic's own gate
+ * admit it rather than refusing a target anton wrote — and rendering through {@link beadSkeleton}
+ * is what keeps this in step with the formula's own `epic` step, rather than a hand-rolled
+ * description the contract gate never sees drift from it (src/prompts/BEADS.md).
  */
 async function newFollowUpEpic(
   ctx: FollowUpContext,
 ): Promise<string | undefined> {
   const area = areaLabelOf(ctx.epic, ctx.all);
   try {
+    const skeleton = await beadSkeleton(ctx.repo, "epic", {
+      outcome:
+        `The pull request for ${ctx.epic.id} merged without ${ctx.ids}. The run that opened it ran ` +
+        `out of time, so that work is in no diff — this epic is its home, because a ticket parented ` +
+        `to an already-merged target is not something anton can run.\n\n` +
+        `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
+        `first if the timeout means they were too big.`,
+      success_criteria: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
+      outcome_ids: outcomeIdsBody(ctx.epic, outcomeIdsOf(ctx.epic)),
+    });
     return await beads.create(ctx.repo, {
       title: `${ctx.epic.title} — undelivered tickets`,
       type: "epic",
@@ -242,17 +255,27 @@ async function newFollowUpEpic(
       // Written in the SAME call as the bead, so no window exists in which the follow-up is on the
       // board without the stamp a retry finds it by.
       metadata: { [REHOME_OF]: ctx.epic.id },
-      description:
-        `The pull request for ${ctx.epic.id} merged without ${ctx.ids}. The run that opened it ran ` +
-        `out of time, so that work is in no diff — this epic is its home, because a ticket parented ` +
-        `to an already-merged target is not something anton can run.\n\n` +
-        `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
-        `first if the timeout means they were too big.`,
-      acceptance: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
+      description: skeleton.description,
+      acceptance: skeleton.acceptance,
     });
   } catch {
     return undefined;
   }
+}
+
+/** The merged run target's own `outcome:<id>` label(s) — what its follow-up epic inherits. */
+const outcomeIdsOf = (epic: Bead): string[] => labelValuesOf(epic.labels, "outcome");
+
+/**
+ * The follow-up's `## Outcome IDs` body. Mirrors {@link followUpWhy}'s split in rework-notes.ts:
+ * `outcomeIds` is empty for a merged target that predates outcome ids ({@link outcomesConfigured}
+ * exempts a fresh draft from the same gap), so there is nothing to carry over as a label — the
+ * body names the origin epic instead of fabricating one.
+ */
+function outcomeIdsBody(epic: Bead, outcomeIds: string[]): string {
+  return outcomeIds.length > 0
+    ? outcomeIds.map((id) => `outcome:${id}`).join(", ")
+    : `${epic.id} predates \`.product/PRODUCT.md\`'s outcome ids, so none carries over as a label here either.`;
 }
 
 /**

@@ -145,13 +145,17 @@ export function followUpDescription(args: FollowUpContractArgs): string {
 /**
  * A half-created follow-up's description, brought in line with the request finishing it
  * (lib/rework-modes.ts). Only what the request DECIDES is touched: the Acceptance section, derived
- * from its instructions and findings, and the Context line saying where the bead runs. Everything
- * else stays as written. The bead matched on title and edge alone, so it may be one a founder made
- * by hand, or a remnant whose Context, Out of scope or Verify they have edited since — and
- * regenerating the whole contract to refresh the boxes would silently discard that authorship.
+ * from its instructions and findings, the Context line saying where the bead runs, and a `## Why`
+ * that is missing outright. Everything else stays as written. The bead matched on title and edge
+ * alone, so it may be one a founder made by hand, or a remnant whose Context, Out of scope or
+ * Verify they have edited since — and regenerating the whole contract to refresh the boxes would
+ * silently discard that authorship.
  *
  * A description with no Acceptance section gets the request's appended, since a bead without one is
- * refused at approval; a blank one gets the whole contract, there being nothing to keep.
+ * refused at approval; a blank one gets the whole contract, there being nothing to keep. `## Why` is
+ * inserted the same way when the section is absent entirely ({@link ensureWhy}) — this is the last
+ * pass that ever looks at a half-created follow-up before the note that finishes it, so a Why
+ * missing now stays missing for good.
  */
 export function reconcileFollowUpDescription(
   current: string | undefined,
@@ -162,8 +166,35 @@ export function reconcileFollowUpDescription(
     current,
     followUpAcceptance(args.instructions, args.findings),
   );
-  return replaceRunsUnder(withAcceptance, args.targetId, args.parentId);
+  const withWhy = ensureWhy(withAcceptance, args.ticket, args.outcomeIds ?? []);
+  return replaceRunsUnder(withWhy, args.targetId, args.parentId);
 }
+
+/**
+ * Insert a `## Why` section when the half-created bead has none at all — a remnant that predates
+ * this requirement, or one a founder made by hand without it ({@link reconcileFollowUpDescription}).
+ * Appended after everything else, closing any fence or HTML comment the description ends inside
+ * ({@link unterminatedCloser}) exactly as {@link replaceAcceptance}'s own no-section fallback does:
+ * that is the one position that needs no fence/HTML-block awareness of its own, since it starts
+ * only after every open construct in the (already Acceptance-reconciled) text has been closed.
+ *
+ * Never touches a Why that IS there, authored or still a placeholder — only the founder should
+ * rewrite their own words, and unlike Acceptance and the run-location line, `## Why` is not a
+ * section this reconcile owns the content of.
+ */
+function ensureWhy(description: string, ticket: Bead, outcomeIds: string[]): string {
+  if (sectionsNamed(scanMarkdown(description), WHY_KEYS).length > 0) return description;
+  const kept = description.trimEnd();
+  const closer = unterminatedCloser(kept);
+  return [kept, ...(closer ? [closer] : []), ``, `## Why`, followUpWhy(ticket, outcomeIds)].join(
+    "\n",
+  );
+}
+
+/** Named apart from {@link CONTEXT_KEYS} and its kind (beads/contract.ts) because `## Why` is not
+ * one of the ticket tier's judged contract sections there — {@link ensureWhy} still needs to find
+ * it by the same heading-scanning `sectionsNamed` every other reconcile here uses. */
+const WHY_KEYS = ["why"];
 
 /**
  * The Acceptance section's body swapped for `boxes`, bounded exactly as the contract judge bounds it
