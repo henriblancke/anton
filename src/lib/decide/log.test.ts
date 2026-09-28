@@ -377,6 +377,21 @@ describe("replay — agreement(point)", () => {
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
   });
 
+  it("treats the new model as active as soon as it answers, before any of its rows settle", async () => {
+    // The old model earned a poor record and is still settled-fresh.
+    const oldId = await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    await settleDecision(test.db, clock, oldId, { operatorAnswer: "decline" });
+    nowMs += 60_000;
+
+    // The point is re-pointed at a new model. It has answered once, but the operator has not
+    // settled that row yet — the normal state for the interval right after a switch.
+    await recordShadow(ANSWER({ modelVersion: "claude-5" }));
+
+    // The old model's settled row must not count: the active pair is the new model's, which has
+    // no settled evidence yet, so the figure reads as unmeasured rather than the predecessor's.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 0, agreed: 0 });
+  });
+
   it("leaves a rule-decided point unscoped — a hard rule has no model version to pin trust to", async () => {
     const ruledPoint: DecisionPoint = {
       ...POINT,

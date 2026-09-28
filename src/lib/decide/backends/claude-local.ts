@@ -185,16 +185,18 @@ function buildPrompt(point: DecisionPoint, state: DecisionState): string {
 
 /** The LAST fenced ```json block in the reply, parsed — never an earlier one. A model correcting or
  * retracting a draft answer produces exactly this shape: an earlier valid block followed by a
- * malformed final one. Falling back to that earlier block would resolve to the withdrawn answer, not
- * the reply the model actually finished on — so a final block that fails to parse is treated the same
- * as no block at all, per the reporting format's own "nothing after it" contract. `undefined` when the
- * reply has no fenced json block or its last one fails to parse; the caller treats either as a failed
- * call. */
+ * malformed final one, or a valid final block followed by trailing prose that walks it back. Falling
+ * back to an earlier block would resolve to the withdrawn answer, not the reply the model actually
+ * finished on — so a final block that fails to parse, OR has anything but whitespace after its
+ * closing fence, is treated the same as no block at all, per the reporting format's own "nothing
+ * after it" contract. `undefined` when the reply has no fenced json block, its last one fails to
+ * parse, or the message continues past it; the caller treats any of those as a failed call. */
 function lastParsedJsonBlock(text: string | undefined): unknown {
   if (!text) return undefined;
   const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
   const last = blocks[blocks.length - 1];
-  if (!last) return undefined;
+  if (!last || last.index === undefined) return undefined;
+  if (text.slice(last.index + last[0].length).trim().length > 0) return undefined;
   try {
     return JSON.parse(last[1] ?? "");
   } catch {

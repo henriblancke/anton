@@ -289,6 +289,27 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow(/no parseable/);
   });
 
+  it("rejects a valid final block followed by trailing prose that retracts it", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      // A model reporting, then walking it back in prose rather than a further fenced block. The
+      // "nothing after it" contract means this withdrawn answer must not authorize anything either.
+      runClaude: fakeDispatcher(async () =>
+        ok(
+          '```json\n{"probabilities": {"fix": 1, "decline": 0, "human": 0}}\n```\n' +
+            "actually, on reflection I'm not confident in that — let's escalate to a human instead.",
+        ),
+      ),
+    });
+
+    await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow(/no parseable/);
+  });
+
   it("rejects when claude reports the session itself failed", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({

@@ -245,8 +245,12 @@ const isJudgmentEvidence = and(
  * Also scoped to the CURRENT backend/model version: a row records both specifically to pin trust to
  * the model that earned it, so a point re-pointed at a new backend or model must be judged only on
  * what that one has produced, never on its predecessor's record. The active pair is read off the
- * newest judged row itself — a hard rule has neither (it is deterministic, not model trust), so a
- * point currently settled by a rule is left unscoped rather than filtered against nothing.
+ * newest ANSWERED row regardless of settlement — a model that just took over may have produced only
+ * unsettled decisions yet, and gating this lookup on `isJudgmentEvidence` too would keep reading the
+ * predecessor's backend/model as "active" for the whole window it takes the first new decision to
+ * settle, which is exactly the stale-agreement window a promotion to `auto` must not be based on. A
+ * hard rule has neither backend nor model (it is deterministic, not model trust), so a point
+ * currently settled by a rule is left unscoped rather than filtered against nothing.
  */
 export async function agreement(
   db: AntonDb,
@@ -254,21 +258,21 @@ export async function agreement(
   window: number = DECISION_AGREEMENT_WINDOW,
   projectId?: string,
 ): Promise<DecisionAgreement> {
-  const scope = and(
+  const pointScope = and(
     eq(schema.decisions.point, point),
-    isJudgmentEvidence,
     projectId === undefined ? undefined : eq(schema.decisions.projectId, projectId),
   );
-  // The id breaks a `settledAt` tie, as `pickerTrackRecord` does for its own second-resolution
-  // column: two decisions settled in the same second would otherwise leave the window's
-  // composition — and the counts read off it — up to SQLite's row order.
+  const scope = and(pointScope, isJudgmentEvidence);
+  // The id breaks a `decidedAt`/`settledAt` tie, as `pickerTrackRecord` does for its own
+  // second-resolution column: two decisions logged in the same second would otherwise leave the
+  // window's composition — and the counts read off it — up to SQLite's row order.
   const orderNewestFirst = [desc(schema.decisions.settledAt), desc(schema.decisions.id)] as const;
 
   const [active] = await db
     .select({ backend: schema.decisions.backend, modelVersion: schema.decisions.modelVersion })
     .from(schema.decisions)
-    .where(scope)
-    .orderBy(...orderNewestFirst)
+    .where(and(pointScope, isNotNull(schema.decisions.answer)))
+    .orderBy(desc(schema.decisions.decidedAt), desc(schema.decisions.id))
     .limit(1);
 
   const rows = await db
