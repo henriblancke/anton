@@ -464,6 +464,14 @@ export function classifyReview(pr: PrReview): Actionable {
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");
+    // Non-`base:*`/`thread:*` entry (anton-091jr review, chatgpt-codex-connector): without one,
+    // `fingerprintHasNonThreadReasons` (review-fix.ts) sees only the `base:*` cache-busting entry
+    // appended below for every actionable reason and treats a conflict-only round as having NO
+    // non-thread reason. `allWaitingThreadsAnswered` then never demands the conflict sentinel, so a
+    // premerge that fails (or otherwise leaves no commit) lets `report` cover only threads and the
+    // round is recorded as fully answered — suppressing the unresolved conflict on every later sweep
+    // at the same head/base. Keyed on `headSha` so a new push always changes it too.
+    fingerprint.push(`conflict:${pr.headSha}`);
   }
   const waiting = threadsNeedingAttention(pr);
   if (waiting.length > 0) {

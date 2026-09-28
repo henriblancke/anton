@@ -82,6 +82,17 @@ describe("classifyReview", () => {
     expect(v.reasons.join()).toMatch(/merge conflicts/);
   });
 
+  // anton-091jr review round 6 (chatgpt-codex-connector): a conflict-only round must add a
+  // non-`base:*`/`thread:*` fingerprint entry, or `fingerprintHasNonThreadReasons` (review-fix.ts)
+  // sees only the cache-busting `base:*` entry and treats it as having no non-thread reason at all.
+  it("adds a non-base fingerprint entry for merge conflicts, keyed on the head sha", () => {
+    const before = classifyReview(pr({ mergeable: "CONFLICTING", headSha: "sha1" }));
+    expect(before.fingerprint).toContain("conflict:sha1");
+    const after = classifyReview(pr({ mergeable: "CONFLICTING", headSha: "sha2" }));
+    expect(after.fingerprint).toContain("conflict:sha2");
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+  });
+
   it("is actionable when an unresolved thread awaits anton (even without CHANGES_REQUESTED)", () => {
     const v = classifyReview(pr({ threads: [thread()] }));
     expect(v.actionable).toBe(true);
