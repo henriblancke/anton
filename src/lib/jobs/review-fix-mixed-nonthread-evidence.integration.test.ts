@@ -11,7 +11,7 @@
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { describeBd, makeBdRepo, saveEnv, type BdRepo } from "@/lib/testing/integration";
@@ -54,6 +54,7 @@ describeBd(
     let epicId: string;
     let branch: string;
     let restoreEnv: () => void;
+    let ghCommentLog: string;
 
     const runDispatch = () =>
       driveJob({
@@ -90,6 +91,8 @@ describeBd(
       repo = bdRepo.repo;
       binDir = join(sandbox, "bin");
       mkdirSync(binDir);
+      ghCommentLog = join(sandbox, "gh-comments.log");
+      writeFileSync(ghCommentLog, "");
 
       epicId = await beads.create(repo, {
         title: "Ship feature X",
@@ -113,9 +116,15 @@ describeBd(
       const fakeGh = writeBin(
         binDir,
         "gh",
-        `const a=process.argv.slice(2);const q=a.join(' ');
+        `const fs=require('fs');
+const a=process.argv.slice(2);const q=a.join(' ');
 if(a[0]==='pr'&&a[1]==='view'){
   console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'REVIEW_REQUIRED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'FAILURE'}]}));
+  process.exit(0);
+}
+if(a[0]==='pr'&&a[1]==='comment'){
+  const body=a[a.indexOf('--body')+1];
+  fs.appendFileSync(process.env.FAKE_GH_COMMENT_LOG, body+'\\n---\\n');
   process.exit(0);
 }
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
@@ -137,11 +146,13 @@ process.exit(0);`,
         "ANTON_WORKTREES_ROOT",
         "ANTON_SESSIONS_ROOT",
         "FAKE_BRANCH",
+        "FAKE_GH_COMMENT_LOG",
       ]);
       process.env.ANTON_GH_BIN = fakeGh;
       process.env.ANTON_WORKTREES_ROOT = join(sandbox, "worktrees");
       process.env.ANTON_SESSIONS_ROOT = join(sandbox, "sessions");
       process.env.FAKE_BRANCH = branch;
+      process.env.FAKE_GH_COMMENT_LOG = ghCommentLog;
 
       tdb = makeProjectDb({ repoPath: repo });
       clock = new FakeClock(1_700_000_000_000);
@@ -228,6 +239,11 @@ process.exit(0);`,
         expect(job?.status).toBe("done");
         const payload = JSON.parse(job!.payloadJson);
         expect(payload.answeredFingerprint).toBeDefined();
+        // The sentinel's own explanation must reach the PR itself, not just get treated as
+        // answered internally (PR #338 review, @chatgpt-codex-connector) — `refreshFixRoundsBody`
+        // never runs for an unpushed round.
+        const comments = readFileSync(ghCommentLog, "utf8");
+        expect(comments).toContain("build failure is flaky infra, nothing to change");
       } finally {
         process.env.ANTON_CLAUDE_BIN = prev;
       }

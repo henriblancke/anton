@@ -133,16 +133,24 @@ export function reviewFixContext(
   gateFailure?: GateFailure,
   hasNonThreadReasons = false,
 ): string {
+  // A gate-failure follow-up is the one bounded round the gate gets, not a re-diagnosis of the
+  // review feedback — so it gets ONLY the header + the gate output, never the reviewer summaries,
+  // thread listings, cluster callout, or a thread report ask. `pr` here is the same pre-fix read
+  // the main round classified from; rendering those sections would show threads the main round may
+  // already have resolved as still "unresolved", and the reporting ask would pull the round's one
+  // shot into re-litigating review feedback instead of the gate (PR #338 review, @claude). Nothing
+  // reads `result.text` from this dispatch, so the report ask is also pure noise here.
+  const gateOnly = gateFailure !== undefined;
   const threads = threadsNeedingAttention(pr);
   return [
     ...headerSection(epic, pr, reasons),
-    ...reviewerSummarySection(pr),
-    ...threadsSection(threads),
-    ...clusterSection(threads),
-    ...failingChecksSection(pr),
+    ...(gateOnly ? [] : reviewerSummarySection(pr)),
+    ...(gateOnly ? [] : threadsSection(threads)),
+    ...(gateOnly ? [] : clusterSection(threads)),
+    ...(gateOnly ? [] : failingChecksSection(pr)),
     ...conflictsSection(conflicts),
     ...gateFailureSection(gateFailure),
-    ...reportingFormatSection(threads, reasons, hasNonThreadReasons),
+    ...(gateOnly ? [] : reportingFormatSection(threads, reasons, hasNonThreadReasons)),
   ]
     .join("\n")
     .trimEnd();

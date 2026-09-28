@@ -221,6 +221,34 @@ describe("reviewFixContext", () => {
     expect(out).not.toContain("## Gate failure");
   });
 
+  // PR #338 review (@claude): a gate-failure follow-up is the one bounded round the gate gets, not
+  // a re-diagnosis of the review feedback — it must not carry the reviewer summaries, thread
+  // listings, cluster callout, or a thread-report ask, even when the (pre-fix) `pr` snapshot still
+  // has them. Nothing reads this dispatch's result text, so the reporting ask is pure noise here.
+  it("trims the prompt to header + gate output when a gate just failed, even with threads/reviews present", () => {
+    const threads: ReviewThread[] = Array.from({ length: CLUSTERED_FINDINGS_THRESHOLD }, (_, i) =>
+      threadOn("src/broken.ts", `RT_${i}`),
+    );
+    const out = reviewFixContext(
+      epic,
+      makePr({
+        threads,
+        failingChecks: ["build"],
+        reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "rename foo to bar" }],
+      }),
+      ["the tests gate failed after the fix (exit 3)"],
+      [],
+      { label: "tests", output: "boom-output" },
+    );
+    expect(out).toContain("## Gate failure (one follow-up round)");
+    expect(out).toContain("boom-output");
+    expect(out).not.toContain("Reviewer summaries requesting changes:");
+    expect(out).not.toContain("[thread RT_0]");
+    expect(out).not.toContain("## Clustered findings");
+    expect(out).not.toContain("Failing CI checks:");
+    expect(out).not.toContain("## Reporting format (required)");
+  });
+
   function threadOn(path: string, id: string): ReviewThread {
     return {
       id,
