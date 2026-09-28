@@ -343,7 +343,18 @@ export function classifyReview(pr: PrReview): Actionable {
   if (pr.state !== "OPEN") return { actionable: false, reasons: ["pr not open"] };
 
   if (pr.reviewDecision === "CHANGES_REQUESTED") {
-    reasons.push("changes requested by a reviewer");
+    // Fold in the count of CHANGES_REQUESTED review events (not just the decision, which stays
+    // CHANGES_REQUESTED across a second/repeat review from the same reviewer) so a genuinely new
+    // review bumps `reasons` even when its body adds no inline comments — otherwise
+    // enqueueReviewFixPrIfAbsent's answered-unchanged suppression (anton-dfuvz) would keep treating
+    // a repeat review as already-answered. Omitted when zero (fixtures that set reviewDecision
+    // without a matching reviews entry) to keep the plain form for those.
+    const changesRequestedCount = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED").length;
+    reasons.push(
+      changesRequestedCount > 0
+        ? `changes requested by a reviewer (${changesRequestedCount} review(s))`
+        : "changes requested by a reviewer",
+    );
   }
   if (pr.failingChecks.length > 0) {
     reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);

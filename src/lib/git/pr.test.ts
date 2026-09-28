@@ -109,6 +109,29 @@ describe("classifyReview", () => {
     const v = classifyReview(pr({ state: "MERGED", reviewDecision: "CHANGES_REQUESTED" }));
     expect(v.actionable).toBe(false);
   });
+
+  // anton-091jr: a repeat CHANGES_REQUESTED review whose body adds no new inline comments must
+  // still change `reasons` — that's what lifts enqueueReviewFixPrIfAbsent's answered-unchanged
+  // suppression (anton-dfuvz) for a genuinely new review.
+  it("changes reasons when a second CHANGES_REQUESTED review arrives, even with the same decision", () => {
+    const first = classifyReview(
+      pr({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "fix this" }],
+      }),
+    );
+    const second = classifyReview(
+      pr({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [
+          { author: "alice", state: "CHANGES_REQUESTED", body: "fix this" },
+          { author: "alice", state: "CHANGES_REQUESTED", body: "still not fixed" },
+        ],
+      }),
+    );
+    expect(first.reasons).not.toEqual(second.reasons);
+    expect(second.reasons.join()).toMatch(/2 review\(s\)/);
+  });
 });
 
 describe("threadsNeedingAttention", () => {
