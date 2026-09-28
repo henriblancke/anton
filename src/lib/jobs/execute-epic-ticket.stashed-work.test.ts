@@ -300,7 +300,11 @@ describe("a yielded turn is its own outcome, not a clean exit (anton-wjfkn)", ()
  * or duplicates a change that already exists.
  */
 describe("the block note tells an operator to RECOVER, not to re-implement (anton-wjfkn)", () => {
-  const note = (kind: "stashed-work" | "agent-yielded", stashes: string[] = []) =>
+  const note = (
+    kind: "stashed-work" | "agent-yielded",
+    stashes: string[] = [],
+    restoreFailures: string[] = [],
+  ) =>
     ticketBlockNote({
       kind,
       selfReport: null,
@@ -308,6 +312,7 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
       branch: "anton/anton-wjfkn",
       committed: false,
       stashes,
+      restoreFailures,
       worktreePath: "/tmp/anton-worktrees/wjfkn",
     });
 
@@ -339,5 +344,39 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
 
   it("stays a single line, so the notes blob parses it back as one machine note", () => {
     expect(note("stashed-work", [SHA_A, SHA_B]).includes("\n")).toBe(false);
+  });
+
+  // The claim this note makes is the one an operator acts on without re-reading the diff. Asserting
+  // it restored when the apply actually failed sends them to a worktree that does not hold the change.
+  it("does not claim the work is back in the tree when every apply failed", () => {
+    const text = note("stashed-work", [SHA_A], [SHA_A]);
+
+    expect(text).not.toContain("anton put the work back");
+    expect(text).toContain("anton could NOT put the work back");
+    expect(text).toContain("only copy");
+  });
+
+  it("says so when only some entries came back", () => {
+    const text = note("stashed-work", [SHA_A, SHA_B], [SHA_B]);
+
+    expect(text).toContain(`anton put 1 of 2 back`);
+    expect(text).toContain(`could not reapply \`${SHA_B}\``);
+  });
+
+  it("still says the work was put back when every apply landed", () => {
+    const text = note("stashed-work", [SHA_A]);
+
+    expect(text).toContain("anton put the work back");
+  });
+
+  // anton-wjfkn round 3 review: this note is re-surfaced to an operator through
+  // `execute-epic-board.ts`'s `clampNote`, which cuts a held ticket's note at 300 characters for the
+  // run-row park. A trailing "Do NOT re-implement it from scratch" is exactly the clause that cap
+  // drops — so it has to survive being cut to the same width this note actually gets read at.
+  it("keeps its central warning inside the first 300 characters a park note ever shows", () => {
+    const text = note("stashed-work", [SHA_A, SHA_B]);
+    const clamped = text.slice(0, 300);
+
+    expect(clamped).toContain("Do NOT re-implement it from scratch");
   });
 });

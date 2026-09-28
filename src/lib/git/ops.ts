@@ -3968,14 +3968,20 @@ export interface StashEntry {
  * baseline taken in the same worktree and is only interested in what GREW, which is why the caller
  * diffs two reads rather than trusting one.
  *
- * Fails closed to `[]` — a repository with no `refs/stash` at all exits non-zero on some gits, and
- * "no entries" is the answer that changes no behaviour. A read that failed therefore never
- * manufactures a stash the caller would then refuse to remove a worktree over.
+ * PROPAGATES a failed read rather than manufacturing `[]` for it (anton-wjfkn round 3): the ticket
+ * baseline this feeds is a BEFORE snapshot a later read is diffed against, and an empty baseline reads
+ * identically to "this repository has never stashed" — a caller that swallowed a timeout or a
+ * corrupted-repo failure here would then misattribute every PRE-EXISTING entry (a sibling worktree's,
+ * or an earlier failed attempt's own) as gained during this ticket, and splice it into the worktree as
+ * this ticket's recovered work. Modern git exits 0 with empty output for the genuinely-empty case (no
+ * `refs/stash`, or no commits yet) — verified against the git this repo runs — so there is no clean
+ * non-zero exit left to fold into `[]` the way {@link symbolicHeadRef} does for a detached HEAD; every
+ * failure here is an operational one and must reach the caller as one.
  */
 export async function readStashEntries(worktreePath: string): Promise<StashEntry[]> {
   // `-z` for the same reason every other read here uses it: a stash message is free text the agent
   // chose, and a newline in it would split one entry into two.
-  const raw = await git(worktreePath, ["stash", "list", "-z", "--format=%H%x00%gs"]).catch(() => "");
+  const raw = await git(worktreePath, ["stash", "list", "-z", "--format=%H%x00%gs"]);
   const fields = raw.split("\0");
   const entries: StashEntry[] = [];
   for (let i = 0; i + 1 < fields.length; i += 2) {

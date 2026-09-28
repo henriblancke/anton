@@ -125,6 +125,11 @@ vi.mock("../git/ops", async () => {
     readCommitNaming: (repo: string, beadId: string, base: string) => readCommitNamingMock(repo, beadId, base),
     resolveForkPoint: (worktree: string, base: string) => resolveForkPointMock(worktree, base),
     readCommitReach: (repo: string, sha: string) => readCommitReachMock(repo, sha),
+    // These cases have nothing to do with stash recovery, and (anton-wjfkn round 3) the real
+    // implementation now PROPAGATES a failed `git stash list` rather than swallowing it to `[]` — over
+    // the fake `WORKTREE` path these fixtures use, that real call would fail and mask every case's own
+    // assertion behind an unrelated git error.
+    readStashEntries: async () => [],
   };
 });
 

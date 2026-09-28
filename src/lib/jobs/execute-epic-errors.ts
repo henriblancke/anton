@@ -102,6 +102,14 @@ export interface RecoverableWork {
    * own note; a measure-the-baseline loop can push several, and none of them may be left to a guess.
    */
   readonly stashes: readonly string[];
+  /**
+   * Which of {@link stashes} anton tried to reapply and could NOT (a conflict against the tree the
+   * entry was made from, or a corrupt entry) — a subset of `stashes`, empty when every apply landed.
+   * The park note must not say "anton put the work back" when this is non-empty: the entries listed
+   * here are only on the stash stack, and a person recovering them still has to run
+   * `git stash apply <sha>` by hand.
+   */
+  readonly restoreFailures: readonly string[];
 }
 
 /** Whether this stop left uncommitted work behind — the one question the worktree teardown asks. */
@@ -128,6 +136,7 @@ export class StashedWorkError extends Error implements RunFailureParts, Recovera
     readonly stashes: readonly string[],
     structural: string = msg,
     selfReport: AntonResult | null = null,
+    readonly restoreFailures: readonly string[] = [],
   ) {
     super(msg);
     this.name = "PoisonError"; // classified as poison by the runner
@@ -164,6 +173,8 @@ export class AgentYieldedError extends Error implements RunFailureParts, Recover
     /** The formula step that yielded — the ticket phase can dispatch several agents. */
     stepId?: string,
     selfReport: AntonResult | null = null,
+    /** Which of `stashes` anton tried to reapply and could not — see {@link RecoverableWork}. */
+    readonly restoreFailures: readonly string[] = [],
   ) {
     const structural =
       `${ticketId} did not finish: its ${stepId ? `\`${stepId}\` ` : ``}agent ENDED ITS TURN to wait ` +

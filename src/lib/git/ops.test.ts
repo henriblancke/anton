@@ -5808,4 +5808,15 @@ suite("readStashEntries / applyStashEntry (real git)", () => {
   it("reports a sha that names no stash entry as a failed apply", async () => {
     expect(await applyStashEntry(repo, "0".repeat(40))).toBe(false);
   });
+
+  /**
+   * anton-wjfkn round 3 review: a swallowed failure here reads identically to "never stashed", and the
+   * ticket baseline this feeds cannot tell the two apart. A caller that treated an unreadable baseline
+   * as an empty one would then misattribute a PRE-EXISTING stash entry as gained during the ticket and
+   * splice it into the worktree — so the read must propagate a genuine failure rather than manufacture
+   * `[]` for it.
+   */
+  it("propagates a failed read rather than reporting it as an empty stash list", async () => {
+    await expect(readStashEntries(join(sandbox, "not-a-repo"))).rejects.toThrow();
+  });
 });

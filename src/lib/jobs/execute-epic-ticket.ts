@@ -97,9 +97,15 @@ export async function runTicket(args: {
   const baseline = await readTicketBaseline(worktreePath);
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
-  const stash = ticketStashRecovery(worktreePath, run.branch, await readStashEntries(worktreePath));
 
   try {
+    // Read INSIDE the try, deliberately not wrapped in its own catch (anton-wjfkn): a stash baseline
+    // anton could not read is not "no stashes", and treating it as one would let a PRE-EXISTING entry
+    // (a neighbour's, or an earlier failed attempt's own) get misread as gained during this ticket and
+    // spliced into this worktree by `refuseStashedDelivery`. Letting the read failure fall straight
+    // into this catch stops the ticket the same safe way any other setup failure does, with the
+    // baseline left unknown rather than guessed at.
+    const stash = ticketStashRecovery(worktreePath, run.branch, await readStashEntries(worktreePath));
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress, stash });
     const settlement = await ticketSettlement(run, progress);
     // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
@@ -532,11 +538,12 @@ async function refuseStashedDelivery(
 ): Promise<never> {
   const shas = stashed.map((e) => e.sha);
   const list = shas.map((sha) => `\`${sha}\``).join(", ");
+  const recovery = await recoverStashed(stashed, stash);
   const structural =
     `${ticket.id} delivered nothing because its work is STASHED, not absent: the worktree gained ` +
     `${shas.length} stash ${shas.length === 1 ? "entry" : "entries"} (${list}) while this ticket ran, ` +
     `so the empty tree the commit step saw is work the agent set aside rather than work it never did. ` +
-    `${await recoverStashed(stashed, stash)}. Blocking the ticket and halting the epic — nothing was ` +
+    `${recovery.summary}. Blocking the ticket and halting the epic — nothing was ` +
     `verified or committed, so this is no delivery — but the worktree is KEPT rather than removed, ` +
     `because that stash is the only record of the change. Read it with ` +
     `\`git stash show -p <sha>\` and restore it with \`git stash apply <sha>\`, then finish the ` +
@@ -547,6 +554,7 @@ async function refuseStashedDelivery(
     shas,
     structural,
     progress.selfReport,
+    recovery.failed,
   );
 }
 
@@ -569,14 +577,24 @@ async function yieldedMidWork(
   stash: StashRecovery,
 ): Promise<AgentYieldedError> {
   const stashed = await stash.gained().catch(() => []);
-  if (stashed.length > 0) await recoverStashed(stashed, stash);
+  const recovery =
+    stashed.length > 0 ? await recoverStashed(stashed, stash) : { restored: [], failed: [], summary: "" };
   return new AgentYieldedError(
     ticket.id,
     armed,
     stashed.map((e) => e.sha),
     stepId,
     progress.selfReport,
+    recovery.failed,
   );
+}
+
+/** What became of a {@link recoverStashed} pass — the shas that landed, the shas that did not, and a
+ * ready-made clause for an operator-facing message that needs to say so in one sentence. */
+interface StashRecoveryResult {
+  restored: string[];
+  failed: string[];
+  summary: string;
 }
 
 /**
@@ -587,11 +605,15 @@ async function yieldedMidWork(
  * order would lay an earlier snapshot over a later one. Best-effort per entry: `applyStashEntry`
  * leaves every entry on the stack whatever happens, so a failed apply costs only the convenience of
  * finding the work already in the tree, never the work.
+ *
+ * Returns which shas actually landed and which did not — never just the prose — so a caller composing
+ * a SEPARATE, shorter note (the bead's block note) can say the same true thing in its own words rather
+ * than repeat-or-drop this function's summary and risk the two disagreeing (anton-wjfkn round 3).
  */
 async function recoverStashed(
   stashed: readonly StashEntry[],
   stash: StashRecovery,
-): Promise<string> {
+): Promise<StashRecoveryResult> {
   const restored: string[] = [];
   const failed: string[] = [];
   for (const entry of [...stashed].reverse()) {
@@ -599,23 +621,17 @@ async function recoverStashed(
     else failed.push(entry.sha);
   }
   const one = stashed.length === 1;
-  if (failed.length === 0) {
-    return (
-      `anton applied ${one ? "it" : "them"} back into the worktree and left ` +
-      `${one ? "the entry" : "the entries"} on the stash stack as the durable copy`
-    );
-  }
-  if (restored.length === 0) {
-    return (
-      `anton could NOT apply ${one ? "it" : "any of them"} back into the worktree (the tree has ` +
-      `moved under ${one ? "it" : "them"}), so the stash ${one ? "commit is" : "commits are"} the ` +
-      `only copy`
-    );
-  }
-  return (
-    `anton applied ${restored.length} of ${stashed.length} back into the worktree and could not ` +
-    `apply ${failed.map((sha) => `\`${sha}\``).join(", ")}; every entry is still on the stash stack`
-  );
+  const summary =
+    failed.length === 0
+      ? `anton applied ${one ? "it" : "them"} back into the worktree and left ` +
+        `${one ? "the entry" : "the entries"} on the stash stack as the durable copy`
+      : restored.length === 0
+        ? `anton could NOT apply ${one ? "it" : "any of them"} back into the worktree (the tree has ` +
+          `moved under ${one ? "it" : "them"}), so the stash ${one ? "commit is" : "commits are"} the ` +
+          `only copy`
+        : `anton applied ${restored.length} of ${stashed.length} back into the worktree and could not ` +
+          `apply ${failed.map((sha) => `\`${sha}\``).join(", ")}; every entry is still on the stash stack`;
+  return { restored, failed, summary };
 }
 
 /**

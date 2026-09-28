@@ -994,6 +994,7 @@ async function blockFailedTicket(args: {
         committed,
         head,
         stashes: args.recoverable?.stashes,
+        restoreFailures: args.recoverable?.restoreFailures,
         worktreePath: args.recoverable ? run.worktreePath : undefined,
       }),
     ),
@@ -1078,6 +1079,12 @@ export function ticketBlockNote(args: {
    * operator meets the stop, and a sha they cannot read off it is a sha they have to go find.
    */
   stashes?: readonly string[];
+  /**
+   * Which of `stashes` anton tried to reapply into the worktree and could NOT — see
+   * {@link RecoverableWork}. Undefined/empty reads as "every entry landed", which is also the honest
+   * answer when there was nothing to restore at all (an `agent-yielded` stop with no stash).
+   */
+  restoreFailures?: readonly string[];
   /** The worktree kept for that recovery — the path the note sends the operator to. */
   worktreePath?: string;
 }): string {
@@ -1098,7 +1105,7 @@ export function ticketBlockNote(args: {
           `declared the ticket incomplete${reason ? `: "${reason}"` : ` (no reason given)`}; needs ` +
           `a human to finish or re-scope it, then resume the run.`
         : kind === "stashed-work" || kind === "agent-yielded"
-          ? recoverableWorkBody(kind, args.stashes ?? [], args.worktreePath)
+          ? recoverableWorkBody(kind, args.stashes ?? [], args.restoreFailures ?? [], args.worktreePath)
           : `run failed after committing work — needs review.` +
             (failure ? ` It failed with: ${failure}` : "");
 
@@ -1118,13 +1125,30 @@ export function ticketBlockNote(args: {
  * duplicate it. The stash shas are spelled out because this bead is the durable record: the run row's
  * park text ages out of an operator's attention long before the bead does, and a stash entry nobody
  * can name is a stash entry nobody recovers.
+ *
+ * "Do NOT re-implement it from scratch" LEADS the message rather than closing it (anton-wjfkn round 3
+ * review): this note is also read back through `execute-epic-board.ts`'s `clampNote`, which caps a
+ * held ticket's surfaced note at 300 characters for the run-row park — and a realistic instance of this
+ * body (a worktree path plus one or two 40-hex shas) runs past that cap. A trailing warning is exactly
+ * the clause a cap cuts, and it is the one sentence this whole note exists to deliver: the alternative
+ * reading — "run delivered nothing" — is what sent an operator to redo the 2026-09-27 incident's work
+ * in the first place. The full note, shas and commands included, is always still readable via
+ * `bd show <id>`; only the CLAMPED surface is at risk, and only the lead sentence is safe there.
+ *
+ * The restoration claim is equally load-bearing and equally capable of being wrong: `applyStashEntry`
+ * can fail (a conflict against the tree the entry was made from, a corrupt entry), and a note that says
+ * "anton put the work back" over a failed apply sends the operator to a worktree that does NOT hold the
+ * change — only the stash stack does. `restoreFailures` (a subset of `stashes`) is what tells this
+ * function which case it is actually in.
  */
 function recoverableWorkBody(
   kind: "stashed-work" | "agent-yielded",
   stashes: readonly string[],
+  restoreFailures: readonly string[],
   worktreePath: string | undefined,
 ): string {
   const where = worktreePath ? ` in \`${worktreePath}\`` : ``;
+  const restoredCount = stashes.length - restoreFailures.length;
   const stashClause =
     stashes.length > 0
       ? ` The agent had stashed it: ${stashes.map((sha) => `\`${sha}\``).join(", ")} — read one with ` +
@@ -1136,11 +1160,25 @@ function recoverableWorkBody(
         `aside, not work never done.`
       : `the agent ENDED ITS TURN to wait on a background job and never reported an outcome, so it ` +
         `stopped mid-work while its session exited cleanly.`;
+  // Three true answers to "is the change actually in the worktree": all of it (nothing failed, or
+  // nothing was ever stashed to begin with), none of it (every apply failed), or some of it.
+  const recoveryClause =
+    stashes.length === 0
+      ? `anton KEPT that worktree${where} rather than removing it`
+      : restoreFailures.length === 0
+        ? `anton put the work back${where} and KEPT that worktree rather than removing it`
+        : restoredCount === 0
+          ? `anton could NOT put the work back into the tree${where} — reapplying it failed, so the ` +
+            `stash ${stashes.length === 1 ? "commit is" : "commits are"} the only copy — and KEPT ` +
+            `that worktree rather than removing it`
+          : `anton put ${restoredCount} of ${stashes.length} back into the tree${where} and could not ` +
+            `reapply ${restoreFailures.map((sha) => `\`${sha}\``).join(", ")}; anton KEPT that ` +
+            `worktree rather than removing it`;
   return (
-    `${opening} anton put the work back${where} and KEPT that worktree rather than removing it.` +
+    `Do NOT re-implement it from scratch. ${opening} ${recoveryClause}.` +
     stashClause +
     ` Nothing was verified or committed, so this is no delivery — recover the change there, then ` +
-    `finish the ticket by hand or resume the run. Do NOT re-implement it from scratch.`
+    `finish the ticket by hand or resume the run.`
   );
 }
 
