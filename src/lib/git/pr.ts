@@ -441,7 +441,14 @@ export async function getPrComments(
   return (view.comments ?? []).map((c) => c.body ?? "");
 }
 
-/** Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId). */
+/**
+ * Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId).
+ *
+ * Throws rather than no-oping when the repo's `nameWithOwner` can't be resolved — the sole caller
+ * (`recordThreadOutcome`, review-fix.ts) wraps this in `safe()`, which reports whether the reply
+ * actually reached GitHub. A silent early return would report `true` for a reply nobody sent,
+ * miscounting an actionable thread as delivered (PR #335 review).
+ */
 export async function replyToReviewComment(
   repoPath: string,
   number: number,
@@ -450,7 +457,7 @@ export async function replyToReviewComment(
   signal?: AbortSignal,
 ): Promise<void> {
   const nwo = await nameWithOwner(repoPath, signal);
-  if (!nwo) return;
+  if (!nwo) throw new Error(`replyToReviewComment: could not resolve nameWithOwner for ${repoPath}`);
   await gh(
     repoPath,
     ["api", "--method", "POST", `repos/${nwo}/pulls/${number}/comments/${commentId}/replies`, "-f", `body=${body}`],

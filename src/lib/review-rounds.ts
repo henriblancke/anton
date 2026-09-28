@@ -274,16 +274,23 @@ export async function recordPrTerminalState(
  * since they truly are final.
  */
 export async function unsettledPrNumbers(db: AntonDb, projectId: string): Promise<number[]> {
-  const rows = await db
-    .selectDistinct({ prNumber: schema.reviewRounds.prNumber })
-    .from(schema.reviewRounds)
-    .where(
-      and(
-        eq(schema.reviewRounds.projectId, projectId),
-        or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed")),
-      ),
-    );
-  return rows.map((r) => r.prNumber);
+  try {
+    const rows = await db
+      .selectDistinct({ prNumber: schema.reviewRounds.prNumber })
+      .from(schema.reviewRounds)
+      .where(
+        and(
+          eq(schema.reviewRounds.projectId, projectId),
+          or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed")),
+        ),
+      );
+    return rows.map((r) => r.prNumber);
+  } catch {
+    // Best-effort, like every other read/write on this table (PR #335 review): a source
+    // deployment that ships this code before its migration runs must read as "no orphans this
+    // pass", not throw past the per-target triage loop and fail the whole dispatcher pass.
+    return [];
+  }
 }
 
 /**

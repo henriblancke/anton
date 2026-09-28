@@ -22,6 +22,7 @@ import {
   recordPrTerminalState,
   recordReviewRound,
   roundCounts,
+  unsettledPrNumbers,
   type ReviewRoundRow,
 } from "./review-rounds";
 import type { AntonDb, Clock } from "./jobs/queue";
@@ -505,5 +506,19 @@ describe("recording never fails the round", () => {
       }),
     ).resolves.toBeUndefined();
     expect(rows()).toHaveLength(0);
+  });
+
+  // PR #335 review: unlike this describe block's other reads/writes, `unsettledPrNumbers` is a read
+  // the caller (`dispatchInReview`'s reconciliation sweep) does not otherwise guard — a source
+  // deployment that ships this code before its migration runs (or any other db hiccup) must see "no
+  // orphans this pass", not throw past every already-triaged ordinary target.
+  it("swallows a read against a table that vanished underneath it — no orphans, not a throw", async () => {
+    t.sqlite.exec("DROP TABLE review_rounds");
+
+    await expect(unsettledPrNumbers(t.db, PROJECT)).resolves.toEqual([]);
+  });
+
+  it("swallows a read against a broken db", async () => {
+    await expect(unsettledPrNumbers(brokenDb(), PROJECT)).resolves.toEqual([]);
   });
 });

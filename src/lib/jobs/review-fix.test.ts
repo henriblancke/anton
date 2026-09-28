@@ -698,7 +698,10 @@ describe("applyThreadOutcomes (reactions)", () => {
       `#!/usr/bin/env node
 const fs = require('fs');
 const a = process.argv.slice(2);
-if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'repo' && a[1] === 'view') {
+  process.stdout.write(process.env.ANTON_TEST_EMPTY_NWO === '1' ? '\\n' : 'o/r\\n');
+  process.exit(0);
+}
 fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
 if (process.env.ANTON_TEST_FAIL_REACTIONS === '1' && a.some((x) => x.includes('/reactions'))) {
   process.stderr.write('boom');
@@ -775,6 +778,7 @@ process.exit(0);
     process.env.ANTON_TEST_GH_LOG = logFile;
     delete process.env.ANTON_TEST_FAIL_REACTIONS;
     delete process.env.ANTON_TEST_FAIL_REPLIES;
+    delete process.env.ANTON_TEST_EMPTY_NWO;
   });
 
   afterEach(() => {
@@ -785,6 +789,7 @@ process.exit(0);
     if (prevFailReplies === undefined) delete process.env.ANTON_TEST_FAIL_REPLIES;
     else process.env.ANTON_TEST_FAIL_REPLIES = prevFailReplies;
     delete process.env.ANTON_TEST_GH_LOG;
+    delete process.env.ANTON_TEST_EMPTY_NWO;
     rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -854,6 +859,18 @@ process.exit(0);
 
     const item = { id: "RT_1", outcome: "left" as const, reply: "style-only, skipped" };
     await expect(run([item], [thread()], true)).resolves.toEqual([]);
+  });
+
+  // PR #335 review: `replyToReviewComment` used to return normally (no reply posted) when the repo's
+  // `nameWithOwner` resolved empty, so `safe()` — which only reports false on a thrown error — read
+  // that as a successful reply. For a non-fixed outcome there is no resolve to fall back on, so this
+  // is the scenario where a reply that never reached GitHub would have been counted as delivered.
+  it("does not count a reply as delivered when the repo's nameWithOwner resolves empty", async () => {
+    process.env.ANTON_TEST_EMPTY_NWO = "1";
+
+    const item = { id: "RT_1", outcome: "left" as const, reply: "style-only, skipped" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([]);
+    expect(ghCalls()).toEqual([]); // never reached the /replies call at all
   });
 
   it("a session-log write failure is best-effort — the delivered reply/resolve still counts (PR #335 review)", async () => {
