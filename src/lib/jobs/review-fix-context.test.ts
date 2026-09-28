@@ -32,6 +32,7 @@ function makePr(overrides: Partial<PrReview> = {}): PrReview {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
     ...overrides,
   } as PrReview;
 }

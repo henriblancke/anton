@@ -287,6 +287,7 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
   };
 
   const fakeCtx = (): JobContext =>
@@ -389,6 +390,7 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
     ...over,
   });
 
@@ -600,6 +602,7 @@ process.exit(0);
       failingChecks: [],
       pendingChecks: 0,
       threads,
+      threadsComplete: true,
     };
   }
 

@@ -1,0 +1,1 @@
+ALTER TABLE `review_rounds` ADD `threads_complete` integer DEFAULT true NOT NULL;

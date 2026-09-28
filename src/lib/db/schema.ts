@@ -1180,6 +1180,14 @@ export const reviewRounds = sqliteTable(
      */
     threadsActionable: integer("threads_actionable").notNull().default(0),
     /**
+     * Whether the thread-count columns above are the PR's WHOLE inline history, or a degraded
+     * GraphQL read (`getReviewThreads`, git/pr.ts) — a failed first page, or a later page that broke
+     * the fetch loop. False makes a real zero-thread round distinguishable from one where the read
+     * itself failed and `threads_seen`/`threads_unresolved`/`threads_outdated`/`threads_actionable`
+     * are an understated prefix, not the PR's actual count (PR #335 review).
+     */
+    threadsComplete: integer("threads_complete", { mode: "boolean" }).notNull().default(true),
+    /**
      * How anton answered, in `ThreadOutcome`'s own vocabulary (review-fix-context.ts). Counted from
      * the outcomes that SURVIVED triage, so a "fixed" claim with nothing pushed — a fabrication
      * (`fabricatedFix`) — is not counted as a fix.

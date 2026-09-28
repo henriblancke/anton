@@ -18,6 +18,7 @@ import type { PrReview, ReviewThread } from "./git/pr";
 import { ANTON_MARK } from "./git/pr";
 import type { ThreadOutcome } from "./jobs/review-fix-context";
 import {
+  recordPrReopened,
   recordPrTerminalState,
   recordReviewRound,
   roundCounts,
@@ -54,7 +55,7 @@ function thread(
   };
 }
 
-function prWith(threads: ReviewThread[]): PrReview {
+function prWith(threads: ReviewThread[], threadsComplete = true): PrReview {
   return {
     number: 331,
     state: "OPEN",
@@ -67,6 +68,7 @@ function prWith(threads: ReviewThread[]): PrReview {
     failingChecks: [],
     pendingChecks: 0,
     threads,
+    threadsComplete,
   };
 }
 
@@ -97,6 +99,7 @@ describe("roundCounts", () => {
       outcomesNeedsHuman: 1,
       // The whole reason the record is worth keeping: a bot's volume and a human's are distinguishable.
       byAuthor: { "claude[bot]": 2, henri: 1 },
+      threadsComplete: true,
     });
   });
 
@@ -171,7 +174,15 @@ describe("roundCounts", () => {
       outcomesLeft: 0,
       outcomesNeedsHuman: 0,
       byAuthor: {},
+      threadsComplete: true,
     });
+  });
+
+  it("flags a round as incomplete when the PR's thread read degraded (PR #335 review)", () => {
+    // A GraphQL failure yields an empty or truncated `threads` indistinguishable from a genuinely
+    // clean PR unless the round also carries `threadsComplete: false`.
+    const pr = prWith([], false);
+    expect(roundCounts(pr, [], false)).toMatchObject({ threadsSeen: 0, threadsComplete: false });
   });
 });
 
@@ -370,6 +381,57 @@ describe("recordPrTerminalState", () => {
     });
 
     expect(rows()).toHaveLength(0);
+  });
+});
+
+describe("recordPrReopened", () => {
+  const record = (prNumber: number) =>
+    recordReviewRound(t.db, clock, {
+      projectId: PROJECT,
+      prNumber,
+      pr: FIXTURE,
+      report: FIXTURE_REPORT,
+      pushed: true,
+    });
+
+  it("restamps a PR reopened and closed again without another round in between (PR #335 review)", async () => {
+    await record(331);
+    await recordPrTerminalState(t.db, clock, { projectId: PROJECT, prNumber: 331, state: "closed" });
+
+    // The PR reopened and stayed clean — no round dispatched, so no fresh null-state row exists for
+    // `recordPrTerminalState`'s heuristic to find. `recordPrReopened` is the observation that fills
+    // that gap.
+    await recordPrReopened(t.db, { projectId: PROJECT, prNumber: 331 });
+    const laterClock: Clock = { now: () => T0 + 9000 };
+    await recordPrTerminalState(t.db, laterClock, { projectId: PROJECT, prNumber: 331, state: "closed" });
+
+    expect(rows()[0]).toMatchObject({ prState: "closed" });
+    expect(rows()[0].prStateAt?.getTime()).toBe(T0 + 9000);
+  });
+
+  it("does nothing to a PR that was never closed", async () => {
+    await record(331);
+    await recordPrReopened(t.db, { projectId: PROJECT, prNumber: 331 });
+
+    expect(rows()[0]).toMatchObject({ prState: null });
+  });
+
+  it("does not disturb a merged PR — GitHub does not allow reopening one", async () => {
+    await record(331);
+    await recordPrTerminalState(t.db, clock, { projectId: PROJECT, prNumber: 331, state: "merged" });
+
+    await recordPrReopened(t.db, { projectId: PROJECT, prNumber: 331 });
+
+    expect(rows()[0]).toMatchObject({ prState: "merged" });
+  });
+
+  it("swallows a write against a broken db", async () => {
+    const boom = () => {
+      throw new Error("SQLITE_BUSY: database is locked");
+    };
+    await expect(
+      recordPrReopened({ update: boom } as unknown as AntonDb, { projectId: PROJECT, prNumber: 331 }),
+    ).resolves.toBeUndefined();
   });
 });
 

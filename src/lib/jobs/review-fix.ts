@@ -112,7 +112,7 @@ import {
   triageOutcomes,
   type ThreadOutcome,
 } from "./review-fix-context";
-import { recordPrTerminalState, recordReviewRound } from "../review-rounds";
+import { recordPrReopened, recordPrTerminalState, recordReviewRound } from "../review-rounds";
 import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
@@ -291,6 +291,11 @@ async function dispatchInReview(args: {
           prNumber: triage.prNumber,
           state: "closed",
         });
+      }
+      // The counterpart observation (PR #335 review): a PR that reopens, stays clean, and closes
+      // again would otherwise leave no evidence of the reopen for the next close to find.
+      if (triage.state === "OPEN" && triage.prNumber !== undefined) {
+        await recordPrReopened(db, { projectId, prNumber: triage.prNumber });
       }
       if (!triage.needsFix) continue;
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
@@ -1128,10 +1133,11 @@ async function recordThreadOutcome(
   await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
   const resolved =
     item.outcome === "fixed" && (await safe(() => resolveReviewThread(repo, thread.id, signal)));
+  // Best-effort: a diagnostic log write must never cost an already-delivered outcome (PR #335 review).
   await appendSessionLog(
     logPath,
     `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
-  );
+  ).catch(() => {});
   return replied || resolved;
 }
 

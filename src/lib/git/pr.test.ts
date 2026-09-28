@@ -35,6 +35,7 @@ function pr(overrides: Partial<PrReview> = {}): PrReview {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
     ...overrides,
   };
 }
@@ -216,6 +217,7 @@ process.exit(0);
     // The unresolved thread lived on page 2 — proving it actually reached the classifier is the
     // whole point: a truncated fetch would report this PR clean.
     expect(classifyReview(review).actionable).toBe(true);
+    expect(review.threadsComplete).toBe(true);
   });
 
   it("preserves already-fetched pages when a later page fails", async () => {
@@ -255,5 +257,34 @@ process.exit(0);
     const review = await getPrReview(sandbox, 7);
     expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
     expect(classifyReview(review).actionable).toBe(true);
+    // The fetch never reached page 2 — a caller persisting counts from this must not read them as
+    // the PR's whole thread history (PR #335 review).
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  it("marks the read incomplete outright when the GraphQL call fails before any page lands", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') { process.stderr.write('boom'); process.exit(1); }
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads).toEqual([]);
+    expect(review.threadsComplete).toBe(false);
   });
 });

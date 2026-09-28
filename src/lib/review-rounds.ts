@@ -43,6 +43,13 @@ export interface RoundCounts {
   outcomesNeedsHuman: number;
   /** Actionable threads per reviewer login — see {@link roundCounts}. */
   byAuthor: Record<string, number>;
+  /**
+   * Whether the `threads*` counts above are the PR's whole inline history (`pr.threadsComplete`,
+   * git/pr.ts) rather than an understated prefix left by a failed GraphQL page. False on a round
+   * whose GitHub thread read degraded — checked by a reader BEFORE trusting a low or zero
+   * `threadsSeen`/`threadsUnresolved`/`threadsOutdated`/`threadsActionable` as the real count.
+   */
+  threadsComplete: boolean;
 }
 
 /** Whole-second, like every other timestamp anton writes — see `runs.ts`. */
@@ -84,6 +91,7 @@ export function roundCounts(
     outcomesLeft: outcomes.filter((o) => o === "left").length,
     outcomesNeedsHuman: outcomes.filter((o) => o === "needs-human").length,
     byAuthor: threadsByAuthor(actionable),
+    threadsComplete: pr.threadsComplete,
   };
 }
 
@@ -161,6 +169,7 @@ export async function recordReviewRound(
       outcomesLeft: counts.outcomesLeft,
       outcomesNeedsHuman: counts.outcomesNeedsHuman,
       byAuthorJson: JSON.stringify(counts.byAuthor),
+      threadsComplete: counts.threadsComplete,
       recordedAt: secDate(clock.now()),
     });
   } catch {
@@ -192,6 +201,13 @@ export async function recordReviewRound(
  * `closed` ones included — is restamped to the new close together. Finding none means this is just a
  * repeated poll of an already-settled close, and the call is a no-op so it never bumps `prStateAt`
  * on a fact already recorded.
+ *
+ * That null-row heuristic only sees a reopen that produced another recorded round — a PR that
+ * reopens, stays clean (so no round ever writes a fresh row), and closes again leaves no null row for
+ * the second close to find, and the stale first-close stamp would stand forever. {@link
+ * recordPrReopened} is the counterpart observation that covers this: called wherever anton reads the
+ * PR as OPEN, it unsettles the PR's already-`closed` rows back to null so this function's null-row
+ * check finds real reopen evidence even when no round ran in between.
  */
 export async function recordPrTerminalState(
   db: AntonDb,
@@ -222,6 +238,41 @@ export async function recordPrTerminalState(
       .update(schema.reviewRounds)
       .set({ prState: "closed", prStateAt: secDate(clock.now()) })
       .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))));
+  } catch {
+    // Swallowed on purpose — see the contract above.
+  }
+}
+
+/**
+ * Observe that a PR is OPEN — the counterpart read to `recordPrTerminalState`'s `closed` branch,
+ * called from the same triage that reads PR state every pass (PR #335 review). A PR that closes,
+ * reopens, stays clean (so no round ever writes a fresh row), and closes again would otherwise leave
+ * `recordPrTerminalState`'s null-row check with no evidence of the reopen: it finds no unsettled row,
+ * reads the second close as a repeated poll of the first, and the stale first-close stamp stands.
+ *
+ * Unsettles every row this PR has already stamped `closed` back to null — the same "not yet settled"
+ * state a round's own insert starts from — so the next close finds real reopen evidence and restamps
+ * them all together. A no-op once the rows are already unsettled or the PR was never closed, so
+ * calling this on every OPEN observation (most of them, since OPEN is the common case) costs nothing.
+ * `merged` rows are never touched: GitHub does not allow reopening a merged PR.
+ *
+ * Best-effort by contract, the same rule every write on this table follows — never throws.
+ */
+export async function recordPrReopened(
+  db: AntonDb,
+  input: { projectId: string; prNumber: number },
+): Promise<void> {
+  try {
+    await db
+      .update(schema.reviewRounds)
+      .set({ prState: null, prStateAt: null })
+      .where(
+        and(
+          eq(schema.reviewRounds.projectId, input.projectId),
+          eq(schema.reviewRounds.prNumber, input.prNumber),
+          eq(schema.reviewRounds.prState, "closed"),
+        ),
+      );
   } catch {
     // Swallowed on purpose — see the contract above.
   }

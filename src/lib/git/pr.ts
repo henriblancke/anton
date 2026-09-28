@@ -66,6 +66,13 @@ export interface PrReview {
   pendingChecks: number;
   /** Inline review threads (resolved ones included; filter with threadsNeedingAttention). */
   threads: ReviewThread[];
+  /**
+   * Whether `threads` is the PR's WHOLE inline history, or a degraded read — the GraphQL call failed
+   * outright, or a later page did (see `getReviewThreads`). False makes an empty or short `threads`
+   * distinguishable from a genuinely thread-free PR: a counter that persists `threads.length` without
+   * checking this would report zero or understated counts indistinguishable from a clean PR.
+   */
+  threadsComplete: boolean;
 }
 
 interface GhPrView {
@@ -148,7 +155,7 @@ export async function getPrReview(
     reviews,
     failingChecks,
     pendingChecks,
-    threads: await getReviewThreads(repoPath, number, signal),
+    ...(await getReviewThreads(repoPath, number, signal)),
   };
 }
 
@@ -242,27 +249,32 @@ interface ReviewThreadsPage {
 
 /**
  * Inline review threads via GraphQL — the only API that exposes thread resolution state and the
- * node ids `resolveReviewThread` needs. Best-effort — returns [] on any failure (same contract as
- * the old REST comment fetch), so a missing token degrades to "no inline feedback", not a crash.
+ * node ids `resolveReviewThread` needs. Best-effort — degrades to `{ threads: [], complete: false }`
+ * on any failure (same contract as the old REST comment fetch), so a missing token reads as "no
+ * inline feedback", not a crash.
  *
  * Paginated: a PR that has collected over 100 threads (routine on a long-running epic with a bot
  * reviewer commenting every round) used to have everything past the first page silently dropped,
  * including whichever thread was actually unresolved — `threadsNeedingAttention` never saw it, so
  * `classifyReview` reported the PR clean and the dispatcher skipped it with nothing to show for why.
  *
- * A later-page failure breaks the loop and returns the pages already fetched rather than throwing
- * to the outer catch and discarding every completed page — losing page 1's unresolved threads would
- * misclassify a >100-thread PR as clean the same way truncation did.
+ * A later-page failure breaks the loop and returns the pages already fetched (marked `complete:
+ * false`) rather than throwing to the outer catch and discarding every completed page — losing page
+ * 1's unresolved threads would misclassify a >100-thread PR as clean the same way truncation did.
+ * `classifyReview`/`threadsNeedingAttention` still act on the partial list (some feedback acted on
+ * beats none), but a caller PERSISTING counts from `threads` (e.g. `recordReviewRound`) must check
+ * `complete` first — a degraded read must not be indistinguishable from a genuinely thread-free PR.
  */
 async function getReviewThreads(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
-): Promise<ReviewThread[]> {
+): Promise<{ threads: ReviewThread[]; threadsComplete: boolean }> {
   const allNodes: RawReviewThreadNode[] = [];
+  let complete = true;
   try {
     const nwo = await nameWithOwner(repoPath, signal);
-    if (!nwo) return [];
+    if (!nwo) return { threads: [], threadsComplete: false };
     const [owner, repo] = nwo.split("/");
 
     let cursor: string | undefined;
@@ -283,7 +295,9 @@ async function getReviewThreads(
         );
         parsed = JSON.parse(raw) as ReviewThreadsPage;
       } catch {
-        // Keep the pages already fetched; a failed first page still degrades to [].
+        // Keep the pages already fetched, but flag the read as incomplete — a failed first page
+        // still degrades to an empty, incomplete list.
+        complete = false;
         break;
       }
       const page = parsed.data?.repository?.pullRequest?.reviewThreads;
@@ -292,10 +306,10 @@ async function getReviewThreads(
       cursor = page.pageInfo.endCursor;
     }
   } catch {
-    return [];
+    return { threads: [], threadsComplete: false };
   }
 
-  return allNodes
+  const threads = allNodes
     .filter((n) => typeof n?.id === "string")
     .map((n) => ({
       id: n.id!,
@@ -311,6 +325,7 @@ async function getReviewThreads(
           body: c.body ?? "",
         })),
     }));
+  return { threads, threadsComplete: complete };
 }
 
 /**
