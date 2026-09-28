@@ -152,6 +152,13 @@ describe("roundCounts", () => {
     });
   });
 
+  it("counts a reviewer whose login shadows an Object.prototype member", () => {
+    // "constructor" as a plain key would read back Object.prototype.constructor instead of
+    // undefined, so `?? 0` never fires and the count comes out corrupted.
+    const pr = prWith([thread("RT_1", [["constructor", "nit"]])]);
+    expect(roundCounts(pr, [], false)).toMatchObject({ byAuthor: { constructor: 1 } });
+  });
+
   it("counts a round with no inline threads at all as zeros, not as nothing", () => {
     // A CI-only or merge-conflict round: real review work, over no threads. The zeros say so —
     // distinct from the no-row a polling tick leaves.
@@ -309,6 +316,48 @@ describe("recordPrTerminalState", () => {
 
     expect(rows()[0]).toMatchObject({ prState: "merged" });
     expect(rows()[0].prStateAt?.getTime()).toBe(T0 + 9000);
+  });
+
+  it("restamps every row together when a reopened PR closes again", async () => {
+    await record(331);
+    await recordPrTerminalState(t.db, clock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      state: "closed",
+    });
+
+    // The PR was reopened for another round, then closed again without merging.
+    await record(331);
+    const laterClock: Clock = { now: () => T0 + 9000 };
+    await recordPrTerminalState(t.db, laterClock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      state: "closed",
+    });
+
+    // Both rows must agree on the same, later close — not one stuck at the first close.
+    expect(rows().map((r) => [r.round, r.prState, r.prStateAt?.getTime()])).toEqual([
+      [1, "closed", T0 + 9000],
+      [2, "closed", T0 + 9000],
+    ]);
+  });
+
+  it("does not refresh prStateAt on a repeat poll of an already-settled close", async () => {
+    await record(331);
+    await recordPrTerminalState(t.db, clock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      state: "closed",
+    });
+
+    await recordPrTerminalState(t.db, { now: () => T0 + 9000 }, {
+      projectId: PROJECT,
+      prNumber: 331,
+      state: "closed",
+    });
+
+    expect(rows()[0]).toMatchObject({ prState: "closed" });
+    expect(rows()[0].prStateAt?.getTime()).toBe(T0);
   });
 
   it("writes nothing for a PR with no recorded rounds", async () => {

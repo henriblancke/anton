@@ -89,7 +89,9 @@ export function roundCounts(
 
 /** Threads grouped by the author of their opening comment — an empty thread belongs to nobody. */
 function threadsByAuthor(threads: readonly ReviewThread[]): Record<string, number> {
-  const byAuthor: Record<string, number> = {};
+  // Object.create(null): a login like "constructor" or "toString" must not read back an
+  // inherited Object.prototype member instead of a missing count.
+  const byAuthor: Record<string, number> = Object.create(null);
   for (const thread of threads) {
     const opener = thread.comments[0]?.author;
     if (!opener) continue;
@@ -181,6 +183,15 @@ export async function recordReviewRound(
  * Writes nothing when the PR has no rows — a PR whose every round predates this table, or one anton
  * only ever polled. That is the intended gap: a reader reports the rounds it has, and a synthesized
  * row would report a PR nobody reviewed.
+ *
+ * A `closed` PR can also be REOPENED and closed again without merging — a round dispatched in
+ * between leaves a fresh null-`prState` row alongside the earlier round's `closed` stamp from the
+ * first close. Restamping only that null row (the naive fix) would leave the two rows disagreeing
+ * about when the PR ended. So a `closed` call first checks for a null row: finding one means a round
+ * actually ran since the last close (real reopen evidence), and every row for the PR — the stale
+ * `closed` ones included — is restamped to the new close together. Finding none means this is just a
+ * repeated poll of an already-settled close, and the call is a no-op so it never bumps `prStateAt`
+ * on a fact already recorded.
  */
 export async function recordPrTerminalState(
   db: AntonDb,
@@ -188,18 +199,29 @@ export async function recordPrTerminalState(
   input: { projectId: string; prNumber: number; state: PrTerminalState },
 ): Promise<void> {
   try {
+    const forPr = and(
+      eq(schema.reviewRounds.projectId, input.projectId),
+      eq(schema.reviewRounds.prNumber, input.prNumber),
+    );
+
+    if (input.state === "merged") {
+      await db
+        .update(schema.reviewRounds)
+        .set({ prState: "merged", prStateAt: secDate(clock.now()) })
+        .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))));
+      return;
+    }
+
+    const unsettled = await db
+      .select({ n: count() })
+      .from(schema.reviewRounds)
+      .where(and(forPr, isNull(schema.reviewRounds.prState)));
+    if ((unsettled[0]?.n ?? 0) === 0) return;
+
     await db
       .update(schema.reviewRounds)
-      .set({ prState: input.state, prStateAt: secDate(clock.now()) })
-      .where(
-        and(
-          eq(schema.reviewRounds.projectId, input.projectId),
-          eq(schema.reviewRounds.prNumber, input.prNumber),
-          input.state === "merged"
-            ? or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))
-            : isNull(schema.reviewRounds.prState),
-        ),
-      );
+      .set({ prState: "closed", prStateAt: secDate(clock.now()) })
+      .where(and(forPr, or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))));
   } catch {
     // Swallowed on purpose — see the contract above.
   }
