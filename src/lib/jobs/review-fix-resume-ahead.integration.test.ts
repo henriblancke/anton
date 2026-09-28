@@ -250,6 +250,12 @@ process.exit(0);`,
       expect(edits).toHaveLength(1);
       expect(edits[0]?.pr).toBe("101");
       expect(edits[0]?.body).toContain("### Review-fix rounds");
+
+      // And NO round row (anton-z5e3g). The PR-body region above is about what reached the remote;
+      // the round record is about review anton did, and this path reviewed nothing — it pushed an
+      // operator's own commits through the gates. A row here would credit anton with a review round
+      // no reviewer's finding was ever handed to.
+      expect(await tdb.db.select().from(schema.reviewRounds)).toHaveLength(0);
     });
 
     it("parks a red gate on an already-ahead branch and pushes nothing", async () => {
@@ -286,6 +292,12 @@ process.exit(0);`,
       // claude WAS dispatched exactly once — the normal path, unchanged by the fast path above.
       const calls = readFileSync(claudeCallLog, "utf8").trim().split("\n").filter(Boolean);
       expect(calls).toHaveLength(1);
+
+      // …and THAT is the round that records (anton-z5e3g) — the same job type as the fast path above,
+      // separated by the one thing the record is grained on: whether claude was handed the review.
+      const rounds = await tdb.db.select().from(schema.reviewRounds);
+      expect(rounds).toHaveLength(1);
+      expect(rounds[0]).toMatchObject({ projectId, beadId: epicId, prNumber: 103, round: 1 });
 
       g(repo, ["fetch", "-q", "origin"]);
       const remoteLog = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/${branch}`], {

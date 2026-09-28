@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { BODY_REGION_END, BODY_REGION_START } from "./steps/prompts";
 import {
   extractFixRoundsRegion,
+  fallbackReasonsFor,
   fixRoundFrom,
   nextFixRoundsRegion,
   parseDroppedCount,
@@ -18,6 +19,22 @@ import {
 import type { ThreadOutcome } from "./review-fix-context";
 
 const now = new Date("2026-09-23T12:00:00Z");
+
+describe("fallbackReasonsFor", () => {
+  it("passes the reasons through when the raw report is empty (CI-only/conflict-only trigger)", () => {
+    expect(fallbackReasonsFor([], ["failing checks: claude-review"])).toEqual([
+      "failing checks: claude-review",
+    ]);
+  });
+
+  it("suppresses the reasons when the raw report is nonempty — even if every outcome failed to deliver", () => {
+    // e.g. every reply/resolve attempt failed against GitHub: `delivered` came back empty, but the
+    // model DID emit a reporting contract, so this is not the no-report case the fallback exists
+    // for — those threads are still waiting on a retry, not answered.
+    const rawReport: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }];
+    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([]);
+  });
+});
 
 describe("fixRoundFrom", () => {
   it("renders a round from a thread report, one line per fixed thread", () => {

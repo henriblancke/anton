@@ -15,13 +15,14 @@ import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
 import type { JobContext } from "./runner";
 import { GH_BIN_ENV } from "../git/ops";
-import { ANTON_MARK, type PrReview, type ReviewThread } from "../git/pr";
+import { ANTON_MARK, type PrActivity, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
 import {
   applyThreadOutcomes,
   claimOwnerFor,
   inReviewEpics,
   makeReviewFixHandler,
+  makeReviewFixPrHandler,
   notifyGateParked,
   parseThreadReport,
   prepareFixWorktree,
@@ -36,16 +37,27 @@ import type { ProjectSettings } from "../projects";
 
 /** The board read the dispatcher triages off. Everything else in beads stays real. */
 const listMock = vi.fn();
+/** `fixOnePr`'s post-fix dolt sync — resolved by default so its `.catch` never sees `undefined`. */
+const syncMock = vi.fn().mockResolvedValue(undefined);
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
-  return { ...actual, beads: { ...actual.beads, list: (...a: unknown[]) => listMock(...a), sync: vi.fn() } };
+  return {
+    ...actual,
+    beads: { ...actual.beads, list: (...a: unknown[]) => listMock(...a), sync: (...a: unknown[]) => syncMock(...a) },
+  };
 });
 
 /** The one `gh` read per target. `classifyReview` stays real — the verdict is what is under test. */
 const getPrReviewMock = vi.fn();
+/** The lighter state-only read orphaned-round reconciliation uses instead of `getPrReview`. */
+const getPrActivityMock = vi.fn();
 vi.mock("../git/pr", async () => {
   const actual = await vi.importActual<typeof import("../git/pr")>("../git/pr");
-  return { ...actual, getPrReview: (...a: unknown[]) => getPrReviewMock(...a) };
+  return {
+    ...actual,
+    getPrReview: (...a: unknown[]) => getPrReviewMock(...a),
+    getPrActivity: (...a: unknown[]) => getPrActivityMock(...a),
+  };
 });
 
 const resolveOperatorMock = vi.fn();
@@ -287,6 +299,7 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
   };
 
   const fakeCtx = (): JobContext =>
@@ -389,6 +402,16 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
+    ...over,
+  });
+
+  const prActivity = (number: number, over: Partial<PrActivity> = {}): PrActivity => ({
+    number,
+    state: "OPEN",
+    url: `https://example.test/pull/${number}`,
+    updatedAtMs: 1_700_000_000_000,
+    isDraft: false,
     ...over,
   });
 
@@ -446,6 +469,29 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     const job = await getJob(t.db, await dispatch());
     expect(job?.status).toBe("done");
     expect(job?.outcome).toBe("noop");
+    expect(dispatchedTargets()).toEqual([]);
+  });
+
+  // PR #335 review (src/lib/jobs/review-fix.ts:302): a CLOSED target is never dispatched, so this
+  // terminal-state stamp is this pass's only effect on it — same shape as the per-target reopened
+  // observation, `changed: false` would contradict `JobEffect`'s contract if the stamp went uncounted.
+  it("counts a CLOSED target's terminal stamp as a change even though it is never dispatched", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    t.db
+      .insert(schema.reviewRounds)
+      .values({ id: "round-1", projectId: t.projectId, prNumber: 1, round: 1 })
+      .run();
+    getPrReviewMock.mockResolvedValue(openPr(1, { state: "CLOSED" }));
+
+    const job = await getJob(t.db, await dispatch());
+    const prState = t.db
+      .select({ prState: schema.reviewRounds.prState })
+      .from(schema.reviewRounds)
+      .where(eq(schema.reviewRounds.prNumber, 1))
+      .get()?.prState;
+    expect(prState).toBe("closed");
+    expect(job?.outcome).not.toBe("noop");
+    expect(job?.outcomeNote).toBe("examined 1 PR(s) in review, dispatched 0, closed 1 PR(s)");
     expect(dispatchedTargets()).toEqual([]);
   });
 
@@ -525,6 +571,259 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     expect(dispatchedTargets()).toEqual([]);
     expect(getPrReviewMock).not.toHaveBeenCalled(); // not even read — ownership is decided first
   });
+
+  // PR #335 review (src/lib/jobs/review-fix.ts:885): a round's own post-insert freshness check can
+  // still race a merge another instance finalizes mid-`getPrReview`. That instance clears
+  // `stage:in-review` and closes the epic before the racing row is even inserted, so the PR never
+  // reappears in `targets` — the row's `pr_state` would otherwise stay null forever.
+  describe("orphaned-round reconciliation", () => {
+    const insertUnsettledRound = (prNumber: number) =>
+      t.db
+        .insert(schema.reviewRounds)
+        .values({ id: `round-${prNumber}`, projectId: t.projectId, prNumber, round: 1 })
+        .run();
+
+    const prStateOf = (prNumber: number) =>
+      t.db
+        .select({ prState: schema.reviewRounds.prState })
+        .from(schema.reviewRounds)
+        .where(eq(schema.reviewRounds.prNumber, prNumber))
+        .get()?.prState ?? null;
+
+    it("stamps a null round whose target already left the board once GitHub confirms it merged", async () => {
+      listMock.mockResolvedValue([]); // the epic that owned PR #9 already closed and dropped off
+      insertUnsettledRound(9);
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "MERGED" }));
+
+      const job = await getJob(t.db, await dispatch());
+      expect(prStateOf(9)).toBe("merged");
+      expect(job?.outcomeNote).toBe("examined 0 PR(s) in review, dispatched 0, reconciled 1 orphaned PR(s)");
+      expect(job?.outcome).not.toBe("noop");
+    });
+
+    it("stamps closed the same way, and leaves a still-open orphan null for the next pass", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      insertUnsettledRound(10);
+      getPrActivityMock.mockImplementation(async (_repo: string, number: number) =>
+        number === 9 ? prActivity(9, { state: "CLOSED" }) : prActivity(10, { state: "OPEN" }),
+      );
+
+      await dispatch();
+      expect(prStateOf(9)).toBe("closed");
+      expect(prStateOf(10)).toBeNull();
+    });
+
+    it("does not re-read a PR the ordinary triage loop already covered this pass", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      insertUnsettledRound(1); // same PR the in-review target already names
+      getPrReviewMock.mockResolvedValue(openPr(1, { state: "MERGED" }));
+
+      await dispatch();
+      // Reconciliation must skip a PR the triage loop already read via `getPrReview` — it never
+      // falls through to the lighter `getPrActivity` reader for a PR that isn't orphaned.
+      expect(getPrReviewMock).toHaveBeenCalledTimes(1);
+      expect(getPrActivityMock).not.toHaveBeenCalled();
+    });
+
+    // PR #335 review (src/lib/review-rounds.ts:259): a `closed` orphan row must stay eligible for
+    // reconciliation — GitHub allows reopening a closed PR (never a merged one), so a row this same
+    // sweep already stamped `closed` is the one row most likely to need upgrading to `merged` next.
+    it("upgrades an already-closed orphan row once GitHub shows it reopened and merged", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      t.db
+        .update(schema.reviewRounds)
+        .set({ prState: "closed", prStateAt: new Date(clock.now()) })
+        .where(eq(schema.reviewRounds.prNumber, 9))
+        .run();
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "MERGED" }));
+
+      await dispatch();
+      expect(prStateOf(9)).toBe("merged");
+    });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:350): an orphan already stamped `closed` has no
+    // OPEN branch in the state chain unless this reconciliation restores one — without it, a PR
+    // that reopens and closes again without merging would be read as a repeated poll of the first
+    // close, and the row would keep its stale first-close timestamp.
+    it("resets an already-closed orphan row back to unsettled when GitHub reports it reopened", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      t.db
+        .update(schema.reviewRounds)
+        .set({ prState: "closed", prStateAt: new Date(clock.now()) })
+        .where(eq(schema.reviewRounds.prNumber, 9))
+        .run();
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "OPEN" }));
+
+      await dispatch();
+      expect(prStateOf(9)).toBeNull();
+    });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:350): `unsettledPrNumbers` deliberately keeps
+    // returning an orphan stamped `closed` forever, so a repeated poll of a PR that stays closed
+    // must not keep incrementing `reconciled` — that would report `changed: true` and a fabricated
+    // reconciliation count on a pass that restamped nothing.
+    it("does not count a repeated poll of an already-closed orphan as reconciled", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      t.db
+        .update(schema.reviewRounds)
+        .set({ prState: "closed", prStateAt: new Date(clock.now()) })
+        .where(eq(schema.reviewRounds.prNumber, 9))
+        .run();
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "CLOSED" }));
+
+      const job = await getJob(t.db, await dispatch());
+      expect(prStateOf(9)).toBe("closed");
+      expect(job?.outcomeNote).toBe("nothing in review");
+      expect(job?.outcome).toBe("noop");
+    });
+
+    it("never reconciles on a targeted single-epic run", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      insertUnsettledRound(9); // orphaned, but this run is scoped to epicBeadId "e-1"
+      getPrReviewMock.mockResolvedValue(openPr(1));
+
+      await driveJob({
+        db: t.db,
+        clock,
+        type: "review-fix",
+        handler: makeReviewFixHandler,
+        projectId: t.projectId,
+        payload: { projectId: t.projectId, epicBeadId: "e-1" },
+        config: { leaseMs: 30_000 },
+      });
+      expect(prStateOf(9)).toBeNull();
+      expect(getPrReviewMock).toHaveBeenCalledTimes(1); // only PR #1, never #9
+      expect(getPrActivityMock).not.toHaveBeenCalled();
+    });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:362): `targets` already excludes an epic another
+    // operator claimed (`ownedByOperator`), so its PR number never lands in `triagedNumbers` even
+    // though it is not actually orphaned — it is simply owned elsewhere. Without also excluding it
+    // here, this operator would re-read every other operator's in-review PR via `getPrActivity` on
+    // every pass, scaling with total shared-board activity instead of true orphans.
+    it("does not treat a target another operator claimed as an orphan", async () => {
+      listMock.mockResolvedValue([{ ...target("e-1", 9), assignee: "bob" }]); // claimed by bob, this pass is alice
+      insertUnsettledRound(9); // bob's fix job hasn't run yet — the round row is still null
+
+      await dispatch();
+      expect(getPrReviewMock).not.toHaveBeenCalled(); // excluded from `targets` by ownership
+      expect(getPrActivityMock).not.toHaveBeenCalled(); // must not be re-read as an "orphan" either
+      expect(prStateOf(9)).toBeNull();
+    });
+
+    // PR #335 review: a bead another operator claimed keeps its assignee even after it closes, so
+    // scoping the exclusion from every assigned bead (rather than active ones) would exclude its PR
+    // from reconciliation forever — no operator's dispatch loop ever revisits a closed epic, so a
+    // round row left null by a late-insert race (the scenario this whole reconciliation pass exists
+    // for) would never get stamped.
+    it("still reconciles an orphan whose epic closed while claimed by another operator", async () => {
+      listMock.mockResolvedValue([
+        { ...target("e-1", 9), assignee: "bob", status: "closed" },
+      ]);
+      insertUnsettledRound(9);
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "MERGED" }));
+
+      await dispatch();
+      expect(getPrActivityMock).toHaveBeenCalled(); // closed epic no longer shields its PR
+      expect(prStateOf(9)).toBe("merged");
+    });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:409): `heartbeat()` never throws for an aborted
+    // signal, so the runner's own no-progress timeout firing while `getPrActivity` is pending used
+    // to be swallowed as an ordinary unreadable PR — a pass containing only orphan reconciliation
+    // then settled the job successfully instead of the abort failing it (and the runner retrying).
+    // Drives `makeReviewFixHandler` directly with a signal that is already aborted by the time
+    // `getPrActivity` rejects, the same shape a real no-progress abort takes — deterministic, with
+    // no dependency on the runner's real timers.
+    it("re-throws (rather than swallowing) an aborted signal from orphan reconciliation", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      const controller = new AbortController();
+      getPrActivityMock.mockImplementation(
+        () =>
+          new Promise<never>((_resolve, reject) => {
+            const rejectAborted = () => reject(new DOMException("aborted", "AbortError"));
+            if (controller.signal.aborted) rejectAborted();
+            else controller.signal.addEventListener("abort", rejectAborted);
+          }),
+      );
+
+      const handler = makeReviewFixHandler({ db: t.db, clock });
+      const ctx: JobContext = {
+        jobId: "job-test",
+        type: "review-fix",
+        payload: { projectId: t.projectId },
+        attempt: 1,
+        heartbeat: async () => {},
+        signal: controller.signal,
+      } as JobContext;
+
+      const pending = handler(ctx);
+      controller.abort(); // the runner's own no-progress timeout, simulated
+      await expect(pending).rejects.toThrow(/aborted/);
+      expect(prStateOf(9)).toBeNull(); // never reconciled — the abort must not read as a clean sweep
+    });
+  });
+
+  describe("makeReviewFixPrHandler (the per-PR worker)", () => {
+    const fixDispatch = (epicBeadId: string) =>
+      driveJob({
+        db: t.db,
+        clock,
+        type: "review-fix-pr",
+        handler: makeReviewFixPrHandler,
+        projectId: t.projectId,
+        payload: { projectId: t.projectId, epicBeadId },
+        config: { leaseMs: 30_000 },
+      });
+
+    // PR #335 review (src/lib/jobs/review-fix.ts:570): a PR first observed CLOSED here stamps a
+    // terminal round row (the dispatcher's own re-read of the same target could already be a pass
+    // away), but `classifyReview` treats CLOSED as not-actionable, so `handleEpic` falls straight
+    // through to a "clean" outcome. Without propagating the stamp's own result, `fixOnePr` would
+    // report `changed: false` even though this call's only effect was moving the ledger.
+    it("reports changed when a CLOSED PR's terminal stamp is this run's only effect", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      t.db
+        .insert(schema.reviewRounds)
+        .values({ id: "round-1", projectId: t.projectId, prNumber: 1, round: 1 })
+        .run();
+      getPrReviewMock.mockResolvedValue(openPr(1, { state: "CLOSED" }));
+
+      const job = await getJob(t.db, await fixDispatch("e-1"));
+      const prState = t.db
+        .select({ prState: schema.reviewRounds.prState })
+        .from(schema.reviewRounds)
+        .where(eq(schema.reviewRounds.prNumber, 1))
+        .get()?.prState;
+      expect(prState).toBe("closed");
+      expect(job?.outcome).not.toBe("noop");
+      expect(job?.outcomeNote).toBe("e-1: nothing actionable on the PR");
+    });
+
+    it("reports unchanged when a CLOSED PR's round is already settled and nothing moves", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      t.db
+        .insert(schema.reviewRounds)
+        .values({
+          id: "round-1",
+          projectId: t.projectId,
+          prNumber: 1,
+          round: 1,
+          prState: "closed",
+          prStateAt: new Date(clock.now()),
+        })
+        .run();
+      getPrReviewMock.mockResolvedValue(openPr(1, { state: "CLOSED" }));
+
+      const job = await getJob(t.db, await fixDispatch("e-1"));
+      expect(job?.outcome).toBe("noop");
+    });
+  });
 });
 
 /**
@@ -539,10 +838,12 @@ describe("applyThreadOutcomes (reactions)", () => {
   let logFile: string;
   let prevGh: string | undefined;
   let prevFail: string | undefined;
+  let prevFailReplies: string | undefined;
 
   /** Fake gh: answers `repo view`, and logs every other invocation's argv as one JSON line. Fails
-   * any call touching `/reactions` when ANTON_TEST_FAIL_REACTIONS=1, so the "best-effort" contract
-   * can be proven without a real network failure. */
+   * any call touching `/reactions` when ANTON_TEST_FAIL_REACTIONS=1, or `/replies` when
+   * ANTON_TEST_FAIL_REPLIES=1, so the "best-effort" contract (and what counts as delivered) can be
+   * proven without a real network failure. */
   function installFakeGh(): void {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
@@ -550,9 +851,16 @@ describe("applyThreadOutcomes (reactions)", () => {
       `#!/usr/bin/env node
 const fs = require('fs');
 const a = process.argv.slice(2);
-if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'repo' && a[1] === 'view') {
+  process.stdout.write(process.env.ANTON_TEST_EMPTY_NWO === '1' ? '\\n' : 'o/r\\n');
+  process.exit(0);
+}
 fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
 if (process.env.ANTON_TEST_FAIL_REACTIONS === '1' && a.some((x) => x.includes('/reactions'))) {
+  process.stderr.write('boom');
+  process.exit(1);
+}
+if (process.env.ANTON_TEST_FAIL_REPLIES === '1' && a.some((x) => x.includes('/replies'))) {
   process.stderr.write('boom');
   process.exit(1);
 }
@@ -594,6 +902,7 @@ process.exit(0);
       failingChecks: [],
       pendingChecks: 0,
       threads,
+      threadsComplete: true,
     };
   }
 
@@ -617,9 +926,12 @@ process.exit(0);
     installFakeGh();
     prevGh = process.env[GH_BIN_ENV];
     prevFail = process.env.ANTON_TEST_FAIL_REACTIONS;
+    prevFailReplies = process.env.ANTON_TEST_FAIL_REPLIES;
     process.env[GH_BIN_ENV] = join(binDir, "gh");
     process.env.ANTON_TEST_GH_LOG = logFile;
     delete process.env.ANTON_TEST_FAIL_REACTIONS;
+    delete process.env.ANTON_TEST_FAIL_REPLIES;
+    delete process.env.ANTON_TEST_EMPTY_NWO;
   });
 
   afterEach(() => {
@@ -627,7 +939,10 @@ process.exit(0);
     else process.env[GH_BIN_ENV] = prevGh;
     if (prevFail === undefined) delete process.env.ANTON_TEST_FAIL_REACTIONS;
     else process.env.ANTON_TEST_FAIL_REACTIONS = prevFail;
+    if (prevFailReplies === undefined) delete process.env.ANTON_TEST_FAIL_REPLIES;
+    else process.env.ANTON_TEST_FAIL_REPLIES = prevFailReplies;
     delete process.env.ANTON_TEST_GH_LOG;
+    delete process.env.ANTON_TEST_EMPTY_NWO;
     rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -663,20 +978,70 @@ process.exit(0);
   });
 
   it("posts no reaction (and no reply) for a fabricated fix — claimed fixed with nothing pushed", async () => {
-    await run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], false);
+    const delivered = await run(
+      [{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }],
+      [thread()],
+      false,
+    );
 
     expect(ghCalls()).toEqual([]);
+    expect(delivered).toEqual([]);
   });
 
-  it("a reaction failure is best-effort — the reply still lands and the run stays green", async () => {
+  it("a reaction failure is best-effort — the reply still lands, counts as delivered, and the run stays green", async () => {
     process.env.ANTON_TEST_FAIL_REACTIONS = "1";
 
-    await expect(
-      run([{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }], [thread()], true),
-    ).resolves.toBeUndefined();
+    const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([item]);
 
     const reply = ghCalls().find((c) => c.some((x) => x.includes("/replies")));
     expect(reply).toBeDefined();
+  });
+
+  it("a reply failure on a fixed thread still counts as delivered when the resolve went through — a resolved thread never resurfaces for a later round to retry", async () => {
+    process.env.ANTON_TEST_FAIL_REPLIES = "1";
+
+    const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([item]);
+
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
+
+  it("a reply failure on a non-fixed thread (no resolve to fall back on) is not counted as delivered", async () => {
+    process.env.ANTON_TEST_FAIL_REPLIES = "1";
+
+    const item = { id: "RT_1", outcome: "left" as const, reply: "style-only, skipped" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([]);
+  });
+
+  // PR #335 review: `replyToReviewComment` used to return normally (no reply posted) when the repo's
+  // `nameWithOwner` resolved empty, so `safe()` — which only reports false on a thrown error — read
+  // that as a successful reply. For a non-fixed outcome there is no resolve to fall back on, so this
+  // is the scenario where a reply that never reached GitHub would have been counted as delivered.
+  it("does not count a reply as delivered when the repo's nameWithOwner resolves empty", async () => {
+    process.env.ANTON_TEST_EMPTY_NWO = "1";
+
+    const item = { id: "RT_1", outcome: "left" as const, reply: "style-only, skipped" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([]);
+    expect(ghCalls()).toEqual([]); // never reached the /replies call at all
+  });
+
+  it("a session-log write failure is best-effort — the delivered reply/resolve still counts (PR #335 review)", async () => {
+    // logPath points at a directory, not a file, so appendSessionLog's appendFile rejects (EISDIR)
+    // while the reply/resolve calls above it in recordThreadOutcome have already gone through.
+    const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    const delivered = await applyThreadOutcomes({
+      repo: sandbox,
+      number: 7,
+      pr: pr([thread()]),
+      report: [item],
+      pushed: true,
+      signal: new AbortController().signal,
+      logPath: sandbox,
+    });
+
+    expect(delivered).toEqual([item]);
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
   });
 });
 

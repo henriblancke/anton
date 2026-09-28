@@ -72,6 +72,7 @@ import {
   ANTON_MARK,
   classifyReview,
   commentOnPr,
+  getPrActivity,
   getPrComments,
   getPrReview,
   prNumberFromRef,
@@ -80,7 +81,6 @@ import {
   replyToReviewComment,
   resolveReviewThread,
   reviewersRequestingChanges,
-  threadsNeedingAttention,
   type Actionable,
   type PrReactionContent,
   type PrReview,
@@ -109,11 +109,17 @@ import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import {
   buildReviewFixPrompt,
-  fabricatedFix,
   parseThreadReport,
+  triageOutcomes,
   type ThreadOutcome,
 } from "./review-fix-context";
-import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
+import {
+  recordPrReopened,
+  recordPrTerminalState,
+  recordReviewRound,
+  unsettledPrNumbers,
+} from "../review-rounds";
+import { fallbackReasonsFor, fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
@@ -231,7 +237,8 @@ export function claimOwnerFor(jobId: string): string {
 /** Build the DISPATCHER handler bound to a db/clock. Register it as the "review-fix" handler. */
 export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
   const db = deps.db;
-  return (ctx: JobContext) => dispatchInReview({ db, ctx });
+  const clock = deps.clock ?? systemClock;
+  return (ctx: JobContext) => dispatchInReview({ db, clock, ctx });
 }
 
 /** Build the PER-PR handler bound to a db/clock. Register it as the "review-fix-pr" handler. */
@@ -247,8 +254,12 @@ export function makeReviewFixPrHandler(deps: ReviewFixDeps): JobHandler {
  * work to its own job. Reads the board once and each PR once — no worktree, no claude, no gates —
  * so the pass costs seconds and always fits inside its poll slot.
  */
-async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise<JobEffect> {
-  const { db, ctx } = args;
+async function dispatchInReview(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+}): Promise<JobEffect> {
+  const { db, clock, ctx } = args;
   const { projectId, epicBeadId } = ctx.payload as ReviewFixPayload;
   const project = await getProjectById(db, projectId);
   if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -263,7 +274,6 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // before dispatching a merged target by id (anton-k0kj).
   const operator = await resolveOperator();
   const targets = inReviewEpics(all, { operator, epicBeadId });
-  if (targets.length === 0) return { changed: false, note: "nothing in review" };
 
   let dispatched = 0;
   // A target the dispatcher declined to (re-)dispatch even though it needs a fix (anton-bzm7s): a
@@ -271,11 +281,42 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // identically — counted apart from `dispatched` so an operator reading the pass's note can tell
   // this suppressed target from a merely-idle one (a clean PR never reaches this loop's insides).
   let suppressed = 0;
+  // A row `recordPrReopened` actually unsettled — a reopened, still-clean PR whose only effect this
+  // pass is that write (anton PR #335 follow-up review): without counting it, `changed` below would
+  // report `false` even though a row moved, contradicting `JobEffect.changed`'s contract.
+  let reopened = 0;
+  // A CLOSED target this pass actually stamped a terminal row for (anton PR #335 review): a
+  // closed-and-never-dispatched PR whose only effect this pass is that stamp would otherwise fall
+  // through to `changed: false`, the same contradiction `reopened` above exists to avoid — counted
+  // apart from `reconciled` since that counter is the orphan sweep's own transitions, not a target's.
+  let closedStamped = 0;
   let lastError: unknown;
   for (const target of targets) {
     await ctx.heartbeat();
     try {
       const triage = await needsFix(repo, target, ctx.signal);
+      // A CLOSED-unmerged PR ends here (anton-z5e3g): it is not actionable, so it is never
+      // dispatched, and this triage read is the ONLY place anton observes the close at all. The
+      // target keeps its `stage:in-review` and PR ref for a recovery run, so it is re-read every
+      // pass — the stamp is first-observation-wins and writes nothing once it has landed.
+      if (triage.state === "CLOSED" && triage.prNumber !== undefined) {
+        if (
+          await recordPrTerminalState(db, clock, {
+            projectId,
+            prNumber: triage.prNumber,
+            state: "closed",
+          })
+        ) {
+          closedStamped += 1;
+        }
+      }
+      // The counterpart observation (PR #335 review): a PR that reopens, stays clean, and closes
+      // again would otherwise leave no evidence of the reopen for the next close to find.
+      if (triage.state === "OPEN" && triage.prNumber !== undefined) {
+        if (await recordPrReopened(db, { projectId, prNumber: triage.prNumber })) {
+          reopened += 1;
+        }
+      }
       if (!triage.needsFix) continue;
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
       // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
@@ -298,18 +339,104 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
     }
   }
 
+  // Terminal reconciliation, independent of board membership (PR #335 review): a round's own
+  // post-insert freshness check (`handleEpic`, below) can still race a merge that another instance
+  // finalizes mid-`getPrReview` — that instance's `finalizeMergedTarget` clears `stage:in-review` and
+  // closes the epic before this row is even inserted, so the PR never appears in `targets` again (not
+  // even as an empty pass — `targets.length === 0` used to return before this ran at all) and its
+  // row's `pr_state` would stay null forever. Reconcile every PR this project has an unsettled round
+  // for that this pass did NOT already triage above (those are already covered) by reading it
+  // directly — one `gh` read per orphaned PR, which is rare by construction. Only on the untargeted,
+  // whole-project sweep: a single-epic run (`epicBeadId` set) has no reason to scan every PR.
+  //
+  // Reads `getPrActivity` (state only), not `getPrReview` (reviews + CI rollup + paginated thread
+  // GraphQL): reconciliation only ever inspects `.state`, and a `closed` orphan is kept in
+  // `unsettledPrNumbers` indefinitely for a possible reopen/merge, so every recurring untargeted
+  // sweep would otherwise pay `getPrReview`'s full cost for every historical closed PR forever
+  // (PR #335 review).
+  let reconciled = 0;
+  if (!epicBeadId) {
+    const triagedNumbers = new Set(
+      targets.map((t) => prNumberFromRef(beads.getPrRef(t))).filter((n): n is number => n !== undefined),
+    );
+    // `targets` already dropped any epic a DIFFERENT operator claimed (`ownedByOperator`, above) —
+    // that PR is still actively worked by its owner, not orphaned, and its round row commonly still
+    // has `pr_state` null while that work is in flight. Without excluding it too, every operator on
+    // a shared board would re-read every OTHER operator's in-review PR here on every pass, scaling
+    // with total shared-board activity instead of true orphans (PR #335 review).
+    //
+    // Restricted to ACTIVE in-review targets (open, run-target, still tagged in-review), not every
+    // bead a different operator has ever been assigned (PR #335 review): an epic another operator
+    // finished and closed keeps its assignee forever, so scoping this from `all` unfiltered would
+    // exclude that PR from reconciliation permanently — even though no operator's dispatch loop will
+    // ever touch it again once it's closed, and its round row could be stuck with a null `pr_state`.
+    const claimedByOtherOperator = new Set(
+      all
+        .filter(
+          (b) =>
+            beads.isRunTarget(b, all) &&
+            b.status !== "closed" &&
+            (b.labels?.includes(IN_REVIEW) ?? false) &&
+            !ownedByOperator(b, operator),
+        )
+        .map((b) => prNumberFromRef(beads.getPrRef(b)))
+        .filter((n): n is number => n !== undefined),
+    );
+    const orphaned = (await unsettledPrNumbers(db, projectId, clock)).filter(
+      (n) => !triagedNumbers.has(n) && !claimedByOtherOperator.has(n),
+    );
+    for (const prNumber of orphaned) {
+      await ctx.heartbeat();
+      try {
+        const latest = await getPrActivity(repo, prNumber, ctx.signal);
+        if (latest.state === "MERGED") {
+          if (await recordPrTerminalState(db, clock, { projectId, prNumber, state: "merged" })) {
+            reconciled += 1;
+          }
+        } else if (latest.state === "CLOSED") {
+          if (await recordPrTerminalState(db, clock, { projectId, prNumber, state: "closed" })) {
+            reconciled += 1;
+          }
+        } else if (latest.state === "OPEN") {
+          // The orphan's own counterpart to the per-target OPEN observation above (PR #335 review):
+          // an orphan stamped `closed` that GitHub now reports reopened has no null row for the next
+          // close to find (nothing here ever writes a fresh round), so without this the state chain
+          // has no OPEN branch and a second close reads as a repeated poll of the first.
+          if (await recordPrReopened(db, { projectId, prNumber })) {
+            reopened += 1;
+          }
+        }
+      } catch (e) {
+        // `heartbeat()` never throws for an aborted signal, so without this check a no-progress
+        // timeout firing mid-read looks like an ordinary unreadable PR and the pass can settle as
+        // done instead of retrying (PR #335 review).
+        if (ctx.signal.aborted) throw e;
+        // One unreadable orphaned PR must not block reconciling the rest — it stays null and is
+        // retried next pass, the same as any other best-effort read in this job.
+        consoleLog.error(`PR #${prNumber}: orphaned-round reconciliation read failed`, e);
+      }
+    }
+  }
+
   // Surface the failure so the job retries/parks — but only after triaging every target, so a
   // reported pass never claims a clean sweep over a PR it could not actually read.
   if (lastError !== undefined) {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
+  if (targets.length === 0 && reconciled === 0 && reopened === 0 && closedStamped === 0) {
+    return { changed: false, note: "nothing in review" };
+  }
+
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
   // nothing, and the counts together are what an operator checks the poll against.
   const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
+  const reconciledNote = reconciled > 0 ? `, reconciled ${reconciled} orphaned PR(s)` : "";
+  const reopenedNote = reopened > 0 ? `, reopened ${reopened} PR(s)` : "";
+  const closedNote = closedStamped > 0 ? `, closed ${closedStamped} PR(s)` : "";
   return {
-    changed: dispatched > 0,
-    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}`,
+    changed: dispatched > 0 || reconciled > 0 || reopened > 0 || closedStamped > 0,
+    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}${reconciledNote}${reopenedNote}${closedNote}`,
   };
 }
 
@@ -318,6 +445,10 @@ interface FixTriage {
   needsFix: boolean;
   /** The PR head's commit SHA — undefined only if the PR could not be identified. */
   headSha?: string;
+  /** OPEN | MERGED | CLOSED as the triage read it; undefined when there is no PR to read. */
+  state?: string;
+  /** The PR this triage read, undefined when the target names none. */
+  prNumber?: number;
 }
 
 /**
@@ -338,6 +469,8 @@ async function needsFix(
   return {
     needsFix: pr.state === "MERGED" || classifyReview(pr).actionable,
     headSha: pr.headSha || undefined,
+    state: pr.state,
+    prNumber: number,
   };
 }
 
@@ -370,7 +503,7 @@ async function fixOnePr(args: {
   if (!epic) return { changed: false, note: `${epicBeadId} is no longer in review` };
 
   try {
-    const outcome = await handleEpic({
+    const { outcome, ledgerChanged } = await handleEpic({
       db,
       clock,
       ctx,
@@ -382,7 +515,13 @@ async function fixOnePr(args: {
       baseBranch: settings.baseBranch ?? project.defaultBranch,
       all,
     });
-    return { changed: outcome !== "clean", note: `${epic.id}: ${OUTCOME_NOTE[outcome]}` };
+    // A "clean" outcome (nothing to push) can still have stamped a terminal/reopen row below
+    // (PR #335 review) — that write is this pass's only effect, so `changed` must reflect it or
+    // automation history claims a job that moved the ledger did nothing.
+    return {
+      changed: outcome !== "clean" || ledgerChanged,
+      note: `${epic.id}: ${OUTCOME_NOTE[outcome]}`,
+    };
   } finally {
     // The claude session above may have written beads (notes, bd remember); push them. This job is
     // the writer now, so the sync moved here with the writes. Logged, not thrown — a sync hiccup
@@ -417,7 +556,7 @@ async function handleEpic(args: {
   /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
   baseBranch: string | undefined;
   all: Bead[];
-}): Promise<PrFixOutcome> {
+}): Promise<{ outcome: PrFixOutcome; ledgerChanged: boolean }> {
   const {
     db,
     clock,
@@ -431,7 +570,7 @@ async function handleEpic(args: {
     all,
   } = args;
   const number = prNumberFromRef(beads.getPrRef(epic));
-  if (number === undefined) return "clean";
+  if (number === undefined) return { outcome: "clean", ledgerChanged: false };
 
   const pr = await getPrReview(repo, number, ctx.signal);
   const branch = pr.headRefName || `${branchPrefix}/${epic.id}`;
@@ -449,21 +588,48 @@ async function handleEpic(args: {
       projectId,
       epic,
       children: runTickets(all, epic.id),
+      prNumber: number,
       branch,
       all,
     });
-    return "merged";
+    return { outcome: "merged", ledgerChanged: true };
+  }
+
+  // A PR that CLOSED between the dispatch and now (anton-z5e3g). `classifyReview` below treats it as
+  // not-actionable and the target is left untouched, so this read would otherwise be discarded — and
+  // the dispatcher, which re-reads every in-review target each pass, would be the only site to ever
+  // record the close. Stamping here too means whichever job first reads the end is the one that
+  // records it; the write is first-observation-wins, so the two sites cannot disagree.
+  //
+  // Both branches feed `ledgerChanged` (PR #335 review): a CLOSED PR always falls through to
+  // `!verdict.actionable` below and returns "clean", so without this a stamp that is this call's
+  // only effect would report `changed: false` and contradict the `JobEffect` contract.
+  let ledgerChanged = false;
+  if (pr.state === "CLOSED") {
+    ledgerChanged = await recordPrTerminalState(db, clock, {
+      projectId,
+      prNumber: number,
+      state: "closed",
+    });
+  }
+
+  // The counterpart observation (PR #335 review), mirrored from the dispatcher's own OPEN branch: a
+  // job queued while the PR was open can run after a later dispatcher pass already stamped a close
+  // and the PR has since reopened. Without this, `recordPrTerminalState`'s null-row heuristic sees no
+  // evidence of that reopen and a subsequent close silently preserves the stale first-close timestamp.
+  if (pr.state === "OPEN") {
+    ledgerChanged = (await recordPrReopened(db, { projectId, prNumber: number })) || ledgerChanged;
   }
 
   const verdict = classifyReview(pr);
-  if (!verdict.actionable) return "clean"; // nothing to fix on this PR yet.
+  if (!verdict.actionable) return { outcome: "clean", ledgerChanged }; // nothing to fix on this PR yet.
 
   // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
   // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
   // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
   // the commit and push behind it.
   const claimOwner = claimOwnerFor(ctx.jobId);
-  return withWorktreeClaim(repo, branch, claimOwner, async () => {
+  const outcome = await withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
     const { worktree, conflicts, alreadyAhead } = await prepareFixWorktree({
@@ -495,6 +661,7 @@ async function handleEpic(args: {
     });
     return pushed ? "pushed" : "answered";
   });
+  return { outcome, ledgerChanged };
 }
 
 /**
@@ -804,18 +971,67 @@ async function runFixSession(args: {
     sessionSettled = true;
 
     const report = parseThreadReport(result.text);
-    await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
+    // `delivered` is the subset of `report` whose reply actually posted (PR #335 review) — what
+    // both the round record and the PR body below must count, not the raw model report, since a
+    // GitHub failure mid-reply leaves that thread still waiting on anton regardless of what claude
+    // claimed.
+    const delivered = await applyThreadOutcomes({
+      repo,
+      number,
+      pr,
+      report,
+      pushed,
+      signal: ctx.signal,
+      logPath,
+    });
+    // The round's own record (anton-z5e3g): what GitHub's reviewers handed this round and how anton
+    // answered it, from the values already in hand. AFTER the outcomes are applied, and only on this
+    // path — a session that threw replied to no thread, so its findings are still waiting on anton
+    // and the retry's row carries them; recording both would count the same review twice. The write
+    // never throws (see `recordReviewRound`), so the fix above cannot be lost to a meter.
+    await recordReviewRound(db, clock, {
+      projectId,
+      beadId: epic.id,
+      jobId: ctx.jobId,
+      prNumber: number,
+      pr,
+      report: delivered,
+      pushed,
+    });
+    // Recheck the terminal state right after the insert above, against a FRESH read rather than the
+    // `pr` snapshot fetched before this session's claude dispatch (PR #335 review). On a shared board,
+    // a second anton instance (its own local review_rounds db) can observe MERGED/CLOSED and move the
+    // target out of in-review while this session was still running — this instance then never revisits
+    // the PR (it has left in-review), so the row just inserted would otherwise be the last one this
+    // instance ever writes for it and would permanently miss the terminal stamp.
+    //
+    // `getPrActivity`, not `getPrReview` (PR #335 review): this recheck only ever inspects `.state`,
+    // same as the dispatcher's own orphan reconciliation above — paying for reviews + CI rollup + a
+    // full paginated GraphQL thread fetch here buys nothing this call reads.
+    const latest = await getPrActivity(repo, number, ctx.signal).catch((e): undefined => {
+      // Same guard as the orphan-reconciliation read above: a no-progress timeout aborting this call
+      // must not settle as best-effort undefined, or the runner never sees the throw it needs to
+      // treat this pass as retryable (PR #335 review).
+      if (ctx.signal.aborted) throw e;
+      return undefined;
+    });
+    if (latest?.state === "MERGED") {
+      await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "merged" });
+    } else if (latest?.state === "CLOSED") {
+      await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "closed" });
+    }
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
-    // no thread report (CI-only/conflict-only/no-inline-threads trigger).
+    // no thread report (CI-only/conflict-only/no-inline-threads trigger); `fallbackReasonsFor` gates
+    // that on the RAW `report`, not `delivered` (PR #335 review).
     await refreshFixRoundsBody({
       repo,
       number,
-      report,
+      report: delivered,
       pushed,
       now: new Date(clock.now()),
       logPath,
-      reasons: verdict.reasons,
+      reasons: fallbackReasonsFor(report, verdict.reasons),
     });
 
     if (!pushed) {
@@ -1025,6 +1241,14 @@ interface ThreadReplyArgs {
  * threadsNeedingAttention); the reaction is the free calibration signal on top, not a substitute
  * for the reply. A "fixed" claim without a push is a fabrication — leave that thread untouched,
  * reply and reaction both.
+ *
+ * Returns only the outcomes that actually reached the PR in a way that stops the thread being
+ * re-triaged: a posted reply, or — for a "fixed" outcome — a resolve that went through on its own
+ * (a resolved thread is gone from `threadsNeedingAttention` regardless of whether the reply landed,
+ * so its delivery must be counted here or nowhere; PR #335 review). A GitHub failure on both must
+ * not report as delivered: the thread is still waiting on anton and would otherwise be counted as
+ * answered nowhere anyone can see it. Callers that persist "what this round did"
+ * (`recordReviewRound`, `refreshFixRoundsBody`) must use this return value, not the raw report.
  */
 export async function applyThreadOutcomes(args: {
   repo: string;
@@ -1034,36 +1258,40 @@ export async function applyThreadOutcomes(args: {
   pushed: boolean;
   signal: AbortSignal;
   logPath: string;
-}): Promise<void> {
-  const waiting = threadsNeedingAttention(args.pr);
-  for (const item of args.report) {
-    const thread = waiting.find((t) => t.id === item.id);
-    const anchor = thread?.comments[0];
-    if (!thread || !anchor) continue;
-    if (fabricatedFix(item, args.pushed)) continue;
-    await recordThreadOutcome(args, thread, anchor.id, item);
+}): Promise<ThreadOutcome[]> {
+  const delivered: ThreadOutcome[] = [];
+  for (const { item, thread, anchor } of triageOutcomes(args.pr, args.report, args.pushed)) {
+    if (await recordThreadOutcome(args, thread, anchor.id, item)) delivered.push(item);
   }
+  return delivered;
 }
 
-/** Reply on the thread, resolve it when the fix landed, and log what was said. */
+/** Reply on the thread, resolve it when the fix landed, and log what was said. Returns whether
+ * the outcome reached GitHub in a way that makes the thread stop being actionable: either the
+ * reply posted, or — for a "fixed" outcome — the resolve went through even though the reply
+ * itself failed (a resolved thread never resurfaces for a later round to retry, so its delivery
+ * would otherwise be lost from every round/PR-body count for good). The reaction stays best-effort
+ * on top of both. */
 async function recordThreadOutcome(
   args: ThreadReplyArgs,
   thread: ReviewThread,
   anchorId: number,
   item: ThreadOutcome,
-): Promise<void> {
+): Promise<boolean> {
   const { repo, number, signal, logPath } = args;
   const note = item.reply?.trim() || defaultReply(item.outcome);
-  await safe(() =>
+  const replied = await safe(() =>
     replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
   );
   await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
-  if (item.outcome === "fixed")
-    await safe(() => resolveReviewThread(repo, thread.id, signal));
+  const resolved =
+    item.outcome === "fixed" && (await safe(() => resolveReviewThread(repo, thread.id, signal)));
+  // Best-effort: a diagnostic log write must never cost an already-delivered outcome (PR #335 review).
   await appendSessionLog(
     logPath,
     `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
-  );
+  ).catch(() => {});
+  return replied || resolved;
 }
 
 /**
