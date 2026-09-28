@@ -120,7 +120,12 @@ import { safe } from "./safe";
 import { finalizeMergedEpic } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
-import { reviewFixPrParkedAtHead, systemClock } from "./queue";
+import {
+  recordReviewFixAnswered,
+  reviewFixPrAnsweredUnchanged,
+  reviewFixPrParkedAtHead,
+  systemClock,
+} from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
 
 // The per-thread report parser is a review-fix protocol concern; re-export so existing importers
@@ -270,7 +275,14 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
   // `parked` row for it already sits at this exact PR head, so a fresh attempt would just fail
   // identically — counted apart from `dispatched` so an operator reading the pass's note can tell
   // this suppressed target from a merely-idle one (a clean PR never reaches this loop's insides).
-  let suppressed = 0;
+  let suppressedParked = 0;
+  // A target whose last round ANSWERED the review feedback (replied to threads, maybe re-requested
+  // review) but pushed no commit, at the SAME head and the SAME actionable reasons as right now
+  // (anton-dfuvz) — some reasons no code change can satisfy (a PR-body waiver line, a CI check stuck
+  // re-evaluating the same commit), so re-dispatching every pass would burn a full session on the
+  // same answer forever. Counted apart from both `dispatched` and `suppressedParked` for the same
+  // reason those are counted apart from each other.
+  let suppressedAnswered = 0;
   let lastError: unknown;
   for (const target of targets) {
     await ctx.heartbeat();
@@ -280,15 +292,26 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
       // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
       // The head SHA lets the runner's dedupe suppress a doomed retry — see `enqueueReviewFixPrIfAbsent`.
-      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha);
+      // `reasons` is only ever set for the classifyReview (non-merged) branch, so a merged target's
+      // dispatch is never caught by the answered check either.
+      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha, triage.reasons);
       if (jobId) {
         dispatched += 1;
         continue;
       }
       if (triage.headSha && reviewFixPrParkedAtHead(db, projectId, target.id, triage.headSha)) {
-        suppressed += 1;
+        suppressedParked += 1;
         consoleLog.info(
           `epic ${target.id}: suppressed — parked review-fix-pr at unchanged head ${triage.headSha}`,
+        );
+      } else if (
+        triage.headSha &&
+        triage.reasons &&
+        reviewFixPrAnsweredUnchanged(db, projectId, target.id, triage.headSha, triage.reasons)
+      ) {
+        suppressedAnswered += 1;
+        consoleLog.info(
+          `epic ${target.id}: suppressed — answered at unchanged head ${triage.headSha} with the same actionable reasons`,
         );
       }
     } catch (e) {
@@ -306,7 +329,10 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
 
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
   // nothing, and the counts together are what an operator checks the poll against.
-  const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
+  const suppressedParts: string[] = [];
+  if (suppressedParked > 0) suppressedParts.push(`suppressed ${suppressedParked} (parked, unchanged head)`);
+  if (suppressedAnswered > 0) suppressedParts.push(`suppressed ${suppressedAnswered} (answered, unchanged)`);
+  const suppressedNote = suppressedParts.length > 0 ? `, ${suppressedParts.join(", ")}` : "";
   return {
     changed: dispatched > 0,
     note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}`,
@@ -318,6 +344,13 @@ interface FixTriage {
   needsFix: boolean;
   /** The PR head's commit SHA — undefined only if the PR could not be identified. */
   headSha?: string;
+  /**
+   * `classifyReview`'s reasons for the current PR state (anton-dfuvz) — what `enqueueReviewFixPrIfAbsent`
+   * keys its answered suppression on, alongside `headSha`. Only ever set on the classifyReview
+   * (non-merged) branch: a merged target's finalization must never be suppressed by a stale answered
+   * round from before it merged.
+   */
+  reasons?: string[];
 }
 
 /**
@@ -325,7 +358,8 @@ interface FixTriage {
  * anything else is a clean PR that costs nothing to leave alone. One `gh` read per target, the same
  * read `handleEpic` repeats when the dispatched job actually runs: PR state can change in between,
  * and the fix re-decides against what it finds rather than trusting this triage. The head SHA rides
- * along on the same read — it is what `enqueueReviewFixPrIfAbsent` keys its park suppression on.
+ * along on the same read — it is what `enqueueReviewFixPrIfAbsent` keys its park and answered
+ * suppressions on.
  */
 async function needsFix(
   repo: string,
@@ -335,10 +369,10 @@ async function needsFix(
   const number = prNumberFromRef(beads.getPrRef(target));
   if (number === undefined) return { needsFix: false };
   const pr = await getPrReview(repo, number, signal);
-  return {
-    needsFix: pr.state === "MERGED" || classifyReview(pr).actionable,
-    headSha: pr.headSha || undefined,
-  };
+  const headSha = pr.headSha || undefined;
+  if (pr.state === "MERGED") return { needsFix: true, headSha };
+  const verdict = classifyReview(pr);
+  return { needsFix: verdict.actionable, headSha, reasons: verdict.reasons };
 }
 
 /**
@@ -493,6 +527,12 @@ async function handleEpic(args: {
       branch,
       number,
     });
+    if (!pushed) {
+      // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
+      // actionable again — record what this round answered so a fresh triage matching BOTH the head
+      // and these reasons is suppressed instead of handed a brand new session (anton-dfuvz).
+      recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.reasons);
+    }
     return pushed ? "pushed" : "answered";
   });
 }

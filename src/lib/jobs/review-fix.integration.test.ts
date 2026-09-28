@@ -705,4 +705,102 @@ process.exit(0);`,
       restore();
     }
   });
+
+  it("does not re-dispatch a target that answered at the current PR head with unchanged reasons; admits one once a reason changes", async () => {
+    const answerEpic = await beads.create(repo, {
+      title: "Feature stuck on an unfixable check",
+      type: "epic",
+      description: "## Goal\nUnfixable check.",
+    });
+    const answerBranch = `anton/${answerEpic}`;
+    const g = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, stdio: "ignore" });
+    g(["checkout", "-q", "-b", answerBranch]);
+    writeFileSync(join(repo, "answer.txt"), "v1\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "answer work"]);
+    g(["push", "-q", "-u", "origin", answerBranch]);
+    g(["checkout", "-q", "main"]);
+    await beads.tag(repo, answerEpic, [LABELS.stage("in-review")]);
+    await beads.setPrRef(repo, answerEpic, "gh-21");
+
+    // Always actionable (CHANGES_REQUESTED) at a fixed head; FAKE_ANSWER_FAILING toggles a second
+    // reason (a failing check) so the test can change classifyReview's reasons without a new commit
+    // — exactly the "PR-body waiver / stuck CI check" case anton-dfuvz targets.
+    const answerGh = writeBin(
+      binDir,
+      "gh-answer",
+      `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='view'){
+  const checks = process.env.FAKE_ANSWER_FAILING === '1' ? [{__typename:'CheckRun',name:'golden-fence',status:'COMPLETED',conclusion:'FAILURE'}] : [];
+  console.log(JSON.stringify({number:21,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:'${answerBranch}',headRefOid:'sha-answer',url:'u',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}],statusCheckRollup:checks}));
+  process.exit(0);
+}
+if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));process.exit(0);}
+process.exit(0);`,
+    );
+
+    const restore = saveEnv(["ANTON_GH_BIN", "FAKE_ANSWER_FAILING"]);
+    process.env.ANTON_GH_BIN = answerGh;
+    process.env.FAKE_ANSWER_FAILING = "0";
+    const jobsForAnswerEpic = () =>
+      tdb.db
+        .select()
+        .from(schema.jobs)
+        .where(eq(schema.jobs.type, "review-fix-pr"))
+        .all()
+        .filter((j) => JSON.parse(j.payloadJson).epicBeadId === answerEpic);
+
+    try {
+      // The prior test leaves its own `queued` review-fix-pr row behind (the whole point of its
+      // last assertion) — sweep it aside so this test's single-tick `driveJob` calls lease THIS
+      // target's job rather than that unrelated leftover one.
+      tdb.db
+        .update(schema.jobs)
+        .set({ status: "cancelled" })
+        .where(and(eq(schema.jobs.type, "review-fix-pr"), eq(schema.jobs.status, "queued")))
+        .run();
+
+      // Pass 1: nothing covers the target yet — one job is dispatched.
+      await runDispatch(answerEpic);
+      let jobs = jobsForAnswerEpic();
+      expect(jobs).toHaveLength(1);
+      const answeredId = jobs[0].id;
+
+      // The round answers the review feedback but pushes no commit — simulated directly (what
+      // actually decides push-vs-answer, `runFixSession`, is exercised by the push-path e2e test
+      // above; only the dispatcher's read of the settled state is under test here).
+      tdb.db
+        .update(schema.jobs)
+        .set({
+          status: "done",
+          payloadJson: JSON.stringify({
+            projectId,
+            epicBeadId: answerEpic,
+            headSha: "sha-answer",
+            answeredReasons: ["changes requested by a reviewer"],
+          }),
+        })
+        .where(eq(schema.jobs.id, answeredId))
+        .run();
+
+      // Pass 2: same head, same reasons — the answered round suppresses a fresh enqueue.
+      const job2 = await getJob(tdb.db, await runDispatch(answerEpic));
+      jobs = jobsForAnswerEpic();
+      expect(jobs).toHaveLength(1);
+      expect(job2?.outcomeNote).toBe(
+        "examined 1 PR(s) in review, dispatched 0, suppressed 1 (answered, unchanged)",
+      );
+
+      // A newly failing check changes the actionable reasons without moving the head — pass 3 must
+      // admit the retry that could now actually act on it.
+      process.env.FAKE_ANSWER_FAILING = "1";
+      await runDispatch(answerEpic);
+      jobs = jobsForAnswerEpic();
+      expect(jobs).toHaveLength(2);
+      expect(jobs.some((j) => j.status === "queued")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
 });

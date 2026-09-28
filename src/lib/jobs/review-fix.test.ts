@@ -501,6 +501,95 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     expect(rows.some((r) => r.status === "queued")).toBe(true);
   });
 
+  /** A `done` row simulating an answered round (anton-dfuvz) — what actually settles it is out of this suite's scope. */
+  const markAnswered = (epicBeadId: string, headSha: string, answeredReasons: string[]) =>
+    t.db
+      .update(schema.jobs)
+      .set({
+        status: "done",
+        payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId, headSha, answeredReasons }),
+      })
+      .where(eq(schema.jobs.type, "review-fix-pr"))
+      .run();
+
+  // anton-dfuvz: checks no code change can satisfy (a PR-body waiver line, a CI check stuck
+  // re-evaluating the same commit) keep classifyReview actionable forever — a fixer session that
+  // answered the feedback without pushing must not be handed a fresh one every scheduled pass.
+  it("suppresses a target that answered at the current PR head with unchanged reasons, and says so distinctly", async () => {
+    listMock.mockResolvedValue([target("e-1", 1), target("e-2", 2)]);
+    getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
+      number === 1 ? openPr(1, { reviewDecision: "CHANGES_REQUESTED" }) : openPr(2), // e-2 stays clean
+    );
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    const job = await getJob(t.db, await dispatch());
+    expect(dispatchedTargets()).toEqual(["e-1"]); // still the one row from the first pass
+    expect(job?.outcomeNote).toBe(
+      "examined 2 PR(s) in review, dispatched 0, suppressed 1 (answered, unchanged)",
+    );
+  });
+
+  it("admits a fresh job once the PR head moves past an answered attempt, even with unchanged reasons", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, { reviewDecision: "CHANGES_REQUESTED", headSha: "sha-new" }),
+    );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  it("admits a fresh job once a new unresolved review thread appears, even at the unchanged head", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, {
+        reviewDecision: "CHANGES_REQUESTED",
+        threads: [
+          {
+            id: "RT_new",
+            isResolved: false,
+            isOutdated: false,
+            comments: [{ id: 1, author: "alice", body: "one more thing" }],
+          },
+        ],
+      }),
+    );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  it("admits a fresh job for a MERGED target even though a prior answered attempt matches its head", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    // Merged, same head as the stale answered round — classifyReview never runs for it, so it
+    // carries no `reasons` and the answered check (which requires both) never applies.
+    getPrReviewMock.mockResolvedValue(openPr(1, { state: "MERGED" }));
+    const job = await getJob(t.db, await dispatch());
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+    expect(job?.outcomeNote).toBe("examined 1 PR(s) in review, dispatched 1");
+  });
+
   // One unreadable PR must not cost the others their dispatch — but the failure still surfaces, so
   // the poll retries rather than reporting a clean pass over a target it never actually triaged.
   it("keeps fanning out past a PR it cannot read, then surfaces the failure", async () => {
