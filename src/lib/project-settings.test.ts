@@ -89,6 +89,18 @@ describe("mergeSettings", () => {
     expect(next.decisionModes).toEqual({ "point-a": "shadow", "point-b": "auto" });
   });
 
+  // Selecting a point's own default is a per-point delete (anton-528bw review), not an explicit
+  // override — resolveDecisionMode must fall back to whatever the point's shipped default is LATER,
+  // not the value that happened to be current when the operator picked it.
+  it("drops a point set to null, leaving the others, instead of storing an explicit value", () => {
+    const current: ProjectSettings = { decisionModes: { "point-a": "auto", "point-b": "assist" } };
+    const next = mergeSettings(
+      current,
+      { decisionModes: { "point-a": null } } as unknown as Partial<ProjectSettings>,
+    );
+    expect(next.decisionModes).toEqual({ "point-b": "assist" });
+  });
+
   it("clears a nested object wholesale on an explicit undefined, not just its known knobs", () => {
     const current: ProjectSettings = { budgetPolicy: { daytimeReservePct: 25 } };
     const next = mergeSettings(current, { budgetPolicy: undefined });

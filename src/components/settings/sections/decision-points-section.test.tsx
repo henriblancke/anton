@@ -78,6 +78,26 @@ describe("DecisionPointsSection", () => {
     await waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 
+  // anton-528bw review: reselecting the point's own default must delete the override, not persist
+  // it as an explicit value equal to today's default — otherwise a later release changing the
+  // point's shipped default would leave this project silently pinned to the old one.
+  it("selecting the point's own default clears the override instead of pinning it", async () => {
+    const fetchMock = okFetch();
+    render(
+      <DecisionPointsSection
+        slug="p1"
+        points={[{ ...POINT, defaultMode: "shadow", mode: "assist" }]}
+      />,
+    );
+
+    fireEvent.click(radio("review-fix-nit", "shadow"));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
+      decisionModes: { "review-fix-nit": null },
+    });
+  });
+
   it("promoting to auto opens a confirm dialog and saves nothing until confirmed", async () => {
     const fetchMock = okFetch();
     render(<DecisionPointsSection slug="p1" points={[POINT]} />);

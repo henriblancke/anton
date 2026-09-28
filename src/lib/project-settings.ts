@@ -834,9 +834,15 @@ export function resolveAutonomyPolicy(settings: ProjectSettings): ProposalAutono
  * import without depending on every point's own module. An id the live registry does not recognise is
  * refused with a 400 rather than persisted — an override for a point that does not exist would be
  * silently ignored the moment {@link resolveDecisionMode} reads it back.
+ *
+ * A point's value may also be `null` — a per-point delete, distinct from clearing the whole field
+ * (`decisionModes: null`, handled by `isClear`). Selecting a point's own `defaultMode` back is
+ * exactly this: {@link mergeSettings} drops the key rather than storing the default as an explicit
+ * override, so a later release that changes the point's shipped default carries this project along
+ * instead of leaving it pinned to the value that was current when the operator picked it.
  */
 export const decisionModeOverridesSchema = z
-  .record(z.string(), z.enum(DECISION_MODES))
+  .record(z.string(), z.enum(DECISION_MODES).nullable())
   .superRefine((overrides, ctx) => {
     for (const id of Object.keys(overrides)) {
       if (!getPoint(id)) {
@@ -1495,9 +1501,16 @@ export function mergeSettings(
       next.repairAutonomy = { ...current.repairAutonomy, ...(v as object) };
     }
     // Per POINT, for the same reason: a client that renders only the points currently registered
-    // must not disarm the ones it didn't send.
+    // must not disarm the ones it didn't send. A point's value may be `null` — a per-point delete
+    // (see decisionModeOverridesSchema) — so a selection equal to the point's own default clears
+    // the override instead of pinning it as an explicit value.
     else if (k === "decisionModes") {
-      next.decisionModes = { ...current.decisionModes, ...(v as object) };
+      const merged: Record<string, DecisionMode> = { ...current.decisionModes };
+      for (const [id, mode] of Object.entries(v as Record<string, DecisionMode | null>)) {
+        if (mode === null) delete merged[id];
+        else merged[id] = mode;
+      }
+      next.decisionModes = merged;
     }
     else (next as Record<string, unknown>)[k] = v;
   }

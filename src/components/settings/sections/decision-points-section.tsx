@@ -134,10 +134,13 @@ function DecisionPointRowView({ slug, point }: { slug: string; point: DecisionPo
     setChosen(next);
     setSaving(true);
     try {
+      // A selection equal to the point's own default is a delete, not an override: storing it as
+      // `next` would pin this project to today's default even after a later release changes it.
+      const value = next === point.defaultMode ? null : next;
       const res = await fetch(`/api/projects/${slug}/settings`, {
         method: "PATCH",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ decisionModes: { [point.id]: next } }),
+        body: JSON.stringify({ decisionModes: { [point.id]: value } }),
       });
       const data = (await res.json().catch(() => null)) as { error?: string } | null;
       if (!res.ok) throw new Error(data?.error ?? `Save failed (${res.status})`);

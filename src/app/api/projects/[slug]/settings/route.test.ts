@@ -1505,6 +1505,20 @@ describe("settings route — decision-point modes (anton-xky9e)", () => {
     expect((await res.json()).settings.decisionModes).toBeUndefined();
     expect("decisionModes" in persisted()).toBe(false);
   });
+
+  // anton-528bw review: selecting a point's own default must delete that ONE point's override, not
+  // pin it as an explicit value equal to today's default — a null per point does that, leaving the
+  // others untouched (unlike `decisionModes: null`, which clears every point at once).
+  it("deletes one point on a null value, leaving the others stored", async () => {
+    await PATCH(
+      patchReq({ decisionModes: { "test-point-a": "auto", "test-point-b": "assist" } }),
+      ctx("tmp"),
+    );
+    const res = await PATCH(patchReq({ decisionModes: { "test-point-a": null } }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.decisionModes).toEqual({ "test-point-b": "assist" });
+    expect(persisted().decisionModes).toEqual({ "test-point-b": "assist" });
+  });
 });
 
 /**
