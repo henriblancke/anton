@@ -4,7 +4,14 @@ import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, loadAllIssues } from "./beads/issues";
-import { activeOutcomeIds, readProjectOutcomes, type ProjectOutcome } from "./outcomes";
+import {
+  activeOutcomeIds,
+  outcomesConfigured,
+  parseOutcomes,
+  readProductMd,
+  readProjectOutcomes,
+  type ProjectOutcome,
+} from "./outcomes";
 import type { Project } from "./types";
 
 /**
@@ -295,9 +302,15 @@ function extractOutcomeIdsSection(description: string): string {
  */
 async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise<void> {
   const outcomeId = draft.feature.outcomeId.trim();
-  const outcomes = await readProjectOutcomes(project.repoPath);
-  const active = activeOutcomeIds(outcomes);
-  if (!active.has(outcomeId)) {
+  const markdown = await readProductMd(project.repoPath);
+  const active = activeOutcomeIds(parseOutcomes(markdown));
+  // A missing `## Outcomes` section is an upgrade gap (anton-cdeki), not a deliberate choice to
+  // offer only the built-in `codebase-health` — gating a closed set that was never configured
+  // would leave every project that predates this feature unable to submit a normal feature until
+  // someone manually discovers and edits the new file format. Once a project DOES declare the
+  // section, even an empty one, it's opted in and gets the full check.
+  const configured = outcomesConfigured(markdown);
+  if (configured && !active.has(outcomeId)) {
     throw new DraftOutcomeError(
       `"${outcomeId}" is not an outcome \`.product/PRODUCT.md\` offers for new work — pick one from its \`## Outcomes\` section`,
     );
@@ -311,12 +324,15 @@ async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise
     }
     // Every declared id is a real commitment the epic makes, not just the one the feature happens
     // to use — a typo elsewhere in the list (`outcome:report-sharng`) would otherwise persist onto
-    // the board unnoticed because the feature's OWN id already satisfied the check above.
-    const unknown = declared.filter((id) => !active.has(id));
-    if (unknown.length > 0) {
-      throw new DraftOutcomeError(
-        `the new epic's Outcome IDs name ${unknown.map((id) => `"${id}"`).join(", ")}, which \`.product/PRODUCT.md\` doesn't offer for new work — fix the typo or remove it`,
-      );
+    // the board unnoticed because the feature's OWN id already satisfied the check above. Same
+    // upgrade-gap exemption as above: nothing to validate against until PRODUCT.md is configured.
+    if (configured) {
+      const unknown = declared.filter((id) => !active.has(id));
+      if (unknown.length > 0) {
+        throw new DraftOutcomeError(
+          `the new epic's Outcome IDs name ${unknown.map((id) => `"${id}"`).join(", ")}, which \`.product/PRODUCT.md\` doesn't offer for new work — fix the typo or remove it`,
+        );
+      }
     }
   }
 }

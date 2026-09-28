@@ -67,6 +67,24 @@ function tempProject(): Project {
   };
 }
 
+/** A project whose `.product/PRODUCT.md` has no `## Outcomes` section at all — an upgraded project
+ * that predates outcome ids (anton-cdeki), not one that deliberately offers only the built-in
+ * outcome. The outcome-id check should let this project's drafts through unvalidated rather than
+ * refuse every id but `codebase-health` forever. */
+function unconfiguredProject(): Project {
+  const repoPath = mkdtempSync(join(tmpdir(), "anton-backlog-unconfigured-"));
+  temps.push(repoPath);
+  return {
+    id: "p",
+    slug: "p",
+    name: "p",
+    repoPath,
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+  };
+}
+
 const EPIC = {
   title: "Reports are shareable outside the app",
   goal: "Every report view leaves the app in a format a customer can open.",
@@ -472,6 +490,37 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(rejection).toBeInstanceOf(DraftOutcomeError);
     expect(rejection?.message).toContain("reports-are-sharable");
     expect(create).not.toHaveBeenCalled();
+  });
+
+  // The upgrade gap the review flagged (anton-cdeki PR #334): a project whose PRODUCT.md predates
+  // outcome ids has no `## Outcomes` section, so it must not be treated as a closed set offering
+  // only `codebase-health` — that would strand every existing project until someone manually
+  // discovers and edits the new file format.
+  it("accepts any outcome id when PRODUCT.md has no ## Outcomes section", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(unconfiguredProject(), {
+        feature: { ...FEATURE, outcomeId: "reports-are-sharable" },
+        epic: { kind: "existing", id: "p-1" },
+      }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
+  it("accepts a new epic's Outcome IDs unvalidated when PRODUCT.md has no ## Outcomes section", async () => {
+    const createGraph = graphLands();
+
+    await expect(
+      createDraftFeature(unconfiguredProject(), {
+        feature: FEATURE,
+        epic: {
+          kind: "new",
+          epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:totally-made-up" },
+        },
+      }),
+    ).resolves.toMatchObject({ epicCreated: true });
+    expect(createGraph).toHaveBeenCalledTimes(1);
   });
 
   it("refuses an outcome PRODUCT.md marks retired", async () => {

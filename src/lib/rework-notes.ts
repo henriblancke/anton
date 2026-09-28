@@ -99,6 +99,9 @@ export interface FollowUpContractArgs {
   targetId: string;
   parentId?: string;
   pipeline?: ReworkPipeline;
+  /** The run target's own `outcome:<id>` label ({@link labelValueOf}, lib/rework-modes.ts) — undefined
+   * for a target that predates outcome ids, same upgrade gap {@link outcomesConfigured} exempts. */
+  outcomeId?: string;
 }
 
 /**
@@ -112,10 +115,13 @@ export interface FollowUpContractArgs {
  * request in the founder's own words and order; this section is what "done" means, box by box.
  */
 export function followUpDescription(args: FollowUpContractArgs): string {
-  const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
+  const { summary, instructions, findings, ticket, targetId, parentId, pipeline, outcomeId } = args;
   return [
     `## Goal`,
     goalBody(summary),
+    ``,
+    `## Why`,
+    followUpWhy(ticket, outcomeId),
     ``,
     `## ${ACCEPTANCE_HEADING}`,
     ...followUpAcceptance(instructions, findings),
@@ -597,6 +603,24 @@ function goalBody(summary: string): string {
     isHeading(text) ||
     THEMATIC_BREAK.test(text);
   return block ? `\\${text}` : text;
+}
+
+/**
+ * Which outcome the follow-up serves, and how — the `## Why` every ticket's contract requires
+ * (src/prompts/BEADS.md). A follow-up doesn't ask the founder this the way a fresh draft does
+ * ({@link FeatureDraft.why}, lib/backlog.ts) — it continues work the outcome was already decided
+ * for, so it inherits the run target's own answer rather than asking again.
+ *
+ * `outcomeId` is undefined for a target that predates outcome ids — the same upgrade gap
+ * {@link outcomesConfigured} exempts a fresh draft from (lib/outcomes.ts). Nothing to carry over
+ * there, so the sentence names the origin ticket instead of a label that doesn't exist yet.
+ */
+function followUpWhy(ticket: Bead, outcomeId: string | undefined): string {
+  return outcomeId
+    ? `Serves outcome:${outcomeId}, the same outcome ${ticket.id} served — this bead carries the ` +
+        `next iteration its self-review prompted.`
+    : `Continues the outcome ${ticket.id} served; that ticket predates \`.product/PRODUCT.md\`'s ` +
+        `outcome ids, so none carries over as a label here either.`;
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */

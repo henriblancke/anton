@@ -88,18 +88,52 @@ export function productMdPath(repoPath: string): string {
 }
 
 /**
+ * `repoPath`'s `.product/PRODUCT.md` raw text, or `""` if it doesn't exist yet. Never throws on a
+ * missing file — the shared read {@link readProjectOutcomes} and {@link projectOutcomesConfigured}
+ * both build on.
+ */
+export async function readProductMd(repoPath: string): Promise<string> {
+  try {
+    return await readFile(productMdPath(repoPath), "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw err;
+  }
+}
+
+/**
  * Read and parse `repoPath`'s `.product/PRODUCT.md`. Never throws — a project with no PRODUCT.md
  * yet (or no `## Outcomes` section) resolves to just {@link BUILT_IN_OUTCOME}, same as
  * {@link parseOutcomes} handed an empty string, so a fresh project is never stuck unable to file
  * work for want of the file.
  */
 export async function readProjectOutcomes(repoPath: string): Promise<ProjectOutcome[]> {
-  try {
-    return parseOutcomes(await readFile(productMdPath(repoPath), "utf8"));
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return parseOutcomes("");
-    throw err;
-  }
+  return parseOutcomes(await readProductMd(repoPath));
+}
+
+/**
+ * Whether `markdown` declares at least one REAL outcome, as opposed to resolving to just the
+ * built-in via {@link parseOutcomes}'s fallback. The distinction matters to callers deciding how
+ * strictly to gate an outcome id against the parsed set:
+ *
+ *   - a project whose PRODUCT.md predates this feature (anton-cdeki) has no `## Outcomes` section
+ *     at all;
+ *   - a project scaffolded by `/setup` since (skills/setup/templates/.product/PRODUCT.md) has the
+ *     section, but its bundled placeholder is deliberately unparseable (an HTML comment, not a
+ *     bullet) rather than a fake outcome a founder could ship features against by never noticing it.
+ *
+ * Both are "nothing decided yet", not "deliberately only `codebase-health`" — so both fall out of
+ * this the same way, off `parseOutcomes`' own result rather than re-deriving section presence: a
+ * section with only malformed or unparseable bullets is exactly as unconfigured as no section, and
+ * the two are already the same input to every caller that matters (`activeOutcomeIds`).
+ */
+export function outcomesConfigured(markdown: string): boolean {
+  return parseOutcomes(markdown).some((o) => o.id !== BUILT_IN_OUTCOME.id);
+}
+
+/** {@link outcomesConfigured}, reading `repoPath`'s `.product/PRODUCT.md` itself. */
+export async function projectOutcomesConfigured(repoPath: string): Promise<boolean> {
+  return outcomesConfigured(await readProductMd(repoPath));
 }
 
 /** The outcome ids new work may point at — retired ones resolve for existing labels but are never

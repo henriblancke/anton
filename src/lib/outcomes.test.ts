@@ -2,7 +2,13 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { activeOutcomeIds, parseOutcomes, readProjectOutcomes } from "./outcomes";
+import {
+  activeOutcomeIds,
+  outcomesConfigured,
+  parseOutcomes,
+  projectOutcomesConfigured,
+  readProjectOutcomes,
+} from "./outcomes";
 
 describe("parseOutcomes", () => {
   it("parses `id` — summary bullets under ## Outcomes", () => {
@@ -106,6 +112,33 @@ describe("parseOutcomes", () => {
   });
 });
 
+describe("outcomesConfigured", () => {
+  it("is false when the file has no ## Outcomes section — a project predating this feature", () => {
+    expect(outcomesConfigured("")).toBe(false);
+    expect(outcomesConfigured("# PRODUCT\n\nNo outcomes here.\n")).toBe(false);
+  });
+
+  // A `## Outcomes` section on its own decides nothing — a freshly scaffolded project has the
+  // heading (skills/setup/templates/.product/PRODUCT.md) with nothing real under it yet, and that
+  // must gate exactly like no section at all, not like a closed set of zero outcomes.
+  it("is still false when the section exists but carries no real outcome — empty, or only unparseable content", () => {
+    expect(outcomesConfigured("## Outcomes\n")).toBe(false);
+    expect(
+      outcomesConfigured(["## Outcomes", "<!-- fill this in with your own outcomes -->"].join("\n")),
+    ).toBe(false);
+  });
+
+  it("is still false when the only bullet overrides the built-in codebase-health entry", () => {
+    expect(
+      outcomesConfigured(["## Outcomes", "- `codebase-health` — Custom summary."].join("\n")),
+    ).toBe(false);
+  });
+
+  it("is true once a real, non-built-in outcome bullet parses", () => {
+    expect(outcomesConfigured(["## Outcomes", "- `a` — first"].join("\n"))).toBe(true);
+  });
+});
+
 describe("activeOutcomeIds", () => {
   it("keeps non-retired ids and drops ones marked retired", () => {
     const outcomes = parseOutcomes(
@@ -142,5 +175,51 @@ describe("readProjectOutcomes", () => {
   it("resolves to just the built-in outcome when PRODUCT.md is absent, never throwing", async () => {
     const outcomes = await readProjectOutcomes(tempRepo());
     expect(outcomes.map((o) => o.id)).toEqual(["codebase-health"]);
+  });
+});
+
+describe("projectOutcomesConfigured", () => {
+  const temps: string[] = [];
+  afterEach(() => {
+    for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function tempRepo(): string {
+    const repoPath = mkdtempSync(join(tmpdir(), "anton-outcomes-configured-"));
+    temps.push(repoPath);
+    return repoPath;
+  }
+
+  it("is false when PRODUCT.md is absent", async () => {
+    expect(await projectOutcomesConfigured(tempRepo())).toBe(false);
+  });
+
+  it("is false when PRODUCT.md exists but has no ## Outcomes section — an upgraded project", async () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".product"), { recursive: true });
+    writeFileSync(join(repo, ".product", "PRODUCT.md"), "# PRODUCT\n\nNo outcomes section yet.\n");
+    expect(await projectOutcomesConfigured(repo)).toBe(false);
+  });
+
+  // A freshly `/setup`-scaffolded project has the section (skills/setup/templates/.product/PRODUCT.md)
+  // but nothing real under it until the founder fills it in — same gap as no section at all.
+  it("is false when PRODUCT.md's ## Outcomes section is still just the bundled placeholder", async () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".product"), { recursive: true });
+    writeFileSync(
+      join(repo, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n<!-- fill this in with your own outcomes -->\n",
+    );
+    expect(await projectOutcomesConfigured(repo)).toBe(false);
+  });
+
+  it("is true once PRODUCT.md declares ## Outcomes", async () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".product"), { recursive: true });
+    writeFileSync(
+      join(repo, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n- `reports-are-shareable` — Every report leaves the app.\n",
+    );
+    expect(await projectOutcomesConfigured(repo)).toBe(true);
   });
 });

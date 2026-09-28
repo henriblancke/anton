@@ -121,6 +121,7 @@ describe("followUpDescription", () => {
     const description = followUpDescription({ ...args, parentId: "feat" });
     for (const heading of [
       "## Goal",
+      "## Why",
       "## Acceptance Criteria",
       "## Context",
       "## Out of scope",
@@ -128,6 +129,21 @@ describe("followUpDescription", () => {
     ]) {
       expect(description).toContain(heading);
     }
+  });
+
+  // The upgrade gap the review flagged (anton-cdeki PR #334): a follow-up is a run target when
+  // created parentless, so it must carry `## Why` and — where the target's own label names one —
+  // the outcome it serves, not just the five sections the automated contract judge happens to check.
+  it("names the run target's own outcome under ## Why when it has one", () => {
+    const description = followUpDescription({ ...args, outcomeId: "reports-are-shareable" });
+    expect(description).toContain(
+      "## Why\nServes outcome:reports-are-shareable, the same outcome t1 served",
+    );
+  });
+
+  it("falls back to naming the origin ticket under ## Why when the target has no outcome label yet", () => {
+    const description = followUpDescription(args);
+    expect(description).toContain("## Why\nContinues the outcome t1 served");
   });
 
   it("builds the acceptance from the instructions and the selected findings, not the summary", () => {
@@ -479,6 +495,9 @@ describe("followUpDescription", () => {
     ).toMatchInlineSnapshot(`
       "## Goal
       harden the retry
+
+      ## Why
+      Continues the outcome t1 served; that ticket predates \`.product/PRODUCT.md\`'s outcome ids, so none carries over as a label here either.
 
       ## Acceptance Criteria
       - [ ] Add a test that fails without the null guard.

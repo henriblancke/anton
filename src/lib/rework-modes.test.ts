@@ -365,6 +365,37 @@ describe("applyFollowUp", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  // The upgrade gap the review flagged (anton-cdeki PR #334): a follow-up created parentless is a
+  // run target of its own (src/prompts/BEADS.md), so it must carry the `outcome:` label the
+  // convention reserves for run targets — derived from the TARGET's own label, since that's the
+  // bead whose review produced this one.
+  it("carries the target's own outcome label when created standing alone", async () => {
+    board(solo({ labels: ["outcome:reports-are-shareable"] }));
+
+    const applied = await applyFollowUp(
+      project,
+      solo({ labels: ["outcome:reports-are-shareable"] }),
+      solo({ labels: ["outcome:reports-are-shareable"] }),
+      followUp(),
+    );
+
+    expect(applied.runsUnderTarget).toBe(false);
+    expect(createMock.mock.calls[0]![1].labels).toEqual(["outcome:reports-are-shareable"]);
+    expect(createMock.mock.calls[0]![1].description).toContain(
+      "## Why\nServes outcome:reports-are-shareable",
+    );
+  });
+
+  it("does not label a PARENTED follow-up with an outcome — it is a ticket of the target's run, not a run target itself", async () => {
+    await applyFollowUp(project, feature({ labels: ["outcome:reports-are-shareable"] }), finishedTicket(), followUp());
+
+    expect(createMock.mock.calls[0]![1].labels).not.toContain("outcome:reports-are-shareable");
+    // The Why section still names it — every ticket's contract requires one, not just run targets'.
+    expect(createMock.mock.calls[0]![1].description).toContain(
+      "## Why\nServes outcome:reports-are-shareable",
+    );
+  });
+
   it("stands a follow-up of a STANDALONE target alone — a child of one is a ticket of no run", async () => {
     board(solo());
 
@@ -373,6 +404,8 @@ describe("applyFollowUp", () => {
     expect(applied.runsUnderTarget).toBe(false);
     expect(createMock.mock.calls[0]![1].deps).toBeUndefined();
     expect(createMock.mock.calls[0]![1].description).toContain("It is its own run target");
+    // No label on the target to derive from — created without one rather than a fabricated value.
+    expect(createMock.mock.calls[0]![1].labels).toEqual([]);
   });
 
   it("stands it alone under a SHIPPED target too — its run has nothing left to dispatch", async () => {
