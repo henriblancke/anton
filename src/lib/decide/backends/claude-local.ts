@@ -238,7 +238,7 @@ function argmax(distribution: Record<string, number>): [string, number] {
  * confidence, which decide()'s own `isValidAnswer`/`isValidConfidence` reject — the "invalid model
  * answer" fallback path, not a call failure.
  */
-function toModelAnswer(question: Question, report: unknown, modelVersion: string): ModelAnswer {
+function toModelAnswer(question: Question, report: unknown, modelVersion: string | undefined): ModelAnswer {
   const base = { backend: BACKEND, modelVersion };
   const obj = typeof report === "object" && report !== null ? (report as Record<string, unknown>) : {};
 
@@ -333,8 +333,16 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
       // map's key order carries no meaning, so picking `[0]` can attribute a model-less text-bearing
       // reply to a sidecar that never authored it, preserving stale agreement across a real model
       // switch. Unidentified is the honest answer there, not an arbitrary guess (PR #332 review).
+      //
+      // Left `undefined`, never a placeholder string like `"unknown"`, when none of the above
+      // resolves: a literal sentinel would itself be a real, reusable `modelVersion` value, so
+      // `agreement()`'s cohort lookup (log.ts) could pin the "current" cohort to it and fold
+      // different underlying models' unidentified answers into one cohort, preserving stale
+      // agreement across an actual model switch (PR #332 review). `undefined` instead makes the row
+      // excluded from cohort candidacy entirely, the same treatment a driver-level failure with no
+      // identified model already gets.
       const singleModelUsed = result.modelUsage.length === 1 ? result.modelUsage[0]?.model : undefined;
-      const modelVersion = result.answeringModel ?? config.model ?? singleModelUsed ?? "unknown";
+      const modelVersion = result.answeringModel ?? config.model ?? singleModelUsed;
       if (!result.ok) {
         throw new ModelCallError(`decide/claude-local: session for "${point.id}" reported an error`, {
           backend: BACKEND,

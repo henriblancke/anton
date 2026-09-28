@@ -580,6 +580,26 @@ describe("replay — agreement(point)", () => {
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
   });
 
+  it("does not let an answered-but-unidentified model become a reusable cohort", async () => {
+    // The current model has a settled, agreeing record.
+    const knownId = await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    await settleDecision(test.db, clock, knownId, { point: POINT, operatorAnswer: "fix" });
+    nowMs += 60_000;
+
+    // A later call answers validly but with no identifiable model — claude-local.ts reports this as
+    // `modelVersion: undefined`, never a placeholder string like `"unknown"` (PR #332 review): a
+    // literal sentinel would itself be a real, reusable `modelVersion` value that two DIFFERENT
+    // underlying models' unidentified answers could both match, folding their evidence into one
+    // cohort across an actual model switch. `undefined` must instead read the same as a driver
+    // failure with no modelVersion: excluded from cohort candidacy, leaving claude-4 as current.
+    const unidentifiedId = await recordShadow(ANSWER({ modelVersion: undefined }));
+    await settleDecision(test.db, clock, unidentifiedId, { point: POINT, operatorAnswer: "decline" });
+
+    // Only claude-4's settled agreement counts — the unidentified row must not itself become the
+    // cohort (which would report 0 settled), nor bleed its disagreement into claude-4's figure.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
+  });
+
   it("leaves a rule-decided point unscoped — a hard rule has no model version to pin trust to", async () => {
     const ruledPoint: DecisionPoint = {
       ...POINT,

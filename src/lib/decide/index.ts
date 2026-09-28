@@ -27,7 +27,12 @@ export interface ModelAnswer {
   readonly confidence: number;
   readonly distribution?: Readonly<Record<string, number>>;
   readonly backend: string;
-  readonly modelVersion: string;
+  /** `undefined` when the backend answered but could not identify which model authored the reply
+   * (e.g. a model-less event alongside more than one `modelUsage` entry) — never a placeholder
+   * string, which `agreement()`'s cohort lookup (log.ts) would otherwise treat as a real, reusable
+   * model identity and fold different underlying models' evidence into one cohort (PR #332 review).
+   */
+  readonly modelVersion?: string;
 }
 
 /**

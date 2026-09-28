@@ -283,7 +283,10 @@ describe("claudeLocalBackend — structured output", () => {
 
     const answer = await ask(choicePoint(), { nitText: "x" });
 
-    expect(answer.modelVersion).toBe("unknown");
+    // `undefined`, never a placeholder string: a literal sentinel would itself be a real, reusable
+    // `modelVersion` that agreement()'s cohort lookup could pin different underlying models' rows to
+    // (PR #332 review).
+    expect(answer.modelVersion).toBeUndefined();
   });
 
   it("derives a yes/no answer and its distribution from probabilityYes", async () => {
