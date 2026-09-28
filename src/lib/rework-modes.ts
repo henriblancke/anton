@@ -244,10 +244,18 @@ async function resumeFollowUp(
     // and the description diff below make retrying either a no-op.
     await tagDetachedOutcome(context, existing);
     // A completed follow-up never takes the match.partial branch below, so this is the only pass
-    // that would ever add a Why a legacy bead was created without — the contract gate never
-    // catches its absence, so a merged detachment must not leave it missing for good.
+    // (short of the parentless-from-the-outset case below) that would ever add a Why a legacy bead
+    // was created without — the contract gate never catches its absence, so a merged detachment
+    // must not leave it missing for good.
     if (!match.partial) await reconcileMissingWhy(context, existing);
     await beads.reparent(context.repo, existing.id, "");
+  } else if (!match.partial && beads.parentOf(existing) === undefined) {
+    // A DONE match that owes no detachment is normally read without a write (resumeFollowUp's own
+    // doc comment). But a match that was created parentless to begin with — its target had already
+    // shipped, or it stood alone from the start — is a run target the contract gate checks same as
+    // any other, and a legacy one predating the Why requirement never passes through the branch
+    // above to pick it up. This is the only other pass that ever will.
+    await reconcileMissingWhy(context, existing);
   }
   if (match.partial) {
     const parentId = detachment ? undefined : beads.parentOf(existing);

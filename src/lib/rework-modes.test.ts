@@ -738,7 +738,13 @@ describe("applyFollowUp", () => {
   });
 
   it("leaves a detachment alone once it has gone through — the third retry writes nothing", async () => {
-    board(feature(), finishedTicket(), candidate("dup", { parent: undefined }));
+    // Realistic: an earlier pass already reconciled Why before this reparent landed, so it is not
+    // owed again here.
+    board(
+      feature(),
+      finishedTicket(),
+      candidate("dup", { parent: undefined, description: createdUnderFeat() }),
+    );
     showsWithNote("dup", followUpBody(), {
       notes: [detachedNote(true), formatHumanNote(followUpBody(), "founder", new Date())].join("\n"),
     });
@@ -872,13 +878,48 @@ describe("applyFollowUp", () => {
   });
 
   it("leaves an already-parentless match alone when the target has shipped — nothing to reconcile", async () => {
-    board(feature(), finishedTicket(), candidate("dup", { parent: undefined }));
+    board(
+      feature(),
+      finishedTicket(),
+      candidate("dup", {
+        parent: undefined,
+        description: followUpDescription({
+          summary: SUMMARY,
+          instructions: INSTRUCTIONS,
+          findings: [],
+          ticket: finishedTicket(),
+          targetId: "feat",
+        }),
+      }),
+    );
     showsWithNote("dup", followUpBody());
 
     await expect(
       applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
     ).resolves.toMatchObject({ runsUnderTarget: false, reconciled: false });
     expect(reparentMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  // anton-cdeki PR #334 review: a completed follow-up that was parentless FROM THE OUTSET — created
+  // after its target had already shipped, or from a standalone target — never takes the `detachment`
+  // branch above (nothing is owed on a bead that was never under the target), so it never used to hit
+  // reconcileMissingWhy either. That left a legacy parentless follow-up missing `## Why` forever: the
+  // contract gate doesn't catch the omission, and no other pass ever revisits a DONE match.
+  it("adds a missing Why to a completed follow-up that was parentless from the outset", async () => {
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature(), finishedTicket(), candidate("dup", { parent: undefined, description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(updateMock).toHaveBeenCalledWith(
+      "/repo",
+      "dup",
+      expect.objectContaining({ description: expect.stringContaining("## Why") }),
+    );
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Acceptance Criteria\n- [ ] done");
   });
 
   it("reads the match's parentage off the RE-READ, not the snapshot a rival may have moved", async () => {
