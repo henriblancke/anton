@@ -36,10 +36,56 @@ function toolEvents(blocks: unknown[], raw: unknown): ClaudeEvent[] {
     .map((b) => ({ type: "tool" as const, text: (b as { name?: string }).name, raw }));
 }
 
+/**
+ * Tools whose whole purpose is to END THE TURN and be woken later (anton-wjfkn): the session hands
+ * control back and expects a future invocation to read the result.
+ *
+ * An autonomous ticket session has no such future — anton reads one final message and settles the
+ * ticket on it — so arming one of these is how a session stops mid-work while exiting 0 and looking
+ * like a clean finish. Matched by name because that is all the stream carries for the intent; the
+ * `run_in_background` case is matched on the input instead ({@link backgroundedTool}), since the tool
+ * names that accept it (`Bash`, `Agent`) are also the ordinary foreground ones.
+ */
+const YIELDING_TOOLS = new Set(["ScheduleWakeup", "Monitor"]);
+
+/** True when a tool_use block asks for its work to run detached from the turn. */
+function backgroundedTool(block: unknown): boolean {
+  const input = (block as { input?: unknown } | null)?.input;
+  return (
+    typeof input === "object" &&
+    input !== null &&
+    (input as { run_in_background?: unknown }).run_in_background === true
+  );
+}
+
+/**
+ * The yield-shaped tools this message armed, by name — empty for an ordinary message.
+ *
+ * A backgrounded call is recorded under its own tool name with the reason appended, so the park an
+ * operator reads names the thing the agent actually did rather than a bare tool name that looks
+ * innocent.
+ */
+function yieldingTools(blocks: unknown[]): string[] {
+  const names: string[] = [];
+  for (const block of blocks) {
+    if (!isBlock(block, "tool_use")) continue;
+    const name = (block as { name?: unknown }).name;
+    if (typeof name !== "string") continue;
+    if (YIELDING_TOOLS.has(name)) names.push(name);
+    else if (backgroundedTool(block)) names.push(`${name} (run_in_background)`);
+  }
+  return names;
+}
+
+/** An assistant message's content blocks — `[]` when the line carries none in the expected shape. */
+function messageBlocks(raw: Record<string, unknown>): unknown[] {
+  const content = (raw.message as { content?: unknown[] } | undefined)?.content;
+  return Array.isArray(content) ? content : [];
+}
+
 /** Text first, then each tool call; an empty message still yields one event so it stays visible. */
 function assistantEvents(raw: Record<string, unknown>): ClaudeEvent[] {
-  const content = (raw.message as { content?: unknown[] } | undefined)?.content;
-  const blocks = Array.isArray(content) ? content : [];
+  const blocks = messageBlocks(raw);
   const events: ClaudeEvent[] = [];
 
   const text = assistantText(blocks);
@@ -109,10 +155,20 @@ export interface StreamState {
    * `result` field (anton-juar).
    */
   lastAssistantText?: string;
+  /**
+   * The yield-shaped tools the LAST assistant message armed (anton-wjfkn) — see
+   * {@link YIELDING_TOOLS}.
+   *
+   * Only the last message's, because that is the question: a `Monitor` armed mid-session and then
+   * read is ordinary work, while one armed by the message the session ENDED on is a turn handed back
+   * to a wake-up that will never come. Reset on every assistant message with content, so a later
+   * ordinary message clears an earlier arm.
+   */
+  pendingYields: string[];
 }
 
 export function createStreamState(): StreamState {
-  return { transcript: "" };
+  return { transcript: "", pendingYields: [] };
 }
 
 /** One stream-json line, or undefined when the line is blank or not JSON (claude prints both). */
@@ -139,6 +195,7 @@ function captureEvents(
   parsed: Record<string, unknown>,
   onEvent?: (event: ClaudeEvent) => void,
 ): void {
+  if (parsed.type === "assistant") state.pendingYields = yieldingTools(messageBlocks(parsed));
   for (const event of toEvents(parsed)) {
     if (event.text) state.transcript += `${event.text}\n`;
     if (event.type === "assistant" && event.text) state.lastAssistantText = event.text;

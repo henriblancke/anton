@@ -23,6 +23,7 @@ import { encodeGateFailure } from "./gate-failure-record";
 import {
   askSettleError,
   BlockedTailError,
+  holdsRecoverableWork,
   NeedsHumanError,
   ReviewBlockedError,
   runFailureParts,
@@ -349,7 +350,13 @@ async function teardownStoppedRun(run: EpicRun, settlement: RunSettlement): Prom
       // A halt over unrollbackable partial work keeps its checkout: that tree is the only copy
       // of the work, and the run's own note tells an operator to clear THIS path before
       // resuming — a `--force` release here would delete what that instruction points at.
-      holdsPartialWork: e instanceof WorktreeDirtyError,
+      //
+      // A stashed or yielded-mid-work stop keeps it for the same reason with the sign flipped
+      // (anton-wjfkn): the tree holds work nobody has committed — restored off the stash stack, or
+      // left loose by an agent that handed its turn back — and removing it is how the 2026-09-27
+      // incident turned a recoverable stop into lost work. The stash commit survives a removal; the
+      // loose tree does not, and neither should have to.
+      holdsPartialWork: e instanceof WorktreeDirtyError || holdsRecoverableWork(e),
     };
     let kept = false;
     await safe(async () => {

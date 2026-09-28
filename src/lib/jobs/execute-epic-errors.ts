@@ -87,6 +87,105 @@ export class NoDeliveryError extends Error implements RunFailureParts {
 }
 
 /**
+ * A stop whose WORK IS STILL IN THE WORKTREE, uncommitted (anton-wjfkn) — the two ways an agent can
+ * leave a run holding a change that no commit, and therefore no branch, records.
+ *
+ * The property every reader cares about is the same for both: this checkout may not be force-removed
+ * as a failed run's residue, because it — or the stash entries named here — is the only copy of the
+ * work. {@link holdsRecoverableWork} is what the teardown asks, so neither class needs the teardown to
+ * know it by name.
+ */
+export interface RecoverableWork {
+  /**
+   * The stash commits this stop is holding, newest first — empty when the work is loose in the tree
+   * rather than on the stack. Named in the park so the durable copy is reachable from an operator's
+   * own note; a measure-the-baseline loop can push several, and none of them may be left to a guess.
+   */
+  readonly stashes: readonly string[];
+}
+
+/** Whether this stop left uncommitted work behind — the one question the worktree teardown asks. */
+export function holdsRecoverableWork(e: unknown): boolean {
+  return e instanceof StashedWorkError || e instanceof AgentYieldedError;
+}
+
+/**
+ * The tree is empty because the agent STASHED its own work (anton-wjfkn).
+ *
+ * Distinct from {@link NoDeliveryError} in the one way that matters to an operator: nothing was
+ * delivered, but the work is not gone — it is a commit on the repository's stash stack, named here by
+ * sha. A zero-diff park tells them to implement the ticket or fix its spec, which is the wrong move
+ * and (once the worktree is force-removed as a failed run's residue) the expensive one: the stash
+ * commit is all that is left of the change. Poison-classified like the delivery block it replaces —
+ * re-running the agent would find the same set-aside tree — but carried as its own class so the
+ * teardown keeps this checkout and the park names the sha a person recovers from.
+ */
+export class StashedWorkError extends Error implements RunFailureParts, RecoverableWork {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null;
+  constructor(
+    msg: string,
+    readonly stashes: readonly string[],
+    structural: string = msg,
+    selfReport: AntonResult | null = null,
+  ) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
+    this.selfReport = selfReport;
+  }
+}
+
+/**
+ * The agent ENDED ITS TURN to wait on something (anton-wjfkn): its final message armed a
+ * `ScheduleWakeup`, a `Monitor` or a `run_in_background` job, and it emitted no `ANTON-RESULT` at all.
+ *
+ * Nothing wakes an autonomous ticket session — anton reads one final message and settles the ticket on
+ * it — so that turn is the whole session, and it is a STOP dressed as a clean exit. Its own class
+ * because every other reading of it is wrong and expensively so: read as a clean exit it becomes a
+ * zero-diff `no-delivery` park (the ticket blocked for "nothing landed", the epic halted, the
+ * worktree removed) over a session that was mid-work and usually holding its own diff aside to
+ * measure a baseline. That is the 2026-09-27 incident, and it is the reason this is a distinct outcome
+ * rather than a message on an existing one.
+ *
+ * Poison-classified: the agent is waiting for a reply the harness has no way to send, so another
+ * attempt reproduces the same yield. A person raises the ticket's budget, or the prompt's ban on
+ * yielding does its job on the next attempt.
+ */
+export class AgentYieldedError extends Error implements RunFailureParts, RecoverableWork {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null;
+  constructor(
+    readonly ticketId: string,
+    /** The yield-shaped tools the last message armed, by name — what the park tells the operator. */
+    readonly armed: readonly string[],
+    /** Stash entries the yielded session left behind, newest first; empty when it stashed nothing. */
+    readonly stashes: readonly string[] = [],
+    /** The formula step that yielded — the ticket phase can dispatch several agents. */
+    stepId?: string,
+    selfReport: AntonResult | null = null,
+  ) {
+    const structural =
+      `${ticketId} did not finish: its ${stepId ? `\`${stepId}\` ` : ``}agent ENDED ITS TURN to wait ` +
+      `on ${armed.join(", ")} and emitted no \`ANTON-RESULT\` line. Nothing wakes an autonomous ticket ` +
+      `session — anton reads one final message and settles the ticket on it — so the agent stopped ` +
+      `mid-work while the session exited cleanly. ` +
+      (stashes.length > 0
+        ? `It had set its own work aside first: ${stashes.map((s) => `\`${s}\``).join(", ")} on the ` +
+          `stash stack. anton restored what it could and KEPT this worktree rather than removing it, ` +
+          `so the change survives. `
+        : `Whatever it had built is loose in the run's worktree, which anton KEPT rather than removed. `) +
+      `Blocking the ticket and halting the epic — the work is unverified and uncommitted, so settling ` +
+      `it either way would be a guess. Checks must run in the FOREGROUND; resume the run (with a ` +
+      `raised ticketTimeoutMinutes if the agent yielded to wait out a long one).`;
+    super(structural);
+    this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
+    this.selfReport = selfReport;
+  }
+}
+
+/**
  * The agent committed changes but SELF-REPORTED `ANTON-RESULT: blocked` (anton-j5i8) — it declared
  * the ticket incomplete despite leaving a diff. Poison-classified (`name = "PoisonError"`) so the
  * runner parks for a human rather than retrying: the agent has said it can't finish, so re-running

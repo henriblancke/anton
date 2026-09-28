@@ -56,6 +56,17 @@ export interface StepFacts {
    * inheriting another step's read.
    */
   dispatched?: Bead;
+  /**
+   * `implement` / `claude` — the session ENDED ITS TURN to wait on something (anton-wjfkn), naming
+   * the yield-shaped tools its last message armed: `ScheduleWakeup`, `Monitor`, a backgrounded call.
+   *
+   * An autonomous ticket session gets no wake-up, so this is a stop dressed as a clean exit — and it
+   * is the shape that loses work, because the agent typically set its own diff aside (`git stash`) to
+   * measure something before yielding. Reported apart from {@link selfReport} because it is a fact
+   * about the STREAM, not a claim: an agent that yields emits no `ANTON-RESULT` at all, which is
+   * exactly why the absent line cannot be read as "nothing to say".
+   */
+  yielded?: string[];
   /** `commit` — whether the worktree actually had a diff to commit (false ⇒ nothing delivered). */
   committed?: boolean;
   /**

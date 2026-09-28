@@ -3944,6 +3944,71 @@ export async function restoreWorktreeState(
   await git(worktreePath, ["clean", "-fd"]);
 }
 
+/**
+ * One entry on the repository's stash reflog: the commit that holds the stashed tree, and the
+ * subject git generated for it.
+ *
+ * The SHA is the identity, never the `stash@{n}` selector: the stack is shared by every worktree cut
+ * from one repository, so a concurrent run pushing its own entry renumbers everything below it — a
+ * selector read a moment ago can name a different entry by the time it is used.
+ */
+export interface StashEntry {
+  /** Full sha of the stash commit — stable while the entry exists, unlike its `stash@{n}` index. */
+  sha: string;
+  /** git's own reflog subject, e.g. `On anton/anton-wjfkn: <message>`. */
+  subject: string;
+}
+
+/**
+ * Every stash entry this repository currently holds, newest first — the read a zero-diff gate needs
+ * to tell an empty tree from one whose work is parked on the stash stack (anton-wjfkn).
+ *
+ * Repository-wide, because that is what the stash IS: `refs/stash` lives in the shared git dir, so a
+ * worktree's `git stash push` lands on the same stack as every sibling's. The gate compares against a
+ * baseline taken in the same worktree and is only interested in what GREW, which is why the caller
+ * diffs two reads rather than trusting one.
+ *
+ * Fails closed to `[]` — a repository with no `refs/stash` at all exits non-zero on some gits, and
+ * "no entries" is the answer that changes no behaviour. A read that failed therefore never
+ * manufactures a stash the caller would then refuse to remove a worktree over.
+ */
+export async function readStashEntries(worktreePath: string): Promise<StashEntry[]> {
+  // `-z` for the same reason every other read here uses it: a stash message is free text the agent
+  // chose, and a newline in it would split one entry into two.
+  const raw = await git(worktreePath, ["stash", "list", "-z", "--format=%H%x00%gs"]).catch(() => "");
+  const fields = raw.split("\0");
+  const entries: StashEntry[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const [sha, subject] = [fields[i], fields[i + 1]];
+    if (sha && /^[0-9a-f]{40}$/.test(sha)) entries.push({ sha, subject: subject ?? "" });
+  }
+  return entries;
+}
+
+/**
+ * Put a stash entry's changes back into the working tree, by SHA — and deliberately LEAVE the entry
+ * on the stack (anton-wjfkn).
+ *
+ * `apply <sha>`, never `pop`: `pop` takes whatever sits at `stash@{0}`, and the stack is shared by
+ * every worktree cut from one repository, so on a machine running several tickets at once that entry
+ * can be a CONCURRENT run's — popping it would move another worktree's work into this one.
+ *
+ * The entry is not dropped because the restored copy is UNCOMMITTED: it lives only in a worktree that
+ * a later teardown or reaper pass may remove, and the stash commit is then the sole surviving copy of
+ * the work. Keeping both costs an operator one `git stash drop` once they have recovered it; dropping
+ * eagerly costs the change. Callers name the sha in whatever they park on, so the durable copy is
+ * always reachable.
+ *
+ * Answers whether the tree actually has the work: false means the apply failed (a conflict against
+ * the tree the entry was made from, a corrupt entry) and only the stack copy exists.
+ */
+export async function applyStashEntry(worktreePath: string, sha: string): Promise<boolean> {
+  return git(worktreePath, ["stash", "apply", sha]).then(
+    () => true,
+    () => false,
+  );
+}
+
 export interface PullRequest {
   url: string;
   /** beads external-ref form: `gh-<number>` when the number is parseable, else the url. */

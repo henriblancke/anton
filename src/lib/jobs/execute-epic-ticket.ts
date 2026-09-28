@@ -14,8 +14,14 @@ import type { Bead } from "../beads/bd";
 import { metered, type InvocationDimensions } from "../claude-invocations";
 import { formatAntonResult, type AntonOutcome, type AntonResult } from "../claude/anton-result";
 import { runClaude } from "../claude/driver";
-import { branchAddedCommit } from "../git/ops";
-import { BlockedByAgentError, NeedsHumanError, NoDeliveryError } from "./execute-epic-errors";
+import { applyStashEntry, branchAddedCommit, readStashEntries, type StashEntry } from "../git/ops";
+import {
+  AgentYieldedError,
+  BlockedByAgentError,
+  NeedsHumanError,
+  NoDeliveryError,
+  StashedWorkError,
+} from "./execute-epic-errors";
 import {
   claimTicket,
   finishTicket,
@@ -91,9 +97,10 @@ export async function runTicket(args: {
   const baseline = await readTicketBaseline(worktreePath);
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
+  const stash = ticketStashRecovery(worktreePath, await readStashEntries(worktreePath));
 
   try {
-    await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress });
+    await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress, stash });
     const settlement = await ticketSettlement(run, progress);
     // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
     // settlement's commit lookup are plain git reads that take no signal, so a deadline landing
@@ -142,6 +149,8 @@ async function walkTicketSteps(args: {
   ticketCtx: StepContext;
   session: { sessionId: string; logPath: string };
   progress: TicketProgress;
+  /** The stash reads that tell an empty tree from a set-aside one (anton-wjfkn). */
+  stash: StashRecovery;
 }): Promise<void> {
   const { run, ticket, ticketCtx, session, progress } = args;
   const { db } = run;
@@ -216,6 +225,21 @@ async function walkTicketSteps(args: {
       throw new NeedsHumanError(ticket.id, progress.selfReport.reason);
     }
 
+    // The agent ENDED ITS TURN to wait (anton-wjfkn): its last message armed a wake-up, a monitor or
+    // a background job and it emitted no `ANTON-RESULT` at all. Nothing wakes an autonomous ticket
+    // session, so that turn is the whole session — and it is a stop, not a finish.
+    //
+    // Judged HERE, at the step that yielded, for the same reason the ask above is: what follows would
+    // MISREAD it. A `verify` gate would run against a half-written tree, and the delivery gate would
+    // read the agent's silence as "nothing to report" and settle whatever the tree happens to hold —
+    // which for the shape that actually occurs is an empty tree it files as a zero-diff stall. The
+    // stash is recovered on the way out, because this exit precedes the gate that would otherwise do
+    // it and the yield and the stash are one event: the agent stashed in order to measure, then
+    // yielded to wait for the measurement.
+    if (progress.yielded) {
+      throw await yieldedMidWork(ticket, progress.yielded, cooked.id, progress, args.stash);
+    }
+
     if (definition.name !== "commit") {
       // A step that RAN and did not achieve its work halts the ticket (and, through it, the epic).
       // Verify gates and any other throwing step propagate untouched, so the runner's own
@@ -235,8 +259,12 @@ async function walkTicketSteps(args: {
     // `alreadyShippedBase` can let a commit the checkout only carries because of the base refresh —
     // not this run's own work — read as "added by the branch", the exact false success every sibling
     // check in this file was updated to close (see `alreadyShippedBase`'s own doc comment).
-    await assertDelivered(ticket, result.facts ?? {}, progress, (commit) =>
-      branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, commit),
+    await assertDelivered(
+      ticket,
+      result.facts ?? {},
+      progress,
+      (commit) => branchAddedCommit(run.repoPath, run.branch, run.alreadyShippedBase, commit),
+      args.stash,
     );
   }
 }
@@ -263,6 +291,10 @@ async function walkTicketSteps(args: {
  * reporting agent never received.
  */
 export function recordStepReport(progress: TicketProgress, facts: StepFacts | undefined): void {
+  // The yield is a fact about the step that just ran and is acted on immediately by the walk, so it
+  // is recorded outside the severity merge above: it is not a claim competing with other claims, and
+  // a step that yielded cannot have reported anything for the merge to weigh it against.
+  if (facts?.yielded?.length) progress.yielded = facts.yielded;
   const reported = facts?.selfReport;
   if (!reported || !displacesSelfReport(reported, progress.selfReport)) return;
   progress.selfReport = reported;
@@ -275,6 +307,50 @@ export function recordStepReport(progress: TicketProgress, facts: StepFacts | un
  * {@link branchAddedCommit} over the run's repository, branch and fork point.
  */
 export type BranchAddedCommit = (commit: string) => Promise<boolean>;
+
+/**
+ * The stash reads the delivery gate needs to tell an empty tree from a SET-ASIDE one (anton-wjfkn),
+ * injected for the same reason {@link BranchAddedCommit} is: the gate stays a unit.
+ *
+ * Required rather than optional, deliberately. An agent that stashed its diff and yielded produces a
+ * tree byte-identical to one that did nothing, so a call site that omitted this would settle the
+ * incident this exists to stop while looking perfectly correct — the silent-failure seam is the bug.
+ */
+export interface StashRecovery {
+  /**
+   * Stash entries the worktree gained since this ticket's baseline, newest first — `[]` when it
+   * gained none, which is every ordinary ticket.
+   *
+   * The DELTA, not the stack: the stack is shared by every worktree cut from the repository, so a
+   * concurrent run's entries are on it and are none of this ticket's business.
+   */
+  gained: () => Promise<readonly StashEntry[]>;
+  /** Put one entry's changes back into the tree, leaving the durable stack copy — {@link applyStashEntry}. */
+  apply: (sha: string) => Promise<boolean>;
+}
+
+/**
+ * The production {@link StashRecovery} for one ticket, closed over the stash stack as it stood BEFORE
+ * any of the ticket's steps ran.
+ *
+ * The baseline is what makes the answer this ticket's own. `refs/stash` lives in the shared git dir,
+ * so every worktree on this machine pushes onto one stack — a run executing tickets in parallel
+ * worktrees has siblings' entries on it, and an absolute read would attribute them here: the ticket
+ * would park `stashed-work` over a neighbour's entry and, worse, APPLY that neighbour's changes into
+ * this worktree. Diffing against the baseline by sha keeps both halves honest, and it is only a
+ * one-way guard — an entry that was already there and has since been popped elsewhere simply drops out
+ * of the delta, which is the correct answer.
+ */
+function ticketStashRecovery(
+  worktreePath: string,
+  baseline: readonly StashEntry[],
+): StashRecovery {
+  const before = new Set(baseline.map((e) => e.sha));
+  return {
+    gained: async () => (await readStashEntries(worktreePath)).filter((e) => !before.has(e.sha)),
+    apply: (sha) => applyStashEntry(worktreePath, sha),
+  };
+}
 
 /**
  * The commit is the ticket's evidence of record — honor the step's verdict on whether there is one,
@@ -295,12 +371,19 @@ export type BranchAddedCommit = (commit: string) => Promise<boolean>;
  * folded into the reason. The step then settles with `committed: false` — the tree fact is still
  * true, this ticket added nothing — and `delivered: true`, which is what the board and the pull
  * request read. Which commit it settled against is the next ticket's business (attribution).
+ *
+ * ONE zero diff is not this ticket's answer to give at all (anton-wjfkn): the tree is empty because
+ * the agent STASHED its own work. `git stash` produces a tree byte-identical to one nothing touched,
+ * so before this gate may call an empty tree a zero diff it asks {@link StashRecovery} whether the
+ * worktree gained an entry since the ticket's baseline — and refuses the delivery block if it did.
+ * See {@link refuseStashedDelivery} for what it does instead.
  */
 export async function assertDelivered(
   ticket: Bead,
   facts: StepFacts,
   progress: TicketProgress,
   branchAdded: BranchAddedCommit,
+  stash: StashRecovery,
 ): Promise<void> {
   const committed = facts.committed === true;
   // The TREE fact is recorded first and unconditionally — the timeout path reads it to know there
@@ -322,6 +405,12 @@ export async function assertDelivered(
     ) {
       progress.delivered = true;
       return;
+    }
+    // Before the tree may be called EMPTY, ask whether it is merely SET ASIDE (anton-wjfkn). Asked
+    // only here, on the one path that would otherwise report "nothing landed" over work that exists.
+    const stashed = await stash.gained().catch(() => []);
+    if (stashed.length > 0) {
+      await refuseStashedDelivery(ticket, progress, stashed, stash);
     }
     // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
     // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
@@ -379,6 +468,126 @@ export async function assertDelivered(
     throw new NoDeliveryError(structural, structural, selfReport ?? null);
   }
   progress.delivered = true;
+}
+
+/**
+ * The empty tree is a SET-ASIDE one: the worktree gained stash entries while this ticket ran, so
+ * whatever the agent built is on the stash stack rather than nowhere (anton-wjfkn). Always throws.
+ *
+ * This is the incident of 2026-09-27 (fati-8sme): the agent implemented the ticket, hit a coverage
+ * floor, ran `git stash -u` to measure the baseline, started that measurement in the background and
+ * yielded its turn. anton read the yielded turn as a clean exit over an empty tree, blocked the
+ * ticket `no-delivery`, halted the epic, and force-removed the worktree — after which a stash commit
+ * in the shared repository was the only copy of +171 lines of passing work. Every step of that was
+ * correct except the first: the tree was never empty.
+ *
+ * So the entries are RESTORED, newest last — `git stash` is a stack, so replaying it oldest-first is
+ * what reproduces the tree the agent had. A restore that lands is not a delivery: nothing here
+ * verified the work or ran a gate over it, and the commit step has already been and gone. The ticket
+ * still stops, but it stops on THIS class rather than a zero diff, which changes the three things
+ * that actually cost the work:
+ *
+ *  - the park names the stash shas, so the durable copy is reachable from the operator's own note;
+ *  - the worktree is KEPT (this error is `holdsPartialWork` at the run's teardown), so the restored
+ *    tree survives for the resume that continues from it;
+ *  - the remedy an operator is handed is "your work is here", not "implement this ticket".
+ *
+ * The apply is best-effort and its failure is reported rather than repaired: `applyStashEntry` leaves
+ * every entry on the stack either way, so the only thing a failed apply costs is the convenience of
+ * finding the work already in the tree. Nothing is ever dropped — see {@link applyStashEntry}.
+ */
+async function refuseStashedDelivery(
+  ticket: Bead,
+  progress: TicketProgress,
+  stashed: readonly StashEntry[],
+  stash: StashRecovery,
+): Promise<never> {
+  const shas = stashed.map((e) => e.sha);
+  const list = shas.map((sha) => `\`${sha}\``).join(", ");
+  const structural =
+    `${ticket.id} delivered nothing because its work is STASHED, not absent: the worktree gained ` +
+    `${shas.length} stash ${shas.length === 1 ? "entry" : "entries"} (${list}) while this ticket ran, ` +
+    `so the empty tree the commit step saw is work the agent set aside rather than work it never did. ` +
+    `${await recoverStashed(stashed, stash)}. Blocking the ticket and halting the epic — nothing was ` +
+    `verified or committed, so this is no delivery — but the worktree is KEPT rather than removed, ` +
+    `because that stash is the only record of the change. Read it with ` +
+    `\`git stash show -p <sha>\` and restore it with \`git stash apply <sha>\`, then finish the ` +
+    `ticket by hand or resume the run. Agents must never stash their own work: the harness reads the ` +
+    `worktree as the delivery.`;
+  throw new StashedWorkError(
+    structural + selfReportSuffix(progress.selfReport),
+    shas,
+    structural,
+    progress.selfReport,
+  );
+}
+
+/**
+ * The stop a yielded turn earns (anton-wjfkn), with whatever the agent stashed on its way to yielding
+ * put back first.
+ *
+ * The recovery runs HERE and not only in {@link refuseStashedDelivery} because a yield exits the walk
+ * BEFORE the commit step, so that gate never gets to ask. They are one event in practice — the agent
+ * stashes to measure a baseline, then yields to wait for the measurement — and the incident this
+ * closes is exactly that pair. A yield with no stash is the ordinary case and costs one empty read.
+ *
+ * Returns the error rather than throwing it, so the throw is visible at the call site in the walk.
+ */
+async function yieldedMidWork(
+  ticket: Bead,
+  armed: readonly string[],
+  stepId: string,
+  progress: TicketProgress,
+  stash: StashRecovery,
+): Promise<AgentYieldedError> {
+  const stashed = await stash.gained().catch(() => []);
+  if (stashed.length > 0) await recoverStashed(stashed, stash);
+  return new AgentYieldedError(
+    ticket.id,
+    armed,
+    stashed.map((e) => e.sha),
+    stepId,
+    progress.selfReport,
+  );
+}
+
+/**
+ * Put every gained stash entry back into the worktree, and say what became of them in one clause an
+ * operator-facing message can embed.
+ *
+ * Replayed OLDEST FIRST — the entries arrive newest-first off the reflog, and applying a stack in that
+ * order would lay an earlier snapshot over a later one. Best-effort per entry: `applyStashEntry`
+ * leaves every entry on the stack whatever happens, so a failed apply costs only the convenience of
+ * finding the work already in the tree, never the work.
+ */
+async function recoverStashed(
+  stashed: readonly StashEntry[],
+  stash: StashRecovery,
+): Promise<string> {
+  const restored: string[] = [];
+  const failed: string[] = [];
+  for (const entry of [...stashed].reverse()) {
+    if (await stash.apply(entry.sha)) restored.push(entry.sha);
+    else failed.push(entry.sha);
+  }
+  const one = stashed.length === 1;
+  if (failed.length === 0) {
+    return (
+      `anton applied ${one ? "it" : "them"} back into the worktree and left ` +
+      `${one ? "the entry" : "the entries"} on the stash stack as the durable copy`
+    );
+  }
+  if (restored.length === 0) {
+    return (
+      `anton could NOT apply ${one ? "it" : "any of them"} back into the worktree (the tree has ` +
+      `moved under ${one ? "it" : "them"}), so the stash ${one ? "commit is" : "commits are"} the ` +
+      `only copy`
+    );
+  }
+  return (
+    `anton applied ${restored.length} of ${stashed.length} back into the worktree and could not ` +
+    `apply ${failed.map((sha) => `\`${sha}\``).join(", ")}; every entry is still on the stash stack`
+  );
 }
 
 /**
