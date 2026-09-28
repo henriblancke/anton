@@ -19,5 +19,13 @@ it short. This is *what this business is* — not a backlog (that's beads) and n
 ## Success signals
 <the 1–3 metrics or behaviors that mean it's working>
 
+## Outcomes
+<!-- Stable ids a run target can point at (`outcome:<id>` label) to say which of the success
+     signals above it serves. Parsed by src/lib/outcomes.ts as `- `id` — summary`; an outcome no
+     longer offered gets a trailing `(retired)` on its summary but keeps resolving for old labels.
+     `codebase-health` is built in — every project has it whether or not it's listed here; list it
+     only to override its summary. -->
+- `example-outcome-id` — <what winning looks like, one line>
+
 ## Stack
 <e.g. Next.js/Vercel + Supabase; or FastAPI + Postgres. Determines which agents apply.>
