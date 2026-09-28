@@ -61,8 +61,16 @@ export interface PrReview {
   url: string;
   /** Submitted reviews (latest state per reviewer as gh reports them). */
   reviews: Array<{ author: string; state: string; body: string }>;
-  /** Failing checks, by name. */
+  /** Failing checks, by name (display text — a name alone repeats across reruns, see `failingCheckAttempts`). */
   failingChecks: string[];
+  /**
+   * One entry per failing check in `failingChecks`, `name@attemptIdentity` — where attemptIdentity is
+   * the check's own details URL / timestamp, which changes on a rerun even when the name and
+   * conclusion don't (anton-091jr review, chatgpt-codex-connector). The answered-suppression
+   * fingerprint keys on this instead of `failingChecks` so a check that goes green and fails again at
+   * the same head is treated as a NEW failure rather than matched against a stale "answered" row.
+   */
+  failingCheckAttempts: string[];
   pendingChecks: number;
   /** Inline review threads (resolved ones included; filter with threadsNeedingAttention). */
   threads: ReviewThread[];
@@ -84,6 +92,10 @@ interface GhPrView {
     conclusion?: string; // SUCCESS | FAILURE | ... (checkRun)
     state?: string; // SUCCESS | FAILURE | PENDING (statusContext)
     context?: string; // statusContext name
+    detailsUrl?: string; // checkRun — points at the actual run/job, changes on rerun
+    targetUrl?: string; // statusContext equivalent of detailsUrl
+    completedAt?: string; // checkRun — changes on rerun even when detailsUrl is absent
+    createdAt?: string; // statusContext equivalent of completedAt
   }>;
 }
 
@@ -100,6 +112,17 @@ function isPending(c: NonNullable<GhPrView["statusCheckRollup"]>[number]): boole
   if (c.status && c.status !== "COMPLETED") return true;
   if (c.state === "PENDING") return true;
   return false;
+}
+
+/**
+ * Stable identity of THIS check's attempt, not just its name — a rerun of the same check keeps the
+ * same name but gets a fresh `detailsUrl`/`completedAt`, which is exactly what distinguishes "the
+ * failure a prior round already answered" from "a fresh failure at the same head" (anton-091jr
+ * review, chatgpt-codex-connector). Falls back to "unknown" only when `gh` reports neither — at
+ * that point the name is genuinely all there is.
+ */
+function checkAttemptId(c: NonNullable<GhPrView["statusCheckRollup"]>[number]): string {
+  return c.detailsUrl || c.targetUrl || c.completedAt || c.createdAt || "unknown";
 }
 
 /**
@@ -125,10 +148,11 @@ export async function getPrReview(
   const view = JSON.parse(raw) as GhPrView;
 
   const rollup = view.statusCheckRollup ?? [];
-  const failingChecks = rollup
-    .filter(isFailing)
-    .map((c) => c.name ?? c.context ?? "check")
-    .filter(Boolean);
+  const failing = rollup.filter(isFailing);
+  const failingChecks = failing.map((c) => c.name ?? c.context ?? "check");
+  const failingCheckAttempts = failing.map(
+    (c) => `${c.name ?? c.context ?? "check"}@${checkAttemptId(c)}`,
+  );
   const pendingChecks = rollup.filter(isPending).length;
 
   const reviews = (view.reviews ?? []).map((r) => ({
@@ -147,6 +171,7 @@ export async function getPrReview(
     url: view.url,
     reviews,
     failingChecks,
+    failingCheckAttempts,
     pendingChecks,
     threads: await getReviewThreads(repoPath, number, signal),
   };
@@ -369,9 +394,15 @@ export function classifyReview(pr: PrReview): Actionable {
     fingerprint.push(reason);
   }
   if (pr.failingChecks.length > 0) {
-    const reason = `failing checks: ${pr.failingChecks.join(", ")}`;
-    reasons.push(reason);
-    fingerprint.push(reason);
+    reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
+    // Keyed on the attempt identity, not the name — a check that goes green and fails again at
+    // the same PR head gets a fresh `detailsUrl`/`completedAt`, so this changes the fingerprint
+    // even though `failingChecks`' display names read identically to the prior failure. Falls back
+    // to the plain names when a caller-built fixture leaves `failingCheckAttempts` empty; sorted so
+    // ordering never depends on `gh`'s own rollup order.
+    const attempts =
+      pr.failingCheckAttempts.length > 0 ? pr.failingCheckAttempts : pr.failingChecks;
+    for (const id of [...attempts].sort()) fingerprint.push(`check:${id}`);
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");

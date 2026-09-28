@@ -33,6 +33,7 @@ function pr(overrides: Partial<PrReview> = {}): PrReview {
     url: "https://github.com/o/r/pull/7",
     reviews: [],
     failingChecks: [],
+    failingCheckAttempts: [],
     pendingChecks: 0,
     threads: [],
     ...overrides,
@@ -150,6 +151,27 @@ describe("classifyReview", () => {
     const a = classifyReview(pr({ threads: [t1, t2] }));
     const b = classifyReview(pr({ threads: [t2, t1] }));
     expect(a.fingerprint).toEqual(b.fingerprint);
+  });
+
+  // anton-091jr review round 2 (chatgpt-codex-connector): a check rerun at the same head, same
+  // name, keeps `reasons` identical (display text is name-only) but must still change the
+  // fingerprint — otherwise a fresh failure with different output gets matched against a stale
+  // "answered" row from the PRIOR run of the same check.
+  it("changes fingerprint (but not reasons) when a failing check reruns with a new attempt id, same name", () => {
+    const before = classifyReview(
+      pr({ failingChecks: ["build"], failingCheckAttempts: ["build@https://ci/run/1"] }),
+    );
+    const after = classifyReview(
+      pr({ failingChecks: ["build"], failingCheckAttempts: ["build@https://ci/run/2"] }),
+    );
+    expect(before.reasons).toEqual(after.reasons);
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+    expect(after.fingerprint).toContain("check:build@https://ci/run/2");
+  });
+
+  it("check fingerprint falls back to the plain name when no attempt identity is available", () => {
+    const v = classifyReview(pr({ failingChecks: ["build", "lint"] }));
+    expect(v.fingerprint).toEqual(["check:build", "check:lint"]);
   });
 });
 
@@ -297,5 +319,39 @@ process.exit(0);
     const review = await getPrReview(sandbox, 7);
     expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
     expect(classifyReview(review).actionable).toBe(true);
+  });
+
+  it("pairs each failing check's name with its own detailsUrl in failingCheckAttempts", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [],
+    statusCheckRollup: [
+      { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://ci/run/42' },
+    ],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.failingChecks).toEqual(["build"]);
+    expect(review.failingCheckAttempts).toEqual(["build@https://ci/run/42"]);
   });
 });

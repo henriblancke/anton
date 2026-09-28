@@ -702,23 +702,21 @@ interface RunFixSessionResult {
 
 /**
  * Do EVERY thread `waitingIds` named (the PR's own unresolved-and-not-yet-replied-to set, read
- * BEFORE this round touched anything) now have a real outcome in `report` — i.e. is there nothing
- * left that this round was asked about but never actually answered? A `fabricatedFix` "fixed" claim
- * doesn't count (same rule `applyThreadOutcomes` uses to skip replying to it), and a thread the
- * report never mentions at all — because it was malformed, or claude's final message carried no
- * reporting contract — doesn't count either. Vacuously true when nothing was waiting.
+ * BEFORE this round touched anything) now have a real, DELIVERED outcome — i.e. is there nothing
+ * left that this round was asked about but never actually answered? `answeredIds` is
+ * `applyThreadOutcomes`'s own return value: the ids whose GitHub reply actually landed. A
+ * `fabricatedFix` "fixed" claim never reaches that set (same rule `applyThreadOutcomes` uses to
+ * skip replying to it), and neither does a thread whose reply call failed — a report entry alone
+ * isn't enough, since `replyToReviewComment` failing is swallowed by `safe()` and must not read as
+ * "answered" (anton-091jr review, chatgpt-codex-connector). Vacuously true when nothing was waiting.
  */
 function allWaitingThreadsAnswered(
   waitingIds: ReadonlySet<string>,
-  report: ThreadOutcome[],
-  pushed: boolean,
+  answeredIds: ReadonlySet<string>,
 ): boolean {
   if (waitingIds.size === 0) return true;
-  const answered = new Set(
-    report.filter((item) => !fabricatedFix(item, pushed)).map((item) => item.id),
-  );
   for (const id of waitingIds) {
-    if (!answered.has(id)) return false;
+    if (!answeredIds.has(id)) return false;
   }
   return true;
 }
@@ -956,7 +954,15 @@ async function runFixSession(args: {
     sessionSettled = true;
 
     const report = parseThreadReport(result.text);
-    await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
+    const answeredIds = await applyThreadOutcomes({
+      repo,
+      number,
+      pr,
+      report,
+      pushed,
+      signal: ctx.signal,
+      logPath,
+    });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
     // no thread report (CI-only/conflict-only/no-inline-threads trigger).
@@ -975,7 +981,7 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      return { pushed: false, answeredAllThreads: allWaitingThreadsAnswered(waitingIds, report, false) };
+      return { pushed: false, answeredAllThreads: allWaitingThreadsAnswered(waitingIds, answeredIds) };
     }
 
     await notifyReReview({
@@ -1363,27 +1369,34 @@ export async function applyThreadOutcomes(args: {
   pushed: boolean;
   signal: AbortSignal;
   logPath: string;
-}): Promise<void> {
+}): Promise<ReadonlySet<string>> {
   const waiting = threadsNeedingAttention(args.pr);
+  const delivered = new Set<string>();
   for (const item of args.report) {
     const thread = waiting.find((t) => t.id === item.id);
     const anchor = thread?.comments[0];
     if (!thread || !anchor) continue;
     if (fabricatedFix(item, args.pushed)) continue;
-    await recordThreadOutcome(args, thread, anchor.id, item);
+    if (await recordThreadOutcome(args, thread, anchor.id, item)) delivered.add(item.id);
   }
+  return delivered;
 }
 
-/** Reply on the thread, resolve it when the fix landed, and log what was said. */
+/**
+ * Reply on the thread, resolve it when the fix landed, and log what was said. Returns whether the
+ * reply itself actually reached GitHub — the reaction and resolve legs stay best-effort (calibration
+ * signal, not the record of record), but the reply is what makes a thread "answered": a caller must
+ * not suppress re-triage on a thread whose reply call failed (anton-091jr review, chatgpt-codex-connector).
+ */
 async function recordThreadOutcome(
   args: ThreadReplyArgs,
   thread: ReviewThread,
   anchorId: number,
   item: ThreadOutcome,
-): Promise<void> {
+): Promise<boolean> {
   const { repo, number, signal, logPath } = args;
   const note = item.reply?.trim() || defaultReply(item.outcome);
-  await safe(() =>
+  const replied = await safe(() =>
     replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
   );
   await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
@@ -1393,6 +1406,7 @@ async function recordThreadOutcome(
     logPath,
     `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
   );
+  return replied;
 }
 
 /**
