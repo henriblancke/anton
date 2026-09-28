@@ -1,6 +1,6 @@
 ---
 name: scan-triage
-version: 773e3b052094
+version: 3b563b007d80
 description: >-
   Turn a stringer scan into a small set of well-formed beads, protecting queue quality. Reads
   stringer signal output, dedupes across every automated producer (stringer/gardener/pm

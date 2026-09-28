@@ -170,9 +170,9 @@ const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
  * and a ticket render legitimately ignores `outcome`.
  */
 const TIER_CONTRACT_VARS: Record<BeadTier, string[]> = {
-  epic: ["outcome", "success_criteria"],
-  feature: ["goal", "acceptance", "context", "out_of_scope", "verify"],
-  ticket: ["goal", "acceptance", "context", "out_of_scope", "verify"],
+  epic: ["outcome", "success_criteria", "outcome_ids"],
+  feature: ["goal", "why", "acceptance", "context", "out_of_scope", "verify"],
+  ticket: ["goal", "why", "acceptance", "context", "out_of_scope", "verify"],
 };
 
 /**

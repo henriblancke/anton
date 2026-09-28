@@ -5,6 +5,12 @@ import { createDraftFeature, DraftContractError, DraftEpicError } from "@/lib/ba
 import { AREA_SHAPE } from "@/lib/epic-patch";
 import { resolveProject } from "../resolve-project";
 
+/** A label-safe suffix — the same shape bd round-trips for `area:<value>` and `outcome:<value>`. */
+const labelValue = z
+  .string()
+  .trim()
+  .regex(AREA_SHAPE, "expected a label-safe value — letters, digits, . _ -");
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -23,10 +29,7 @@ const epicSchema = z.discriminatedUnion("kind", [
       title: z.string().trim().min(1).max(200),
       goal: section,
       successCriteria: section,
-      area: z
-        .string()
-        .trim()
-        .regex(AREA_SHAPE, "expected a label-safe value — letters, digits, . _ -"),
+      area: labelValue,
       outcomeIds: section,
     }),
   }),
@@ -51,6 +54,7 @@ const draftSchema = z.object({
     title: z.string().trim().min(1).max(200),
     goal: section,
     why: section,
+    outcomeId: labelValue,
     acceptance: section,
     context: section,
     outOfScope: section,

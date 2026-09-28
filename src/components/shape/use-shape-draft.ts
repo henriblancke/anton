@@ -9,6 +9,7 @@ import {
   canSubmitDraft,
   draftAreaValid,
   draftGaps,
+  draftOutcomeIdValid,
   isNewEpic,
   type EpicDraftFields,
   type FeatureDraftFields,
@@ -19,6 +20,7 @@ const EMPTY_FEATURE: FeatureDraftFields = {
   title: "",
   goal: "",
   why: "",
+  outcomeId: "",
   acceptance: "",
   context: "",
   outOfScope: "",
@@ -45,7 +47,8 @@ export interface ShapeDraft {
   /** Whether the epic is being created here rather than picked off the board. */
   creatingEpic: boolean;
   areaValid: boolean;
-  /** Every field present and the area label-safe: the draft satisfies the contract. */
+  outcomeIdValid: boolean;
+  /** Every field present and every label-shaped one valid: the draft satisfies the contract. */
   complete: boolean;
 }
 
@@ -91,6 +94,7 @@ export function useShapeDraft(): ShapeDraft {
       gaps: draftGaps(fields),
       creatingEpic: isNewEpic(fields),
       areaValid: draftAreaValid(fields),
+      outcomeIdValid: draftOutcomeIdValid(fields),
       complete: canSubmitDraft(fields),
     }),
     [fields, seedFrom, setEpicField, setEpicId, setFeatureField],

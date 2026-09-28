@@ -45,8 +45,8 @@ export function ShapingDraftPanel({
       footer={
         <SubmitFooter
           disabled={!draft.complete || sending}
-          invalid={!draft.areaValid}
-          hint={submitHint(draft.gaps, draft.areaValid)}
+          invalid={!draft.areaValid || !draft.outcomeIdValid}
+          hint={submitHint(draft.gaps, draft.areaValid && draft.outcomeIdValid)}
           onSend={onSend}
         />
       }

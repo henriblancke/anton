@@ -10,7 +10,9 @@ import {
   draftAreaValid,
   draftBody,
   draftGaps,
+  draftOutcomeIdValid,
   isAreaValid,
+  isOutcomeIdValid,
   NEW_EPIC,
   submitHint,
   type ShapeDraftFields,
@@ -20,6 +22,7 @@ const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
   why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
+  outcomeId: "reports-are-shareable",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow src/lib/export.ts",
   outOfScope: "- PDF export",
@@ -66,6 +69,7 @@ describe("draftGaps", () => {
           title: "",
           goal: "",
           why: "",
+          outcomeId: "",
           acceptance: "",
           context: "",
           outOfScope: "",
@@ -78,6 +82,7 @@ describe("draftGaps", () => {
       "a title",
       "a goal",
       "why",
+      "which outcome this serves",
       "acceptance criteria",
       "context",
       "out of scope",
@@ -128,6 +133,39 @@ describe("isAreaValid", () => {
   // not keep Send disabled forever.
   it("is not judged at all once an existing epic is chosen", () => {
     expect(draftAreaValid({ ...FULL, epic: { ...EPIC, area: "two words" } })).toBe(true);
+  });
+});
+
+describe("isOutcomeIdValid", () => {
+  it("accepts label-safe ids and the not-yet-typed empty state", () => {
+    for (const id of ["reports-are-shareable", "billing.core", "data_ingest", "v2-api", ""]) {
+      expect(isOutcomeIdValid(id), id).toBe(true);
+    }
+  });
+
+  it("rejects values bd could not round-trip through outcome:<value>", () => {
+    for (const id of ["two words", "outcome:reports", "-leading"]) {
+      expect(isOutcomeIdValid(id), id).toBe(false);
+    }
+  });
+
+  // A malformed outcome id is a validation error, not a missing field, exactly like a malformed
+  // area — the panel must say WHY, not just stay disabled with the gap list empty.
+  it("blocks submit without adding a gap", () => {
+    const draft = { ...FULL, feature: { ...FEATURE, outcomeId: "two words" } };
+    expect(draftGaps(draft)).toEqual([]);
+    expect(canSubmitDraft(draft)).toBe(false);
+  });
+
+  // Unlike the epic's area, the feature's outcome id is sent on EVERY draft — new epic or
+  // existing — so it stays judged regardless of which epic branch the panel is in.
+  it("is judged the same whether the epic is new or already on the board", () => {
+    expect(draftOutcomeIdValid({ ...FULL, feature: { ...FEATURE, outcomeId: "two words" } })).toBe(
+      false,
+    );
+    expect(
+      draftOutcomeIdValid({ ...FULL_NEW_EPIC, feature: { ...FEATURE, outcomeId: "two words" } }),
+    ).toBe(false);
   });
 });
 

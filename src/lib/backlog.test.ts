@@ -71,6 +71,7 @@ const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
   why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
+  outcomeId: "reports-are-shareable",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow the pattern in src/lib/export.ts",
   outOfScope: "- PDF export, which is its own feature",
@@ -159,7 +160,11 @@ describe("buildEpicSkeleton", () => {
         formula: "anton-bead",
         vars: {},
         steps: [
-          { id: "epic", type: "epic", description: "## Goal\n\n{{outcome}}\n\n## House rule" },
+          {
+            id: "epic",
+            type: "epic",
+            description: "## Goal\n\n{{outcome}}\n\n## House rule\n\n{{outcome_ids}}",
+          },
           { id: "feature", description: "f" },
           { id: "ticket", description: "t" },
         ],
@@ -225,6 +230,7 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
       type: "feature",
       deps: ["parent-child:p-1"],
       acceptance: FEATURE.acceptance,
+      labels: [`outcome:${FEATURE.outcomeId}`],
     });
   });
 
@@ -245,7 +251,12 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
     expect(createGraph.mock.calls[0]![1].nodes).toEqual([
       expect.objectContaining({ key: "epic", type: "epic", labels: ["area:reports"] }),
-      expect.objectContaining({ key: "feature", type: "feature", parent_key: "epic" }),
+      expect.objectContaining({
+        key: "feature",
+        type: "feature",
+        parent_key: "epic",
+        labels: [`outcome:${FEATURE.outcomeId}`],
+      }),
     ]);
   });
 

@@ -38,6 +38,9 @@ export interface FeatureDraft {
   goal: string;
   /** Which outcome this serves, and how — the feature's `## Why`. */
   why: string;
+  /** The `.product/PRODUCT.md` outcome id this feature serves — lands as its `outcome:<id>` label,
+   * the run-target home for that label (skills/bd/SKILL.md); set alongside `why`. */
+  outcomeId: string;
   acceptance: string;
   context: string;
   outOfScope: string;
@@ -343,7 +346,10 @@ export async function createDraftFeature(
   const target = draft.epic;
   const title = draft.feature.title.trim();
   const feature = await buildFeatureSkeleton(project, draft.feature);
-  assertContract(title, feature, []);
+  // The `outcome:` label lives on the run target (skills/bd/SKILL.md), never on the epic that
+  // groups it — so every write path below carries it on the FEATURE node alone.
+  const labels = [`outcome:${draft.feature.outcomeId.trim()}`];
+  assertContract(title, feature, labels);
 
   if (target.kind === "new") {
     const epicNode = await draftEpicNode(project, target.epic, EPIC_KEY);
@@ -355,6 +361,7 @@ export async function createDraftFeature(
           title,
           type: feature.type,
           description: feature.description,
+          labels,
           parent_key: EPIC_KEY,
         },
       ],
@@ -371,6 +378,7 @@ export async function createDraftFeature(
       title,
       type: feature.type,
       description: feature.description,
+      labels,
       // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
       // description states. The graph path above has no such field and needs none — the plan schema
       // carries only the description, which is the home both readers check first.

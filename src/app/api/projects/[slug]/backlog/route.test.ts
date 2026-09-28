@@ -43,6 +43,7 @@ const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
   why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
+  outcomeId: "reports-are-shareable",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow the pattern in src/lib/export.ts",
   outOfScope: "- PDF export, which is its own feature",
@@ -83,6 +84,18 @@ describe("POST /backlog", () => {
       expect(createDraftFeature).not.toHaveBeenCalled();
     },
   );
+
+  it("rejects a draft missing the feature's outcome id — it becomes the run target's outcome: label", async () => {
+    const res = await post({ ...DRAFT, feature: { ...FEATURE, outcomeId: "" } });
+    expect(res.status).toBe(400);
+    expect(createDraftFeature).not.toHaveBeenCalled();
+  });
+
+  it("rejects a feature outcome id bd could not round-trip as a label", async () => {
+    const res = await post({ ...DRAFT, feature: { ...FEATURE, outcomeId: "two words" } });
+    expect(res.status).toBe(400);
+    expect(createDraftFeature).not.toHaveBeenCalled();
+  });
 
   // The whole point of anton-h1ds: the UI producer must not be able to file a run target that
   // hangs off nothing.

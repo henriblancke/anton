@@ -230,6 +230,52 @@ describe("interpolation", () => {
     ).toThrow(/the `epic` template never references \{\{outcome\}\}/);
   });
 
+  // `why` (feature/ticket) and `outcome_ids` (epic) are CONTRACT vars too (TIER_CONTRACT_VARS):
+  // a hand-edited formula that drops either placeholder while a caller still supplies it must
+  // fail loud here, the same way an unreferenced `{{outcome}}` does above — silently dropping the
+  // founder's answer to "which outcome does this serve" is the exact false green this guard exists
+  // to prevent, for these vars as much as for Goal or Acceptance.
+  it("fails loud when the feature/ticket template never references a supplied `why`", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: {},
+      steps: [
+        { id: "epic", description: "e" },
+        { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "feature", {
+        goal: "Ship it.",
+        why: "Serves outcome:reports-are-shareable.",
+        acceptance: "- [ ] ok",
+      }),
+    ).toThrow(/the `feature` template never references \{\{why\}\}/);
+  });
+
+  it("fails loud when the epic template never references a supplied `outcome_ids`", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: { success_criteria: { default: "- [ ] TODO — stub" } },
+      steps: [
+        {
+          id: "epic",
+          description: "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}",
+        },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+        outcome: "Reports leave the app.",
+        success_criteria: "- [ ] every report exports",
+        outcome_ids: "outcome:reports-are-shareable",
+      }),
+    ).toThrow(/the `epic` template never references \{\{outcome_ids\}\}/);
+  });
+
   it("does not count a var referenced only in the step title — the skeleton never emits it", () => {
     // `renderBeadSkeleton` renders description + mirrored acceptance only; the Add-work commit uses
     // the draft's own title. A `{{outcome}}` living solely in `step.title` is still discarded.

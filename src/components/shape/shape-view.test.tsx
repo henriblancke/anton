@@ -57,8 +57,13 @@ function epicSelect() {
   return screen.getByRole("combobox", { name: /^Epic/ }) as HTMLSelectElement;
 }
 
+/** The feature's outcome id field — "Outcome", not the epic's "Outcome IDs". */
+const FEATURE_OUTCOME_NAME = /^Outcome(?! IDs)/;
+
 /** Fill the feature's sections the seed doesn't cover, so only the epic is left to choose. */
 function fillFeature() {
+  typeInto(/^Why/, "Serves outcome:reports-are-shareable.");
+  typeInto(FEATURE_OUTCOME_NAME, "reports-are-shareable");
   typeInto(/^Acceptance criteria/, "- [ ] every report view has a CSV export button");
   typeInto(/^Context/, "touches: src/app/reports");
   typeInto(/^Out of scope/, "- PDF export");
@@ -195,7 +200,9 @@ describe("ShapeView", () => {
 
     // Title and goal came from the seed; the rest of the contract has not been filled in.
     expect(sendButton().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("Needs an epic, acceptance criteria, context + 2 more")).toBeTruthy();
+    expect(
+      screen.getByText("Needs an epic, why, which outcome this serves + 4 more"),
+    ).toBeTruthy();
 
     fillFeature();
     // Everything but the epic — the gap this ticket exists to close.
@@ -227,16 +234,18 @@ describe("ShapeView", () => {
 
     fillFeature();
     fireEvent.change(epicSelect(), { target: { value: "__new__" } });
-    expect(screen.getByText("Needs an epic title, an epic outcome, epic success criteria + 1 more"))
-      .toBeTruthy();
+    expect(
+      screen.getByText("Needs an epic title, an epic outcome, epic success criteria + 2 more"),
+    ).toBeTruthy();
 
     typeInto(/^Epic title/, "Reports are shareable outside the app");
     typeInto(/^Epic outcome/, "Every report leaves the app in a format a customer can open.");
     typeInto(/^Epic success criteria/, "- [ ] every report view exports");
+    typeInto(/^Outcome IDs/, "outcome:reports-are-shareable");
     // A malformed area leaves no gap, so without its own line the panel would read as ready.
     fireEvent.change(areaInput(), { target: { value: "two words" } });
     expect(sendButton().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("Area must be a single label-safe word")).toBeTruthy();
+    expect(screen.getByText("Area and outcome must be single label-safe words")).toBeTruthy();
 
     fireEvent.change(areaInput(), { target: { value: " reports " } });
     fireEvent.click(sendButton());
@@ -250,6 +259,7 @@ describe("ShapeView", () => {
         goal: "Every report leaves the app in a format a customer can open.",
         successCriteria: "- [ ] every report view exports",
         area: "reports",
+        outcomeIds: "outcome:reports-are-shareable",
       },
     });
   });
@@ -262,6 +272,8 @@ describe("ShapeView", () => {
       .mockResolvedValue(json({}));
     await startShaping(fetchMock, "Export a report view to CSV");
 
+    typeInto(/^Why/, "  Serves outcome:reports-are-shareable.  ");
+    typeInto(FEATURE_OUTCOME_NAME, "  reports-are-shareable  ");
     typeInto(/^Acceptance criteria/, "  - [ ] every report view has a CSV export button  ");
     typeInto(/^Context/, "touches: src/app/reports");
     typeInto(/^Out of scope/, "- PDF export");
@@ -276,6 +288,8 @@ describe("ShapeView", () => {
       feature: {
         title: "Export a report view to CSV",
         goal: "Export a report view to CSV",
+        why: "Serves outcome:reports-are-shareable.",
+        outcomeId: "reports-are-shareable",
         acceptance: "- [ ] every report view has a CSV export button",
         context: "touches: src/app/reports",
         outOfScope: "- PDF export",

@@ -23,6 +23,7 @@ describeBd("Add-work commit (real bd · feature under an epic)", () => {
     title: "Export a report view to CSV",
     goal: "A customer can take a report out of the app as CSV.",
     why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
+    outcomeId: "reports-are-shareable",
     acceptance: "- [ ] every report view has a working CSV export button",
     context: "touches: src/app/reports; follow the pattern in src/lib/export.ts",
     outOfScope: "- PDF export, which is its own feature",
@@ -74,6 +75,7 @@ describeBd("Add-work commit (real bd · feature under an epic)", () => {
 
     expect(feature.issue_type).toBe("feature");
     expect(beads.parentOf(feature)).toBe(epic.id);
+    expect(feature.labels).toContain("outcome:reports-are-shareable");
     expect(epic.issue_type).toBe("epic");
     expect(epic.labels).toContain(`area:${EPIC.area}`);
 

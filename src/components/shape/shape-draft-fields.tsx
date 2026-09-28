@@ -22,7 +22,7 @@ export function DraftFields({
   areas: string[];
   epics: EpicChoice[];
 }) {
-  const { fields, setFeatureField } = draft;
+  const { fields, setFeatureField, outcomeIdValid } = draft;
   return (
     <>
       <EpicSection draft={draft} areas={areas} epics={epics} />
@@ -46,6 +46,18 @@ export function DraftFields({
           onChange={(v) => setFeatureField("why", v)}
           placeholder="Which outcome does this serve, and how?"
           hint="The forcing question behind the outcome: label — set them together."
+        />
+        <DraftInput
+          label="Outcome"
+          value={fields.feature.outcomeId}
+          onChange={(v) => setFeatureField("outcomeId", v)}
+          placeholder="reports-are-shareable"
+          invalid={!outcomeIdValid}
+          hint={
+            outcomeIdValid
+              ? "The `.product/PRODUCT.md` outcome id this feature serves — becomes its `outcome:<id>` label."
+              : "Letters, digits, . _ - only — it becomes the label outcome:<value>."
+          }
         />
         <DraftTextarea
           label="Acceptance criteria"
