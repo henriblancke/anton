@@ -7,15 +7,18 @@
  * disagreement, an answerless row counted as evidence, and a window that does not roll — plus the
  * digest's own promise that it only ever covers state the point declared.
  */
+import { eq } from "drizzle-orm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { schema } from "../db";
 import { makeTestDb, type TestDb } from "../db/testing";
 import { decide, ModelCallError, type ModelAnswer } from "./index";
-import type { DecisionPoint } from "./points";
+import { definePoint, resetRegistryForTests, type DecisionPoint } from "./points";
 import {
   DECISION_AGREEMENT_WINDOW,
   agreement,
   decisionInputHash,
   listDecisions,
+  pointDefinitionHash,
   recordDecision,
   recordDecisionOutcome,
   settleDecision,
@@ -52,7 +55,10 @@ beforeEach(() => {
   nowMs = 1_700_000_000_000;
 });
 
-afterEach(() => test.close());
+afterEach(() => {
+  test.close();
+  resetRegistryForTests();
+});
 
 /** Record one shadow decision through the real pipeline and return its row id. */
 async function recordShadow(
@@ -192,6 +198,52 @@ describe("the input digest", () => {
     // The backend never sees the absent field at all (buildPrompt's own JSON.stringify drops it),
     // but does see an explicit null — so the two must not digest identically.
     expect(decisionInputHash(point, {})).not.toBe(decisionInputHash(point, { nitText: null }));
+  });
+});
+
+describe("the point-definition digest", () => {
+  it("is stable for the same instruction, question, escape value, and hard rules", () => {
+    expect(pointDefinitionHash(POINT)).toBe(pointDefinitionHash({ ...POINT }));
+  });
+
+  it("moves when the instruction changes", () => {
+    expect(pointDefinitionHash(POINT)).not.toBe(
+      pointDefinitionHash({ ...POINT, instruction: `${POINT.instruction} (v2)` }),
+    );
+  });
+
+  it("moves when the question's options change", () => {
+    expect(pointDefinitionHash(POINT)).not.toBe(
+      pointDefinitionHash({
+        ...POINT,
+        question: { kind: "choice", options: ["fix", "decline", "human", "extra"] },
+      }),
+    );
+  });
+
+  it("moves when a hard rule's own source changes", () => {
+    const always: DecisionPoint = {
+      ...POINT,
+      hardRules: [() => ({ value: "fix", reason: "always fix" })],
+    };
+    const never: DecisionPoint = { ...POINT, hardRules: [() => undefined] };
+
+    // Two closures with the SAME captured environment but different source text — the only
+    // observable identity a function has for this purpose — must digest differently.
+    expect(pointDefinitionHash(always)).not.toBe(pointDefinitionHash(never));
+  });
+
+  it("never moves for the point's id, mode, threshold, consequence, or declared state fields", () => {
+    expect(pointDefinitionHash(POINT)).toBe(
+      pointDefinitionHash({
+        ...POINT,
+        id: "a-different-id",
+        threshold: 0.5,
+        consequence: "high",
+        defaultMode: "auto",
+        stateFields: ["something-else"],
+      }),
+    );
   });
 });
 
@@ -531,6 +583,48 @@ describe("replay — agreement(point)", () => {
     // "the newest answered row" must not also null out which model is current: claude-4's
     // disagreement stays excluded.
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 2, agreed: 2 });
+  });
+
+  it("scopes to the active point definition — a changed instruction is not judged by its predecessor's record", async () => {
+    // The point's wording earns a disagreement under its OLD instruction.
+    const oldPoint: DecisionPoint = { ...POINT, instruction: `${POINT.instruction} (v1)` };
+    const oldResult = await decide({ point: oldPoint, state: {}, mode: "shadow", ask: async () => ANSWER() });
+    const oldId = await recordDecision(test.db, clock, { result: oldResult, point: oldPoint, state: {} });
+    await settleDecision(test.db, clock, oldId!, { point: oldPoint, operatorAnswer: "decline" });
+    nowMs += 60_000;
+
+    // A release changes the wording and registers the new definition as current — same id, same model.
+    definePoint({ ...POINT });
+    const newId = await recordShadow();
+    await settleDecision(test.db, clock, newId, { point: POINT, operatorAnswer: "fix" });
+
+    // Only the new definition's own settled row counts — the old wording's disagreement does not
+    // bleed in just because it is still inside the raw window (PR #332 review).
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
+  });
+
+  it("keeps a row written before pointDefinitionHash existed as evidence, unconditionally", async () => {
+    definePoint({ ...POINT });
+    const id = await recordShadow();
+    await settleDecision(test.db, clock, id, { point: POINT, operatorAnswer: "fix" });
+    // Simulate a row written before this column existed — there is no prior definition on record to
+    // compare it against, so it must not be treated as a mismatch and dropped.
+    await test.db
+      .update(schema.decisions)
+      .set({ pointDefinitionHash: null })
+      .where(eq(schema.decisions.id, id));
+
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
+  });
+
+  it("leaves agreement unscoped by definition when the point is not currently registered", async () => {
+    // No definePoint() call — mirrors every other test in this file, which never registers POINT.
+    const oldPoint: DecisionPoint = { ...POINT, instruction: `${POINT.instruction} (v1)` };
+    const oldResult = await decide({ point: oldPoint, state: {}, mode: "shadow", ask: async () => ANSWER() });
+    const oldId = await recordDecision(test.db, clock, { result: oldResult, point: oldPoint, state: {} });
+    await settleDecision(test.db, clock, oldId!, { point: oldPoint, operatorAnswer: "fix" });
+
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
   });
 
   it("rolls the window — a point fixed lately is not judged by the record it replaced", async () => {

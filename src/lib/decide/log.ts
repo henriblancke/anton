@@ -33,7 +33,7 @@ import { getDb, schema } from "../db";
 import { toEpoch } from "../db/epoch";
 import type { AntonDb, Clock } from "../jobs/queue";
 import { isValidAnswer, type DecideResult } from "./index";
-import { narrowState, type AnswerValue, type DecisionPoint, type DecisionState } from "./points";
+import { getPoint, narrowState, type AnswerValue, type DecisionPoint, type DecisionState } from "./points";
 
 /**
  * How many settled decisions a point's agreement is measured over.
@@ -65,6 +65,32 @@ export function decisionInputHash(point: DecisionPoint, state: DecisionState): s
   const hash = createHash("sha256");
   for (const key of Object.keys(narrowed).sort()) {
     hash.update(`${key}\u0000${encodeValue(narrowed[key])}\u0000`);
+  }
+  return hash.digest("hex").slice(0, 32);
+}
+
+/**
+ * A digest of the point's own judgment logic — instruction, question shape, escape value, and hard
+ * rules — never its id, mode, threshold, consequence, or `stateFields` (a point that starts reading
+ * one more field still asks the same question of the evidence it already had). A release can change
+ * what a point asks while keeping its id and model; without this, {@link agreement} would keep
+ * folding in rows earned under the old definition as if they were evidence for the new one (PR #332
+ * review).
+ *
+ * Hard rules are functions, hashed by `Function.prototype.toString()`: source text is the only
+ * observable identity a closure has, and a rule whose condition changed but whose name and position
+ * didn't must still digest differently.
+ */
+export function pointDefinitionHash(point: DecisionPoint): string {
+  const hash = createHash("sha256");
+  hash.update(point.instruction);
+  hash.update("\u0000");
+  hash.update(JSON.stringify(point.question));
+  hash.update("\u0000");
+  hash.update(point.escapeValue ?? "\u0000none");
+  for (const rule of point.hardRules) {
+    hash.update("\u0000");
+    hash.update(rule.toString());
   }
   return hash.digest("hex").slice(0, 32);
 }
@@ -157,6 +183,7 @@ export async function recordDecision(
       backend: result.backend ?? null,
       modelVersion: result.modelVersion ?? null,
       inputHash: decisionInputHash(point, state),
+      pointDefinitionHash: pointDefinitionHash(point),
       acted: result.acted,
       reason: result.reason ?? null,
       decidedAt: secDate(clock.now()),
@@ -289,6 +316,10 @@ const isJudgmentEvidence = and(
  * project's successes or failures bleed into another's figure and can encourage a promotion to `auto`
  * that this project's own history never earned.
  *
+ * Also scoped to the point's CURRENT definition ({@link pointDefinitionHash}): a release can change a
+ * point's instruction, question, escape value, or hard rules while keeping its id and model, and a
+ * row earned under the old definition is not evidence the new one deserves the operator's trust.
+ *
  * Also scoped to the CURRENT backend/model version: a row records both specifically to pin trust to
  * the model that earned it, so a point re-pointed at a new backend or model must be judged only on
  * what that one has produced, never on its predecessor's record. The cohort pair is read off the
@@ -371,13 +402,30 @@ export async function agreement(
       )
     : undefined;
 
+  // Scoped to the point's CURRENT definition, the same reasoning as the cohort filter above but
+  // for the judgment logic itself rather than the model answering it: a release can change a
+  // point's instruction, question, escape value, or hard rules while keeping its id, and a row
+  // earned under the old definition is not evidence for the new one (PR #332 review). `getPoint`
+  // reads the live registry, not a historical one, so this always compares against what is
+  // registered right now. Rows with a NULL `pointDefinitionHash` (written before that column
+  // existed) are kept unconditionally rather than retroactively invalidated — there is no prior
+  // definition on record to compare them against, unlike a genuine mismatch. Falls back to
+  // unscoped when the point isn't currently registered (a caller asking about a retired id).
+  const currentDefinition = getPoint(point);
+  const definitionFilter = currentDefinition
+    ? or(
+        isNull(schema.decisions.pointDefinitionHash),
+        eq(schema.decisions.pointDefinitionHash, pointDefinitionHash(currentDefinition)),
+      )
+    : undefined;
+
   const rows = await db
     .select({
       answer: schema.decisions.answer,
       operatorAnswer: schema.decisions.operatorAnswer,
     })
     .from(schema.decisions)
-    .where(and(scope, cohortFilter))
+    .where(and(scope, cohortFilter, definitionFilter))
     .orderBy(...orderNewestFirst)
     .limit(window);
   const agreed = rows.filter((row) => row.answer === row.operatorAnswer).length;

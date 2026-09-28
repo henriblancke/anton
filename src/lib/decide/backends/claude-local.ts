@@ -282,10 +282,14 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
   const timeoutMs = config.timeoutMs ?? DEFAULT_DECISION_TIMEOUT_MS;
 
   return async function ask(point: DecisionPoint, state: DecisionState): Promise<ModelAnswer> {
-    const prompt = buildPrompt(point, state);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
+      // Built inside the guarded block: `narrowState`'s `JSON.stringify` throws on a cyclic
+      // state field, a `BigInt`, or a throwing `toJSON` — a serialization failure here must
+      // still land as an attributed `ModelCallError`, not bypass it and surface unattributed
+      // (anton-528bw PR #332 review).
+      const prompt = buildPrompt(point, state);
       const result = await driver({
         cwd: config.cwd,
         prompt,

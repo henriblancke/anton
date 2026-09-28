@@ -1167,6 +1167,16 @@ export const decisions = sqliteTable(
      * comment, a bead body), and this column is only ever compared for equality.
      */
     inputHash: text("input_hash").notNull(),
+    /**
+     * A digest of the point's own definition at decide() time (`pointDefinitionHash`, decide/log.ts)
+     * — instruction, question shape, escape value, and hard rules. A release can change a point's
+     * judgment logic while keeping its id and model, and a row from the old definition is not
+     * evidence for the new one: `agreement()` restricts its window to rows matching the CURRENT
+     * definition, the same reason it restricts to the current backend/model cohort. NULL on rows
+     * written before this column existed, which `agreement()` keeps as evidence unconditionally
+     * rather than retroactively invalidating history it has no definition to compare against.
+     */
+    pointDefinitionHash: text("point_definition_hash"),
     /** What was TAKEN, not what was answered: true only where mode was `auto` and the threshold held. */
     acted: integer("acted", { mode: "boolean" }).notNull(),
     /** Why a hard rule fired, or why a fallback was taken — carried so a row explains itself. */
