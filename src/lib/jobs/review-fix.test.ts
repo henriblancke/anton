@@ -275,20 +275,6 @@ describe("claimOwnerFor", () => {
  * run path (execute-epic-claim.ts) does.
  */
 describe("prepareFixWorktree (anton-u02rt)", () => {
-  const pr: PrReview = {
-    number: 7,
-    state: "OPEN",
-    reviewDecision: "CHANGES_REQUESTED",
-    mergeable: "MERGEABLE",
-    headRefName: "anton/fix-7",
-    headSha: "sha-7",
-    url: "https://example.test/pull/7",
-    reviews: [],
-    failingChecks: [],
-    pendingChecks: 0,
-    threads: [],
-  };
-
   const fakeCtx = (): JobContext =>
     ({
       jobId: "job-test",
@@ -325,7 +311,6 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       branch: "anton/fix-7",
       settings,
       baseBranch: "main",
-      pr,
       number: 7,
       claimOwner: "review-fix:job-test",
     });

@@ -506,7 +506,6 @@ async function handleEpic(args: {
       branch,
       settings,
       baseBranch,
-      pr,
       number,
       claimOwner,
     });
@@ -539,9 +538,10 @@ async function handleEpic(args: {
 
 /**
  * Materialize the PR branch into a fresh worktree and get it ready for claude: fetch origin (a
- * reviewer may have pushed), fast-forward to the remote branch, and — when GitHub reports the PR
- * CONFLICTING — pre-merge the base so claude only has conflict markers to resolve. Every git step
- * is best-effort: a repo with no reachable origin still gets the review-comment flow.
+ * reviewer may have pushed), fast-forward to the remote branch, and — whenever the branch is
+ * behind its base — pre-merge the base so the verify gates below run against the same tree GitHub
+ * would merge, and claude has only conflict markers (if any) left to resolve. Every git step is
+ * best-effort: a repo with no reachable origin still gets the review-comment flow.
  */
 export async function prepareFixWorktree(args: {
   ctx: JobContext;
@@ -550,13 +550,11 @@ export async function prepareFixWorktree(args: {
   settings: ProjectSettings;
   /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
   baseBranch: string | undefined;
-  pr: PrReview;
   number: number;
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
 }): Promise<{ worktree: Worktree; conflicts: string[]; alreadyAhead: boolean }> {
-  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } =
-    args;
+  const { ctx, repo, branch, settings, baseBranch, number, claimOwner } = args;
 
   const worktree = await createWorktree({
     repoPath: repo,
@@ -626,21 +624,33 @@ export async function prepareFixWorktree(args: {
   // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
   // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
   // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
-  const conflicts = await premergeBase(repo, worktree.path, pr, baseBranch, number);
+  const conflicts = await premergeBase(repo, worktree.path, baseBranch, number);
   await ctx.heartbeat();
   return { worktree, conflicts, alreadyAhead };
 }
 
-/** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
+/**
+ * The base merge the verify gates need underneath them — brought in whenever the branch doesn't
+ * already carry the base's tip, regardless of what GitHub's own `mergeable` field says. The gates
+ * below (e.g. check-migration-ordering) diff against `origin/<base>` directly, so a MERGEABLE-but-
+ * behind branch (fast-forwardable, no textual conflict) still needs this merge — without it the
+ * gates judge a tree that's missing base commits and can pass against files the base already
+ * superseded (#2141). Conflicts, when they happen, are what claude is asked to resolve.
+ */
 async function premergeBase(
   repo: string,
   worktreePath: string,
-  pr: PrReview,
   baseBranch: string | undefined,
   number: number,
 ): Promise<string[]> {
-  if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
+  if (!baseBranch) return [];
   const baseRef = `origin/${baseBranch}`;
+  // Already caught up → no merge to do. Best-effort like every other git read on this path (see
+  // prepareFixWorktree's doc): a failed read (origin/<base> didn't resolve, a transient git error)
+  // reads as "can't confirm we're caught up" rather than aborting the premerge — the merge attempt
+  // below tolerates a no-op fine on its own.
+  const upToDate = await isAncestor(worktreePath, baseRef, "HEAD").catch(() => false);
+  if (upToDate) return [];
   const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
     ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
     : undefined;
