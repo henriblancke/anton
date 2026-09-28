@@ -244,6 +244,23 @@ export async function recordPrTerminalState(
 }
 
 /**
+ * Every PR this project has an UNSETTLED round for (`pr_state IS NULL`) — regardless of whether its
+ * target is still on the board. A target that leaves the board (another instance's
+ * `finalizeMergedTarget` closes the epic and clears `stage:in-review`) drops out of `inReviewEpics`
+ * for good, so a null row a race left behind (PR #335 review: `getPrReview`'s own state read can
+ * still be stale by the time it resolves, even on the post-insert freshness check) would otherwise
+ * never be revisited by the per-target triage loop. A caller reconciles these independently of board
+ * membership — orphaned or not, restamping is idempotent (`recordPrTerminalState`).
+ */
+export async function unsettledPrNumbers(db: AntonDb, projectId: string): Promise<number[]> {
+  const rows = await db
+    .selectDistinct({ prNumber: schema.reviewRounds.prNumber })
+    .from(schema.reviewRounds)
+    .where(and(eq(schema.reviewRounds.projectId, projectId), isNull(schema.reviewRounds.prState)));
+  return rows.map((r) => r.prNumber);
+}
+
+/**
  * Observe that a PR is OPEN — the counterpart read to `recordPrTerminalState`'s `closed` branch,
  * called from the same triage that reads PR state every pass (PR #335 review). A PR that closes,
  * reopens, stays clean (so no round ever writes a fresh row), and closes again would otherwise leave

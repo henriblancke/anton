@@ -527,6 +527,79 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     expect(dispatchedTargets()).toEqual([]);
     expect(getPrReviewMock).not.toHaveBeenCalled(); // not even read — ownership is decided first
   });
+
+  // PR #335 review (src/lib/jobs/review-fix.ts:885): a round's own post-insert freshness check can
+  // still race a merge another instance finalizes mid-`getPrReview`. That instance clears
+  // `stage:in-review` and closes the epic before the racing row is even inserted, so the PR never
+  // reappears in `targets` — the row's `pr_state` would otherwise stay null forever.
+  describe("orphaned-round reconciliation", () => {
+    const insertUnsettledRound = (prNumber: number) =>
+      t.db
+        .insert(schema.reviewRounds)
+        .values({ id: `round-${prNumber}`, projectId: t.projectId, prNumber, round: 1 })
+        .run();
+
+    const prStateOf = (prNumber: number) =>
+      t.db
+        .select({ prState: schema.reviewRounds.prState })
+        .from(schema.reviewRounds)
+        .where(eq(schema.reviewRounds.prNumber, prNumber))
+        .get()?.prState ?? null;
+
+    it("stamps a null round whose target already left the board once GitHub confirms it merged", async () => {
+      listMock.mockResolvedValue([]); // the epic that owned PR #9 already closed and dropped off
+      insertUnsettledRound(9);
+      getPrReviewMock.mockResolvedValue(openPr(9, { state: "MERGED" }));
+
+      const job = await getJob(t.db, await dispatch());
+      expect(prStateOf(9)).toBe("merged");
+      expect(job?.outcomeNote).toBe("examined 0 PR(s) in review, dispatched 0, reconciled 1 orphaned PR(s)");
+      expect(job?.outcome).not.toBe("noop");
+    });
+
+    it("stamps closed the same way, and leaves a still-open orphan null for the next pass", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      insertUnsettledRound(10);
+      getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
+        number === 9 ? openPr(9, { state: "CLOSED" }) : openPr(10, { state: "OPEN" }),
+      );
+
+      await dispatch();
+      expect(prStateOf(9)).toBe("closed");
+      expect(prStateOf(10)).toBeNull();
+    });
+
+    it("does not re-read a PR the ordinary triage loop already covered this pass", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      insertUnsettledRound(1); // same PR the in-review target already names
+      getPrReviewMock.mockResolvedValue(openPr(1, { state: "MERGED" }));
+
+      await dispatch();
+      // One `gh` read for PR #1, not two — reconciliation must skip a PR the triage loop already read.
+      expect(getPrReviewMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("never reconciles on a targeted single-epic run", async () => {
+      listMock.mockResolvedValue([target("e-1", 1)]);
+      insertUnsettledRound(9); // orphaned, but this run is scoped to epicBeadId "e-1"
+      getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
+        number === 1 ? openPr(1) : openPr(9, { state: "MERGED" }),
+      );
+
+      await driveJob({
+        db: t.db,
+        clock,
+        type: "review-fix",
+        handler: makeReviewFixHandler,
+        projectId: t.projectId,
+        payload: { projectId: t.projectId, epicBeadId: "e-1" },
+        config: { leaseMs: 30_000 },
+      });
+      expect(prStateOf(9)).toBeNull();
+      expect(getPrReviewMock).toHaveBeenCalledTimes(1); // only PR #1, never #9
+    });
+  });
 });
 
 /**

@@ -112,7 +112,12 @@ import {
   triageOutcomes,
   type ThreadOutcome,
 } from "./review-fix-context";
-import { recordPrReopened, recordPrTerminalState, recordReviewRound } from "../review-rounds";
+import {
+  recordPrReopened,
+  recordPrTerminalState,
+  recordReviewRound,
+  unsettledPrNumbers,
+} from "../review-rounds";
 import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
@@ -268,7 +273,6 @@ async function dispatchInReview(args: {
   // before dispatching a merged target by id (anton-k0kj).
   const operator = await resolveOperator();
   const targets = inReviewEpics(all, { operator, epicBeadId });
-  if (targets.length === 0) return { changed: false, note: "nothing in review" };
 
   let dispatched = 0;
   // A target the dispatcher declined to (re-)dispatch even though it needs a fix (anton-bzm7s): a
@@ -319,18 +323,55 @@ async function dispatchInReview(args: {
     }
   }
 
+  // Terminal reconciliation, independent of board membership (PR #335 review): a round's own
+  // post-insert freshness check (`handleEpic`, below) can still race a merge that another instance
+  // finalizes mid-`getPrReview` — that instance's `finalizeMergedTarget` clears `stage:in-review` and
+  // closes the epic before this row is even inserted, so the PR never appears in `targets` again (not
+  // even as an empty pass — `targets.length === 0` used to return before this ran at all) and its
+  // row's `pr_state` would stay null forever. Reconcile every PR this project has an unsettled round
+  // for that this pass did NOT already triage above (those are already covered) by reading it
+  // directly — one `gh` read per orphaned PR, which is rare by construction. Only on the untargeted,
+  // whole-project sweep: a single-epic run (`epicBeadId` set) has no reason to scan every PR.
+  let reconciled = 0;
+  if (!epicBeadId) {
+    const triagedNumbers = new Set(
+      targets.map((t) => prNumberFromRef(beads.getPrRef(t))).filter((n): n is number => n !== undefined),
+    );
+    const orphaned = (await unsettledPrNumbers(db, projectId)).filter((n) => !triagedNumbers.has(n));
+    for (const prNumber of orphaned) {
+      await ctx.heartbeat();
+      try {
+        const latest = await getPrReview(repo, prNumber, ctx.signal);
+        if (latest.state === "MERGED") {
+          await recordPrTerminalState(db, clock, { projectId, prNumber, state: "merged" });
+          reconciled += 1;
+        } else if (latest.state === "CLOSED") {
+          await recordPrTerminalState(db, clock, { projectId, prNumber, state: "closed" });
+          reconciled += 1;
+        }
+      } catch (e) {
+        // One unreadable orphaned PR must not block reconciling the rest — it stays null and is
+        // retried next pass, the same as any other best-effort read in this job.
+        consoleLog.error(`PR #${prNumber}: orphaned-round reconciliation read failed`, e);
+      }
+    }
+  }
+
   // Surface the failure so the job retries/parks — but only after triaging every target, so a
   // reported pass never claims a clean sweep over a PR it could not actually read.
   if (lastError !== undefined) {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
+  if (targets.length === 0 && reconciled === 0) return { changed: false, note: "nothing in review" };
+
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
   // nothing, and the counts together are what an operator checks the poll against.
   const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
+  const reconciledNote = reconciled > 0 ? `, reconciled ${reconciled} orphaned PR(s)` : "";
   return {
-    changed: dispatched > 0,
-    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}`,
+    changed: dispatched > 0 || reconciled > 0,
+    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}${reconciledNote}`,
   };
 }
 

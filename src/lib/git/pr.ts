@@ -219,7 +219,7 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$c
       pageInfo{hasNextPage endCursor}
       nodes{
         id isResolved isOutdated path line
-        comments(first:50){nodes{databaseId author{login} body}}
+        comments(first:50){totalCount nodes{databaseId author{login} body}}
       }
     }
   }}
@@ -231,7 +231,10 @@ interface RawReviewThreadNode {
   isOutdated?: boolean;
   path?: string | null;
   line?: number | null;
-  comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
+  comments?: {
+    totalCount?: number;
+    nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }>;
+  };
 }
 
 interface ReviewThreadsPage {
@@ -308,6 +311,15 @@ async function getReviewThreads(
         break;
       }
       allNodes.push(...page.nodes ?? []);
+      // Each thread's comments connection is capped at first:50 with no cursor of its own — a
+      // thread that has collected more comments than that (a long back-and-forth) silently drops
+      // everything past comment 50, including the most recent one. threadsNeedingAttention treats
+      // the last *fetched* comment as authoritative, so a truncated thread can misreport an anton
+      // reply (or a human follow-up after it) as never having happened. totalCount lets us detect
+      // that without a second, nested pagination loop — flag the read incomplete instead.
+      if ((page.nodes ?? []).some((n) => (n.comments?.totalCount ?? 0) > (n.comments?.nodes?.length ?? 0))) {
+        complete = false;
+      }
       if (!page.pageInfo) {
         // No pageInfo at all is a malformed response, not "last page" — pagination could not
         // even be checked, so the read is incomplete.
