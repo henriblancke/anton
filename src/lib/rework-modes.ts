@@ -22,6 +22,7 @@ import {
   hasHumanNote,
   originNoteBody,
   reconcileFollowUpDescription,
+  reconcileFollowUpWhy,
   reworkNoteBody,
 } from "./rework-notes";
 import { RUN_STAGE_LABELS } from "./rework-pipeline";
@@ -242,6 +243,10 @@ async function resumeFollowUp(
     // is harmless — it only adds labels the bead doesn't already carry.
     await tagDetachedOutcome(context, existing);
     await beads.reparent(context.repo, existing.id, "");
+    // A completed follow-up never takes the match.partial branch below, so this is the only pass
+    // that would ever add a Why a legacy bead was created without — the contract gate never
+    // catches its absence, so a merged detachment must not leave it missing for good.
+    if (!match.partial) await reconcileMissingWhy(context, existing);
   }
   if (match.partial) {
     const parentId = detachment ? undefined : beads.parentOf(existing);
@@ -336,6 +341,18 @@ async function tagDetachedOutcome(context: FollowUpContext, existing: Bead): Pro
     .map((id) => `outcome:${id}`)
     .filter((label) => !current.includes(label));
   if (missing.length > 0) await beads.tag(context.repo, existing.id, missing);
+}
+
+/**
+ * Add a missing `## Why` to a completed follow-up being detached ({@link resumeFollowUp}). Never
+ * touches Acceptance or the run-location line — only {@link reconcileHalfCreatedContract} owns
+ * rewriting those, and only for a still-partial bead.
+ */
+async function reconcileMissingWhy(context: FollowUpContext, existing: Bead): Promise<void> {
+  const { repo, ticket, target } = context;
+  const current = existing.description ?? "";
+  const description = reconcileFollowUpWhy(current, ticket, outcomeIdsOf(target));
+  if (description !== current) await beads.update(repo, existing.id, { description });
 }
 
 /**

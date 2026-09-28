@@ -768,7 +768,8 @@ describe("applyFollowUp", () => {
   });
 
   it("detaches a follow-up stranded under a target whose PR merged under it, and reports the write", async () => {
-    board(feature(), finishedTicket(), candidate("dup"));
+    // A realistic finished follow-up already carries its contract, Why included, from creation.
+    board(feature(), finishedTicket(), candidate("dup", { description: createdUnderFeat() }));
     showsWithNote("dup", followUpBody());
 
     const applied = await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
@@ -783,12 +784,37 @@ describe("applyFollowUp", () => {
     expect(noteOn("dup")).toContain("gh-42");
     expect(noteOn("dup")).toContain("its own run target");
     // A finished bead keeps its Context, so the note points at the stale parent it still names.
+    // Its description already carries Why, so nothing here rewrites it.
     expect(updateMock).not.toHaveBeenCalled();
     expect(noteOn("dup")).toBe(detachedNote(true));
     expect(noteOn("dup")).toContain("Its Context section still names the parent it was created under.");
     // Recorded before the reparent — the record a retry finds the detachment by once the parent
     // edge is gone, and worded so it holds whether or not the reparent lands.
     expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+  });
+
+  // A follow-up a pre-Why version of this job finished is not half-created (match.partial is
+  // false, it already has its human note), so it never took the reconcileHalfCreatedContract
+  // branch — but the contract gate never validates Why, so nothing else would ever add it either.
+  it("adds a missing Why to a FINISHED legacy follow-up a merged PR detaches", async () => {
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature(), finishedTicket(), candidate("dup", { description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(updateMock).toHaveBeenCalledWith(
+      "/repo",
+      "dup",
+      expect.objectContaining({
+        description: expect.stringContaining(
+          "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids",
+        ),
+      }),
+    );
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Why");
+    // The rest of the legacy contract is left alone — only Why is ever added here.
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Acceptance Criteria\n- [ ] done");
   });
 
   // Same gap as the half-created case above, for a follow-up whose creation had already finished

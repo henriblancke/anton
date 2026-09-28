@@ -161,10 +161,20 @@ export function parseBeadFormula(raw: string, source: string): BeadFormula {
   };
 }
 
+/**
+ * Resolve and parse the formula for `repoPath`, keeping the resolved `path` alongside it —
+ * {@link beadSkeleton}'s self-heal retry needs `path` to tell a project-local copy (worth
+ * resyncing) from the bundled fallback (not).
+ */
+async function loadBeadFormulaWithPath(repoPath: string): Promise<{ formula: BeadFormula; path: string }> {
+  const path = resolveBeadFormulaPath(repoPath);
+  const formula = parseBeadFormula(await readFile(path, "utf8"), path);
+  return { formula, path };
+}
+
 /** Load the formula that applies to `repoPath` (project copy first, bundled asset as fallback). */
 export async function loadBeadFormula(repoPath: string): Promise<BeadFormula> {
-  const path = resolveBeadFormulaPath(repoPath);
-  return parseBeadFormula(await readFile(path, "utf8"), path);
+  return (await loadBeadFormulaWithPath(repoPath)).formula;
 }
 
 /** One `{{var}}` token — the shape {@link interpolate} resolves and the consumption check scans. */
@@ -299,8 +309,7 @@ export async function beadSkeleton(
   tier: BeadTier,
   vars: Record<string, string> = {},
 ): Promise<BeadSkeleton> {
-  const path = resolveBeadFormulaPath(repoPath);
-  const formula = parseBeadFormula(await readFile(path, "utf8"), path);
+  const { formula, path } = await loadBeadFormulaWithPath(repoPath);
   try {
     return renderBeadSkeleton(formula, tier, vars);
   } catch (err) {
@@ -311,7 +320,7 @@ export async function beadSkeleton(
     if (synced.status !== "replaced" && synced.status !== "already" && synced.status !== "installed") {
       throw err;
     }
-    const refreshed = parseBeadFormula(await readFile(path, "utf8"), path);
+    const { formula: refreshed } = await loadBeadFormulaWithPath(repoPath);
     return renderBeadSkeleton(refreshed, tier, vars);
   }
 }

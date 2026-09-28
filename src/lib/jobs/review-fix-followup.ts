@@ -8,8 +8,9 @@
  * operators share. Nothing here decides WHICH tickets move; see review-fix-rehome.ts for that.
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
-import { outcomeIdsOf } from "../backlog";
+import { extractOutcomeIdsSection, outcomeIdsOf } from "../backlog";
 import { beadSkeleton } from "../beads/formula";
+import { unterminatedCloser } from "../beads/markdown";
 import { olderOf, tryList, type ReadBead } from "./review-fix-board";
 import { safe } from "./safe";
 
@@ -100,12 +101,44 @@ export async function resolveFollowUp(
   const election = await electFollowUp(ctx, board);
   if (!election.ok) return election;
   const strandedRival = await reconcileLosers(ctx, election.losers, board);
-  if (election.reused)
+  if (election.reused) {
+    await reconcileReusedContract(ctx, election.reused);
     return {
       ok: true,
       home: { id: election.reused.id, disposable: true, board, strandedRival },
     };
+  }
   return createFollowUp(ctx, board, strandedRival);
+}
+
+/**
+ * Patch `## Outcome IDs` onto a reused follow-up that predates it (anton-cdeki) — the same repair
+ * orphan-grooming's own reuse path applies to ITS reused epic (orphan-grooming.ts), for the same
+ * reason: this bead is found by its {@link REHOME_OF} stamp, never by contract shape, so a
+ * follow-up an earlier, pre-outcome-ids version of this job created would otherwise stay stuck
+ * missing the section forever — the retry moves the remaining tickets under it and can close the
+ * merged source, leaving the resulting runnable epic permanently without one. Best-effort: a failed
+ * patch is not fatal to the rehome, since a later sweep reusing the same bead retries it.
+ */
+async function reconcileReusedContract(ctx: FollowUpContext, reused: Bead): Promise<void> {
+  const description = reused.description ?? "";
+  if (extractOutcomeIdsSection(description).present) return;
+  const outcomeIds = outcomeIdsOf(ctx.epic);
+  const kept = description.trimEnd();
+  const closer = unterminatedCloser(kept);
+  const patched = [
+    kept,
+    ...(closer ? [closer] : []),
+    ``,
+    `## Outcome IDs`,
+    ``,
+    // Direct patch, not a formula render — unlike newFollowUpEpic's placeholder dance
+    // ({@link blankOutcomeIdsPlaceholder}), an empty id list here is written genuinely empty.
+    ...(outcomeIds.length > 0 ? [outcomeIds.map((id) => `outcome:${id}`).join(", ")] : []),
+  ].join("\n");
+  await safe(() =>
+    beads.update(ctx.repo, reused.id, { description: patched }, reused.labels ?? []),
+  );
 }
 
 /**

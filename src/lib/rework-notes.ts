@@ -172,6 +172,20 @@ export function reconcileFollowUpDescription(
 }
 
 /**
+ * Add a missing `## Why` to a follow-up that isn't half-created — a legacy bead finished before
+ * Why became part of the contract, detached after its target merges ({@link resumeFollowUp} in
+ * rework-modes.ts). That path only reads {@link ensureWhy} through
+ * {@link reconcileFollowUpDescription}, which `resumeFollowUp` calls solely on the `match.partial`
+ * branch; an already-completed follow-up never takes it, so it would otherwise stand approved
+ * without Why forever (the contract gate doesn't validate that section — skills/bd/SKILL.md).
+ * Never touches Acceptance or the run-location line: unlike a half-created bead, a completed one's
+ * acceptance already reflects a shipped request and is not this pass's to rewrite.
+ */
+export function reconcileFollowUpWhy(description: string, ticket: Bead, outcomeIds: string[]): string {
+  return ensureWhy(description, ticket, outcomeIds);
+}
+
+/**
  * Insert a `## Why` section when the half-created bead has none at all — a remnant that predates
  * this requirement, or one a founder made by hand without it ({@link reconcileFollowUpDescription}).
  * Landed right after `## Goal`, the contract's own order (skills/bd/SKILL.md: Goal, Why, Acceptance,
