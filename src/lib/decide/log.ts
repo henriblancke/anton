@@ -128,6 +128,13 @@ export interface RecordDecisionInput {
  * nothing was written. A decision that was made and acted on must not fail because the log could not
  * be written, and the caller is already past the point of no return by the time it gets here. A
  * missing row loses one sample, which reads as "not measured" — never as a disagreement.
+ *
+ * `result.point` is checked against `point.id` before the insert: `RecordDecisionInput` does not
+ * type-link the two, and a caller that mismatches them would store the row under the wrong point
+ * while hashing the right one's state — a later `settleDecision` keyed on the correct point would
+ * then refuse to match it, leaving the row permanently unsettled (PR #332 review). Treated as a
+ * failed write, not thrown: the contract above is "never throws", and a caller bug here is no less
+ * a reason to skip the write than a failed insert is.
  */
 export async function recordDecision(
   db: AntonDb,
@@ -135,6 +142,7 @@ export async function recordDecision(
   input: RecordDecisionInput,
 ): Promise<string | undefined> {
   const { result, point, state, projectId } = input;
+  if (result.point !== point.id) return undefined;
   try {
     const id = randomUUID();
     await db.insert(schema.decisions).values({

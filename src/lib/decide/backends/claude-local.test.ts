@@ -108,6 +108,33 @@ describe("claudeLocalBackend — structured output", () => {
     expect(seenPrompt).toContain(choicePoint().instruction);
   });
 
+  it("selects a `__proto__` option instead of dropping it via the inherited setter", async () => {
+    // Assigning `distribution["__proto__"] = …` on a plain object literal reassigns the object's
+    // prototype instead of creating an enumerable own property (PR #332 review) — argmax would then
+    // never see it as a candidate even though it won the vote.
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () =>
+        ok('```json\n{"probabilities": {"fix": 0.1, "__proto__": 0.9}}\n```'),
+      ),
+    });
+
+    const answer = await ask(choicePoint({ question: { kind: "choice", options: ["fix", "__proto__"] } }), {
+      nitText: "x",
+    });
+
+    expect(answer.value).toBe("__proto__");
+    expect(answer.confidence).toBe(0.9);
+    // A `__proto__:` key in an object literal sets the prototype rather than an own property, so the
+    // expected value is built the same way the fix builds its own — via a computed key.
+    expect(answer.distribution).toEqual({ fix: 0.1, ["__proto__"]: 0.9 });
+  });
+
   it("denies every tool via the bare wildcard, not an allow-list that bypassPermissions ignores", async () => {
     // `allowedTools` only governs which calls skip a permission PROMPT; under bypassPermissions
     // nothing prompts, so an empty allow-list would be a no-op (PR #332 review). The bare `"*"`

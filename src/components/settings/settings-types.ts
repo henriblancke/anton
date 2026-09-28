@@ -3,7 +3,6 @@ import type {
   SchedulePendingStatus,
 } from "@/components/settings/automation-table";
 import type { Policy } from "@/components/settings/policy-draft-section";
-import type { DecisionMode } from "@/lib/decide/points";
 import type { PickerAutonomy } from "@/lib/policy/types";
 
 /**
@@ -127,12 +126,6 @@ export interface EditableSettings {
    * shipped level rather than rendering it.
    */
   repairAutonomy?: Record<string, string>;
-  /**
-   * How far anton may go answering each registered decision point (anton-xky9e), keyed by
-   * `DecisionPoint.id`. Only the points moved off their own default are stored; absent for a given id
-   * reads back as that point's `defaultMode` (`resolveDecisionMode`).
-   */
-  decisionModes?: Record<string, DecisionMode>;
   /** Budget-aware execution master-switch (anton-7mpv.1); off by default. Gates the knobs below. */
   budgetAware?: boolean;
   /**

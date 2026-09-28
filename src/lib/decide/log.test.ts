@@ -125,6 +125,17 @@ describe("write", () => {
     ).resolves.toBeUndefined();
   });
 
+  it("refuses to log a decision under the wrong point", async () => {
+    const other: DecisionPoint = { ...POINT, id: "other-point" };
+    const result = await decide({ point: POINT, state: {}, mode: "shadow", ask: async () => ANSWER() });
+
+    await expect(
+      recordDecision(test.db, clock, { result, point: other, state: {} }),
+    ).resolves.toBeUndefined();
+    expect(await listDecisions(test.db, other.id)).toHaveLength(0);
+    expect(await listDecisions(test.db, POINT.id)).toHaveLength(0);
+  });
+
   it("appends a re-decision rather than revising the first row", async () => {
     const first = await recordShadow(ANSWER({ confidence: 0.5 }));
     nowMs += 60_000;

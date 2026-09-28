@@ -200,7 +200,9 @@ function readDistribution(
   options: readonly string[],
 ): Record<string, number> | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
-  const distribution: Record<string, number> = {};
+  // Prototype-free: a registered option named "__proto__" must land as an own
+  // property, not reassign the object's prototype via the inherited setter.
+  const distribution: Record<string, number> = Object.create(null);
   let sum = 0;
   for (const option of options) {
     const probability = readNumber((raw as Record<string, unknown>)[option]);
