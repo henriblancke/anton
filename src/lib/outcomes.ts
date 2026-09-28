@@ -28,7 +28,6 @@ const BUILT_IN_OUTCOME: ProjectOutcome = {
   retired: false,
 };
 
-const HEADING_PATTERN = /^#{1,6}\s+/;
 const OUTCOMES_HEADING = /^##\s+Outcomes\s*$/i;
 const BULLET_PATTERN = /^-\s*`([^`]+)`\s*—\s*(.+)$/;
 const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
@@ -38,14 +37,16 @@ const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
  * Reads via {@link renderedLines} so HTML-comment content (the scaffolded template's embedded
  * example bullet) is masked out before scanning, the same way the contract parser's
  * `renderedText` does — otherwise an unedited PRODUCT.md's example bullet inside `<!-- ... -->`
- * would parse as a real outcome.
+ * would parse as a real outcome. Terminates on any rendered heading, ATX or Setext — a Setext
+ * heading's text doesn't start with `#`, so re-checking its source spelling here would let a
+ * later section's bullets leak into Outcomes.
  */
 function outcomesSection(markdown: string): string[] | undefined {
   const lines = renderedLines(markdown);
   const start = lines.findIndex((line) => line.heading && OUTCOMES_HEADING.test(line.text.trim()));
   if (start === -1) return undefined;
   const body: string[] = [];
-  for (let i = start + 1; i < lines.length && !(lines[i].heading && HEADING_PATTERN.test(lines[i].text)); i++) {
+  for (let i = start + 1; i < lines.length && !lines[i].heading; i++) {
     body.push(lines[i].text);
   }
   return body;

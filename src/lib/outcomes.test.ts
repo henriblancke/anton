@@ -38,6 +38,18 @@ describe("parseOutcomes", () => {
     expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "a"]);
   });
 
+  it("stops the section at a Setext heading, not just an ATX one", () => {
+    const markdown = [
+      "## Outcomes",
+      "- `a` — first",
+      "Other settings",
+      "-----",
+      "- `b` — second",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "a"]);
+  });
+
   it("always includes the built-in codebase-health outcome even when the file omits it", () => {
     const markdown = ["## Outcomes", "- `oriented-operator` — Every run target says why it exists."].join("\n");
 

@@ -117,6 +117,20 @@ describe("draftFromDetail", () => {
     expect(draft.body).toBe("## Why now\n\nNot the contract field");
   });
 
+  it("stops `## Why` at a shallower heading, leaving it and everything after it in body", () => {
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description: "## Goal\n\nDo it\n\n## Why\n\nServes the outcome\n\n# Notes\n\nUnrelated section",
+    });
+    expect(draft.why).toBe("Serves the outcome");
+    expect(draft.body).toBe("# Notes\n\nUnrelated section");
+  });
+
   it("falls back to the acceptance field when the description has no ## Acceptance section", () => {
     const draft = draftFromDetail({
       id: "x",
@@ -170,6 +184,11 @@ describe("stripContractSections", () => {
   it("does not mistake a `## Why now` / `## Why this approach` section for the contract's `## Why`", () => {
     const desc = "## Goal\n\ng\n\n## Why now\n\nnot the contract field\n\n## Acceptance\n\na";
     expect(stripContractSections(desc)).toBe("## Why now\n\nnot the contract field");
+  });
+
+  it("stops `## Why` at a shallower heading rather than absorbing it into the stripped body", () => {
+    const desc = "## Goal\n\ng\n\n## Why\n\nserves the outcome\n\n# Notes\n\nunrelated section";
+    expect(stripContractSections(desc)).toBe("# Notes\n\nunrelated section");
   });
 
   it("does not mistake a fenced example's `## Goal` / `## Why` / `## Acceptance` lines for real headings", () => {

@@ -125,14 +125,18 @@ const sectionHeading = (name: string) =>
     : new RegExp(`^##\\s*${name}\\s*$`, "i");
 
 /**
- * Is this line, at this position, a genuine `##` (level-2) heading — as opposed to a line that
- * merely LOOKS like one inside a fenced code block, an HTML comment, or other non-rendered
- * markdown? Backed by {@link scanMarkdown}'s AST-aware line scan (src/lib/beads/markdown.ts), the
- * same parser the contract reader uses — a raw `/^##\s+/` test on the trimmed line text can't tell
- * a real heading from a fenced example that merely contains one.
+ * Is this line, at this position, a genuine heading at depth 2 or shallower — as opposed to a
+ * line that merely LOOKS like one inside a fenced code block, an HTML comment, or other
+ * non-rendered markdown? Backed by {@link scanMarkdown}'s AST-aware line scan
+ * (src/lib/beads/markdown.ts), the same parser the contract reader uses — a raw `/^##\s+/` test
+ * on the trimmed line text can't tell a real heading from a fenced example that merely contains
+ * one. Depth 1 and shallower also count as boundaries: a `# Notes` following `## Why` still ends
+ * the section, even though only a depth-2 heading can be the section opener itself (see
+ * {@link sectionHeading}) — otherwise a shallower heading and everything below it gets absorbed
+ * into the open section instead of staying independent body text.
  */
 const isSectionHeadingLine = (scanned: ReturnType<typeof scanMarkdown>[number] | undefined): boolean =>
-  scanned?.heading?.depth === 2;
+  scanned?.heading !== undefined && scanned.heading.depth <= 2;
 
 /**
  * Drop the `## Goal` / `## Why` / `## Acceptance Criteria` blocks (heading through the line before
