@@ -32,7 +32,7 @@ import { and, desc, eq, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { getDb, schema } from "../db";
 import { toEpoch } from "../db/epoch";
 import type { AntonDb, Clock } from "../jobs/queue";
-import type { DecideResult } from "./index";
+import { isValidAnswer, type DecideResult } from "./index";
 import { narrowState, type AnswerValue, type DecisionPoint, type DecisionState } from "./points";
 
 /**
@@ -161,6 +161,9 @@ export async function recordDecision(
 }
 
 export interface SettleDecisionInput {
+  /** The point being settled, needed to validate `operatorAnswer` against its own question shape
+   * before it is trusted as evidence. */
+  point: DecisionPoint;
   /** What the operator's answer turned out to be, in the point's own answer vocabulary. */
   operatorAnswer: AnswerValue;
   /** The affordance that produced it (`fix`, `park`, `release`) — recorded, never counted. */
@@ -177,9 +180,16 @@ export interface SettleDecisionInput {
  * false rather than overwriting the first. That is the honest reading of a double-click, and of a
  * retry of a request that already landed.
  *
+ * `operatorAnswer` is checked against `input.point.question` with the same {@link isValidAnswer}
+ * decide() itself trusts a model's answer through, and BEFORE the update runs: settlement is
+ * first-write-wins, so a typo (`"fixed"` for `"fix"`) or an answer lifted from a different question
+ * would otherwise stamp `settledAt` permanently and read as a disagreement in {@link agreement}
+ * forever after, with no way to correct it (PR #332 review).
+ *
  * Unlike {@link recordDecision} this does NOT swallow: a settle is the operator's own act, and a
  * caller that asked whether it landed must be able to tell "already settled" (false) from "the write
- * failed" (a throw). Collapsing the two would let a route report success over a lost answer.
+ * failed" (a throw). Collapsing the two would let a route report success over a lost answer. An
+ * invalid answer is the same kind of caller bug and throws for the same reason.
  */
 export async function settleDecision(
   db: AntonDb,
@@ -187,6 +197,11 @@ export async function settleDecision(
   id: string,
   input: SettleDecisionInput,
 ): Promise<boolean> {
+  if (!isValidAnswer(input.point.question, input.operatorAnswer)) {
+    throw new Error(
+      `decide: "${input.point.id}" cannot settle with ${JSON.stringify(input.operatorAnswer)} — not a valid answer to its own question`,
+    );
+  }
   const rows = await db
     .update(schema.decisions)
     .set({
@@ -245,9 +260,11 @@ const isJudgmentEvidence = and(
 /**
  * How often this point's answer matched the operator's, over the rolling window.
  *
- * Compared as encoded JSON, which is what makes the comparison honest across question shapes: a
- * `score` point answering `1` and an operator answering `"1"` disagree, and a string equality over
- * raw text would call them the same.
+ * Compared as encoded JSON rather than raw string equality, so a `score` point answering `1` and an
+ * operator answering `"1"` would disagree instead of reading as the same value. Belt-and-suspenders
+ * today: `settleDecision`'s own {@link isValidAnswer} check already keeps a `"1"` from ever reaching
+ * `operatorAnswer` for a `score` point, since decide()'s `answer` is validated the same way — but the
+ * encoded comparison stays the honest one to make regardless.
  *
  * Scoped to `projectId` when given, since the same point runs across every project: without it, one
  * project's successes or failures bleed into another's figure and can encourage a promotion to `auto`

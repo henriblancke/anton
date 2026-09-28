@@ -85,7 +85,10 @@ function fireHardRule(point: DecisionPoint, state: DecisionState) {
   return undefined;
 }
 
-function isValidAnswer(question: Question, value: AnswerValue): boolean {
+/** Exported for {@link settleDecision} (log.ts): an operator answer needs the same shape check
+ * before it is trusted as evidence, or a typo (`"fixed"` for `"fix"`) or an answer to a different
+ * question would settle silently and, being first-write-wins, could never be corrected. */
+export function isValidAnswer(question: Question, value: AnswerValue): boolean {
   switch (question.kind) {
     case "choice":
       return typeof value === "string" && question.options.includes(value);

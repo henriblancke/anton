@@ -90,18 +90,21 @@ describe("the decision log over a real anton.db", () => {
     // ── settle: a separate pass over persisted rows, which is the "later" in the contract ──
     expect(
       await log.settleDecision(getDb(), clock, agreedA, {
+        point: POINT,
         operatorAnswer: "fix",
         operatorAction: "fix",
       }),
     ).toBe(true);
     expect(
       await log.settleDecision(getDb(), clock, agreedB, {
+        point: POINT,
         operatorAnswer: "fix",
         operatorAction: "fix",
       }),
     ).toBe(true);
     expect(
       await log.settleDecision(getDb(), clock, disagreed, {
+        point: POINT,
         operatorAnswer: "decline",
         operatorAction: "decline",
       }),
@@ -118,6 +121,7 @@ describe("the decision log over a real anton.db", () => {
   it("round-trips every logged field through the migration's real columns", async () => {
     const id = await decideAndLog("check this", "decline", 0.77);
     await log.settleDecision(getDb(), clock, id, {
+      point: POINT,
       operatorAnswer: "decline",
       operatorAction: "decline-with-reply",
       outcome: "merged",
@@ -144,7 +148,7 @@ describe("the decision log over a real anton.db", () => {
 
   it("records an outcome after the settle, as a third observation", async () => {
     const id = await decideAndLog("later outcome", "fix");
-    await log.settleDecision(getDb(), clock, id, { operatorAnswer: "fix" });
+    await log.settleDecision(getDb(), clock, id, { point: POINT, operatorAnswer: "fix" });
 
     // The outcome is knowable after the choice — sometimes days later — so it lands on its own.
     expect(await log.recordDecisionOutcome(getDb(), id, "reverted")).toBe(true);
@@ -171,7 +175,7 @@ describe("the decision log over a real anton.db", () => {
       }),
     });
     const id = await log.recordDecision(getDb(), clock, { result, point: other, state });
-    await log.settleDecision(getDb(), clock, id!, { operatorAnswer: "fix" });
+    await log.settleDecision(getDb(), clock, id!, { point: other, operatorAnswer: "fix" });
 
     expect(await log.latestAgreement(other.id)).toEqual({
       point: "stall-retry",
