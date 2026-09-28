@@ -48,7 +48,17 @@ describe("definePoint", () => {
   it("rejects a choice question with fewer than two options", () => {
     expect(() =>
       definePoint({ ...CHOICE_POINT, question: { kind: "choice", options: ["human"] } }),
-    ).toThrow(/fewer than two options/);
+    ).toThrow(/fewer than two distinct options/);
+  });
+
+  it("rejects a choice question whose options are all duplicates of one value", () => {
+    expect(() =>
+      definePoint({
+        ...CHOICE_POINT,
+        question: { kind: "choice", options: ["fix", "fix"] },
+        escapeValue: "fix",
+      }),
+    ).toThrow(/fewer than two distinct options/);
   });
 
   it("rejects a choice point with no escapeValue", () => {
