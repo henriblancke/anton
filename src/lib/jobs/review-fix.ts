@@ -531,6 +531,13 @@ async function handleEpic(args: {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
       // and these reasons is suppressed instead of handed a brand new session (anton-dfuvz).
+      //
+      // Friction classification (ADR-0001 clause 5, anton-tuf4l): this job settles `done`, not
+      // parked or cancelled, so it is NOT anton failing and NOT a human touch — nobody was asked
+      // anything and nothing is waiting on a person. It still counts toward `prFixRounds` (this PR
+      // really did need a round of attention), but contributes zero to every anton-failing/
+      // human-touch counter. The later suppression this enables (declining to re-dispatch at the
+      // same head + reasons) creates no job row of its own, so it needs no counter beyond this one.
       recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.reasons);
     }
     return pushed ? "pushed" : "answered";
@@ -1005,7 +1012,15 @@ async function captureRedGate(
   return outcomes.find((o) => !o.ok);
 }
 
-/** Opening sentence unchanged (existing readers parse it) — the gate output tail is appended. */
+/**
+ * Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
+ *
+ * Friction classification (ADR-0001 clause 5, anton-tuf4l): this poison parks the job through the
+ * runner's ordinary non-quota path, so it counts toward `failureParkCount` — anton failing, a human
+ * has to clear it — same as any other poison park. No new counter: a gate still red after the one
+ * bounded follow-up round (anton-pwekp) is exactly the "job parked (non-quota)" row in the gap-3
+ * taxonomy, not a new kind of stop.
+ */
 function gateFailurePoison(red: VerifyGateOutcome, number: number): PoisonError {
   return new PoisonError(
     `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
