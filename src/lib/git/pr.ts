@@ -337,7 +337,11 @@ async function getReviewThreads(
       // there is no "true latest" being hidden behind a totalCount the response never reported).
       for (const n of page.nodes) {
         if (!n.comments || typeof n.comments.totalCount !== "number") {
+          // comments missing entirely is a malformed response, not a real zero-comment thread — drop
+          // it like the other malformed-comments cases below, so it never surfaces as an actionable
+          // thread with no anchor comment to triage against (PR #335 review).
           complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
           continue;
         }
         if (!Array.isArray(n.comments.nodes)) {

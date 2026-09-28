@@ -261,11 +261,11 @@ process.exit(0);
     expect(review.threadsComplete).toBe(false);
   });
 
-  // PR #335 review (src/lib/git/pr.ts:326): a thread missing its `comments` connection (or
-  // `totalCount`) entirely used to fall back to 0 on both sides of the truncation check, so the
-  // comparison never fired and `complete` stayed true — losing the thread's comments and reviewer
-  // attribution while the persisted round still claimed to be complete.
-  it("marks the read incomplete when a thread's comments connection is missing entirely", async () => {
+  // PR #335 review (src/lib/git/pr.ts:339): a thread missing its `comments` connection (or
+  // `totalCount`) entirely was flagged incomplete but kept, mapping to `comments: []` — so
+  // threadsNeedingAttention saw an actionable thread with no anchor comment a triage outcome
+  // could ever attach to. Drop it like the other malformed-comments cases.
+  it("drops a thread whose comments connection is missing entirely, and marks the read incomplete", async () => {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
       fakeGh,
@@ -293,7 +293,7 @@ process.exit(0);
     chmodSync(fakeGh, 0o755);
 
     const review = await getPrReview(sandbox, 7);
-    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(review.threads).toEqual([]);
     expect(review.threadsComplete).toBe(false);
   });
 
@@ -358,7 +358,7 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   if (!hasCursor) {
     process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
-      nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+      nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
     } } } } }));
     process.exit(0);
   }
@@ -421,7 +421,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
 }
 if (a[0] === 'api' && a[1] === 'graphql') {
   process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
-    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
   } } } } }));
   process.exit(0);
 }
@@ -455,7 +455,7 @@ if (a[0] === 'pr' && a[1] === 'view') {
 if (a[0] === 'api' && a[1] === 'graphql') {
   process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
     pageInfo: { hasNextPage: true, endCursor: null },
-    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
   } } } } }));
   process.exit(0);
 }

@@ -407,6 +407,10 @@ async function dispatchInReview(args: {
           }
         }
       } catch (e) {
+        // `heartbeat()` never throws for an aborted signal, so without this check a no-progress
+        // timeout firing mid-read looks like an ordinary unreadable PR and the pass can settle as
+        // done instead of retrying (PR #335 review).
+        if (ctx.signal.aborted) throw e;
         // One unreadable orphaned PR must not block reconciling the rest — it stays null and is
         // retried next pass, the same as any other best-effort read in this job.
         consoleLog.error(`PR #${prNumber}: orphaned-round reconciliation read failed`, e);
