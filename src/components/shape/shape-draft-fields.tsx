@@ -1,6 +1,7 @@
 "use client";
 
 import type { EpicChoice } from "@/lib/backlog";
+import type { ProjectOutcome } from "@/lib/outcomes";
 import { cn } from "@/lib/utils";
 
 import { NEW_EPIC } from "./shape-draft";
@@ -17,10 +18,14 @@ export function DraftFields({
   draft,
   areas,
   epics,
+  outcomes,
 }: {
   draft: ShapeDraft;
   areas: string[];
   epics: EpicChoice[];
+  /** The outcomes `.product/PRODUCT.md` currently offers for new work — suggested so a typo'd id
+   * gets caught here rather than surviving to the submit-time check. */
+  outcomes: ProjectOutcome[];
 }) {
   const { fields, setFeatureField, outcomeIdValid } = draft;
   return (
@@ -52,6 +57,7 @@ export function DraftFields({
           value={fields.feature.outcomeId}
           onChange={(v) => setFeatureField("outcomeId", v)}
           placeholder="reports-are-shareable"
+          list="shape-outcomes"
           invalid={!outcomeIdValid}
           hint={
             outcomeIdValid
@@ -59,6 +65,15 @@ export function DraftFields({
               : "Letters, digits, . _ - only — it becomes the label outcome:<value>."
           }
         />
+        {/* Outcome ids already offered by `.product/PRODUCT.md` — suggested so a typo surfaces here
+            rather than surviving to the submit-time check. */}
+        <datalist id="shape-outcomes">
+          {outcomes.map((o) => (
+            <option key={o.id} value={o.id}>
+              {o.summary}
+            </option>
+          ))}
+        </datalist>
         <DraftTextarea
           label="Acceptance criteria"
           value={fields.feature.acceptance}

@@ -59,12 +59,13 @@ describe("draftFromDetail", () => {
       risk: "",
       size: "",
       goal: "",
+      why: "",
       acceptance: "",
       body: "",
     });
   });
 
-  it("splits the contract into goal / acceptance / body, keeping the rest in body", () => {
+  it("splits the contract into goal / why / acceptance / body, keeping the rest in body", () => {
     const draft = draftFromDetail({
       id: "x",
       title: "t",
@@ -74,9 +75,11 @@ describe("draftFromDetail", () => {
       ...meta,
       goal: "Ship the widget",
       acceptance: "- [ ] It renders",
-      description: "## Goal\n\nShip the widget\n\n## Acceptance\n\n- [ ] It renders\n\n## Verify\n\nRun the tests",
+      description:
+        "## Goal\n\nShip the widget\n\n## Why\n\nServes the reports outcome\n\n## Acceptance\n\n- [ ] It renders\n\n## Verify\n\nRun the tests",
     });
     expect(draft.goal).toBe("Ship the widget");
+    expect(draft.why).toBe("Serves the reports outcome");
     expect(draft.acceptance).toBe("- [ ] It renders");
     expect(draft.body).toBe("## Verify\n\nRun the tests");
   });
@@ -124,6 +127,11 @@ describe("stripContractSections", () => {
     expect(composed).toContain("## Acceptance Criteria\n\n- [ ] a");
     expect(stripContractSections(composed)).toBe(draft.body);
     expect(composeDescription({ ...draft, body: stripContractSections(composed) })).toBe(composed);
+  });
+
+  it("also removes a `## Why` block, so it never survives into body", () => {
+    const desc = "## Goal\n\ng\n\n## Why\n\nserves the outcome\n\n## Acceptance\n\na\n\n## Context\n\nc";
+    expect(stripContractSections(desc)).toBe("## Context\n\nc");
   });
 });
 
@@ -198,6 +206,24 @@ describe("contract editing", () => {
   it("round-trips an edited goal so parseGoal reads the new text", () => {
     const patch = diffTicketPatch(original, { ...original, goal: "Brand new goal" });
     expect(parseGoal(asBead({ description: patch.description }))).toBe("Brand new goal");
+  });
+
+  it("keeps Why ahead of Acceptance when an unrelated contract field is edited", () => {
+    // A ticket carrying `## Why` (anton-n60zq) has it seeded into its own draft field, not folded
+    // into `body` — otherwise editing just the goal would recompose Goal + Acceptance + body and
+    // push Why after Acceptance, violating the contract's own section order.
+    const withWhy = draftFromDetail({
+      ...contractDetail,
+      description:
+        "## Goal\n\nOld goal\n\n## Why\n\nServes the reports outcome\n\n## Acceptance\n\n- [ ] old item\n\n## Verify\n\ntests",
+    });
+    expect(withWhy.why).toBe("Serves the reports outcome");
+
+    const patch = diffTicketPatch(withWhy, { ...withWhy, goal: "Brand new goal" });
+    const description = patch.description ?? "";
+    expect(description.indexOf("## Why")).toBeGreaterThan(-1);
+    expect(description.indexOf("## Why")).toBeLessThan(description.indexOf("## Acceptance Criteria"));
+    expect(description).toContain("## Why\n\nServes the reports outcome");
   });
 
   it("round-trips an edited acceptance so parseAcceptance (section-first) reads the new text", () => {

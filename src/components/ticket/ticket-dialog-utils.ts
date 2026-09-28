@@ -9,14 +9,16 @@ import type { TicketDetail } from "@/lib/types";
 
 /**
  * The editable fields of a ticket. Scalar/label fields plus the markdown contract, which is
- * decomposed into three editable pieces: `goal` (the `## Goal` section), `acceptance` (the
- * `## Acceptance Criteria` section, falling back to the bead's acceptance field), and `body` (the
- * rest of the description). Absent labels are held as "" in the draft.
+ * decomposed into four pieces: `goal` (the `## Goal` section), `why` (the `## Why` section — no bd
+ * field of its own, so it lives only in the description), `acceptance` (the `## Acceptance
+ * Criteria` section, falling back to the bead's acceptance field), and `body` (the rest of the
+ * description). Absent labels are held as "" in the draft.
  *
  * Storage rule: the whole contract is canonically the bead DESCRIPTION markdown. On save the
- * description is recomposed as `## Goal` + `## Acceptance Criteria` + body (`composeDescription`),
- * and the acceptance text is mirrored into bd's dedicated acceptance field so the two never
- * drift — `parseGoal`/`parseAcceptance` both read the `## <section>` from the description first.
+ * description is recomposed as `## Goal` + `## Why` + `## Acceptance Criteria` + body
+ * (`composeDescription`) — the contract's own order — and the acceptance text is mirrored into
+ * bd's dedicated acceptance field so the two never drift — `parseGoal`/`parseAcceptance` both read
+ * the `## <section>` from the description first.
  */
 export interface TicketDraft {
   title: string;
@@ -26,6 +28,7 @@ export interface TicketDraft {
   risk: string;
   size: string;
   goal: string;
+  why: string;
   acceptance: string;
   body: string;
 }
@@ -101,14 +104,19 @@ export const AGENT_OPTIONS = [
  * The contract sections that live in their own draft fields — everything else stays in `body`.
  * `Acceptance` is the PREFIX, not the full heading: the `\b` match below also claims the
  * `## Acceptance Criteria` we now write, so a description in either spelling strips to the same
- * body and recomposes under the canonical one.
+ * body and recomposes under the canonical one. Listed in the contract's own order (Goal → Why →
+ * Acceptance), which is also the order {@link composeDescription} writes them back in.
  */
-const CONTRACT_SECTIONS = ["Goal", "Acceptance"] as const;
+const CONTRACT_SECTIONS = ["Goal", "Why", "Acceptance"] as const;
+
+/** Match a `## <name>` heading — the PREFIX, so it also claims `## Acceptance Criteria`. */
+const sectionHeading = (name: string) => new RegExp(`^##\\s*${name}\\b`, "i");
 
 /**
- * Drop the `## Goal` / `## Acceptance Criteria` blocks (heading through the line before the next
- * `##`) from a description, leaving "the rest" that the Description textarea edits. Mirrors the
- * heading semantics of `parseSection` in src/lib/tickets.ts so the split round-trips cleanly.
+ * Drop the `## Goal` / `## Why` / `## Acceptance Criteria` blocks (heading through the line before
+ * the next `##`) from a description, leaving "the rest" that the Description textarea edits.
+ * Mirrors the heading semantics of `parseSection` in src/lib/tickets.ts so the split round-trips
+ * cleanly.
  */
 export function stripContractSections(description: string): string {
   const lines = description.split("\n");
@@ -117,9 +125,7 @@ export function stripContractSections(description: string): string {
   for (const line of lines) {
     const trimmed = line.trim();
     if (/^##\s+/.test(trimmed)) {
-      const isContract = CONTRACT_SECTIONS.some((name) =>
-        new RegExp(`^##\\s*${name}\\b`, "i").test(trimmed),
-      );
+      const isContract = CONTRACT_SECTIONS.some((name) => sectionHeading(name).test(trimmed));
       skipping = isContract;
       if (skipping) continue;
     }
@@ -129,16 +135,42 @@ export function stripContractSections(description: string): string {
 }
 
 /**
+ * Extract one `## <name>` block's body (heading through the line before the next `##`), or "" when
+ * absent. The read half of {@link stripContractSections} for a section with no bd field home of
+ * its own — unlike Goal/Acceptance, Why is never mirrored onto {@link TicketDetail}, so it can only
+ * be read back out of the description markdown.
+ */
+function extractSection(description: string, name: string): string {
+  const lines = description.split("\n");
+  const heading = sectionHeading(name);
+  const body: string[] = [];
+  let inSection = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^##\s+/.test(trimmed)) {
+      if (inSection) break;
+      inSection = heading.test(trimmed);
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
+/**
  * Recompose a draft's contract into a single canonical description markdown: `## Goal`, then
- * `## Acceptance Criteria`, then the remaining body. Empty pieces are omitted. This is what gets
- * written to `--description`, and `parseGoal`/`parseAcceptance` read it straight back.
+ * `## Why`, then `## Acceptance Criteria`, then the remaining body — the contract's own order
+ * (skills/bd/SKILL.md). Empty pieces are omitted. This is what gets written to `--description`,
+ * and `parseGoal`/`parseAcceptance` read it straight back.
  */
 export function composeDescription(draft: TicketDraft): string {
   const parts: string[] = [];
   const goal = draft.goal.trim();
+  const why = draft.why.trim();
   const acceptance = draft.acceptance.trim();
   const body = draft.body.trim();
   if (goal) parts.push(`## Goal\n\n${goal}`);
+  if (why) parts.push(`## Why\n\n${why}`);
   if (acceptance) parts.push(`## ${ACCEPTANCE_HEADING}\n\n${acceptance}`);
   if (body) parts.push(body);
   return parts.join("\n\n");
@@ -154,6 +186,7 @@ export function draftFromDetail(detail: TicketDetail): TicketDraft {
     risk: detail.risk ?? "",
     size: detail.size ?? "",
     goal: detail.goal ?? "",
+    why: extractSection(detail.description ?? "", "Why"),
     acceptance: detail.acceptance ?? "",
     body: stripContractSections(detail.description ?? ""),
   };
@@ -181,11 +214,12 @@ export function diffTicketPatch(original: TicketDraft, draft: TicketDraft): Tick
   if (draft.risk !== "" && draft.risk !== original.risk) patch.risk = draft.risk;
   if (draft.size !== "" && draft.size !== original.size) patch.size = draft.size;
 
-  // Contract: when any of Goal/Acceptance/body changed, rewrite the whole description and
+  // Contract: when any of Goal/Why/Acceptance/body changed, rewrite the whole description and
   // mirror acceptance into bd's dedicated field so the two homes can't drift. Empty pieces are
   // no-ops server-side (they never clobber the current value), matching the label behavior above.
   const contractChanged =
     draft.goal !== original.goal ||
+    draft.why !== original.why ||
     draft.acceptance !== original.acceptance ||
     draft.body !== original.body;
   if (contractChanged) {

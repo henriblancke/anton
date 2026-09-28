@@ -32,6 +32,7 @@ import {
   createDraftFeature,
   DraftContractError,
   DraftEpicError,
+  DraftOutcomeError,
   epicChoices,
   knownAreas,
 } from "./backlog";
@@ -44,10 +45,17 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** A project whose repo has no `.beads/formulas/` — so it resolves anton's bundled asset. */
+/** A project whose repo has no `.beads/formulas/` — so it resolves anton's bundled asset. Its
+ * `.product/PRODUCT.md` carries the one outcome the fixtures below point at, so the outcome-id
+ * check {@link createDraftFeature} runs doesn't refuse every other test in this file. */
 function tempProject(): Project {
   const repoPath = mkdtempSync(join(tmpdir(), "anton-backlog-"));
   temps.push(repoPath);
+  mkdirSync(join(repoPath, ".product"), { recursive: true });
+  writeFileSync(
+    join(repoPath, ".product", "PRODUCT.md"),
+    "## Outcomes\n\n- `reports-are-shareable` — Every report view leaves the app in a format a customer can open.\n",
+  );
   return {
     id: "p",
     slug: "p",
@@ -447,6 +455,68 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  // The typo the review flagged (anton-cdeki): nothing upstream of this write ever checked the
+  // feature's outcome id against `.product/PRODUCT.md`'s actual `## Outcomes`, so a misspelled id
+  // landed as a real `outcome:<id>` label no gate would ever flag.
+  it("refuses an outcome id `.product/PRODUCT.md` doesn't offer, naming it", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: { ...FEATURE, outcomeId: "reports-are-sharable" },
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain("reports-are-sharable");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an outcome PRODUCT.md marks retired", async () => {
+    const target = project();
+    writeFileSync(
+      join(target.repoPath, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n- `reports-are-shareable` — Old outcome (retired).\n",
+    );
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    await expect(
+      createDraftFeature(target, { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).rejects.toThrow(DraftOutcomeError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // The epic's Outcome IDs are the outcomes its features add up to serving — a new epic that omits
+  // its own feature's outcome is exactly the drift the review flagged.
+  it("refuses a new epic whose Outcome IDs never mention the feature's own outcome", async () => {
+    const createGraph = vi.spyOn(beads, "createGraph");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "new", epic: { ...EPIC, outcomeIds: "outcome:something-else" } },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain(FEATURE.outcomeId);
+    expect(createGraph).not.toHaveBeenCalled();
+  });
+
+  it("accepts a new epic whose Outcome IDs list several ids including the feature's own", async () => {
+    const createGraph = graphLands();
+
+    await expect(
+      createDraftFeature(project(), {
+        feature: FEATURE,
+        epic: { kind: "new", epic: { ...EPIC, outcomeIds: "outcome:something-else, reports-are-shareable" } },
+      }),
+    ).resolves.toMatchObject({ epicCreated: true });
+    expect(createGraph).toHaveBeenCalledTimes(1);
+  });
 });
 
 // The epic half is judged with the same validator, and — like the feature's — ahead of the single

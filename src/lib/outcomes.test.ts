@@ -1,5 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { parseOutcomes } from "./outcomes";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { activeOutcomeIds, parseOutcomes, readProjectOutcomes } from "./outcomes";
 
 describe("parseOutcomes", () => {
   it("parses `id` — summary bullets under ## Outcomes", () => {
@@ -89,5 +92,44 @@ describe("parseOutcomes", () => {
     expect(parseOutcomes(markdown)).toEqual([
       { id: "codebase-health", summary: "Custom summary for this project.", retired: false },
     ]);
+  });
+});
+
+describe("activeOutcomeIds", () => {
+  it("keeps non-retired ids and drops ones marked retired", () => {
+    const outcomes = parseOutcomes(
+      ["## Outcomes", "- `live` — Still offered.", "- `dead` — Gone (retired)."].join("\n"),
+    );
+    expect(activeOutcomeIds(outcomes)).toEqual(new Set(["codebase-health", "live"]));
+  });
+});
+
+describe("readProjectOutcomes", () => {
+  const temps: string[] = [];
+  afterEach(() => {
+    for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  function tempRepo(): string {
+    const repoPath = mkdtempSync(join(tmpdir(), "anton-outcomes-"));
+    temps.push(repoPath);
+    return repoPath;
+  }
+
+  it("reads .product/PRODUCT.md's ## Outcomes relative to the repo root", async () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".product"), { recursive: true });
+    writeFileSync(
+      join(repo, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n- `reports-are-shareable` — Every report leaves the app.\n",
+    );
+
+    const outcomes = await readProjectOutcomes(repo);
+    expect(outcomes.map((o) => o.id)).toEqual(["codebase-health", "reports-are-shareable"]);
+  });
+
+  it("resolves to just the built-in outcome when PRODUCT.md is absent, never throwing", async () => {
+    const outcomes = await readProjectOutcomes(tempRepo());
+    expect(outcomes.map((o) => o.id)).toEqual(["codebase-health"]);
   });
 });

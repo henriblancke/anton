@@ -16,9 +16,15 @@ export default async function ProjectShapePage({
   if (!project) notFound();
 
   // Off the warm issue snapshot the board already reads — no extra bd spawn. Best-effort: a board
-  // that can't be read costs the founder the epic picker and the area suggestions, and the draft
-  // then has to state its own epic — never the ability to file work.
-  const { areas, epics } = await getDraftOptions(project).catch(() => ({ areas: [], epics: [] }));
+  // that can't be read costs the founder the epic picker and the area/outcome suggestions, and the
+  // draft then has to state its own epic — never the ability to file work.
+  const { areas, epics, outcomes } = await getDraftOptions(project).catch(() => ({
+    areas: [],
+    epics: [],
+    outcomes: [],
+  }));
 
-  return <ShapeView slug={slug} projectName={project.name} areas={areas} epics={epics} />;
+  return (
+    <ShapeView slug={slug} projectName={project.name} areas={areas} epics={epics} outcomes={outcomes} />
+  );
 }

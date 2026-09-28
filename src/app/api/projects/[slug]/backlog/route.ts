@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { createDraftFeature, DraftContractError, DraftEpicError } from "@/lib/backlog";
+import { createDraftFeature, DraftContractError, DraftEpicError, DraftOutcomeError } from "@/lib/backlog";
 import { AREA_SHAPE } from "@/lib/epic-patch";
 import { resolveProject } from "../resolve-project";
 
@@ -86,9 +86,9 @@ export async function POST(
     const created = await createDraftFeature(project, draft);
     return NextResponse.json(created, { status: 201 });
   } catch (err) {
-    // An unusable epic is a question for the founder (pick another), not a bd failure — 400, so the
-    // panel keeps the draft and says which epic it could not use.
-    if (err instanceof DraftEpicError) {
+    // An unusable epic or outcome is a question for the founder (pick another), not a bd failure —
+    // 400, so the panel keeps the draft and says what it could not use.
+    if (err instanceof DraftEpicError || err instanceof DraftOutcomeError) {
       return NextResponse.json({ error: err.message }, { status: 400 });
     }
     if (err instanceof DraftContractError) {

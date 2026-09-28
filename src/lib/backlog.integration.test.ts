@@ -6,6 +6,8 @@
  * `isContainer` on the epic). Before this ticket the same click produced an epic per PR, which
  * `/shape` had already stopped emitting.
  */
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterAll, beforeAll, expect, it } from "vitest";
 
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
@@ -42,6 +44,13 @@ describeBd("Add-work commit (real bd · feature under an epic)", () => {
     bdRepo = makeBdRepo();
     // The install step `anton init` / addProject runs — the formula both writes render from.
     expect(ensureBeadFormula(`${bdRepo.repo}/.beads`).status).toBe("installed");
+    // The outcome the fixture's feature/epic both point at (anton-cdeki) must be one
+    // `.product/PRODUCT.md` actually offers, or `createDraftFeature` now refuses the draft.
+    mkdirSync(join(bdRepo.repo, ".product"), { recursive: true });
+    writeFileSync(
+      join(bdRepo.repo, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n- `reports-are-shareable` — Every report view leaves the app in a format a customer can open.\n",
+    );
     project = {
       id: "p",
       slug: "p",

@@ -4,6 +4,7 @@ import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, loadAllIssues } from "./beads/issues";
+import { activeOutcomeIds, readProjectOutcomes, type ProjectOutcome } from "./outcomes";
 import type { Project } from "./types";
 
 /**
@@ -164,14 +165,18 @@ export function epicChoices(all: Bead[]): EpicChoice[] {
     .sort((a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id));
 }
 
-/** Everything the Add-work panel offers, derived from ONE board read — the warm issue snapshot the
- * board already holds, so no extra bd spawn: the epics a feature may attach to, and the `area:`
- * vocabulary a new epic should reuse. */
+/** Everything the Add-work panel offers: the epics a feature may attach to and the `area:`
+ * vocabulary a new epic should reuse, off ONE board read (the warm issue snapshot, so no extra bd
+ * spawn) — plus the outcomes `.product/PRODUCT.md` currently offers for new work, so the panel can
+ * suggest them and catch a typo'd outcome id before it ever reaches {@link createDraftFeature}. */
 export async function getDraftOptions(
   project: Project,
-): Promise<{ areas: string[]; epics: EpicChoice[] }> {
-  const all = await allIssues(project.repoPath);
-  return { areas: knownAreas(all), epics: epicChoices(all) };
+): Promise<{ areas: string[]; epics: EpicChoice[]; outcomes: ProjectOutcome[] }> {
+  const [all, outcomes] = await Promise.all([
+    allIssues(project.repoPath),
+    readProjectOutcomes(project.repoPath),
+  ]);
+  return { areas: knownAreas(all), epics: epicChoices(all), outcomes: outcomes.filter((o) => !o.retired) };
 }
 
 /**
@@ -221,6 +226,53 @@ export class DraftEpicError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DraftEpicError";
+  }
+}
+
+/**
+ * A draft whose outcome doesn't hold up against `.product/PRODUCT.md` — the feature's outcome id
+ * names nothing active there, or a NEW epic's `## Outcome IDs` never mentions it. Same shape as
+ * {@link DraftEpicError}: a question for the founder, not a bd failure, and the route maps it to a
+ * 400.
+ */
+export class DraftOutcomeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftOutcomeError";
+  }
+}
+
+/** Does the epic's free-text `## Outcome IDs` (e.g. `outcome:reports-are-shareable`) name this
+ * outcome id? Split on anything that can't appear inside a label-safe id, so a bare id, a
+ * `outcome:<id>` label form, and a comma/whitespace-separated list of several all match — while a
+ * longer id merely containing this one as a substring does not. */
+function outcomeIdsMention(outcomeIds: string, outcomeId: string): boolean {
+  return outcomeIds.split(/[^A-Za-z0-9._-]+/).includes(outcomeId);
+}
+
+/**
+ * Refuse a draft whose feature outcome id names nothing `.product/PRODUCT.md` currently offers for
+ * new work — a typo, or one marked `(retired)` — or, for a NEW epic, whose `## Outcome IDs` never
+ * mentions that same id. The epic's outcome ids are the outcomes its features add up to serving
+ * (skills/bd/SKILL.md), so a feature naming an outcome its own new epic doesn't list is exactly the
+ * drift the contract exists to catch.
+ *
+ * Read fresh on every commit rather than cached: PRODUCT.md can change between the shape page
+ * rendering and the founder sending the draft, same reason {@link assertEpicEligible} re-reads the
+ * board instead of trusting the picker's snapshot.
+ */
+async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise<void> {
+  const outcomeId = draft.feature.outcomeId.trim();
+  const outcomes = await readProjectOutcomes(project.repoPath);
+  if (!activeOutcomeIds(outcomes).has(outcomeId)) {
+    throw new DraftOutcomeError(
+      `"${outcomeId}" is not an outcome \`.product/PRODUCT.md\` offers for new work — pick one from its \`## Outcomes\` section`,
+    );
+  }
+  if (draft.epic.kind === "new" && !outcomeIdsMention(draft.epic.epic.outcomeIds, outcomeId)) {
+    throw new DraftOutcomeError(
+      `the new epic's Outcome IDs must include "${outcomeId}" — the feature's own outcome is one of the outcomes its epic serves`,
+    );
   }
 }
 
@@ -350,6 +402,7 @@ export async function createDraftFeature(
   // groups it — so every write path below carries it on the FEATURE node alone.
   const labels = [`outcome:${draft.feature.outcomeId.trim()}`];
   assertContract(title, feature, labels);
+  await assertOutcomeUsable(project, draft);
 
   if (target.kind === "new") {
     const epicNode = await draftEpicNode(project, target.epic, EPIC_KEY);

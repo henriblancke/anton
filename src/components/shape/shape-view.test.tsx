@@ -36,7 +36,9 @@ const EPICS = [
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 function renderView() {
-  render(<ShapeView slug="anton" projectName="anton" areas={["reports"]} epics={EPICS} />);
+  render(
+    <ShapeView slug="anton" projectName="anton" areas={["reports"]} epics={EPICS} outcomes={[]} />,
+  );
 }
 
 function sendButton() {
@@ -47,23 +49,27 @@ function typeInto(name: RegExp, value: string) {
   fireEvent.change(screen.getByRole("textbox", { name }), { target: { value } });
 }
 
-/** Area is a datalist input, so it answers to combobox rather than textbox. */
+/** Area and Outcome are both datalist inputs, so they answer to combobox rather than textbox. */
 function areaInput() {
   return screen.getByRole("combobox", { name: /^Area/ }) as HTMLInputElement;
-}
-
-/** The epic picker — the only combobox whose label opens with "Epic" (Area is the other one). */
-function epicSelect() {
-  return screen.getByRole("combobox", { name: /^Epic/ }) as HTMLSelectElement;
 }
 
 /** The feature's outcome id field — "Outcome", not the epic's "Outcome IDs". */
 const FEATURE_OUTCOME_NAME = /^Outcome(?! IDs)/;
 
+function outcomeInput() {
+  return screen.getByRole("combobox", { name: FEATURE_OUTCOME_NAME }) as HTMLInputElement;
+}
+
+/** The epic picker — the only remaining combobox whose label opens with "Epic". */
+function epicSelect() {
+  return screen.getByRole("combobox", { name: /^Epic/ }) as HTMLSelectElement;
+}
+
 /** Fill the feature's sections the seed doesn't cover, so only the epic is left to choose. */
 function fillFeature() {
   typeInto(/^Why/, "Serves outcome:reports-are-shareable.");
-  typeInto(FEATURE_OUTCOME_NAME, "reports-are-shareable");
+  fireEvent.change(outcomeInput(), { target: { value: "reports-are-shareable" } });
   typeInto(/^Acceptance criteria/, "- [ ] every report view has a CSV export button");
   typeInto(/^Context/, "touches: src/app/reports");
   typeInto(/^Out of scope/, "- PDF export");
@@ -274,7 +280,7 @@ describe("ShapeView", () => {
     await startShaping(fetchMock, "Export a report view to CSV");
 
     typeInto(/^Why/, "  Serves outcome:reports-are-shareable.  ");
-    typeInto(FEATURE_OUTCOME_NAME, "  reports-are-shareable  ");
+    fireEvent.change(outcomeInput(), { target: { value: "  reports-are-shareable  " } });
     typeInto(/^Acceptance criteria/, "  - [ ] every report view has a CSV export button  ");
     typeInto(/^Context/, "touches: src/app/reports");
     typeInto(/^Out of scope/, "- PDF export");

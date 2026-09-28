@@ -1,6 +1,7 @@
 "use client";
 
 import type { EpicChoice } from "@/lib/backlog";
+import type { ProjectOutcome } from "@/lib/outcomes";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -30,12 +31,14 @@ export function ShapingDraftPanel({
   draft,
   areas,
   epics,
+  outcomes,
   sending,
   onSend,
 }: {
   draft: ShapeDraft;
   areas: string[];
   epics: EpicChoice[];
+  outcomes: ProjectOutcome[];
   sending: boolean;
   onSend: () => void;
 }) {
@@ -51,7 +54,7 @@ export function ShapingDraftPanel({
         />
       }
     >
-      <DraftFields draft={draft} areas={areas} epics={epics} />
+      <DraftFields draft={draft} areas={areas} epics={epics} outcomes={outcomes} />
     </DraftPanelShell>
   );
 }

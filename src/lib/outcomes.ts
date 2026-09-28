@@ -3,6 +3,9 @@
  * so every consumer — contract gaps, board chips, the shaping formula — agrees on the same id set
  * without each re-parsing the file its own way.
  */
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+
 export interface ProjectOutcome {
   /** Stable id, referenced elsewhere by an `outcome:<id>` label. */
   id: string;
@@ -63,4 +66,30 @@ export function parseOutcomes(markdown: string): ProjectOutcome[] {
     if (outcome) outcomes.set(outcome.id, outcome);
   }
   return [...outcomes.values()];
+}
+
+/** Where a project's outcomes live — read relative to the project's repo root. */
+export function productMdPath(repoPath: string): string {
+  return join(repoPath, ".product", "PRODUCT.md");
+}
+
+/**
+ * Read and parse `repoPath`'s `.product/PRODUCT.md`. Never throws — a project with no PRODUCT.md
+ * yet (or no `## Outcomes` section) resolves to just {@link BUILT_IN_OUTCOME}, same as
+ * {@link parseOutcomes} handed an empty string, so a fresh project is never stuck unable to file
+ * work for want of the file.
+ */
+export async function readProjectOutcomes(repoPath: string): Promise<ProjectOutcome[]> {
+  try {
+    return parseOutcomes(await readFile(productMdPath(repoPath), "utf8"));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return parseOutcomes("");
+    throw err;
+  }
+}
+
+/** The outcome ids new work may point at — retired ones resolve for existing labels but are never
+ * offered here (see {@link ProjectOutcome.retired}). */
+export function activeOutcomeIds(outcomes: ProjectOutcome[]): Set<string> {
+  return new Set(outcomes.filter((o) => !o.retired).map((o) => o.id));
 }
