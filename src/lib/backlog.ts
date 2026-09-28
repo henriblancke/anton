@@ -267,26 +267,31 @@ function outcomeIdsMention(outcomeIds: string, outcomeId: string): boolean {
   return outcomeIdTokens(outcomeIds).includes(outcomeId);
 }
 
-const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\b/i;
+// Exact match, like `sectionHeading` for `Goal`/`Why` in ticket-dialog-utils.ts — a prefix match
+// would also claim `## Outcome IDs and Caveats`, scooping its free text in as the declared ids.
+const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\s*$/i;
 
-/** An existing epic's `## Outcome IDs` body, verbatim, or "" when the section is absent. Free text
- * (unlike Goal/Acceptance, "Outcome IDs" is not a section `validateBeadContract` judges), so a
- * plain heading scan rather than the contract's slugged-heading machinery — same shape as
- * `extractSection` in ticket-dialog-utils.ts. */
-function extractOutcomeIdsSection(description: string): string {
+/** An existing epic's `## Outcome IDs` section: whether the heading is present at all, and its body
+ * verbatim ("" for an absent OR a blank-but-present section — those two are NOT the same case to a
+ * caller, so `present` carries the distinction). Free text (unlike Goal/Acceptance, "Outcome IDs"
+ * is not a section `validateBeadContract` judges), so a plain heading scan rather than the
+ * contract's slugged-heading machinery — same shape as `extractSection` in ticket-dialog-utils.ts. */
+function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
   const lines = description.split("\n");
   const body: string[] = [];
   let inSection = false;
+  let present = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (/^##\s+/.test(trimmed)) {
       if (inSection) break;
       inSection = OUTCOME_IDS_HEADING.test(trimmed);
+      if (inSection) present = true;
       continue;
     }
     if (inSection) body.push(line);
   }
-  return body.join("\n").trim();
+  return { present, body: body.join("\n").trim() };
 }
 
 /**
@@ -413,8 +418,8 @@ async function assertEpicEligible(project: Project, epicId: string, outcomeId: s
   if (!bead) throw new DraftEpicError(`epic ${epicId} is not on the board`);
   const reason = ineligibleReason(bead, all);
   if (reason) throw new DraftEpicError(reason);
-  const outcomeIds = extractOutcomeIdsSection(bead.description ?? "");
-  if (outcomeIds && !outcomeIdsMention(outcomeIds, outcomeId)) {
+  const { present, body } = extractOutcomeIdsSection(bead.description ?? "");
+  if (present && !outcomeIdsMention(body, outcomeId)) {
     throw new DraftOutcomeError(
       `epic ${epicId}'s Outcome IDs don't include "${outcomeId}" — the feature's own outcome must be one of the outcomes its epic serves`,
     );

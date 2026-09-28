@@ -586,6 +586,47 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
   });
 
+  // A present-but-empty section is a declared empty outcome set, not "nothing to contradict" —
+  // unlike the absent-section case above, this must refuse.
+  it("refuses an existing epic whose Outcome IDs section is present but blank", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description: "## Goal\n\ng\n\n## Outcome IDs\n\n",
+      }),
+    );
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // A prefix match would also claim `## Outcome IDs and Caveats` as the contract's own section,
+  // folding its free text in as the declared ids — this must require the exact heading.
+  it("does not mistake `## Outcome IDs and Caveats` for the contract's `## Outcome IDs` section", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description:
+          "## Goal\n\ng\n\n## Outcome IDs and Caveats\n\nsome unrelated free text that mentions nothing",
+      }),
+    );
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
   // The epic's Outcome IDs are the outcomes its features add up to serving — a new epic that omits
   // its own feature's outcome is exactly the drift the review flagged.
   it("refuses a new epic whose Outcome IDs never mention the feature's own outcome", async () => {

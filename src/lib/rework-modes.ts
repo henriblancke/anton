@@ -8,7 +8,7 @@
  * already reads (`humanNotesPromptBlock`, lib/jobs/step-registry.ts) — so the implementer that picks
  * the bead up next is shown the steer without a new prompt seam.
  */
-import { beads, labelValueOf, type Bead } from "./beads/bd";
+import { beads, labelValuesOf, type Bead } from "./beads/bd";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote } from "./beads/notes";
 import { resolveOperator } from "./operator";
@@ -235,6 +235,7 @@ async function resumeFollowUp(
       await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
     }
     await beads.reparent(context.repo, existing.id, "");
+    await tagDetachedOutcome(context, existing);
   }
   if (match.partial) {
     await reconcileHalfCreatedContract(
@@ -313,6 +314,21 @@ async function noteStrandedFollowUp(
 }
 
 /**
+ * Catch a detached follow-up up on the labels a bead created parentless gets from the start
+ * ({@link followUpLabels}) — detaching it here ({@link resumeFollowUp}) makes it a run target of its
+ * own (src/prompts/BEADS.md) just as surely as `createFollowUp` does, and every outcome the target's
+ * own label(s) name comes over, partial or already-finished alike. A bead that already carries a
+ * label (a retried resume) is left alone rather than double-added.
+ */
+async function tagDetachedOutcome(context: FollowUpContext, existing: Bead): Promise<void> {
+  const current = existing.labels ?? [];
+  const missing = labelValuesOf(context.target.labels, "outcome")
+    .map((id) => `outcome:${id}`)
+    .filter((label) => !current.includes(label));
+  if (missing.length > 0) await beads.tag(context.repo, existing.id, missing);
+}
+
+/**
  * Reconcile a half-created follow-up's contract ({@link existingFollowUp}) to the request finishing
  * it. `bd create` froze the FIRST attempt's instructions and findings into the acceptance, and the
  * founder may have edited either before retrying under the same title — the note about to land
@@ -341,7 +357,7 @@ async function reconcileHalfCreatedContract(
     targetId: target.id,
     parentId,
     pipeline,
-    outcomeId: labelValueOf(target.labels, "outcome"),
+    outcomeIds: labelValuesOf(target.labels, "outcome"),
   });
   if (existing.description !== description) {
     await beads.update(repo, existing.id, { description });
@@ -366,7 +382,7 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
   const { repo, target, ticket, request, author, body, pipeline } = context;
   const parentId =
     context.shippedPr === undefined && isBoardCard(target, all) ? target.id : undefined;
-  const outcomeId = labelValueOf(target.labels, "outcome");
+  const outcomeIds = labelValuesOf(target.labels, "outcome");
   const followUpId = await beads.create(repo, {
     title: request.summary,
     type: "task",
@@ -378,9 +394,9 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
       targetId: target.id,
       parentId,
       pipeline,
-      outcomeId,
+      outcomeIds,
     }),
-    labels: followUpLabels(ticket, parentId, outcomeId),
+    labels: followUpLabels(ticket, parentId, outcomeIds),
     ...(parentId ? { deps: [`parent-child:${parentId}`] } : {}),
   });
   // Provenance, and the reason this bead exists at all: `bd link <new> <origin> --type
@@ -512,17 +528,18 @@ export function inheritedLabels(ticket: Bead): string[] {
 }
 
 /**
- * The full label set `createFollowUp` writes: the routing labels the ticket carries over, plus an
+ * The full label set `createFollowUp` writes: the routing labels the ticket carries over, plus every
  * `outcome:<id>` when this bead is being created PARENTLESS — a run target of its own
  * (src/prompts/BEADS.md), which the label convention reserves the tag for. A parented follow-up runs
  * as a ticket of its target's own run and carries no such label, same as any other ticket.
  *
- * `outcomeId` is undefined for a target whose own `outcome:` label predates this feature — nothing
- * to carry over, so the run target is created without one rather than with a fabricated value.
+ * `outcomeIds` is empty for a target whose own `outcome:` label predates this feature — nothing to
+ * carry over, so the run target is created without one rather than with a fabricated value. A
+ * scan-produced target can carry more than one (skills/scan-triage/SKILL.md); all of them come over.
  */
-function followUpLabels(ticket: Bead, parentId: string | undefined, outcomeId: string | undefined): string[] {
+function followUpLabels(ticket: Bead, parentId: string | undefined, outcomeIds: string[]): string[] {
   const labels = inheritedLabels(ticket);
-  return parentId === undefined && outcomeId ? [...labels, `outcome:${outcomeId}`] : labels;
+  return parentId === undefined ? [...labels, ...outcomeIds.map((id) => `outcome:${id}`)] : labels;
 }
 
 /** Stage labels a reopen strips — one still on the bead means this rework's untag hasn't run yet. */

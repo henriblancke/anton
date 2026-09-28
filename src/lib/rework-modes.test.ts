@@ -23,6 +23,7 @@ const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 const noteMock = vi.fn();
 const reopenMock = vi.fn();
 const untagMock = vi.fn();
+const tagMock = vi.fn();
 type CreateOpts = {
   title: string;
   type: string;
@@ -47,6 +48,7 @@ vi.mock("./beads/bd", async () => {
       note: (...args: unknown[]) => noteMock(...args),
       reopen: (...args: unknown[]) => reopenMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      tag: (...args: unknown[]) => tagMock(...args),
       create: (...args: unknown[]) => createMock(...(args as [string, CreateOpts])),
       link: (...args: unknown[]) => linkMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
@@ -197,7 +199,7 @@ function candidate(id: string, over: Partial<Bead> = {}): Bead {
 }
 
 /** Every bd write these modes can make — asserted absent wherever a request must write nothing. */
-const allWrites = [noteMock, reopenMock, untagMock, createMock, linkMock, reparentMock, updateMock];
+const allWrites = [noteMock, reopenMock, untagMock, tagMock, createMock, linkMock, reparentMock, updateMock];
 
 /** The bead a bd call was made on, and when it happened — the seam for asserting write order. */
 function orderOn(mock: ReturnType<typeof vi.fn>, id: string, nth = 0): number {
@@ -384,6 +386,19 @@ describe("applyFollowUp", () => {
     expect(createMock.mock.calls[0]![1].description).toContain(
       "## Why\nServes outcome:reports-are-shareable",
     );
+  });
+
+  // A scan-produced target can carry `outcome:codebase-health` plus a product outcome
+  // (skills/scan-triage/SKILL.md) — dropping either from a parentless follow-up would misreport
+  // which outcomes it serves.
+  it("carries every outcome label the target has when created standing alone", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(solo({ labels }));
+
+    const applied = await applyFollowUp(project, solo({ labels }), solo({ labels }), followUp());
+
+    expect(applied.runsUnderTarget).toBe(false);
+    expect(createMock.mock.calls[0]![1].labels).toEqual(labels);
   });
 
   it("does not label a PARENTED follow-up with an outcome — it is a ticket of the target's run, not a run target itself", async () => {
@@ -596,6 +611,20 @@ describe("applyFollowUp", () => {
     expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(updateMock.mock.invocationCallOrder[0]!);
   });
 
+  // The gap the review flagged (anton-cdeki PR #334): detaching a half-created follow-up makes it a
+  // run target of its own just as surely as `createFollowUp` does, so it must pick up the same
+  // `outcome:` label(s) — every one the target carries, not just the first.
+  it("labels a half-created follow-up with every one of the target's outcomes once a merged PR detaches it", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "half", labels);
+    // After the reparent — the label describes the bead's parentless shape, which the reparent creates.
+    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(tagMock.mock.invocationCallOrder[0]!);
+  });
+
   it("keeps the detachment recorded when the half-created Context rewrite fails after it", async () => {
     board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
     updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
@@ -743,6 +772,30 @@ describe("applyFollowUp", () => {
     // Recorded before the reparent — the record a retry finds the detachment by once the parent
     // edge is gone, and worded so it holds whether or not the reparent lands.
     expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+  });
+
+  // Same gap as the half-created case above, for a follow-up whose creation had already finished
+  // before the target's PR merged out from under it.
+  it("labels a FINISHED follow-up with every one of the target's outcomes once a merged PR detaches it", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("dup"));
+    showsWithNote("dup", followUpBody());
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "dup", labels);
+    expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(tagMock.mock.invocationCallOrder[0]!);
+  });
+
+  // A bead already carrying one of the outcome labels (a retried resume) must not get it re-added.
+  it("does not re-tag an outcome the detached bead already carries", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("dup", { labels: ["outcome:codebase-health"] }));
+    showsWithNote("dup", followUpBody(), { labels: ["outcome:codebase-health"] });
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "dup", ["outcome:reports-are-shareable"]);
   });
 
   it("leaves an already-parentless match alone when the target has shipped — nothing to reconcile", async () => {

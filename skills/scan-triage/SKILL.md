@@ -1,6 +1,6 @@
 ---
 name: scan-triage
-version: 3b563b007d80
+version: b1dd04d2ad9d
 description: >-
   Turn a stringer scan into a small set of well-formed beads, protecting queue quality. Reads
   stringer signal output, dedupes across every automated producer (stringer/gardener/pm
@@ -213,8 +213,14 @@ the founder to place.
      it isn't the right home — file the work per §4.3 instead.
 2. **Nothing fits, but you can name the outcome → create the epic.** State it as an outcome a
    stakeholder would recognise ("Dependencies are current and CVE-free"), not a restatement of the
-   feature ("Upgrade stale deps"). Give it exactly one `area:` label and Success Criteria that
-   several features add up to.
+   feature ("Upgrade stale deps"). Cook the formula's `epic` step same as the feature/ticket cook in
+   §5 — `bd cook anton-bead --mode=runtime --var outcome='…' --var success_criteria='…' --var
+   outcome_ids='outcome:<id>[, outcome:<id>…]' …` — and fill `outcome_ids` with the
+   `.product/PRODUCT.md` id(s) this epic's features add up to serving, the same `## Outcome IDs`
+   contract an existing epic already carries (`src/prompts/BEADS.md`). Give it exactly one `area:`
+   label and Success Criteria that several features add up to. An unfilled `TODO —` in
+   `## Outcome IDs` is as unshaped as an empty Acceptance box on a ticket — never create the epic
+   without it.
 3. **Can't name an outcome you'd defend → don't fake one.** Never mint a one-feature epic to
    silence the question, and never leave a `feature` parentless. File the work instead as a
    parentless `task`/`bug` — a run of one, still a run target — and list it in §6 under
@@ -243,10 +249,11 @@ carries less — a one-line outcome, Success Criteria, and its `area:`:
 
 Cook that shape from the project's bead formula rather than retyping it —
 `bd cook anton-bead --mode=runtime --var goal='…' --var why='…' …`, then create from the cooked
-step for the tier you're creating (`feature` for the cluster, `ticket` for its children). **The
-description carries all six sections and nothing lives in `--acceptance` or `--context`** — the
-`bd` skill has the one command. Fill every var: an unfilled `TODO —` default is not a triaged bead,
-and a fabricated Acceptance box is worse than none.
+step for the tier you're creating (`epic` for a new epic per §4.2, with its `outcome_ids` var
+filled; `feature` for the cluster; `ticket` for its children). **The description carries all six
+sections and nothing lives in `--acceptance` or `--context`** — the `bd` skill has the one command.
+Fill every var: an unfilled `TODO —` default is not a triaged bead, and a fabricated Acceptance box
+is worse than none.
 
 **Every created bead records its routing decision** on its own `## Context`, as one `routed:` line
 directly under `touches:`. Placement is the judgment call in this whole prompt and it runs

@@ -135,9 +135,21 @@ describe("followUpDescription", () => {
   // created parentless, so it must carry `## Why` and — where the target's own label names one —
   // the outcome it serves, not just the five sections the automated contract judge happens to check.
   it("names the run target's own outcome under ## Why when it has one", () => {
-    const description = followUpDescription({ ...args, outcomeId: "reports-are-shareable" });
+    const description = followUpDescription({ ...args, outcomeIds: ["reports-are-shareable"] });
     expect(description).toContain(
       "## Why\nServes outcome:reports-are-shareable, the same outcome t1 served",
+    );
+  });
+
+  // A scan-produced target can carry `outcome:codebase-health` plus a product outcome
+  // (skills/scan-triage/SKILL.md) — dropping either would misreport what this bead carries over.
+  it("names every outcome under ## Why when the target carries more than one", () => {
+    const description = followUpDescription({
+      ...args,
+      outcomeIds: ["codebase-health", "reports-are-shareable"],
+    });
+    expect(description).toContain(
+      "## Why\nServes outcome:codebase-health, outcome:reports-are-shareable, the same outcomes t1 served",
     );
   });
 

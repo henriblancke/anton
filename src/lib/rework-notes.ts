@@ -99,9 +99,11 @@ export interface FollowUpContractArgs {
   targetId: string;
   parentId?: string;
   pipeline?: ReworkPipeline;
-  /** The run target's own `outcome:<id>` label ({@link labelValueOf}, lib/rework-modes.ts) — undefined
-   * for a target that predates outcome ids, same upgrade gap {@link outcomesConfigured} exempts. */
-  outcomeId?: string;
+  /** The run target's own `outcome:<id>` label(s) ({@link labelValuesOf}, lib/rework-modes.ts) —
+   * a scan-produced target can carry more than one (skills/scan-triage/SKILL.md), so this is every
+   * value, not just the first. Empty for a target that predates outcome ids, same upgrade gap
+   * {@link outcomesConfigured} exempts. */
+  outcomeIds?: string[];
 }
 
 /**
@@ -115,13 +117,13 @@ export interface FollowUpContractArgs {
  * request in the founder's own words and order; this section is what "done" means, box by box.
  */
 export function followUpDescription(args: FollowUpContractArgs): string {
-  const { summary, instructions, findings, ticket, targetId, parentId, pipeline, outcomeId } = args;
+  const { summary, instructions, findings, ticket, targetId, parentId, pipeline, outcomeIds } = args;
   return [
     `## Goal`,
     goalBody(summary),
     ``,
     `## Why`,
-    followUpWhy(ticket, outcomeId),
+    followUpWhy(ticket, outcomeIds ?? []),
     ``,
     `## ${ACCEPTANCE_HEADING}`,
     ...followUpAcceptance(instructions, findings),
@@ -611,14 +613,16 @@ function goalBody(summary: string): string {
  * ({@link FeatureDraft.why}, lib/backlog.ts) — it continues work the outcome was already decided
  * for, so it inherits the run target's own answer rather than asking again.
  *
- * `outcomeId` is undefined for a target that predates outcome ids — the same upgrade gap
+ * `outcomeIds` is empty for a target that predates outcome ids — the same upgrade gap
  * {@link outcomesConfigured} exempts a fresh draft from (lib/outcomes.ts). Nothing to carry over
- * there, so the sentence names the origin ticket instead of a label that doesn't exist yet.
+ * there, so the sentence names the origin ticket instead of a label that doesn't exist yet. A
+ * scan-produced target can name more than one outcome (skills/scan-triage/SKILL.md); every one is
+ * named here, not just the first, since dropping one would misreport what this bead carries over.
  */
-function followUpWhy(ticket: Bead, outcomeId: string | undefined): string {
-  return outcomeId
-    ? `Serves outcome:${outcomeId}, the same outcome ${ticket.id} served — this bead carries the ` +
-        `next iteration its self-review prompted.`
+function followUpWhy(ticket: Bead, outcomeIds: string[]): string {
+  return outcomeIds.length > 0
+    ? `Serves ${outcomeIds.map((id) => `outcome:${id}`).join(", ")}, the same outcome${outcomeIds.length > 1 ? "s" : ""} ` +
+        `${ticket.id} served — this bead carries the next iteration its self-review prompted.`
     : `Continues the outcome ${ticket.id} served; that ticket predates \`.product/PRODUCT.md\`'s ` +
         `outcome ids, so none carries over as a label here either.`;
 }
