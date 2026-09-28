@@ -51,6 +51,8 @@ import {
   distanceBehindUpstream,
   hasRemote,
   readPreservedCommitFor,
+  readStashEntries,
+  applyStashEntry,
   readWorktreeState,
   SIGNAL_KILL_BACKOFF_ENV,
   resolveFreshBase,
@@ -5688,5 +5690,133 @@ suite("pushBranch retries only classified-transient failures (real git)", () => 
         expect(existsSync(marker)).toBe(true);
       },
     );
+  });
+});
+
+/**
+ * anton-wjfkn: `git stash` leaves a tree byte-identical to one nothing touched, so the delivery gate
+ * needs a read that tells the two apart — and a restore that can never lose what it finds. These two
+ * are that seam, against real git.
+ */
+suite("readStashEntries / applyStashEntry (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const read = (name: string) => readFileSync(join(repo, name), "utf8");
+  const porcelain = () =>
+    execFileSync("git", ["-C", repo, "status", "--porcelain"], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-stash-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "tracked.md"), "base\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true });
+  });
+
+  it("reads nothing from a repository that has never stashed", async () => {
+    expect(await readStashEntries(repo)).toEqual([]);
+  });
+
+  it("reads each entry's sha and subject, newest first", async () => {
+    writeFileSync(join(repo, "tracked.md"), "first change\n");
+    g(["stash", "push", "-u", "-q", "-m", "oldest"]);
+    writeFileSync(join(repo, "tracked.md"), "second change\n");
+    g(["stash", "push", "-u", "-q", "-m", "newest"]);
+
+    const entries = await readStashEntries(repo);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].subject).toContain("newest");
+    expect(entries[1].subject).toContain("oldest");
+    for (const entry of entries) expect(entry.sha).toMatch(/^[0-9a-f]{40}$/);
+    // Distinct commits, so a caller diffing two reads by sha can tell one entry from another.
+    expect(entries[0].sha).not.toBe(entries[1].sha);
+  });
+
+  // The whole point: the agent's `git stash -u` takes the modification AND the new file, and the
+  // restore has to bring back both or the "recovered" tree is a partial one.
+  it("applies a `-u` entry back into the tree — tracked edits and untracked files alike", async () => {
+    writeFileSync(join(repo, "tracked.md"), "edited by the agent\n");
+    writeFileSync(join(repo, "new.md"), "written by the agent\n");
+    g(["stash", "push", "-u", "-q", "-m", "the agent's work"]);
+    expect(porcelain()).toBe("");
+    expect(read("tracked.md")).toBe("base\n");
+
+    const [entry] = await readStashEntries(repo);
+    expect(await applyStashEntry(repo, entry.sha)).toBe(true);
+
+    expect(read("tracked.md")).toBe("edited by the agent\n");
+    expect(read("new.md")).toBe("written by the agent\n");
+  });
+
+  /**
+   * The entry is deliberately KEPT after a successful apply: the restored copy is uncommitted and
+   * lives only in a worktree a later teardown may remove, which would leave the stash commit as the
+   * sole surviving copy — so dropping it eagerly is how the recovery loses the very work it saved.
+   */
+  it("leaves the entry on the stack, so the durable copy outlives the worktree", async () => {
+    writeFileSync(join(repo, "tracked.md"), "the agent's work\n");
+    g(["stash", "push", "-u", "-q", "-m", "keep me"]);
+    const [entry] = await readStashEntries(repo);
+
+    expect(await applyStashEntry(repo, entry.sha)).toBe(true);
+
+    expect((await readStashEntries(repo)).map((e) => e.sha)).toEqual([entry.sha]);
+  });
+
+  /**
+   * `pop` would take `stash@{0}` — and on a machine running tickets in parallel worktrees off ONE
+   * shared `refs/stash`, that entry can be a sibling run's. Applying by sha is what keeps a recovery
+   * from moving a neighbour's changes into this tree.
+   */
+  it("applies the named entry, never whichever one happens to sit at the top", async () => {
+    writeFileSync(join(repo, "ours.md"), "this ticket's work\n");
+    g(["stash", "push", "-u", "-q", "-m", "ours"]);
+    const [ours] = await readStashEntries(repo);
+    // A concurrent worktree pushes onto the same stack, landing above ours.
+    writeFileSync(join(repo, "theirs.md"), "a sibling run's work\n");
+    g(["stash", "push", "-u", "-q", "-m", "theirs"]);
+
+    expect(await applyStashEntry(repo, ours.sha)).toBe(true);
+
+    expect(existsSync(join(repo, "ours.md"))).toBe(true);
+    expect(existsSync(join(repo, "theirs.md"))).toBe(false);
+  });
+
+  it("reports a failed apply rather than throwing, leaving the entry on the stack", async () => {
+    writeFileSync(join(repo, "tracked.md"), "the agent's edit\n");
+    g(["stash", "push", "-u", "-q", "-m", "conflicting"]);
+    const [entry] = await readStashEntries(repo);
+    // The tree moves under the entry, so applying it conflicts.
+    writeFileSync(join(repo, "tracked.md"), "someone else's edit\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "a conflicting commit"]);
+
+    expect(await applyStashEntry(repo, entry.sha)).toBe(false);
+    expect((await readStashEntries(repo)).map((e) => e.sha)).toEqual([entry.sha]);
+  });
+
+  it("reports a sha that names no stash entry as a failed apply", async () => {
+    expect(await applyStashEntry(repo, "0".repeat(40))).toBe(false);
+  });
+
+  /**
+   * anton-wjfkn round 3 review: a swallowed failure here reads identically to "never stashed", and the
+   * ticket baseline this feeds cannot tell the two apart. A caller that treated an unreadable baseline
+   * as an empty one would then misattribute a PRE-EXISTING stash entry as gained during the ticket and
+   * splice it into the worktree — so the read must propagate a genuine failure rather than manufacture
+   * `[]` for it.
+   */
+  it("propagates a failed read rather than reporting it as an empty stash list", async () => {
+    await expect(readStashEntries(join(sandbox, "not-a-repo"))).rejects.toThrow();
   });
 });

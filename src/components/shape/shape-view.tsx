@@ -1,6 +1,7 @@
 "use client";
 
 import type { EpicChoice } from "@/lib/backlog";
+import type { ProjectOutcome } from "@/lib/outcomes";
 
 import { IdleDraftPanel, ShapingDraftPanel } from "./shape-draft-panel";
 import { SessionPane } from "./shape-session-pane";
@@ -22,6 +23,7 @@ export function ShapeView({
   projectName,
   areas,
   epics,
+  outcomes,
 }: {
   slug: string;
   projectName: string;
@@ -29,6 +31,8 @@ export function ShapeView({
   areas: string[];
   /** The live epics the draft feature may attach to. */
   epics: EpicChoice[];
+  /** The outcomes `.product/PRODUCT.md` currently offers for new work. */
+  outcomes: ProjectOutcome[];
 }) {
   const draft = useShapeDraft();
   const backlog = useSendToBacklog(slug);
@@ -56,6 +60,7 @@ export function ShapeView({
             draft={draft}
             areas={areas}
             epics={epics}
+            outcomes={outcomes}
             sending={backlog.sending}
             onSend={() => backlog.send(sessionId, draft.fields)}
           />

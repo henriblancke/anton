@@ -10,6 +10,7 @@ import {
   resolutionOf,
   runToastMessage,
   stripContractSections,
+  wouldClearWhy,
   type TicketDraft,
 } from "@/components/ticket/ticket-dialog-utils";
 import { parseAcceptance, parseGoal } from "@/lib/tickets";
@@ -59,12 +60,13 @@ describe("draftFromDetail", () => {
       risk: "",
       size: "",
       goal: "",
+      why: "",
       acceptance: "",
       body: "",
     });
   });
 
-  it("splits the contract into goal / acceptance / body, keeping the rest in body", () => {
+  it("splits the contract into goal / why / acceptance / body, keeping the rest in body", () => {
     const draft = draftFromDetail({
       id: "x",
       title: "t",
@@ -74,11 +76,78 @@ describe("draftFromDetail", () => {
       ...meta,
       goal: "Ship the widget",
       acceptance: "- [ ] It renders",
-      description: "## Goal\n\nShip the widget\n\n## Acceptance\n\n- [ ] It renders\n\n## Verify\n\nRun the tests",
+      description:
+        "## Goal\n\nShip the widget\n\n## Why\n\nServes the reports outcome\n\n## Acceptance\n\n- [ ] It renders\n\n## Verify\n\nRun the tests",
     });
     expect(draft.goal).toBe("Ship the widget");
+    expect(draft.why).toBe("Serves the reports outcome");
     expect(draft.acceptance).toBe("- [ ] It renders");
     expect(draft.body).toBe("## Verify\n\nRun the tests");
+  });
+
+  // The gap the review flagged (anton-cdeki PR #334): a fenced example containing a line that
+  // merely reads `## Why` is not a rendered heading, so it must stay in `body` untouched rather
+  // than being sliced out into the `why` field (and mangled — the fence would end up unmatched).
+  it("leaves a fenced example's `## Why` line alone — it is body text, not a section boundary", () => {
+    const example = ["```", "## Why", "not a real heading — just an example inside a fence", "```"].join("\n");
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description: `## Goal\n\nDo it\n\n## Why\n\nServes the outcome\n\n## Context\n\n${example}`,
+    });
+    expect(draft.why).toBe("Serves the outcome");
+    expect(draft.body).toBe(`## Context\n\n${example}`);
+  });
+
+  it("leaves a `## Why now` / `## Why this approach` section in body, not the `why` field", () => {
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description: "## Goal\n\nDo it\n\n## Why now\n\nNot the contract field",
+    });
+    expect(draft.why).toBe("");
+    expect(draft.body).toBe("## Why now\n\nNot the contract field");
+  });
+
+  // anton-cdeki PR #334 review: a ticket with more than one authored `## Why` used to lose every
+  // occurrence past the first — `stripContractSections` stripped them all from `body`, but the old
+  // `extractSection` stopped reading at the first following heading, so only the first copy
+  // survived into the draft and saving any other field silently deleted the rest.
+  it("aggregates repeated `## Why` sections, matching how stripContractSections drops all of them", () => {
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description:
+        "## Goal\n\nDo it\n\n## Why\n\nServes outcome A\n\n## Context\n\nsome context\n\n## Why\n\nAlso serves outcome B",
+    });
+    expect(draft.why).toBe("Serves outcome A\n\nAlso serves outcome B");
+    expect(draft.body).toBe("## Context\n\nsome context");
+  });
+
+  it("stops `## Why` at a shallower heading, leaving it and everything after it in body", () => {
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description: "## Goal\n\nDo it\n\n## Why\n\nServes the outcome\n\n# Notes\n\nUnrelated section",
+    });
+    expect(draft.why).toBe("Serves the outcome");
+    expect(draft.body).toBe("# Notes\n\nUnrelated section");
   });
 
   it("falls back to the acceptance field when the description has no ## Acceptance section", () => {
@@ -124,6 +193,29 @@ describe("stripContractSections", () => {
     expect(composed).toContain("## Acceptance Criteria\n\n- [ ] a");
     expect(stripContractSections(composed)).toBe(draft.body);
     expect(composeDescription({ ...draft, body: stripContractSections(composed) })).toBe(composed);
+  });
+
+  it("also removes a `## Why` block, so it never survives into body", () => {
+    const desc = "## Goal\n\ng\n\n## Why\n\nserves the outcome\n\n## Acceptance\n\na\n\n## Context\n\nc";
+    expect(stripContractSections(desc)).toBe("## Context\n\nc");
+  });
+
+  it("does not mistake a `## Why now` / `## Why this approach` section for the contract's `## Why`", () => {
+    const desc = "## Goal\n\ng\n\n## Why now\n\nnot the contract field\n\n## Acceptance\n\na";
+    expect(stripContractSections(desc)).toBe("## Why now\n\nnot the contract field");
+  });
+
+  it("stops `## Why` at a shallower heading rather than absorbing it into the stripped body", () => {
+    const desc = "## Goal\n\ng\n\n## Why\n\nserves the outcome\n\n# Notes\n\nunrelated section";
+    expect(stripContractSections(desc)).toBe("# Notes\n\nunrelated section");
+  });
+
+  it("does not mistake a fenced example's `## Goal` / `## Why` / `## Acceptance` lines for real headings", () => {
+    const example = ["```", "## Goal", "## Why", "## Acceptance", "not real headings — a fenced example", "```"].join(
+      "\n",
+    );
+    const desc = `## Goal\n\ng\n\n## Context\n\n${example}`;
+    expect(stripContractSections(desc)).toBe(`## Context\n\n${example}`);
   });
 });
 
@@ -198,6 +290,36 @@ describe("contract editing", () => {
   it("round-trips an edited goal so parseGoal reads the new text", () => {
     const patch = diffTicketPatch(original, { ...original, goal: "Brand new goal" });
     expect(parseGoal(asBead({ description: patch.description }))).toBe("Brand new goal");
+  });
+
+  it("keeps Why ahead of Acceptance when an unrelated contract field is edited", () => {
+    // A ticket carrying `## Why` (anton-n60zq) has it seeded into its own draft field, not folded
+    // into `body` — otherwise editing just the goal would recompose Goal + Acceptance + body and
+    // push Why after Acceptance, violating the contract's own section order.
+    const withWhy = draftFromDetail({
+      ...contractDetail,
+      description:
+        "## Goal\n\nOld goal\n\n## Why\n\nServes the reports outcome\n\n## Acceptance\n\n- [ ] old item\n\n## Verify\n\ntests",
+    });
+    expect(withWhy.why).toBe("Serves the reports outcome");
+
+    const patch = diffTicketPatch(withWhy, { ...withWhy, goal: "Brand new goal" });
+    const description = patch.description ?? "";
+    expect(description.indexOf("## Why")).toBeGreaterThan(-1);
+    expect(description.indexOf("## Why")).toBeLessThan(description.indexOf("## Acceptance Criteria"));
+    expect(description).toContain("## Why\n\nServes the reports outcome");
+  });
+
+  it("flags clearing a Why the ticket already carries, but not editing or never having had one", () => {
+    const withWhy = draftFromDetail({
+      ...contractDetail,
+      description: "## Goal\n\ng\n\n## Why\n\nServes the reports outcome\n\n## Acceptance\n\n- [ ] a",
+    });
+    expect(wouldClearWhy(withWhy, { ...withWhy, why: "" })).toBe(true);
+    expect(wouldClearWhy(withWhy, { ...withWhy, why: "Still serves it, reworded" })).toBe(false);
+    expect(wouldClearWhy(withWhy, { ...withWhy, goal: "New goal" })).toBe(false);
+    // No Why to begin with — an empty draft field is not a regression.
+    expect(wouldClearWhy(original, { ...original, why: "" })).toBe(false);
   });
 
   it("round-trips an edited acceptance so parseAcceptance (section-first) reads the new text", () => {

@@ -132,6 +132,7 @@ function renderView(
       earned={earned}
       pickerEarned={pickerEarned}
       quotaProjects={QUOTA_PROJECTS}
+      decisionPoints={[]}
     />,
   );
 }

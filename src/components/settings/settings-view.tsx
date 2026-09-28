@@ -14,6 +14,10 @@ import { AgentsSection } from "@/components/settings/sections/agents-section";
 import { AutomationSection } from "@/components/settings/sections/automation-section";
 import { AutopilotSection } from "@/components/settings/sections/autopilot-section";
 import { DangerSection } from "@/components/settings/sections/danger-section";
+import {
+  DecisionPointsSection,
+  type DecisionPointRow,
+} from "@/components/settings/sections/decision-points-section";
 import { DescribeSection } from "@/components/settings/sections/describe-section";
 import { ExecutionSection } from "@/components/settings/sections/execution-section";
 import { GatesSection } from "@/components/settings/sections/gates-section";
@@ -65,6 +69,7 @@ export function SettingsView({
   earned,
   pickerEarned,
   quotaProjects,
+  decisionPoints,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -132,6 +137,12 @@ export function SettingsView({
    * other shares, and the split has to redraw as this project's own share is edited.
    */
   quotaProjects: QuotaShareProject[];
+  /**
+   * Every registered decide() point (anton-xky9e), its mode on this project, and its measured
+   * agreement — computed on the server, since `listPoints()` only sees points a job step's own
+   * module has registered, which a client bundle never imports.
+   */
+  decisionPoints: DecisionPointRow[];
 }) {
   // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
   // lands where it says it will, a reload returns to the same place, and a link points at a section
@@ -181,6 +192,7 @@ export function SettingsView({
     autopilot: <AutopilotSection form={form} />,
     value: <ValueSection form={form} labelVocabulary={labelVocabulary} />,
     repairs: <RepairsSection form={form} projectSlug={project.slug} />,
+    decide: <DecisionPointsSection slug={project.slug} points={decisionPoints} />,
     gates: <GatesSection form={form} />,
     review: <ReviewSection form={form} agents={agents} />,
     describe: <DescribeSection form={form} />,

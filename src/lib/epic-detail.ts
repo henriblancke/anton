@@ -49,7 +49,10 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
   // Either way, pipeline plumbing is not a member: `runTickets` refuses it, and the one-hop read
   // must too — a poured molecule or a gate hung under a container epic is coordination, not a
   // deliverable this page may count (anton-ve2r).
-  const childBeads = beads.isRunTarget(lite, all)
+  // Hoisted rather than asked twice: it also decides whether this target HAS a ledger
+  // (`hasLedgerScope` gates the same way), and the page must not offer a link that would 404.
+  const runTarget = beads.isRunTarget(lite, all);
+  const childBeads = runTarget
     ? runTickets(all, epicId)
     : all.filter((b) => beads.parentOf(b) === epicId && !isPipelineArtifact(b));
 
@@ -69,7 +72,15 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     });
     attachPrUrl(epic, base);
     attachPrUrl(self, base);
-    return { epic, description: full.description, tickets: [self], edges: [], run, parentEpic };
+    return {
+      epic,
+      description: full.description,
+      tickets: [self],
+      edges: [],
+      run,
+      parentEpic,
+      runTarget,
+    };
   }
 
   const tickets = childBeads.map((bead) => toTicket(bead));
@@ -102,7 +113,7 @@ export async function getEpicDetail(project: Project, epicId: string): Promise<E
     edges.push({ from: e.from, to: e.to, type: e.type });
   }
 
-  return { epic, description: full.description, tickets, edges, run, parentEpic };
+  return { epic, description: full.description, tickets, edges, run, parentEpic, runTarget };
 }
 
 /**

@@ -7,7 +7,7 @@
  * turns a prompt into fake content) reddens this suite rather than quietly reintroducing the
  * unshaped beads the board then has to flag.
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ACCEPTANCE_HEADING, validateBeadContract } from "./contract";
 import {
   BEAD_FORMULA_FILENAME,
+  beadSkeleton,
   bundledBeadFormulaPath,
   loadBeadFormula,
   parseBeadFormula,
@@ -230,6 +231,52 @@ describe("interpolation", () => {
     ).toThrow(/the `epic` template never references \{\{outcome\}\}/);
   });
 
+  // `why` (feature/ticket) and `outcome_ids` (epic) are CONTRACT vars too (TIER_CONTRACT_VARS):
+  // a hand-edited formula that drops either placeholder while a caller still supplies it must
+  // fail loud here, the same way an unreferenced `{{outcome}}` does above — silently dropping the
+  // founder's answer to "which outcome does this serve" is the exact false green this guard exists
+  // to prevent, for these vars as much as for Goal or Acceptance.
+  it("fails loud when the feature/ticket template never references a supplied `why`", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: {},
+      steps: [
+        { id: "epic", description: "e" },
+        { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "feature", {
+        goal: "Ship it.",
+        why: "Serves outcome:reports-are-shareable.",
+        acceptance: "- [ ] ok",
+      }),
+    ).toThrow(/the `feature` template never references \{\{why\}\}/);
+  });
+
+  it("fails loud when the epic template never references a supplied `outcome_ids`", () => {
+    const doc = JSON.stringify({
+      formula: "anton-bead",
+      vars: { success_criteria: { default: "- [ ] TODO — stub" } },
+      steps: [
+        {
+          id: "epic",
+          description: "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}",
+        },
+        { id: "feature", description: "f" },
+        { id: "ticket", description: "t" },
+      ],
+    });
+    expect(() =>
+      renderBeadSkeleton(parseBeadFormula(doc, "test"), "epic", {
+        outcome: "Reports leave the app.",
+        success_criteria: "- [ ] every report exports",
+        outcome_ids: "outcome:reports-are-shareable",
+      }),
+    ).toThrow(/the `epic` template never references \{\{outcome_ids\}\}/);
+  });
+
   it("does not count a var referenced only in the step title — the skeleton never emits it", () => {
     // `renderBeadSkeleton` renders description + mirrored acceptance only; the Add-work commit uses
     // the draft's own title. A `{{outcome}}` living solely in `step.title` is still discarded.
@@ -375,6 +422,110 @@ describe("resolution", () => {
       renderBeadSkeleton(await loadBeadFormula(repo), "ticket", { acceptance: "- [ ] ok" })
         .description,
     ).toBe("PROJECT LOCAL");
+  });
+});
+
+// `anton update` refreshes the runtime binary but never touches a registered project's own
+// formula copy — only re-running `anton init <repo>` does. A project's copy written before a
+// newer contract var existed (here: `why`) would otherwise 500 on every submission that supplies
+// it, forever, until an operator notices (PR #334 review). `beadSkeleton` self-heals instead.
+describe("beadSkeleton self-heals a stale project-local formula (PR #334 review)", () => {
+  it("resyncs from the bundled asset and retries when a newer contract var would be discarded", async () => {
+    const repo = repoWithFormula(
+      JSON.stringify({
+        formula: "anton-bead",
+        vars: {},
+        steps: [
+          { id: "epic", description: "e" },
+          { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+          {
+            id: "ticket",
+            type: "task",
+            description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}",
+          },
+        ],
+      }),
+    );
+    const skeleton = await beadSkeleton(repo, "feature", {
+      goal: "Ship it.",
+      why: "Serves outcome:reports-are-shareable.",
+      acceptance: "- [ ] ok",
+      context: "touches: x",
+      out_of_scope: "- nothing else",
+      verify: "unit tests",
+    });
+    // The bundled template (which references {{why}}) rendered the resynced formula, not the
+    // stale local one that would have discarded it.
+    expect(skeleton.description).toContain("Serves outcome:reports-are-shareable.");
+    // The stale copy was backed up, same as `anton init` — the self-heal is a real resync, not a
+    // one-off in-memory fallback that leaves the project's copy stale on disk.
+    expect(existsSync(`${projectBeadFormulaPath(repo)}.bak`)).toBe(true);
+  });
+
+  it("still fails loud when the resync itself cannot go through", async () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    const outside = join(repo, "outside-formula.json");
+    writeFileSync(
+      outside,
+      JSON.stringify({
+        formula: "anton-bead",
+        vars: {},
+        steps: [
+          { id: "epic", description: "e" },
+          { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+          {
+            id: "ticket",
+            type: "task",
+            description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}",
+          },
+        ],
+      }),
+    );
+    // A symlinked formula file is exactly what `ensureBeadFormula` refuses to write through
+    // (config.test.ts), so the resync reports "unsafe-dest" rather than "replaced" — the original
+    // discarded-var error must propagate instead of being swallowed by a resync that never happened.
+    symlinkSync(outside, projectBeadFormulaPath(repo));
+    await expect(
+      beadSkeleton(repo, "feature", {
+        goal: "Ship it.",
+        why: "Serves outcome:reports-are-shareable.",
+        acceptance: "- [ ] ok",
+      }),
+    ).rejects.toThrow(/never references \{\{why\}\}/);
+  });
+
+  it("refuses to resync when .gitignore can't be guarded first, instead of leaving a committable .bak", async () => {
+    const repo = repoWithFormula(
+      JSON.stringify({
+        formula: "anton-bead",
+        vars: {},
+        steps: [
+          { id: "epic", description: "e" },
+          { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+          {
+            id: "ticket",
+            type: "task",
+            description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}",
+          },
+        ],
+      }),
+    );
+    // Same class of refusal `ensureBeadFormula` guards against (a symlinked destination) — here
+    // aimed at `.beads/.gitignore` so `formulas/*.bak` can never be added before the resync writes
+    // the backup a `git add -A` could otherwise commit.
+    const outsideGitignore = join(repo, "outside.gitignore");
+    writeFileSync(outsideGitignore, "");
+    symlinkSync(outsideGitignore, join(repo, ".beads", ".gitignore"));
+    await expect(
+      beadSkeleton(repo, "feature", {
+        goal: "Ship it.",
+        why: "Serves outcome:reports-are-shareable.",
+        acceptance: "- [ ] ok",
+      }),
+    ).rejects.toThrow(/never references \{\{why\}\}/);
+    // Refused before the formula was ever touched — no stray backup left on disk.
+    expect(existsSync(`${projectBeadFormulaPath(repo)}.bak`)).toBe(false);
   });
 });
 

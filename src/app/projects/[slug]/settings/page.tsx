@@ -3,8 +3,11 @@ import { notFound } from "next/navigation";
 import {
   getProjectBySlug,
   getProjectSettingsBySlug,
+  resolveDecisionMode,
   resolvePickerApplyOverride,
 } from "@/lib/projects";
+import { listPoints } from "@/lib/decide/points";
+import { latestAgreement } from "@/lib/decide/log";
 import { allIssues } from "@/lib/beads/issues";
 import { cycleEvidenceFor } from "@/lib/beads/cycle-evidence";
 import { boardLabelVocabulary } from "@/lib/beads/labels";
@@ -27,6 +30,7 @@ import { quotaMeterKey } from "@/lib/quota-meter";
 import type { QuotaShareProject } from "@/lib/quota-share";
 import { SettingsView } from "@/components/settings/settings-view";
 import type { EarnedPicker } from "@/components/settings/sections/picker-autonomy-section";
+import type { DecisionPointRow } from "@/components/settings/sections/decision-points-section";
 
 export const dynamic = "force-dynamic";
 
@@ -129,6 +133,30 @@ export default async function ProjectSettingsPage({
     ...(picker.earned.reason ? { reason: picker.earned.reason } : {}),
   };
 
+  // Every decide() point this build has registered (anton-xky9e), this project's own mode for it,
+  // and its measured agreement — a fold over the decisions table, read per point rather than in bulk
+  // since the table's one index is keyed by point (schema.ts). A read that fails locks nothing: it
+  // just reports the point as never having settled anything yet, the same as a point nobody has
+  // called.
+  const decisionPoints: DecisionPointRow[] = await Promise.all(
+    listPoints().map(async (point) => {
+      const { agreed, settled } = await latestAgreement(point.id, project.id).catch(() => ({
+        point: point.id,
+        settled: 0,
+        agreed: 0,
+      }));
+      return {
+        id: point.id,
+        questionKind: point.question.kind,
+        consequence: point.consequence,
+        defaultMode: point.defaultMode,
+        mode: resolveDecisionMode(settings, point),
+        settled,
+        agreed,
+      };
+    }),
+  );
+
   // Every project's position in the quota split (R6) — declared share, live eligibility and what
   // this week attributed to it. Cross-project because a share only reads against the others.
   // Fail-soft to THIS project's own row rather than to nothing: an empty list would take the share
@@ -173,6 +201,7 @@ export default async function ProjectSettingsPage({
       earned={earned}
       pickerEarned={pickerEarned}
       quotaProjects={quotaProjects}
+      decisionPoints={decisionPoints}
     />
   );
 }

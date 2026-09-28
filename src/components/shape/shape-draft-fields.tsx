@@ -1,6 +1,7 @@
 "use client";
 
 import type { EpicChoice } from "@/lib/backlog";
+import type { ProjectOutcome } from "@/lib/outcomes";
 import { cn } from "@/lib/utils";
 
 import { NEW_EPIC } from "./shape-draft";
@@ -17,12 +18,16 @@ export function DraftFields({
   draft,
   areas,
   epics,
+  outcomes,
 }: {
   draft: ShapeDraft;
   areas: string[];
   epics: EpicChoice[];
+  /** The outcomes `.product/PRODUCT.md` currently offers for new work — suggested so a typo'd id
+   * gets caught here rather than surviving to the submit-time check. */
+  outcomes: ProjectOutcome[];
 }) {
-  const { fields, setFeatureField } = draft;
+  const { fields, setFeatureField, outcomeIdValid } = draft;
   return (
     <>
       <EpicSection draft={draft} areas={areas} epics={epics} />
@@ -40,6 +45,35 @@ export function DraftFields({
           onChange={(v) => setFeatureField("goal", v)}
           placeholder="One sentence: what this delivers, and why it matters."
         />
+        <DraftTextarea
+          label="Why"
+          value={fields.feature.why}
+          onChange={(v) => setFeatureField("why", v)}
+          placeholder="Which outcome does this serve, and how?"
+          hint="The forcing question behind the outcome: label — set them together."
+        />
+        <DraftInput
+          label="Outcome"
+          value={fields.feature.outcomeId}
+          onChange={(v) => setFeatureField("outcomeId", v)}
+          placeholder="reports-are-shareable"
+          list="shape-outcomes"
+          invalid={!outcomeIdValid}
+          hint={
+            outcomeIdValid
+              ? "The `.product/PRODUCT.md` outcome id this feature serves — becomes its `outcome:<id>` label."
+              : "Letters, digits, . _ - only — it becomes the label outcome:<value>."
+          }
+        />
+        {/* Outcome ids already offered by `.product/PRODUCT.md` — suggested so a typo surfaces here
+            rather than surviving to the submit-time check. */}
+        <datalist id="shape-outcomes">
+          {outcomes.map((o) => (
+            <option key={o.id} value={o.id}>
+              {o.summary}
+            </option>
+          ))}
+        </datalist>
         <DraftTextarea
           label="Acceptance criteria"
           value={fields.feature.acceptance}
@@ -145,6 +179,13 @@ function EpicSection({
             onChange={(v) => setEpicField("successCriteria", v)}
             placeholder={"- [ ] the observable state that means this outcome is reached"}
             hint="What several features add up to — not this PR's checklist."
+          />
+          <DraftInput
+            label="Outcome IDs"
+            value={fields.epic.outcomeIds}
+            onChange={(v) => setEpicField("outcomeIds", v)}
+            placeholder="outcome:reports-are-shareable"
+            hint="Which `.product/PRODUCT.md` outcome id(s) this epic's features serve."
           />
           <DraftInput
             label="Area"

@@ -32,8 +32,12 @@ import {
   createDraftFeature,
   DraftContractError,
   DraftEpicError,
+  DraftOutcomeError,
   epicChoices,
+  extractOutcomeIdsSection,
   knownAreas,
+  outcomeIdsOf,
+  outcomeIdTokens,
 } from "./backlog";
 import { validateBeadContract } from "./beads/contract";
 import { projectBeadFormulaPath } from "./beads/formula";
@@ -44,9 +48,34 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** A project whose repo has no `.beads/formulas/` — so it resolves anton's bundled asset. */
+/** A project whose repo has no `.beads/formulas/` — so it resolves anton's bundled asset. Its
+ * `.product/PRODUCT.md` carries the one outcome the fixtures below point at, so the outcome-id
+ * check {@link createDraftFeature} runs doesn't refuse every other test in this file. */
 function tempProject(): Project {
   const repoPath = mkdtempSync(join(tmpdir(), "anton-backlog-"));
+  temps.push(repoPath);
+  mkdirSync(join(repoPath, ".product"), { recursive: true });
+  writeFileSync(
+    join(repoPath, ".product", "PRODUCT.md"),
+    "## Outcomes\n\n- `reports-are-shareable` — Every report view leaves the app in a format a customer can open.\n",
+  );
+  return {
+    id: "p",
+    slug: "p",
+    name: "p",
+    repoPath,
+    defaultBranch: "main",
+    hasBeads: true,
+    createdAt: 0,
+  };
+}
+
+/** A project whose `.product/PRODUCT.md` has no `## Outcomes` section at all — an upgraded project
+ * that predates outcome ids (anton-cdeki), not one that deliberately offers only the built-in
+ * outcome. The outcome-id check should let this project's drafts through unvalidated rather than
+ * refuse every id but `codebase-health` forever. */
+function unconfiguredProject(): Project {
+  const repoPath = mkdtempSync(join(tmpdir(), "anton-backlog-unconfigured-"));
   temps.push(repoPath);
   return {
     id: "p",
@@ -64,11 +93,14 @@ const EPIC = {
   goal: "Every report view leaves the app in a format a customer can open.",
   successCriteria: "- [ ] every report view exports to CSV and PDF",
   area: "reports",
+  outcomeIds: "outcome:reports-are-shareable",
 };
 
 const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
+  why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
+  outcomeId: "reports-are-shareable",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow the pattern in src/lib/export.ts",
   outOfScope: "- PDF export, which is its own feature",
@@ -114,6 +146,125 @@ function graphLands() {
   });
 }
 
+describe("extractOutcomeIdsSection", () => {
+  it("stops at a following H2, not just consuming to the end of the description", () => {
+    const { present, body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\noutcome:a\n\n## Notes\n\nsome unrelated prose",
+    );
+    expect(present).toBe(true);
+    expect(body).toBe("outcome:a");
+  });
+
+  // A depth-2-only check let a `#` heading placed after `## Outcome IDs` fall through as ordinary
+  // body text instead of ending the section — outcomeIdTokens then tokenized the heading and the
+  // prose below it as declared ids.
+  it("stops at a following H1 too, not just another H2", () => {
+    const { present, body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\noutcome:a\n\n# Unrelated top-level section\n\nsome unrelated prose",
+    );
+    expect(present).toBe(true);
+    expect(body).toBe("outcome:a");
+  });
+
+  // anton-cdeki PR #334 review: an epic whose `## Outcome IDs` is authored twice used to only ever
+  // read the first occurrence — assertEpicEligible then rejected a feature whose outcome was
+  // declared solely in the later section, and outcomeIdsOf silently dropped those ids too.
+  it("collects every `## Outcome IDs` occurrence, not just the first", () => {
+    const { present, body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\noutcome:a\n\n## Notes\n\nsome unrelated prose\n\n## Outcome IDs\n\noutcome:b",
+    );
+    expect(present).toBe(true);
+    expect(body).toBe("outcome:a\n\noutcome:b");
+    expect(outcomeIdTokens(body)).toEqual(["a", "b"]);
+  });
+
+  // PR #334 review: a manually authored or legacy epic pairing an id with explanatory prose on the
+  // same line used to have every whitespace-separated word treated as its own declared token —
+  // `outcome:trustworthy-board — primary outcome` split into `trustworthy-board`, `—`, `primary`,
+  // `outcome`. Splitting only on comma/newline keeps that whole line as one token instead (still
+  // returned raw here — a caller like `assertOutcomeUsable` needs the raw token to name it in an
+  // error; `outcomeIdsOf` below is where malformed tokens are actually dropped).
+  it("keeps explanatory prose sharing a line with a declared id as one raw token, not several", () => {
+    expect(outcomeIdTokens("outcome:trustworthy-board — primary outcome")).toEqual([
+      "trustworthy-board — primary outcome",
+    ]);
+  });
+
+  it("still splits a genuine comma-separated list on the same line", () => {
+    expect(outcomeIdTokens("outcome:a, outcome:b")).toEqual(["a", "b"]);
+  });
+
+  // PR #334 review: a genuine `## Outcome IDs` section may still contain a fenced or commented
+  // example line — it must not be copied into the section body, or outcomeIdTokens treats the
+  // example as a real declared id.
+  it("excludes a fenced example line from the section body", () => {
+    const { body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\n```\noutcome:example-id\n```\n\noutcome:real-id",
+    );
+    expect(outcomeIdTokens(body)).toEqual(["real-id"]);
+  });
+
+  it("excludes an HTML-commented example line from the section body", () => {
+    const { body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\n<!-- outcome:example-id -->\n\noutcome:real-id",
+    );
+    expect(outcomeIdTokens(body)).toEqual(["real-id"]);
+  });
+
+  it("excludes a line inside a raw HTML block from the section body", () => {
+    const { body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\n<pre>\noutcome:example-id\n</pre>\n\noutcome:real-id",
+    );
+    expect(outcomeIdTokens(body)).toEqual(["real-id"]);
+  });
+});
+
+describe("outcomeIdsOf", () => {
+  // PR #334 review: `outcomeIdsOf` is the one place every rework path reads a target's outcome ids
+  // before mapping them straight into a follow-up's `outcome:<id>` labels — a manually authored or
+  // legacy `## Outcome IDs` section pairing an id with explanatory prose on the same line must not
+  // have that prose fabricated into bogus labels (`outcome:primary`, `outcome:outcome`) once it
+  // reaches those paths.
+  it("drops a token that fails outcome:<id> label syntax rather than propagating it", () => {
+    const target = bead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Outcome IDs\n\noutcome:trustworthy-board — primary outcome",
+    });
+    expect(outcomeIdsOf(target)).toEqual([]);
+  });
+
+  it("keeps a well-formed id declared alongside a malformed one", () => {
+    const target = bead({
+      id: "epic-1",
+      issue_type: "epic",
+      description: "## Outcome IDs\n\noutcome:trustworthy-board — primary outcome, outcome:real-id",
+    });
+    expect(outcomeIdsOf(target)).toEqual(["real-id"]);
+  });
+
+  // A board `outcome:` label is usually written by code that already validated it, but labels can
+  // also be hand-authored — a malformed one must not bypass the same AREA_SHAPE filter the free-text
+  // path applies, or it would be copied straight into a follow-up's beads.create/beads.tag calls.
+  it("drops a labeled outcome that fails outcome:<id> label syntax", () => {
+    const target = bead({
+      id: "feature-1",
+      issue_type: "task",
+      labels: ["outcome:bad!"],
+    });
+    expect(outcomeIdsOf(target)).toEqual([]);
+  });
+
+  it("keeps a well-formed labeled outcome alongside a malformed one", () => {
+    const target = bead({
+      id: "feature-1",
+      issue_type: "task",
+      labels: ["outcome:bad!", "outcome:real-id"],
+    });
+    expect(outcomeIdsOf(target)).toEqual(["real-id"]);
+  });
+});
+
 describe("buildEpicSkeleton", () => {
   it("renders an epic the contract validator passes with zero violations", async () => {
     const project = tempProject();
@@ -157,7 +308,11 @@ describe("buildEpicSkeleton", () => {
         formula: "anton-bead",
         vars: {},
         steps: [
-          { id: "epic", type: "epic", description: "## Goal\n\n{{outcome}}\n\n## House rule" },
+          {
+            id: "epic",
+            type: "epic",
+            description: "## Goal\n\n{{outcome}}\n\n## House rule\n\n{{outcome_ids}}",
+          },
           { id: "feature", description: "f" },
           { id: "ticket", description: "t" },
         ],
@@ -187,10 +342,11 @@ describe("buildFeatureSkeleton", () => {
     ).toEqual([]);
   });
 
-  it("carries all five sections the run and its self-review read", async () => {
+  it("carries all six sections the run and its self-review read", async () => {
     const { description, acceptance } = await buildFeatureSkeleton(tempProject(), FEATURE);
     for (const heading of [
       "## Goal",
+      "## Why",
       "## Acceptance Criteria",
       "## Context",
       "## Out of scope",
@@ -222,6 +378,7 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
       type: "feature",
       deps: ["parent-child:p-1"],
       acceptance: FEATURE.acceptance,
+      labels: [`outcome:${FEATURE.outcomeId}`],
     });
   });
 
@@ -242,7 +399,12 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
     expect(createGraph.mock.calls[0]![1].nodes).toEqual([
       expect.objectContaining({ key: "epic", type: "epic", labels: ["area:reports"] }),
-      expect.objectContaining({ key: "feature", type: "feature", parent_key: "epic" }),
+      expect.objectContaining({
+        key: "feature",
+        type: "feature",
+        parent_key: "epic",
+        labels: [`outcome:${FEATURE.outcomeId}`],
+      }),
     ]);
   });
 
@@ -433,6 +595,230 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  // The typo the review flagged (anton-cdeki): nothing upstream of this write ever checked the
+  // feature's outcome id against `.product/PRODUCT.md`'s actual `## Outcomes`, so a misspelled id
+  // landed as a real `outcome:<id>` label no gate would ever flag.
+  it("refuses an outcome id `.product/PRODUCT.md` doesn't offer, naming it", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: { ...FEATURE, outcomeId: "reports-are-sharable" },
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain("reports-are-sharable");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // The upgrade gap the review flagged (anton-cdeki PR #334): a project whose PRODUCT.md predates
+  // outcome ids has no `## Outcomes` section, so it must not be treated as a closed set offering
+  // only `codebase-health` — that would strand every existing project until someone manually
+  // discovers and edits the new file format.
+  it("accepts any outcome id when PRODUCT.md has no ## Outcomes section", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(unconfiguredProject(), {
+        feature: { ...FEATURE, outcomeId: "reports-are-sharable" },
+        epic: { kind: "existing", id: "p-1" },
+      }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
+  it("accepts a new epic's Outcome IDs against PRODUCT.md's active set when it has no ## Outcomes section — syntax is still checked", async () => {
+    const createGraph = graphLands();
+
+    await expect(
+      createDraftFeature(unconfiguredProject(), {
+        feature: FEATURE,
+        epic: {
+          kind: "new",
+          epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:totally-made-up" },
+        },
+      }),
+    ).resolves.toMatchObject({ epicCreated: true });
+    expect(createGraph).toHaveBeenCalledTimes(1);
+  });
+
+  // The review flagged that the `configured` exemption skipped ALL checks on the declared ids,
+  // including whether they can survive as an `outcome:<id>` label at all (anton-cdeki PR #334) —
+  // that check must fire whether or not PRODUCT.md is configured.
+  it("refuses a new epic's Outcome IDs with label-unsafe syntax even when PRODUCT.md has no ## Outcomes section", async () => {
+    const rejection = await createDraftFeature(unconfiguredProject(), {
+      feature: FEATURE,
+      epic: {
+        kind: "new",
+        epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:bad!" },
+      },
+    }).catch((e) => e);
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+  });
+
+  it("refuses an outcome PRODUCT.md marks retired", async () => {
+    const target = project();
+    writeFileSync(
+      join(target.repoPath, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n- `reports-are-shareable` — Old outcome (retired).\n",
+    );
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    await expect(
+      createDraftFeature(target, { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).rejects.toThrow(DraftOutcomeError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // The prior fix only checked a NEW epic's Outcome IDs; an EXISTING epic that already declares a
+  // different set is the same drift the review flagged as still open.
+  it("refuses an existing epic whose Outcome IDs contradict the feature's own outcome", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description: "## Goal\n\ng\n\n## Outcome IDs\n\noutcome:something-else",
+      }),
+    );
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain("p-1");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("accepts an existing epic whose Outcome IDs already include the feature's own outcome", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description: "## Goal\n\ng\n\n## Outcome IDs\n\noutcome:reports-are-shareable",
+      }),
+    );
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
+  it("accepts an existing epic with no Outcome IDs section at all — nothing to contradict", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic", description: "## Goal\n\nno outcome ids yet" }));
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
+  // A present-but-empty section is a declared empty outcome set, not "nothing to contradict" —
+  // unlike the absent-section case above, this must refuse.
+  it("refuses an existing epic whose Outcome IDs section is present but blank", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description: "## Goal\n\ng\n\n## Outcome IDs\n\n",
+      }),
+    );
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  // A prefix match would also claim `## Outcome IDs and Caveats` as the contract's own section,
+  // folding its free text in as the declared ids — this must require the exact heading.
+  it("does not mistake `## Outcome IDs and Caveats` for the contract's `## Outcome IDs` section", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description:
+          "## Goal\n\ng\n\n## Outcome IDs and Caveats\n\nsome unrelated free text that mentions nothing",
+      }),
+    );
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
+  // The epic's Outcome IDs are the outcomes its features add up to serving — a new epic that omits
+  // its own feature's outcome is exactly the drift the review flagged.
+  it("refuses a new epic whose Outcome IDs never mention the feature's own outcome", async () => {
+    const createGraph = vi.spyOn(beads, "createGraph");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "new", epic: { ...EPIC, outcomeIds: "outcome:something-else" } },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain(FEATURE.outcomeId);
+    expect(createGraph).not.toHaveBeenCalled();
+  });
+
+  it("accepts a new epic whose Outcome IDs list several ids including the feature's own", async () => {
+    const target = project();
+    writeFileSync(
+      join(target.repoPath, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n" +
+        "- `reports-are-shareable` — Every report view leaves the app in a format a customer can open.\n" +
+        "- `codebase-health` — Tests, types, and lint stay green as the code changes; found debt gets paid down.\n",
+    );
+    const createGraph = graphLands();
+
+    await expect(
+      createDraftFeature(target, {
+        feature: FEATURE,
+        epic: { kind: "new", epic: { ...EPIC, outcomeIds: "outcome:codebase-health, reports-are-shareable" } },
+      }),
+    ).resolves.toMatchObject({ epicCreated: true });
+    expect(createGraph).toHaveBeenCalledTimes(1);
+  });
+
+  // The typo the review flagged (anton-cdeki): the feature's own outcome id being valid and present
+  // is not enough — every id the new epic declares is a real commitment, so a typo elsewhere in the
+  // list must be caught here too, not just silently persisted onto the board.
+  it("refuses a new epic whose Outcome IDs name a second id PRODUCT.md doesn't offer, even though the feature's own id is valid and present", async () => {
+    const createGraph = vi.spyOn(beads, "createGraph");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: {
+        kind: "new",
+        epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:report-sharng" },
+      },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain("report-sharng");
+    expect(createGraph).not.toHaveBeenCalled();
+  });
 });
 
 // The epic half is judged with the same validator, and — like the feature's — ahead of the single

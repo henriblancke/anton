@@ -1038,6 +1038,93 @@ export async function listDeliveriesByBead(
 }
 
 /**
+ * Which of `beadIds` carry a run row in any of `statuses` — either as its `epicBeadId` or its
+ * `ticketBeadId`, the same OR {@link listDeliveriesByBead} queries.
+ *
+ * A bead's own status is not enough to tell live work from a terminated attempt (PR #331 review,
+ * cohort-read.ts): an agent that self-reports `ANTON-RESULT: blocked` settles its run
+ * `status: "failed"` while leaving the TICKET at `status: "blocked"` forever
+ * (`execute-epic.abandon-base.integration.test.ts`) — so a caller that reads "blocked" as "still
+ * executing" mistakes a terminated attempt for live work. Passing `ACTIVE_RUN_STATUSES` answers
+ * "does this target still have an open run", passing `["failed"]` answers "did its last known
+ * attempt already run out" — {@link cohortFeatures} asks both to tell the two apart.
+ */
+export async function listRunBeadIdsByStatus(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+  statuses: readonly RunStatus[],
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (beadIds.length === 0 || statuses.length === 0) return out;
+  const ids = [...new Set(beadIds)];
+  const wanted = new Set(ids);
+  const rows = await db
+    .select({ epicBeadId: schema.runs.epicBeadId, ticketBeadId: schema.runs.ticketBeadId })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        inArray(schema.runs.status, [...statuses]),
+        or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
+      ),
+    );
+  for (const row of rows) {
+    for (const id of [row.epicBeadId, row.ticketBeadId]) {
+      if (id !== null && wanted.has(id)) out.add(id);
+    }
+  }
+  return out;
+}
+
+/**
+ * When each of `beadIds`' currently-OPEN run began its live attempt, epoch ms — `attemptStartedAt`
+ * (falling back to `startedAt` on rows predating that column), never `deliveredAtMs` (PR #331
+ * review, cohort-read.ts). A prior delivery only bounds a target that has nothing live to bound
+ * it more precisely with; a target with an actual open run can have SETTLED activity between that
+ * delivery and now — a completed failed rerun, say — that already has an outcome and belongs in
+ * the cohort's numerators. Cutting at the open attempt's own start keeps exactly that settled
+ * activity while still excluding the live attempt's own premature rows. Two open rows matching the
+ * same id (unusual, but not impossible mid-transition) take the EARLIER start, so the cutoff never
+ * drifts later than the oldest attempt still genuinely unsettled.
+ */
+export async function listOpenRunAttemptStartMs(
+  db: AntonDb,
+  projectId: string,
+  beadIds: readonly string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (beadIds.length === 0) return out;
+  const ids = [...new Set(beadIds)];
+  const wanted = new Set(ids);
+  const rows = await db
+    .select({
+      epicBeadId: schema.runs.epicBeadId,
+      ticketBeadId: schema.runs.ticketBeadId,
+      startedAt: schema.runs.startedAt,
+      attemptStartedAt: schema.runs.attemptStartedAt,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        inArray(schema.runs.status, [...ACTIVE_RUN_STATUSES]),
+        or(inArray(schema.runs.epicBeadId, ids), inArray(schema.runs.ticketBeadId, ids)),
+      ),
+    );
+  for (const row of rows) {
+    const startMs = (row.attemptStartedAt ?? row.startedAt)?.getTime();
+    if (startMs === undefined) continue;
+    for (const id of [row.epicBeadId, row.ticketBeadId]) {
+      if (id === null || !wanted.has(id)) continue;
+      const existing = out.get(id);
+      if (existing === undefined || startMs < existing) out.set(id, startMs);
+    }
+  }
+  return out;
+}
+
+/**
  * Every run of a project in the given statuses, oldest activity first (anton-4ks0). The read the
  * run-health sweep detects over — `updatedAt` on a settled run is when it settled, so ordering by
  * it puts the most-stalled work first. db-injectable; strictly read-only.

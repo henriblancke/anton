@@ -336,7 +336,7 @@ describe("required skill assets", () => {
     it("bd scopes `--validate` to the rubric heading and denies it proves a contract", () => {
       expect(bd).toMatch(/`--validate` gates the \*\*rubric heading only\*\*/);
       expect(bd).toMatch(/never\s+read a green `--validate` as a filled contract/);
-      expect(bd).toMatch(/\*\*bd checks one of the five, not five\.\*\*/);
+      expect(bd).toMatch(/\*\*bd checks one of the six, not six\.\*\*/);
       // The claims that were wrong — bd accepts both bodies they promise it refuses.
       expect(bd).not.toMatch(/refuses a body missing/);
       expect(bd).not.toMatch(/catches a cooked-but-unfilled skeleton/);

@@ -12,6 +12,7 @@
  * `anton setup` created rather than inside a directory the next update deletes.
  */
 import { join, resolve } from "node:path";
+import { Worker } from "node:worker_threads";
 
 import {
   buildRecordPath,
@@ -224,20 +225,208 @@ function invalidateCaches(): void {
  */
 const ON_DISK_TTL_MS = 15_000;
 
-let onDiskCache: { at: number; generation: number; identity: BuildIdentity } | null = null;
+type OnDiskCache = { at: number; generation: number; seq: number; identity: BuildIdentity };
+
+/**
+ * Anchored on `globalThis`, not a module-local `let`, for the reason `BOOT_KEY` above is: the
+ * runner and the request graph hold separate copies of this module, and the seq ordering below
+ * only means anything if both copies read and write the SAME cache slot and the SAME counter.
+ */
+const ON_DISK_CACHE_KEY = Symbol.for("anton.build.onDiskCache");
+const ON_DISK_SEQ_KEY = Symbol.for("anton.build.onDiskSeq");
+
+function onDiskCache(): OnDiskCache | null {
+  return (globalThis as unknown as Record<symbol, OnDiskCache | undefined>)[ON_DISK_CACHE_KEY] ?? null;
+}
+
+function setOnDiskCache(cache: OnDiskCache): void {
+  (globalThis as unknown as Record<symbol, OnDiskCache>)[ON_DISK_CACHE_KEY] = cache;
+}
+
+/**
+ * Orders reads within one generation, since `checkoutMoved` is the only invalidation an EXTERNAL
+ * `git pull` is guaranteed to trigger and a caller doing its own pull may skip it (anton-fzarz
+ * review). Assigned when a read is ISSUED, not when it settles: the off-thread display read that
+ * started before such a pull must lose to the synchronous `fresh` gate read the pull's caller takes
+ * afterwards, even though the display read's worker round trip lands second. Without this, that
+ * later-completing-but-earlier-issued read would overwrite the gate's correct, fresher store and
+ * every render within the TTL would compare against the pre-pull identity again.
+ *
+ * Process-wide for the same reason the cache itself is: a seq minted in the runner's copy of this
+ * module must outrank a seq minted earlier in the request graph's copy, or the ordering this exists
+ * to guarantee only holds when both reads happen to land in the same module registry.
+ */
+function nextOnDiskSeq(): number {
+  const seq = ((globalThis as unknown as Record<symbol, number | undefined>)[ON_DISK_SEQ_KEY] ?? 0) + 1;
+  (globalThis as unknown as Record<symbol, number>)[ON_DISK_SEQ_KEY] = seq;
+  return seq;
+}
+
+/** The cached read, when one still stands for this generation — the shared hit both paths take. */
+function cachedOnDisk(generation: number): BuildIdentity | null {
+  const cache = onDiskCache();
+  if (!cache || cache.generation !== generation) return null;
+  return Date.now() - cache.at < ON_DISK_TTL_MS ? cache.identity : null;
+}
+
+/** What a process with no resolvable runtime dir is running: nothing anything here can name. */
+function unreadableIdentity(): BuildIdentity {
+  return { version: null, revision: null, worktree: null, source: null, env: null };
+}
+
+/**
+ * Stores a read as the cache's answer for `generation`, unless a read ISSUED later already won that
+ * slot — in which case the CALLER is handed that winning identity too (anton-fzarz review), not the
+ * stale one it read: a loser that returned its own read would still hand a post-pull consumer (a
+ * verdict computed from it, then cached again downstream) the pre-pull disk, which is the exact
+ * silence the seq ordering above exists to end.
+ */
+function storeOnDisk(generation: number, identity: BuildIdentity, seq: number): BuildIdentity {
+  const cache = onDiskCache();
+  if (cache && cache.generation === generation && cache.seq > seq) return cache.identity;
+  setOnDiskCache({ at: Date.now(), generation, seq, identity });
+  return identity;
+}
 
 function onDiskIdentity(fresh = false): BuildIdentity {
-  const now = Date.now();
   const generation = cacheGeneration();
-  if (!fresh && onDiskCache && onDiskCache.generation === generation && now - onDiskCache.at < ON_DISK_TTL_MS) {
-    return onDiskCache.identity;
+  if (!fresh) {
+    const cached = cachedOnDisk(generation);
+    if (cached) return cached;
   }
   const root = appRoot();
-  const identity = root
-    ? (readBuildIdentity(root) as BuildIdentity)
-    : { version: null, revision: null, worktree: null, source: null, env: null };
-  onDiskCache = { at: now, generation, identity };
-  return identity;
+  const seq = nextOnDiskSeq();
+  return storeOnDisk(generation, root ? (readBuildIdentity(root) as BuildIdentity) : unreadableIdentity(), seq);
+}
+
+/**
+ * Where the off-thread reader lives, relative to the runtime dir — resolved from {@link appRoot}
+ * rather than from this module's own URL, because a webpack chunk's `import.meta.url` names the
+ * bundle and not the source file. Both install shapes carry it at this path: a source checkout
+ * because it IS the checkout, a standalone bundle because `next.config.ts` traces it in and
+ * `scripts/build-bundle.mjs` stages it (anton-fzarz).
+ */
+const IDENTITY_WORKER = ["src", "lib", "build", "identity-worker.mjs"] as const;
+
+/**
+ * One read of the code on disk, taken OFF the request event loop (anton-fzarz).
+ *
+ * `readBuildIdentity` is synchronous and expensive — six git spawns on a cold path, plus hashing
+ * whatever the checkout holds beyond HEAD, measured at 87–275 ms. Every display surface reads it on
+ * the 15-second cadence above, so each operator refresh that landed on a miss stalled every other
+ * request in the process for the length of the scan. A worker thread has its own loop, which turns
+ * that block into a message round trip (measured: 88 ms → ~1 ms of event-loop delay) for the same
+ * return value of the same function.
+ *
+ * The VERDICT is untouched: the gate still reads synchronously ({@link serverBuildDrift} with
+ * `fresh`), which is correct there — it runs off the request path, where a thread spawn would only
+ * add latency to a caller nothing else is waiting behind.
+ *
+ * A worker that cannot run at all — no such file, a thread the platform refused — degrades to the
+ * synchronous read rather than to no verdict: a display surface that reports nothing is the silence
+ * this whole module exists to end, and a rare blocking read is the lesser cost.
+ *
+ * Both git timeouts and the one-shot exit bound the wait, so no deadline is imposed here: a scan this
+ * cannot finish is one the synchronous read could not have finished either, and a timeout would only
+ * add a second, WRONG answer — a display surface claiming a build it never read.
+ */
+async function readIdentityOffThread(root: string): Promise<BuildIdentity> {
+  const worker = new Worker(join(root, ...IDENTITY_WORKER), { workerData: { appRoot: root } });
+  try {
+    return await new Promise<BuildIdentity>((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+      // A worker that exited without posting established nothing — distinct from one that answered,
+      // since `once("message")` has already resolved by then and a settled promise ignores this.
+      worker.once("exit", (code) => reject(new Error(`identity worker exited with code ${code}`)));
+    });
+  } finally {
+    // The worker is one-shot and exits on its own; terminating is how a REJECTED read (an error, or
+    // a scan still running behind one) stops costing anything rather than lingering as a thread.
+    await worker.terminate();
+  }
+}
+
+/**
+ * The read currently running off-thread, shared with every caller that arrives while it does.
+ *
+ * Anchored on `globalThis`, not a module-local `let`, for the reason `onDiskCache` above is: the
+ * runner and the request graph are separate module registries, and a miss landing in both around the
+ * same moment must still share ONE worker — the property this exists for in the first place — rather
+ * than each registry spawning its own because its own copy of this variable was independently null.
+ *
+ * Generation-tagged for the reason {@link inflightDrifts} is: sharing is only correct WITHIN one, so
+ * a read that began before `checkoutMoved` fired is never handed to a caller arriving after it. That
+ * tag is also what keeps concurrent display renders down to ONE worker rather than a thread per
+ * request — the cost this indirection exists to avoid paying twice over.
+ */
+const ON_DISK_INFLIGHT_KEY = Symbol.for("anton.build.onDiskInflight");
+
+type OnDiskInflight = { generation: number; identity: Promise<BuildIdentity> };
+
+function inflightOnDisk(): OnDiskInflight | null {
+  return (globalThis as unknown as Record<symbol, OnDiskInflight | undefined>)[ON_DISK_INFLIGHT_KEY] ?? null;
+}
+
+function setInflightOnDisk(inflight: OnDiskInflight | null): void {
+  (globalThis as unknown as Record<symbol, OnDiskInflight | null>)[ON_DISK_INFLIGHT_KEY] = inflight;
+}
+
+/**
+ * Whether this process has already said the off-thread read failed. Once per process — not per
+ * registry, for the same reason `inflightOnDisk` above is anchored on `globalThis` — the failure
+ * repeats on every cache miss for as long as the install stays as it is, and a line per miss (or per
+ * registry) would bury the one that names the cause.
+ */
+const WARNED_OFF_THREAD_KEY = Symbol.for("anton.build.warnedOffThread");
+
+function warnOffThreadReadFailed(err: unknown): void {
+  const g = globalThis as unknown as Record<symbol, boolean | undefined>;
+  if (g[WARNED_OFF_THREAD_KEY]) return;
+  g[WARNED_OFF_THREAD_KEY] = true;
+  console.warn(
+    "[build/drift] off-thread build-identity read unavailable — falling back to a blocking read on " +
+      "every display miss. Is src/lib/build/identity-worker.mjs present in this install?",
+    err,
+  );
+}
+
+/**
+ * What is on disk now, for a caller that can await it — the display path's read.
+ *
+ * Answers from the shared cache the synchronous path fills, so the two never disagree about the same
+ * generation, and writes back into it so a following gate read within the TTL is served for free.
+ */
+async function onDiskIdentityAsync(): Promise<BuildIdentity> {
+  const generation = cacheGeneration();
+  const cached = cachedOnDisk(generation);
+  if (cached) return cached;
+  const root = appRoot();
+  if (!root) return storeOnDisk(generation, unreadableIdentity(), nextOnDiskSeq());
+  let inflight = inflightOnDisk();
+  if (!inflight || inflight.generation !== generation) {
+    // Issued here, before the worker round trip — not in the `.then` below — so a synchronous
+    // `fresh` gate read taken while this is in flight is stamped with a LATER seq than this one,
+    // whichever of the two settles first (PR anton-fzarz review).
+    const seq = nextOnDiskSeq();
+    const identity = readIdentityOffThread(root)
+      // The fallback stands in the same place the worker would have: a thread this platform or
+      // install cannot start must not leave a display surface with no verdict at all. Logged once
+      // per process because the usual cause is an install MISSING the worker file — a permanent
+      // condition that silently restores the blocking read this exists to remove, and which nothing
+      // else would ever report.
+      .catch((err) => {
+        warnOffThreadReadFailed(err);
+        return readBuildIdentity(root) as BuildIdentity;
+      })
+      .then((identity) => (cacheGeneration() === generation ? storeOnDisk(generation, identity, seq) : identity))
+      .finally(() => {
+        if (inflightOnDisk()?.generation === generation) setInflightOnDisk(null);
+      });
+    inflight = { generation, identity };
+    setInflightOnDisk(inflight);
+  }
+  return inflight.identity;
 }
 
 /**
@@ -599,20 +788,24 @@ export async function runnerBootDependencies(): Promise<string | null> {
 async function readServerDrifts(): Promise<ServerDrift[]> {
   const db = antonDbPath();
   const root = appRoot();
+  // Read ONCE, off-thread, and compare every record against that one snapshot. Per-record reads
+  // would have each pay the cache lookup separately and — worse — could straddle an invalidation,
+  // leaving two servers of one install judged against different disks in the same verdict list.
+  const onDisk = await onDiskIdentityAsync();
   const records: BuildRecord[] =
     db && root ? liveBuildRecords(db, root).map(({ record }: { record: BuildRecord }) => record) : [];
   const drifts: ServerDrift[] = [];
   for (const record of records) {
-    const drift = driftOf(record, bootedAtOf(record));
+    const drift = driftOf(record, bootedAtOf(record), onDisk);
     if (drift) drifts.push({ pid: record.pid, self: record.pid === process.pid, runner: runsJobs(record), drift });
   }
   const boot = booted();
   if (boot && !records.some((record) => record.pid === process.pid)) {
-    const drift = driftOf(boot.identity, null);
+    const drift = driftOf(boot.identity, null, onDisk);
     if (drift) drifts.push({ pid: process.pid, self: true, runner: boot.runner, drift });
   }
   for (const pid of await unstampedNeighbours(root, records)) {
-    drifts.push({ pid, self: false, runner: undefined, drift: unstampedDrift() });
+    drifts.push({ pid, self: false, runner: undefined, drift: unstampedDrift(onDisk) });
   }
   return drifts;
 }
@@ -646,8 +839,8 @@ async function unstampedNeighbours(root: string | null, records: BuildRecord[]):
   });
 }
 
-function driftOf(running: BuildIdentity, bootedAt: number | null): BuildDrift | null {
-  const verdict = compareBuild(running, onDiskIdentity());
+function driftOf(running: BuildIdentity, bootedAt: number | null, onDisk: BuildIdentity): BuildDrift | null {
+  const verdict = compareBuild(running, onDisk);
   if (verdict.state === "current") return null;
   return { ...verdict, bootedAt } as BuildDrift;
 }
@@ -657,8 +850,8 @@ function driftOf(running: BuildIdentity, bootedAt: number | null): BuildDrift | 
  * Never "current" — an identity with no version is what `compareBuild` reads as unstamped — and it
  * carries no boot time, because the only thing that would have written one is the record it lacks.
  */
-function unstampedDrift(): BuildDrift {
-  return { ...compareBuild(null, onDiskIdentity()), bootedAt: null } as BuildDrift;
+function unstampedDrift(onDisk: BuildIdentity): BuildDrift {
+  return { ...compareBuild(null, onDisk), bootedAt: null } as BuildDrift;
 }
 
 /** Whether a record claims its process runs the jobs — undefined when it predates the field. */

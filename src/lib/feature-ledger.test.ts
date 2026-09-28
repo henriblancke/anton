@@ -101,6 +101,8 @@ describe("ledgerTiming on a run that parked overnight", () => {
     expect(timing.activeMs).toBe(15 * MINUTE);
     expect(timing.leadMs).toBe(deliveredAt - firstStart);
     expect(timing.leadMs).toBe(22 * HOUR + 10 * MINUTE);
+    // Both invocations landed before delivery — nothing was excluded.
+    expect(timing.excludesPostDeliveryWork).toBe(false);
   });
 
   it("separates working from waiting — the figure the split exists for", () => {
@@ -136,6 +138,9 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
     expect(timing.timedInvocations).toBe(2);
     expect(timing.invocations).toBe(2);
     expect(timing.leadMs).toBe(30 * MINUTE);
+    // `timedInvocations` alone cannot say so — this is the only signal that `activeMs` no longer
+    // covers everything anton recorded (PR #329 review).
+    expect(timing.excludesPostDeliveryWork).toBe(true);
   });
 
   it("does not let post-delivery work eat into waitingMs", () => {
@@ -169,6 +174,8 @@ describe("ledgerTiming with an invocation that ended AFTER delivery", () => {
     expect(timing.timedInvocations).toBe(2);
     expect(timing.splitAmbiguous).toBe(true);
     expect(waitingMs(timing)).toBeUndefined();
+    // A same-second tie is folded IN, not excluded — nothing here was dropped from `activeMs`.
+    expect(timing.excludesPostDeliveryWork).toBe(false);
   });
 });
 
@@ -187,6 +194,9 @@ describe("ledgerTiming with an invocation that spans delivery", () => {
     expect(timing.activeMs).toBe(10 * MINUTE);
     expect(timing.timedInvocations).toBe(1);
     expect(timing.leadMs).toBe(10 * MINUTE);
+    // Only the pre-delivery portion survived — the caller must be told activeMs is not the whole
+    // invocation's duration.
+    expect(timing.excludesPostDeliveryWork).toBe(true);
   });
 
   it("does not let the clipped portion outrun leadMs", () => {
@@ -393,9 +403,11 @@ describe("wall time", () => {
       timedInvocations: number;
       leadMs: number | undefined;
       splitAmbiguous: boolean;
+      excludesPostDeliveryWork: boolean;
     }>();
     expect(Object.keys(ledgerTiming([row()])).sort()).toEqual([
       "activeMs",
+      "excludesPostDeliveryWork",
       "invocations",
       "leadMs",
       "splitAmbiguous",

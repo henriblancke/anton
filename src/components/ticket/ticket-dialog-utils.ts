@@ -5,18 +5,21 @@
  * title/status/priority/agent/risk/size (see ticket-patch.ts).
  */
 import { ACCEPTANCE_HEADING } from "@/lib/beads/contract";
+import { scanMarkdown } from "@/lib/beads/markdown";
 import type { TicketDetail } from "@/lib/types";
 
 /**
  * The editable fields of a ticket. Scalar/label fields plus the markdown contract, which is
- * decomposed into three editable pieces: `goal` (the `## Goal` section), `acceptance` (the
- * `## Acceptance Criteria` section, falling back to the bead's acceptance field), and `body` (the
- * rest of the description). Absent labels are held as "" in the draft.
+ * decomposed into four pieces: `goal` (the `## Goal` section), `why` (the `## Why` section — no bd
+ * field of its own, so it lives only in the description), `acceptance` (the `## Acceptance
+ * Criteria` section, falling back to the bead's acceptance field), and `body` (the rest of the
+ * description). Absent labels are held as "" in the draft.
  *
  * Storage rule: the whole contract is canonically the bead DESCRIPTION markdown. On save the
- * description is recomposed as `## Goal` + `## Acceptance Criteria` + body (`composeDescription`),
- * and the acceptance text is mirrored into bd's dedicated acceptance field so the two never
- * drift — `parseGoal`/`parseAcceptance` both read the `## <section>` from the description first.
+ * description is recomposed as `## Goal` + `## Why` + `## Acceptance Criteria` + body
+ * (`composeDescription`) — the contract's own order — and the acceptance text is mirrored into
+ * bd's dedicated acceptance field so the two never drift — `parseGoal`/`parseAcceptance` both read
+ * the `## <section>` from the description first.
  */
 export interface TicketDraft {
   title: string;
@@ -26,6 +29,7 @@ export interface TicketDraft {
   risk: string;
   size: string;
   goal: string;
+  why: string;
   acceptance: string;
   body: string;
 }
@@ -101,25 +105,55 @@ export const AGENT_OPTIONS = [
  * The contract sections that live in their own draft fields — everything else stays in `body`.
  * `Acceptance` is the PREFIX, not the full heading: the `\b` match below also claims the
  * `## Acceptance Criteria` we now write, so a description in either spelling strips to the same
- * body and recomposes under the canonical one.
+ * body and recomposes under the canonical one. Listed in the contract's own order (Goal → Why →
+ * Acceptance), which is also the order {@link composeDescription} writes them back in.
  */
-const CONTRACT_SECTIONS = ["Goal", "Acceptance"] as const;
+const CONTRACT_SECTIONS = ["Goal", "Why", "Acceptance"] as const;
+
+/** The one section whose heading is intentionally matched by PREFIX — see {@link CONTRACT_SECTIONS}. */
+const PREFIX_MATCHED_SECTIONS: ReadonlySet<string> = new Set(["Acceptance"]);
 
 /**
- * Drop the `## Goal` / `## Acceptance Criteria` blocks (heading through the line before the next
- * `##`) from a description, leaving "the rest" that the Description textarea edits. Mirrors the
- * heading semantics of `parseSection` in src/lib/tickets.ts so the split round-trips cleanly.
+ * Match a `## <name>` heading. Only `Acceptance` matches by prefix (to also claim `## Acceptance
+ * Criteria`); `Goal` and `Why` require the exact heading, or a non-contract section sharing the
+ * same first word — `## Why now`, `## Why this approach` — would be mistaken for the contract's
+ * `## Why` and get silently folded into that draft field instead of staying in `body`.
+ */
+const sectionHeading = (name: string) =>
+  PREFIX_MATCHED_SECTIONS.has(name)
+    ? new RegExp(`^##\\s*${name}\\b`, "i")
+    : new RegExp(`^##\\s*${name}\\s*$`, "i");
+
+/**
+ * Is this line, at this position, a genuine heading at depth 2 or shallower — as opposed to a
+ * line that merely LOOKS like one inside a fenced code block, an HTML comment, or other
+ * non-rendered markdown? Backed by {@link scanMarkdown}'s AST-aware line scan
+ * (src/lib/beads/markdown.ts), the same parser the contract reader uses — a raw `/^##\s+/` test
+ * on the trimmed line text can't tell a real heading from a fenced example that merely contains
+ * one. Depth 1 and shallower also count as boundaries: a `# Notes` following `## Why` still ends
+ * the section, even though only a depth-2 heading can be the section opener itself (see
+ * {@link sectionHeading}) — otherwise a shallower heading and everything below it gets absorbed
+ * into the open section instead of staying independent body text.
+ */
+const isSectionHeadingLine = (scanned: ReturnType<typeof scanMarkdown>[number] | undefined): boolean =>
+  scanned?.heading !== undefined && scanned.heading.depth <= 2;
+
+/**
+ * Drop the `## Goal` / `## Why` / `## Acceptance Criteria` blocks (heading through the line before
+ * the next `##`) from a description, leaving "the rest" that the Description textarea edits. A
+ * fenced example containing a line that merely reads `## Why` is left alone — it is body text, not
+ * a section boundary.
  */
 export function stripContractSections(description: string): string {
-  const lines = description.split("\n");
+  const lines = description.split(/\r?\n/);
+  const scanned = scanMarkdown(description);
   const kept: string[] = [];
   let skipping = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (/^##\s+/.test(trimmed)) {
-      const isContract = CONTRACT_SECTIONS.some((name) =>
-        new RegExp(`^##\\s*${name}\\b`, "i").test(trimmed),
-      );
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (isSectionHeadingLine(scanned[i])) {
+      const trimmed = line.trim();
+      const isContract = CONTRACT_SECTIONS.some((name) => sectionHeading(name).test(trimmed));
       skipping = isContract;
       if (skipping) continue;
     }
@@ -129,16 +163,53 @@ export function stripContractSections(description: string): string {
 }
 
 /**
+ * Extract a `## <name>` section's body, or "" when absent. The read half of
+ * {@link stripContractSections} for a section with no bd field home of its own — unlike
+ * Goal/Acceptance, Why is never mirrored onto {@link TicketDetail}, so it can only be read back out
+ * of the description markdown.
+ *
+ * A repeated heading concatenates — mirrors `sectionsOf` in beads/contract.ts, which every OTHER
+ * contract reader uses. Stopping at the first occurrence (as this once did) let `stripContractSections`
+ * strip every authored `## Why` from `body` while this only ever recovered the first, so saving any
+ * other field edit silently dropped the later ones.
+ */
+function extractSection(description: string, name: string): string {
+  const lines = description.split(/\r?\n/);
+  const scanned = scanMarkdown(description);
+  const heading = sectionHeading(name);
+  const occurrences: string[] = [];
+  let body: string[] = [];
+  let inSection = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (isSectionHeadingLine(scanned[i])) {
+      if (inSection) {
+        occurrences.push(body.join("\n").trim());
+        body = [];
+      }
+      inSection = heading.test(line.trim());
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  if (inSection) occurrences.push(body.join("\n").trim());
+  return occurrences.filter(Boolean).join("\n\n");
+}
+
+/**
  * Recompose a draft's contract into a single canonical description markdown: `## Goal`, then
- * `## Acceptance Criteria`, then the remaining body. Empty pieces are omitted. This is what gets
- * written to `--description`, and `parseGoal`/`parseAcceptance` read it straight back.
+ * `## Why`, then `## Acceptance Criteria`, then the remaining body — the contract's own order
+ * (skills/bd/SKILL.md). Empty pieces are omitted. This is what gets written to `--description`,
+ * and `parseGoal`/`parseAcceptance` read it straight back.
  */
 export function composeDescription(draft: TicketDraft): string {
   const parts: string[] = [];
   const goal = draft.goal.trim();
+  const why = draft.why.trim();
   const acceptance = draft.acceptance.trim();
   const body = draft.body.trim();
   if (goal) parts.push(`## Goal\n\n${goal}`);
+  if (why) parts.push(`## Why\n\n${why}`);
   if (acceptance) parts.push(`## ${ACCEPTANCE_HEADING}\n\n${acceptance}`);
   if (body) parts.push(body);
   return parts.join("\n\n");
@@ -154,6 +225,7 @@ export function draftFromDetail(detail: TicketDetail): TicketDraft {
     risk: detail.risk ?? "",
     size: detail.size ?? "",
     goal: detail.goal ?? "",
+    why: extractSection(detail.description ?? "", "Why"),
     acceptance: detail.acceptance ?? "",
     body: stripContractSections(detail.description ?? ""),
   };
@@ -181,11 +253,12 @@ export function diffTicketPatch(original: TicketDraft, draft: TicketDraft): Tick
   if (draft.risk !== "" && draft.risk !== original.risk) patch.risk = draft.risk;
   if (draft.size !== "" && draft.size !== original.size) patch.size = draft.size;
 
-  // Contract: when any of Goal/Acceptance/body changed, rewrite the whole description and
+  // Contract: when any of Goal/Why/Acceptance/body changed, rewrite the whole description and
   // mirror acceptance into bd's dedicated field so the two homes can't drift. Empty pieces are
   // no-ops server-side (they never clobber the current value), matching the label behavior above.
   const contractChanged =
     draft.goal !== original.goal ||
+    draft.why !== original.why ||
     draft.acceptance !== original.acceptance ||
     draft.body !== original.body;
   if (contractChanged) {
@@ -215,6 +288,18 @@ export function detailsSummary(draft: TicketDraft, deferred: boolean): string {
 /** Whether a draft has any field the dialog would PATCH (drives the Save-disabled state). */
 export function hasTicketChanges(original: TicketDraft, draft: TicketDraft): boolean {
   return Object.keys(diffTicketPatch(original, draft)).length > 0;
+}
+
+/**
+ * Whether saving `draft` would silently drop a `## Why` the ticket already carries. Unlike
+ * Goal/Acceptance, the contract gate deliberately never validates Why (skills/bd/SKILL.md) — nothing
+ * else stops `composeDescription` from omitting an emptied Why and the PATCH landing a ticket that
+ * looks written but has lost its motivation, and can still pass every later approval check. The
+ * dialog refuses the save outright rather than silently keeping the old value or dropping the
+ * section, so clearing Why is always a deliberate, visible choice.
+ */
+export function wouldClearWhy(original: TicketDraft, draft: TicketDraft): boolean {
+  return original.why.trim() !== "" && draft.why.trim() === "";
 }
 
 /**

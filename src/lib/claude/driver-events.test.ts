@@ -99,6 +99,41 @@ describe("consumeLine", () => {
     expect(events.map((e) => e.type)).toEqual(["system", "assistant", "assistant", "result"]);
   });
 
+  it("captures the model that authored the last text-bearing assistant message, not an earlier one", () => {
+    const state = createStreamState();
+    const feed = (raw: unknown) => consumeLine(state, JSON.stringify(raw));
+
+    feed({
+      type: "assistant",
+      message: { model: "claude-haiku-4-5", content: [{ type: "text", text: "first" }] },
+    });
+    feed({
+      type: "assistant",
+      message: { model: "claude-5-2026-09", content: [{ type: "text", text: "second" }] },
+    });
+    // A tool-only turn carries a model too, but it never produced text — it must not overwrite
+    // the model attributed to the last real answer.
+    feed({ type: "assistant", message: { model: "claude-haiku-4-5", content: [{ type: "tool_use", name: "Read" }] } });
+
+    expect(state.lastAssistantModel).toBe("claude-5-2026-09");
+  });
+
+  it("clears the last assistant model when a later text-bearing message omits it", () => {
+    const state = createStreamState();
+    const feed = (raw: unknown) => consumeLine(state, JSON.stringify(raw));
+
+    feed({
+      type: "assistant",
+      message: { model: "claude-haiku-4-5", content: [{ type: "text", text: "first" }] },
+    });
+    // Same message replaces the text but reports no model — must not keep attributing the new
+    // text to the earlier message's model.
+    feed({ type: "assistant", message: { content: [{ type: "text", text: "second" }] } });
+
+    expect(state.lastAssistantText).toBe("second");
+    expect(state.lastAssistantModel).toBeUndefined();
+  });
+
   it("ignores blank lines and non-JSON noise rather than failing the run", () => {
     const state = createStreamState();
     const events: ClaudeEvent[] = [];
@@ -108,5 +143,75 @@ describe("consumeLine", () => {
 
     expect(events).toEqual([]);
     expect(state.transcript).toBe("");
+  });
+});
+
+/**
+ * anton-wjfkn: a session that arms a wake-up, a monitor or a background job on its FINAL message has
+ * not finished — it handed its turn back to something an autonomous ticket run never delivers. The
+ * stream is the only place that intent is visible (the exit code is 0 and the agent emits no
+ * `ANTON-RESULT`), so the state carries what the last message armed and nothing else.
+ */
+describe("consumeLine — the yield-shaped tools the last assistant message armed (anton-wjfkn)", () => {
+  const feedAll = (...lines: unknown[]) => {
+    const state = createStreamState();
+    for (const raw of lines) consumeLine(state, JSON.stringify(raw));
+    return state;
+  };
+  const assistant = (...blocks: unknown[]) => ({ type: "assistant", message: { content: blocks } });
+
+  it("reports nothing for an ordinary session", () => {
+    const state = feedAll(
+      assistant({ type: "text", text: "implemented" }, { type: "tool_use", name: "Edit" }),
+      { type: "result", subtype: "success", result: "ANTON-RESULT: delivered" },
+    );
+    expect(state.pendingYields).toEqual([]);
+  });
+
+  it("names a ScheduleWakeup and a Monitor the last message armed", () => {
+    expect(
+      feedAll(assistant({ type: "tool_use", name: "ScheduleWakeup", input: { delaySeconds: 600 } }))
+        .pendingYields,
+    ).toEqual(["ScheduleWakeup"]);
+    expect(feedAll(assistant({ type: "tool_use", name: "Monitor", input: {} })).pendingYields).toEqual([
+      "Monitor",
+    ]);
+  });
+
+  // The tools that TAKE `run_in_background` are the ordinary foreground ones, so the intent is in the
+  // input rather than the name — and the recorded name says which it was, so the park an operator
+  // reads names the thing the agent actually did.
+  it("names a backgrounded call by its tool and the reason it counts", () => {
+    const state = feedAll(
+      assistant({ type: "tool_use", name: "Bash", input: { command: "bun test", run_in_background: true } }),
+    );
+    expect(state.pendingYields).toEqual(["Bash (run_in_background)"]);
+  });
+
+  it("leaves a FOREGROUND call of the same tool alone", () => {
+    const state = feedAll(assistant({ type: "tool_use", name: "Bash", input: { command: "bun test" } }));
+    expect(state.pendingYields).toEqual([]);
+  });
+
+  // A Monitor armed mid-session and then read is ordinary work; only the message the session ENDED on
+  // says the turn was handed back. So a later message clears an earlier arm.
+  it("keeps only the LAST message's arms, so a monitor that was read clears", () => {
+    const state = feedAll(
+      assistant({ type: "tool_use", name: "Monitor", input: {} }),
+      assistant({ type: "text", text: "the monitor reported green" }),
+      { type: "result", subtype: "success", result: "ANTON-RESULT: delivered" },
+    );
+    expect(state.pendingYields).toEqual([]);
+  });
+
+  it("carries every arm when one message makes several", () => {
+    const state = feedAll(
+      assistant(
+        { type: "text", text: "kicking off the suite" },
+        { type: "tool_use", name: "Bash", input: { command: "bun test", run_in_background: true } },
+        { type: "tool_use", name: "ScheduleWakeup", input: { delaySeconds: 270 } },
+      ),
+    );
+    expect(state.pendingYields).toEqual(["Bash (run_in_background)", "ScheduleWakeup"]);
   });
 });

@@ -6,7 +6,7 @@
  * would quietly drop one of the three.
  */
 import { metered, type InvocationDimensions } from "../../claude-invocations";
-import { formatAntonResult, parseAntonResult } from "../../claude/anton-result";
+import { formatAntonResult, parseAntonResult, type AntonResult } from "../../claude/anton-result";
 import { claudeRouting, runClaude } from "../../claude/driver";
 import { quotaMeterKey } from "../../quota-meter";
 import { appendSessionLog, endSession, setSessionClaudeId, type SessionKind } from "../../sessions";
@@ -14,6 +14,23 @@ import { resolveModel } from "../model-routing";
 import { stepName } from "./resolve";
 import { stepSession, type StepContext } from "./context";
 import type { StepResult } from "./result";
+
+/**
+ * The yield-shaped tools that make this session's exit a STOP rather than a finish (anton-wjfkn), or
+ * `[]`.
+ *
+ * A session that armed one AND still signed off with an `ANTON-RESULT` is not yielding: it said what
+ * it did, and the arm is a leftover the settled ticket is entitled to ignore. It is the SILENT yield
+ * that the harness cannot read any other way — no self-report, and a clean exit 0 that the delivery
+ * gate would otherwise settle as an ordinary empty-tree stall, decided without ever learning the
+ * agent believed it was coming back.
+ */
+function yieldedWithoutResult(
+  pendingYields: string[] | undefined,
+  selfReport: AntonResult | null,
+): string[] {
+  return selfReport ? [] : (pendingYields ?? []);
+}
 
 /**
  * One claude dispatch, with everything a step inherits from the run: the session row + log (opened
@@ -70,7 +87,7 @@ export async function dispatchClaude(
      */
     attribution?: Pick<
       InvocationDimensions,
-      "agentTag" | "promptId" | "promptBodyDigest" | "skillId" | "skillDigest"
+      "agentTag" | "promptId" | "promptBodyDigest" | "skillId" | "skillDigest" | "skillIsDefault"
     >;
   },
 ): Promise<StepResult> {
@@ -146,11 +163,26 @@ export async function dispatchClaude(
     await appendSessionLog(session.logPath, `[anton-result] ${formatAntonResult(selfReport)}\n`).catch(
       () => {},
     );
+    // A session that armed a wake-up on its final message did not finish — it handed its turn back
+    // (anton-wjfkn). Logged here beside the self-report, because the two answer one question between
+    // them and a yielded turn is precisely the case that emits no self-report to log.
+    const yielded = yieldedWithoutResult(result.pendingYields, selfReport);
+    if (yielded.length > 0) {
+      await appendSessionLog(
+        session.logPath,
+        `[yielded] the session ended its turn on ${yielded.join(", ")} with no ANTON-RESULT — ` +
+          `nothing wakes an autonomous ticket session, so this is a stop, not a finish\n`,
+      ).catch(() => {});
+    }
     if (owned) await endSession(ctx.db, ctx.clock, session.sessionId, result.ok ? "done" : "failed");
     return {
       ok: result.ok,
       detail: result.ok ? formatAntonResult(selfReport) : args.failure(result.text),
-      facts: { selfReport, sessionIds: [session.sessionId] },
+      facts: {
+        selfReport,
+        ...(yielded.length > 0 ? { yielded } : {}),
+        sessionIds: [session.sessionId],
+      },
     };
   } catch (e) {
     if (owned) await endSession(ctx.db, ctx.clock, session.sessionId, "failed");

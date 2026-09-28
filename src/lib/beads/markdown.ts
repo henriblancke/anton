@@ -43,6 +43,8 @@ export interface ScannedLine {
   fenced: boolean;
   delimiter: boolean;
   commented: boolean;
+  /** Inside a raw HTML block (`<script>`, `<pre>`, ...) — Markdown renders no structure here. */
+  html: boolean;
   visible: string;
   masked: string;
   heading?: Heading;
@@ -53,6 +55,8 @@ export interface ScannedLine {
 export interface RenderedLine {
   text: string;
   fenced: boolean;
+  /** Inside a raw HTML block (`<script>`, `<pre>`, ...) — Markdown renders no structure here. */
+  html: boolean;
   /** Structural heading markup rather than authored body text. */
   heading: boolean;
 }
@@ -440,6 +444,7 @@ function scanMarkdownUncached(source: string): ScannedLine[] {
       fenced: false,
       delimiter: false,
       commented: false,
+      html: false,
       visible: text,
       masked: text,
       headingRest: false,
@@ -509,11 +514,12 @@ function scanMarkdownParsed(source: string): ScannedLine[] {
   });
   markSetextHeadings(lines);
 
-  return lines.map(({ text, fenced, delimiter, commented, visible, masked, heading, headingRest }) => ({
+  return lines.map(({ text, fenced, delimiter, commented, html, visible, masked, heading, headingRest }) => ({
     text,
     fenced,
     delimiter,
     commented,
+    html,
     visible: fenced || delimiter ? (delimiter ? "" : text) : visible,
     masked,
     headingRest,
@@ -721,6 +727,7 @@ export function renderedLines(raw: string): RenderedLine[] {
     .map((line) => ({
       text: line.visible,
       fenced: line.fenced,
+      html: line.html,
       heading: line.heading !== undefined || line.headingRest,
     }));
 }
