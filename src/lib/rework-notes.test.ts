@@ -577,6 +577,11 @@ describe("reconcileFollowUpDescription", () => {
       { severity: "blocking", location: "src/retry.ts:12", note: "retries on a 4xx" },
     ] as ReviewFinding[],
   };
+  // What `ensureWhy` (rework-notes.ts) writes for `ticket()` and no outcome ids — reused by every
+  // test below that reconciles a description carrying no `## Why` of its own.
+  const WHY_BODY =
+    "## Why\nContinues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome " +
+    "ids, so none carries over as a label here either.";
 
   it("round-trips a generated contract — a frozen first attempt reconciles to exactly the regenerated one", () => {
     expect(reconcileFollowUpDescription(followUpDescription(args), edited)).toBe(
@@ -621,12 +626,13 @@ describe("reconcileFollowUpDescription", () => {
       expect(reconciled).toContain(kept);
     }
     // The section boundary is the contract judge's: the rest of the description is byte-for-byte,
-    // up to the `## Why` this reconcile appends since `authored` carries none of its own.
+    // up to the `## Why` this reconcile inserts right after Goal since `authored` carries none of
+    // its own.
     const contextRest = authored.split("\n\n## Context")[1]!;
     expect(reconciled.split("\n\n## Context")[1]!.startsWith(contextRest)).toBe(true);
-    expect(reconciled.trimEnd().endsWith(
-      "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.",
-    )).toBe(true);
+    // Landed right after Goal — the contract's own order — not appended after Verify, where the
+    // founder never wrote it.
+    expect(reconciled).toContain(`## Goal\nharden the retry\n\n${WHY_BODY}\n\n## Acceptance Criteria`);
   });
 
   it("keeps a Setext-underlined Acceptance heading whole — the underline is the heading, not its body", () => {
@@ -843,19 +849,21 @@ describe("reconcileFollowUpDescription", () => {
   it("appends an Acceptance section to a hand-made bead that has none, keeping what it says", () => {
     const handMade = "## Goal\nharden the retry\n\n## Context\nMade by hand.\n";
     const reconciled = reconcileFollowUpDescription(handMade, edited);
-    expect(reconciled.startsWith("## Goal\nharden the retry\n\n## Context\nMade by hand.")).toBe(true);
     expect(reconciled).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
     expect(reconciled).toContain("or answered with why they don't apply");
-    // The hand-made bead also carries no `## Why` — reconciled onto the end.
-    expect(reconciled.trimEnd().endsWith(
-      "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.",
-    )).toBe(true);
+    expect(reconciled).toContain("Made by hand.");
+    // The hand-made bead also carries no `## Why` — landed right after Goal, ahead of both Context
+    // and the appended Acceptance, the contract's own order.
+    expect(reconciled).toContain(`## Goal\nharden the retry\n\n${WHY_BODY}\n\n## Context`);
+    expect(reconciled.indexOf(WHY_BODY)).toBeLessThan(reconciled.indexOf("## Acceptance Criteria"));
   });
 
   it("closes a fence the hand-made description ends inside before appending — a heading in a fence is literal code to the judge", () => {
     const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n```ts\nretry();";
     const reconciled = reconcileFollowUpDescription(unclosed, edited);
-    expect(reconciled.startsWith(unclosed)).toBe(true);
+    // `## Why` lands right after Goal, ahead of the founder's Context — the rest is untouched.
+    expect(reconciled.startsWith(`## Goal\nharden the retry\n\n${WHY_BODY}\n\n## Context`)).toBe(true);
+    expect(reconciled).toContain("Made by hand:\n```ts\nretry();");
     expect(reconciled).toContain("\nretry();\n```\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
     expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
       "- [ ] Cover the exhausted path.",
@@ -868,7 +876,8 @@ describe("reconcileFollowUpDescription", () => {
   it("closes an HTML comment the hand-made description ends inside before appending — a heading in a comment renders nothing", () => {
     const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand. <!-- todo: finish";
     const reconciled = reconcileFollowUpDescription(unclosed, edited);
-    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled.startsWith(`## Goal\nharden the retry\n\n${WHY_BODY}\n\n## Context`)).toBe(true);
+    expect(reconciled).toContain("Made by hand. <!-- todo: finish");
     expect(reconciled).toContain("finish\n-->\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
     expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toContain(
       "- [ ] Cover the exhausted path.",
@@ -897,7 +906,8 @@ describe("reconcileFollowUpDescription", () => {
     // see, and no retry reconciles a finished bead, so it could never be approved.
     const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n<script>\nretry();";
     const reconciled = reconcileFollowUpDescription(unclosed, edited);
-    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled.startsWith(`## Goal\nharden the retry\n\n${WHY_BODY}\n\n## Context`)).toBe(true);
+    expect(reconciled).toContain("Made by hand:\n<script>\nretry();");
     expect(reconciled).toContain(
       "\nretry();\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
     );
@@ -916,8 +926,10 @@ describe("reconcileFollowUpDescription", () => {
     const hidden = "## Goal\nharden the retry\n\n<script>\n## Acceptance Criteria\n- [ ] hidden";
     const reconciled = reconcileFollowUpDescription(hidden, edited);
     expect(reconciled).toContain("<!-- ## Acceptance Criteria -->\n- [ ] hidden");
+    // `<script>` has no visible heading of its own, so Goal's section runs through the whole block —
+    // `## Why` lands right before the real, appended Acceptance section.
     expect(reconciled).toContain(
-      "- [ ] hidden\n</script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+      `- [ ] hidden\n</script>\n\n${WHY_BODY}\n\n## Acceptance Criteria\n- [ ] Guard the null branch.`,
     );
     // What the judge reads as this bead's acceptance is the request's boxes — the hidden ones are
     // inside the block, above the closer, so no renderer and no reader shows them as criteria.
@@ -946,7 +958,7 @@ describe("reconcileFollowUpDescription", () => {
     const appended = reconcileFollowUpDescription(held, edited);
     expect(appended).toContain("  <!-- ## Acceptance Criteria -->\n  - [ ] stale");
     expect(appended).toContain(
-      "  - [ ] stale\n  </script>\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+      "  - [ ] stale\n  </script>\n\n" + WHY_BODY + "\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
     );
     expect(acceptanceBody(makeBead({ id: "f", description: appended }))).toContain(
       "- [ ] Cover the exhausted path.",
@@ -956,7 +968,9 @@ describe("reconcileFollowUpDescription", () => {
     const custom = "## Goal\ng\n\n<widget>\n## Acceptance Criteria\n- [ ] stale\n";
     const customAppended = reconcileFollowUpDescription(custom, edited);
     expect(customAppended).toContain("<!-- ## Acceptance Criteria -->\n- [ ] stale");
-    expect(customAppended).toContain("- [ ] stale\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(customAppended).toContain(
+      "- [ ] stale\n\n" + WHY_BODY + "\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
     // A persistent block in a list ends with that list. The dedented Acceptance is visible and
     // therefore is the section to replace, not a hidden copy that needs another section appended.
     const dedented = "## Goal\ng\n\n- <script>\n  raw\n## Acceptance Criteria\n- [ ] stale";
@@ -991,7 +1005,9 @@ describe("reconcileFollowUpDescription", () => {
     const blankTerminated = "## Goal\ng\n\n<div>\n## Acceptance Criteria\n- [ ] hidden\n\n";
     const appendedAfterBlock = reconcileFollowUpDescription(blankTerminated, edited);
     expect(appendedAfterBlock).toContain("<!-- ## Acceptance Criteria -->\n- [ ] hidden");
-    expect(appendedAfterBlock).toContain("\n\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    expect(appendedAfterBlock).toContain(
+      "\n\n" + WHY_BODY + "\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
     expect(appendedAfterBlock.match(/^##+ Acceptance/gm)).toHaveLength(1);
 
     // A heading inside a closed raw block must not survive into the description-first contract
@@ -1024,7 +1040,8 @@ describe("reconcileFollowUpDescription", () => {
     // reconciles a finished bead, so it could never be approved.
     const unclosed = "## Goal\nharden the retry\n\n## Context\n- Made by hand:\n  ```ts\n  retry();";
     const reconciled = reconcileFollowUpDescription(unclosed, edited);
-    expect(reconciled.startsWith(unclosed)).toBe(true);
+    expect(reconciled.startsWith(`## Goal\nharden the retry\n\n${WHY_BODY}\n\n## Context`)).toBe(true);
+    expect(reconciled).toContain("- Made by hand:\n  ```ts\n  retry();");
     expect(reconciled).toContain(
       "\n  retry();\n  ```\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
     );
@@ -1111,9 +1128,14 @@ describe("reconcileFollowUpDescription", () => {
       "- [ ] stale",
     ].join("\n");
     const reconciled = reconcileFollowUpDescription(dedentedFence, edited);
-    expect(reconciled).toContain("  ```md\n  old\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    // No other heading exists until the (swapped, not appended) Acceptance section, so Goal's own
+    // section runs through the whole list-contained fence and `## Why` lands right before it.
+    expect(reconciled).toContain(
+      "  ```md\n  old\n\n" + WHY_BODY + "\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
     expect(reconciled).not.toContain("stale");
-    expect(reconciled).not.toMatch(/\n  ```\n\n## Acceptance Criteria/);
+    // No indented closer was added — the dedent itself closes the fence, exactly as `old` left it.
+    expect(reconciled).not.toMatch(/\n  ```\n\n/);
   });
 
   it("keeps a list container across a blank before its nested fence", () => {
@@ -1129,7 +1151,11 @@ describe("reconcileFollowUpDescription", () => {
       "- [ ] stale",
     ].join("\n");
     const reconciled = reconcileFollowUpDescription(separatedFence, edited);
-    expect(reconciled).toContain("  ```md\n  sample\n## Acceptance Criteria\n- [ ] Guard the null branch.");
+    // No other heading exists until the (swapped, not appended) Acceptance section, so Goal's own
+    // section runs through the whole list-contained fence and `## Why` lands right before it.
+    expect(reconciled).toContain(
+      "  ```md\n  sample\n\n" + WHY_BODY + "\n\n## Acceptance Criteria\n- [ ] Guard the null branch.",
+    );
     expect(reconciled).not.toContain("stale");
   });
 
@@ -1196,10 +1222,13 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled).not.toContain("### Grouped");
     expect(reconciled).toContain("## Acceptance Criteria\n- [ ] Guard the null branch.");
     expect(reconciled).toContain("\n\n## Context\nKept.\n\n## Verify\nKept too.");
-    // `repeated` carries no `## Why` of its own, so this reconcile appends one after Verify.
-    expect(reconciled.trimEnd().endsWith(
-      "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.",
-    )).toBe(true);
+    // `repeated` carries no `## Why` of its own — landed right after Goal, ahead of the (swapped)
+    // Acceptance section, the contract's own order.
+    expect(reconciled).toContain(
+      "## Goal\nharden the retry\n\n## Why\nContinues the outcome t1 served; that ticket predates " +
+        "`.product/PRODUCT.md`'s outcome ids, so none carries over as a label here either.\n\n" +
+        "## Acceptance Criteria",
+    );
     // What the contract judge reads as this bead's acceptance is exactly the request's boxes.
     expect(acceptanceBody(makeBead({ id: "f", description: reconciled }))).toBe(
       [

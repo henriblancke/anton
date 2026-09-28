@@ -12,6 +12,7 @@ import {
   ACCEPTANCE_HEADING,
   ACCEPTANCE_KEYS,
   CONTEXT_KEYS,
+  GOAL_KEYS,
   isTicketContractHeading,
 } from "./beads/contract";
 import {
@@ -173,22 +174,36 @@ export function reconcileFollowUpDescription(
 /**
  * Insert a `## Why` section when the half-created bead has none at all — a remnant that predates
  * this requirement, or one a founder made by hand without it ({@link reconcileFollowUpDescription}).
- * Appended after everything else, closing any fence or HTML comment the description ends inside
- * ({@link unterminatedCloser}) exactly as {@link replaceAcceptance}'s own no-section fallback does:
- * that is the one position that needs no fence/HTML-block awareness of its own, since it starts
- * only after every open construct in the (already Acceptance-reconciled) text has been closed.
+ * Landed right after `## Goal`, the contract's own order (skills/bd/SKILL.md: Goal, Why, Acceptance,
+ * Context, Out of scope, Verify) — appending it after Verify instead would leave a normal five-section
+ * bead reading Goal → Acceptance → Context → Out of scope → Verify → Why, an order the founder never
+ * wrote and no later pass straightens out, since the contract judge doesn't score Why's position and
+ * nothing else here ever revisits a bead once it has one.
+ *
+ * A description with no Goal section at all (a remnant even more stripped-down than the usual
+ * half-created follow-up) falls back to appending after everything else, closing any fence or HTML
+ * comment the description ends inside ({@link unterminatedCloser}) exactly as {@link replaceAcceptance}'s
+ * own no-section fallback does.
  *
  * Never touches a Why that IS there, authored or still a placeholder — only the founder should
  * rewrite their own words, and unlike Acceptance and the run-location line, `## Why` is not a
  * section this reconcile owns the content of.
  */
 function ensureWhy(description: string, ticket: Bead, outcomeIds: string[]): string {
-  if (sectionsNamed(scanMarkdown(description), WHY_KEYS).length > 0) return description;
+  const lines = scanMarkdown(description);
+  if (sectionsNamed(lines, WHY_KEYS).length > 0) return description;
+  const whyLines = [`## Why`, followUpWhy(ticket, outcomeIds)];
+  const [goalSection] = sectionsNamed(lines, GOAL_KEYS);
+  if (goalSection) {
+    const texts = lines.map((line) => line.text);
+    const before = withoutTrailingBlank(texts.slice(0, goalSection.end));
+    let after = texts.slice(goalSection.end);
+    while (after.length > 0 && after[0]!.trim() === "") after = after.slice(1);
+    return [...before, ``, ...whyLines, ``, ...after].join("\n");
+  }
   const kept = description.trimEnd();
   const closer = unterminatedCloser(kept);
-  return [kept, ...(closer ? [closer] : []), ``, `## Why`, followUpWhy(ticket, outcomeIds)].join(
-    "\n",
-  );
+  return [kept, ...(closer ? [closer] : []), ``, ...whyLines].join("\n");
 }
 
 /** Named apart from {@link CONTEXT_KEYS} and its kind (beads/contract.ts) because `## Why` is not

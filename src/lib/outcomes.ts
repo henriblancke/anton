@@ -42,10 +42,10 @@ const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
  */
 function outcomesSection(markdown: string): string[] | undefined {
   const lines = renderedLines(markdown);
-  const start = lines.findIndex((line) => OUTCOMES_HEADING.test(line.text.trim()));
+  const start = lines.findIndex((line) => line.heading && OUTCOMES_HEADING.test(line.text.trim()));
   if (start === -1) return undefined;
   const body: string[] = [];
-  for (let i = start + 1; i < lines.length && !HEADING_PATTERN.test(lines[i].text); i++) {
+  for (let i = start + 1; i < lines.length && !(lines[i].heading && HEADING_PATTERN.test(lines[i].text)); i++) {
     body.push(lines[i].text);
   }
   return body;

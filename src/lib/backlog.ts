@@ -4,6 +4,7 @@ import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, loadAllIssues } from "./beads/issues";
+import { scanMarkdown } from "./beads/markdown";
 import {
   activeOutcomeIds,
   outcomesConfigured,
@@ -275,15 +276,20 @@ const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\s*$/i;
  * verbatim ("" for an absent OR a blank-but-present section — those two are NOT the same case to a
  * caller, so `present` carries the distinction). Free text (unlike Goal/Acceptance, "Outcome IDs"
  * is not a section `validateBeadContract` judges), so a plain heading scan rather than the
- * contract's slugged-heading machinery — same shape as `extractSection` in ticket-dialog-utils.ts. */
+ * contract's slugged-heading machinery — same shape as `extractSection` in ticket-dialog-utils.ts.
+ * Uses `scanMarkdown`'s AST-aware heading metadata (`heading?.depth === 2`), not a raw `/^##\s+/`
+ * text test, so a fenced example whose line merely reads `## Outcome IDs` isn't mistaken for the
+ * genuine section. */
 function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
   const lines = description.split("\n");
+  const scanned = scanMarkdown(description);
   const body: string[] = [];
   let inSection = false;
   let present = false;
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
     const trimmed = line.trim();
-    if (/^##\s+/.test(trimmed)) {
+    if (scanned[i]?.heading?.depth === 2) {
       if (inSection) break;
       inSection = OUTCOME_IDS_HEADING.test(trimmed);
       if (inSection) present = true;
