@@ -882,6 +882,7 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
       timeoutMs: 60_000,
       standalone: true,
       ranOutOfTime: true,
+      recoverableWork: false,
     });
     abort.abort();
 
@@ -909,11 +910,86 @@ suite("settleTicketTimeout — a kill after the preserve still owns the board", 
       // A run with other tickets: the preserve refuses before it ever reaches the gates.
       standalone: false,
       ranOutOfTime: true,
+      recoverableWork: false,
     });
     abort.abort();
 
     await expect(settled).resolves.toBeUndefined();
     expect(existsSync(join(repo, "HALF_WRITTEN.md"))).toBe(true);
+  });
+});
+
+// The deadline can fire while `yieldedMidWork`/`refuseStashedDelivery` is still listing or applying
+// stashes, so the `AgentYieldedError`/`StashedWorkError` it throws reaches `settleFailedTicket` with
+// `ranOutOfTime=true` too (PR #333 review). That error already carries the durable record of the
+// work — the ordinary (non-timed-out) recoverable path names the stashes and keeps the worktree — so
+// the timeout must not run its own rollback over the same tree and supersede it with a bare
+// `TicketTimeoutError` that says nothing of the recovery.
+suite("settleTicketTimeout — a recoverable stop is settled by its own path, not the timeout's", () => {
+  let sandbox: string;
+  let repo: string;
+  let logPath: string;
+  let tdb: TestDb;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  const run = (): Omit<StepContext, "tickets"> => ({
+    db: tdb.db,
+    clock: new FixedClock(1_700_000_000_000),
+    ctx: { signal: new AbortController().signal, heartbeat: async () => {}, report: () => {}, claudeReached: async () => {}, jobId: "job-test", type: "execute-epic" },
+    projectId: randomUUID(),
+    runId: randomUUID(),
+    repoPath: repo,
+    worktreePath: repo,
+    branch: BRANCH,
+    baseBranch: "main",
+    baseRef: "origin/main",
+    baseForkSha: "f0f0f0forkcommit",
+    alreadyShippedBase: "f0f0f0forkcommit",
+    target: ticket,
+    settings: {} satisfies ProjectSettings,
+  });
+
+  beforeEach(() => {
+    tdb = makeTestDb();
+    sandbox = mkdtempSync(join(tmpdir(), "anton-settle-recoverable-"));
+    repo = join(sandbox, "repo");
+    logPath = join(sandbox, "session.log");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    g(["checkout", "-q", "-b", BRANCH]);
+  });
+
+  afterEach(() => {
+    tdb.close();
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("does not roll back the tree, and returns instead of throwing a TicketTimeoutError", async () => {
+    const baseline = await readWorktreeState(repo);
+    // Stands in for a stash `yieldedMidWork` already restored into the tree — the exact change a
+    // rollback onto `baseline` would erase.
+    writeFileSync(join(repo, "RESTORED_FROM_STASH.md"), "work a recoverable stop is holding\n");
+
+    const settled = settleTicketTimeout({
+      run: run(),
+      ticket,
+      session: { logPath, sessionId: "sess-1" },
+      baseline,
+      progress: { committed: false, delivered: false, selfReport: null },
+      timeoutMs: 60_000,
+      standalone: true,
+      ranOutOfTime: true,
+      recoverableWork: true,
+    });
+
+    await expect(settled).resolves.toBeUndefined();
+    expect(existsSync(join(repo, "RESTORED_FROM_STASH.md"))).toBe(true);
   });
 });
 
@@ -965,6 +1041,7 @@ suite("settleTicketTimeout — a commit the delivery gate refused is not a deliv
         timeoutMs: 60_000,
         standalone: true,
         ranOutOfTime: true,
+        recoverableWork: false,
       });
     } catch (e) {
       return e as TicketTimeoutError;
@@ -1144,6 +1221,7 @@ suite("settleTicketTimeout — a satisfied step the deadline caught during its b
         // A satisfied step has siblings by definition: an earlier ticket of the same run did its work.
         standalone: false,
         ranOutOfTime: true,
+        recoverableWork: false,
       });
     } catch (e) {
       err = e;
@@ -1262,6 +1340,7 @@ suite("settleTicketTimeout — unmarkable self-committed work stops the run", ()
       timeoutMs: 60_000,
       standalone: true,
       ranOutOfTime: true,
+      recoverableWork: false,
     }).catch((e: unknown) => e);
 
     expect(isPoisonError(err)).toBe(true);

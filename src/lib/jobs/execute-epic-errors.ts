@@ -5,7 +5,7 @@
  * ones — so they live together rather than beside the code that happens to throw them.
  */
 import type { SatisfiedBy } from "../beads/satisfied-note";
-import type { AntonResult } from "../claude/anton-result";
+import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
 
 /**
@@ -43,6 +43,32 @@ function hasRunFailureParts(e: unknown): e is RunFailureParts {
 export function runFailureParts(e: unknown): RunFailureParts {
   if (hasRunFailureParts(e)) return { structural: e.structural, selfReport: e.selfReport };
   return { structural: e instanceof Error ? e.message : String(e), selfReport: null };
+}
+
+/**
+ * Fold the parsed self-report into a failure's rendered message, when one was emitted (anton-j5i8).
+ *
+ * Lives beside the error classes rather than their one-time settle-side caller (anton-wjfkn, PR #333
+ * review) so a class that composes its own `structural` text internally — {@link AgentYieldedError},
+ * which builds it from its own fields rather than taking a pre-built `msg` — can fold this in too. A
+ * caller-side `structural + selfReportSuffix(...)` only reaches classes whose constructor takes the
+ * whole message as an argument.
+ */
+export function selfReportSuffix(selfReport: AntonResult | null): string {
+  if (!selfReport) return "";
+  if (selfReport.outcome === "delivered") {
+    return ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`;
+  }
+  // A satisfied claim only reaches a no-delivery message when the branch did not bear it out
+  // (anton-nuft): the gate settles a verified one before any message is composed.
+  if (selfReport.outcome === "satisfied") {
+    return (
+      ` The agent self-reported ANTON-RESULT: ${formatAntonResult(selfReport)}, but that names no ` +
+      `commit this run's branch added over its base, so the claim is unverified — a false success ` +
+      `on an unchanged tree.`
+    );
+  }
+  return ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
 }
 
 /**
@@ -175,32 +201,45 @@ export class AgentYieldedError extends Error implements RunFailureParts, Recover
     selfReport: AntonResult | null = null,
     /** Which of `stashes` anton tried to reapply and could not — see {@link RecoverableWork}. */
     readonly restoreFailures: readonly string[] = [],
+    /**
+     * The stash LIST READ ITSELF failed (anton-wjfkn, PR #333 review) — `stashes` is `[]` because
+     * nothing could be read, not because nothing was there. A stash this session left could be sitting
+     * on the stack invisible to this error, so the message below must not claim the tree is the only
+     * place to look.
+     */
+    readonly stashReadFailed: boolean = false,
   ) {
     const structural =
       `${ticketId} did not finish: its ${stepId ? `\`${stepId}\` ` : ``}agent ENDED ITS TURN to wait ` +
       `on ${armed.join(", ")} and emitted no \`ANTON-RESULT\` line. Nothing wakes an autonomous ticket ` +
       `session — anton reads one final message and settles the ticket on it — so the agent stopped ` +
       `mid-work while the session exited cleanly. ` +
-      (stashes.length > 0
-        ? `It had set its own work aside first: ${stashes.map((s) => `\`${s}\``).join(", ")} on the ` +
-          `stash stack. ` +
-          (restoreFailures.length === 0
-            ? `anton restored it into the worktree and KEPT this worktree rather than removing it, so ` +
-              `the change survives. `
-            : restoreFailures.length === stashes.length
-              ? `anton could NOT restore ${stashes.length === 1 ? "it" : "any of it"} back into the ` +
-                `worktree (the tree has moved under ${stashes.length === 1 ? "it" : "them"}), so the ` +
-                `stash ${stashes.length === 1 ? "commit is" : "commits are"} the only copy; anton KEPT ` +
-                `this worktree rather than removing it. `
-              : `anton restored ${stashes.length - restoreFailures.length} of ${stashes.length} back ` +
-                `into the worktree and could not apply ` +
-                `${restoreFailures.map((s) => `\`${s}\``).join(", ")}; every entry is still on the ` +
-                `stash stack, and anton KEPT this worktree rather than removing it. `)
-        : `Whatever it had built is loose in the run's worktree, which anton KEPT rather than removed. `) +
+      (stashReadFailed
+        ? `Whether it set anything aside first is UNKNOWN: reading the worktree's stash list failed, ` +
+          `so a stash this session left could be sitting on the stack, invisible to this error. anton ` +
+          `KEPT the worktree rather than removing it either way — check \`git stash list\` in it by ` +
+          `hand before assuming the tree is the only copy. `
+        : stashes.length > 0
+          ? `It had set its own work aside first: ${stashes.map((s) => `\`${s}\``).join(", ")} on the ` +
+            `stash stack. ` +
+            (restoreFailures.length === 0
+              ? `anton restored it into the worktree and KEPT this worktree rather than removing it, so ` +
+                `the change survives. `
+              : restoreFailures.length === stashes.length
+                ? `anton could NOT restore ${stashes.length === 1 ? "it" : "any of it"} back into the ` +
+                  `worktree (the tree has moved under ${stashes.length === 1 ? "it" : "them"}), so the ` +
+                  `stash ${stashes.length === 1 ? "commit is" : "commits are"} the only copy; anton ` +
+                  `KEPT this worktree rather than removing it. `
+                : `anton restored ${stashes.length - restoreFailures.length} of ${stashes.length} back ` +
+                  `into the worktree and could not apply ` +
+                  `${restoreFailures.map((s) => `\`${s}\``).join(", ")}; every entry is still on the ` +
+                  `stash stack, and anton KEPT this worktree rather than removing it. `)
+          : `Whatever it had built is loose in the run's worktree, which anton KEPT rather than ` +
+            `removed. `) +
       `Blocking the ticket and halting the epic — the work is unverified and uncommitted, so settling ` +
       `it either way would be a guess. Checks must run in the FOREGROUND; resume the run (with a ` +
       `raised ticketTimeoutMinutes if the agent yielded to wait out a long one).`;
-    super(structural);
+    super(structural + selfReportSuffix(selfReport));
     this.name = "PoisonError"; // classified as poison by the runner
     this.structural = structural;
     this.selfReport = selfReport;

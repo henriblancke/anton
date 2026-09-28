@@ -318,6 +318,34 @@ describe("a yielded turn is its own outcome, not a clean exit (anton-wjfkn)", ()
     expect(err.message).not.toContain("so the change survives");
   });
 
+  // The final `git stash list` read can itself fail (PR #333 review, round 2): `stashes` is then `[]`
+  // for lack of a read, not because there was nothing there. The message must say so rather than
+  // claim the tree is the only place to look — the false version is what a caller would get by
+  // silently catching the read failure into `[]`.
+  it("says the stash list is unknown rather than claiming the tree is all there is, when its read failed", () => {
+    const err = new AgentYieldedError(TICKET.id, ["Monitor"], [], "implement", null, [], true);
+
+    expect(err.message).toContain("UNKNOWN");
+    expect(err.message).toContain("git stash list");
+    expect(err.message).not.toContain("loose in the run's worktree");
+    expect(err.stashes).toEqual([]);
+    expect(err.stashReadFailed).toBe(true);
+    expect(holdsRecoverableWork(err)).toBe(true);
+  });
+
+  // Unlike `StashedWorkError` (whose caller mixes the suffix into the message it passes in), this
+  // class builds its own message internally — so the self-report has to be folded in by the
+  // constructor itself, or it is dropped from `err.message`/`job.error` entirely (PR #333 review).
+  it("folds the agent's self-report into its own message, not just onto `.selfReport`", () => {
+    const err = new AgentYieldedError(TICKET.id, ["Monitor"], [], "implement", {
+      outcome: "blocked",
+      reason: "needs review",
+    });
+
+    expect(err.message).toContain("self-reported");
+    expect(err.message).toContain("needs review");
+  });
+
   /**
    * The one question the worktree teardown asks. Both classes hold uncommitted work, so a
    * `--force` release over either is how a recoverable stop becomes lost work — and neither
@@ -341,11 +369,12 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
     kind: "stashed-work" | "agent-yielded",
     stashes: string[] = [],
     restoreFailures: string[] = [],
+    selfReport: TicketProgress["selfReport"] = null,
   ) =>
     ticketBlockNote({
       ticketId: TICKET.id,
       kind,
-      selfReport: null,
+      selfReport,
       sessionId: "sess-1",
       branch: "anton/anton-wjfkn",
       committed: false,
@@ -353,6 +382,19 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
       restoreFailures,
       worktreePath: "/tmp/anton-worktrees/wjfkn",
     });
+
+  // Dropped from this note before this test existed (PR #333 review): a self-report an earlier
+  // dispatching step already produced — before a LATER step yielded, or before the commit step found
+  // the stashed-empty tree — is exactly the account an operator reading `bd show <id>` wants, and this
+  // bead is where they meet the stop. The run row's own `error` ages out of attention long before it.
+  it("carries the agent's self-report, same as the zero-diff notes already do", () => {
+    for (const kind of ["stashed-work", "agent-yielded"] as const) {
+      const text = note(kind, [SHA_A], [], { outcome: "blocked", reason: "hit a coverage floor" });
+
+      expect(text).toContain("self-reported");
+      expect(text).toContain("hit a coverage floor");
+    }
+  });
 
   it("names the stash shas, the worktree, and the recovery commands", () => {
     const text = note("stashed-work", [SHA_A]);

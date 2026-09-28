@@ -20,6 +20,7 @@ import {
   BlockedByAgentError,
   NeedsHumanError,
   NoDeliveryError,
+  selfReportSuffix,
   StashedWorkError,
 } from "./execute-epic-errors";
 import {
@@ -33,7 +34,6 @@ import {
 } from "./execute-epic-ticket-bookends";
 import { resilientClaude } from "./execute-epic-ticket-claude";
 import {
-  selfReportSuffix,
   settleFailedTicket,
   ticketSettlement,
   type TicketProgress,
@@ -580,10 +580,19 @@ async function yieldedMidWork(
   progress: TicketProgress,
   stash: StashRecovery,
 ): Promise<AgentYieldedError> {
-  // Deliberately NOT caught into `[]` (PR #333 review): a read failure here is not "stashed
-  // nothing" — reporting it as such would tell the operator the work is loose in the tree when a
-  // stash they cannot see might hold it instead. Let it propagate to the ticket's own catch.
-  const stashed = await stash.gained();
+  // NOT read as "stashed nothing" on a read failure (PR #333 review, round 2): a raw rejection
+  // escaping this function would reach the walk's catch as a plain `Error`, which
+  // `holdsRecoverableWork` does not recognise — the run's teardown would then read this stop as
+  // ordinary failure residue and force-remove the very worktree this recovery exists to keep. Caught
+  // instead, so the stop still comes back as a RECOVERABLE `AgentYieldedError`, one that says plainly
+  // it does not know whether a stash exists rather than falsely claiming there is none.
+  let stashed: readonly StashEntry[] = [];
+  let stashReadFailed = false;
+  try {
+    stashed = await stash.gained();
+  } catch {
+    stashReadFailed = true;
+  }
   const recovery =
     stashed.length > 0 ? await recoverStashed(stashed, stash) : { restored: [], failed: [], summary: "" };
   return new AgentYieldedError(
@@ -593,6 +602,7 @@ async function yieldedMidWork(
     stepId,
     progress.selfReport,
     recovery.failed,
+    stashReadFailed,
   );
 }
 

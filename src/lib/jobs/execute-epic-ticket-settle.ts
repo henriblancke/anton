@@ -19,7 +19,7 @@ import { blockNoteEvidence } from "../beads/block-note";
 import { swapUnderLock } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { shortSha, type SatisfiedBy } from "../beads/satisfied-note";
-import { formatAntonResult, type AntonResult } from "../claude/anton-result";
+import type { AntonResult } from "../claude/anton-result";
 import {
   describeCommit,
   preservedCommitPrefix,
@@ -40,6 +40,7 @@ import {
   ParkedOnPrereqError,
   ReorderedOnPrereqError,
   RepairedBlockError,
+  selfReportSuffix,
   StashedWorkError,
   TicketRetiredError,
   TicketTimeoutError,
@@ -233,6 +234,7 @@ export async function settleFailedTicket(args: {
     timeoutMs,
     standalone,
     ranOutOfTime,
+    recoverableWork: kinds.recoverableWork,
   });
   await settleAbortedTicket({ run, ticket, session, e });
   // Attempted only AFTER the abort path has had its say: a ticket someone killed or abandoned is
@@ -375,8 +377,16 @@ export async function settleTicketTimeout(args: {
   timeoutMs: number;
   standalone: boolean;
   ranOutOfTime: boolean;
+  /**
+   * The deadline's own failure is a `StashedWorkError`/`AgentYieldedError` (anton-wjfkn, PR #333
+   * review): the ticket's stop already carries uncommitted work the caller's own recoverable-work
+   * path knows how to settle — name the stashes, keep the worktree, never touch the tree. Passed by
+   * the caller (which already classifies `e` for its own session log) rather than derived from an
+   * `e` this function would otherwise need to accept just to ask.
+   */
+  recoverableWork: boolean;
 }): Promise<void> {
-  const { run, ticket, session, baseline, timeoutMs, standalone, ranOutOfTime } = args;
+  const { run, ticket, session, baseline, timeoutMs, standalone, ranOutOfTime, recoverableWork } = args;
   const { ctx, worktreePath, branch } = run;
   const repo = run.repoPath;
   const { logPath } = session;
@@ -388,7 +398,14 @@ export async function settleTicketTimeout(args: {
   const { committed, delivered } = args.progress;
   // `!ctx.signal.aborted` breaks the tie when both fired: an operator's kill outranks the budget,
   // and the abort path is the one that writes nothing to a board a human is deciding on.
-  if (ranOutOfTime && !ctx.signal.aborted) {
+  //
+  // `!recoverableWork` breaks a second tie the same way (PR #333 review): the deadline can fire while
+  // `yieldedMidWork`/`refuseStashedDelivery` is still listing or applying stashes, and the resulting
+  // error's OWN `holdsRecoverableWork` handling — reached via the caller's ordinary fall-through to
+  // `releaseFailedTicket` — already names the stashes and keeps the worktree. Falling into the
+  // rollback below instead would hard-reset the tree onto `baseline` and erase what that recovery
+  // just restored, then supersede the error with a bare `TicketTimeoutError` that says nothing of it.
+  if (ranOutOfTime && !ctx.signal.aborted && !recoverableWork) {
     // A delivery with no commit of its own is a SATISFIED step the deadline caught between the
     // gate's acceptance and its close (PR #253 review). Settled here exactly as the close would have
     // — resolved against the repository — so the run's ledger and the bead both learn which commit
@@ -1002,24 +1019,6 @@ async function blockFailedTicket(args: {
   );
 }
 
-/** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
-export function selfReportSuffix(selfReport: AntonResult | null): string {
-  if (!selfReport) return "";
-  if (selfReport.outcome === "delivered") {
-    return ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`;
-  }
-  // A satisfied claim only reaches a no-delivery message when the branch did not bear it out
-  // (anton-nuft): the gate settles a verified one before any message is composed.
-  if (selfReport.outcome === "satisfied") {
-    return (
-      ` The agent self-reported ANTON-RESULT: ${formatAntonResult(selfReport)}, but that names no ` +
-      `commit this run's branch added over its base, so the claim is unverified — a false success ` +
-      `on an unchanged tree.`
-    );
-  }
-  return ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
-}
-
 /**
  * How much of an agent's reason (or a failure's error text) one block note may carry. The note is a
  * board-level summary, not a transcript: enough to decide from, and bounded so a runaway message
@@ -1117,6 +1116,7 @@ export function ticketBlockNote(args: {
               args.stashes ?? [],
               args.restoreFailures ?? [],
               args.worktreePath,
+              selfReport,
             )
           : `run failed after committing work — needs review.` +
             (failure ? ` It failed with: ${failure}` : "");
@@ -1159,6 +1159,14 @@ function recoverableWorkBody(
   stashes: readonly string[],
   restoreFailures: readonly string[],
   worktreePath: string | undefined,
+  /**
+   * The agent's own self-report, when it emitted one (PR #333 review): dropped from this body before
+   * this parameter existed, even though the `no-delivery` and `agent-blocked` bodies both carry
+   * theirs — the one place an operator reading `bd show <id>` could see what the agent last claimed,
+   * for a stop whose run-row `error` (where `AgentYieldedError`/`StashedWorkError` otherwise put it)
+   * ages out of attention long before the bead does.
+   */
+  selfReport: AntonResult | null,
 ): string {
   const where = worktreePath ? ` in \`${worktreePath}\`` : ``;
   const restoredCount = stashes.length - restoreFailures.length;
@@ -1192,7 +1200,8 @@ function recoverableWorkBody(
     stashClause +
     ` Nothing was verified or committed, so this is no delivery — recover the change there, then ` +
     `finish the ticket by hand, or reopen it (\`bd update ${ticketId} --status open\` — this block ` +
-    `left it \`blocked\`, which the claim gate refuses) before resuming the run.`
+    `left it \`blocked\`, which the claim gate refuses) before resuming the run.` +
+    selfReportSuffix(selfReport)
   );
 }
 
