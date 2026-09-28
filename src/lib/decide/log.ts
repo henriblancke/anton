@@ -256,20 +256,26 @@ const isJudgmentEvidence = and(
  * Also scoped to the CURRENT backend/model version: a row records both specifically to pin trust to
  * the model that earned it, so a point re-pointed at a new backend or model must be judged only on
  * what that one has produced, never on its predecessor's record. The cohort pair is read off the
- * newest MODEL-ATTRIBUTED row (`backend` not null) regardless of settlement OR answer validity — a
- * model that just took over may have produced only unsettled decisions yet, and gating this lookup
- * on `isJudgmentEvidence` too would keep reading the predecessor's backend/model as "current" for
- * the whole window it takes the first new decision to settle, which is exactly the stale-agreement
- * window a promotion to `auto` must not be based on. Requiring a non-null `answer` here has the same
- * effect for a replacement model that is failing every call: `decide()` still attributes the attempt
- * (`backend`/`modelVersion`) to an invalid answer, but the row's `answer` stays null, and gating on
- * it would keep the predecessor as "current" for as long as the replacement keeps failing (PR #332
- * review) — the one case where "current" most needs to reflect what is actually running. A hard rule
- * has neither backend nor model (it is deterministic, not model trust), so rule-produced rows are
- * kept as evidence unconditionally — unscoped by cohort, never filtered out — while model-produced
- * rows are still restricted to the current cohort; reading the cohort off the newest row of any kind
- * would let an exceptional rule hit go unscoped instead and fold in a predecessor model's whole
- * history.
+ * newest MODEL-ATTRIBUTED row that also carries a `modelVersion` (not just `backend`) regardless of
+ * settlement OR answer validity — a model that just took over may have produced only unsettled
+ * decisions yet, and gating this lookup on `isJudgmentEvidence` too would keep reading the
+ * predecessor's backend/model as "current" for the whole window it takes the first new decision to
+ * settle, which is exactly the stale-agreement window a promotion to `auto` must not be based on.
+ * Requiring a non-null `answer` here has the same effect for a replacement model that is failing
+ * every call: `decide()` still attributes the attempt (`backend`/`modelVersion`) to an invalid
+ * answer, but the row's `answer` stays null, and gating on it would keep the predecessor as
+ * "current" for as long as the replacement keeps failing (PR #332 review) — the one case where
+ * "current" most needs to reflect what is actually running. But a driver-level failure BEFORE any
+ * model is identified (timeout, abort, stall — claude-local.ts's outer `catch`) attributes only
+ * `backend`, never `modelVersion`; such a row is excluded from the cohort candidates entirely
+ * rather than read as "the current cohort has no model", because the latter makes `cohortFilter`
+ * `undefined` below and drops cohort scoping altogether, folding every predecessor model's
+ * settled rows back in — exactly the cross-model bleed this scoping exists to prevent (PR #332
+ * review). A hard rule has neither backend nor model (it is deterministic, not model trust), so
+ * rule-produced rows are kept as evidence unconditionally — unscoped by cohort, never filtered
+ * out — while model-produced rows are still restricted to the current cohort; reading the cohort
+ * off the newest row of any kind would let an exceptional rule hit go unscoped instead and fold in
+ * a predecessor model's whole history.
  */
 export async function agreement(
   db: AntonDb,
@@ -309,7 +315,13 @@ export async function agreement(
   const [modelCohort] = await db
     .select({ backend: schema.decisions.backend, modelVersion: schema.decisions.modelVersion })
     .from(schema.decisions)
-    .where(and(pointScope, isNotNull(schema.decisions.backend)))
+    .where(
+      and(
+        pointScope,
+        isNotNull(schema.decisions.backend),
+        isNotNull(schema.decisions.modelVersion),
+      ),
+    )
     .orderBy(desc(schema.decisions.decidedAt), rowidDesc)
     .limit(1);
 

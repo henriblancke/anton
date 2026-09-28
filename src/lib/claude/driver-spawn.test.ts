@@ -35,11 +35,11 @@ describe("buildClaudeArgs", () => {
     expect(args).not.toContain("--append-system-prompt-file");
   });
 
-  it("omits disallowedTools/settingSources when empty, but always emits allowedTools once passed", () => {
+  it("omits allowedTools/disallowedTools/settingSources when passed as empty lists", () => {
     const args = buildClaudeArgs({ allowedTools: [], disallowedTools: [], settingSources: [] });
+    expect(args).not.toContain("--allowedTools");
     expect(args).not.toContain("--disallowedTools");
     expect(args).not.toContain("--setting-sources");
-    expect(flag(args, "--allowedTools")).toBe("");
   });
 
   it("joins list flags on commas and passes the system prompt as a file, never inline", () => {

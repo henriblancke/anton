@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { makeTestDb, type TestDb } from "../db/testing";
-import { decide, type ModelAnswer } from "./index";
+import { decide, ModelCallError, type ModelAnswer } from "./index";
 import type { DecisionPoint } from "./points";
 import {
   DECISION_AGREEMENT_WINDOW,
@@ -414,6 +414,38 @@ describe("replay — agreement(point)", () => {
     // claude-4's disagreement must not bleed back in just because claude-5 has not produced a valid,
     // settleable answer yet — the point reads as unmeasured, not as its predecessor's record.
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 0, agreed: 0 });
+  });
+
+  it("does not let a driver failure with no modelVersion unscope the model cohort", async () => {
+    // Two models back, a disagreement.
+    const oldestId = await recordShadow(ANSWER({ modelVersion: "claude-3" }));
+    await settleDecision(test.db, clock, oldestId, { operatorAnswer: "decline" });
+    nowMs += 60_000;
+
+    // Re-pointed at the next model, which agreed.
+    const priorId = await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    await settleDecision(test.db, clock, priorId, { operatorAnswer: "fix" });
+    nowMs += 60_000;
+
+    // Re-pointed again at a replacement that fails before any modelVersion is known —
+    // claude-local.ts's outer `catch` throws exactly this shape (timeout/abort/stall), so decide()'s
+    // fallback attributes `backend` alone. This must not read as "the cohort has no model" and drop
+    // cohort scoping entirely: the last known cohort is still claude-4, and claude-3's disagreement
+    // must stay excluded even though it is inside the raw window (PR #332 review).
+    const result = await decide({
+      point: POINT,
+      state: {},
+      mode: "shadow",
+      ask: async () => {
+        throw new ModelCallError("driver timed out", { backend: "claude-local" });
+      },
+    });
+    expect(result.answer).toBeUndefined();
+    expect(result.modelVersion).toBeUndefined();
+    await recordDecision(test.db, clock, { result, point: POINT, state: {} });
+
+    // Only claude-4's settled agreement counts; claude-3's disagreement stays out of scope.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
   });
 
   it("leaves a rule-decided point unscoped — a hard rule has no model version to pin trust to", async () => {

@@ -106,7 +106,22 @@ function validate(point: DecisionPoint): void {
   }
 }
 
-const registry = new Map<string, DecisionPoint>();
+/**
+ * On `globalThis`, not module scope: Next compiles `instrumentation.ts` (where a job step's own
+ * module runs and calls {@link definePoint} as a side effect of being imported) and the app layer
+ * (RSC pages, route handlers — the Settings page, `project-settings.ts`'s PATCH validator) into
+ * SEPARATE module registries, so a plain `new Map()` here would give each graph its own empty copy
+ * — exactly the split `service-runner.ts`'s `STATE_KEY` documents and works around for the job
+ * runner singleton. Only the instrumentation side ever imports a point-defining module, so it is the
+ * only side that ever calls `definePoint`; the app layer only reads what is already there by the
+ * time a request arrives, since `instrumentation.ts` runs once at server boot, before any request.
+ */
+const REGISTRY_KEY = Symbol.for("anton.decide.points");
+
+function registry(): Map<string, DecisionPoint> {
+  const global = globalThis as unknown as Record<symbol, Map<string, DecisionPoint> | undefined>;
+  return (global[REGISTRY_KEY] ??= new Map());
+}
 
 /**
  * Validates and registers a decision point. Throws on a bad shape or a duplicate id — both are
@@ -114,19 +129,19 @@ const registry = new Map<string, DecisionPoint>();
  */
 export function definePoint(point: DecisionPoint): DecisionPoint {
   validate(point);
-  if (registry.has(point.id)) {
+  if (registry().has(point.id)) {
     throw new Error(`decide: duplicate decision point id "${point.id}"`);
   }
-  registry.set(point.id, point);
+  registry().set(point.id, point);
   return point;
 }
 
 export function getPoint(id: string): DecisionPoint | undefined {
-  return registry.get(id);
+  return registry().get(id);
 }
 
 export function listPoints(): readonly DecisionPoint[] {
-  return [...registry.values()];
+  return [...registry().values()];
 }
 
 /**
@@ -141,8 +156,9 @@ export function narrowState(point: DecisionPoint, state: DecisionState): Decisio
   return picked;
 }
 
-/** Test-only: the registry is a module-level singleton, so suites that define points need a way to
- * clear it between runs instead of leaking into one another. */
+/** Test-only: the registry is a process-wide singleton (`globalThis`, so it survives Next's
+ * instrumentation/app-layer module split — see the field's own doc comment), so suites that define
+ * points need a way to clear it between runs instead of leaking into one another. */
 export function resetRegistryForTests(): void {
-  registry.clear();
+  registry().clear();
 }
