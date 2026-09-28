@@ -1108,3 +1108,97 @@ export const runAttempts = sqliteTable(
     index("run_attempts_run_idx").on(table.runId, table.attempt),
   ],
 );
+
+/**
+ * THE DECISION LOG (anton-q5ixf): one append-only row per `decide()` call, plus the operator's own
+ * answer to the same question whenever it arrives.
+ *
+ * It exists because `shadow` mode has no other product. A point in shadow computes exactly the answer
+ * `auto` would have acted on and then acts on nothing — so unless the answer is written down beside
+ * what the operator actually did, nothing measures whether the point is trustworthy, and the only way
+ * to promote one would be to guess. Every row is therefore half of a pair: the decision at the moment
+ * it was made, and later `operator_answer` — the settle. Agreement is the fold over settled pairs
+ * (`agreement`, decide/log.ts).
+ *
+ * The decision half is never revised. A row records what was decided with the information of that
+ * instant, so a re-decision writes a NEW row rather than touching the previous one — the same
+ * append-only rule as `claude_invocations` and `run_attempts`, and for the same reason: a row is only
+ * ever true of the call that produced it.
+ *
+ * `answer` and `operator_answer` hold JSON-encoded `AnswerValue`s (string | number | boolean) rather
+ * than raw text, so the three question shapes round-trip through one column and agreement can compare
+ * them as a plain string equality — `1` and `"1"` are different answers and must not read as the same
+ * one.
+ */
+export const decisions = sqliteTable(
+  "decisions",
+  {
+    id: text("id").primaryKey(),
+    /**
+     * The project the decision was made for. NOT a foreign key, like `run_attempts` and unlike most
+     * of this schema: the log write is best-effort (`recordDecision` swallows), and a reference the
+     * writer cannot satisfy is one more way for it to reject a row about a decision that really
+     * happened. Null for a decision made outside any project.
+     */
+    projectId: text("project_id"),
+    /** The registered `DecisionPoint.id` this row answers — what `agreement` is measured per. */
+    point: text("point").notNull(),
+    /** The `DecisionMode` in force for this call, which is what makes `acted` legible. */
+    mode: text("mode").notNull(),
+    /** `DecidedBy`: `rule` | `model` | `fallback`. */
+    decidedBy: text("decided_by").notNull(),
+    /**
+     * The decided answer, JSON-encoded. NULL means decide() produced NO answer — `off` mode, or a
+     * fallback to a human — which is never an answer of any kind and so is excluded from agreement
+     * outright: a backend that times out all week is a broken backend, not a point that disagrees
+     * with its operator.
+     */
+    answer: text("answer"),
+    confidence: real("confidence").notNull(),
+    /** Per-option probabilities as JSON, for `choice`/`yes-no` backends that report them. */
+    distribution: text("distribution"),
+    backend: text("backend"),
+    /** Pinned, not derived: a promotion is earned by a specific model, never by its successor. */
+    modelVersion: text("model_version"),
+    /**
+     * A digest of the state the point actually sent (`decisionInputHash`) — narrowed by the point's
+     * own `stateFields` before it is hashed, so the log carries no more of the caller's state than
+     * the backend saw. Hashed rather than stored: the inputs are unbounded untrusted text (a PR
+     * comment, a bead body), and this column is only ever compared for equality.
+     */
+    inputHash: text("input_hash").notNull(),
+    /** What was TAKEN, not what was answered: true only where mode was `auto` and the threshold held. */
+    acted: integer("acted", { mode: "boolean" }).notNull(),
+    /** Why a hard rule fired, or why a fallback was taken — carried so a row explains itself. */
+    reason: text("reason"),
+    decidedAt: ts("decided_at").notNull().default(now),
+    /**
+     * What the operator's own answer to this question turned out to be, JSON-encoded in the same
+     * vocabulary as `answer`. NULL while unsettled, which is the state most rows are in at any moment
+     * — agreement counts settled pairs and never guesses at an open one.
+     */
+    operatorAnswer: text("operator_answer"),
+    /**
+     * The act that produced that answer, in the caller's own vocabulary (`fix`, `park`, `release`) —
+     * kept beside `operator_answer` for the reason `picker_verdicts.action` sits beside its verdict:
+     * the affordance and the answer it implies are different facts, and only the answer is evidence.
+     */
+    operatorAction: text("operator_action"),
+    /**
+     * How it turned out afterwards, in the caller's own vocabulary. Separate from the settle because
+     * it is knowable later — the operator's choice and whether that choice worked out are two
+     * observations, sometimes days apart ({@link recordDecisionOutcome}).
+     */
+    outcome: text("outcome"),
+    /** When the operator's answer was recorded. NULL exactly when `operator_answer` is. */
+    settledAt: ts("settled_at"),
+  },
+  (table) => [
+    // The one read this table has: a point's newest decisions, which the agreement fold then narrows
+    // to the settled ones. `decided_at` trails `point` because the point is always an equality
+    // predicate and the window is a range — the reverse order would leave the seek to the range. A
+    // project narrowing filters within one point's rows rather than earning its own index: a single
+    // point's log is small, and a second index on a table this write-light is pure tax.
+    index("decisions_point_idx").on(table.point, table.decidedAt),
+  ],
+);

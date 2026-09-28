@@ -115,6 +115,18 @@ export function listPoints(): readonly DecisionPoint[] {
   return [...registry.values()];
 }
 
+/**
+ * The untrusted-text boundary (anton-528bw): the subset of `state` a point declared, and the only
+ * shape that ever leaves the process. Lives here rather than in decide() because it is a property of
+ * the POINT — the decision log hashes the same narrowing (`decisionInputHash`, log.ts), and two
+ * copies of the rule would let a row claim a digest over state the backend never saw.
+ */
+export function narrowState(point: DecisionPoint, state: DecisionState): DecisionState {
+  const picked: Record<string, unknown> = {};
+  for (const field of point.stateFields) picked[field] = state[field];
+  return picked;
+}
+
 /** Test-only: the registry is a module-level singleton, so suites that define points need a way to
  * clear it between runs instead of leaking into one another. */
 export function resetRegistryForTests(): void {

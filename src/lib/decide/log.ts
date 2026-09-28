@@ -1,0 +1,345 @@
+/**
+ * THE DECISION LOG (anton-q5ixf): write every decide() call down, learn later what the operator did
+ * about the same question, and fold the settled pairs into one number per point.
+ *
+ * This is what makes shadow mode worth running. A point in shadow computes exactly the answer `auto`
+ * would have acted on and then acts on nothing (decide/index.ts), so the only evidence it ever
+ * produces is the comparison between that answer and the operator's own — and that comparison only
+ * exists if both halves are recorded. {@link recordDecision} writes the first half at decision time;
+ * {@link settleDecision} writes the second whenever the operator's answer becomes known, which is
+ * usually a different request and sometimes a different day. {@link agreement} is the fold.
+ *
+ * Three rules the fold has to get right, or it inverts:
+ *
+ *   • AN UNSETTLED ROW IS NOT A DISAGREEMENT. Most rows are unsettled at any moment — nobody has
+ *     answered yet. Counting them would drive every point's agreement toward zero as it is used.
+ *   • NO ANSWER IS NOT AN ANSWER. A row decide() produced no answer for (`off`, or a fallback to a
+ *     human) settles nothing about the point's judgment: a backend that times out all week is a
+ *     broken backend, not a point that disagrees with its operator. Such rows are excluded in the
+ *     QUERY, before the window applies, for the reason `pickerTrackRecord` narrows in its own — a
+ *     point whose backend was down through a whole window would otherwise fetch nothing but
+ *     answerless rows, filter them all away, and report an EMPTY record over a log that has real
+ *     pairs to weigh one row past the limit.
+ *   • THE WINDOW ROLLS. Only the newest {@link DECISION_AGREEMENT_WINDOW} settled rows count, so a
+ *     point re-pointed at a new backend or a new model is not judged forever by the record of the one
+ *     it replaced.
+ *
+ * db-injectable, like `picker-veto` and `escalations`: a job and its tests share one connection, and
+ * the UI read path goes through the shared anton.db.
+ */
+import { createHash, randomUUID } from "node:crypto";
+import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
+import { getDb, schema } from "../db";
+import { toEpoch } from "../db/epoch";
+import type { AntonDb, Clock } from "../jobs/queue";
+import type { DecideResult } from "./index";
+import { narrowState, type AnswerValue, type DecisionPoint, type DecisionState } from "./points";
+
+/**
+ * How many settled decisions a point's agreement is measured over.
+ *
+ * Thirty, matching `EARNED_AUTONOMY_WINDOW`: the same question is being asked (has this judgment
+ * earned the operator's trust lately), so the two surfaces should not disagree about how much
+ * "lately" is. Big enough that a single disagreement does not swing the figure, small enough that a
+ * point fixed last week can show it.
+ */
+export const DECISION_AGREEMENT_WINDOW = 30;
+
+/**
+ * A digest of the state a point actually sent — narrowed by the point's own `stateFields` first, so
+ * the log never carries a claim about state the backend did not see ({@link narrowState}).
+ *
+ * Hashed rather than stored: the inputs are unbounded untrusted text (a PR comment, a bead body), and
+ * the column is only ever compared for equality — two decisions over the same input, or a re-decision
+ * after the input moved.
+ *
+ * Key order is sorted before hashing, because a point's `stateFields` order is a declaration detail
+ * and an object's own key order is an accident of how a caller built it: the same inputs must digest
+ * identically either way, or a re-decision over unchanged state would look like a new input. Values
+ * go through `JSON.stringify`, and a value that cannot be encoded (a cycle, a BigInt) is recorded as
+ * the marker `\u0000unencodable` rather than throwing — a log write must not be the thing that fails a
+ * decision, and an input nobody can serialize is still an input that differs from an absent one.
+ */
+export function decisionInputHash(point: DecisionPoint, state: DecisionState): string {
+  const narrowed = narrowState(point, state);
+  const hash = createHash("sha256");
+  for (const key of Object.keys(narrowed).sort()) {
+    hash.update(`${key}\u0000${encodeValue(narrowed[key])}\u0000`);
+  }
+  return hash.digest("hex").slice(0, 32);
+}
+
+function encodeValue(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? "null";
+  } catch {
+    return "\u0000unencodable";
+  }
+}
+
+/**
+ * An answer as the log stores it: JSON, so the three question shapes round-trip through one column
+ * and agreement can compare them as plain string equality. `1` and `"1"` are different answers and
+ * must never read as the same one — which is exactly what storing the raw value as text would do.
+ */
+function encodeAnswer(value: AnswerValue | undefined): string | null {
+  return value === undefined ? null : JSON.stringify(value);
+}
+
+function decodeAnswer(encoded: string | null): AnswerValue | undefined {
+  if (encoded === null) return undefined;
+  try {
+    return JSON.parse(encoded) as AnswerValue;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface RecordDecisionInput {
+  /** The decision as decide() produced it — every field of the log's first half comes from here. */
+  result: DecideResult;
+  /** The point that produced it, needed to narrow the state before hashing it. */
+  point: DecisionPoint;
+  /** The FULL caller state; only the point's own `stateFields` reach the digest. */
+  state: DecisionState;
+  projectId?: string;
+}
+
+/**
+ * Write the decision half of a row and return its id — the handle a later settle needs.
+ *
+ * Best-effort by contract, like `recordInvocation`: it NEVER throws, and returns `undefined` when
+ * nothing was written. A decision that was made and acted on must not fail because the log could not
+ * be written, and the caller is already past the point of no return by the time it gets here. A
+ * missing row loses one sample, which reads as "not measured" — never as a disagreement.
+ */
+export async function recordDecision(
+  db: AntonDb,
+  clock: Clock,
+  input: RecordDecisionInput,
+): Promise<string | undefined> {
+  const { result, point, state, projectId } = input;
+  try {
+    const id = randomUUID();
+    await db.insert(schema.decisions).values({
+      id,
+      projectId: projectId ?? null,
+      point: result.point,
+      mode: result.mode,
+      decidedBy: result.decidedBy,
+      answer: encodeAnswer(result.answer),
+      confidence: result.confidence,
+      distribution: result.distribution ? JSON.stringify(result.distribution) : null,
+      backend: result.backend ?? null,
+      modelVersion: result.modelVersion ?? null,
+      inputHash: decisionInputHash(point, state),
+      acted: result.acted,
+      reason: result.reason ?? null,
+      decidedAt: secDate(clock.now()),
+    });
+    return id;
+  } catch {
+    // Swallowed on purpose — see the contract above.
+    return undefined;
+  }
+}
+
+export interface SettleDecisionInput {
+  /** What the operator's answer turned out to be, in the point's own answer vocabulary. */
+  operatorAnswer: AnswerValue;
+  /** The affordance that produced it (`fix`, `park`, `release`) — recorded, never counted. */
+  operatorAction?: string;
+  /** How it turned out, when that is already known. Settable later via {@link recordDecisionOutcome}. */
+  outcome?: string;
+}
+
+/**
+ * Record what the operator answered the same question — the half that makes a row evidence.
+ *
+ * The unsettled guard lives in the UPDATE's WHERE, like `settleEscalation`'s status guard: a row
+ * carries ONE operator answer, so a second settle of the same decision updates zero rows and reports
+ * false rather than overwriting the first. That is the honest reading of a double-click, and of a
+ * retry of a request that already landed.
+ *
+ * Unlike {@link recordDecision} this does NOT swallow: a settle is the operator's own act, and a
+ * caller that asked whether it landed must be able to tell "already settled" (false) from "the write
+ * failed" (a throw). Collapsing the two would let a route report success over a lost answer.
+ */
+export async function settleDecision(
+  db: AntonDb,
+  clock: Clock,
+  id: string,
+  input: SettleDecisionInput,
+): Promise<boolean> {
+  const rows = await db
+    .update(schema.decisions)
+    .set({
+      operatorAnswer: JSON.stringify(input.operatorAnswer),
+      operatorAction: input.operatorAction ?? null,
+      ...(input.outcome === undefined ? {} : { outcome: input.outcome }),
+      settledAt: secDate(clock.now()),
+    })
+    .where(and(eq(schema.decisions.id, id), isNull(schema.decisions.settledAt)))
+    .returning({ id: schema.decisions.id });
+  return rows.length > 0;
+}
+
+/**
+ * Record how a settled decision turned out, after the fact.
+ *
+ * Separate from the settle because it is knowable LATER: the operator picks `fix`, and whether that
+ * fix held is a different observation, sometimes days apart. Refuses an UNSETTLED row (reporting
+ * false) — an outcome with no operator answer beside it explains nothing, and writing one would leave
+ * the log claiming a result for a question nobody answered.
+ */
+export async function recordDecisionOutcome(
+  db: AntonDb,
+  id: string,
+  outcome: string,
+): Promise<boolean> {
+  const rows = await db
+    .update(schema.decisions)
+    .set({ outcome })
+    .where(and(eq(schema.decisions.id, id), isNotNull(schema.decisions.settledAt)))
+    .returning({ id: schema.decisions.id });
+  return rows.length > 0;
+}
+
+/** What a point has earned: how many settled decisions it has, and how many the operator matched. */
+export interface DecisionAgreement {
+  point: string;
+  /** Settled rows carrying a real answer, within the window — the denominator. */
+  settled: number;
+  /** Of those, how many the operator's own answer matched exactly. */
+  agreed: number;
+}
+
+/**
+ * A row is evidence only if decide() answered at all. An answerless row (`off`, or a fallback to a
+ * human) says nothing about the point's judgment, so it is dropped in the query rather than filtered
+ * afterwards — see the header for why that distinction decides whether a broken backend reads as a
+ * point that disagrees.
+ */
+const isJudgmentEvidence = and(
+  isNotNull(schema.decisions.settledAt),
+  isNotNull(schema.decisions.answer),
+);
+
+/**
+ * How often this point's answer matched the operator's, over the rolling window.
+ *
+ * Compared as encoded JSON, which is what makes the comparison honest across question shapes: a
+ * `score` point answering `1` and an operator answering `"1"` disagree, and a string equality over
+ * raw text would call them the same.
+ */
+export async function agreement(
+  db: AntonDb,
+  point: string,
+  window: number = DECISION_AGREEMENT_WINDOW,
+): Promise<DecisionAgreement> {
+  const rows = await db
+    .select({
+      answer: schema.decisions.answer,
+      operatorAnswer: schema.decisions.operatorAnswer,
+    })
+    .from(schema.decisions)
+    .where(and(eq(schema.decisions.point, point), isJudgmentEvidence))
+    // The id breaks a `settledAt` tie, as `pickerTrackRecord` does for its own second-resolution
+    // column: two decisions settled in the same second would otherwise leave the window's
+    // composition — and the counts read off it — up to SQLite's row order.
+    .orderBy(desc(schema.decisions.settledAt), desc(schema.decisions.id))
+    .limit(window);
+  const agreed = rows.filter((row) => row.answer === row.operatorAnswer).length;
+  return { point, settled: rows.length, agreed };
+}
+
+export type DecisionRow = typeof schema.decisions.$inferSelect;
+
+/** One logged decision, with its answers decoded back into the vocabulary callers speak. */
+export interface DecisionView {
+  id: string;
+  point: string;
+  mode: string;
+  decidedBy: string;
+  answer?: AnswerValue;
+  confidence: number;
+  distribution?: Record<string, number>;
+  backend?: string;
+  modelVersion?: string;
+  inputHash: string;
+  acted: boolean;
+  reason?: string;
+  decidedAtMs: number;
+  operatorAnswer?: AnswerValue;
+  operatorAction?: string;
+  outcome?: string;
+  settledAtMs?: number;
+}
+
+export function toDecisionView(row: DecisionRow): DecisionView {
+  const decidedAt = toEpoch(row.decidedAt);
+  const settledAt = toEpoch(row.settledAt);
+  const answer = decodeAnswer(row.answer);
+  const operatorAnswer = decodeAnswer(row.operatorAnswer);
+  return {
+    id: row.id,
+    point: row.point,
+    mode: row.mode,
+    decidedBy: row.decidedBy,
+    ...(answer === undefined ? {} : { answer }),
+    confidence: row.confidence,
+    ...(row.distribution ? { distribution: parseDistribution(row.distribution) } : {}),
+    ...(row.backend ? { backend: row.backend } : {}),
+    ...(row.modelVersion ? { modelVersion: row.modelVersion } : {}),
+    inputHash: row.inputHash,
+    acted: row.acted,
+    ...(row.reason ? { reason: row.reason } : {}),
+    decidedAtMs: (decidedAt ?? 0) * 1000,
+    ...(operatorAnswer === undefined ? {} : { operatorAnswer }),
+    ...(row.operatorAction ? { operatorAction: row.operatorAction } : {}),
+    ...(row.outcome ? { outcome: row.outcome } : {}),
+    ...(settledAt === undefined ? {} : { settledAtMs: settledAt * 1000 }),
+  };
+}
+
+function parseDistribution(encoded: string): Record<string, number> | undefined {
+  try {
+    return JSON.parse(encoded) as Record<string, number>;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * This point's decisions, newest first — the audit trail behind the agreement figure. Ordered on the
+ * same tiebreaker for the same reason: the trail and the number it explains must not disagree about
+ * which decisions are the newest.
+ */
+export async function listDecisions(
+  db: AntonDb,
+  point: string,
+  limit: number = DECISION_AGREEMENT_WINDOW,
+): Promise<DecisionView[]> {
+  const rows = await db
+    .select()
+    .from(schema.decisions)
+    .where(eq(schema.decisions.point, point))
+    .orderBy(desc(schema.decisions.decidedAt), desc(schema.decisions.id))
+    .limit(limit);
+  return rows.map(toDecisionView);
+}
+
+/** UI read path over the shared anton.db — the figure a Settings row shows per point. */
+export function latestAgreement(point: string): Promise<DecisionAgreement> {
+  return agreement(getDb(), point);
+}
+
+/** UI read path over the shared anton.db. */
+export function latestDecisions(point: string, limit?: number): Promise<DecisionView[]> {
+  return listDecisions(getDb(), point, limit);
+}
+
+/** The timestamp columns store seconds as a Date; match the rest of the lib layer's truncation. */
+function secDate(ms: number): Date {
+  return new Date(Math.floor(ms / 1000) * 1000);
+}

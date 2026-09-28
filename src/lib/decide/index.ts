@@ -15,6 +15,7 @@
  * difference between the two is entirely how a caller presents `acted: false`: shadow logs it,
  * assist surfaces it as a suggestion — neither is this module's concern.
  */
+import { narrowState } from "./points";
 import type { AnswerValue, DecisionMode, DecisionPoint, DecisionState, Question } from "./points";
 
 export type DecidedBy = "rule" | "model" | "fallback";
@@ -87,13 +88,6 @@ function isValidConfidence(confidence: number): boolean {
   );
 }
 
-/** The untrusted-text boundary (anton-528bw): a backend only ever sees the fields the point declared. */
-function selectStateFields(point: DecisionPoint, state: DecisionState): DecisionState {
-  const picked: Record<string, unknown> = {};
-  for (const field of point.stateFields) picked[field] = state[field];
-  return picked;
-}
-
 function acted(mode: DecisionMode, answer: AnswerValue | undefined, confidence: number, threshold: number): boolean {
   return mode === "auto" && answer !== undefined && confidence >= threshold;
 }
@@ -128,7 +122,7 @@ export async function decide(input: DecideInput): Promise<DecideResult> {
 
   let modelAnswer: ModelAnswer;
   try {
-    modelAnswer = await ask(point, selectStateFields(point, state));
+    modelAnswer = await ask(point, narrowState(point, state));
   } catch {
     return fallback(point, mode, "model call failed");
   }
@@ -156,6 +150,7 @@ export {
   definePoint,
   getPoint,
   listPoints,
+  narrowState,
   resetRegistryForTests,
 } from "./points";
 export type {
