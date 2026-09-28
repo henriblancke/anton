@@ -1,6 +1,6 @@
 ---
 name: scan-triage
-version: 04d2a77f77db
+version: 773e3b052094
 description: >-
   Turn a stringer scan into a small set of well-formed beads, protecting queue quality. Reads
   stringer signal output, dedupes across every automated producer (stringer/gardener/pm
@@ -231,6 +231,9 @@ carries less — a one-line outcome, Success Criteria, and its `area:`:
 
 ```
 ## Goal                one line: the risk/debt and why it matters (cite the signal)
+## Why                 what the signal is, where it lives, and the cost of leaving it — the
+                       forcing question 'which outcome does this serve, and how?' answered from
+                       the signal itself, not guessed
 ## Acceptance Criteria - [ ] concrete, verifiable fix (e.g. "no OSV-2026-xxxx in lockfile")
 ## Context             touches: <file:line from the signal>; remediation: <stringer suggestion>
                        routed: <parent-id|none> — <why THIS parent>
@@ -239,11 +242,11 @@ carries less — a one-line outcome, Success Criteria, and its `area:`:
 ```
 
 Cook that shape from the project's bead formula rather than retyping it —
-`bd cook anton-bead --mode=runtime --var goal='…' …`, then create from the cooked step for the tier
-you're creating (`feature` for the cluster, `ticket` for its children). **The description carries
-all five sections and nothing lives in `--acceptance` or `--context`** — the `bd` skill has the one
-command. Fill every var: an unfilled `TODO —` default is not a triaged bead, and a fabricated
-Acceptance box is worse than none.
+`bd cook anton-bead --mode=runtime --var goal='…' --var why='…' …`, then create from the cooked
+step for the tier you're creating (`feature` for the cluster, `ticket` for its children). **The
+description carries all six sections and nothing lives in `--acceptance` or `--context`** — the
+`bd` skill has the one command. Fill every var: an unfilled `TODO —` default is not a triaged bead,
+and a fabricated Acceptance box is worse than none.
 
 **Every created bead records its routing decision** on its own `## Context`, as one `routed:` line
 directly under `touches:`. Placement is the judgment call in this whole prompt and it runs
@@ -261,13 +264,17 @@ A `routed:` line that only restates the parent id ("routed: anton-abcd") is not 
 the file/surface or the absence that decided it. Same line on a cross-link (§2), naming the bead the
 issue was already on and the fingerprint that matched.
 
-Labels: `domain:eng`, `source:stringer`, `risk:<class>`, `agent:<stack match>`, `size:`, and a
-fingerprint (`stringer:<collector>:<hash>`) for future dedup — on the feature and on each ticket, so
-the next scan dedupes against either. The `<hash>` identifies the **issue**, not the producer:
-derive it from the file + rule so it is stable across scans and reproducible by another producer —
-a hash keyed on the line number or the scan date defeats §2 for everyone. One `area:` on the epic,
-and nowhere else. Edges: `bd link <ticket> <feature> --type parent-child` and `bd link <feature>
-<epic> --type parent-child`.
+Labels: `domain:eng`, `source:stringer`, `risk:<class>`, `agent:<stack match>`, `size:`,
+`outcome:codebase-health`, and a fingerprint (`stringer:<collector>:<hash>`) for future dedup — on
+the feature and on each ticket, so the next scan dedupes against either. `outcome:codebase-health`
+is the default for every triage-produced bead — scanned debt always serves it, built in whether or
+not `.product/PRODUCT.md` lists it (`src/lib/outcomes.ts`). Add a **second** `outcome:<id>` label
+naming a product outcome only when the signal actually blocks one — a vuln in a path that outcome's
+feature depends on, not a stretch to look more strategic. The `<hash>` identifies the **issue**, not
+the producer: derive it from the file + rule so it is stable across scans and reproducible by
+another producer — a hash keyed on the line number or the scan date defeats §2 for everyone. One
+`area:` on the epic, and nowhere else. Edges: `bd link <ticket> <feature> --type parent-child` and
+`bd link <feature> <epic> --type parent-child`.
 
 ## 6. Report
 

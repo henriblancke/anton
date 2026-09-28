@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 7e8368fe1280
+version: ede56939dedc
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -110,6 +110,7 @@ under it. **Never re-type an existing bead to "migrate" it.**
 | `agent:`  | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, … or `human`; or omitted | which specialist fits; `human` names the one specialist anton does not have — see below |
 | `size:`   | `S`, `M`, `L`                                              | sanity check; `L` on a ticket is a smell — split it |
 | `source:` | `stringer`, `gardener`, or omitted                         | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup, and gardener proposals `gardener:<class>:<hash>` (an open or declined fingerprint stops the patrol re-asking) |
+| `outcome:` | ids from `.product/PRODUCT.md`'s `## Outcomes` (`src/lib/outcomes.ts`); open vocabulary | **run target only** (feature, or parentless task/bug) — which outcome this delivers; set alongside the description's `## Why` |
 
 (Model routing is the executor's concern — shaping does not set a `model:` label.)
 
@@ -156,17 +157,21 @@ execution drives:   ready → in-progress → review → done   (and park/unpark
 
 ## The bead contract
 
-A feature or ticket is not `shaped` until its **description** contains `## Goal`,
-`## Acceptance Criteria` (checkable boxes), `## Context`, `## Out of scope`, `## Verify` — all five,
-in that order, in the one field. Without these the executor has no spec.
+A feature or ticket is not `shaped` until its **description** contains `## Goal`, `## Why`,
+`## Acceptance Criteria` (checkable boxes), `## Context`, `## Out of scope`, `## Verify` — all six,
+in that order, in the one field. `## Why` answers the forcing question **which outcome does this
+serve, and how?** — it is what makes the `outcome:` label above a stated reason rather than a
+guessed tag, so set them together. Without these the executor has no spec.
 
-**bd checks one of the five, not five.** `bd create --validate` and `bd lint` both look for the
-rubric heading alone. The other four — Goal, Context, Out of scope, Verify — are enforced by
-`/shape`, `/scan-triage`, and anton's own contract gate at approve time. Nothing bd says green
-means the contract is complete.
+**bd checks one of the six, not six.** `bd create --validate` and `bd lint` both look for the
+rubric heading alone. Goal, Context, Out of scope, and Verify are enforced by `/shape`,
+`/scan-triage`, and anton's own contract gate at approve time; `## Why` is enforced by `/shape` and
+`/scan-triage` alone — the contract gate does not yet judge it. Nothing bd says green means the
+contract is complete.
 
 An epic is read, not executed, so it carries less: a one-line outcome, Success Criteria its
-features add up to, and its `area:` label.
+features add up to, its `area:` label, and `## Outcome` — the `.product/PRODUCT.md` outcome id(s)
+its features add up to serving.
 
 ## The bead formula — cook the skeleton, don't retype it
 
@@ -179,7 +184,7 @@ sections pre-stubbed:
 ```bash
 bd formula show anton-bead                      # what it templates
 bd cook anton-bead --mode=runtime \
-  --var goal='…' --var acceptance='- [ ] …' \
+  --var goal='…' --var why='…' --var acceptance='- [ ] …' \
   --var context='touches: …' --var out_of_scope='- …' --var verify='…'
 # → JSON; take .steps[] | select(.id=="ticket") | .description as the bead description
 ```
@@ -203,13 +208,15 @@ for the run target, `--type task` (or `bug`/`chore`) for its children:
 ```bash
 bd cook anton-bead --mode=runtime \
   --var goal='Let users export the reports view to CSV so they can share numbers. Requested by 3 users.' \
+  --var why='Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.' \
   --var acceptance=$'- [ ] button on /reports exports current view as CSV\n- [ ] respects active filters' \
   --var context='touches: app/reports/*, lib/csv.ts; follow pattern in app/reports/pdf.ts' \
   --var out_of_scope='- no new columns; no server-side generation' \
   --var verify='unit test lib/csv.ts formatting; e2e: click export → file downloads' \
   | jq -r '.steps[] | select(.id == "ticket") | .description' > /tmp/bead.md
 
-bd create "Add CSV export button" --type task --validate --body-file /tmp/bead.md
+bd create "Add CSV export button" --type task --validate --body-file /tmp/bead.md \
+  --labels domain:eng,outcome:reports-are-shareable
 ```
 
 **Never `--acceptance` or `--context`.** They write bd's own side fields, which splits the contract
@@ -222,7 +229,7 @@ order for every downstream reader.
 `## Success Criteria` on an epic. Verified on bd 1.1.2: a body of nothing but that heading is
 accepted, and so is a cooked skeleton whose every var is still `TODO — …`. Put it on every
 `bd create` — it costs nothing and it is what makes the heading spelling un-revertable — but never
-read a green `--validate` as a filled contract. The other four sections, and a rubric still holding
+read a green `--validate` as a filled contract. The other five sections, and a rubric still holding
 the formula's prompt, are yours to fill here; `/shape`, `/scan-triage` and anton's contract gate
 catch them later, at approve time, where the fix costs a round trip.
 
@@ -243,14 +250,14 @@ cat > /tmp/plan.json <<'EOF'
   "nodes": [
     {"key": "e", "title": "Reports are shareable outside the app", "type": "epic",
      "labels": ["area:reports"],
-     "description": "## Goal\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports"},
+     "description": "## Goal\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports\n\n## Outcome\noutcome:reports-are-shareable"},
 
     {"key": "f", "title": "CSV export", "type": "feature", "parent_key": "e",
-     "labels": ["domain:eng", "risk:low", "size:S"],
-     "description": "## Goal\n…\n\n## Acceptance Criteria\n- [ ] …\n\n## Context\ntouches: …\n\n## Out of scope\n- …\n\n## Verify\n- …"},
+     "labels": ["domain:eng", "risk:low", "size:S", "outcome:reports-are-shareable"],
+     "description": "## Goal\n…\n\n## Why\n…\n\n## Acceptance Criteria\n- [ ] …\n\n## Context\ntouches: …\n\n## Out of scope\n- …\n\n## Verify\n- …"},
 
     {"key": "t1", "title": "Add export button", "type": "task", "parent_key": "f",
-     "labels": ["domain:eng"], "description": "## Goal\n…\n\n## Acceptance Criteria\n- [ ] …\n\n## Context\n…\n\n## Out of scope\n- …\n\n## Verify\n- …"},
+     "labels": ["domain:eng"], "description": "## Goal\n…\n\n## Why\n…\n\n## Acceptance Criteria\n- [ ] …\n\n## Context\n…\n\n## Out of scope\n- …\n\n## Verify\n- …"},
     {"key": "t2", "title": "Wire the endpoint", "type": "task", "parent_key": "f",
      "description": "…"}
   ],
@@ -319,7 +326,7 @@ bd children <epic-id>                      # the full tree under an epic
 
 ```bash
 bd create "Add export button" --type task --validate --body-file t1.md \
-  --labels domain:eng,risk:low,agent:nextjs,size:S
+  --labels domain:eng,risk:low,agent:nextjs,size:S,outcome:reports-are-shareable
 bd update <id> --add-label risk:high --add-label agent:supabase   # repeatable
 bd tag <epic-id> area:reports           # one label; epic tier only, exactly one value
 # /scan-triage also tags: source:stringer  stringer:<collector>:<hash>  (dedup fingerprint)

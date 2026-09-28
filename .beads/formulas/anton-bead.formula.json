@@ -20,6 +20,14 @@
       "description": "One sentence: the outcome this delivers and why it matters",
       "default": "TODO — one sentence: what this delivers, and why it matters"
     },
+    "why": {
+      "description": "Feature/ticket only: which outcome this serves, and how — the forcing question a producer must answer before creating the bead",
+      "default": "TODO — which outcome does this serve, and how?"
+    },
+    "outcome_ids": {
+      "description": "Epic only: the outcome id(s) from `.product/PRODUCT.md`'s `## Outcomes` this epic's features add up to serving, as `outcome:<id>` labels",
+      "default": "TODO — which outcome(s) from `.product/PRODUCT.md` this epic serves (`outcome:<id>`)"
+    },
     "acceptance": {
       "description": "Concrete, checkable boxes — the run's definition of done and the rubric self-review scores the diff against",
       "default": "- [ ] TODO — a concrete, checkable statement of done"
@@ -42,21 +50,21 @@
       "id": "epic",
       "type": "epic",
       "title": "{{title}}",
-      "description": "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}"
+      "description": "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}\n\n## Outcome\n\n{{outcome_ids}}"
     },
     {
       "id": "feature",
       "type": "feature",
       "needs": ["epic"],
       "title": "{{title}}",
-      "description": "## Goal\n\n{{goal}}\n\n## Acceptance Criteria\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
+      "description": "## Goal\n\n{{goal}}\n\n## Why\n\n{{why}}\n\n## Acceptance Criteria\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
     },
     {
       "id": "ticket",
       "type": "task",
       "needs": ["feature"],
       "title": "{{title}}",
-      "description": "## Goal\n\n{{goal}}\n\n## Acceptance Criteria\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
+      "description": "## Goal\n\n{{goal}}\n\n## Why\n\n{{why}}\n\n## Acceptance Criteria\n\n{{acceptance}}\n\n## Context\n\n{{context}}\n\n## Out of scope\n\n{{out_of_scope}}\n\n## Verify\n\n{{verify}}"
     }
   ]
 }

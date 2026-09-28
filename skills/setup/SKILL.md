@@ -1,6 +1,6 @@
 ---
 name: setup
-version: 9598d4960b10
+version: 746b6d4b55af
 description: >-
   Scaffold a project so anton's skills have the `.product/` contract they read. Checks git + bd,
   runs `bd init` if `.beads/` is absent, detects the stack, generates `.product/` from anton's

@@ -35,6 +35,7 @@ parentless `task`/`bug`, or an `epic` with no `feature` children
 | `agent:` | `nextjs`, `supabase`, `fastapi`, `pydantic`, `alembic`, or omitted | which specialist fits |
 | `size:` | `S`, `M`, `L` | sanity check; `L` on a ticket is a smell — split it |
 | `source:` | `stringer`, or omitted | provenance; scan beads also carry `stringer:<collector>:<hash>` for dedup |
+| `outcome:` | ids from `.product/PRODUCT.md`'s `## Outcomes`; open vocabulary | run target only (feature, or parentless task/bug); which outcome this delivers |
 
 (Model routing is the executor's concern — shaping does not set a `model:` label.)
 
@@ -61,10 +62,15 @@ execution drives:   ready → in-progress → review → done   (and park/unpark
 
 ## The bead contract
 
-A feature or ticket is not `shaped` until its description contains `## Goal`, `## Acceptance`
-(checkable boxes), `## Context`, `## Out of scope`, `## Verify`. Without these the executor has no
+A feature or ticket is not `shaped` until its description contains `## Goal`, `## Why`,
+`## Acceptance` (checkable boxes), `## Context`, `## Out of scope`, `## Verify`. `## Why` answers
+which outcome this serves and how — the forcing question a producer answers before creating the
+bead, so it and the `outcome:` label above are set together. Without these the executor has no
 spec.
 `/shape` and `/scan-triage` enforce it; `bd lint` checks the Acceptance/Success sections.
+
+An epic's description carries `## Outcome` alongside its Goal and Success Criteria — the
+`.product/PRODUCT.md` outcome id(s) its features add up to serving.
 
 ## Cross-domain
 
