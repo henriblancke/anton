@@ -740,21 +740,30 @@ interface RunFixSessionResult {
  * isn't enough, since `replyToReviewComment` failing is swallowed by `safe()` and must not read as
  * "answered" (anton-091jr review, chatgpt-codex-connector).
  *
- * When nothing was waiting (no inline threads — the round was actionable only via a failing check,
- * a merge conflict, or a reviewer summary), this is NOT vacuously true: a claude run that finished
- * without error is not evidence it actually handled that reason, and treating it as such would let
- * `recordReviewFixAnswered` suppress a genuinely still-broken PR at this head+fingerprint forever
- * (anton-091jr review round 2, chatgpt-codex-connector). Positive evidence is `report` naming the
- * {@link NON_THREAD_REPORT_ID} sentinel — `reportingFormatSection` asks for it specifically in that
- * situation, so its presence means claude actually addressed the reporting contract for this round
- * rather than the report simply being empty (no threads → nothing to report by default).
+ * `hasNonThreadReasons` names whether `verdict.fingerprint` carries any entry besides `thread:*` —
+ * a failing check, a merge conflict, or a reviewer summary. Whenever it's true (whether or not
+ * threads were ALSO waiting — a mixed round), a claude run that finished without error is not
+ * evidence it actually handled that reason: treating it as such would let `recordReviewFixAnswered`
+ * suppress a genuinely still-broken PR at this head+fingerprint forever (anton-091jr review round 2
+ * and PR #338 review, chatgpt-codex-connector — the latter caught this check only firing when
+ * `waitingIds` was empty, so a mixed round with both threads and a non-thread reason could report
+ * every thread and never once be asked about the failing check/summary). Positive evidence is
+ * `report` naming the {@link NON_THREAD_REPORT_ID} sentinel with a non-fabricated outcome — same
+ * `fabricatedFix` rule `applyThreadOutcomes` applies to a real thread reply, so a claude run can't
+ * claim "fixed" on the sentinel when nothing was actually pushed (PR #338 review,
+ * chatgpt-codex-connector).
  */
 function allWaitingThreadsAnswered(
   waitingIds: ReadonlySet<string>,
   answeredIds: ReadonlySet<string>,
   report: ThreadOutcome[],
+  hasNonThreadReasons: boolean,
+  pushed: boolean,
 ): boolean {
-  if (waitingIds.size === 0) return report.some((r) => r.id === NON_THREAD_REPORT_ID);
+  if (hasNonThreadReasons) {
+    const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
+    if (!sentinel || fabricatedFix(sentinel, pushed)) return false;
+  }
   for (const id of waitingIds) {
     if (!answeredIds.has(id)) return false;
   }
@@ -805,6 +814,11 @@ async function runFixSession(args: {
   // checks a thread report against. `pr` is the same read `verdict` was classified from, so this
   // matches exactly what made the round actionable in the first place.
   const waitingIds = new Set(threadsNeedingAttention(pr).map((t) => t.id));
+  // Does this round need answering for something besides those threads — a failing check, a merge
+  // conflict, or a reviewer summary? Drives both the prompt (ask for the sentinel even in a mixed
+  // round) and `allWaitingThreadsAnswered` (require it), so the two can never drift apart (PR #338
+  // review, chatgpt-codex-connector).
+  const hasNonThreadReasons = verdict.fingerprint.some((f) => !f.startsWith("thread:"));
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
@@ -909,6 +923,7 @@ async function runFixSession(args: {
       pr,
       reasons: verdict.reasons,
       conflicts,
+      hasNonThreadReasons,
       settings,
       projectDir: worktree.path,
     });
@@ -1023,7 +1038,13 @@ async function runFixSession(args: {
       );
       return {
         pushed: false,
-        answeredAllThreads: allWaitingThreadsAnswered(waitingIds, answeredIds, report),
+        answeredAllThreads: allWaitingThreadsAnswered(
+          waitingIds,
+          answeredIds,
+          report,
+          hasNonThreadReasons,
+          pushed,
+        ),
       };
     }
 

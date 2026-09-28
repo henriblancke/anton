@@ -173,6 +173,31 @@ describe("reviewFixContext", () => {
     expect(out).not.toContain("## Reporting format (required)");
   });
 
+  // PR #338 review (chatgpt-codex-connector): a round with BOTH inline threads and a non-thread
+  // reason (a failing check here) must ask for the sentinel too, not just the per-thread report —
+  // otherwise claude never has a chance to acknowledge the non-thread reason and
+  // allWaitingThreadsAnswered can never see the positive evidence it requires for one.
+  it("also asks for the sentinel-keyed entry when threads AND a non-thread reason are both present", () => {
+    const threads: ReviewThread[] = [threadOn("src/a.ts", "RT_1")];
+    const out = reviewFixContext(
+      epic,
+      makePr({ threads, failingChecks: ["build"] }),
+      ["failing checks: build", "1 unresolved review thread(s)"],
+      [],
+      undefined,
+      true,
+    );
+    expect(out).toContain('{"threads":[{"id":"<thread id>"');
+    expect(out).toContain(NON_THREAD_REPORT_ID);
+  });
+
+  it("does not mention the sentinel when threads are present but nothing else is actionable", () => {
+    const threads: ReviewThread[] = [threadOn("src/a.ts", "RT_1")];
+    const out = reviewFixContext(epic, makePr({ threads }), ["1 unresolved review thread(s)"]);
+    expect(out).toContain('{"threads":[{"id":"<thread id>"');
+    expect(out).not.toContain(NON_THREAD_REPORT_ID);
+  });
+
   it("lists merge conflicts when present", () => {
     const out = reviewFixContext(epic, makePr(), ["conflicts"], ["src/a.ts", "src/b.ts"]);
     expect(out).toContain("Merge conflicts:");

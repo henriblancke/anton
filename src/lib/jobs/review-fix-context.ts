@@ -67,11 +67,22 @@ export async function buildReviewFixPrompt(args: {
   conflicts: string[];
   /** A gate that just failed after a prior fix session — the bounded follow-up round's own context. */
   gateFailure?: GateFailure;
+  /**
+   * Does `reasons` include something besides the unresolved-thread count — a failing check, a
+   * merge conflict, or a reviewer summary? When true, `reportingFormatSection` asks for the
+   * {@link NON_THREAD_REPORT_ID} sentinel ALONGSIDE the per-thread report, not just when there are
+   * zero threads — a mixed round (both inline threads and a non-thread reason) must still be asked
+   * about the non-thread reason, or `allWaitingThreadsAnswered` can never see the positive evidence
+   * it now requires for one (PR #338 review, chatgpt-codex-connector). Defaults to `false` for the
+   * gate follow-up round, whose own report is never read back into that check.
+   */
+  hasNonThreadReasons?: boolean;
   settings: ProjectSettings;
   /** The worktree the fix runs in (for resolving a project-local agent prompt). */
   projectDir: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string; attribution: ReasoningAttribution }> {
-  const { epic, pr, reasons, conflicts, gateFailure, settings, projectDir } = args;
+  const { epic, pr, reasons, conflicts, gateFailure, hasNonThreadReasons = false, settings, projectDir } =
+    args;
 
   // Compose the same layered system prompt used for execution (base + agent + seed). Use the
   // epic's agent tag if it has one.
@@ -93,7 +104,7 @@ export async function buildReviewFixPrompt(args: {
     "",
     "---",
     "",
-    reviewFixContext(epic, pr, reasons, conflicts, gateFailure),
+    reviewFixContext(epic, pr, reasons, conflicts, gateFailure, hasNonThreadReasons),
   ].join("\n");
 
   return { prompt, appendSystemPrompt, attribution };
@@ -120,6 +131,7 @@ export function reviewFixContext(
   reasons: string[],
   conflicts: string[] = [],
   gateFailure?: GateFailure,
+  hasNonThreadReasons = false,
 ): string {
   const threads = threadsNeedingAttention(pr);
   return [
@@ -130,7 +142,7 @@ export function reviewFixContext(
     ...failingChecksSection(pr),
     ...conflictsSection(conflicts),
     ...gateFailureSection(gateFailure),
-    ...reportingFormatSection(threads, reasons),
+    ...reportingFormatSection(threads, reasons, hasNonThreadReasons),
   ]
     .join("\n")
     .trimEnd();
@@ -237,38 +249,61 @@ function gateFailureSection(gateFailure: GateFailure | undefined): string[] {
   ];
 }
 
-function reportingFormatSection(threads: ReviewThread[], reasons: string[]): string[] {
-  if (threads.length > 0) {
+/**
+ * `hasNonThreadReasons` names whether this round is ALSO actionable via something besides the
+ * threads above (a failing check, a merge conflict, or a reviewer summary with no inline
+ * comments — see "Why this needs action" above). A mixed round (both inline threads and a
+ * non-thread reason) must still ask for the {@link NON_THREAD_REPORT_ID} sentinel — restricting
+ * that ask to the `threads.length === 0` case let a mixed round report every thread and never
+ * once be asked about the non-thread reason, so `allWaitingThreadsAnswered` had no way to tell a
+ * genuinely-handled round from one that silently ignored it (PR #338 review,
+ * chatgpt-codex-connector).
+ */
+function reportingFormatSection(
+  threads: ReviewThread[],
+  reasons: string[],
+  hasNonThreadReasons: boolean,
+): string[] {
+  if (threads.length === 0) {
+    // No inline threads, but the round is still actionable. Without an explicit report, a claude
+    // run that touches nothing looks identical to one that genuinely resolved the reason — and
+    // would get recorded as "answered" on nothing but that resemblance (anton-091jr review round
+    // 2, chatgpt-codex-connector). Reuses the thread-report shape (one entry keyed on the sentinel
+    // id) so parseThreadReport needs no separate parsing path.
+    if (reasons.length === 0) return [];
     return [
       `## Reporting format (required)`,
       ``,
-      `End your final message with a fenced json block reporting each thread listed above:`,
+      `There are no inline review threads here, but this round is still actionable. End your final`,
+      `message with a fenced json block naming what you did about it:`,
       ``,
       "```json",
-      `{"threads":[{"id":"<thread id>","outcome":"fixed" | "left" | "needs-human","reply":"one-line note for the reviewer"}]}`,
+      `{"threads":[{"id":"${NON_THREAD_REPORT_ID}","outcome":"fixed" | "left","reply":"one-line summary of what you changed, or why nothing needed to change"}]}`,
       "```",
-      ``,
-      `Use "fixed" only for threads you actually changed code for, "left" for findings you`,
-      `deliberately did not act on, "needs-human" when a decision is required. The reply is posted`,
-      `on the thread verbatim.`,
     ];
   }
-  // No inline threads, but the round is still actionable (a failing check, a merge conflict, or a
-  // reviewer summary with no inline comments — see "Why this needs action" above). Without an
-  // explicit report, a claude run that touches nothing looks identical to one that genuinely
-  // resolved the reason — and would get recorded as "answered" on nothing but that resemblance
-  // (anton-091jr review round 2, chatgpt-codex-connector). Reuses the thread-report shape (one entry
-  // keyed on the sentinel id) so parseThreadReport needs no separate parsing path.
-  if (reasons.length === 0) return [];
   return [
     `## Reporting format (required)`,
     ``,
-    `There are no inline review threads here, but this round is still actionable. End your final`,
-    `message with a fenced json block naming what you did about it:`,
+    `End your final message with a fenced json block reporting each thread listed above:`,
     ``,
     "```json",
-    `{"threads":[{"id":"${NON_THREAD_REPORT_ID}","outcome":"fixed" | "left","reply":"one-line summary of what you changed, or why nothing needed to change"}]}`,
+    `{"threads":[{"id":"<thread id>","outcome":"fixed" | "left" | "needs-human","reply":"one-line note for the reviewer"}]}`,
     "```",
+    ``,
+    `Use "fixed" only for threads you actually changed code for, "left" for findings you`,
+    `deliberately did not act on, "needs-human" when a decision is required. The reply is posted`,
+    `on the thread verbatim.`,
+    ...(hasNonThreadReasons
+      ? [
+          ``,
+          `This round is ALSO actionable for a reason with no inline thread (a failing check, a`,
+          `merge conflict, or a reviewer summary with no inline comments — see "Why this needs`,
+          `action" above). Report that too: add one more entry to the same "threads" array, keyed`,
+          `on the sentinel id "${NON_THREAD_REPORT_ID}", with outcome "fixed" or "left" and a`,
+          `one-line reply summarizing what you did about it.`,
+        ]
+      : []),
   ];
 }
 
