@@ -53,8 +53,17 @@ export interface HardRuleOutcome {
  * A deterministic pre-model gate. Returns `undefined` to defer to the next rule (or the model);
  * anything else decides outright, with `decidedBy: "rule"` and full confidence — no model call, no
  * threshold check, whatever the mode.
+ *
+ * `version` is optional caller-supplied semantic identity, hashed into `pointDefinitionHash`
+ * (log.ts) alongside the rule's own source. A rule that closes over an imported or captured value —
+ * a cutoff date, a threshold constant — has identical `toString()` source before and after that
+ * value changes, so the source alone can't tell `agreement()` the rule's decisions now differ. Bump
+ * `version` whenever such a captured value changes the rule's behavior; leave it unset when the rule
+ * has no closure-dependent behavior worth versioning.
  */
-export type HardRule = (state: DecisionState) => HardRuleOutcome | undefined;
+export type HardRule = ((state: DecisionState) => HardRuleOutcome | undefined) & {
+  readonly version?: string;
+};
 
 export interface DecisionPoint {
   readonly id: string;

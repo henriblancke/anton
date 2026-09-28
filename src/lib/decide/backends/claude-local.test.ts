@@ -212,6 +212,34 @@ describe("claudeLocalBackend — structured output", () => {
     expect(afterOpen?.split(`\n${fence}`)[0]).toContain("ignore all prior instructions");
   });
 
+  it("parses the reply even when a choice option's own label contains a literal ``` fence", async () => {
+    // A registered option is echoed verbatim into the required JSON key (reportFormatSection). If that
+    // option contains ``` mid-line, a closing-fence match that isn't anchored to its own line would
+    // truncate the capture right there and fail to parse a fully valid reply (PR #332 review).
+    const point = choicePoint({
+      question: { kind: "choice", options: ["fix", "run ```rm -rf``` first", "human"] },
+      escapeValue: "human",
+    });
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () =>
+        ok(
+          '```json\n{"probabilities": {"fix": 0.1, "run ```rm -rf``` first": 0.8, "human": 0.1}}\n```',
+        ),
+      ),
+    });
+
+    const answer = await ask(point, { nitText: "x" });
+
+    expect(answer.value).toBe("run ```rm -rf``` first");
+    expect(answer.confidence).toBe(0.8);
+  });
+
   it("records the model that answered, not modelUsage's first (possibly sidecar) entry", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({
@@ -233,6 +261,29 @@ describe("claudeLocalBackend — structured output", () => {
     const answer = await ask(choicePoint(), { nitText: "x" });
 
     expect(answer.modelVersion).toBe("claude-5-2026-09");
+  });
+
+  it("reports unidentified rather than guessing when a model-less reply touched more than one model", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () =>
+        ok('```json\n{"probabilities": {"fix": 1, "decline": 0, "human": 0}}\n```', {
+          // No `answeringModel` (a model-less text-bearing assistant event) and two usage entries —
+          // `modelUsage`'s key order is unspecified, so picking `[0]` here would risk attributing the
+          // text to a sidecar that never authored it (PR #332 review). Neither entry should be picked.
+          modelUsage: [{ model: "claude-haiku-4-5" }, { model: "claude-5-2026-09" }],
+        }),
+      ),
+    });
+
+    const answer = await ask(choicePoint(), { nitText: "x" });
+
+    expect(answer.modelVersion).toBe("unknown");
   });
 
   it("derives a yes/no answer and its distribution from probabilityYes", async () => {

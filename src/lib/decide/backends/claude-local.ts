@@ -171,7 +171,14 @@ function buildPrompt(point: DecisionPoint, state: DecisionState): string {
  * parse, or the message continues past it; the caller treats any of those as a failed call. */
 function lastParsedJsonBlock(text: string | undefined): unknown {
   if (!text) return undefined;
-  const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
+  // The closing fence must end its OWN line (CommonMark's own fence rule) — a bare `[\s\S]*?```` `
+  // stops at the first ``` ANYWHERE, including one inside a quoted JSON string. A registered choice
+  // option containing a literal ``` (rare, but the option text is caller-supplied and echoed verbatim
+  // into the required JSON key) would otherwise truncate the capture mid-object and fail to parse
+  // despite a fully valid reply (PR #332 review). Requiring "\n```" plus only trailing spaces/tabs
+  // before the next newline or end of string rules out a mid-line occurrence while still matching the
+  // real closing fence the reporting format demands.
+  const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)\n```(?=[^\S\n]*(?:\n|$))/g)];
   const last = blocks[blocks.length - 1];
   if (!last || last.index === undefined) return undefined;
   if (text.slice(last.index + last[0].length).trim().length > 0) return undefined;
@@ -320,7 +327,14 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
       // with the model attributed — dropping it here would erase the attempt from decide()'s log and
       // let agreement() keep reading a predecessor model as "current" for as long as this one keeps
       // failing (anton-528bw PR #332 review).
-      const modelVersion = result.answeringModel ?? config.model ?? result.modelUsage[0]?.model ?? "unknown";
+      //
+      // `modelUsage` is trusted ONLY when the session touched exactly one model — then there is no
+      // ordering to get wrong. With two or more entries (a sidecar alongside the primary model) the
+      // map's key order carries no meaning, so picking `[0]` can attribute a model-less text-bearing
+      // reply to a sidecar that never authored it, preserving stale agreement across a real model
+      // switch. Unidentified is the honest answer there, not an arbitrary guess (PR #332 review).
+      const singleModelUsed = result.modelUsage.length === 1 ? result.modelUsage[0]?.model : undefined;
+      const modelVersion = result.answeringModel ?? config.model ?? singleModelUsed ?? "unknown";
       if (!result.ok) {
         throw new ModelCallError(`decide/claude-local: session for "${point.id}" reported an error`, {
           backend: BACKEND,

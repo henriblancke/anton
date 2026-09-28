@@ -83,9 +83,14 @@ export function decisionInputHash(point: DecisionPoint, state: DecisionState): s
  * sorts its keys — declaration order is an accident of how the point was written, not a semantic
  * difference in what it reads.
  *
- * Hard rules are functions, hashed by `Function.prototype.toString()`: source text is the only
- * observable identity a closure has, and a rule whose condition changed but whose name and position
- * didn't must still digest differently.
+ * Hard rules are functions, hashed by `Function.prototype.toString()` PLUS their own optional
+ * `version` (`HardRule.version`, points.ts): source text is the only identity a closure has by
+ * default, but a rule that reads an imported or captured value — a cutoff date, a threshold constant
+ * — has identical source before and after that value changes, so `toString()` alone would leave the
+ * digest unchanged even though the rule's decisions now differ, letting `agreement()` keep folding in
+ * evidence earned under the old behavior (PR #332 review). A rule with no `version` set hashes as
+ * before; one that does gets that string folded in too, so bumping it moves the digest without
+ * touching source.
  */
 export function pointDefinitionHash(point: DecisionPoint): string {
   const hash = createHash("sha256");
@@ -99,6 +104,8 @@ export function pointDefinitionHash(point: DecisionPoint): string {
   for (const rule of point.hardRules) {
     hash.update("\u0000");
     hash.update(rule.toString());
+    hash.update("\u0000version:");
+    hash.update(rule.version ?? "");
   }
   return hash.digest("hex").slice(0, 32);
 }

@@ -233,6 +233,29 @@ describe("the point-definition digest", () => {
     expect(pointDefinitionHash(always)).not.toBe(pointDefinitionHash(never));
   });
 
+  it("moves when a hard rule's own version changes, even with identical source", () => {
+    // A rule closing over an imported/captured value (a cutoff date, say) has the SAME toString()
+    // before and after that value changes — `version` is how a caller declares that the rule's
+    // decisions differ anyway, so agreement() doesn't keep folding in evidence earned under the old
+    // behavior (PR #332 review). Two separate function objects with IDENTICAL source, differing only
+    // in `version`, so the version alone is what's under test here.
+    const makeRule = (version: string) =>
+      Object.assign(() => ({ value: "fix", reason: "past the cutoff" }), { version });
+    const v1: DecisionPoint = { ...POINT, hardRules: [makeRule("2026-01-01")] };
+    const v2: DecisionPoint = { ...POINT, hardRules: [makeRule("2026-02-01")] };
+
+    expect(pointDefinitionHash(v1)).not.toBe(pointDefinitionHash(v2));
+  });
+
+  it("does not move when an unset hard rule version is compared to itself", () => {
+    const point: DecisionPoint = {
+      ...POINT,
+      hardRules: [() => ({ value: "fix", reason: "always fix" })],
+    };
+
+    expect(pointDefinitionHash(point)).toBe(pointDefinitionHash({ ...point }));
+  });
+
   it("never moves for the point's id, mode, threshold, or consequence", () => {
     expect(pointDefinitionHash(POINT)).toBe(
       pointDefinitionHash({
