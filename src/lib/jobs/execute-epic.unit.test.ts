@@ -58,6 +58,7 @@ import {
   displacesSelfReport,
   recordStepReport,
   selfReportRank,
+  type StashRecovery,
 } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
@@ -1675,6 +1676,19 @@ describe("stalePrBodyNote — the satisfied attribution rides the salvage too (P
 });
 
 /**
+ * The stash reads the delivery gate takes before it may call a tree EMPTY (anton-wjfkn) — here,
+ * answering that the worktree gained nothing. Shared by every gate case below whose subject is the
+ * pre-existing rows of the gate: those all assert on a genuinely empty tree, which is only what they
+ * mean while the stash says so. The set-aside answer has its own suite.
+ */
+const NO_STASH: StashRecovery = {
+  gained: async () => [],
+  apply: async () => {
+    throw new Error("assertDelivered applied a stash entry for a tree that gained none");
+  },
+};
+
+/**
  * The delivery-evidence gate's judgement on WHOSE work the commit is (anton-d967 / PR #228 review).
  *
  * A commit adopted from a previous attempt's preserved `WIP` is the one kind of evidence that says
@@ -1698,7 +1712,7 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
   const neverAsked = async (): Promise<boolean> => {
     throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
   };
-  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked, NO_STASH);
 
   it("passes work THIS run committed, self-report or not", async () => {
     await expect(gate({ committed: true }, progress(null))).resolves.toBeUndefined();
@@ -1800,7 +1814,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     const evidence = branch(ON_BRANCH);
     const p = progress(satisfied(ON_BRANCH));
 
-    await expect(assertDelivered(ticket, { committed: false }, p, evidence.read)).resolves.toBeUndefined();
+    await expect(assertDelivered(ticket, { committed: false }, p, evidence.read, NO_STASH)).resolves.toBeUndefined();
 
     // The tree fact stays true — this ticket committed nothing — and the verdict is delivery.
     expect(p).toMatchObject({ committed: false, delivered: true });
@@ -1811,7 +1825,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     const evidence = branch(ON_BRANCH);
     const p = progress(satisfied("0123456"));
 
-    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read, NO_STASH));
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/anton-nuft produced no delivery: claude exited cleanly/);
@@ -1826,7 +1840,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     const evidence = branch(ON_BRANCH);
     const p = progress(satisfied());
 
-    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read, NO_STASH));
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/produced no delivery/);
@@ -1837,7 +1851,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
   });
 
   it("parks a zero diff with no satisfied claim exactly as today — the message is unchanged", async () => {
-    const plain = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked));
+    const plain = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked, NO_STASH));
     expect(plain?.name).toBe("PoisonError");
     expect(plain?.message).toBe(
       "anton-nuft produced no delivery: claude exited cleanly and passed the verify gates but " +
@@ -1846,7 +1860,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     );
 
     const claimed = await failure(
-      assertDelivered(ticket, { committed: false }, progress({ outcome: "delivered" }), neverAsked),
+      assertDelivered(ticket, { committed: false }, progress({ outcome: "delivered" }), neverAsked, NO_STASH),
     );
     expect(claimed?.message).toBe(
       `${plain?.message} The agent self-reported ANTON-RESULT: delivered — a false success on an ` +
@@ -1859,6 +1873,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
         { committed: false },
         progress({ outcome: "blocked", klass: "other", reason: "the spec is empty" }),
         neverAsked,
+        NO_STASH,
       ),
     );
     expect(blocked?.message).toBe(
@@ -1869,7 +1884,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
   it("leaves a normal commit-backed delivery untouched, whatever the agent reported", async () => {
     for (const report of [null, { outcome: "delivered" as const }, satisfied(ON_BRANCH), satisfied("0123456")]) {
       const p = progress(report);
-      await expect(assertDelivered(ticket, { committed: true }, p, neverAsked)).resolves.toBeUndefined();
+      await expect(assertDelivered(ticket, { committed: true }, p, neverAsked, NO_STASH)).resolves.toBeUndefined();
       expect(p).toMatchObject({ committed: true, delivered: true });
     }
   });
@@ -1886,7 +1901,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
 
     const unaffirmed = progress(null);
     const plain = await failure(
-      assertDelivered(ticket, { committed: true, preservedAdoption: true }, unaffirmed, neverAsked),
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, unaffirmed, neverAsked, NO_STASH),
     );
     expect(plain?.name).toBe("PoisonError");
     expect(plain?.message).toBe(expected);
@@ -1896,7 +1911,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     // the evidence on the branch is explicitly incomplete, and the branch is never asked.
     const claimed = progress(satisfied(ON_BRANCH));
     const refused = await failure(
-      assertDelivered(ticket, { committed: true, preservedAdoption: true }, claimed, neverAsked),
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, claimed, neverAsked, NO_STASH),
     );
     expect(refused?.message).toBe(expected);
     expect(claimed).toMatchObject({ committed: true, delivered: false });
@@ -1926,7 +1941,7 @@ describe("a run failure exposes anton's text and the agent's self-report as dist
   const neverAsked = async (): Promise<boolean> => {
     throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
   };
-  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked, NO_STASH);
   const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
 
   it("splits a plain zero diff — no self-report, so the structural half is the whole message", async () => {

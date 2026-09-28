@@ -27,6 +27,15 @@ anton drives the mechanical lifecycle so runs stay deterministic and resumable. 
   reference.
 - **Switch branches or manage the worktree.** You are already on the correct branch in the
   correct worktree; stay there.
+- **Stash, revert, or otherwise set aside your own work — ever.** No `git stash`, no
+  `git checkout -- <path>`, no `git reset --hard`, no moving your changes to a scratch directory,
+  not even temporarily. The working tree IS your delivery: anton reads it when you finish, and a
+  stashed tree is indistinguishable from a ticket that did nothing — it gets filed as "delivered
+  nothing" and the run halts. If you need a comparison baseline (coverage before vs. after, a
+  benchmark), get it WITHOUT disturbing your changes: read it from CI, from the base branch via
+  `git show <base>:<path>` or `git stash`-free worktree-less commands, or compute it from
+  `git diff`. If you genuinely cannot measure it without a clean tree, say so and report
+  `ANTON-RESULT: blocked — other — <what you could not measure>` with your work intact in the tree.
 
 ## Your job
 
@@ -84,13 +93,18 @@ project's own checks — in whatever language(s) the repo uses — and leaving t
    right way (per the quality floor above) — never by weakening the check.
 4. **If the project has no such checks, say so explicitly** in your summary ("no test/lint/build
    tooling found") rather than silently skipping — so the gap is visible, not assumed-passed.
-5. **Wait on the artifact, not on a process.** When a check runs long enough that you background it,
-   poll for its *output* — `until [ -s run.json ]; do sleep 10; done` — or use your harness's own
-   completion signal. Never gate on process absence. `pgrep -f "<pattern>"` matches every command
-   line *containing* that text, which includes the polling shell's own `zsh -c` argv and this
-   session's `claude` process — your ticket spec is on that command line, so a spec quoting
-   `vitest run` makes `pgrep -f "vitest run"` match forever. The loop then never exits and the run
-   burns its whole budget waiting on a check that already finished.
+5. **Run checks in the FOREGROUND, and never end your turn to wait.** This session gets exactly one
+   turn: anton reads your final message and settles the ticket on it. Nothing wakes you up — so
+   `ScheduleWakeup`, `Monitor`, and `run_in_background` are all traps here. Arming one and ending
+   your turn does not pause the ticket; it *ends* it, mid-work, with your changes unverified. The
+   only thing that ends your turn is the `ANTON-RESULT` line. So: call the check and wait for it to
+   return. A long suite is fine — you have a wall-clock budget, not a per-tool one.
+   If a check genuinely cannot run in the foreground, poll for its *output* in the foreground —
+   `until [ -s run.json ]; do sleep 10; done` — and never gate on process absence. `pgrep -f
+   "<pattern>"` matches every command line *containing* that text, which includes the polling
+   shell's own `zsh -c` argv and this session's `claude` process — your ticket spec is on that
+   command line, so a spec quoting `vitest run` makes `pgrep -f "vitest run"` match forever. The
+   loop then never exits and the run burns its whole budget waiting on a check that already finished.
 6. **Never run the full suite concurrently with another run.** anton executes tickets in parallel
    worktrees on one machine. Two suites at once starve each other and produce timeout failures that
    belong to neither change — do not "fix" a timeout you have not first reproduced on an idle box.
@@ -185,6 +199,11 @@ there is not an ask, and re-emitting it parks the run on a question that has bee
 
 Rules:
 - Emit it **once**, as the final line. anton reads the last `ANTON-RESULT:` line from your output.
+- **Your turn ends with this line and no other way.** There is no later turn: if you stop without it
+  — to wait on a background job, a wakeup, or a monitor — anton sees a session that exited having
+  said nothing, blocks the ticket, and halts the run. When you are out of time or out of ideas,
+  report `blocked` or `needs-human` rather than yielding; a stated stop is always better than a
+  silent one.
 - **Never report `delivered` on an unchanged tree — with one exception, a CONTINUATION of this
   ticket.** If you made no code changes, you normally delivered nothing —
   report `satisfied` with the commit that already did the work, or `blocked` (or `needs-human`) with the reason. anton

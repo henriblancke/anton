@@ -23,6 +23,10 @@ vi.mock("../git/ops", async () => {
     ...actual,
     branchAddedCommit: (...args: unknown[]) => branchAddedCommitMock(...args),
     describeCommit: (...args: unknown[]) => describeCommitMock(...args),
+    // This suite's worktree (`/tmp/anton-wt`) is fake, and the ticket's stash baseline read (anton-wjfkn
+    // round 3) now PROPAGATES a real git failure rather than swallowing it to `[]` — a change these
+    // deadline/timeout cases have nothing to do with.
+    readStashEntries: async () => [],
   };
 });
 

@@ -5,7 +5,7 @@
  * ones — so they live together rather than beside the code that happens to throw them.
  */
 import type { SatisfiedBy } from "../beads/satisfied-note";
-import type { AntonResult } from "../claude/anton-result";
+import { formatAntonResult, type AntonResult } from "../claude/anton-result";
 import { blockedByPoison, parkedOnGateClause, PoisonEpic } from "./errors";
 
 /**
@@ -46,6 +46,32 @@ export function runFailureParts(e: unknown): RunFailureParts {
 }
 
 /**
+ * Fold the parsed self-report into a failure's rendered message, when one was emitted (anton-j5i8).
+ *
+ * Lives beside the error classes rather than their one-time settle-side caller (anton-wjfkn, PR #333
+ * review) so a class that composes its own `structural` text internally — {@link AgentYieldedError},
+ * which builds it from its own fields rather than taking a pre-built `msg` — can fold this in too. A
+ * caller-side `structural + selfReportSuffix(...)` only reaches classes whose constructor takes the
+ * whole message as an argument.
+ */
+export function selfReportSuffix(selfReport: AntonResult | null): string {
+  if (!selfReport) return "";
+  if (selfReport.outcome === "delivered") {
+    return ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`;
+  }
+  // A satisfied claim only reaches a no-delivery message when the branch did not bear it out
+  // (anton-nuft): the gate settles a verified one before any message is composed.
+  if (selfReport.outcome === "satisfied") {
+    return (
+      ` The agent self-reported ANTON-RESULT: ${formatAntonResult(selfReport)}, but that names no ` +
+      `commit this run's branch added over its base, so the claim is unverified — a false success ` +
+      `on an unchanged tree.`
+    );
+  }
+  return ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
+}
+
+/**
  * The run ran every ticket it could and the rest are held by a prerequisite outside it (anton-1two).
  * Poison (`PoisonEpic`), so the runner parks the JOB for a human rather than burning retries on a
  * wait no retry shortens — and, like {@link ReviewBlockedError}, the RUN row is parked instead of
@@ -83,6 +109,208 @@ export class NoDeliveryError extends Error implements RunFailureParts {
     this.name = "PoisonError"; // classified as poison by the runner
     this.structural = structural;
     this.selfReport = selfReport;
+  }
+}
+
+/**
+ * A stop whose WORK IS STILL IN THE WORKTREE, uncommitted (anton-wjfkn) — the two ways an agent can
+ * leave a run holding a change that no commit, and therefore no branch, records.
+ *
+ * The property every reader cares about is the same for both: this checkout may not be force-removed
+ * as a failed run's residue, because it — or the stash entries named here — is the only copy of the
+ * work. {@link holdsRecoverableWork} is what the teardown asks, so neither class needs the teardown to
+ * know it by name.
+ */
+export interface RecoverableWork {
+  /**
+   * The stash commits this stop is holding, newest first — empty when the work is loose in the tree
+   * rather than on the stack. Named in the park so the durable copy is reachable from an operator's
+   * own note; a measure-the-baseline loop can push several, and none of them may be left to a guess.
+   */
+  readonly stashes: readonly string[];
+  /**
+   * Which of {@link stashes} anton tried to reapply and could NOT (a conflict against the tree the
+   * entry was made from, or a corrupt entry) — a subset of `stashes`, empty when every apply landed.
+   * The park note must not say "anton put the work back" when this is non-empty: the entries listed
+   * here are only on the stash stack, and a person recovering them still has to run
+   * `git stash apply <sha>` by hand.
+   */
+  readonly restoreFailures: readonly string[];
+  /**
+   * Whether the stash list itself could not be read (anton-wjfkn, PR #333 review round 3) — `stashes`
+   * is `[]` because nothing could be confirmed, not because a read said so. A reader (the block note,
+   * the run row) must not tell an operator the tree — or the stash stack — is the only place to look
+   * when this is true; it doesn't know that. Optional/absent reads the same as `false`: every reader
+   * that predates this field already treated an empty `stashes` as a confirmed empty stack, which is
+   * still the honest answer for {@link StashedWorkError} (only ever built from a non-empty read).
+   */
+  readonly readFailed?: boolean;
+}
+
+/** Whether this stop left uncommitted work behind — the one question the worktree teardown asks. */
+export function holdsRecoverableWork(e: unknown): boolean {
+  return (
+    e instanceof StashedWorkError ||
+    e instanceof AgentYieldedError ||
+    e instanceof StashBaselineUnreadableError
+  );
+}
+
+/**
+ * The tree is empty because the agent STASHED its own work (anton-wjfkn).
+ *
+ * Distinct from {@link NoDeliveryError} in the one way that matters to an operator: nothing was
+ * delivered, but the work is not gone — it is a commit on the repository's stash stack, named here by
+ * sha. A zero-diff park tells them to implement the ticket or fix its spec, which is the wrong move
+ * and (once the worktree is force-removed as a failed run's residue) the expensive one: the stash
+ * commit is all that is left of the change. Poison-classified like the delivery block it replaces —
+ * re-running the agent would find the same set-aside tree — but carried as its own class so the
+ * teardown keeps this checkout and the park names the sha a person recovers from.
+ */
+export class StashedWorkError extends Error implements RunFailureParts, RecoverableWork {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null;
+  constructor(
+    msg: string,
+    readonly stashes: readonly string[],
+    structural: string = msg,
+    selfReport: AntonResult | null = null,
+    readonly restoreFailures: readonly string[] = [],
+  ) {
+    super(msg);
+    this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
+    this.selfReport = selfReport;
+  }
+}
+
+/**
+ * The agent ENDED ITS TURN to wait on something (anton-wjfkn): its final message armed a
+ * `ScheduleWakeup`, a `Monitor` or a `run_in_background` job, and it emitted no `ANTON-RESULT` at all.
+ *
+ * Nothing wakes an autonomous ticket session — anton reads one final message and settles the ticket on
+ * it — so that turn is the whole session, and it is a STOP dressed as a clean exit. Its own class
+ * because every other reading of it is wrong and expensively so: read as a clean exit it becomes a
+ * zero-diff `no-delivery` park (the ticket blocked for "nothing landed", the epic halted, the
+ * worktree removed) over a session that was mid-work and usually holding its own diff aside to
+ * measure a baseline. That is the 2026-09-27 incident, and it is the reason this is a distinct outcome
+ * rather than a message on an existing one.
+ *
+ * Poison-classified: the agent is waiting for a reply the harness has no way to send, so another
+ * attempt reproduces the same yield. A person raises the ticket's budget, or the prompt's ban on
+ * yielding does its job on the next attempt.
+ */
+export class AgentYieldedError extends Error implements RunFailureParts, RecoverableWork {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null;
+  constructor(
+    readonly ticketId: string,
+    /** The yield-shaped tools the last message armed, by name — what the park tells the operator. */
+    readonly armed: readonly string[],
+    /** Stash entries the yielded session left behind, newest first; empty when it stashed nothing. */
+    readonly stashes: readonly string[] = [],
+    /** The formula step that yielded — the ticket phase can dispatch several agents. */
+    stepId?: string,
+    selfReport: AntonResult | null = null,
+    /** Which of `stashes` anton tried to reapply and could not — see {@link RecoverableWork}. */
+    readonly restoreFailures: readonly string[] = [],
+    /**
+     * The stash LIST READ ITSELF failed (anton-wjfkn, PR #333 review) — `stashes` is `[]` because
+     * nothing could be read, not because nothing was there. A stash this session left could be sitting
+     * on the stack invisible to this error, so the message below must not claim the tree is the only
+     * place to look.
+     */
+    readonly stashReadFailed: boolean = false,
+  ) {
+    const structural =
+      `${ticketId} did not finish: its ${stepId ? `\`${stepId}\` ` : ``}agent ENDED ITS TURN to wait ` +
+      `on ${armed.join(", ")} and emitted no \`ANTON-RESULT\` line. Nothing wakes an autonomous ticket ` +
+      `session — anton reads one final message and settles the ticket on it — so the agent stopped ` +
+      `mid-work while the session exited cleanly. ` +
+      (stashReadFailed
+        ? `Whether it set anything aside first is UNKNOWN: reading the worktree's stash list failed, ` +
+          `so a stash this session left could be sitting on the stack, invisible to this error. anton ` +
+          `KEPT the worktree rather than removing it either way — check \`git stash list\` in it by ` +
+          `hand before assuming the tree is the only copy. `
+        : stashes.length > 0
+          ? `It had set its own work aside first: ${stashes.map((s) => `\`${s}\``).join(", ")} on the ` +
+            `stash stack. ` +
+            (restoreFailures.length === 0
+              ? `anton restored it into the worktree and KEPT this worktree rather than removing it, so ` +
+                `the change survives. `
+              : restoreFailures.length === stashes.length
+                ? `anton could NOT restore ${stashes.length === 1 ? "it" : "any of it"} back into the ` +
+                  `worktree (the tree has moved under ${stashes.length === 1 ? "it" : "them"}), so the ` +
+                  `stash ${stashes.length === 1 ? "commit is" : "commits are"} the only copy; anton ` +
+                  `KEPT this worktree rather than removing it. `
+                : `anton restored ${stashes.length - restoreFailures.length} of ${stashes.length} back ` +
+                  `into the worktree and could not apply ` +
+                  `${restoreFailures.map((s) => `\`${s}\``).join(", ")}; every entry is still on the ` +
+                  `stash stack, and anton KEPT this worktree rather than removing it. `)
+          : `Whatever it had built is loose in the run's worktree, which anton KEPT rather than ` +
+            `removed. `) +
+      `Blocking the ticket and halting the epic — the work is unverified and uncommitted, so settling ` +
+      `it either way would be a guess. Checks must run in the FOREGROUND; resume the run (with a ` +
+      `raised ticketTimeoutMinutes if the agent yielded to wait out a long one).`;
+    super(structural + selfReportSuffix(selfReport));
+    this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
+    this.selfReport = selfReport;
+  }
+
+  /** {@link RecoverableWork.readFailed}, read off this class's own `stashReadFailed` field — the
+   * name callers that construct this error already use. */
+  get readFailed(): boolean {
+    return this.stashReadFailed;
+  }
+}
+
+/**
+ * anton could not even READ this ticket's stash list, at one of two points a stash read gates a
+ * settlement (anton-wjfkn, PR #333 review round 2 and round 3) — so whether the checkout holds
+ * uncommitted work anton hasn't accounted for (loose in the tree, or on the stash stack from a
+ * neighbour's push or an earlier stop) is simply unknown.
+ *
+ * A plain rethrow of that read failure would settle this ticket as an ORDINARY setup/delivery
+ * failure — indistinguishable at the teardown from any other reason a ticket failed, and an ordinary
+ * failure's worktree is force-removed as the run's residue. That is wrong precisely when it matters
+ * most: a RESUME of a checkout a human gate or an earlier yield already left dirty, or a ticket that
+ * committed real work and merely couldn't confirm the stack alongside it — either way this read
+ * failure is transient and the tree was never anton's to discard on a guess. So both read sites throw
+ * this one class, {@link RecoverableWork}-shaped like {@link StashedWorkError} and
+ * {@link AgentYieldedError}, purely so {@link holdsRecoverableWork} recognises the stop and the
+ * teardown keeps the checkout instead of assuming it was safe to remove. `stashes`/`restoreFailures`
+ * are always empty — there was nothing to name, only something that could not be ruled out — and
+ * `readFailed` is always true.
+ */
+export class StashBaselineUnreadableError extends Error implements RunFailureParts, RecoverableWork {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null = null;
+  readonly stashes: readonly string[] = [];
+  readonly restoreFailures: readonly string[] = [];
+  readonly readFailed = true;
+  constructor(
+    ticketId: string,
+    cause: unknown,
+    /**
+     * WHEN this read happened, and what is left unaccounted for as a result — the one thing the two
+     * call sites cannot share, since the delivery-gate's read runs after this ticket's own steps
+     * (round 3) rather than before any of them (round 2). Defaults to the baseline read's own
+     * wording, the original and still the more common call site.
+     */
+    when: string = "before its steps ran",
+    unaccounted: string = "when this attempt started",
+  ) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    const structural =
+      `${ticketId} could not read this worktree's stash list ${when} (${reason}). ` +
+      `Whether the checkout already held uncommitted work ${unaccounted} — loose in the ` +
+      `tree, or already on the stash stack from an earlier stop — is unknown, so the run halts here ` +
+      `rather than guess: the worktree is KEPT rather than removed. Retry once the read succeeds, ` +
+      `then resume the run.`;
+    super(structural);
+    this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
   }
 }
 
