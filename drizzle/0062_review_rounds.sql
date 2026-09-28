@@ -36,8 +36,6 @@ CREATE TABLE `review_rounds` (
 	`recorded_at` integer DEFAULT (unixepoch()) NOT NULL
 );
 --> statement-breakpoint
-CREATE INDEX `review_rounds_project_idx` ON `review_rounds` (`project_id`,`recorded_at`);
---> statement-breakpoint
-CREATE INDEX `review_rounds_pr_idx` ON `review_rounds` (`project_id`,`pr_number`,`round`);
---> statement-breakpoint
+CREATE INDEX `review_rounds_project_idx` ON `review_rounds` (`project_id`,`recorded_at`);--> statement-breakpoint
+CREATE INDEX `review_rounds_pr_idx` ON `review_rounds` (`project_id`,`pr_number`,`round`);--> statement-breakpoint
 CREATE INDEX `review_rounds_bead_idx` ON `review_rounds` (`bead_id`);

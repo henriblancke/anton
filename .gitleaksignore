@@ -5,3 +5,8 @@
 # an inline `gitleaks:allow`; this entry covers the commit that introduced it, since a PR scan
 # re-reads every commit in the range and history is not rewritten.
 f4490ebaf26082050b671e8b3a2a2071a6c91a70:src/lib/stringer.test.ts:generic-api-key:784
+
+# decisionInputHash's own narrowing test used a fake `sk-live-hunter2` fixture, replaced with a
+# non-key-shaped string in a later commit on this branch — but the scan re-reads every commit in the
+# range, so the now-fixed introducing commit still flags.
+525158b8777da32c61437e9f7af76c803ed04d0c:src/lib/decide/log.test.ts:generic-api-key:143

@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1ef5a9f3-736e-4cd8-af02-61187971f77c",
-  "prevId": "c136a137-0646-4682-9474-74e240407273",
+  "id": "f2c18640-3e06-4eaa-ab43-8addb3cd1ef6",
+  "prevId": "1ef5a9f3-736e-4cd8-af02-61187971f77c",
   "tables": {
     "autopilot_disarms": {
       "name": "autopilot_disarms",
@@ -684,6 +684,13 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true,
+          "autoincrement": false
+        },
+        "point_definition_hash": {
+          "name": "point_definition_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
           "autoincrement": false
         },
         "acted": {

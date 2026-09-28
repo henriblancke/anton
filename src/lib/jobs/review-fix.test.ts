@@ -13,7 +13,7 @@ import * as schema from "../db/schema";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
-import { JobRunner, type JobContext, type JobPolicy } from "./runner";
+import type { JobContext } from "./runner";
 import { GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrActivity, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
@@ -733,38 +733,39 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     });
 
     // PR #335 review (src/lib/jobs/review-fix.ts:409): `heartbeat()` never throws for an aborted
-    // signal, so a no-progress timeout that fires while `getPrActivity` is pending used to be
-    // swallowed as an ordinary unreadable PR — a pass containing only orphan reconciliation then
-    // settled the job as done instead of retrying it. Drive this through a real `JobRunner` (not
-    // `dispatch()`) with a tiny per-project timeout so the abort is genuine, not simulated.
-    it("re-throws instead of settling the pass when the no-progress timeout aborts mid-reconciliation", async () => {
+    // signal, so the runner's own no-progress timeout firing while `getPrActivity` is pending used
+    // to be swallowed as an ordinary unreadable PR — a pass containing only orphan reconciliation
+    // then settled the job successfully instead of the abort failing it (and the runner retrying).
+    // Drives `makeReviewFixHandler` directly with a signal that is already aborted by the time
+    // `getPrActivity` rejects, the same shape a real no-progress abort takes — deterministic, with
+    // no dependency on the runner's real timers.
+    it("re-throws (rather than swallowing) an aborted signal from orphan reconciliation", async () => {
       listMock.mockResolvedValue([]);
       insertUnsettledRound(9);
+      const controller = new AbortController();
       getPrActivityMock.mockImplementation(
-        (_repo: string, _n: number, signal: AbortSignal) =>
+        () =>
           new Promise<never>((_resolve, reject) => {
-            signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+            const rejectAborted = () => reject(new DOMException("aborted", "AbortError"));
+            if (controller.signal.aborted) rejectAborted();
+            else controller.signal.addEventListener("abort", rejectAborted);
           }),
       );
 
-      const runner = new JobRunner({
-        db: t.db,
-        clock,
-        config: { maxConcurrent: 1, maxAttempts: 3 },
-        resolvePolicy: (): JobPolicy => ({ concurrency: 1, timeoutMs: 20, maxAttempts: 3 }),
-      });
-      runner.registerHandler("review-fix", makeReviewFixHandler({ db: t.db, clock }));
-      const jobId = await runner.enqueue({ type: "review-fix", projectId: t.projectId });
+      const handler = makeReviewFixHandler({ db: t.db, clock });
+      const ctx: JobContext = {
+        jobId: "job-test",
+        type: "review-fix",
+        payload: { projectId: t.projectId },
+        attempt: 1,
+        heartbeat: async () => {},
+        signal: controller.signal,
+      } as JobContext;
 
-      await runner.tickOnce();
-      await runner.whenIdle();
-
-      const job = await getJob(t.db, jobId);
-      // Retried, not settled as a clean sweep: `made no progress` is the abort path, never a
-      // reported outcome note claiming the orphan was reconciled.
-      expect(job?.status).toBe("queued");
-      expect(job?.lastError).toMatch(/made no progress/);
-      expect(prStateOf(9)).toBeNull();
+      const pending = handler(ctx);
+      controller.abort(); // the runner's own no-progress timeout, simulated
+      await expect(pending).rejects.toThrow(/aborted/);
+      expect(prStateOf(9)).toBeNull(); // never reconciled — the abort must not read as a clean sweep
     });
   });
 
