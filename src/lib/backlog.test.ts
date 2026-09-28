@@ -34,6 +34,7 @@ import {
   DraftEpicError,
   DraftOutcomeError,
   epicChoices,
+  extractOutcomeIdsSection,
   knownAreas,
 } from "./backlog";
 import { validateBeadContract } from "./beads/contract";
@@ -142,6 +143,27 @@ function graphLands() {
     return ids;
   });
 }
+
+describe("extractOutcomeIdsSection", () => {
+  it("stops at a following H2, not just consuming to the end of the description", () => {
+    const { present, body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\noutcome:a\n\n## Notes\n\nsome unrelated prose",
+    );
+    expect(present).toBe(true);
+    expect(body).toBe("outcome:a");
+  });
+
+  // A depth-2-only check let a `#` heading placed after `## Outcome IDs` fall through as ordinary
+  // body text instead of ending the section — outcomeIdTokens then tokenized the heading and the
+  // prose below it as declared ids.
+  it("stops at a following H1 too, not just another H2", () => {
+    const { present, body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\noutcome:a\n\n# Unrelated top-level section\n\nsome unrelated prose",
+    );
+    expect(present).toBe(true);
+    expect(body).toBe("outcome:a");
+  });
+});
 
 describe("buildEpicSkeleton", () => {
   it("renders an epic the contract validator passes with zero violations", async () => {

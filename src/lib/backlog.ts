@@ -290,9 +290,14 @@ export function extractOutcomeIdsSection(description: string): { present: boolea
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     const trimmed = line.trim();
-    if (scanned[i]?.heading?.depth === 2) {
+    const depth = scanned[i]?.heading?.depth;
+    // Any rendered heading at or above this section's own depth ends it — not just another `##`.
+    // A `#` placed after `## Outcome IDs` still closes the document's own top-level grouping, and
+    // leaving it in the body would let outcomeIdTokens tokenize the heading text and everything
+    // after it as declared ids.
+    if (depth !== undefined && depth <= 2) {
       if (inSection) break;
-      inSection = OUTCOME_IDS_HEADING.test(trimmed);
+      inSection = depth === 2 && OUTCOME_IDS_HEADING.test(trimmed);
       if (inSection) present = true;
       continue;
     }

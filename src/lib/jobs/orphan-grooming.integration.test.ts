@@ -6,6 +6,7 @@ import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { describeBd, makeBdRepo, type BdRepo } from "@/lib/testing/integration";
 import { driveJob } from "@/lib/testing/jobs";
+import { extractOutcomeIdsSection } from "../backlog";
 import { beads } from "../beads/bd";
 import { getJob, type Clock } from "./queue";
 import {
@@ -230,5 +231,56 @@ describeBd("orphan-grooming e2e — reusing a legacy epic (anton-cdeki PR #334)"
     expect(board.find((b) => beads.isEpic(b) && b.labels?.includes(ORPHAN_EPIC_LABEL))?.id).toBe(
       legacyEpic,
     );
+  });
+});
+
+describeBd("orphan-grooming e2e — reusing a legacy epic left inside an unterminated fence", () => {
+  // A legacy epic whose description ends inside an unclosed code fence: appending `## Outcome IDs`
+  // verbatim would land the heading inside that fence, where the contract reader sees no section at
+  // all — the patch would look like it landed but never actually satisfy the contract.
+  let bdRepo: BdRepo;
+  let repo: string;
+  let tdb: TestProjectDb;
+  let clock: FakeClock;
+  let projectId: string;
+  let legacyEpic: string;
+
+  beforeAll(async () => {
+    bdRepo = makeBdRepo({ initialCommit: true });
+    repo = bdRepo.repo;
+
+    legacyEpic = await beads.create(repo, {
+      title: ORPHAN_EPIC_TITLE,
+      type: "epic",
+      description:
+        "## Goal\n\nBucket for orphaned tickets.\n\n## Success Criteria\n\n- [ ] x\n\n```\nunclosed fence",
+    });
+    await beads.tag(repo, legacyEpic, [ORPHAN_EPIC_LABEL]);
+    createTicket(repo, "Loose legacy ticket");
+
+    tdb = makeProjectDb({ repoPath: repo });
+    clock = new FakeClock(1_700_000_000_000);
+    projectId = tdb.projectId;
+  });
+
+  afterAll(() => {
+    tdb?.close();
+    bdRepo.cleanup();
+  });
+
+  it("closes the fence before appending, so the Outcome IDs section actually parses", async () => {
+    await driveJob({
+      db: tdb.db,
+      clock,
+      type: "orphan-grooming",
+      handler: makeOrphanGroomingHandler,
+      projectId,
+    });
+
+    const board = await beads.list(repo, ["--status", "all"]);
+    const epic = board.find((b) => b.id === legacyEpic)!;
+    const { present, body } = extractOutcomeIdsSection(epic.description ?? "");
+    expect(present).toBe(true);
+    expect(body).toBe(ORPHAN_EPIC_VARS.outcome_ids);
   });
 });

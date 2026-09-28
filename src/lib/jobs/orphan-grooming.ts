@@ -12,6 +12,7 @@ import { extractOutcomeIdsSection } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { isTicketTier } from "../beads/contract";
 import { beadSkeleton } from "../beads/formula";
+import { unterminatedCloser } from "../beads/markdown";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -130,7 +131,16 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
         // sweep — it's found by its `source:orphan-grooming` label, never by contract shape, so its
         // description would otherwise stay stuck missing `## Outcome IDs` forever. Patch it in
         // place rather than leaving the gap for the next contract-gap sweep to flag.
-        const description = `${(existing.description ?? "").trimEnd()}\n\n## Outcome IDs\n\n${ORPHAN_EPIC_VARS.outcome_ids}`;
+        const kept = (existing.description ?? "").trimEnd();
+        const closer = unterminatedCloser(kept);
+        const description = [
+          kept,
+          ...(closer ? [closer] : []),
+          ``,
+          `## Outcome IDs`,
+          ``,
+          ORPHAN_EPIC_VARS.outcome_ids,
+        ].join("\n");
         const patched = await safe(() => beads.update(repo, epicId, { description }, existing.labels ?? []));
         // Thrown BEFORE any linking below: once an orphan is parented here it stops being an orphan,
         // so a sweep with nothing left to bucket returns early (`orphans.length === 0`) and never
