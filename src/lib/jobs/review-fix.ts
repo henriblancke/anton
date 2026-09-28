@@ -364,9 +364,21 @@ async function dispatchInReview(args: {
     // has `pr_state` null while that work is in flight. Without excluding it too, every operator on
     // a shared board would re-read every OTHER operator's in-review PR here on every pass, scaling
     // with total shared-board activity instead of true orphans (PR #335 review).
+    //
+    // Restricted to ACTIVE in-review targets (open, run-target, still tagged in-review), not every
+    // bead a different operator has ever been assigned (PR #335 review): an epic another operator
+    // finished and closed keeps its assignee forever, so scoping this from `all` unfiltered would
+    // exclude that PR from reconciliation permanently — even though no operator's dispatch loop will
+    // ever touch it again once it's closed, and its round row could be stuck with a null `pr_state`.
     const claimedByOtherOperator = new Set(
       all
-        .filter((b) => !ownedByOperator(b, operator))
+        .filter(
+          (b) =>
+            beads.isRunTarget(b, all) &&
+            b.status !== "closed" &&
+            (b.labels?.includes(IN_REVIEW) ?? false) &&
+            !ownedByOperator(b, operator),
+        )
         .map((b) => prNumberFromRef(beads.getPrRef(b)))
         .filter((n): n is number => n !== undefined),
     );
@@ -988,7 +1000,11 @@ async function runFixSession(args: {
     // target out of in-review while this session was still running — this instance then never revisits
     // the PR (it has left in-review), so the row just inserted would otherwise be the last one this
     // instance ever writes for it and would permanently miss the terminal stamp.
-    const latest = await getPrReview(repo, number, ctx.signal).catch((): undefined => undefined);
+    //
+    // `getPrActivity`, not `getPrReview` (PR #335 review): this recheck only ever inspects `.state`,
+    // same as the dispatcher's own orphan reconciliation above — paying for reviews + CI rollup + a
+    // full paginated GraphQL thread fetch here buys nothing this call reads.
+    const latest = await getPrActivity(repo, number, ctx.signal).catch((): undefined => undefined);
     if (latest?.state === "MERGED") {
       await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "merged" });
     } else if (latest?.state === "CLOSED") {

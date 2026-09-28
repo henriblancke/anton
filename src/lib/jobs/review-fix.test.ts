@@ -714,6 +714,23 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
       expect(getPrActivityMock).not.toHaveBeenCalled(); // must not be re-read as an "orphan" either
       expect(prStateOf(9)).toBeNull();
     });
+
+    // PR #335 review: a bead another operator claimed keeps its assignee even after it closes, so
+    // scoping the exclusion from every assigned bead (rather than active ones) would exclude its PR
+    // from reconciliation forever — no operator's dispatch loop ever revisits a closed epic, so a
+    // round row left null by a late-insert race (the scenario this whole reconciliation pass exists
+    // for) would never get stamped.
+    it("still reconciles an orphan whose epic closed while claimed by another operator", async () => {
+      listMock.mockResolvedValue([
+        { ...target("e-1", 9), assignee: "bob", status: "closed" },
+      ]);
+      insertUnsettledRound(9);
+      getPrActivityMock.mockResolvedValue(prActivity(9, { state: "MERGED" }));
+
+      await dispatch();
+      expect(getPrActivityMock).toHaveBeenCalled(); // closed epic no longer shields its PR
+      expect(prStateOf(9)).toBe("merged");
+    });
   });
 
   describe("makeReviewFixPrHandler (the per-PR worker)", () => {
