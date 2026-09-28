@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
+import Database from "better-sqlite3";
 import { hasGit, makeFileDb, saveEnv, type FileDb } from "@/lib/testing/integration";
 
 const suite = hasGit() ? describe : describe.skip;
@@ -285,5 +286,40 @@ suite("deleteProject (real git + temp anton.db)", () => {
       burnSamples: 1,
       reviewRounds: 1,
     });
+  });
+
+  it("tears down a project even when review_rounds hasn't been migrated yet (PR #335 review)", async () => {
+    // Simulates a source deployment that pulled this code before applying migration 0062: the
+    // optional ledger table simply doesn't exist. Teardown must still remove the project rather
+    // than fail after worktrees/branches/session logs are already gone.
+    const db = getDb();
+    const raw = new Database(fileDb.path);
+    const reviewRoundsDdl = raw
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE tbl_name = 'review_rounds' AND type IN ('table','index') AND sql IS NOT NULL",
+      )
+      .all() as { sql: string }[];
+    raw.exec("DROP TABLE review_rounds");
+    raw.close();
+
+    const projectId = randomUUID();
+    try {
+      await db.insert(schema.projects).values({
+        id: projectId,
+        slug: "pre-0062",
+        name: "pre-0062",
+        repoPath: repo,
+      });
+
+      await deleteProject("pre-0062");
+
+      expect(
+        (await db.select().from(schema.projects).where(eq(schema.projects.id, projectId))).length,
+      ).toBe(0);
+    } finally {
+      const restore = new Database(fileDb.path);
+      for (const { sql } of reviewRoundsDdl) restore.exec(sql);
+      restore.close();
+    }
   });
 });

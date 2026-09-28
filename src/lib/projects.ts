@@ -319,7 +319,15 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
       tx.delete(schema.runHealthReports).where(eq(schema.runHealthReports.projectId, projectId)).run();
       // No foreign key (review-rounds.ts: a best-effort write must never be blocked by one), so
       // nothing forces this cleanup — left out, a project's review history outlives the project.
-      tx.delete(schema.reviewRounds).where(eq(schema.reviewRounds.projectId, projectId)).run();
+      // The table itself is optional too: a deployment that pulled this code before applying
+      // migration 0062 has no `review_rounds` table yet, and that absence must read the same as
+      // "nothing to clean up" rather than fail the whole teardown after worktrees/branches/session
+      // logs are already gone.
+      try {
+        tx.delete(schema.reviewRounds).where(eq(schema.reviewRounds.projectId, projectId)).run();
+      } catch (e) {
+        if (!/no such table/i.test(errMsg(e))) throw e;
+      }
       tx
         .delete(schema.boardPickerPlans)
         .where(eq(schema.boardPickerPlans.projectId, projectId))
