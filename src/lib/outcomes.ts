@@ -6,6 +6,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { renderedLines } from "./beads/markdown";
 import { AREA_SHAPE } from "./epic-patch";
 
 export interface ProjectOutcome {
@@ -32,14 +33,20 @@ const OUTCOMES_HEADING = /^##\s+Outcomes\s*$/i;
 const BULLET_PATTERN = /^-\s*`([^`]+)`\s*—\s*(.+)$/;
 const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
 
-/** The `## Outcomes` section body, up to the next heading of any level — or undefined if absent. */
+/**
+ * The `## Outcomes` section body, up to the next heading of any level — or undefined if absent.
+ * Reads via {@link renderedLines} so HTML-comment content (the scaffolded template's embedded
+ * example bullet) is masked out before scanning, the same way the contract parser's
+ * `renderedText` does — otherwise an unedited PRODUCT.md's example bullet inside `<!-- ... -->`
+ * would parse as a real outcome.
+ */
 function outcomesSection(markdown: string): string[] | undefined {
-  const lines = markdown.split(/\r?\n/);
-  const start = lines.findIndex((line) => OUTCOMES_HEADING.test(line.trim()));
+  const lines = renderedLines(markdown);
+  const start = lines.findIndex((line) => OUTCOMES_HEADING.test(line.text.trim()));
   if (start === -1) return undefined;
   const body: string[] = [];
-  for (let i = start + 1; i < lines.length && !HEADING_PATTERN.test(lines[i]); i++) {
-    body.push(lines[i]);
+  for (let i = start + 1; i < lines.length && !HEADING_PATTERN.test(lines[i].text); i++) {
+    body.push(lines[i].text);
   }
   return body;
 }

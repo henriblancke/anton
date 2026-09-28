@@ -85,6 +85,24 @@ describe("draftFromDetail", () => {
     expect(draft.body).toBe("## Verify\n\nRun the tests");
   });
 
+  // The gap the review flagged (anton-cdeki PR #334): a fenced example containing a line that
+  // merely reads `## Why` is not a rendered heading, so it must stay in `body` untouched rather
+  // than being sliced out into the `why` field (and mangled — the fence would end up unmatched).
+  it("leaves a fenced example's `## Why` line alone — it is body text, not a section boundary", () => {
+    const example = ["```", "## Why", "not a real heading — just an example inside a fence", "```"].join("\n");
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description: `## Goal\n\nDo it\n\n## Why\n\nServes the outcome\n\n## Context\n\n${example}`,
+    });
+    expect(draft.why).toBe("Serves the outcome");
+    expect(draft.body).toBe(`## Context\n\n${example}`);
+  });
+
   it("leaves a `## Why now` / `## Why this approach` section in body, not the `why` field", () => {
     const draft = draftFromDetail({
       id: "x",
@@ -152,6 +170,14 @@ describe("stripContractSections", () => {
   it("does not mistake a `## Why now` / `## Why this approach` section for the contract's `## Why`", () => {
     const desc = "## Goal\n\ng\n\n## Why now\n\nnot the contract field\n\n## Acceptance\n\na";
     expect(stripContractSections(desc)).toBe("## Why now\n\nnot the contract field");
+  });
+
+  it("does not mistake a fenced example's `## Goal` / `## Why` / `## Acceptance` lines for real headings", () => {
+    const example = ["```", "## Goal", "## Why", "## Acceptance", "not real headings — a fenced example", "```"].join(
+      "\n",
+    );
+    const desc = `## Goal\n\ng\n\n## Context\n\n${example}`;
+    expect(stripContractSections(desc)).toBe(`## Context\n\n${example}`);
   });
 });
 

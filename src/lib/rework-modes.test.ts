@@ -627,6 +627,21 @@ describe("applyFollowUp", () => {
     expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
   });
 
+  // The gap the review flagged (anton-cdeki PR #334): a half-created follow-up that is ALREADY
+  // parentless — it predates outcome labels, or was created by hand without a parent — owes no
+  // detachment at all, so `tagDetachedOutcome` was never reached even though this pass still
+  // finishes the bead (the note that follows is what stops a later retry from reconciling it).
+  it("labels a half-created follow-up with the target's outcomes even when no detachment is owed", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("half", { parent: undefined }));
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp());
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "half", labels);
+    // No detachment write in this path — nothing merged, nothing to reparent.
+    expect(reparentMock).not.toHaveBeenCalled();
+  });
+
   it("keeps the detachment recorded when the half-created Context rewrite fails after it", async () => {
     board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
     updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));

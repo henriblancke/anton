@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -101,6 +101,20 @@ describe("parseOutcomes", () => {
     ].join("\n");
 
     expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "valid-id"]);
+  });
+
+  it("does not parse an example bullet embedded inside a multi-line HTML comment", () => {
+    const markdown = [
+      "## Outcomes",
+      "<!-- Stable ids a run target can point at.",
+      "",
+      "     Add one bullet per outcome, in that exact form, e.g.:",
+      "     - `reports-are-shareable` — Every report leaves the app in a format a customer can open.",
+      "",
+      "     Left empty (as scaffolded), no outcome id is offered. -->",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health"]);
   });
 
   it("lets a later bullet override the built-in codebase-health entry", () => {
@@ -221,5 +235,23 @@ describe("projectOutcomesConfigured", () => {
       "## Outcomes\n\n- `reports-are-shareable` — Every report leaves the app.\n",
     );
     expect(await projectOutcomesConfigured(repo)).toBe(true);
+  });
+
+  // Regression guard for the actual bundled scaffold: its `## Outcomes` comment includes a
+  // worked example bullet (`- \`reports-are-shareable\` — ...`) that must stay unparseable, or a
+  // freshly `/setup`-scaffolded, unedited project reads as already having a real outcome.
+  it("is false for the unedited bundled skills/setup/templates/.product/PRODUCT.md scaffold", () => {
+    const templatePath = join(
+      import.meta.dirname,
+      "..",
+      "..",
+      "skills",
+      "setup",
+      "templates",
+      ".product",
+      "PRODUCT.md",
+    );
+    const markdown = readFileSync(templatePath, "utf8");
+    expect(outcomesConfigured(markdown)).toBe(false);
   });
 });

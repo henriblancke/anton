@@ -243,11 +243,15 @@ async function resumeFollowUp(
     await beads.reparent(context.repo, existing.id, "");
   }
   if (match.partial) {
-    await reconcileHalfCreatedContract(
-      context,
-      existing,
-      detachment ? undefined : beads.parentOf(existing),
-    );
+    const parentId = detachment ? undefined : beads.parentOf(existing);
+    // A standalone run target must carry the target's outcome label(s) before this pass notes it
+    // and ends the retry loop that would otherwise catch it up later (existingFollowUp's
+    // unfinishedCreation only matches a still-partial bead). The `detachment` branch above already
+    // tagged a bead this pass is detaching; this covers the other way a resumed half-created
+    // follow-up ends up parentless — it predates outcome labels, or was created by hand without
+    // them — where no detachment is owed at all, so tagDetachedOutcome was never reached.
+    if (!detachment && parentId === undefined) await tagDetachedOutcome(context, existing);
+    await reconcileHalfCreatedContract(context, existing, parentId);
     await finishHalfCreatedFollowUp(context, existing);
   }
   return {

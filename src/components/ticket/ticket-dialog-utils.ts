@@ -5,6 +5,7 @@
  * title/status/priority/agent/risk/size (see ticket-patch.ts).
  */
 import { ACCEPTANCE_HEADING } from "@/lib/beads/contract";
+import { scanMarkdown } from "@/lib/beads/markdown";
 import type { TicketDetail } from "@/lib/types";
 
 /**
@@ -124,18 +125,30 @@ const sectionHeading = (name: string) =>
     : new RegExp(`^##\\s*${name}\\s*$`, "i");
 
 /**
+ * Is this line, at this position, a genuine `##` (level-2) heading — as opposed to a line that
+ * merely LOOKS like one inside a fenced code block, an HTML comment, or other non-rendered
+ * markdown? Backed by {@link scanMarkdown}'s AST-aware line scan (src/lib/beads/markdown.ts), the
+ * same parser the contract reader uses — a raw `/^##\s+/` test on the trimmed line text can't tell
+ * a real heading from a fenced example that merely contains one.
+ */
+const isSectionHeadingLine = (scanned: ReturnType<typeof scanMarkdown>[number] | undefined): boolean =>
+  scanned?.heading?.depth === 2;
+
+/**
  * Drop the `## Goal` / `## Why` / `## Acceptance Criteria` blocks (heading through the line before
- * the next `##`) from a description, leaving "the rest" that the Description textarea edits.
- * Mirrors the heading semantics of `parseSection` in src/lib/tickets.ts so the split round-trips
- * cleanly.
+ * the next `##`) from a description, leaving "the rest" that the Description textarea edits. A
+ * fenced example containing a line that merely reads `## Why` is left alone — it is body text, not
+ * a section boundary.
  */
 export function stripContractSections(description: string): string {
-  const lines = description.split("\n");
+  const lines = description.split(/\r?\n/);
+  const scanned = scanMarkdown(description);
   const kept: string[] = [];
   let skipping = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (/^##\s+/.test(trimmed)) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (isSectionHeadingLine(scanned[i])) {
+      const trimmed = line.trim();
       const isContract = CONTRACT_SECTIONS.some((name) => sectionHeading(name).test(trimmed));
       skipping = isContract;
       if (skipping) continue;
@@ -152,15 +165,16 @@ export function stripContractSections(description: string): string {
  * be read back out of the description markdown.
  */
 function extractSection(description: string, name: string): string {
-  const lines = description.split("\n");
+  const lines = description.split(/\r?\n/);
+  const scanned = scanMarkdown(description);
   const heading = sectionHeading(name);
   const body: string[] = [];
   let inSection = false;
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (/^##\s+/.test(trimmed)) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (isSectionHeadingLine(scanned[i])) {
       if (inSection) break;
-      inSection = heading.test(trimmed);
+      inSection = heading.test(line.trim());
       continue;
     }
     if (inSection) body.push(line);
