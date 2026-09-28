@@ -56,6 +56,15 @@ export interface PrReview {
   mergeable: string | null;
   /** The PR's head branch — the branch anton pushes fixes to. */
   headRefName: string;
+  /**
+   * The PR's actual base branch on GitHub — NOT necessarily the project's configured/default
+   * branch. A retargeted PR, or a project whose default branch setting changed after the PR opened,
+   * leaves those two diverging; premerging the wrong one pushes an unrelated branch's history into
+   * the PR (anton-091jr review, chatgpt-codex-connector). Optional only because `gh` always reports
+   * it in practice — a caller building a synthetic `PrReview` (tests) may still omit it, in which
+   * case callers fall back to the project's configured base branch.
+   */
+  baseRefName?: string;
   /** The PR head's commit SHA — what distinguishes "same doomed input" from new commits (anton-bzm7s). */
   headSha: string;
   url: string;
@@ -82,6 +91,7 @@ interface GhPrView {
   reviewDecision: string | null;
   mergeable?: string | null;
   headRefName: string;
+  baseRefName?: string;
   headRefOid?: string;
   url: string;
   reviews?: Array<{ author?: { login?: string }; state?: string; body?: string }>;
@@ -141,7 +151,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,headRefOid,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,headRefOid,url,reviews,statusCheckRollup",
     ],
     signal,
   );
@@ -167,6 +177,7 @@ export async function getPrReview(
     reviewDecision: view.reviewDecision ?? null,
     mergeable: view.mergeable ?? null,
     headRefName: view.headRefName,
+    baseRefName: view.baseRefName,
     headSha: view.headRefOid ?? "",
     url: view.url,
     reviews,

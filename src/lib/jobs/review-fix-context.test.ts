@@ -24,6 +24,7 @@ function makePr(overrides: Partial<PrReview> = {}): PrReview {
     reviewDecision: "CHANGES_REQUESTED",
     mergeable: "MERGEABLE",
     headRefName: "anton/anton-x1",
+    baseRefName: "main",
     headSha: "sha1",
     url: "https://github.com/acme/repo/pull/7",
     reviews: [],

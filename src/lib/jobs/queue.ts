@@ -636,10 +636,11 @@ export function reviewFixPrParkedAtHead(
  * {@link recordReviewFixAnswered}) at the SAME head SHA and the SAME `classifyReview` fingerprint —
  * anton-dfuvz. Filtered on `headSha` in SQL like {@link parkedAtHead}; `answeredFingerprint` is a
  * JSON array, so its equality is checked in JS after parsing rather than trying to express array
- * equality in the query. Ordered newest-first so a fingerprint that cycled A→B→A is matched against
- * the MOST RECENT answered row at that state, not an arbitrary/stale one from before B (anton-091jr
- * review, @claude): reasons/fingerprints can thrash without the head moving, so more than one row
- * can answer the same pair over a PR's lifetime.
+ * equality in the query. Compared against ONLY the target's single most recent settled row at this
+ * head — never a search over history for any matching row — so a fingerprint that cycled A→B→A
+ * admits the fresh A round instead of being resuppressed by a stale row: if the newest settled row
+ * answered B, it simply doesn't match a fresh A fingerprint, regardless of what an older row once
+ * answered (anton-091jr review, @claude, round 2).
  */
 function answeredUnchanged(
   tx: Pick<AntonDb, "select">,
@@ -648,7 +649,7 @@ function answeredUnchanged(
   headSha: string,
   fingerprint: string[],
 ): string | undefined {
-  const rows = tx
+  const row = tx
     .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson })
     .from(schema.jobs)
     .where(
@@ -661,19 +662,19 @@ function answeredUnchanged(
       ),
     )
     .orderBy(desc(schema.jobs.updatedAt))
-    .all();
-  const wanted = JSON.stringify(fingerprint);
-  return rows.find((r) => {
-    let payload: { answeredFingerprint?: string[] };
-    try {
-      payload = JSON.parse(r.payloadJson);
-    } catch {
-      return false;
-    }
-    return (
-      payload.answeredFingerprint !== undefined && JSON.stringify(payload.answeredFingerprint) === wanted
-    );
-  })?.id;
+    .limit(1)
+    .all()[0];
+  if (!row) return undefined;
+  let payload: { answeredFingerprint?: string[] };
+  try {
+    payload = JSON.parse(row.payloadJson);
+  } catch {
+    return undefined;
+  }
+  return payload.answeredFingerprint !== undefined &&
+    JSON.stringify(payload.answeredFingerprint) === JSON.stringify(fingerprint)
+    ? row.id
+    : undefined;
 }
 
 /**
@@ -705,7 +706,10 @@ export function reviewFixPrAnsweredUnchanged(
  * the suppression only ever describes the exact state an answered round left behind. `fingerprint`
  * (unlike display `reasons`) names each unresolved thread by id + last comment id, so a reviewer's
  * new reply on an already-counted thread is never mistaken for the state this round actually
- * answered (anton-091jr review, chatgpt-codex-connector).
+ * answered (anton-091jr review, chatgpt-codex-connector). Read-modify-write wrapped in ONE
+ * transaction (anton-091jr review, @claude, re-raised) — nothing else writes this job's payload
+ * concurrently today, but the pair is cheap to make atomic and closes the gap for good rather than
+ * leaving it to keep resurfacing as a "still open" note on every future touch of this function.
  */
 export function recordReviewFixAnswered(
   db: AntonDb,
@@ -713,25 +717,27 @@ export function recordReviewFixAnswered(
   headSha: string,
   fingerprint: string[],
 ): void {
-  const row = db
-    .select({ payloadJson: schema.jobs.payloadJson })
-    .from(schema.jobs)
-    .where(eq(schema.jobs.id, jobId))
-    .limit(1)
-    .all()[0];
-  if (!row) return;
-  let payload: Record<string, unknown>;
-  try {
-    payload = JSON.parse(row.payloadJson);
-  } catch {
-    payload = {};
-  }
-  payload.headSha = headSha;
-  payload.answeredFingerprint = fingerprint;
-  db.update(schema.jobs)
-    .set({ payloadJson: JSON.stringify(payload) })
-    .where(eq(schema.jobs.id, jobId))
-    .run();
+  db.transaction((tx) => {
+    const row = tx
+      .select({ payloadJson: schema.jobs.payloadJson })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, jobId))
+      .limit(1)
+      .all()[0];
+    if (!row) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payloadJson);
+    } catch {
+      payload = {};
+    }
+    payload.headSha = headSha;
+    payload.answeredFingerprint = fingerprint;
+    tx.update(schema.jobs)
+      .set({ payloadJson: JSON.stringify(payload) })
+      .where(eq(schema.jobs.id, jobId))
+      .run();
+  });
 }
 
 /**

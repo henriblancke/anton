@@ -449,7 +449,11 @@ async function handleEpic(args: {
   epic: Bead;
   settings: ProjectSettings;
   branchPrefix: string;
-  /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
+  /**
+   * Fallback base branch for conflict pre-merges (project setting, else the repo's default
+   * branch) — used only when the PR's own `baseRefName` is unavailable; the PR's actual base
+   * always wins once `pr` is fetched (see `prBaseBranch` below).
+   */
   baseBranch: string | undefined;
   all: Bead[];
 }): Promise<PrFixOutcome> {
@@ -470,6 +474,12 @@ async function handleEpic(args: {
 
   const pr = await getPrReview(repo, number, ctx.signal);
   const branch = pr.headRefName || `${branchPrefix}/${epic.id}`;
+  // The PR's OWN base on GitHub, not the project's configured/default branch — a retargeted PR or a
+  // project whose default branch setting changed after the PR opened leaves those two diverging,
+  // and premerging the project's setting would merge the wrong branch into the PR (anton-091jr
+  // review, chatgpt-codex-connector). Falls back to the project setting only when `gh` didn't report
+  // one (a synthetic PrReview in tests).
+  const prBaseBranch = pr.baseRefName || baseBranch;
 
   // A merged PR is terminal — finalize the epic (done + cleanup) rather than fixing feedback. A PR
   // merely CLOSED (not merged) falls through to classifyReview, which treats any non-OPEN state as
@@ -506,7 +516,7 @@ async function handleEpic(args: {
       repo,
       branch,
       settings,
-      baseBranch,
+      baseBranch: prBaseBranch,
       number,
       claimOwner,
     });
@@ -545,8 +555,18 @@ async function handleEpic(args: {
       // same head + fingerprint) creates no job row of its own, so it needs no counter beyond this
       // one. Best-effort like the beads sync above: a write hiccup here must not turn a legitimately
       // successful "answered, nothing to push" round into a job failure (anton-tuf4l).
+      //
+      // Stored WITHOUT `thread:` entries (anton-091jr review, chatgpt-codex-connector): `verdict`
+      // was classified BEFORE this round replied, so its fingerprint still names every thread that
+      // was waiting then. `answeredAllThreads` just proved every one of those got a real, delivered
+      // reply — anton is now each thread's last commenter, so `threadsNeedingAttention` drops all of
+      // them on the very next sweep and a fresh `classifyReview` fingerprint would never include
+      // them either. Storing the pre-reply fingerprint verbatim would compare against a shape the
+      // next sweep can never reproduce, so the suppression check would always miss and hand this PR
+      // a brand new fix session despite nothing about it having changed.
+      const postReplyFingerprint = verdict.fingerprint.filter((f) => !f.startsWith("thread:"));
       try {
-        recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.fingerprint);
+        recordReviewFixAnswered(db, ctx.jobId, pr.headSha, postReplyFingerprint);
       } catch (e) {
         consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
       }
