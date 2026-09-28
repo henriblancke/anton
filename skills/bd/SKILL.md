@@ -1,6 +1,6 @@
 ---
 name: bd
-version: 559611367675
+version: db4076a441a0
 description: >-
   Conventions for how anton writes to the beads board (bd). The single place bd usage is
   defined, so /shape and /scan-triage stay consistent and beads stays swappable. Shaping is the
@@ -193,6 +193,15 @@ bd cook anton-bead --mode=runtime \
   --var context='touches: …' --var out_of_scope='- …' --var verify='…'
 # → JSON; take .steps[] | select(.id=="ticket") | .description as the bead description
 ```
+
+**Check `bd formula show anton-bead` names a `why` var before you cook.** `anton update` upgrades
+the runtime binary but never touches a registered project's own
+`.beads/formulas/anton-bead.formula.json` — only `anton init <repo>` (re-)syncs that copy from the
+current bundled asset. A project whose copy predates this contract's `## Why` section is stuck
+cooking the old five-section shape (or `bd cook` fails outright on the unrecognized `--var why`)
+until something resyncs it. If `why` is missing from the `vars` `bd formula show` prints, resync
+first — `anton init <repo-path>` is idempotent and safe to re-run on an already-configured repo —
+then retry the cook.
 
 Then materialise with the ordinary `bd create` below: the cooked step's `description`, whole, and
 nothing beside it. **The description is the only place the contract lives** — see the next section.

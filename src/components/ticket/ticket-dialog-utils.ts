@@ -109,8 +109,19 @@ export const AGENT_OPTIONS = [
  */
 const CONTRACT_SECTIONS = ["Goal", "Why", "Acceptance"] as const;
 
-/** Match a `## <name>` heading — the PREFIX, so it also claims `## Acceptance Criteria`. */
-const sectionHeading = (name: string) => new RegExp(`^##\\s*${name}\\b`, "i");
+/** The one section whose heading is intentionally matched by PREFIX — see {@link CONTRACT_SECTIONS}. */
+const PREFIX_MATCHED_SECTIONS: ReadonlySet<string> = new Set(["Acceptance"]);
+
+/**
+ * Match a `## <name>` heading. Only `Acceptance` matches by prefix (to also claim `## Acceptance
+ * Criteria`); `Goal` and `Why` require the exact heading, or a non-contract section sharing the
+ * same first word — `## Why now`, `## Why this approach` — would be mistaken for the contract's
+ * `## Why` and get silently folded into that draft field instead of staying in `body`.
+ */
+const sectionHeading = (name: string) =>
+  PREFIX_MATCHED_SECTIONS.has(name)
+    ? new RegExp(`^##\\s*${name}\\b`, "i")
+    : new RegExp(`^##\\s*${name}\\s*$`, "i");
 
 /**
  * Drop the `## Goal` / `## Why` / `## Acceptance Criteria` blocks (heading through the line before

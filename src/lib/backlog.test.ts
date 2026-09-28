@@ -555,15 +555,43 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
   });
 
   it("accepts a new epic whose Outcome IDs list several ids including the feature's own", async () => {
+    const target = project();
+    writeFileSync(
+      join(target.repoPath, ".product", "PRODUCT.md"),
+      "## Outcomes\n\n" +
+        "- `reports-are-shareable` — Every report view leaves the app in a format a customer can open.\n" +
+        "- `codebase-health` — Tests, types, and lint stay green as the code changes; found debt gets paid down.\n",
+    );
     const createGraph = graphLands();
 
     await expect(
-      createDraftFeature(project(), {
+      createDraftFeature(target, {
         feature: FEATURE,
-        epic: { kind: "new", epic: { ...EPIC, outcomeIds: "outcome:something-else, reports-are-shareable" } },
+        epic: { kind: "new", epic: { ...EPIC, outcomeIds: "outcome:codebase-health, reports-are-shareable" } },
       }),
     ).resolves.toMatchObject({ epicCreated: true });
     expect(createGraph).toHaveBeenCalledTimes(1);
+  });
+
+  // The typo the review flagged (anton-cdeki): the feature's own outcome id being valid and present
+  // is not enough — every id the new epic declares is a real commitment, so a typo elsewhere in the
+  // list must be caught here too, not just silently persisted onto the board.
+  it("refuses a new epic whose Outcome IDs name a second id PRODUCT.md doesn't offer, even though the feature's own id is valid and present", async () => {
+    const createGraph = vi.spyOn(beads, "createGraph");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: {
+        kind: "new",
+        epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:report-sharng" },
+      },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain("report-sharng");
+    expect(createGraph).not.toHaveBeenCalled();
   });
 });
 

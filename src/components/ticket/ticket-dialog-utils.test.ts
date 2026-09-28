@@ -85,6 +85,20 @@ describe("draftFromDetail", () => {
     expect(draft.body).toBe("## Verify\n\nRun the tests");
   });
 
+  it("leaves a `## Why now` / `## Why this approach` section in body, not the `why` field", () => {
+    const draft = draftFromDetail({
+      id: "x",
+      title: "t",
+      status: "open",
+      stage: "backlog",
+      type: "task",
+      ...meta,
+      description: "## Goal\n\nDo it\n\n## Why now\n\nNot the contract field",
+    });
+    expect(draft.why).toBe("");
+    expect(draft.body).toBe("## Why now\n\nNot the contract field");
+  });
+
   it("falls back to the acceptance field when the description has no ## Acceptance section", () => {
     const draft = draftFromDetail({
       id: "x",
@@ -133,6 +147,11 @@ describe("stripContractSections", () => {
   it("also removes a `## Why` block, so it never survives into body", () => {
     const desc = "## Goal\n\ng\n\n## Why\n\nserves the outcome\n\n## Acceptance\n\na\n\n## Context\n\nc";
     expect(stripContractSections(desc)).toBe("## Context\n\nc");
+  });
+
+  it("does not mistake a `## Why now` / `## Why this approach` section for the contract's `## Why`", () => {
+    const desc = "## Goal\n\ng\n\n## Why now\n\nnot the contract field\n\n## Acceptance\n\na";
+    expect(stripContractSections(desc)).toBe("## Why now\n\nnot the contract field");
   });
 });
 

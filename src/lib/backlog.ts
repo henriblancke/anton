@@ -242,12 +242,22 @@ export class DraftOutcomeError extends Error {
   }
 }
 
-/** Does the epic's free-text `## Outcome IDs` (e.g. `outcome:reports-are-shareable`) name this
- * outcome id? Split on anything that can't appear inside a label-safe id, so a bare id, a
- * `outcome:<id>` label form, and a comma/whitespace-separated list of several all match — while a
- * longer id merely containing this one as a substring does not. */
+/** Split a free-text `## Outcome IDs` field (e.g. `outcome:reports-are-shareable,
+ * outcome:report-sharng`) into its individual declared id tokens: comma/whitespace-separated
+ * entries, each with an optional `outcome:` label prefix stripped. Shared by every check that
+ * needs the full declared set, not just whether one particular id is among them. */
+function outcomeIdTokens(outcomeIds: string): string[] {
+  return outcomeIds
+    .split(/[,\s]+/)
+    .map((token) => token.trim().replace(/^outcome:/i, ""))
+    .filter(Boolean);
+}
+
+/** Does the epic's free-text `## Outcome IDs` name this outcome id? A bare id, an `outcome:<id>`
+ * label form, and a comma/whitespace-separated list of several all match — while a longer id
+ * merely containing this one as a substring does not. */
 function outcomeIdsMention(outcomeIds: string, outcomeId: string): boolean {
-  return outcomeIds.split(/[^A-Za-z0-9._-]+/).includes(outcomeId);
+  return outcomeIdTokens(outcomeIds).includes(outcomeId);
 }
 
 const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\b/i;
@@ -286,15 +296,28 @@ function extractOutcomeIdsSection(description: string): string {
 async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise<void> {
   const outcomeId = draft.feature.outcomeId.trim();
   const outcomes = await readProjectOutcomes(project.repoPath);
-  if (!activeOutcomeIds(outcomes).has(outcomeId)) {
+  const active = activeOutcomeIds(outcomes);
+  if (!active.has(outcomeId)) {
     throw new DraftOutcomeError(
       `"${outcomeId}" is not an outcome \`.product/PRODUCT.md\` offers for new work — pick one from its \`## Outcomes\` section`,
     );
   }
-  if (draft.epic.kind === "new" && !outcomeIdsMention(draft.epic.epic.outcomeIds, outcomeId)) {
-    throw new DraftOutcomeError(
-      `the new epic's Outcome IDs must include "${outcomeId}" — the feature's own outcome is one of the outcomes its epic serves`,
-    );
+  if (draft.epic.kind === "new") {
+    const declared = outcomeIdTokens(draft.epic.epic.outcomeIds);
+    if (!declared.includes(outcomeId)) {
+      throw new DraftOutcomeError(
+        `the new epic's Outcome IDs must include "${outcomeId}" — the feature's own outcome is one of the outcomes its epic serves`,
+      );
+    }
+    // Every declared id is a real commitment the epic makes, not just the one the feature happens
+    // to use — a typo elsewhere in the list (`outcome:report-sharng`) would otherwise persist onto
+    // the board unnoticed because the feature's OWN id already satisfied the check above.
+    const unknown = declared.filter((id) => !active.has(id));
+    if (unknown.length > 0) {
+      throw new DraftOutcomeError(
+        `the new epic's Outcome IDs name ${unknown.map((id) => `"${id}"`).join(", ")}, which \`.product/PRODUCT.md\` doesn't offer for new work — fix the typo or remove it`,
+      );
+    }
   }
 }
 
