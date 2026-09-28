@@ -80,7 +80,6 @@ import {
   replyToReviewComment,
   resolveReviewThread,
   reviewersRequestingChanges,
-  threadsNeedingAttention,
   type Actionable,
   type PrReactionContent,
   type PrReview,
@@ -109,10 +108,11 @@ import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
 import {
   buildReviewFixPrompt,
-  fabricatedFix,
   parseThreadReport,
+  triageOutcomes,
   type ThreadOutcome,
 } from "./review-fix-context";
+import { recordPrTerminalState, recordReviewRound } from "../review-rounds";
 import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
@@ -231,7 +231,8 @@ export function claimOwnerFor(jobId: string): string {
 /** Build the DISPATCHER handler bound to a db/clock. Register it as the "review-fix" handler. */
 export function makeReviewFixHandler(deps: ReviewFixDeps): JobHandler {
   const db = deps.db;
-  return (ctx: JobContext) => dispatchInReview({ db, ctx });
+  const clock = deps.clock ?? systemClock;
+  return (ctx: JobContext) => dispatchInReview({ db, clock, ctx });
 }
 
 /** Build the PER-PR handler bound to a db/clock. Register it as the "review-fix-pr" handler. */
@@ -247,8 +248,12 @@ export function makeReviewFixPrHandler(deps: ReviewFixDeps): JobHandler {
  * work to its own job. Reads the board once and each PR once — no worktree, no claude, no gates —
  * so the pass costs seconds and always fits inside its poll slot.
  */
-async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise<JobEffect> {
-  const { db, ctx } = args;
+async function dispatchInReview(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+}): Promise<JobEffect> {
+  const { db, clock, ctx } = args;
   const { projectId, epicBeadId } = ctx.payload as ReviewFixPayload;
   const project = await getProjectById(db, projectId);
   if (!project) throw new PoisonError(`project ${projectId} not found`);
@@ -276,6 +281,17 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
     await ctx.heartbeat();
     try {
       const triage = await needsFix(repo, target, ctx.signal);
+      // A CLOSED-unmerged PR ends here (anton-z5e3g): it is not actionable, so it is never
+      // dispatched, and this triage read is the ONLY place anton observes the close at all. The
+      // target keeps its `stage:in-review` and PR ref for a recovery run, so it is re-read every
+      // pass — the stamp is first-observation-wins and writes nothing once it has landed.
+      if (triage.state === "CLOSED" && triage.prNumber !== undefined) {
+        await recordPrTerminalState(db, clock, {
+          projectId,
+          prNumber: triage.prNumber,
+          state: "closed",
+        });
+      }
       if (!triage.needsFix) continue;
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
       // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
@@ -318,6 +334,10 @@ interface FixTriage {
   needsFix: boolean;
   /** The PR head's commit SHA — undefined only if the PR could not be identified. */
   headSha?: string;
+  /** OPEN | MERGED | CLOSED as the triage read it; undefined when there is no PR to read. */
+  state?: string;
+  /** The PR this triage read, undefined when the target names none. */
+  prNumber?: number;
 }
 
 /**
@@ -338,6 +358,8 @@ async function needsFix(
   return {
     needsFix: pr.state === "MERGED" || classifyReview(pr).actionable,
     headSha: pr.headSha || undefined,
+    state: pr.state,
+    prNumber: number,
   };
 }
 
@@ -449,10 +471,20 @@ async function handleEpic(args: {
       projectId,
       epic,
       children: runTickets(all, epic.id),
+      prNumber: number,
       branch,
       all,
     });
     return "merged";
+  }
+
+  // A PR that CLOSED between the dispatch and now (anton-z5e3g). `classifyReview` below treats it as
+  // not-actionable and the target is left untouched, so this read would otherwise be discarded — and
+  // the dispatcher, which re-reads every in-review target each pass, would be the only site to ever
+  // record the close. Stamping here too means whichever job first reads the end is the one that
+  // records it; the write is first-observation-wins, so the two sites cannot disagree.
+  if (pr.state === "CLOSED") {
+    await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "closed" });
   }
 
   const verdict = classifyReview(pr);
@@ -805,6 +837,20 @@ async function runFixSession(args: {
 
     const report = parseThreadReport(result.text);
     await applyThreadOutcomes({ repo, number, pr, report, pushed, signal: ctx.signal, logPath });
+    // The round's own record (anton-z5e3g): what GitHub's reviewers handed this round and how anton
+    // answered it, from the values already in hand. AFTER the outcomes are applied, and only on this
+    // path — a session that threw replied to no thread, so its findings are still waiting on anton
+    // and the retry's row carries them; recording both would count the same review twice. The write
+    // never throws (see `recordReviewRound`), so the fix above cannot be lost to a meter.
+    await recordReviewRound(db, clock, {
+      projectId,
+      beadId: epic.id,
+      jobId: ctx.jobId,
+      prNumber: number,
+      pr,
+      report,
+      pushed,
+    });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
     // no thread report (CI-only/conflict-only/no-inline-threads trigger).
@@ -1035,12 +1081,7 @@ export async function applyThreadOutcomes(args: {
   signal: AbortSignal;
   logPath: string;
 }): Promise<void> {
-  const waiting = threadsNeedingAttention(args.pr);
-  for (const item of args.report) {
-    const thread = waiting.find((t) => t.id === item.id);
-    const anchor = thread?.comments[0];
-    if (!thread || !anchor) continue;
-    if (fabricatedFix(item, args.pushed)) continue;
+  for (const { item, thread, anchor } of triageOutcomes(args.pr, args.report, args.pushed)) {
     await recordThreadOutcome(args, thread, anchor.id, item);
   }
 }

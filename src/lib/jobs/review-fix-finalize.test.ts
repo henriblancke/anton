@@ -127,6 +127,7 @@ const finalize = (epic: Bead, children: Bead[], rest: Bead[] = []) => {
     projectId: "p1",
     epic,
     children: linked,
+    prNumber: 7,
     branch: "anton/epic-1",
     all: [epic, ...linked, ...rest],
   });
