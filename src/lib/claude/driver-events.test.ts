@@ -99,6 +99,41 @@ describe("consumeLine", () => {
     expect(events.map((e) => e.type)).toEqual(["system", "assistant", "assistant", "result"]);
   });
 
+  it("captures the model that authored the last text-bearing assistant message, not an earlier one", () => {
+    const state = createStreamState();
+    const feed = (raw: unknown) => consumeLine(state, JSON.stringify(raw));
+
+    feed({
+      type: "assistant",
+      message: { model: "claude-haiku-4-5", content: [{ type: "text", text: "first" }] },
+    });
+    feed({
+      type: "assistant",
+      message: { model: "claude-5-2026-09", content: [{ type: "text", text: "second" }] },
+    });
+    // A tool-only turn carries a model too, but it never produced text — it must not overwrite
+    // the model attributed to the last real answer.
+    feed({ type: "assistant", message: { model: "claude-haiku-4-5", content: [{ type: "tool_use", name: "Read" }] } });
+
+    expect(state.lastAssistantModel).toBe("claude-5-2026-09");
+  });
+
+  it("clears the last assistant model when a later text-bearing message omits it", () => {
+    const state = createStreamState();
+    const feed = (raw: unknown) => consumeLine(state, JSON.stringify(raw));
+
+    feed({
+      type: "assistant",
+      message: { model: "claude-haiku-4-5", content: [{ type: "text", text: "first" }] },
+    });
+    // Same message replaces the text but reports no model — must not keep attributing the new
+    // text to the earlier message's model.
+    feed({ type: "assistant", message: { content: [{ type: "text", text: "second" }] } });
+
+    expect(state.lastAssistantText).toBe("second");
+    expect(state.lastAssistantModel).toBeUndefined();
+  });
+
   it("ignores blank lines and non-JSON noise rather than failing the run", () => {
     const state = createStreamState();
     const events: ClaudeEvent[] = [];

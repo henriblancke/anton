@@ -19,6 +19,12 @@ export async function register(): Promise<void> {
   const { readBootDependencies } = await import("./lib/jobs/self-freshness");
   const { recordServerBuild } = await import("./lib/build/drift");
   recordServerBuild({ runner, dependencies: await readBootDependencies() });
+  // Load the job handler modules for their `definePoint` registration side effects even with the
+  // runner off (anton-528bw): the decide() registry is a `globalThis` singleton populated only by
+  // whatever this process imports (see points.ts's REGISTRY_KEY comment), and the Settings page /
+  // PATCH validator read it independently of whether the runner ever starts. Gating this import
+  // behind the runner flag left both blind to every point while ANTON_RUNNER=off.
+  await import("./lib/jobs/service-handlers");
   if (!runner) return;
   const { startRunner } = await import("./lib/jobs/service");
   await startRunner();
