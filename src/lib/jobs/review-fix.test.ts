@@ -21,6 +21,7 @@ import {
   allWaitingThreadsAnswered,
   applyThreadOutcomes,
   claimOwnerFor,
+  fingerprintHasNonThreadReasons,
   inReviewEpics,
   makeReviewFixHandler,
   notifyGateParked,
@@ -906,6 +907,35 @@ describe("allWaitingThreadsAnswered", () => {
     // — `pushed` here only feeds `fabricatedFix`'s own check on the sentinel.
     const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "fixed it" }];
     expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(true);
+  });
+});
+
+/**
+ * `fingerprintHasNonThreadReasons` feeds `allWaitingThreadsAnswered` as `hasNonThreadReasons` (PR
+ * #338 review, chatgpt-codex-connector + @claude): `classifyReview` (src/lib/git/pr.ts) appends a
+ * `base:<oid>` entry to every nonempty fingerprint as a pure cache-buster, not a real reason — a
+ * thread-only round's fingerprint is `["thread:...", "base:..."]`, and treating that `base:` entry
+ * as a non-thread reason would demand a `NON_THREAD_REPORT_ID` sentinel that never has anything real
+ * to report, silently defeating the answered-unchanged suppression for the most common actionable
+ * shape: a PR whose only feedback is inline review comments.
+ */
+describe("fingerprintHasNonThreadReasons", () => {
+  it("is false for a thread-only fingerprint, even with the base cache-buster appended", () => {
+    expect(fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1"])).toBe(false);
+  });
+
+  it("is true when a real non-thread reason (a failing check) is present", () => {
+    expect(fingerprintHasNonThreadReasons(["check:build", "base:sha-1"])).toBe(true);
+  });
+
+  it("is true for a bare merge-conflict reason with no thread/check entries", () => {
+    expect(fingerprintHasNonThreadReasons(["merge conflicts with the base branch", "base:sha-1"])).toBe(
+      true,
+    );
+  });
+
+  it("is false for an empty fingerprint", () => {
+    expect(fingerprintHasNonThreadReasons([])).toBe(false);
   });
 });
 

@@ -777,6 +777,19 @@ export function allWaitingThreadsAnswered(
 }
 
 /**
+ * Does `verdict.fingerprint` carry an actionable reason besides an unresolved thread? Excludes
+ * `thread:*` (fed to {@link allWaitingThreadsAnswered} as per-thread evidence instead) AND `base:*`
+ * — `classifyReview` (src/lib/git/pr.ts) appends a `base:<oid>` entry to every nonempty fingerprint
+ * as a pure cache-busting key, not a real reason. Without excluding it too, a PR whose only
+ * actionable reason is an unresolved inline thread would always read as having a non-thread reason,
+ * demanding a {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never existed
+ * (PR #338 review, chatgpt-codex-connector and claude).
+ */
+export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): boolean {
+  return fingerprint.some((f) => !f.startsWith("thread:") && !f.startsWith("base:"));
+}
+
+/**
  * Drive claude to resolve the review feedback, then commit/push the fix and notify the reviewers.
  * Wrapped in a recorded session so the UI can follow it and a mid-flight failure marks the session
  * failed before propagating (the runner then applies quota backoff / retry / park). Answers whether
@@ -824,7 +837,7 @@ async function runFixSession(args: {
   // conflict, or a reviewer summary? Drives both the prompt (ask for the sentinel even in a mixed
   // round) and `allWaitingThreadsAnswered` (require it), so the two can never drift apart (PR #338
   // review, chatgpt-codex-connector).
-  const hasNonThreadReasons = verdict.fingerprint.some((f) => !f.startsWith("thread:"));
+  const hasNonThreadReasons = fingerprintHasNonThreadReasons(verdict.fingerprint);
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
@@ -1253,6 +1266,11 @@ async function runGatesWithFollowUp(args: {
     `[review-fix] PR #${number}: ${red.label} gate failed (exit ${red.code}); running one follow-up fix round before parking\n`,
   );
   onFollowUpAttempted();
+  // The main round plus the first gate can already have burned most of a bounded
+  // `jobTimeoutMinutes` — reset the no-progress clock before spending it on the follow-up round and
+  // the gate re-run below, since `ctx.claudeReached()` is a no-op after the first spawn and can't do
+  // it for us (PR #338 review, chatgpt-codex-connector).
+  await ctx.heartbeat();
   await runGateFixFollowUp({
     db,
     clock,
@@ -1267,6 +1285,7 @@ async function runGatesWithFollowUp(args: {
     onEvent,
     red,
   });
+  await ctx.heartbeat();
 
   const red2 = await captureRedGate(settings, worktree.path, ctx.signal, logPath);
   if (red2) throw gateFailurePoison(red2, number);
