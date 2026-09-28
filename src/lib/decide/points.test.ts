@@ -4,6 +4,7 @@
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { definePoint, getPoint, listPoints, narrowState, resetRegistryForTests } from "./points";
+import type { HardRule } from "./points";
 
 afterEach(() => resetRegistryForTests());
 
@@ -157,6 +158,26 @@ describe("definePoint", () => {
     });
     expect(point.escapeValue).toBeUndefined();
   });
+
+  it("snapshots options so mutating the caller's array afterward can't reopen a validated invariant", () => {
+    const options = ["fix", "decline", "human"];
+    definePoint({ ...CHOICE_POINT, question: { kind: "choice", options }, stateFields: ["nitText"] });
+
+    options.push("fix");
+
+    const stored = getPoint("review-nit");
+    expect(stored?.question.kind).toBe("choice");
+    expect(stored?.question.kind === "choice" && stored.question.options).toEqual(["fix", "decline", "human"]);
+  });
+
+  it("freezes the registered point's arrays against later mutation", () => {
+    const point = definePoint({ ...CHOICE_POINT });
+    expect(() => {
+      if (point.question.kind === "choice") (point.question.options as string[]).push("extra");
+    }).toThrow();
+    expect(() => (point.stateFields as string[]).push("extra")).toThrow();
+    expect(() => (point.hardRules as HardRule[]).push(() => undefined)).toThrow();
+  });
 });
 
 describe("resetRegistryForTests", () => {
@@ -185,6 +206,17 @@ describe("narrowState", () => {
     const narrowed = narrowState(point, state);
 
     expect(Object.getOwnPropertyDescriptor(narrowed, "__proto__")?.value).toBe("malicious-looking-value");
+    expect(Object.keys(narrowed)).toEqual(["__proto__"]);
+  });
+
+  it("treats a declared `__proto__` field as absent when the input has no own property for it", () => {
+    // Bracket access on a plain object reads the inherited `Object.prototype` accessor here,
+    // not undefined — without an own-property check this would hash the same as an explicit
+    // `{"__proto__": {}}` input instead of "field not supplied".
+    const point = { ...CHOICE_POINT, stateFields: ["__proto__"] };
+    const narrowed = narrowState(point, {});
+
+    expect(Object.getOwnPropertyDescriptor(narrowed, "__proto__")?.value).toBeUndefined();
     expect(Object.keys(narrowed)).toEqual(["__proto__"]);
   });
 });

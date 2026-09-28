@@ -127,6 +127,25 @@ function registry(): Map<string, DecisionPoint> {
 }
 
 /**
+ * Clones the mutable containers a caller could still hold a reference to (`options`, `stateFields`,
+ * `hardRules`) so a post-registration mutation — e.g. pushing a duplicate choice option onto the
+ * caller's own array — can't reopen an invariant `validate` already checked. Freezing what we store
+ * makes that reopening throw instead of silently corrupting the registry entry.
+ */
+function snapshot(point: DecisionPoint): DecisionPoint {
+  const question: Question =
+    point.question.kind === "choice"
+      ? { kind: "choice", options: Object.freeze([...point.question.options]) }
+      : point.question;
+  return Object.freeze({
+    ...point,
+    question: Object.freeze(question),
+    stateFields: Object.freeze([...point.stateFields]),
+    hardRules: Object.freeze([...point.hardRules]),
+  });
+}
+
+/**
  * Validates and registers a decision point. Throws on a bad shape or a duplicate id — both are
  * programmer errors caught at definition time, never something a caller is meant to recover from.
  */
@@ -135,8 +154,9 @@ export function definePoint(point: DecisionPoint): DecisionPoint {
   if (registry().has(point.id)) {
     throw new Error(`decide: duplicate decision point id "${point.id}"`);
   }
-  registry().set(point.id, point);
-  return point;
+  const registered = snapshot(point);
+  registry().set(point.id, registered);
+  return registered;
 }
 
 export function getPoint(id: string): DecisionPoint | undefined {
@@ -159,7 +179,11 @@ export function narrowState(point: DecisionPoint, state: DecisionState): Decisio
   // drop it from both the backend prompt and decisionInputHash).
   const picked: Record<string, unknown> = Object.create(null);
   for (const field of point.stateFields) {
-    Object.defineProperty(picked, field, { value: state[field], enumerable: true, writable: true, configurable: true });
+    // Bracket access on a field named "__proto__" reads the inherited accessor (Object.prototype
+    // itself) when `state` doesn't own that key, not undefined — an own-property check is required
+    // to tell "field absent" from "field named __proto__" apart.
+    const value = Object.prototype.hasOwnProperty.call(state, field) ? state[field] : undefined;
+    Object.defineProperty(picked, field, { value, enumerable: true, writable: true, configurable: true });
   }
   return picked;
 }
