@@ -329,6 +329,16 @@ export function threadsNeedingAttention(pr: PrReview): ReviewThread[] {
 export interface Actionable {
   actionable: boolean;
   reasons: string[];
+  /**
+   * Stable identity of the CURRENT actionable state, for the answered-suppression fingerprint
+   * (anton-091jr review, chatgpt-codex-connector). `reasons` is display text and stays coarse on
+   * purpose (a count, a check-name list) — it does not change when a reviewer replies again on a
+   * thread already counted, so comparing `reasons` alone lets that new reply get silently
+   * suppressed by a stale "answered" row at the same head. `fingerprint` names each unresolved
+   * thread by id + its last comment id, so a new reply always changes it even when the coarse count
+   * doesn't. Never shown to a human — comparison-only.
+   */
+  fingerprint: string[];
 }
 
 /**
@@ -340,7 +350,8 @@ export interface Actionable {
  */
 export function classifyReview(pr: PrReview): Actionable {
   const reasons: string[] = [];
-  if (pr.state !== "OPEN") return { actionable: false, reasons: ["pr not open"] };
+  const fingerprint: string[] = [];
+  if (pr.state !== "OPEN") return { actionable: false, reasons: ["pr not open"], fingerprint: [] };
 
   if (pr.reviewDecision === "CHANGES_REQUESTED") {
     // Fold in the count of CHANGES_REQUESTED review events (not just the decision, which stays
@@ -350,23 +361,33 @@ export function classifyReview(pr: PrReview): Actionable {
     // a repeat review as already-answered. Omitted when zero (fixtures that set reviewDecision
     // without a matching reviews entry) to keep the plain form for those.
     const changesRequestedCount = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED").length;
-    reasons.push(
+    const reason =
       changesRequestedCount > 0
         ? `changes requested by a reviewer (${changesRequestedCount} review(s))`
-        : "changes requested by a reviewer",
-    );
+        : "changes requested by a reviewer";
+    reasons.push(reason);
+    fingerprint.push(reason);
   }
   if (pr.failingChecks.length > 0) {
-    reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
+    const reason = `failing checks: ${pr.failingChecks.join(", ")}`;
+    reasons.push(reason);
+    fingerprint.push(reason);
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");
+    fingerprint.push("merge conflicts with the base branch");
   }
   const waiting = threadsNeedingAttention(pr);
   if (waiting.length > 0) {
     reasons.push(`${waiting.length} unresolved review thread(s)`);
+    // One entry per thread (sorted for a stable fingerprint regardless of GraphQL ordering), keyed
+    // on its last comment so a fresh reply on an already-counted thread still changes this.
+    for (const t of [...waiting].sort((a, b) => a.id.localeCompare(b.id))) {
+      const last = t.comments[t.comments.length - 1];
+      fingerprint.push(`thread:${t.id}:${last?.id ?? "none"}`);
+    }
   }
-  return { actionable: reasons.length > 0, reasons };
+  return { actionable: reasons.length > 0, reasons, fingerprint };
 }
 
 /** Post a comment on the PR (used to note that anton pushed fixes). Best-effort. */

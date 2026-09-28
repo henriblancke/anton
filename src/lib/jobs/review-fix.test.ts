@@ -487,12 +487,12 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
   });
 
   /** A `done` row simulating an answered round (anton-dfuvz) — what actually settles it is out of this suite's scope. */
-  const markAnswered = (epicBeadId: string, headSha: string, answeredReasons: string[]) =>
+  const markAnswered = (epicBeadId: string, headSha: string, answeredFingerprint: string[]) =>
     t.db
       .update(schema.jobs)
       .set({
         status: "done",
-        payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId, headSha, answeredReasons }),
+        payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId, headSha, answeredFingerprint }),
       })
       .where(eq(schema.jobs.type, "review-fix-pr"))
       .run();
@@ -552,6 +552,32 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
         ],
       }),
     );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  // anton-091jr review (chatgpt-codex-connector): a reviewer's new reply on the SAME thread anton
+  // already answered must not be swallowed by a stale answered row just because the coarse thread
+  // COUNT is unchanged — the fingerprint has to key on the thread's actual comment identity.
+  it("admits a fresh job when a reviewer replies again on an already-answered thread, even with the same thread count and head", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    const threadWithComment = (commentId: number) => ({
+      id: "RT_1",
+      isResolved: false,
+      isOutdated: false,
+      comments: [{ id: commentId, author: "alice", body: "please fix" }],
+    });
+    getPrReviewMock.mockResolvedValue(openPr(1, { threads: [threadWithComment(1)] }));
+
+    await dispatch();
+    // What classifyReview's fingerprint actually stores for one thread whose last comment is #1.
+    markAnswered("e-1", "sha-1", ["thread:RT_1:1"]);
+
+    // Same head, same thread, but the reviewer posted a NEW comment on it — still 1 unresolved
+    // thread by count, but a different fingerprint.
+    getPrReviewMock.mockResolvedValue(openPr(1, { threads: [threadWithComment(2)] }));
     await dispatch();
     const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
     expect(rows).toHaveLength(2);

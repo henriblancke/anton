@@ -293,9 +293,9 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
       // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
       // The head SHA lets the runner's dedupe suppress a doomed retry — see `enqueueReviewFixPrIfAbsent`.
-      // `reasons` is only ever set for the classifyReview (non-merged) branch, so a merged target's
-      // dispatch is never caught by the answered check either.
-      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha, triage.reasons);
+      // `fingerprint` is only ever set for the classifyReview (non-merged) branch, so a merged
+      // target's dispatch is never caught by the answered check either.
+      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha, triage.fingerprint);
       if (jobId) {
         dispatched += 1;
         continue;
@@ -307,8 +307,8 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
         );
       } else if (
         triage.headSha &&
-        triage.reasons &&
-        reviewFixPrAnsweredUnchanged(db, projectId, target.id, triage.headSha, triage.reasons)
+        triage.fingerprint &&
+        reviewFixPrAnsweredUnchanged(db, projectId, target.id, triage.headSha, triage.fingerprint)
       ) {
         suppressedAnswered += 1;
         consoleLog.info(
@@ -346,12 +346,12 @@ interface FixTriage {
   /** The PR head's commit SHA — undefined only if the PR could not be identified. */
   headSha?: string;
   /**
-   * `classifyReview`'s reasons for the current PR state (anton-dfuvz) — what `enqueueReviewFixPrIfAbsent`
-   * keys its answered suppression on, alongside `headSha`. Only ever set on the classifyReview
-   * (non-merged) branch: a merged target's finalization must never be suppressed by a stale answered
-   * round from before it merged.
+   * `classifyReview`'s fingerprint for the current PR state (anton-dfuvz) — what
+   * `enqueueReviewFixPrIfAbsent` keys its answered suppression on, alongside `headSha`. Only ever
+   * set on the classifyReview (non-merged) branch: a merged target's finalization must never be
+   * suppressed by a stale answered round from before it merged.
    */
-  reasons?: string[];
+  fingerprint?: string[];
 }
 
 /**
@@ -373,7 +373,7 @@ async function needsFix(
   const headSha = pr.headSha || undefined;
   if (pr.state === "MERGED") return { needsFix: true, headSha };
   const verdict = classifyReview(pr);
-  return { needsFix: verdict.actionable, headSha, reasons: verdict.reasons };
+  return { needsFix: verdict.actionable, headSha, fingerprint: verdict.fingerprint };
 }
 
 /**
@@ -511,7 +511,7 @@ async function handleEpic(args: {
       claimOwner,
     });
 
-    const pushed = await runFixSession({
+    const { pushed, answeredAllThreads } = await runFixSession({
       db,
       clock,
       ctx,
@@ -527,24 +527,33 @@ async function handleEpic(args: {
       branch,
       number,
     });
-    if (!pushed) {
+    if (!pushed && answeredAllThreads) {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
-      // and these reasons is suppressed instead of handed a brand new session (anton-dfuvz).
+      // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz).
+      // Gated on `answeredAllThreads` (anton-091jr review, chatgpt-codex-connector): a report that
+      // never arrived (a claude error text with no reporting contract) or left some of the threads
+      // this round was actually asked about untouched must NOT be recorded as answered — that thread
+      // is still genuinely waiting on anton, and marking the round "answered" would suppress a fresh
+      // attempt at it forever (same head, same fingerprint) instead of a real reply ever reaching it.
       //
       // Friction classification (ADR-0001 clause 5, anton-tuf4l): this job settles `done`, not
       // parked or cancelled, so it is NOT anton failing and NOT a human touch — nobody was asked
       // anything and nothing is waiting on a person. It still counts toward `prFixRounds` (this PR
       // really did need a round of attention), but contributes zero to every anton-failing/
       // human-touch counter. The later suppression this enables (declining to re-dispatch at the
-      // same head + reasons) creates no job row of its own, so it needs no counter beyond this one.
-      // Best-effort like the beads sync above: a write hiccup here must not turn a legitimately
+      // same head + fingerprint) creates no job row of its own, so it needs no counter beyond this
+      // one. Best-effort like the beads sync above: a write hiccup here must not turn a legitimately
       // successful "answered, nothing to push" round into a job failure (anton-tuf4l).
       try {
-        recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.reasons);
+        recordReviewFixAnswered(db, ctx.jobId, pr.headSha, verdict.fingerprint);
       } catch (e) {
         consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
       }
+    } else if (!pushed) {
+      consoleLog.info(
+        `PR #${number}: round left thread(s) unaddressed (no/incomplete report) — not recording answered`,
+      );
     }
     return pushed ? "pushed" : "answered";
   });
@@ -677,6 +686,43 @@ async function premergeBase(
   }
 }
 
+/** What one fix session decided (see {@link runFixSession}). */
+interface RunFixSessionResult {
+  /** Did this round push a commit to the remote? */
+  pushed: boolean;
+  /**
+   * Did every thread that was waiting on anton BEFORE this session started end up with a real
+   * (non-fabricated) outcome? Only meaningful when `!pushed` — {@link handleEpic} gates
+   * `recordReviewFixAnswered` on it so a malformed/partial thread report, or a fast path that never
+   * looked at threads at all, is never mistaken for an actually-answered round (anton-091jr review,
+   * chatgpt-codex-connector).
+   */
+  answeredAllThreads: boolean;
+}
+
+/**
+ * Do EVERY thread `waitingIds` named (the PR's own unresolved-and-not-yet-replied-to set, read
+ * BEFORE this round touched anything) now have a real outcome in `report` — i.e. is there nothing
+ * left that this round was asked about but never actually answered? A `fabricatedFix` "fixed" claim
+ * doesn't count (same rule `applyThreadOutcomes` uses to skip replying to it), and a thread the
+ * report never mentions at all — because it was malformed, or claude's final message carried no
+ * reporting contract — doesn't count either. Vacuously true when nothing was waiting.
+ */
+function allWaitingThreadsAnswered(
+  waitingIds: ReadonlySet<string>,
+  report: ThreadOutcome[],
+  pushed: boolean,
+): boolean {
+  if (waitingIds.size === 0) return true;
+  const answered = new Set(
+    report.filter((item) => !fabricatedFix(item, pushed)).map((item) => item.id),
+  );
+  for (const id of waitingIds) {
+    if (!answered.has(id)) return false;
+  }
+  return true;
+}
+
 /**
  * Drive claude to resolve the review feedback, then commit/push the fix and notify the reviewers.
  * Wrapped in a recorded session so the UI can follow it and a mid-flight failure marks the session
@@ -699,7 +745,7 @@ async function runFixSession(args: {
   alreadyAhead: boolean;
   branch: string;
   number: number;
-}): Promise<boolean> {
+}): Promise<RunFixSessionResult> {
   const {
     db,
     clock,
@@ -716,6 +762,11 @@ async function runFixSession(args: {
     branch,
     number,
   } = args;
+
+  // Snapshot BEFORE this round touches anything — what `answeredAllThreads` (in every return below)
+  // checks a thread report against. `pr` is the same read `verdict` was classified from, so this
+  // matches exactly what made the round actionable in the first place.
+  const waitingIds = new Set(threadsNeedingAttention(pr).map((t) => t.id));
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
@@ -805,7 +856,9 @@ async function runFixSession(args: {
         reasons: verdict.reasons,
       });
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
-      return pushed;
+      // This path never dispatches claude, so nothing here ever looked at (let alone replied to)
+      // any thread — an unpushed round can only be "fully answered" when nothing was waiting.
+      return { pushed, answeredAllThreads: pushed || waitingIds.size === 0 };
     }
 
     await appendSessionLog(
@@ -922,7 +975,7 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      return false;
+      return { pushed: false, answeredAllThreads: allWaitingThreadsAnswered(waitingIds, report, false) };
     }
 
     await notifyReReview({
@@ -932,7 +985,7 @@ async function runFixSession(args: {
       reasons: verdict.reasons,
       signal: ctx.signal,
     });
-    return true;
+    return { pushed: true, answeredAllThreads: true };
   } catch (e) {
     if (!sessionSettled) await endSession(db, clock, sessionId, "failed");
     // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say

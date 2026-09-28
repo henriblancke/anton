@@ -505,18 +505,18 @@ export function enqueueExecuteEpicIfAbsent(
  * parked job is never re-suppressed by this check. Omitted (the merge-finalize dispatch has no PR
  * commit of its own to key on), the suppression is simply skipped — unchanged prior behavior.
  *
- * `reasons` (anton-dfuvz), when passed alongside `headSha`, adds a THIRD suppression targeting a
+ * `fingerprint` (anton-dfuvz), when passed alongside `headSha`, adds a THIRD suppression targeting a
  * different dead end than a red gate: a `done` row for the same target whose payload carries the
- * SAME head SHA *and* the same `classifyReview` reasons (a fixer session that answered the review
- * feedback — replied to threads, maybe re-requested review — but pushed no commit) is also treated
- * as covering it. Some actionable reasons no code change can satisfy — a PR-body waiver line, a
- * stuck CI check re-evaluating the same commit — so without this, the dispatcher hands the same
+ * SAME head SHA *and* the same `classifyReview` fingerprint (a fixer session that answered the
+ * review feedback — replied to threads, maybe re-requested review — but pushed no commit) is also
+ * treated as covering it. Some actionable state no code change can satisfy — a PR-body waiver line,
+ * a stuck CI check re-evaluating the same commit — so without this, the dispatcher hands the same
  * unresolved-but-unfixable PR to a fresh session every scheduled pass forever. Keyed on state, not
- * a status a human must clear: ANY of a new head, a newly/no-longer-unresolved thread, a new
- * failing check, or a changed review decision changes `reasons` or `headSha`, and the very next
- * pass's fresh triage no longer matches what's stored — the suppression lifts itself. The
- * merge-finalize dispatch passes no `reasons` (its target isn't open, so `classifyReview` never
- * ran for it), so a merged PR is never caught by this check either.
+ * a status a human must clear: ANY of a new head, a newly/no-longer-unresolved thread, a NEW REPLY on
+ * an already-counted thread, a new failing check, or a changed review decision changes `fingerprint`
+ * or `headSha`, and the very next pass's fresh triage no longer matches what's stored — the
+ * suppression lifts itself. The merge-finalize dispatch passes no `fingerprint` (its target isn't
+ * open, so `classifyReview` never ran for it), so a merged PR is never caught by this check either.
  *
  * Synchronous transaction with no awaits inside, like the execute-epic helpers above: better-sqlite3
  * runs one connection, so the read→write pair cannot interleave and two overlapping passes yield
@@ -541,8 +541,8 @@ export function enqueueReviewFixPrIfAbsent(
   opts?: {
     refuseProject?: (projectId: string) => boolean;
     headSha?: string;
-    /** classifyReview's reasons for the CURRENT triage — see this function's doc, anton-dfuvz. */
-    reasons?: string[];
+    /** classifyReview's fingerprint for the CURRENT triage — see this function's doc, anton-dfuvz. */
+    fingerprint?: string[];
   },
 ): string | undefined {
   const nowMs = clock.now();
@@ -565,8 +565,8 @@ export function enqueueReviewFixPrIfAbsent(
 
       if (
         opts?.headSha &&
-        opts.reasons &&
-        answeredUnchanged(tx, projectId, epicBeadId, opts.headSha, opts.reasons)
+        opts.fingerprint &&
+        answeredUnchanged(tx, projectId, epicBeadId, opts.headSha, opts.fingerprint)
       ) {
         return undefined;
       }
@@ -633,20 +633,20 @@ export function reviewFixPrParkedAtHead(
 
 /**
  * Id of a `done` `review-fix-pr` job for this target that answered its round (see
- * {@link recordReviewFixAnswered}) at the SAME head SHA and the SAME `classifyReview` reasons —
- * anton-dfuvz. Filtered on `headSha` in SQL like {@link parkedAtHead}; `answeredReasons` is a JSON
- * array, so its equality is checked in JS after parsing rather than trying to express array
- * equality in the query. Every row a fresh dispatch can ever create for a given (head, reasons)
- * pair is answered by at most one settled `done` row — once one exists, the next matching triage is
- * suppressed before a second attempt is ever enqueued — so there is no "most recent wins" ambiguity
- * to resolve here.
+ * {@link recordReviewFixAnswered}) at the SAME head SHA and the SAME `classifyReview` fingerprint —
+ * anton-dfuvz. Filtered on `headSha` in SQL like {@link parkedAtHead}; `answeredFingerprint` is a
+ * JSON array, so its equality is checked in JS after parsing rather than trying to express array
+ * equality in the query. Ordered newest-first so a fingerprint that cycled A→B→A is matched against
+ * the MOST RECENT answered row at that state, not an arbitrary/stale one from before B (anton-091jr
+ * review, @claude): reasons/fingerprints can thrash without the head moving, so more than one row
+ * can answer the same pair over a PR's lifetime.
  */
 function answeredUnchanged(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,
   headSha: string,
-  reasons: string[],
+  fingerprint: string[],
 ): string | undefined {
   const rows = tx
     .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson })
@@ -660,24 +660,27 @@ function answeredUnchanged(
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
     )
+    .orderBy(desc(schema.jobs.updatedAt))
     .all();
-  const wanted = JSON.stringify(reasons);
+  const wanted = JSON.stringify(fingerprint);
   return rows.find((r) => {
-    let payload: { answeredReasons?: string[] };
+    let payload: { answeredFingerprint?: string[] };
     try {
       payload = JSON.parse(r.payloadJson);
     } catch {
       return false;
     }
-    return payload.answeredReasons !== undefined && JSON.stringify(payload.answeredReasons) === wanted;
+    return (
+      payload.answeredFingerprint !== undefined && JSON.stringify(payload.answeredFingerprint) === wanted
+    );
   })?.id;
 }
 
 /**
  * Is a target's last settled `review-fix-pr` attempt an ANSWERED round (replied to threads, maybe
- * re-requested review, but pushed no commit) at the same head and the same actionable reasons as
+ * re-requested review, but pushed no commit) at the same head and the same actionable fingerprint as
  * right now — i.e. is a fresh enqueue for it currently suppressed by
- * {@link enqueueReviewFixPrIfAbsent}'s reasons check? Exported for the dispatcher's own reporting,
+ * {@link enqueueReviewFixPrIfAbsent}'s check? Exported for the dispatcher's own reporting,
  * mirroring {@link reviewFixPrParkedAtHead}: a caller that already knows a target needs a fix but got
  * no job id back can tell this suppression apart from a parked red gate or a job already in flight.
  */
@@ -686,26 +689,29 @@ export function reviewFixPrAnsweredUnchanged(
   projectId: string,
   epicBeadId: string,
   headSha: string,
-  reasons: string[],
+  fingerprint: string[],
 ): boolean {
-  return answeredUnchanged(db, projectId, epicBeadId, headSha, reasons) !== undefined;
+  return answeredUnchanged(db, projectId, epicBeadId, headSha, fingerprint) !== undefined;
 }
 
 /**
  * Record that THIS `review-fix-pr` job's round answered its target's review feedback without
- * pushing a commit — the head SHA and `classifyReview` reasons it acted on, folded into the job's
- * own payload (anton-dfuvz). The next dispatcher pass compares a fresh triage against this (via
- * {@link reviewFixPrAnsweredUnchanged}/the enqueue's own check) so a target that answered at an
- * UNCHANGED head with the SAME actionable reasons is not handed to a brand new fix session every
+ * pushing a commit — the head SHA and `classifyReview` fingerprint it acted on, folded into the
+ * job's own payload (anton-dfuvz). The next dispatcher pass compares a fresh triage against this
+ * (via {@link reviewFixPrAnsweredUnchanged}/the enqueue's own check) so a target that answered at an
+ * UNCHANGED head with the SAME actionable fingerprint is not handed to a brand new fix session every
  * scheduled pass for a fix no code change can supply — a PR-body waiver line, a CI check stuck
  * re-evaluating the same commit. A merged, pushed, or newly-actionable round never calls this, so
- * the suppression only ever describes the exact state an answered round left behind.
+ * the suppression only ever describes the exact state an answered round left behind. `fingerprint`
+ * (unlike display `reasons`) names each unresolved thread by id + last comment id, so a reviewer's
+ * new reply on an already-counted thread is never mistaken for the state this round actually
+ * answered (anton-091jr review, chatgpt-codex-connector).
  */
 export function recordReviewFixAnswered(
   db: AntonDb,
   jobId: string,
   headSha: string,
-  reasons: string[],
+  fingerprint: string[],
 ): void {
   const row = db
     .select({ payloadJson: schema.jobs.payloadJson })
@@ -721,7 +727,7 @@ export function recordReviewFixAnswered(
     payload = {};
   }
   payload.headSha = headSha;
-  payload.answeredReasons = reasons;
+  payload.answeredFingerprint = fingerprint;
   db.update(schema.jobs)
     .set({ payloadJson: JSON.stringify(payload) })
     .where(eq(schema.jobs.id, jobId))

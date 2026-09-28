@@ -818,7 +818,7 @@ process.exit(0);`,
             projectId,
             epicBeadId: answerEpic,
             headSha: "sha-answer",
-            answeredReasons: ["changes requested by a reviewer (1 review(s))"],
+            answeredFingerprint: ["changes requested by a reviewer (1 review(s))"],
           }),
         })
         .where(eq(schema.jobs.id, answeredId))

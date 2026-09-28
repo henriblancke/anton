@@ -132,6 +132,25 @@ describe("classifyReview", () => {
     expect(first.reasons).not.toEqual(second.reasons);
     expect(second.reasons.join()).toMatch(/2 review\(s\)/);
   });
+
+  // anton-091jr review (chatgpt-codex-connector): `reasons` is coarse display text (a count) and
+  // must NOT be what the answered-suppression fingerprint keys on — a new reply on an
+  // already-counted thread has to change the fingerprint even though the count doesn't.
+  it("changes fingerprint (but not reasons) when a thread gets a new reply, same count", () => {
+    const before = classifyReview(pr({ threads: [thread({ comments: [{ id: 100, author: "alice", body: "x" }] })] }));
+    const after = classifyReview(pr({ threads: [thread({ comments: [{ id: 100, author: "alice", body: "x" }, { id: 101, author: "alice", body: "still broken" }] })] }));
+    expect(before.reasons).toEqual(after.reasons);
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+    expect(after.fingerprint).toContain("thread:RT_1:101");
+  });
+
+  it("fingerprint is stable regardless of thread ordering", () => {
+    const t1 = thread({ id: "RT_1", comments: [{ id: 1, author: "alice", body: "a" }] });
+    const t2 = thread({ id: "RT_2", comments: [{ id: 2, author: "alice", body: "b" }] });
+    const a = classifyReview(pr({ threads: [t1, t2] }));
+    const b = classifyReview(pr({ threads: [t2, t1] }));
+    expect(a.fingerprint).toEqual(b.fingerprint);
+  });
 });
 
 describe("threadsNeedingAttention", () => {

@@ -423,17 +423,17 @@ export interface JobContext {
    * project's active rows, and the delete then fails over it. Returns the new job id, or undefined
    * when a live job already covers the target — or the project is being torn down — or (anton-bzm7s)
    * a `parked` job for it is already sitting at the same PR `headSha` — or (anton-dfuvz) a `done` job
-   * for it already ANSWERED the same `reasons` at the same `headSha`, so a fresh attempt would just
-   * repeat work no code change can act on. `headSha` is optional — omit it (as the merge-finalize
-   * dispatch does) to skip both of those checks entirely; `reasons` is optional and only meaningful
-   * alongside `headSha` (omit it — as a merged target's dispatch does — to skip just the answered
-   * check).
+   * for it already ANSWERED the same `fingerprint` at the same `headSha`, so a fresh attempt would
+   * just repeat work no code change can act on. `headSha` is optional — omit it (as the
+   * merge-finalize dispatch does) to skip both of those checks entirely; `fingerprint` is optional
+   * and only meaningful alongside `headSha` (omit it — as a merged target's dispatch does — to skip
+   * just the answered check).
    */
   enqueueReviewFixPr: (
     projectId: string,
     epicBeadId: string,
     headSha?: string,
-    reasons?: string[],
+    fingerprint?: string[],
   ) => string | undefined;
 }
 
@@ -942,20 +942,20 @@ export class JobRunner {
    * dispatcher mid-triage can only reach the write after `quiesceProject` has raised the flag and
    * swept, and a pre-read check would still let that write through. Refused → undefined, no row.
    * `headSha`, when passed, also suppresses a `parked` job for this target at the same head
-   * (anton-bzm7s); `reasons`, when passed alongside it, also suppresses a `done` job that already
-   * ANSWERED the same reasons at the same head (anton-dfuvz) — see `enqueueReviewFixPrIfAbsent`
-   * (queue.ts) for why.
+   * (anton-bzm7s); `fingerprint`, when passed alongside it, also suppresses a `done` job that
+   * already ANSWERED the same fingerprint at the same head (anton-dfuvz) — see
+   * `enqueueReviewFixPrIfAbsent` (queue.ts) for why.
    */
   enqueueReviewFixPrIfAbsent(
     projectId: string,
     epicBeadId: string,
     headSha?: string,
-    reasons?: string[],
+    fingerprint?: string[],
   ): string | undefined {
     return enqueueReviewFixPrIfAbsent(this.db, this.clock, projectId, epicBeadId, {
       refuseProject: (pid) => this.quiescedProjects.has(pid),
       headSha,
-      reasons,
+      fingerprint,
     });
   }
 
@@ -1981,8 +1981,8 @@ export class JobRunner {
             burnBefore = this.readProjectUsageFreshSafe(job.projectId ?? null, meterKey);
             await burnBefore;
           },
-          enqueueReviewFixPr: (projectId, epicBeadId, headSha, reasons) =>
-            this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId, headSha, reasons),
+          enqueueReviewFixPr: (projectId, epicBeadId, headSha, fingerprint) =>
+            this.enqueueReviewFixPrIfAbsent(projectId, epicBeadId, headSha, fingerprint),
         };
         effect = (await handler(ctx)) ?? undefined;
         outcome = { kind: "success" };
