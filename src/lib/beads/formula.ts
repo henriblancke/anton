@@ -35,6 +35,7 @@ import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath as bundledFormulaUnder,
   ensureBeadFormula,
+  ensureBeadsGitignore,
 } from "./config.mjs";
 import { renderedText, validateBeadContract } from "./contract";
 
@@ -293,9 +294,11 @@ function descriptionShadowsAcceptance(skeleton: BeadSkeleton): boolean {
  * newer contract var (e.g. `why`, added by this change) would 500 on every submission that
  * supplies it, forever, until an operator notices and manually reinitializes it. On exactly that
  * failure, resync the project's copy from the bundled asset — the same replace-and-backup
- * `ensureBeadFormula` already performs for `anton init` — and retry once before giving up. A
- * formula that still discards the var after resyncing (the bundled asset itself is missing the
- * placeholder) is a real bug, not staleness, so that error is left to propagate.
+ * `ensureBeadFormula` already performs for `anton init`, guarded by the same `.gitignore`
+ * safeguard `anton init` applies first (config.mjs) so the `.bak` this resync can leave behind is
+ * never committable — and retry once before giving up. A formula that still discards the var
+ * after resyncing (the bundled asset itself is missing the placeholder) is a real bug, not
+ * staleness, so that error is left to propagate.
  *
  * Two concurrent submissions can both read the stale copy before either syncs it: the first sees
  * `"replaced"`, but the second's sync then finds the copy already matches the bundled asset and
@@ -316,7 +319,16 @@ export async function beadSkeleton(
     if (!(err instanceof DiscardedContractVarError) || path !== projectBeadFormulaPath(repoPath)) {
       throw err;
     }
-    const synced = ensureBeadFormula(join(repoPath, ".beads"), bundledBeadFormulaPath());
+    const beadsDir = join(repoPath, ".beads");
+    // Same safeguard the registration path enforces before a formula replacement (config.mjs):
+    // a refusal here means `formulas/*.bak` isn't ignored yet, so the backup this resync is
+    // about to write would be committable by the next `git add -A`. Treat it as fatal and fall
+    // through to the original discard error instead of leaving a stray backup behind.
+    const gi = ensureBeadsGitignore(beadsDir);
+    if (gi.refused) {
+      throw err;
+    }
+    const synced = ensureBeadFormula(beadsDir, bundledBeadFormulaPath());
     if (synced.status !== "replaced" && synced.status !== "already" && synced.status !== "installed") {
       throw err;
     }

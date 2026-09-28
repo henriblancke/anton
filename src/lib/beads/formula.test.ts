@@ -494,6 +494,39 @@ describe("beadSkeleton self-heals a stale project-local formula (PR #334 review)
       }),
     ).rejects.toThrow(/never references \{\{why\}\}/);
   });
+
+  it("refuses to resync when .gitignore can't be guarded first, instead of leaving a committable .bak", async () => {
+    const repo = repoWithFormula(
+      JSON.stringify({
+        formula: "anton-bead",
+        vars: {},
+        steps: [
+          { id: "epic", description: "e" },
+          { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+          {
+            id: "ticket",
+            type: "task",
+            description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}",
+          },
+        ],
+      }),
+    );
+    // Same class of refusal `ensureBeadFormula` guards against (a symlinked destination) — here
+    // aimed at `.beads/.gitignore` so `formulas/*.bak` can never be added before the resync writes
+    // the backup a `git add -A` could otherwise commit.
+    const outsideGitignore = join(repo, "outside.gitignore");
+    writeFileSync(outsideGitignore, "");
+    symlinkSync(outsideGitignore, join(repo, ".beads", ".gitignore"));
+    await expect(
+      beadSkeleton(repo, "feature", {
+        goal: "Ship it.",
+        why: "Serves outcome:reports-are-shareable.",
+        acceptance: "- [ ] ok",
+      }),
+    ).rejects.toThrow(/never references \{\{why\}\}/);
+    // Refused before the formula was ever touched — no stray backup left on disk.
+    expect(existsSync(`${projectBeadFormulaPath(repo)}.bak`)).toBe(false);
+  });
 });
 
 describe("parseBeadFormula fails loud", () => {
