@@ -1008,7 +1008,13 @@ async function runFixSession(args: {
     // `getPrActivity`, not `getPrReview` (PR #335 review): this recheck only ever inspects `.state`,
     // same as the dispatcher's own orphan reconciliation above — paying for reviews + CI rollup + a
     // full paginated GraphQL thread fetch here buys nothing this call reads.
-    const latest = await getPrActivity(repo, number, ctx.signal).catch((): undefined => undefined);
+    const latest = await getPrActivity(repo, number, ctx.signal).catch((e): undefined => {
+      // Same guard as the orphan-reconciliation read above: a no-progress timeout aborting this call
+      // must not settle as best-effort undefined, or the runner never sees the throw it needs to
+      // treat this pass as retryable (PR #335 review).
+      if (ctx.signal.aborted) throw e;
+      return undefined;
+    });
     if (latest?.state === "MERGED") {
       await recordPrTerminalState(db, clock, { projectId, prNumber: number, state: "merged" });
     } else if (latest?.state === "CLOSED") {
