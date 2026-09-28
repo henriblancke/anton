@@ -1057,18 +1057,24 @@ async function runFixSession(args: {
       // fingerprint+headSha forever while the reviewer never learns why nothing changed (PR #338
       // review, @chatgpt-codex-connector).
       const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
+      // Defaults to true: when there's no sentinel to publish (or it's fabricated),
+      // `allWaitingThreadsAnswered` below already rejects it on its own — this flag only needs to
+      // veto the case where a real sentinel existed but the comment never reached GitHub.
+      let sentinelPublished = true;
       if (sentinel && !fabricatedFix(sentinel, pushed)) {
-        await publishUnpushedSentinel({ repo, number, sentinel, signal: ctx.signal, logPath });
+        sentinelPublished = await publishUnpushedSentinel({
+          repo,
+          number,
+          sentinel,
+          signal: ctx.signal,
+          logPath,
+        });
       }
       return {
         pushed: false,
-        answeredAllThreads: allWaitingThreadsAnswered(
-          waitingIds,
-          answeredIds,
-          report,
-          hasNonThreadReasons,
-          pushed,
-        ),
+        answeredAllThreads:
+          sentinelPublished &&
+          allWaitingThreadsAnswered(waitingIds, answeredIds, report, hasNonThreadReasons, pushed),
       };
     }
 
@@ -1557,6 +1563,11 @@ const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
  * see it, even though `allWaitingThreadsAnswered` is about to treat it as a real answer and
  * suppress this fingerprint+headSha for good. Idempotent against the PR's comment history, same as
  * `notifyGateParked` — a resumed job re-parsing the same report has nothing local to remember.
+ *
+ * Returns whether the explanation actually reached GitHub (already posted, or posted just now) —
+ * the caller must not let `allWaitingThreadsAnswered` credit this round when a transient
+ * `gh pr comment` failure meant nobody ever saw why nothing changed (PR #338 review,
+ * @chatgpt-codex-connector).
  */
 async function publishUnpushedSentinel(args: {
   repo: string;
@@ -1564,14 +1575,17 @@ async function publishUnpushedSentinel(args: {
   sentinel: ThreadOutcome;
   signal: AbortSignal;
   logPath: string;
-}): Promise<void> {
+}): Promise<boolean> {
   const { repo, number, sentinel, signal, logPath } = args;
   const note = sentinel.reply?.trim() || defaultReply(sentinel.outcome);
   const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}`;
   const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
-  if (existing.includes(body)) return;
-  await safe(() => commentOnPr(repo, number, body, signal));
-  await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);
+  if (existing.includes(body)) return true;
+  const posted = await safe(() => commentOnPr(repo, number, body, signal));
+  if (posted) {
+    await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);
+  }
+  return posted;
 }
 
 /** The reaction that turns a triaged outcome into the reviewer's free calibration signal. */

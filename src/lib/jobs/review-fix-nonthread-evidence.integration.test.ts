@@ -208,5 +208,48 @@ process.exit(0);`,
         process.env.ANTON_CLAUDE_BIN = prev;
       }
     });
+
+    it("does NOT record the round answered when publishing the sentinel comment fails", async () => {
+      // Same acking claude as above, but `gh pr comment` fails transiently — the explanation never
+      // reaches GitHub, so `answeredAllThreads` must not suppress this fingerprint+headSha (PR #338
+      // review, @chatgpt-codex-connector: `publishUnpushedSentinel` used to swallow this failure via
+      // `safe()` and let the round be recorded answered anyway).
+      const ackingClaude = writeBin(
+        binDir,
+        "claude-acking-2",
+        `const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+const report=JSON.stringify({threads:[{id:${JSON.stringify(NON_THREAD_REPORT_ID)},outcome:'left',reply:'rollout plan already covered in the description; no change needed'}]});
+e({type:'result',subtype:'success',result:'looked at the rollout plan\\n\\n\`\`\`json\\n'+report+'\\n\`\`\`',is_error:false});
+process.exit(0);`,
+      );
+      const failingGh = writeBin(
+        binDir,
+        "gh-failing-comment",
+        `const a=process.argv.slice(2);
+if(a[0]==='pr'&&a[1]==='comment'){process.stderr.write('transient network error\\n');process.exit(1);}
+if(a[0]==='pr'&&a[1]==='view'){
+  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'please double-check the rollout plan in the PR description'}],statusCheckRollup:[]}));
+  process.exit(0);
+}
+if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));process.exit(0);}
+process.exit(0);`,
+      );
+      const prevClaude = process.env.ANTON_CLAUDE_BIN;
+      const prevGh = process.env.ANTON_GH_BIN;
+      process.env.ANTON_CLAUDE_BIN = ackingClaude;
+      process.env.ANTON_GH_BIN = failingGh;
+      try {
+        const fixes = await runSweep();
+        expect(fixes).toHaveLength(1);
+        const job = await getJob(tdb.db, fixes[0]);
+        expect(job?.status).toBe("done");
+        const payload = JSON.parse(job!.payloadJson);
+        expect(payload.answeredFingerprint).toBeUndefined();
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = prevClaude;
+        process.env.ANTON_GH_BIN = prevGh;
+      }
+    });
   },
 );
