@@ -119,7 +119,7 @@ import {
   recordReviewRound,
   unsettledPrNumbers,
 } from "../review-rounds";
-import { fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
+import { fallbackReasonsFor, fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
@@ -1022,7 +1022,8 @@ async function runFixSession(args: {
     }
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
-    // no thread report (CI-only/conflict-only/no-inline-threads trigger).
+    // no thread report (CI-only/conflict-only/no-inline-threads trigger); `fallbackReasonsFor` gates
+    // that on the RAW `report`, not `delivered` (PR #335 review).
     await refreshFixRoundsBody({
       repo,
       number,
@@ -1030,7 +1031,7 @@ async function runFixSession(args: {
       pushed,
       now: new Date(clock.now()),
       logPath,
-      reasons: verdict.reasons,
+      reasons: fallbackReasonsFor(report, verdict.reasons),
     });
 
     if (!pushed) {
