@@ -112,4 +112,29 @@ describe("resolveFollowUp reuse", () => {
 
     expect(updateMock).not.toHaveBeenCalled();
   });
+
+  // PR #334 review: a failed patch here used to be swallowed and the reused epic handed back as
+  // ready anyway. The caller then moves the remaining tickets onto it and closes the merged source
+  // — and since that source never comes up for rehome again, no later sweep would ever retry the
+  // patch, leaving a runnable epic permanently without `## Outcome IDs`. The failure must instead
+  // come back as unfinished, so the merged target stays open for a retry.
+  it("reports the rehome as unfinished when the Outcome IDs patch fails, rather than handing the epic back ready", async () => {
+    updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
+    const epic = makeBead({ id: "epic1", labels: ["outcome:reports-are-shareable"] });
+    const legacy = makeBead({
+      id: "dup",
+      metadata: { rehomeOf: "epic1" },
+      description: "## Goal\n\nfollow up\n\n## Acceptance Criteria\n- [ ] done",
+    });
+
+    const result = await resolveFollowUp({
+      repo: "/repo",
+      epic,
+      all: [legacy],
+      ids: "t1",
+      reread: async (id) => (id === "dup" ? legacy : undefined),
+    });
+
+    expect(result).toEqual({ ok: false, unfinished: "epic1" });
+  });
 });

@@ -815,6 +815,34 @@ describe("applyFollowUp", () => {
     expect(updateMock.mock.calls[0]![2].description).toContain("## Why");
     // The rest of the legacy contract is left alone — only Why is ever added here.
     expect(updateMock.mock.calls[0]![2].description).toContain("## Acceptance Criteria\n- [ ] done");
+    // Written before the reparent (below pins the order), so a Why that fails to land never
+    // settles the detachment — see the next case for the retry this protects.
+    expect(updateMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+  });
+
+  // anton-cdeki PR #334 review: reconcileMissingWhy used to run AFTER the reparent. A bead the
+  // reparent landed on but the Why rewrite then failed on came back parentless yet still missing
+  // Why — and owedDetachment reads the parent edge alone, so a retry saw nothing owed and never
+  // tried the rewrite again. Doing the rewrite first keeps the parent edge (and so the retry) alive
+  // until it lands.
+  it("keeps the detachment owed when the Why rewrite fails, so a retry tries it again", async () => {
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature(), finishedTicket(), candidate("dup", { description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+    updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).rejects.toThrow("bd update: connection reset");
+    // The reparent never ran — the bead is still under "feat", so owedDetachment still finds it
+    // owed on the retry rather than reading a settled detachment that is secretly still malformed.
+    expect(reparentMock).not.toHaveBeenCalled();
+
+    updateMock.mockReset();
+    updateMock.mockResolvedValue(undefined);
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Why");
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "dup", "");
   });
 
   // Same gap as the half-created case above, for a follow-up whose creation had already finished

@@ -236,17 +236,18 @@ async function resumeFollowUp(
     if (!detachment.recorded) {
       await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
     }
-    // Tag BEFORE the reparent, which is the write that settles the detachment (owedDetachment
-    // reads it off the parent edge, not a label). Ordered the other way round, a tag that failed
-    // after a landed reparent could never be retried: the next pass reads the bead as already
-    // parentless, decides nothing is owed, and the outcome label is gone for good. Tagging twice
-    // is harmless — it only adds labels the bead doesn't already carry.
+    // Tag and reconcile Why BEFORE the reparent, which is the write that settles the detachment
+    // (owedDetachment reads it off the parent edge, not a label or the description). Ordered the
+    // other way round, either write failing after a landed reparent could never be retried: the
+    // next pass reads the bead as already parentless, decides nothing is owed, and the outcome
+    // label or the missing Why is gone for good. Both are harmless to repeat — the label filter
+    // and the description diff below make retrying either a no-op.
     await tagDetachedOutcome(context, existing);
-    await beads.reparent(context.repo, existing.id, "");
     // A completed follow-up never takes the match.partial branch below, so this is the only pass
     // that would ever add a Why a legacy bead was created without — the contract gate never
     // catches its absence, so a merged detachment must not leave it missing for good.
     if (!match.partial) await reconcileMissingWhy(context, existing);
+    await beads.reparent(context.repo, existing.id, "");
   }
   if (match.partial) {
     const parentId = detachment ? undefined : beads.parentOf(existing);

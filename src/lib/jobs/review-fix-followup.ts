@@ -102,7 +102,8 @@ export async function resolveFollowUp(
   if (!election.ok) return election;
   const strandedRival = await reconcileLosers(ctx, election.losers, board);
   if (election.reused) {
-    await reconcileReusedContract(ctx, election.reused);
+    if (!(await reconcileReusedContract(ctx, election.reused)))
+      return { ok: false, unfinished: ctx.epic.id };
     return {
       ok: true,
       home: { id: election.reused.id, disposable: true, board, strandedRival },
@@ -116,13 +117,14 @@ export async function resolveFollowUp(
  * orphan-grooming's own reuse path applies to ITS reused epic (orphan-grooming.ts), for the same
  * reason: this bead is found by its {@link REHOME_OF} stamp, never by contract shape, so a
  * follow-up an earlier, pre-outcome-ids version of this job created would otherwise stay stuck
- * missing the section forever — the retry moves the remaining tickets under it and can close the
- * merged source, leaving the resulting runnable epic permanently without one. Best-effort: a failed
- * patch is not fatal to the rehome, since a later sweep reusing the same bead retries it.
+ * missing the section forever. NOT best-effort: once the caller moves the remaining tickets onto
+ * this bead and closes the merged source, no later sweep ever re-selects that closed epic to retry
+ * the patch, so a failed update here must hold finalization back rather than let the caller reach a
+ * runnable epic that permanently lacks the section.
  */
-async function reconcileReusedContract(ctx: FollowUpContext, reused: Bead): Promise<void> {
+async function reconcileReusedContract(ctx: FollowUpContext, reused: Bead): Promise<boolean> {
   const description = reused.description ?? "";
-  if (extractOutcomeIdsSection(description).present) return;
+  if (extractOutcomeIdsSection(description).present) return true;
   const outcomeIds = outcomeIdsOf(ctx.epic);
   const kept = description.trimEnd();
   const closer = unterminatedCloser(kept);
@@ -136,7 +138,7 @@ async function reconcileReusedContract(ctx: FollowUpContext, reused: Bead): Prom
     // ({@link blankOutcomeIdsPlaceholder}), an empty id list here is written genuinely empty.
     ...(outcomeIds.length > 0 ? [outcomeIds.map((id) => `outcome:${id}`).join(", ")] : []),
   ].join("\n");
-  await safe(() =>
+  return safe(() =>
     beads.update(ctx.repo, reused.id, { description: patched }, reused.labels ?? []),
   );
 }
