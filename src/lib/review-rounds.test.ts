@@ -162,6 +162,17 @@ describe("roundCounts", () => {
     expect(roundCounts(pr, [], false)).toMatchObject({ byAuthor: { constructor: 1 } });
   });
 
+  it("buckets a thread opened by a deleted reviewer under \"unknown\" instead of dropping it (PR #335 review)", () => {
+    // GitHub returns author: null for a deleted account, which getReviewThreads normalizes to an
+    // empty login. That thread is still actionable and must still be counted somewhere, or
+    // byAuthor stops summing to threadsActionable.
+    const pr = prWith([thread("RT_1", [["", "nit"]])]);
+    expect(roundCounts(pr, [], false)).toMatchObject({
+      threadsActionable: 1,
+      byAuthor: { unknown: 1 },
+    });
+  });
+
   it("counts a round with no inline threads at all as zeros, not as nothing", () => {
     // A CI-only or merge-conflict round: real review work, over no threads. The zeros say so —
     // distinct from the no-row a polling tick leaves.

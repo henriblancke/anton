@@ -95,14 +95,19 @@ export function roundCounts(
   };
 }
 
-/** Threads grouped by the author of their opening comment — an empty thread belongs to nobody. */
+/**
+ * Threads grouped by the author of their opening comment. A thread with no comments at all
+ * belongs to nobody and is skipped, but a thread whose opener's login is missing or empty (a
+ * deleted GitHub account) still counts — under "unknown" — so `byAuthor` keeps summing to
+ * `threadsActionable` (PR #335 review).
+ */
 function threadsByAuthor(threads: readonly ReviewThread[]): Record<string, number> {
   // Object.create(null): a login like "constructor" or "toString" must not read back an
   // inherited Object.prototype member instead of a missing count.
   const byAuthor: Record<string, number> = Object.create(null);
   for (const thread of threads) {
-    const opener = thread.comments[0]?.author;
-    if (!opener) continue;
+    if (thread.comments.length === 0) continue;
+    const opener = thread.comments[0]?.author || "unknown";
     byAuthor[opener] = (byAuthor[opener] ?? 0) + 1;
   }
   return byAuthor;
