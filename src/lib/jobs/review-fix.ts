@@ -285,6 +285,11 @@ async function dispatchInReview(args: {
   // pass is that write (anton PR #335 follow-up review): without counting it, `changed` below would
   // report `false` even though a row moved, contradicting `JobEffect.changed`'s contract.
   let reopened = 0;
+  // A CLOSED target this pass actually stamped a terminal row for (anton PR #335 review): a
+  // closed-and-never-dispatched PR whose only effect this pass is that stamp would otherwise fall
+  // through to `changed: false`, the same contradiction `reopened` above exists to avoid — counted
+  // apart from `reconciled` since that counter is the orphan sweep's own transitions, not a target's.
+  let closedStamped = 0;
   let lastError: unknown;
   for (const target of targets) {
     await ctx.heartbeat();
@@ -295,11 +300,15 @@ async function dispatchInReview(args: {
       // target keeps its `stage:in-review` and PR ref for a recovery run, so it is re-read every
       // pass — the stamp is first-observation-wins and writes nothing once it has landed.
       if (triage.state === "CLOSED" && triage.prNumber !== undefined) {
-        await recordPrTerminalState(db, clock, {
-          projectId,
-          prNumber: triage.prNumber,
-          state: "closed",
-        });
+        if (
+          await recordPrTerminalState(db, clock, {
+            projectId,
+            prNumber: triage.prNumber,
+            state: "closed",
+          })
+        ) {
+          closedStamped += 1;
+        }
       }
       // The counterpart observation (PR #335 review): a PR that reopens, stays clean, and closes
       // again would otherwise leave no evidence of the reopen for the next close to find.
@@ -386,7 +395,7 @@ async function dispatchInReview(args: {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
-  if (targets.length === 0 && reconciled === 0 && reopened === 0) {
+  if (targets.length === 0 && reconciled === 0 && reopened === 0 && closedStamped === 0) {
     return { changed: false, note: "nothing in review" };
   }
 
@@ -395,9 +404,10 @@ async function dispatchInReview(args: {
   const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
   const reconciledNote = reconciled > 0 ? `, reconciled ${reconciled} orphaned PR(s)` : "";
   const reopenedNote = reopened > 0 ? `, reopened ${reopened} PR(s)` : "";
+  const closedNote = closedStamped > 0 ? `, closed ${closedStamped} PR(s)` : "";
   return {
-    changed: dispatched > 0 || reconciled > 0 || reopened > 0,
-    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}${reconciledNote}${reopenedNote}`,
+    changed: dispatched > 0 || reconciled > 0 || reopened > 0 || closedStamped > 0,
+    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}${reconciledNote}${reopenedNote}${closedNote}`,
   };
 }
 

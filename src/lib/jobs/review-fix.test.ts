@@ -466,6 +466,29 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     expect(dispatchedTargets()).toEqual([]);
   });
 
+  // PR #335 review (src/lib/jobs/review-fix.ts:302): a CLOSED target is never dispatched, so this
+  // terminal-state stamp is this pass's only effect on it — same shape as the per-target reopened
+  // observation, `changed: false` would contradict `JobEffect`'s contract if the stamp went uncounted.
+  it("counts a CLOSED target's terminal stamp as a change even though it is never dispatched", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    t.db
+      .insert(schema.reviewRounds)
+      .values({ id: "round-1", projectId: t.projectId, prNumber: 1, round: 1 })
+      .run();
+    getPrReviewMock.mockResolvedValue(openPr(1, { state: "CLOSED" }));
+
+    const job = await getJob(t.db, await dispatch());
+    const prState = t.db
+      .select({ prState: schema.reviewRounds.prState })
+      .from(schema.reviewRounds)
+      .where(eq(schema.reviewRounds.prNumber, 1))
+      .get()?.prState;
+    expect(prState).toBe("closed");
+    expect(job?.outcome).not.toBe("noop");
+    expect(job?.outcomeNote).toBe("examined 1 PR(s) in review, dispatched 0, closed 1 PR(s)");
+    expect(dispatchedTargets()).toEqual([]);
+  });
+
   it("does not double-dispatch a target a live job already covers", async () => {
     listMock.mockResolvedValue([target("e-1", 1)]);
     getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
