@@ -451,7 +451,9 @@ process.exit(0);`,
       expect((await tdb.db.select().from(schema.sessions)).at(-1)?.status).toBe("done");
     } finally {
       // Restore the table for the suite's remaining cases (the db is shared across this file).
+      // Both migrations: 0060 adds threads_complete, which schema.reviewRounds still declares.
       applyMigrationFile(tdb.sqlite, "0059_review_rounds.sql");
+      applyMigrationFile(tdb.sqlite, "0060_lush_ink.sql");
     }
   });
 

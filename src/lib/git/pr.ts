@@ -301,8 +301,14 @@ async function getReviewThreads(
         break;
       }
       const page = parsed.data?.repository?.pullRequest?.reviewThreads;
-      allNodes.push(...(page?.nodes ?? []));
-      if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      if (!page) {
+        // Missing repository/pullRequest/reviewThreads is a malformed response, not "no threads" —
+        // flag it so a degraded read isn't persisted as a genuinely thread-free PR.
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes ?? []);
+      if (!page.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
       cursor = page.pageInfo.endCursor;
     }
   } catch {
