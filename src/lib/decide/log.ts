@@ -70,12 +70,18 @@ export function decisionInputHash(point: DecisionPoint, state: DecisionState): s
 }
 
 /**
- * A digest of the point's own judgment logic — instruction, question shape, escape value, and hard
- * rules — never its id, mode, threshold, consequence, or `stateFields` (a point that starts reading
- * one more field still asks the same question of the evidence it already had). A release can change
- * what a point asks while keeping its id and model; without this, {@link agreement} would keep
- * folding in rows earned under the old definition as if they were evidence for the new one (PR #332
- * review).
+ * A digest of the point's own judgment logic — instruction, question shape, escape value, declared
+ * state fields, and hard rules — never its id, mode, threshold, or consequence. A release can change
+ * what a point asks, or what evidence it reads, while keeping its id and model; without this,
+ * {@link agreement} would keep folding in rows earned under the old definition as if they were
+ * evidence for the new one (PR #332 review).
+ *
+ * `stateFields` is part of the definition, not exempt from it: a point that starts reading one FEWER
+ * field is answering from less evidence than the rows already on record, and a settled-row count
+ * earned against the old, wider input shape is not evidence the narrower judgment path has earned the
+ * same trust (PR #332 review). Sorted before hashing for the same reason {@link decisionInputHash}
+ * sorts its keys — declaration order is an accident of how the point was written, not a semantic
+ * difference in what it reads.
  *
  * Hard rules are functions, hashed by `Function.prototype.toString()`: source text is the only
  * observable identity a closure has, and a rule whose condition changed but whose name and position
@@ -88,6 +94,8 @@ export function pointDefinitionHash(point: DecisionPoint): string {
   hash.update(JSON.stringify(point.question));
   hash.update("\u0000");
   hash.update(point.escapeValue ?? "\u0000none");
+  hash.update("\u0000");
+  hash.update(JSON.stringify([...point.stateFields].sort()));
   for (const rule of point.hardRules) {
     hash.update("\u0000");
     hash.update(rule.toString());

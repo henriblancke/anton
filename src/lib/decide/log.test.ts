@@ -233,7 +233,7 @@ describe("the point-definition digest", () => {
     expect(pointDefinitionHash(always)).not.toBe(pointDefinitionHash(never));
   });
 
-  it("never moves for the point's id, mode, threshold, consequence, or declared state fields", () => {
+  it("never moves for the point's id, mode, threshold, or consequence", () => {
     expect(pointDefinitionHash(POINT)).toBe(
       pointDefinitionHash({
         ...POINT,
@@ -241,9 +241,20 @@ describe("the point-definition digest", () => {
         threshold: 0.5,
         consequence: "high",
         defaultMode: "auto",
-        stateFields: ["something-else"],
       }),
     );
+  });
+
+  it("moves when the declared state fields change", () => {
+    expect(pointDefinitionHash(POINT)).not.toBe(
+      pointDefinitionHash({ ...POINT, stateFields: ["something-else"] }),
+    );
+  });
+
+  it("does not move when state fields are only reordered", () => {
+    const point: DecisionPoint = { ...POINT, stateFields: ["a", "b"] };
+    const reordered: DecisionPoint = { ...POINT, stateFields: ["b", "a"] };
+    expect(pointDefinitionHash(point)).toBe(pointDefinitionHash(reordered));
   });
 });
 
