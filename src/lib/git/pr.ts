@@ -336,6 +336,13 @@ async function getReviewThreads(
       // round, but the thread itself is kept (its handful of comments, however few, are real and
       // there is no "true latest" being hidden behind a totalCount the response never reported).
       for (const n of page.nodes) {
+        if (typeof n?.id !== "string") {
+          // A thread node with no string id can't be tracked in truncatedThreadIds and gets
+          // silently dropped by the filter below — without this, threadsComplete could stay
+          // true while a real thread vanished from the result (PR #335 review).
+          complete = false;
+          continue;
+        }
         if (!n.comments || typeof n.comments.totalCount !== "number") {
           // comments missing entirely is a malformed response, not a real zero-comment thread — drop
           // it like the other malformed-comments cases below, so it never surfaces as an actionable
