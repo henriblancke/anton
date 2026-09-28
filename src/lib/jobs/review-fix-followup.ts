@@ -236,6 +236,7 @@ async function newFollowUpEpic(
   ctx: FollowUpContext,
 ): Promise<string | undefined> {
   const area = areaLabelOf(ctx.epic, ctx.all);
+  const outcomeIds = outcomeIdsOf(ctx.epic);
   try {
     const skeleton = await beadSkeleton(ctx.repo, "epic", {
       outcome:
@@ -243,9 +244,13 @@ async function newFollowUpEpic(
         `out of time, so that work is in no diff — this epic is its home, because a ticket parented ` +
         `to an already-merged target is not something anton can run.\n\n` +
         `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
-        `first if the timeout means they were too big.`,
+        `first if the timeout means they were too big.` +
+        (outcomeIds.length === 0
+          ? `\n\n${ctx.epic.id} predates \`.product/PRODUCT.md\`'s outcome ids, so none carries over ` +
+            `to this follow-up's \`## Outcome IDs\` below — it's left blank rather than guessed at.`
+          : ""),
       success_criteria: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
-      outcome_ids: outcomeIdsBody(ctx.epic, outcomeIdsOf(ctx.epic)),
+      outcome_ids: outcomeIdsBody(outcomeIds),
     });
     return await beads.create(ctx.repo, {
       title: `${ctx.epic.title} — undelivered tickets`,
@@ -256,7 +261,7 @@ async function newFollowUpEpic(
       // Written in the SAME call as the bead, so no window exists in which the follow-up is on the
       // board without the stamp a retry finds it by.
       metadata: { [REHOME_OF]: ctx.epic.id },
-      description: skeleton.description,
+      description: blankOutcomeIdsPlaceholder(skeleton.description, outcomeIds),
       acceptance: skeleton.acceptance,
     });
   } catch {
@@ -265,15 +270,38 @@ async function newFollowUpEpic(
 }
 
 /**
+ * Non-empty stand-in for "no outcome ids to carry over", passed as the `outcome_ids` template var
+ * so the formula's own var-resolution never falls back to its `outcome_ids` default (a "TODO —
+ * which outcome(s)..." prompt meant for a human filling in a draft) — that default is exactly as
+ * tokenizable as prose, so relying on it here would trade one fallback-corrupts-labels bug for
+ * another. {@link blankOutcomeIdsPlaceholder} strips it back out post-render, so the persisted
+ * section lands genuinely empty.
+ */
+const NO_OUTCOME_IDS_PLACEHOLDER = "outcome-ids-none";
+
+/**
  * The follow-up's `## Outcome IDs` body. Mirrors {@link followUpWhy}'s split in rework-notes.ts:
  * `outcomeIds` is empty for a merged target that predates outcome ids ({@link outcomesConfigured}
- * exempts a fresh draft from the same gap), so there is nothing to carry over as a label — the
- * body names the origin epic instead of fabricating one.
+ * exempts a fresh draft from the same gap), so there is nothing to carry over as a label.
  */
-function outcomeIdsBody(epic: Bead, outcomeIds: string[]): string {
+export function outcomeIdsBody(outcomeIds: string[]): string {
   return outcomeIds.length > 0
     ? outcomeIds.map((id) => `outcome:${id}`).join(", ")
-    : `${epic.id} predates \`.product/PRODUCT.md\`'s outcome ids, so none carries over as a label here either.`;
+    : NO_OUTCOME_IDS_PLACEHOLDER;
+}
+
+/**
+ * Remove the {@link NO_OUTCOME_IDS_PLACEHOLDER} from a rendered description, leaving its `## Outcome
+ * IDs` section truly empty (PR #334 review) rather than filled with prose — the "why" lives in the
+ * `outcome` narrative instead (see {@link newFollowUpEpic}). An empty section is what `outcomeIdsOf`
+ * (backlog.ts) already reads as zero ids, so if THIS follow-up is itself later the target of another
+ * send-back, that re-read yields `[]` instead of tokenizing a sentence into bogus `outcome:<word>`
+ * labels.
+ */
+export function blankOutcomeIdsPlaceholder(description: string, outcomeIds: string[]): string {
+  return outcomeIds.length > 0
+    ? description
+    : description.replace(NO_OUTCOME_IDS_PLACEHOLDER, "").trimEnd();
 }
 
 /**
