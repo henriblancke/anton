@@ -218,6 +218,27 @@ describe("outcomeIdsOf", () => {
     });
     expect(outcomeIdsOf(target)).toEqual(["real-id"]);
   });
+
+  // A board `outcome:` label is usually written by code that already validated it, but labels can
+  // also be hand-authored — a malformed one must not bypass the same AREA_SHAPE filter the free-text
+  // path applies, or it would be copied straight into a follow-up's beads.create/beads.tag calls.
+  it("drops a labeled outcome that fails outcome:<id> label syntax", () => {
+    const target = bead({
+      id: "feature-1",
+      issue_type: "task",
+      labels: ["outcome:bad!"],
+    });
+    expect(outcomeIdsOf(target)).toEqual([]);
+  });
+
+  it("keeps a well-formed labeled outcome alongside a malformed one", () => {
+    const target = bead({
+      id: "feature-1",
+      issue_type: "task",
+      labels: ["outcome:bad!", "outcome:real-id"],
+    });
+    expect(outcomeIdsOf(target)).toEqual(["real-id"]);
+  });
 });
 
 describe("buildEpicSkeleton", () => {

@@ -337,12 +337,13 @@ export function extractOutcomeIdsSection(description: string): { present: boolea
  * target's outcome ids through before mapping them straight into a follow-up's `outcome:<id>`
  * labels, so a manually authored or legacy `## Outcome IDs` section mixing an id with explanatory
  * prose on the same line (`outcome:trustworthy-board — primary outcome`) must not have that prose
- * propagate onward as fabricated labels. An already-set `outcome:` label needs no such filter — it
- * was written by code that validated it (or is a founder's direct edit) at commit time, not parsed
- * from free text now.
+ * propagate onward as fabricated labels. A labeled outcome is usually written by code that already
+ * validated it, but board labels can also be hand-authored, so the same {@link AREA_SHAPE} filter
+ * applies there too — an empty or malformed `outcome:bad!` label must not survive to be copied into
+ * a follow-up's `beads.create`/`beads.tag` calls or its Why text.
  */
 export function outcomeIdsOf(target: Bead): string[] {
-  const labeled = labelValuesOf(target.labels, "outcome");
+  const labeled = labelValuesOf(target.labels, "outcome").filter((id) => AREA_SHAPE.test(id));
   if (labeled.length > 0) return labeled;
   const { present, body } = extractOutcomeIdsSection(target.description ?? "");
   return present ? outcomeIdTokens(body).filter((id) => AREA_SHAPE.test(id)) : [];
