@@ -48,7 +48,7 @@ describe("definePoint", () => {
   it("rejects a choice question with fewer than two options", () => {
     expect(() =>
       definePoint({ ...CHOICE_POINT, question: { kind: "choice", options: ["human"] } }),
-    ).toThrow(/fewer than two distinct options/);
+    ).toThrow(/fewer than two options/);
   });
 
   it("rejects a choice question whose options are all duplicates of one value", () => {
@@ -58,7 +58,15 @@ describe("definePoint", () => {
         question: { kind: "choice", options: ["fix", "fix"] },
         escapeValue: "fix",
       }),
-    ).toThrow(/fewer than two distinct options/);
+    ).toThrow(/duplicate choice options/);
+  });
+
+  it("rejects a choice question with a duplicate alongside a distinct option", () => {
+    // A malformed set like ['fix', 'fix', 'human'] used to pass the "two distinct values"
+    // check while still breaking readDistribution's sum-to-1 accounting downstream.
+    expect(() =>
+      definePoint({ ...CHOICE_POINT, question: { kind: "choice", options: ["fix", "fix", "human"] } }),
+    ).toThrow(/duplicate choice options/);
   });
 
   it("rejects a choice point with no escapeValue", () => {

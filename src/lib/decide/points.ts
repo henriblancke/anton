@@ -87,8 +87,11 @@ function validate(point: DecisionPoint): void {
     throw new Error(`decide: "${point.id}" threshold must be within [0, 1], got ${point.threshold}`);
   }
   if (point.question.kind === "choice") {
-    if (new Set(point.question.options).size < 2) {
-      throw new Error(`decide: "${point.id}" is a choice with fewer than two distinct options`);
+    if (point.question.options.length < 2) {
+      throw new Error(`decide: "${point.id}" is a choice with fewer than two options`);
+    }
+    if (new Set(point.question.options).size !== point.question.options.length) {
+      throw new Error(`decide: "${point.id}" has duplicate choice options`);
     }
     if (point.escapeValue === undefined || !point.question.options.includes(point.escapeValue)) {
       throw new Error(`decide: "${point.id}" needs an escapeValue that is one of its own options`);
