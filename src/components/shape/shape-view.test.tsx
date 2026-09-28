@@ -242,10 +242,11 @@ describe("ShapeView", () => {
     typeInto(/^Epic outcome/, "Every report leaves the app in a format a customer can open.");
     typeInto(/^Epic success criteria/, "- [ ] every report view exports");
     typeInto(/^Outcome IDs/, "outcome:reports-are-shareable");
-    // A malformed area leaves no gap, so without its own line the panel would read as ready.
+    // A malformed area leaves no gap, so without its own line the panel would read as ready. The
+    // feature's outcome id is already valid here (fillFeature), so the hint names only the area.
     fireEvent.change(areaInput(), { target: { value: "two words" } });
     expect(sendButton().hasAttribute("disabled")).toBe(true);
-    expect(screen.getByText("Area and outcome must be single label-safe words")).toBeTruthy();
+    expect(screen.getByText("Area must be a single label-safe word")).toBeTruthy();
 
     fireEvent.change(areaInput(), { target: { value: " reports " } });
     fireEvent.click(sendButton());

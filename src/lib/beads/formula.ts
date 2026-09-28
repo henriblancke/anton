@@ -34,6 +34,7 @@ import { join } from "node:path";
 import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath as bundledFormulaUnder,
+  ensureBeadFormula,
 } from "./config.mjs";
 import { renderedText, validateBeadContract } from "./contract";
 
@@ -65,6 +66,13 @@ const TIER_ACCEPTANCE_VAR: Record<BeadTier, string> = {
   feature: "acceptance",
   ticket: "acceptance",
 };
+
+/**
+ * Thrown by {@link renderBeadSkeleton} when the template would silently drop a supplied contract
+ * var — the one render failure {@link beadSkeleton} attempts to self-heal, distinct from a bare
+ * `Error` (an unresolved `{{var}}`, which is a broken template no resync can fix).
+ */
+export class DiscardedContractVarError extends Error {}
 
 interface FormulaVar {
   description?: string;
@@ -243,7 +251,7 @@ export function renderBeadSkeleton(
   });
   if (discarded.length > 0) {
     const names = discarded.map((n) => `{{${n}}}`).join(", ");
-    throw new Error(
+    throw new DiscardedContractVarError(
       `bead formula ${formula.source}: the \`${tier}\` template never references ${names} — the supplied value would be discarded; add the placeholder to the step's template`,
     );
   }
@@ -266,11 +274,35 @@ function descriptionShadowsAcceptance(skeleton: BeadSkeleton): boolean {
   }).some((v) => v.severity === "blocking");
 }
 
-/** Load the project's formula and render `tier` from it — the one call a creation path needs. */
+/**
+ * Load the project's formula and render `tier` from it — the one call a creation path needs.
+ *
+ * Self-heals a stale PROJECT-LOCAL copy (PR #334 review): `anton update` refreshes the runtime
+ * binary but never touches a registered project's own `.beads/formulas/anton-bead.formula.json` —
+ * only re-running `anton init <repo>` does (bin/anton.mjs) — so a project whose copy predates a
+ * newer contract var (e.g. `why`, added by this change) would 500 on every submission that
+ * supplies it, forever, until an operator notices and manually reinitializes it. On exactly that
+ * failure, resync the project's copy from the bundled asset — the same replace-and-backup
+ * `ensureBeadFormula` already performs for `anton init` — and retry once before giving up. A
+ * formula that still discards the var after resyncing (the bundled asset itself is missing the
+ * placeholder) is a real bug, not staleness, so that error is left to propagate.
+ */
 export async function beadSkeleton(
   repoPath: string,
   tier: BeadTier,
   vars: Record<string, string> = {},
 ): Promise<BeadSkeleton> {
-  return renderBeadSkeleton(await loadBeadFormula(repoPath), tier, vars);
+  const path = resolveBeadFormulaPath(repoPath);
+  const formula = parseBeadFormula(await readFile(path, "utf8"), path);
+  try {
+    return renderBeadSkeleton(formula, tier, vars);
+  } catch (err) {
+    if (!(err instanceof DiscardedContractVarError) || path !== projectBeadFormulaPath(repoPath)) {
+      throw err;
+    }
+    const synced = ensureBeadFormula(join(repoPath, ".beads"), bundledBeadFormulaPath());
+    if (synced.status !== "replaced") throw err;
+    const refreshed = parseBeadFormula(await readFile(path, "utf8"), path);
+    return renderBeadSkeleton(refreshed, tier, vars);
+  }
 }

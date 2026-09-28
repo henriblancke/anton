@@ -7,7 +7,7 @@
  * turns a prompt into fake content) reddens this suite rather than quietly reintroducing the
  * unshaped beads the board then has to flag.
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { ACCEPTANCE_HEADING, validateBeadContract } from "./contract";
 import {
   BEAD_FORMULA_FILENAME,
+  beadSkeleton,
   bundledBeadFormulaPath,
   loadBeadFormula,
   parseBeadFormula,
@@ -421,6 +422,77 @@ describe("resolution", () => {
       renderBeadSkeleton(await loadBeadFormula(repo), "ticket", { acceptance: "- [ ] ok" })
         .description,
     ).toBe("PROJECT LOCAL");
+  });
+});
+
+// `anton update` refreshes the runtime binary but never touches a registered project's own
+// formula copy — only re-running `anton init <repo>` does. A project's copy written before a
+// newer contract var existed (here: `why`) would otherwise 500 on every submission that supplies
+// it, forever, until an operator notices (PR #334 review). `beadSkeleton` self-heals instead.
+describe("beadSkeleton self-heals a stale project-local formula (PR #334 review)", () => {
+  it("resyncs from the bundled asset and retries when a newer contract var would be discarded", async () => {
+    const repo = repoWithFormula(
+      JSON.stringify({
+        formula: "anton-bead",
+        vars: {},
+        steps: [
+          { id: "epic", description: "e" },
+          { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+          {
+            id: "ticket",
+            type: "task",
+            description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}",
+          },
+        ],
+      }),
+    );
+    const skeleton = await beadSkeleton(repo, "feature", {
+      goal: "Ship it.",
+      why: "Serves outcome:reports-are-shareable.",
+      acceptance: "- [ ] ok",
+      context: "touches: x",
+      out_of_scope: "- nothing else",
+      verify: "unit tests",
+    });
+    // The bundled template (which references {{why}}) rendered the resynced formula, not the
+    // stale local one that would have discarded it.
+    expect(skeleton.description).toContain("Serves outcome:reports-are-shareable.");
+    // The stale copy was backed up, same as `anton init` — the self-heal is a real resync, not a
+    // one-off in-memory fallback that leaves the project's copy stale on disk.
+    expect(existsSync(`${projectBeadFormulaPath(repo)}.bak`)).toBe(true);
+  });
+
+  it("still fails loud when the resync itself cannot go through", async () => {
+    const repo = tempRepo();
+    mkdirSync(join(repo, ".beads", "formulas"), { recursive: true });
+    const outside = join(repo, "outside-formula.json");
+    writeFileSync(
+      outside,
+      JSON.stringify({
+        formula: "anton-bead",
+        vars: {},
+        steps: [
+          { id: "epic", description: "e" },
+          { id: "feature", description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}" },
+          {
+            id: "ticket",
+            type: "task",
+            description: "## Goal\n\n{{goal}}\n\n## Acceptance\n\n{{acceptance}}",
+          },
+        ],
+      }),
+    );
+    // A symlinked formula file is exactly what `ensureBeadFormula` refuses to write through
+    // (config.test.ts), so the resync reports "unsafe-dest" rather than "replaced" — the original
+    // discarded-var error must propagate instead of being swallowed by a resync that never happened.
+    symlinkSync(outside, projectBeadFormulaPath(repo));
+    await expect(
+      beadSkeleton(repo, "feature", {
+        goal: "Ship it.",
+        why: "Serves outcome:reports-are-shareable.",
+        acceptance: "- [ ] ok",
+      }),
+    ).rejects.toThrow(/never references \{\{why\}\}/);
   });
 });
 

@@ -120,9 +120,16 @@ const HINT_GAPS = 3;
  * outcome id leaves no GAP, so without this branch the panel would read "ready to land" while
  * refusing to submit. A fresh draft is missing everything, so the list is clipped rather than
  * wrapped over four lines.
+ *
+ * `areaValid`/`outcomeIdValid` are judged separately, not collapsed into one flag: the epic's
+ * Area field only renders when creating a new epic (`EpicSection`, shape-draft-fields.tsx), so a
+ * founder attaching to an existing epic with a malformed outcome id must see a message naming the
+ * outcome, not "Area and outcome" for a field that isn't on screen.
  */
-export function submitHint(gaps: string[], labelsValid: boolean): string {
-  if (!labelsValid) return "Area and outcome must be single label-safe words";
+export function submitHint(gaps: string[], areaValid: boolean, outcomeIdValid: boolean): string {
+  if (!areaValid && !outcomeIdValid) return "Area and outcome must be single label-safe words";
+  if (!areaValid) return "Area must be a single label-safe word";
+  if (!outcomeIdValid) return "Outcome must be a single label-safe word";
   if (gaps.length > HINT_GAPS) {
     return `Needs ${gaps.slice(0, HINT_GAPS).join(", ")} + ${gaps.length - HINT_GAPS} more`;
   }

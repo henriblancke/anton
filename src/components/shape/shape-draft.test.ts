@@ -171,22 +171,30 @@ describe("isOutcomeIdValid", () => {
 
 describe("submitHint", () => {
   it("names the gaps while any field is empty", () => {
-    expect(submitHint(["a goal", "verify"], true)).toBe("Needs a goal, verify");
+    expect(submitHint(["a goal", "verify"], true, true)).toBe("Needs a goal, verify");
   });
 
   it("clips a long list — the footer is one line, not the whole checklist", () => {
-    expect(submitHint(["an epic", "a title", "a goal", "context", "verify"], true)).toBe(
+    expect(submitHint(["an epic", "a title", "a goal", "context", "verify"], true, true)).toBe(
       "Needs an epic, a title, a goal + 2 more",
     );
   });
 
-  it("explains a malformed area, which is a gap-less refusal", () => {
-    expect(submitHint([], false)).toContain("label-safe");
+  it("explains a malformed area and outcome together when both are invalid", () => {
+    expect(submitHint([], false, false)).toContain("Area and outcome");
+  });
+
+  it("names only the area when the outcome id is unrendered or valid", () => {
+    expect(submitHint([], false, true)).toBe("Area must be a single label-safe word");
+  });
+
+  it("names only the outcome when the area is unrendered or valid — the existing-epic flow", () => {
+    expect(submitHint([], true, false)).toBe("Outcome must be a single label-safe word");
   });
 
   it("reads as ready once the draft is complete", () => {
-    expect(submitHint([], true)).toContain("feature");
-    expect(submitHint([], true)).toContain("unapproved");
+    expect(submitHint([], true, true)).toContain("feature");
+    expect(submitHint([], true, true)).toContain("unapproved");
   });
 });
 
