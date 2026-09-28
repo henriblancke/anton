@@ -177,13 +177,16 @@ export function epicChoices(all: Bead[]): EpicChoice[] {
 /** Everything the Add-work panel offers: the epics a feature may attach to and the `area:`
  * vocabulary a new epic should reuse, off ONE board read (the warm issue snapshot, so no extra bd
  * spawn) — plus the outcomes `.product/PRODUCT.md` currently offers for new work, so the panel can
- * suggest them and catch a typo'd outcome id before it ever reaches {@link createDraftFeature}. */
+ * suggest them and catch a typo'd outcome id before it ever reaches {@link createDraftFeature}.
+ * The outcomes read is independent of the board read: a PRODUCT.md that fails to read (a transient
+ * I/O error, not just "file doesn't exist" — {@link readProjectOutcomes} already treats that as
+ * empty) must not cost the founder the epic picker along with it. */
 export async function getDraftOptions(
   project: Project,
 ): Promise<{ areas: string[]; epics: EpicChoice[]; outcomes: ProjectOutcome[] }> {
   const [all, outcomes] = await Promise.all([
     allIssues(project.repoPath),
-    readProjectOutcomes(project.repoPath),
+    readProjectOutcomes(project.repoPath).catch(() => [] as ProjectOutcome[]),
   ]);
   return { areas: knownAreas(all), epics: epicChoices(all), outcomes: outcomes.filter((o) => !o.retired) };
 }
