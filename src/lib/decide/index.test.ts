@@ -235,6 +235,19 @@ describe("fallback on a bad backend", () => {
     expect(result.reason).toBe("invalid model answer");
   });
 
+  it("preserves backend/modelVersion on an invalid answer, so the log still attributes the attempt", async () => {
+    // Dropping these here would erase which model just failed: recordDecision() would store null
+    // attribution, and agreement()'s cohort lookup would keep reading a predecessor model as
+    // "current" for as long as the replacement keeps failing every call (PR #332 review).
+    const ask = askReturning(MODEL_ANSWER({ value: "not-an-option", backend: "claude-local", modelVersion: "claude-6" }));
+    const result = await decide({ point, state: {}, mode: "auto", ask });
+
+    expect(result.decidedBy).toBe("fallback");
+    expect(result.answer).toBeUndefined();
+    expect(result.backend).toBe("claude-local");
+    expect(result.modelVersion).toBe("claude-6");
+  });
+
   it.each([-0.1, 1.1, Number.NaN])("falls back on an out-of-range confidence %s", async (confidence) => {
     const ask = askReturning(MODEL_ANSWER({ confidence }));
     const result = await decide({ point, state: {}, mode: "auto", ask });

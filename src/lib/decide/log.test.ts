@@ -392,6 +392,30 @@ describe("replay — agreement(point)", () => {
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 0, agreed: 0 });
   });
 
+  it("recognizes a replacement model as active even while every one of its answers is invalid", async () => {
+    // The old model earned a poor record.
+    const oldId = await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    await settleDecision(test.db, clock, oldId, { operatorAnswer: "decline" });
+    nowMs += 60_000;
+
+    // The point is re-pointed at a new model that is failing every call — an invalid answer, not a
+    // thrown error, so decide() still attributes the attempt. recordDecision() must not erase which
+    // model produced it, or agreement()'s cohort lookup keeps reading claude-4 as "current" for as
+    // long as claude-5 keeps failing (PR #332 review).
+    const result = await decide({
+      point: POINT,
+      state: {},
+      mode: "shadow",
+      ask: async () => ANSWER({ value: "not-an-option", modelVersion: "claude-5" }),
+    });
+    expect(result.answer).toBeUndefined();
+    await recordDecision(test.db, clock, { result, point: POINT, state: {} });
+
+    // claude-4's disagreement must not bleed back in just because claude-5 has not produced a valid,
+    // settleable answer yet — the point reads as unmeasured, not as its predecessor's record.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 0, agreed: 0 });
+  });
+
   it("leaves a rule-decided point unscoped — a hard rule has no model version to pin trust to", async () => {
     const ruledPoint: DecisionPoint = {
       ...POINT,

@@ -284,13 +284,15 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
         model: config.model,
         routing: config.routing,
         permissionMode: "bypassPermissions",
-        // An empty allow-list, not a deny-list: this session's whole input is already embedded
-        // in the prompt as quoted, inert data (`buildPrompt`), so it has no legitimate use for
-        // ANY tool. Unlike `PM_DENIED_TOOLS`/`REVIEW_DENIED_TOOLS` (which must enumerate what to
-        // deny and leave reads open for passes that genuinely need them), "permit nothing" is a
-        // property of the empty list itself — it doesn't need to be rediscovered every time
-        // Claude Code adds a new tool.
-        allowedTools: [],
+        // `allowedTools` only governs which calls skip a permission PROMPT — under
+        // `bypassPermissions` nothing prompts anyway, so an empty allow-list is a no-op, not a
+        // deny-all (Claude Code CLI reference). The bare wildcard `"*"` in `disallowedTools` is
+        // the actual availability cut: it removes every tool from the session's context outright,
+        // same as `PM_DENIED_TOOLS`/`REVIEW_DENIED_TOOLS` rely on for their own enumerated
+        // removals, and deny rules bind ahead of `permissionMode` so this still holds under
+        // bypass. This session's whole input is already embedded in the prompt as quoted, inert
+        // data (`buildPrompt`), so it has no legitimate use for ANY tool.
+        disallowedTools: ["*"],
         // A bounded judgment has no need of the worktree's own `.claude/settings.json` — reading it
         // would let a project's hooks run shell commands under a session dispatched to answer one
         // question, so this session is configured only by the machine anton runs on.

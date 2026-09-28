@@ -92,8 +92,21 @@ function acted(mode: DecisionMode, answer: AnswerValue | undefined, confidence: 
   return mode === "auto" && answer !== undefined && confidence >= threshold;
 }
 
-function fallback(point: DecisionPoint, mode: DecisionMode, reason: string): DecideResult {
-  return { point: point.id, mode, decidedBy: "fallback", confidence: 0, acted: false, reason };
+function fallback(
+  point: DecisionPoint,
+  mode: DecisionMode,
+  reason: string,
+  attribution?: { backend?: string; modelVersion?: string },
+): DecideResult {
+  return {
+    point: point.id,
+    mode,
+    decidedBy: "fallback",
+    confidence: 0,
+    acted: false,
+    reason,
+    ...attribution,
+  };
 }
 
 /**
@@ -134,7 +147,14 @@ export async function decide(input: DecideInput): Promise<DecideResult> {
   }
 
   if (!isValidConfidence(modelAnswer.confidence) || !isValidAnswer(point.question, modelAnswer.value)) {
-    return fallback(point, mode, "invalid model answer");
+    // Preserve which backend/model attempted this even though its answer didn't validate — dropping
+    // it here would erase the attempt from the log (recordDecision) entirely, and agreement()'s
+    // cohort lookup would then keep reading a predecessor model as "current" for as long as the
+    // replacement kept failing (PR #332 review).
+    return fallback(point, mode, "invalid model answer", {
+      backend: modelAnswer.backend,
+      modelVersion: modelAnswer.modelVersion,
+    });
   }
 
   return {

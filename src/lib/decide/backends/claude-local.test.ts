@@ -108,6 +108,32 @@ describe("claudeLocalBackend — structured output", () => {
     expect(seenPrompt).toContain(choicePoint().instruction);
   });
 
+  it("denies every tool via the bare wildcard, not an allow-list that bypassPermissions ignores", async () => {
+    // `allowedTools` only governs which calls skip a permission PROMPT; under bypassPermissions
+    // nothing prompts, so an empty allow-list would be a no-op (PR #332 review). The bare `"*"`
+    // rule in `disallowedTools` is the one mechanism documented to remove every tool from the
+    // session's context outright, and to bind ahead of `permissionMode`.
+    const tdb = makeProjectDb();
+    let seenOptions: RunClaudeOptions | undefined;
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async (options) => {
+        seenOptions = options;
+        return ok('```json\n{"probabilities": {"fix": 1, "decline": 0, "human": 0}}\n```');
+      }),
+    });
+
+    await ask(choicePoint(), { nitText: "x" });
+
+    expect(seenOptions?.disallowedTools).toEqual(["*"]);
+    expect(seenOptions?.allowedTools).toBeUndefined();
+    expect(seenOptions?.permissionMode).toBe("bypassPermissions");
+  });
+
   it("only sends the state fields the point declared", async () => {
     const tdb = makeProjectDb();
     let seenPrompt = "";
