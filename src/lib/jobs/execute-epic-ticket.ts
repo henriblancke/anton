@@ -442,7 +442,11 @@ export async function assertDelivered(
     }
     // Before the tree may be called EMPTY, ask whether it is merely SET ASIDE (anton-wjfkn). Asked
     // only here, on the one path that would otherwise report "nothing landed" over work that exists.
-    const stashed = await stash.gained().catch(() => []);
+    // Deliberately NOT caught into `[]` (PR #333 review): the same reasoning as the baseline read
+    // above applies to this later one — a `git stash list` failure here is not "no new stash", and
+    // swallowing it would report a stashed change as ordinary no-delivery. Let it fall into the
+    // ticket's own catch, exactly like the baseline read does.
+    const stashed = await stash.gained();
     if (stashed.length > 0) {
       await refuseStashedDelivery(ticket, progress, stashed, stash);
     }
@@ -576,7 +580,10 @@ async function yieldedMidWork(
   progress: TicketProgress,
   stash: StashRecovery,
 ): Promise<AgentYieldedError> {
-  const stashed = await stash.gained().catch(() => []);
+  // Deliberately NOT caught into `[]` (PR #333 review): a read failure here is not "stashed
+  // nothing" — reporting it as such would tell the operator the work is loose in the tree when a
+  // stash they cannot see might hold it instead. Let it propagate to the ticket's own catch.
+  const stashed = await stash.gained();
   const recovery =
     stashed.length > 0 ? await recoverStashed(stashed, stash) : { restored: [], failed: [], summary: "" };
   return new AgentYieldedError(

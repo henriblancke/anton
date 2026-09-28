@@ -986,6 +986,7 @@ async function blockFailedTicket(args: {
       repo,
       ticket.id,
       ticketBlockNote({
+        ticketId: ticket.id,
         kind,
         selfReport,
         error,
@@ -1062,6 +1063,11 @@ export type TicketBlockKind =
  * alone — never an empty quote, never the string "undefined".
  */
 export function ticketBlockNote(args: {
+  /** The ticket this note is written to — named in the recoverable-work remedy below (PR #333 review):
+   * `blockFailedTicket` always leaves the bead `blocked`, which bd's claim gate refuses, so the
+   * remedy must say to reopen it, not just to resume. Optional because only that remedy reads it;
+   * a caller that never reaches `stashed-work`/`agent-yielded` has no reason to supply one. */
+  ticketId?: string;
   kind: TicketBlockKind;
   /** The agent's parsed `ANTON-RESULT` line, when it emitted one. */
   selfReport: AntonResult | null;
@@ -1088,7 +1094,7 @@ export function ticketBlockNote(args: {
   /** The worktree kept for that recovery — the path the note sends the operator to. */
   worktreePath?: string;
 }): string {
-  const { kind, sessionId, branch, committed, head } = args;
+  const { ticketId, kind, sessionId, branch, committed, head } = args;
   const reason = blockNoteDetail(args.selfReport?.reason ?? "");
   // A reason that flattens to nothing is NO reason — drop it, so the rendering falls back to the
   // category text rather than trailing an empty quote or a dangling dash.
@@ -1105,7 +1111,13 @@ export function ticketBlockNote(args: {
           `declared the ticket incomplete${reason ? `: "${reason}"` : ` (no reason given)`}; needs ` +
           `a human to finish or re-scope it, then resume the run.`
         : kind === "stashed-work" || kind === "agent-yielded"
-          ? recoverableWorkBody(kind, args.stashes ?? [], args.restoreFailures ?? [], args.worktreePath)
+          ? recoverableWorkBody(
+              ticketId ?? "<id>",
+              kind,
+              args.stashes ?? [],
+              args.restoreFailures ?? [],
+              args.worktreePath,
+            )
           : `run failed after committing work — needs review.` +
             (failure ? ` It failed with: ${failure}` : "");
 
@@ -1142,6 +1154,7 @@ export function ticketBlockNote(args: {
  * function which case it is actually in.
  */
 function recoverableWorkBody(
+  ticketId: string,
   kind: "stashed-work" | "agent-yielded",
   stashes: readonly string[],
   restoreFailures: readonly string[],
@@ -1178,7 +1191,8 @@ function recoverableWorkBody(
     `Do NOT re-implement it from scratch. ${opening} ${recoveryClause}.` +
     stashClause +
     ` Nothing was verified or committed, so this is no delivery — recover the change there, then ` +
-    `finish the ticket by hand or resume the run.`
+    `finish the ticket by hand, or reopen it (\`bd update ${ticketId} --status open\` — this block ` +
+    `left it \`blocked\`, which the claim gate refuses) before resuming the run.`
   );
 }
 

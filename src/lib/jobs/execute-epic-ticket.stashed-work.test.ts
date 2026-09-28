@@ -222,11 +222,13 @@ describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero 
   });
 
   /**
-   * A stash read that FAILS must not manufacture a stashed-work park: the worktree would then be kept
-   * (and the ticket blocked with a recovery note) over a tree that genuinely holds nothing. The
-   * pre-existing zero-diff block is the honest answer for an unreadable stack.
+   * A stash read that FAILS must not be read as "gained none" either (PR #333 review): a `git stash
+   * list` failure after the agent stashed work is not "no new stash", and reporting a zero-diff block
+   * over it would tell the operator the tree is genuinely empty when an unread stash might hold the
+   * change. Left to propagate, exactly like the ticket's baseline stash read — the ticket stops the
+   * same safe way any other setup failure does, with the answer left unknown rather than guessed at.
    */
-  it("falls back to the zero-diff block when the stash cannot be read", async () => {
+  it("propagates a stash read failure rather than guessing the stack gained nothing", async () => {
     const stash: StashRecovery = {
       gained: async () => {
         throw new Error("git stash list exploded");
@@ -237,7 +239,7 @@ describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero 
     const err = await failure(assertDelivered(TICKET, { committed: false }, progress(), neverAsked, stash));
 
     expect(err).not.toBeInstanceOf(StashedWorkError);
-    expect(err?.message).toContain("zero diff");
+    expect(err?.message).toContain("git stash list exploded");
   });
 });
 
@@ -281,6 +283,41 @@ describe("a yielded turn is its own outcome, not a clean exit (anton-wjfkn)", ()
     expect(err.stashes).toEqual([]);
   });
 
+  // The claim this message makes is the one an operator acts on without re-reading the diff.
+  // Asserting the restore succeeded when every apply failed sends them to a worktree that does not
+  // hold the change (PR #333 review) — mirrors the same three-way phrasing `recoverStashed`'s
+  // `summary` and `ticketBlockNote` already use for `StashedWorkError`.
+  it("does not claim the change survives in the tree when every restore failed", () => {
+    const err = new AgentYieldedError(
+      TICKET.id,
+      ["ScheduleWakeup"],
+      [SHA_A],
+      "implement",
+      null,
+      [SHA_A],
+    );
+
+    expect(err.message).not.toContain("so the change survives");
+    expect(err.message).toContain("could NOT restore");
+    expect(err.message).toContain("only copy");
+    expect(err.message).toContain("KEPT this worktree");
+  });
+
+  it("says so when only some stash entries came back", () => {
+    const err = new AgentYieldedError(
+      TICKET.id,
+      ["ScheduleWakeup"],
+      [SHA_A, SHA_B],
+      "implement",
+      null,
+      [SHA_B],
+    );
+
+    expect(err.message).toContain("restored 1 of 2");
+    expect(err.message).toContain(`could not apply \`${SHA_B}\``);
+    expect(err.message).not.toContain("so the change survives");
+  });
+
   /**
    * The one question the worktree teardown asks. Both classes hold uncommitted work, so a
    * `--force` release over either is how a recoverable stop becomes lost work — and neither
@@ -306,6 +343,7 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
     restoreFailures: string[] = [],
   ) =>
     ticketBlockNote({
+      ticketId: TICKET.id,
       kind,
       selfReport: null,
       sessionId: "sess-1",
@@ -324,6 +362,16 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
     expect(text).toContain("/tmp/anton-worktrees/wjfkn");
     expect(text).toContain("git stash show -p <sha>");
     expect(text).toContain("Do NOT re-implement it from scratch");
+  });
+
+  // The block leaves the bead `blocked` (PR #333 review), and bd's claim gate refuses that status —
+  // so a note that only says "resume the run" sends the operator to a resume that dies on its own
+  // first step. The remedy must name the reopen.
+  it("tells the operator to reopen the ticket before resuming, since the block leaves it blocked", () => {
+    const text = note("agent-yielded", [SHA_A]);
+
+    expect(text).toContain(`bd update ${TICKET.id} --status open`);
+    expect(text).toContain("claim gate refuses");
   });
 
   it("describes a yielded stop as a stop, with no stash clause when there was none", () => {

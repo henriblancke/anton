@@ -183,8 +183,19 @@ export class AgentYieldedError extends Error implements RunFailureParts, Recover
       `mid-work while the session exited cleanly. ` +
       (stashes.length > 0
         ? `It had set its own work aside first: ${stashes.map((s) => `\`${s}\``).join(", ")} on the ` +
-          `stash stack. anton restored what it could and KEPT this worktree rather than removing it, ` +
-          `so the change survives. `
+          `stash stack. ` +
+          (restoreFailures.length === 0
+            ? `anton restored it into the worktree and KEPT this worktree rather than removing it, so ` +
+              `the change survives. `
+            : restoreFailures.length === stashes.length
+              ? `anton could NOT restore ${stashes.length === 1 ? "it" : "any of it"} back into the ` +
+                `worktree (the tree has moved under ${stashes.length === 1 ? "it" : "them"}), so the ` +
+                `stash ${stashes.length === 1 ? "commit is" : "commits are"} the only copy; anton KEPT ` +
+                `this worktree rather than removing it. `
+              : `anton restored ${stashes.length - restoreFailures.length} of ${stashes.length} back ` +
+                `into the worktree and could not apply ` +
+                `${restoreFailures.map((s) => `\`${s}\``).join(", ")}; every entry is still on the ` +
+                `stash stack, and anton KEPT this worktree rather than removing it. `)
         : `Whatever it had built is loose in the run's worktree, which anton KEPT rather than removed. `) +
       `Blocking the ticket and halting the epic — the work is unverified and uncommitted, so settling ` +
       `it either way would be a guess. Checks must run in the FOREGROUND; resume the run (with a ` +
