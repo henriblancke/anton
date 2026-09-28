@@ -24,6 +24,7 @@ const noteMock = vi.fn();
 const createMock = vi.fn();
 const reparentMock = vi.fn();
 const deleteMock = vi.fn();
+const updateMock = vi.fn();
 const unassignMock = vi.fn();
 const setStatusMock = vi.fn();
 const showMock = vi.fn();
@@ -53,6 +54,7 @@ vi.mock("../beads/bd", async () => {
       create: (...args: unknown[]) => createMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
       delete: (...args: unknown[]) => deleteMock(...args),
+      update: (...args: unknown[]) => updateMock(...args),
       unassign: (...args: unknown[]) => unassignMock(...args),
       setStatus: (...args: unknown[]) => setStatusMock(...args),
       show: (...args: unknown[]) => showMock(...args),
@@ -140,6 +142,10 @@ describe("finalizeMergedEpic", () => {
     createMock.mockReset().mockResolvedValue("epic-2");
     reparentMock.mockReset().mockResolvedValue(undefined);
     deleteMock.mockReset().mockResolvedValue(undefined);
+    // A reused follow-up's `## Outcome IDs` patch (anton-cdeki): the fixtures below don't carry
+    // that section, so resolveFollowUp always attempts it — succeeding here keeps these cases
+    // about the rehome/finalize logic they're actually testing.
+    updateMock.mockReset().mockResolvedValue(undefined);
     assignees.clear();
     statuses.clear();
     parents.clear();

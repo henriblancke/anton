@@ -32,6 +32,16 @@ export function labelValueOf(labels: string[] | undefined, prefix: string): stri
   return label ? label.slice(prefix.length + 1) : undefined;
 }
 
+/** Read every value of a multi-valued `prefix:` label off a bead's labels — `outcome:` is the one
+ * of these that is open-ended: a scan-produced run target carries `outcome:codebase-health` plus a
+ * product outcome (skills/scan-triage/SKILL.md), and dropping either would silently narrow which
+ * outcomes a follow-up is recorded as serving. */
+export function labelValuesOf(labels: string[] | undefined, prefix: string): string[] {
+  return (labels ?? [])
+    .filter((l) => l.startsWith(`${prefix}:`))
+    .map((l) => l.slice(prefix.length + 1));
+}
+
 /**
  * Build the single `bd update` argv for a patch, or `null` when nothing changed (no write).
  * Label edits diff each managed prefix against `currentLabels`, so only the prefix that

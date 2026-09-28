@@ -34,6 +34,8 @@ import { join } from "node:path";
 import {
   BEAD_FORMULA_FILENAME,
   bundledBeadFormulaPath as bundledFormulaUnder,
+  ensureBeadFormula,
+  ensureBeadsGitignore,
 } from "./config.mjs";
 import { renderedText, validateBeadContract } from "./contract";
 
@@ -65,6 +67,13 @@ const TIER_ACCEPTANCE_VAR: Record<BeadTier, string> = {
   feature: "acceptance",
   ticket: "acceptance",
 };
+
+/**
+ * Thrown by {@link renderBeadSkeleton} when the template would silently drop a supplied contract
+ * var — the one render failure {@link beadSkeleton} attempts to self-heal, distinct from a bare
+ * `Error` (an unresolved `{{var}}`, which is a broken template no resync can fix).
+ */
+export class DiscardedContractVarError extends Error {}
 
 interface FormulaVar {
   description?: string;
@@ -153,10 +162,20 @@ export function parseBeadFormula(raw: string, source: string): BeadFormula {
   };
 }
 
+/**
+ * Resolve and parse the formula for `repoPath`, keeping the resolved `path` alongside it —
+ * {@link beadSkeleton}'s self-heal retry needs `path` to tell a project-local copy (worth
+ * resyncing) from the bundled fallback (not).
+ */
+async function loadBeadFormulaWithPath(repoPath: string): Promise<{ formula: BeadFormula; path: string }> {
+  const path = resolveBeadFormulaPath(repoPath);
+  const formula = parseBeadFormula(await readFile(path, "utf8"), path);
+  return { formula, path };
+}
+
 /** Load the formula that applies to `repoPath` (project copy first, bundled asset as fallback). */
 export async function loadBeadFormula(repoPath: string): Promise<BeadFormula> {
-  const path = resolveBeadFormulaPath(repoPath);
-  return parseBeadFormula(await readFile(path, "utf8"), path);
+  return (await loadBeadFormulaWithPath(repoPath)).formula;
 }
 
 /** One `{{var}}` token — the shape {@link interpolate} resolves and the consumption check scans. */
@@ -170,9 +189,9 @@ const VAR_TOKEN = /\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g;
  * and a ticket render legitimately ignores `outcome`.
  */
 const TIER_CONTRACT_VARS: Record<BeadTier, string[]> = {
-  epic: ["outcome", "success_criteria"],
-  feature: ["goal", "acceptance", "context", "out_of_scope", "verify"],
-  ticket: ["goal", "acceptance", "context", "out_of_scope", "verify"],
+  epic: ["outcome", "success_criteria", "outcome_ids"],
+  feature: ["goal", "why", "acceptance", "context", "out_of_scope", "verify"],
+  ticket: ["goal", "why", "acceptance", "context", "out_of_scope", "verify"],
 };
 
 /**
@@ -243,7 +262,7 @@ export function renderBeadSkeleton(
   });
   if (discarded.length > 0) {
     const names = discarded.map((n) => `{{${n}}}`).join(", ");
-    throw new Error(
+    throw new DiscardedContractVarError(
       `bead formula ${formula.source}: the \`${tier}\` template never references ${names} — the supplied value would be discarded; add the placeholder to the step's template`,
     );
   }
@@ -266,11 +285,54 @@ function descriptionShadowsAcceptance(skeleton: BeadSkeleton): boolean {
   }).some((v) => v.severity === "blocking");
 }
 
-/** Load the project's formula and render `tier` from it — the one call a creation path needs. */
+/**
+ * Load the project's formula and render `tier` from it — the one call a creation path needs.
+ *
+ * Self-heals a stale PROJECT-LOCAL copy (PR #334 review): `anton update` refreshes the runtime
+ * binary but never touches a registered project's own `.beads/formulas/anton-bead.formula.json` —
+ * only re-running `anton init <repo>` does (bin/anton.mjs) — so a project whose copy predates a
+ * newer contract var (e.g. `why`, added by this change) would 500 on every submission that
+ * supplies it, forever, until an operator notices and manually reinitializes it. On exactly that
+ * failure, resync the project's copy from the bundled asset — the same replace-and-backup
+ * `ensureBeadFormula` already performs for `anton init`, guarded by the same `.gitignore`
+ * safeguard `anton init` applies first (config.mjs) so the `.bak` this resync can leave behind is
+ * never committable — and retry once before giving up. A formula that still discards the var
+ * after resyncing (the bundled asset itself is missing the placeholder) is a real bug, not
+ * staleness, so that error is left to propagate.
+ *
+ * Two concurrent submissions can both read the stale copy before either syncs it: the first sees
+ * `"replaced"`, but the second's sync then finds the copy already matches the bundled asset and
+ * reports `"already"` (or, if the file vanished between the read and the sync, `"installed"`) —
+ * not a failure to resync, just a resync someone else already did. Retry on all three statuses;
+ * only `"unsafe-dest"`/`"missing-asset"`/`"no-workspace"`/`"failed"` mean the resync itself didn't
+ * happen and the original error should propagate.
+ */
 export async function beadSkeleton(
   repoPath: string,
   tier: BeadTier,
   vars: Record<string, string> = {},
 ): Promise<BeadSkeleton> {
-  return renderBeadSkeleton(await loadBeadFormula(repoPath), tier, vars);
+  const { formula, path } = await loadBeadFormulaWithPath(repoPath);
+  try {
+    return renderBeadSkeleton(formula, tier, vars);
+  } catch (err) {
+    if (!(err instanceof DiscardedContractVarError) || path !== projectBeadFormulaPath(repoPath)) {
+      throw err;
+    }
+    const beadsDir = join(repoPath, ".beads");
+    // Same safeguard the registration path enforces before a formula replacement (config.mjs):
+    // a refusal here means `formulas/*.bak` isn't ignored yet, so the backup this resync is
+    // about to write would be committable by the next `git add -A`. Treat it as fatal and fall
+    // through to the original discard error instead of leaving a stray backup behind.
+    const gi = ensureBeadsGitignore(beadsDir);
+    if (gi.refused) {
+      throw err;
+    }
+    const synced = ensureBeadFormula(beadsDir, bundledBeadFormulaPath());
+    if (synced.status !== "replaced" && synced.status !== "already" && synced.status !== "installed") {
+      throw err;
+    }
+    const { formula: refreshed } = await loadBeadFormulaWithPath(repoPath);
+    return renderBeadSkeleton(refreshed, tier, vars);
+  }
 }

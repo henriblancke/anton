@@ -8,6 +8,7 @@
  * already reads (`humanNotesPromptBlock`, lib/jobs/step-registry.ts) — so the implementer that picks
  * the bead up next is shown the steer without a new prompt seam.
  */
+import { outcomeIdsOf } from "./backlog";
 import { beads, type Bead } from "./beads/bd";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote } from "./beads/notes";
@@ -21,6 +22,7 @@ import {
   hasHumanNote,
   originNoteBody,
   reconcileFollowUpDescription,
+  reconcileFollowUpWhy,
   reworkNoteBody,
 } from "./rework-notes";
 import { RUN_STAGE_LABELS } from "./rework-pipeline";
@@ -33,6 +35,11 @@ import type { Project, ReworkPipeline, ReworkResult } from "./types";
  * shaping metadata the board filters and sorts on. Everything else is deliberately NOT copied —
  * `approved` is the founder's gate on the new work, `stage:`/`run-lease:`/`review-score:` describe a
  * run the follow-up never had, and `abandoned` would create it already dead.
+ *
+ * `outcome:` is deliberately absent here too, but for the opposite reason: it is not a routing label
+ * to copy from the TICKET, it is a run-target label (src/prompts/BEADS.md) this bead only earns when
+ * it becomes one — created parentless — and its value comes from the run TARGET's own outcome, not
+ * the ticket's. {@link createFollowUp} and {@link reconcileHalfCreatedContract} add it separately.
  */
 const INHERITED_LABEL_PREFIXES = ["agent:", "domain:", "risk:", "size:", "area:"];
 
@@ -169,15 +176,23 @@ export async function applyFollowUp(
   const match = await existingFollowUp(repo, all, ticket.id, request.summary, context.body);
   if (!match) return createFollowUp(context, all);
   const detachment = owedDetachment(context, match.bead);
+  // A parentless-from-the-outset match that owes no detachment still writes when it is missing its
+  // `## Why` or the target's `outcome:` labels (resumeFollowUp's legacy-repair branch) — writes the
+  // guard below must cover exactly like the detachment and half-created cases, or they land
+  // unserialized past a caller that never held this bead's lock.
+  const parentlessLegacyMatch = !detachment && !match.partial && beads.parentOf(match.bead) === undefined;
+  const missingWhy = parentlessLegacyMatch && missingWhyOwed(context, match.bead);
+  const missingOutcome = parentlessLegacyMatch && outcomeTagsOwed(context, match.bead);
   // A match the caller did not lock became a candidate between its snapshot and its locks. The lock
-  // guards WRITES to that bead — finishing a half-made one, or detaching a stranded one — so only a
-  // resume that owes one is refused: writing unserialized is the lost update the lock exists to
-  // prevent, and the answer is the one every other moved-board race gets (409): look again, and the
-  // retry snapshots — and locks — the bead it will resume. A match that is DONE, and owes nothing, is
-  // read and reported without a write, so it needs no lock. That is exactly what the loser of two
-  // identical requests sees: both snapshot an empty candidate set, the winner creates the follow-up
-  // under the ticket lock, and the loser's re-read finds it — the documented no-op, not a conflict.
-  if ((match.partial || detachment) && !lockedFollowUps.has(match.bead.id)) {
+  // guards WRITES to that bead — finishing a half-made one, detaching a stranded one, or repairing a
+  // legacy parentless one's `## Why`/outcome labels — so only a resume that owes one is refused:
+  // writing unserialized is the lost update the lock exists to prevent, and the answer is the one
+  // every other moved-board race gets (409): look again, and the retry snapshots — and locks — the
+  // bead it will resume. A match that is DONE and owes nothing is read and reported without a write,
+  // so it needs no lock. That is exactly what the loser of two identical requests sees: both
+  // snapshot an empty candidate set, the winner creates the follow-up under the ticket lock, and the
+  // loser's re-read finds it — the documented no-op, not a conflict.
+  if ((match.partial || detachment || missingWhy || missingOutcome) && !lockedFollowUps.has(match.bead.id)) {
     throw new ReworkConflictError(
       `${match.bead.id} became ${ticket.id}'s follow-up while this send-back was being decided — ` +
         `look again and send it back`,
@@ -225,18 +240,48 @@ async function resumeFollowUp(
 ): Promise<AppliedRework> {
   const { target, ticket, body } = context;
   const existing = match.bead;
+  let wroteMissingWhy = false;
+  let wroteMissingOutcome = false;
   if (detachment) {
     if (!detachment.recorded) {
       await noteStrandedFollowUp(context, existing, detachment.pr, !match.partial);
     }
+    // Tag and reconcile Why BEFORE the reparent, which is the write that settles the detachment
+    // (owedDetachment reads it off the parent edge, not a label or the description). Ordered the
+    // other way round, either write failing after a landed reparent could never be retried: the
+    // next pass reads the bead as already parentless, decides nothing is owed, and the outcome
+    // label or the missing Why is gone for good. Both are harmless to repeat — the label filter
+    // and the description diff below make retrying either a no-op.
+    await tagDetachedOutcome(context, existing);
+    // A completed follow-up never takes the match.partial branch below, so this is the only pass
+    // (short of the parentless-from-the-outset case below) that would ever add a Why a legacy bead
+    // was created without — the contract gate never catches its absence, so a merged detachment
+    // must not leave it missing for good.
+    if (!match.partial) await reconcileMissingWhy(context, existing);
     await beads.reparent(context.repo, existing.id, "");
+  } else if (!match.partial && beads.parentOf(existing) === undefined) {
+    // A DONE match that owes no detachment is normally read without a write (resumeFollowUp's own
+    // doc comment). But a match that was created parentless to begin with — its target had already
+    // shipped, or it stood alone from the start — is a run target the contract gate checks same as
+    // any other, and a legacy one predating the Why requirement (or the outcome-label requirement)
+    // never passes through the detachment branch above to pick either up. This is the only other
+    // pass that ever will — and the guard in applyFollowUp already required this bead's lock before
+    // letting these writes happen, so `reconciled` below must report them the same as the detachment
+    // branch's writes. Tag before the Why rewrite, matching the detachment branch's order, though
+    // nothing here depends on it: neither write undoes the other's precondition.
+    wroteMissingOutcome = await tagDetachedOutcome(context, existing);
+    wroteMissingWhy = await reconcileMissingWhy(context, existing);
   }
   if (match.partial) {
-    await reconcileHalfCreatedContract(
-      context,
-      existing,
-      detachment ? undefined : beads.parentOf(existing),
-    );
+    const parentId = detachment ? undefined : beads.parentOf(existing);
+    // A standalone run target must carry the target's outcome label(s) before this pass notes it
+    // and ends the retry loop that would otherwise catch it up later (existingFollowUp's
+    // unfinishedCreation only matches a still-partial bead). The `detachment` branch above already
+    // tagged a bead this pass is detaching; this covers the other way a resumed half-created
+    // follow-up ends up parentless — it predates outcome labels, or was created by hand without
+    // them — where no detachment is owed at all, so tagDetachedOutcome was never reached.
+    if (!detachment && parentId === undefined) await tagDetachedOutcome(context, existing);
+    await reconcileHalfCreatedContract(context, existing, parentId);
     await finishHalfCreatedFollowUp(context, existing);
   }
   return {
@@ -253,7 +298,7 @@ async function resumeFollowUp(
     // Read off the bead the winner actually created — as reconciled above — so the repeat that
     // finishes a half-applied send-back retires on exactly the condition that holds now.
     runsUnderTarget: context.shippedPr === undefined && beads.parentOf(existing) === target.id,
-    reconciled: detachment !== undefined,
+    reconciled: detachment !== undefined || wroteMissingWhy || wroteMissingOutcome,
   };
 }
 
@@ -308,6 +353,65 @@ async function noteStrandedFollowUp(
 }
 
 /**
+ * Catch a detached follow-up up on the labels a bead created parentless gets from the start
+ * ({@link followUpLabels}) — detaching it here ({@link resumeFollowUp}) makes it a run target of its
+ * own (src/prompts/BEADS.md) just as surely as `createFollowUp` does, and every outcome the target's
+ * own label(s) name comes over, partial or already-finished alike. A bead that already carries a
+ * label (a retried resume) is left alone rather than double-added. Returns whether it wrote, so the
+ * caller can report the write ({@link AppliedRework.reconciled}).
+ */
+async function tagDetachedOutcome(context: FollowUpContext, existing: Bead): Promise<boolean> {
+  const missing = outcomeTagsMissing(context, existing);
+  if (missing.length === 0) return false;
+  await beads.tag(context.repo, existing.id, missing);
+  return true;
+}
+
+/** The `outcome:` labels {@link tagDetachedOutcome} would still add, read-only. */
+function outcomeTagsMissing(context: FollowUpContext, existing: Bead): string[] {
+  const current = existing.labels ?? [];
+  return outcomeIdsOf(context.target)
+    .map((id) => `outcome:${id}`)
+    .filter((label) => !current.includes(label));
+}
+
+/**
+ * Whether {@link tagDetachedOutcome} would write if run against `existing` right now — the same
+ * pure check, read-only, so {@link applyFollowUp} can require this bead's lock ({@link
+ * lockedFollowUps}) before the parentless-legacy-repair branch of {@link resumeFollowUp} is allowed
+ * to write it, instead of discovering after the fact that an unlocked write happened.
+ */
+function outcomeTagsOwed(context: FollowUpContext, existing: Bead): boolean {
+  return outcomeTagsMissing(context, existing).length > 0;
+}
+
+/**
+ * Add a missing `## Why` to a completed follow-up being detached, or to one that was already
+ * parentless ({@link resumeFollowUp}). Never touches Acceptance or the run-location line — only
+ * {@link reconcileHalfCreatedContract} owns rewriting those, and only for a still-partial bead.
+ * Returns whether it wrote, so the caller can report the write ({@link AppliedRework.reconciled}).
+ */
+async function reconcileMissingWhy(context: FollowUpContext, existing: Bead): Promise<boolean> {
+  const { repo, ticket, target } = context;
+  const current = existing.description ?? "";
+  const description = reconcileFollowUpWhy(current, ticket, outcomeIdsOf(target));
+  if (description === current) return false;
+  await beads.update(repo, existing.id, { description });
+  return true;
+}
+
+/**
+ * Whether {@link reconcileMissingWhy} would write if run against `existing` right now — the same
+ * pure check, read-only, so {@link applyFollowUp} can require this bead's lock ({@link
+ * lockedFollowUps}) before the parentless-legacy-repair branch of {@link resumeFollowUp} is allowed
+ * to write it, instead of discovering after the fact that an unlocked write happened.
+ */
+function missingWhyOwed(context: FollowUpContext, existing: Bead): boolean {
+  const current = existing.description ?? "";
+  return reconcileFollowUpWhy(current, context.ticket, outcomeIdsOf(context.target)) !== current;
+}
+
+/**
  * Reconcile a half-created follow-up's contract ({@link existingFollowUp}) to the request finishing
  * it. `bd create` froze the FIRST attempt's instructions and findings into the acceptance, and the
  * founder may have edited either before retrying under the same title — the note about to land
@@ -336,6 +440,7 @@ async function reconcileHalfCreatedContract(
     targetId: target.id,
     parentId,
     pipeline,
+    outcomeIds: outcomeIdsOf(target),
   });
   if (existing.description !== description) {
     await beads.update(repo, existing.id, { description });
@@ -360,6 +465,7 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
   const { repo, target, ticket, request, author, body, pipeline } = context;
   const parentId =
     context.shippedPr === undefined && isBoardCard(target, all) ? target.id : undefined;
+  const outcomeIds = outcomeIdsOf(target);
   const followUpId = await beads.create(repo, {
     title: request.summary,
     type: "task",
@@ -371,8 +477,9 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
       targetId: target.id,
       parentId,
       pipeline,
+      outcomeIds,
     }),
-    labels: inheritedLabels(ticket),
+    labels: followUpLabels(ticket, parentId, outcomeIds),
     ...(parentId ? { deps: [`parent-child:${parentId}`] } : {}),
   });
   // Provenance, and the reason this bead exists at all: `bd link <new> <origin> --type
@@ -501,6 +608,21 @@ function unfinishedCreation(bead: Bead): Bead | undefined {
 /** The routing/shaping labels a follow-up carries over — see {@link INHERITED_LABEL_PREFIXES}. */
 export function inheritedLabels(ticket: Bead): string[] {
   return (ticket.labels ?? []).filter((l) => INHERITED_LABEL_PREFIXES.some((p) => l.startsWith(p)));
+}
+
+/**
+ * The full label set `createFollowUp` writes: the routing labels the ticket carries over, plus every
+ * `outcome:<id>` when this bead is being created PARENTLESS — a run target of its own
+ * (src/prompts/BEADS.md), which the label convention reserves the tag for. A parented follow-up runs
+ * as a ticket of its target's own run and carries no such label, same as any other ticket.
+ *
+ * `outcomeIds` is empty for a target whose own `outcome:` label predates this feature — nothing to
+ * carry over, so the run target is created without one rather than with a fabricated value. A
+ * scan-produced target can carry more than one (skills/scan-triage/SKILL.md); all of them come over.
+ */
+function followUpLabels(ticket: Bead, parentId: string | undefined, outcomeIds: string[]): string[] {
+  const labels = inheritedLabels(ticket);
+  return parentId === undefined ? [...labels, ...outcomeIds.map((id) => `outcome:${id}`)] : labels;
 }
 
 /** Stage labels a reopen strips — one still on the bead means this rework's untag hasn't run yet. */

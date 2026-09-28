@@ -1,9 +1,19 @@
-import { beads, labelValueOf, type Bead, type GraphPlanNode } from "./beads/bd";
+import { beads, labelValueOf, labelValuesOf, type Bead, type GraphPlanNode } from "./beads/bd";
 import { ownerOf } from "./beads/claim";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
 import { beadSkeleton, type BeadSkeleton } from "./beads/formula";
 import { allIssues, loadAllIssues } from "./beads/issues";
+import { scanMarkdown } from "./beads/markdown";
+import { AREA_SHAPE } from "./epic-patch";
+import {
+  activeOutcomeIds,
+  outcomesConfigured,
+  parseOutcomes,
+  readProductMd,
+  readProjectOutcomes,
+  type ProjectOutcome,
+} from "./outcomes";
 import type { Project } from "./types";
 
 /**
@@ -20,6 +30,8 @@ export interface EpicDraft {
   successCriteria: string;
   /** The product surface this outcome advances, without the `area:` prefix. */
   area: string;
+  /** Which `.product/PRODUCT.md` outcome id(s) this epic's features serve — the epic's `## Outcome IDs`. */
+  outcomeIds: string;
 }
 
 /**
@@ -34,6 +46,11 @@ export interface EpicDraft {
 export interface FeatureDraft {
   title: string;
   goal: string;
+  /** Which outcome this serves, and how — the feature's `## Why`. */
+  why: string;
+  /** The `.product/PRODUCT.md` outcome id this feature serves — lands as its `outcome:<id>` label,
+   * the run-target home for that label (skills/bd/SKILL.md); set alongside `why`. */
+  outcomeId: string;
   acceptance: string;
   context: string;
   outOfScope: string;
@@ -157,14 +174,21 @@ export function epicChoices(all: Bead[]): EpicChoice[] {
     .sort((a, b) => a.title.localeCompare(b.title) || a.id.localeCompare(b.id));
 }
 
-/** Everything the Add-work panel offers, derived from ONE board read — the warm issue snapshot the
- * board already holds, so no extra bd spawn: the epics a feature may attach to, and the `area:`
- * vocabulary a new epic should reuse. */
+/** Everything the Add-work panel offers: the epics a feature may attach to and the `area:`
+ * vocabulary a new epic should reuse, off ONE board read (the warm issue snapshot, so no extra bd
+ * spawn) — plus the outcomes `.product/PRODUCT.md` currently offers for new work, so the panel can
+ * suggest them and catch a typo'd outcome id before it ever reaches {@link createDraftFeature}.
+ * The outcomes read is independent of the board read: a PRODUCT.md that fails to read (a transient
+ * I/O error, not just "file doesn't exist" — {@link readProjectOutcomes} already treats that as
+ * empty) must not cost the founder the epic picker along with it. */
 export async function getDraftOptions(
   project: Project,
-): Promise<{ areas: string[]; epics: EpicChoice[] }> {
-  const all = await allIssues(project.repoPath);
-  return { areas: knownAreas(all), epics: epicChoices(all) };
+): Promise<{ areas: string[]; epics: EpicChoice[]; outcomes: ProjectOutcome[] }> {
+  const [all, outcomes] = await Promise.all([
+    allIssues(project.repoPath),
+    readProjectOutcomes(project.repoPath).catch(() => [] as ProjectOutcome[]),
+  ]);
+  return { areas: knownAreas(all), epics: epicChoices(all), outcomes: outcomes.filter((o) => !o.retired) };
 }
 
 /**
@@ -177,10 +201,11 @@ export function buildEpicSkeleton(project: Project, draft: EpicDraft): Promise<B
     title: draft.title,
     outcome: draft.goal,
     success_criteria: draft.successCriteria,
+    outcome_ids: draft.outcomeIds,
   });
 }
 
-/** The same, for the feature tier — the five sections a run and its self-review read. */
+/** The same, for the feature tier — the six sections a run and its self-review read. */
 export function buildFeatureSkeleton(
   project: Project,
   draft: FeatureDraft,
@@ -188,6 +213,7 @@ export function buildFeatureSkeleton(
   return beadSkeleton(project.repoPath, "feature", {
     title: draft.title,
     goal: draft.goal,
+    why: draft.why,
     acceptance: draft.acceptance,
     context: draft.context,
     out_of_scope: draft.outOfScope,
@@ -212,6 +238,180 @@ export class DraftEpicError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DraftEpicError";
+  }
+}
+
+/**
+ * A draft whose outcome doesn't hold up against `.product/PRODUCT.md` — the feature's outcome id
+ * names nothing active there, or a NEW epic's `## Outcome IDs` never mentions it. Same shape as
+ * {@link DraftEpicError}: a question for the founder, not a bd failure, and the route maps it to a
+ * 400.
+ */
+export class DraftOutcomeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "DraftOutcomeError";
+  }
+}
+
+/** Split a free-text `## Outcome IDs` field (e.g. `outcome:reports-are-shareable,
+ * outcome:report-sharng`) into its individual declared id tokens: comma/newline-separated
+ * entries, each with an optional `outcome:` label prefix stripped. Splits only on the structured
+ * separators, not on every space — a manually authored or legacy epic that pairs an id with
+ * explanatory prose on the same line (`outcome:trustworthy-board — primary outcome`) must not
+ * have that prose's own words (`primary`, `outcome`) split out as if they were their own declared
+ * tokens. Deliberately does NOT drop a token that fails id syntax ({@link AREA_SHAPE}): a caller
+ * building a founder-facing error (e.g. `assertOutcomeUsable`) needs the raw malformed token to
+ * name it; a caller about to propagate tokens onward as labels validates separately
+ * ({@link outcomeIdsOf}). Shared by every check that needs the full declared set, not just whether
+ * one particular id is among them. */
+export function outcomeIdTokens(outcomeIds: string): string[] {
+  return outcomeIds
+    .split(/[,\n]+/)
+    .map((token) => token.trim().replace(/^outcome:/i, "").trim())
+    .filter(Boolean);
+}
+
+/** Does the epic's free-text `## Outcome IDs` name this outcome id? A bare id, an `outcome:<id>`
+ * label form, and a comma/whitespace-separated list of several all match — while a longer id
+ * merely containing this one as a substring does not. */
+function outcomeIdsMention(outcomeIds: string, outcomeId: string): boolean {
+  return outcomeIdTokens(outcomeIds).includes(outcomeId);
+}
+
+// Exact match, like `sectionHeading` for `Goal`/`Why` in ticket-dialog-utils.ts — a prefix match
+// would also claim `## Outcome IDs and Caveats`, scooping its free text in as the declared ids.
+const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\s*$/i;
+
+/** An existing epic's `## Outcome IDs` section: whether the heading is present at all, and its body
+ * ("" for an absent OR a blank-but-present section — those two are NOT the same case to a
+ * caller, so `present` carries the distinction). Free text (unlike Goal/Acceptance, "Outcome IDs"
+ * is not a section `validateBeadContract` judges), so a plain heading scan rather than the
+ * contract's slugged-heading machinery — same shape as `extractSection` in ticket-dialog-utils.ts.
+ * Uses `scanMarkdown`'s AST-aware heading metadata (`heading?.depth === 2`), not a raw `/^##\s+/`
+ * text test, so a fenced example whose line merely reads `## Outcome IDs` isn't mistaken for the
+ * genuine section. A fenced or raw-HTML line within the section is dropped entirely, and every
+ * other line is read through its masked `visible` text — so a fenced code example, a `<script>`/
+ * `<pre>` block, or an HTML comment (inline or spanning the whole line) never contributes a bogus
+ * id to the body that {@link outcomeIdTokens} and {@link outcomeIdsOf} later tokenize. */
+export function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
+  const lines = description.split("\n");
+  const scanned = scanMarkdown(description);
+  const occurrences: string[] = [];
+  let body: string[] = [];
+  let inSection = false;
+  let present = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const trimmed = line.trim();
+    const depth = scanned[i]?.heading?.depth;
+    // Any rendered heading at or above this section's own depth ends it — not just another `##`.
+    // A `#` placed after `## Outcome IDs` still closes the document's own top-level grouping, and
+    // leaving it in the body would let outcomeIdTokens tokenize the heading text and everything
+    // after it as declared ids. A repeated `## Outcome IDs` heading reopens the section rather than
+    // ending the read entirely — mirrors `sectionsOf` in beads/contract.ts, which every other
+    // contract reader concatenates repeated sections through; stopping at the first occurrence
+    // silently dropped ids declared only in a later one.
+    if (depth !== undefined && depth <= 2) {
+      if (inSection) {
+        occurrences.push(body.join("\n").trim());
+        body = [];
+      }
+      inSection = depth === 2 && OUTCOME_IDS_HEADING.test(trimmed);
+      if (inSection) present = true;
+      continue;
+    }
+    if (!inSection) continue;
+    const scannedLine = scanned[i];
+    // A fenced or raw-HTML line renders as an example, not a declared id — drop it entirely rather
+    // than let outcomeIdTokens read its source text as a real one. `visible` (not the raw line)
+    // already masks out HTML-comment content the same way, inline or spanning the whole line.
+    if (scannedLine?.fenced || scannedLine?.html) continue;
+    body.push(scannedLine?.visible ?? line);
+  }
+  if (inSection) occurrences.push(body.join("\n").trim());
+  return { present, body: occurrences.filter(Boolean).join("\n\n") };
+}
+
+/**
+ * A run target's outcome id(s), wherever its tier stores them. A feature-tier target carries them as
+ * `outcome:<id>` labels (the Add-work path labels only feature nodes), but a standalone epic run
+ * target (no feature children, execute-epic's own tier) never gets that label — its contract stores
+ * them as free text in its own `## Outcome IDs` section instead. Falling back to the label read alone
+ * would make every standalone epic look like it predates outcome ids and silently drop its declared
+ * outcomes wherever a caller derives them from the target.
+ *
+ * The free-text path's tokens are filtered to id syntax ({@link AREA_SHAPE}) before they're handed
+ * back — this is the one place every rework path (review-fix-followup.ts, rework-modes.ts) reads a
+ * target's outcome ids through before mapping them straight into a follow-up's `outcome:<id>`
+ * labels, so a manually authored or legacy `## Outcome IDs` section mixing an id with explanatory
+ * prose on the same line (`outcome:trustworthy-board — primary outcome`) must not have that prose
+ * propagate onward as fabricated labels. A labeled outcome is usually written by code that already
+ * validated it, but board labels can also be hand-authored, so the same {@link AREA_SHAPE} filter
+ * applies there too — an empty or malformed `outcome:bad!` label must not survive to be copied into
+ * a follow-up's `beads.create`/`beads.tag` calls or its Why text.
+ */
+export function outcomeIdsOf(target: Bead): string[] {
+  const labeled = labelValuesOf(target.labels, "outcome").filter((id) => AREA_SHAPE.test(id));
+  if (labeled.length > 0) return labeled;
+  const { present, body } = extractOutcomeIdsSection(target.description ?? "");
+  return present ? outcomeIdTokens(body).filter((id) => AREA_SHAPE.test(id)) : [];
+}
+
+/**
+ * Refuse a draft whose feature outcome id names nothing `.product/PRODUCT.md` currently offers for
+ * new work — a typo, or one marked `(retired)` — or, for a NEW epic, whose `## Outcome IDs` never
+ * mentions that same id. The epic's outcome ids are the outcomes its features add up to serving
+ * (skills/bd/SKILL.md), so a feature naming an outcome its own new epic doesn't list is exactly the
+ * drift the contract exists to catch.
+ *
+ * Read fresh on every commit rather than cached: PRODUCT.md can change between the shape page
+ * rendering and the founder sending the draft, same reason {@link assertEpicEligible} re-reads the
+ * board instead of trusting the picker's snapshot.
+ */
+async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise<void> {
+  const outcomeId = draft.feature.outcomeId.trim();
+  const markdown = await readProductMd(project.repoPath);
+  const active = activeOutcomeIds(parseOutcomes(markdown));
+  // A missing `## Outcomes` section is an upgrade gap (anton-cdeki), not a deliberate choice to
+  // offer only the built-in `codebase-health` — gating a closed set that was never configured
+  // would leave every project that predates this feature unable to submit a normal feature until
+  // someone manually discovers and edits the new file format. Once a project DOES declare the
+  // section, even an empty one, it's opted in and gets the full check.
+  const configured = outcomesConfigured(markdown);
+  if (configured && !active.has(outcomeId)) {
+    throw new DraftOutcomeError(
+      `"${outcomeId}" is not an outcome \`.product/PRODUCT.md\` offers for new work — pick one from its \`## Outcomes\` section`,
+    );
+  }
+  if (draft.epic.kind === "new") {
+    const declared = outcomeIdTokens(draft.epic.epic.outcomeIds);
+    if (!declared.includes(outcomeId)) {
+      throw new DraftOutcomeError(
+        `the new epic's Outcome IDs must include "${outcomeId}" — the feature's own outcome is one of the outcomes its epic serves`,
+      );
+    }
+    // Label syntax is checked unconditionally — even with no `.product/PRODUCT.md` configured, a
+    // declared id still has to survive as an `outcome:<id>` label, so a bare `,`-typo like
+    // `outcome:bad!` is refused before it ever lands on the board.
+    const malformed = declared.filter((id) => !AREA_SHAPE.test(id));
+    if (malformed.length > 0) {
+      throw new DraftOutcomeError(
+        `the new epic's Outcome IDs name ${malformed.map((id) => `"${id}"`).join(", ")}, which can't be an \`outcome:<id>\` label (letters, digits, . _ - only) — fix the syntax or remove it`,
+      );
+    }
+    // Every declared id is a real commitment the epic makes, not just the one the feature happens
+    // to use — a typo elsewhere in the list (`outcome:report-sharng`) would otherwise persist onto
+    // the board unnoticed because the feature's OWN id already satisfied the check above. Same
+    // upgrade-gap exemption as above: nothing to validate against until PRODUCT.md is configured.
+    if (configured) {
+      const unknown = declared.filter((id) => !active.has(id));
+      if (unknown.length > 0) {
+        throw new DraftOutcomeError(
+          `the new epic's Outcome IDs name ${unknown.map((id) => `"${id}"`).join(", ")}, which \`.product/PRODUCT.md\` doesn't offer for new work — fix the typo or remove it`,
+        );
+      }
+    }
   }
 }
 
@@ -275,13 +475,28 @@ async function draftEpicNode(
  * Only the EXISTING-epic path needs this: a NEW epic lands in the same atomic plan as its child, so
  * there is no board state to re-judge. Call it only while holding the epic's write lock — a verdict
  * is worth exactly as long as nothing can move the epic before the child write it authorizes (see
- * {@link createDraftFeature}). */
-async function assertEpicEligible(project: Project, epicId: string): Promise<void> {
+ * {@link createDraftFeature}).
+ *
+ * Also re-checks the outcome the new-epic path already enforces at draft time
+ * ({@link assertOutcomeUsable}): a chosen epic whose `## Outcome IDs` names a set that does NOT
+ * include the feature's own outcome would otherwise land a feature its parent's declared outcomes
+ * don't cover — the epic then undersells what it groups. A MISSING section is not a contradiction —
+ * an epic that predates this convention, or was never asked to state one, has nothing to conflict
+ * with — so only a section that is present and silent on this id is refused; nothing here mutates
+ * that epic to add it, since a silent auto-edit of another bead's contract is a worse surprise than
+ * asking the founder to fix the mismatch (or pick another epic). */
+async function assertEpicEligible(project: Project, epicId: string, outcomeId: string): Promise<void> {
   const all = await loadAllIssues(project.repoPath);
   const bead = all.find((b) => b.id === epicId);
   if (!bead) throw new DraftEpicError(`epic ${epicId} is not on the board`);
   const reason = ineligibleReason(bead, all);
   if (reason) throw new DraftEpicError(reason);
+  const { present, body } = extractOutcomeIdsSection(bead.description ?? "");
+  if (present && !outcomeIdsMention(body, outcomeId)) {
+    throw new DraftOutcomeError(
+      `epic ${epicId}'s Outcome IDs don't include "${outcomeId}" — the feature's own outcome must be one of the outcomes its epic serves`,
+    );
+  }
 }
 
 /** Plan-local handles for the epic+feature tree a NEW-epic draft lands in one write. */
@@ -337,7 +552,11 @@ export async function createDraftFeature(
   const target = draft.epic;
   const title = draft.feature.title.trim();
   const feature = await buildFeatureSkeleton(project, draft.feature);
-  assertContract(title, feature, []);
+  // The `outcome:` label lives on the run target (skills/bd/SKILL.md), never on the epic that
+  // groups it — so every write path below carries it on the FEATURE node alone.
+  const labels = [`outcome:${draft.feature.outcomeId.trim()}`];
+  assertContract(title, feature, labels);
+  await assertOutcomeUsable(project, draft);
 
   if (target.kind === "new") {
     const epicNode = await draftEpicNode(project, target.epic, EPIC_KEY);
@@ -349,6 +568,7 @@ export async function createDraftFeature(
           title,
           type: feature.type,
           description: feature.description,
+          labels,
           parent_key: EPIC_KEY,
         },
       ],
@@ -360,11 +580,12 @@ export async function createDraftFeature(
   if (!epicId) throw new DraftEpicError("no epic chosen — a feature must attach to one");
 
   const id = await withBeadWriteLock(project.repoPath, epicId, async () => {
-    await assertEpicEligible(project, epicId);
+    await assertEpicEligible(project, epicId, draft.feature.outcomeId.trim());
     return beads.create(project.repoPath, {
       title,
       type: feature.type,
       description: feature.description,
+      labels,
       // Mirrored into bd's own field so `bd lint` and the board card read the same criteria the
       // description states. The graph path above has no such field and needs none — the plan schema
       // carries only the description, which is the home both readers check first.

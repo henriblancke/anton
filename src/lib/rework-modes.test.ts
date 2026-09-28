@@ -23,6 +23,7 @@ const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 const noteMock = vi.fn();
 const reopenMock = vi.fn();
 const untagMock = vi.fn();
+const tagMock = vi.fn();
 type CreateOpts = {
   title: string;
   type: string;
@@ -47,6 +48,7 @@ vi.mock("./beads/bd", async () => {
       note: (...args: unknown[]) => noteMock(...args),
       reopen: (...args: unknown[]) => reopenMock(...args),
       untag: (...args: unknown[]) => untagMock(...args),
+      tag: (...args: unknown[]) => tagMock(...args),
       create: (...args: unknown[]) => createMock(...(args as [string, CreateOpts])),
       link: (...args: unknown[]) => linkMock(...args),
       reparent: (...args: unknown[]) => reparentMock(...args),
@@ -197,7 +199,7 @@ function candidate(id: string, over: Partial<Bead> = {}): Bead {
 }
 
 /** Every bd write these modes can make — asserted absent wherever a request must write nothing. */
-const allWrites = [noteMock, reopenMock, untagMock, createMock, linkMock, reparentMock, updateMock];
+const allWrites = [noteMock, reopenMock, untagMock, tagMock, createMock, linkMock, reparentMock, updateMock];
 
 /** The bead a bd call was made on, and when it happened — the seam for asserting write order. */
 function orderOn(mock: ReturnType<typeof vi.fn>, id: string, nth = 0): number {
@@ -365,6 +367,50 @@ describe("applyFollowUp", () => {
     expect(untagMock).not.toHaveBeenCalled();
   });
 
+  // The upgrade gap the review flagged (anton-cdeki PR #334): a follow-up created parentless is a
+  // run target of its own (src/prompts/BEADS.md), so it must carry the `outcome:` label the
+  // convention reserves for run targets — derived from the TARGET's own label, since that's the
+  // bead whose review produced this one.
+  it("carries the target's own outcome label when created standing alone", async () => {
+    board(solo({ labels: ["outcome:reports-are-shareable"] }));
+
+    const applied = await applyFollowUp(
+      project,
+      solo({ labels: ["outcome:reports-are-shareable"] }),
+      solo({ labels: ["outcome:reports-are-shareable"] }),
+      followUp(),
+    );
+
+    expect(applied.runsUnderTarget).toBe(false);
+    expect(createMock.mock.calls[0]![1].labels).toEqual(["outcome:reports-are-shareable"]);
+    expect(createMock.mock.calls[0]![1].description).toContain(
+      "## Why\nServes outcome:reports-are-shareable",
+    );
+  });
+
+  // A scan-produced target can carry `outcome:codebase-health` plus a product outcome
+  // (skills/scan-triage/SKILL.md) — dropping either from a parentless follow-up would misreport
+  // which outcomes it serves.
+  it("carries every outcome label the target has when created standing alone", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(solo({ labels }));
+
+    const applied = await applyFollowUp(project, solo({ labels }), solo({ labels }), followUp());
+
+    expect(applied.runsUnderTarget).toBe(false);
+    expect(createMock.mock.calls[0]![1].labels).toEqual(labels);
+  });
+
+  it("does not label a PARENTED follow-up with an outcome — it is a ticket of the target's run, not a run target itself", async () => {
+    await applyFollowUp(project, feature({ labels: ["outcome:reports-are-shareable"] }), finishedTicket(), followUp());
+
+    expect(createMock.mock.calls[0]![1].labels).not.toContain("outcome:reports-are-shareable");
+    // The Why section still names it — every ticket's contract requires one, not just run targets'.
+    expect(createMock.mock.calls[0]![1].description).toContain(
+      "## Why\nServes outcome:reports-are-shareable",
+    );
+  });
+
   it("stands a follow-up of a STANDALONE target alone — a child of one is a ticket of no run", async () => {
     board(solo());
 
@@ -373,6 +419,8 @@ describe("applyFollowUp", () => {
     expect(applied.runsUnderTarget).toBe(false);
     expect(createMock.mock.calls[0]![1].deps).toBeUndefined();
     expect(createMock.mock.calls[0]![1].description).toContain("It is its own run target");
+    // No label on the target to derive from — created without one rather than a fabricated value.
+    expect(createMock.mock.calls[0]![1].labels).toEqual([]);
   });
 
   it("stands it alone under a SHIPPED target too — its run has nothing left to dispatch", async () => {
@@ -563,6 +611,37 @@ describe("applyFollowUp", () => {
     expect(reparentMock.mock.invocationCallOrder[0]!).toBeLessThan(updateMock.mock.invocationCallOrder[0]!);
   });
 
+  // The gap the review flagged (anton-cdeki PR #334): detaching a half-created follow-up makes it a
+  // run target of its own just as surely as `createFollowUp` does, so it must pick up the same
+  // `outcome:` label(s) — every one the target carries, not just the first.
+  it("labels a half-created follow-up with every one of the target's outcomes once a merged PR detaches it", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "half", labels);
+    // Before the reparent — the irreversible write `owedDetachment` reads to decide whether anything
+    // is still owed. Tagging first means a retry that only loses the reparent still finds the label
+    // applied; the other way round, a tag that failed after a landed reparent could never be retried.
+    expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+  });
+
+  // The gap the review flagged (anton-cdeki PR #334): a half-created follow-up that is ALREADY
+  // parentless — it predates outcome labels, or was created by hand without a parent — owes no
+  // detachment at all, so `tagDetachedOutcome` was never reached even though this pass still
+  // finishes the bead (the note that follows is what stops a later retry from reconciling it).
+  it("labels a half-created follow-up with the target's outcomes even when no detachment is owed", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("half", { parent: undefined }));
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp());
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "half", labels);
+    // No detachment write in this path — nothing merged, nothing to reparent.
+    expect(reparentMock).not.toHaveBeenCalled();
+  });
+
   it("keeps the detachment recorded when the half-created Context rewrite fails after it", async () => {
     board(feature(), finishedTicket(), candidate("half", { description: createdUnderFeat() }));
     updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
@@ -659,7 +738,13 @@ describe("applyFollowUp", () => {
   });
 
   it("leaves a detachment alone once it has gone through — the third retry writes nothing", async () => {
-    board(feature(), finishedTicket(), candidate("dup", { parent: undefined }));
+    // Realistic: an earlier pass already reconciled Why before this reparent landed, so it is not
+    // owed again here.
+    board(
+      feature(),
+      finishedTicket(),
+      candidate("dup", { parent: undefined, description: createdUnderFeat() }),
+    );
     showsWithNote("dup", followUpBody(), {
       notes: [detachedNote(true), formatHumanNote(followUpBody(), "founder", new Date())].join("\n"),
     });
@@ -689,7 +774,8 @@ describe("applyFollowUp", () => {
   });
 
   it("detaches a follow-up stranded under a target whose PR merged under it, and reports the write", async () => {
-    board(feature(), finishedTicket(), candidate("dup"));
+    // A realistic finished follow-up already carries its contract, Why included, from creation.
+    board(feature(), finishedTicket(), candidate("dup", { description: createdUnderFeat() }));
     showsWithNote("dup", followUpBody());
 
     const applied = await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
@@ -704,6 +790,7 @@ describe("applyFollowUp", () => {
     expect(noteOn("dup")).toContain("gh-42");
     expect(noteOn("dup")).toContain("its own run target");
     // A finished bead keeps its Context, so the note points at the stale parent it still names.
+    // Its description already carries Why, so nothing here rewrites it.
     expect(updateMock).not.toHaveBeenCalled();
     expect(noteOn("dup")).toBe(detachedNote(true));
     expect(noteOn("dup")).toContain("Its Context section still names the parent it was created under.");
@@ -712,14 +799,159 @@ describe("applyFollowUp", () => {
     expect(orderOn(noteMock, "dup")).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
   });
 
+  // A follow-up a pre-Why version of this job finished is not half-created (match.partial is
+  // false, it already has its human note), so it never took the reconcileHalfCreatedContract
+  // branch — but the contract gate never validates Why, so nothing else would ever add it either.
+  it("adds a missing Why to a FINISHED legacy follow-up a merged PR detaches", async () => {
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature(), finishedTicket(), candidate("dup", { description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(updateMock).toHaveBeenCalledWith(
+      "/repo",
+      "dup",
+      expect.objectContaining({
+        description: expect.stringContaining(
+          "Continues the outcome t1 served; that ticket predates `.product/PRODUCT.md`'s outcome ids",
+        ),
+      }),
+    );
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Why");
+    // The rest of the legacy contract is left alone — only Why is ever added here.
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Acceptance Criteria\n- [ ] done");
+    // Written before the reparent (below pins the order), so a Why that fails to land never
+    // settles the detachment — see the next case for the retry this protects.
+    expect(updateMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+  });
+
+  // anton-cdeki PR #334 review: reconcileMissingWhy used to run AFTER the reparent. A bead the
+  // reparent landed on but the Why rewrite then failed on came back parentless yet still missing
+  // Why — and owedDetachment reads the parent edge alone, so a retry saw nothing owed and never
+  // tried the rewrite again. Doing the rewrite first keeps the parent edge (and so the retry) alive
+  // until it lands.
+  it("keeps the detachment owed when the Why rewrite fails, so a retry tries it again", async () => {
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature(), finishedTicket(), candidate("dup", { description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+    updateMock.mockRejectedValueOnce(new Error("bd update: connection reset"));
+
+    await expect(
+      applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
+    ).rejects.toThrow("bd update: connection reset");
+    // The reparent never ran — the bead is still under "feat", so owedDetachment still finds it
+    // owed on the retry rather than reading a settled detachment that is secretly still malformed.
+    expect(reparentMock).not.toHaveBeenCalled();
+
+    updateMock.mockReset();
+    updateMock.mockResolvedValue(undefined);
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Why");
+    expect(reparentMock).toHaveBeenCalledWith("/repo", "dup", "");
+  });
+
+  // Same gap as the half-created case above, for a follow-up whose creation had already finished
+  // before the target's PR merged out from under it.
+  it("labels a FINISHED follow-up with every one of the target's outcomes once a merged PR detaches it", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("dup"));
+    showsWithNote("dup", followUpBody());
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "dup", labels);
+    // Before the reparent, same reason as the half-created case above: retryable if only the
+    // reparent fails, never stranded if the tag itself does.
+    expect(tagMock.mock.invocationCallOrder[0]!).toBeLessThan(reparentMock.mock.invocationCallOrder[0]!);
+  });
+
+  // A bead already carrying one of the outcome labels (a retried resume) must not get it re-added.
+  it("does not re-tag an outcome the detached bead already carries", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    board(feature({ labels }), finishedTicket(), candidate("dup", { labels: ["outcome:codebase-health"] }));
+    showsWithNote("dup", followUpBody(), { labels: ["outcome:codebase-health"] });
+
+    await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "dup", ["outcome:reports-are-shareable"]);
+  });
+
   it("leaves an already-parentless match alone when the target has shipped — nothing to reconcile", async () => {
-    board(feature(), finishedTicket(), candidate("dup", { parent: undefined }));
+    board(
+      feature(),
+      finishedTicket(),
+      candidate("dup", {
+        parent: undefined,
+        description: followUpDescription({
+          summary: SUMMARY,
+          instructions: INSTRUCTIONS,
+          findings: [],
+          ticket: finishedTicket(),
+          targetId: "feat",
+        }),
+      }),
+    );
     showsWithNote("dup", followUpBody());
 
     await expect(
       applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED),
     ).resolves.toMatchObject({ runsUnderTarget: false, reconciled: false });
     expect(reparentMock).not.toHaveBeenCalled();
+    expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  // anton-cdeki PR #334 review: a completed follow-up that was parentless FROM THE OUTSET — created
+  // after its target had already shipped, or from a standalone target — never takes the `detachment`
+  // branch above (nothing is owed on a bead that was never under the target), so it never used to hit
+  // reconcileMissingWhy either. That left a legacy parentless follow-up missing `## Why` forever: the
+  // contract gate doesn't catch the omission, and no other pass ever revisits a DONE match.
+  it("adds a missing Why to a completed follow-up that was parentless from the outset", async () => {
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature(), finishedTicket(), candidate("dup", { parent: undefined, description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+
+    await applyFollowUp(project, feature(), finishedTicket(), followUp(), SHIPPED);
+
+    expect(reparentMock).not.toHaveBeenCalled();
+    expect(updateMock).toHaveBeenCalledWith(
+      "/repo",
+      "dup",
+      expect.objectContaining({ description: expect.stringContaining("## Why") }),
+    );
+    expect(updateMock.mock.calls[0]![2].description).toContain("## Acceptance Criteria\n- [ ] done");
+  });
+
+  // The other half of the same gap: a completed follow-up that was parentless from the outset is a
+  // run target of its own just as surely as one `tagDetachedOutcome` reaches through the detachment
+  // branch, so it must pick up the target's `outcome:` label(s) too — not just its `## Why`.
+  it("tags a completed follow-up that was parentless from the outset with the target's outcomes", async () => {
+    const labels = ["outcome:codebase-health", "outcome:reports-are-shareable"];
+    const legacyDescription = "## Goal\nHarden the retry path.\n\n## Acceptance Criteria\n- [ ] done";
+    board(feature({ labels }), finishedTicket(), candidate("dup", { parent: undefined, description: legacyDescription }));
+    showsWithNote("dup", followUpBody());
+
+    const applied = await applyFollowUp(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED);
+
+    expect(tagMock).toHaveBeenCalledWith("/repo", "dup", labels);
+    expect(applied).toMatchObject({ reconciled: true });
+  });
+
+  it("refuses to resume an unlocked match that owes only the target's outcome labels, not a Why rewrite", async () => {
+    // `## Why` is already there, so `missingWhy` alone would miss this — the guard must also cover
+    // the outcome-label write, or it lands unserialized past a caller that never held the lock.
+    const labels = ["outcome:codebase-health"];
+    board(
+      feature({ labels }),
+      finishedTicket(),
+      candidate("dup", { parent: undefined, description: createdUnderFeat() }),
+    );
+    showsWithNote("dup", followUpBody());
+
+    await expect(
+      applyFollowUpHolding(project, feature({ labels }), finishedTicket(), followUp(), SHIPPED, new Set()),
+    ).rejects.toThrow(ReworkConflictError);
+    for (const write of allWrites) expect(write).not.toHaveBeenCalled();
   });
 
   it("reads the match's parentage off the RE-READ, not the snapshot a rival may have moved", async () => {

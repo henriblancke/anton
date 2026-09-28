@@ -1,9 +1,15 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { createDraftFeature, DraftContractError, DraftEpicError } from "@/lib/backlog";
+import { createDraftFeature, DraftContractError, DraftEpicError, DraftOutcomeError } from "@/lib/backlog";
 import { AREA_SHAPE } from "@/lib/epic-patch";
 import { resolveProject } from "../resolve-project";
+
+/** A label-safe suffix — the same shape bd round-trips for `area:<value>` and `outcome:<value>`. */
+const labelValue = z
+  .string()
+  .trim()
+  .regex(AREA_SHAPE, "expected a label-safe value — letters, digits, . _ -");
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -23,10 +29,8 @@ const epicSchema = z.discriminatedUnion("kind", [
       title: z.string().trim().min(1).max(200),
       goal: section,
       successCriteria: section,
-      area: z
-        .string()
-        .trim()
-        .regex(AREA_SHAPE, "expected a label-safe value — letters, digits, . _ -"),
+      area: labelValue,
+      outcomeIds: section,
     }),
   }),
 ]);
@@ -49,6 +53,8 @@ const draftSchema = z.object({
   feature: z.object({
     title: z.string().trim().min(1).max(200),
     goal: section,
+    why: section,
+    outcomeId: labelValue,
     acceptance: section,
     context: section,
     outOfScope: section,
@@ -80,9 +86,9 @@ export async function POST(
     const created = await createDraftFeature(project, draft);
     return NextResponse.json(created, { status: 201 });
   } catch (err) {
-    // An unusable epic is a question for the founder (pick another), not a bd failure — 400, so the
-    // panel keeps the draft and says which epic it could not use.
-    if (err instanceof DraftEpicError) {
+    // An unusable epic or outcome is a question for the founder (pick another), not a bd failure —
+    // 400, so the panel keeps the draft and says what it could not use.
+    if (err instanceof DraftEpicError || err instanceof DraftOutcomeError) {
       return NextResponse.json({ error: err.message }, { status: 400 });
     }
     if (err instanceof DraftContractError) {
