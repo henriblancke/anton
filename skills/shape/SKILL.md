@@ -121,7 +121,7 @@ the mapping onto the tiers is your job.
 3. **Nothing fits → create the epic.** State it as an outcome a stakeholder would recognise
    ("Reports are shareable outside the app"), not a restatement of the feature ("Add CSV export").
    Give it exactly one `area:` label, Success Criteria that several features add up to, and a
-   `## Outcome` naming the `.product/PRODUCT.md` id(s) it serves.
+   `## Outcome IDs` section naming the `.product/PRODUCT.md` id(s) it serves.
 4. **Can't name an outcome you believe in → ask the user.** Show the feature, the epics you
    considered, and why none fit; ask which epic it belongs to or whether it's a genuine one-off.
    Never leave a feature parentless to move on, and never mint a one-feature epic to silence the
@@ -163,7 +163,7 @@ intent. Pure refactors, docs, and UI over existing data are outside the ADR and 
 
 Set labels (`domain:`, `risk:`, `agent:`, `size:`, `outcome:`) per the `bd` skill's conventions,
 plus one `area:` on the epic. `outcome:<id>` goes on the feature (the run target) — the id you
-named answering Phase 1's forcing question — and the epic's `## Outcome` section lists what its
+named answering Phase 1's forcing question — and the epic's `## Outcome IDs` section lists what its
 features add up to serving. Set dependency edges: `parent-child` from ticket to feature and from
 feature to epic, `blocks` for hard ordering. `risk:high` for schema/auth/payments/migrations/infra.
 A `size:L` ticket is a smell — split it; a `size:L` feature usually means two PRs. (Model routing

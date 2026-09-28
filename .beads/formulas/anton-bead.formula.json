@@ -50,7 +50,7 @@
       "id": "epic",
       "type": "epic",
       "title": "{{title}}",
-      "description": "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}\n\n## Outcome\n\n{{outcome_ids}}"
+      "description": "## Goal\n\n{{outcome}}\n\n## Success Criteria\n\n{{success_criteria}}\n\n## Outcome IDs\n\n{{outcome_ids}}"
     },
     {
       "id": "feature",

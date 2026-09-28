@@ -41,6 +41,13 @@ export function DraftFields({
           placeholder="One sentence: what this delivers, and why it matters."
         />
         <DraftTextarea
+          label="Why"
+          value={fields.feature.why}
+          onChange={(v) => setFeatureField("why", v)}
+          placeholder="Which outcome does this serve, and how?"
+          hint="The forcing question behind the outcome: label — set them together."
+        />
+        <DraftTextarea
           label="Acceptance criteria"
           value={fields.feature.acceptance}
           onChange={(v) => setFeatureField("acceptance", v)}
@@ -145,6 +152,13 @@ function EpicSection({
             onChange={(v) => setEpicField("successCriteria", v)}
             placeholder={"- [ ] the observable state that means this outcome is reached"}
             hint="What several features add up to — not this PR's checklist."
+          />
+          <DraftInput
+            label="Outcome IDs"
+            value={fields.epic.outcomeIds}
+            onChange={(v) => setEpicField("outcomeIds", v)}
+            placeholder="outcome:reports-are-shareable"
+            hint="Which `.product/PRODUCT.md` outcome id(s) this epic's features serve."
           />
           <DraftInput
             label="Area"

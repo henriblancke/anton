@@ -64,11 +64,13 @@ const EPIC = {
   goal: "Every report view leaves the app in a format a customer can open.",
   successCriteria: "- [ ] every report view exports to CSV and PDF",
   area: "reports",
+  outcomeIds: "outcome:reports-are-shareable",
 };
 
 const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
+  why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow the pattern in src/lib/export.ts",
   outOfScope: "- PDF export, which is its own feature",
@@ -187,10 +189,11 @@ describe("buildFeatureSkeleton", () => {
     ).toEqual([]);
   });
 
-  it("carries all five sections the run and its self-review read", async () => {
+  it("carries all six sections the run and its self-review read", async () => {
     const { description, acceptance } = await buildFeatureSkeleton(tempProject(), FEATURE);
     for (const heading of [
       "## Goal",
+      "## Why",
       "## Acceptance Criteria",
       "## Context",
       "## Out of scope",

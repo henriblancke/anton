@@ -20,6 +20,8 @@ export interface EpicDraft {
   successCriteria: string;
   /** The product surface this outcome advances, without the `area:` prefix. */
   area: string;
+  /** Which `.product/PRODUCT.md` outcome id(s) this epic's features serve — the epic's `## Outcome IDs`. */
+  outcomeIds: string;
 }
 
 /**
@@ -34,6 +36,8 @@ export interface EpicDraft {
 export interface FeatureDraft {
   title: string;
   goal: string;
+  /** Which outcome this serves, and how — the feature's `## Why`. */
+  why: string;
   acceptance: string;
   context: string;
   outOfScope: string;
@@ -177,10 +181,11 @@ export function buildEpicSkeleton(project: Project, draft: EpicDraft): Promise<B
     title: draft.title,
     outcome: draft.goal,
     success_criteria: draft.successCriteria,
+    outcome_ids: draft.outcomeIds,
   });
 }
 
-/** The same, for the feature tier — the five sections a run and its self-review read. */
+/** The same, for the feature tier — the six sections a run and its self-review read. */
 export function buildFeatureSkeleton(
   project: Project,
   draft: FeatureDraft,
@@ -188,6 +193,7 @@ export function buildFeatureSkeleton(
   return beadSkeleton(project.repoPath, "feature", {
     title: draft.title,
     goal: draft.goal,
+    why: draft.why,
     acceptance: draft.acceptance,
     context: draft.context,
     out_of_scope: draft.outOfScope,

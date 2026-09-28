@@ -69,7 +69,7 @@ bead, so it and the `outcome:` label above are set together. Without these the e
 spec.
 `/shape` and `/scan-triage` enforce it; `bd lint` checks the Acceptance/Success sections.
 
-An epic's description carries `## Outcome` alongside its Goal and Success Criteria — the
+An epic's description carries `## Outcome IDs` alongside its Goal and Success Criteria — the
 `.product/PRODUCT.md` outcome id(s) its features add up to serving.
 
 ## Cross-domain

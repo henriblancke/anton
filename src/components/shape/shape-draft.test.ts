@@ -19,6 +19,7 @@ import {
 const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
+  why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow src/lib/export.ts",
   outOfScope: "- PDF export",
@@ -30,9 +31,10 @@ const EPIC = {
   goal: "Every report view leaves the app in a format a customer can open.",
   successCriteria: "- [ ] every report view exports",
   area: "reports",
+  outcomeIds: "outcome:reports-are-shareable",
 };
 
-const EMPTY_EPIC = { title: "", goal: "", successCriteria: "", area: "" };
+const EMPTY_EPIC = { title: "", goal: "", successCriteria: "", area: "", outcomeIds: "" };
 
 /** A draft attached to an epic already on the board — the common case. */
 const FULL: ShapeDraftFields = { feature: FEATURE, epicId: "anton-1", epic: EMPTY_EPIC };
@@ -60,11 +62,27 @@ describe("draftGaps", () => {
   it("names each missing piece the way the panel labels it", () => {
     expect(
       draftGaps({
-        feature: { title: "", goal: "", acceptance: "", context: "", outOfScope: "", verify: "" },
+        feature: {
+          title: "",
+          goal: "",
+          why: "",
+          acceptance: "",
+          context: "",
+          outOfScope: "",
+          verify: "",
+        },
         epicId: "anton-1",
         epic: EMPTY_EPIC,
       }),
-    ).toEqual(["a title", "a goal", "acceptance criteria", "context", "out of scope", "verify"]);
+    ).toEqual([
+      "a title",
+      "a goal",
+      "why",
+      "acceptance criteria",
+      "context",
+      "out of scope",
+      "verify",
+    ]);
   });
 
   it("asks for the new epic's own contract only while one is being created", () => {
@@ -73,6 +91,7 @@ describe("draftGaps", () => {
       "an epic outcome",
       "epic success criteria",
       "an area",
+      "which outcome(s) the epic serves",
     ]);
     // Picking an existing epic drops those — the panel no longer collects them.
     expect(draftGaps({ ...FULL, epic: EMPTY_EPIC })).toEqual([]);

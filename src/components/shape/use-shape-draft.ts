@@ -18,12 +18,19 @@ import {
 const EMPTY_FEATURE: FeatureDraftFields = {
   title: "",
   goal: "",
+  why: "",
   acceptance: "",
   context: "",
   outOfScope: "",
   verify: "",
 };
-const EMPTY_EPIC: EpicDraftFields = { title: "", goal: "", successCriteria: "", area: "" };
+const EMPTY_EPIC: EpicDraftFields = {
+  title: "",
+  goal: "",
+  successCriteria: "",
+  area: "",
+  outcomeIds: "",
+};
 const EMPTY_DRAFT: ShapeDraftFields = { feature: EMPTY_FEATURE, epicId: "", epic: EMPTY_EPIC };
 
 export interface ShapeDraft {

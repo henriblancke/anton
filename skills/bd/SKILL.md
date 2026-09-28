@@ -166,12 +166,17 @@ guessed tag, so set them together. Without these the executor has no spec.
 **bd checks one of the six, not six.** `bd create --validate` and `bd lint` both look for the
 rubric heading alone. Goal, Context, Out of scope, and Verify are enforced by `/shape`,
 `/scan-triage`, and anton's own contract gate at approve time; `## Why` is enforced by `/shape` and
-`/scan-triage` alone — the contract gate does not yet judge it. Nothing bd says green means the
-contract is complete.
+`/scan-triage` alone, at write time — neither the contract gate (`validateBeadContract`) nor its
+presence/order check (`contractFormGaps`/`contractOrderGaps`, `src/lib/beads/contract.ts`) judges
+it yet, so a ticket missing `## Why`, or carrying it out of sequence, passes every automated check
+silently. Nothing bd says green means the contract is complete.
 
 An epic is read, not executed, so it carries less: a one-line outcome, Success Criteria its
-features add up to, its `area:` label, and `## Outcome` — the `.product/PRODUCT.md` outcome id(s)
-its features add up to serving.
+features add up to, its `area:` label, and `## Outcome IDs` — the `.product/PRODUCT.md` outcome
+id(s) its features add up to serving. Spelled `## Outcome IDs`, not `## Outcome`: the latter is
+already an accepted alias for the epic's own outcome statement (`OUTCOME_KEYS` in
+`src/lib/beads/contract.ts`), and reusing it for the id list would let a filled id list stand in
+for an unwritten Goal.
 
 ## The bead formula — cook the skeleton, don't retype it
 
@@ -250,7 +255,7 @@ cat > /tmp/plan.json <<'EOF'
   "nodes": [
     {"key": "e", "title": "Reports are shareable outside the app", "type": "epic",
      "labels": ["area:reports"],
-     "description": "## Goal\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports\n\n## Outcome\noutcome:reports-are-shareable"},
+     "description": "## Goal\nReports leave the app in a format customers open.\n\n## Success Criteria\n- [ ] every report view exports\n\n## Outcome IDs\noutcome:reports-are-shareable"},
 
     {"key": "f", "title": "CSV export", "type": "feature", "parent_key": "e",
      "labels": ["domain:eng", "risk:low", "size:S", "outcome:reports-are-shareable"],

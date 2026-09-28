@@ -11,10 +11,11 @@
  */
 import { AREA_SHAPE } from "@/lib/epic-patch";
 
-/** The five contract sections a run and its self-review read, plus the feature's title. */
+/** The six contract sections a run and its self-review read, plus the feature's title. */
 export interface FeatureDraftFields {
   title: string;
   goal: string;
+  why: string;
   acceptance: string;
   context: string;
   outOfScope: string;
@@ -27,6 +28,7 @@ export interface EpicDraftFields {
   goal: string;
   successCriteria: string;
   area: string;
+  outcomeIds: string;
 }
 
 /** The picker value that means "create the epic here" rather than naming one on the board. */
@@ -57,9 +59,11 @@ export function draftGaps(draft: ShapeDraftFields): string[] {
     if (!draft.epic.goal.trim()) gaps.push("an epic outcome");
     if (!draft.epic.successCriteria.trim()) gaps.push("epic success criteria");
     if (!draft.epic.area.trim()) gaps.push("an area");
+    if (!draft.epic.outcomeIds.trim()) gaps.push("which outcome(s) the epic serves");
   }
   if (!draft.feature.title.trim()) gaps.push("a title");
   if (!draft.feature.goal.trim()) gaps.push("a goal");
+  if (!draft.feature.why.trim()) gaps.push("why");
   if (!draft.feature.acceptance.trim()) gaps.push("acceptance criteria");
   if (!draft.feature.context.trim()) gaps.push("context");
   if (!draft.feature.outOfScope.trim()) gaps.push("out of scope");
@@ -109,6 +113,7 @@ export function draftBody(draft: ShapeDraftFields) {
     feature: {
       title: draft.feature.title.trim(),
       goal: draft.feature.goal.trim(),
+      why: draft.feature.why.trim(),
       acceptance: draft.feature.acceptance.trim(),
       context: draft.feature.context.trim(),
       outOfScope: draft.feature.outOfScope.trim(),
@@ -122,6 +127,7 @@ export function draftBody(draft: ShapeDraftFields) {
             goal: draft.epic.goal.trim(),
             successCriteria: draft.epic.successCriteria.trim(),
             area: draft.epic.area.trim(),
+            outcomeIds: draft.epic.outcomeIds.trim(),
           },
         } as const)
       : ({ kind: "existing", id: draft.epicId.trim() } as const),

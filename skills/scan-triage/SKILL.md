@@ -264,13 +264,17 @@ A `routed:` line that only restates the parent id ("routed: anton-abcd") is not 
 the file/surface or the absence that decided it. Same line on a cross-link (§2), naming the bead the
 issue was already on and the fingerprint that matched.
 
-Labels: `domain:eng`, `source:stringer`, `risk:<class>`, `agent:<stack match>`, `size:`,
-`outcome:codebase-health`, and a fingerprint (`stringer:<collector>:<hash>`) for future dedup — on
-the feature and on each ticket, so the next scan dedupes against either. `outcome:codebase-health`
-is the default for every triage-produced bead — scanned debt always serves it, built in whether or
-not `.product/PRODUCT.md` lists it (`src/lib/outcomes.ts`). Add a **second** `outcome:<id>` label
-naming a product outcome only when the signal actually blocks one — a vuln in a path that outcome's
-feature depends on, not a stretch to look more strategic. The `<hash>` identifies the **issue**, not
+Labels: `domain:eng`, `source:stringer`, `risk:<class>`, `agent:<stack match>`, `size:`, and a
+fingerprint (`stringer:<collector>:<hash>`) for future dedup — on the feature and on each ticket, so
+the next scan dedupes against either. `outcome:` labels are different: they go on the **run
+target alone** — the feature, or a parentless task/bug when that bead itself is the target
+(§4.3) — never on a ticket parented to one. The `bd` skill's label contract restricts `outcome:` to
+run targets; a child ticket is a working-layer step, not one, and tagging it there contradicts that
+contract. `outcome:codebase-health` is the default outcome for every triage-produced run target —
+scanned debt always serves it, built in whether or not `.product/PRODUCT.md` lists it
+(`src/lib/outcomes.ts`). Add a **second** `outcome:<id>` label naming a product outcome only when
+the signal actually blocks one — a vuln in a path that outcome's feature depends on, not a stretch
+to look more strategic. The `<hash>` identifies the **issue**, not
 the producer: derive it from the file + rule so it is stable across scans and reproducible by
 another producer — a hash keyed on the line number or the scan date defeats §2 for everyone. One
 `area:` on the epic, and nowhere else. Edges: `bd link <ticket> <feature> --type parent-child` and

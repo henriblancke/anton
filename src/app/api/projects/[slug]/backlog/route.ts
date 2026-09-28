@@ -27,6 +27,7 @@ const epicSchema = z.discriminatedUnion("kind", [
         .string()
         .trim()
         .regex(AREA_SHAPE, "expected a label-safe value — letters, digits, . _ -"),
+      outcomeIds: section,
     }),
   }),
 ]);
@@ -49,6 +50,7 @@ const draftSchema = z.object({
   feature: z.object({
     title: z.string().trim().min(1).max(200),
     goal: section,
+    why: section,
     acceptance: section,
     context: section,
     outOfScope: section,
