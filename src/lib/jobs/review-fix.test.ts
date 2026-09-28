@@ -562,7 +562,7 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     );
 
     await dispatch();
-    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer", "base:unknown"]);
 
     const job = await getJob(t.db, await dispatch());
     expect(dispatchedTargets()).toEqual(["e-1"]); // still the one row from the first pass

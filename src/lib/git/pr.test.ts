@@ -190,7 +190,24 @@ describe("classifyReview", () => {
 
   it("check fingerprint falls back to the plain name when no attempt identity is available", () => {
     const v = classifyReview(pr({ failingChecks: ["build", "lint"] }));
-    expect(v.fingerprint).toEqual(["check:build", "check:lint"]);
+    expect(v.fingerprint).toEqual(["check:build", "check:lint", "base:unknown"]);
+  });
+
+  // anton-091jr review round 5 (chatgpt-codex-connector): the review-fix worker unconditionally
+  // premerges the base before running gates, so the base tip must enter the fingerprint for EVERY
+  // actionable reason, not just CONFLICTING — otherwise a mergeable PR with an answered/no-push
+  // round keeps matching a stale answered row even after the base (and thus what gets premerged
+  // and verified) has moved on.
+  it("changes fingerprint when only the base tip advances, reasons and everything else unchanged", () => {
+    const before = classifyReview(
+      pr({ reviewDecision: "CHANGES_REQUESTED", reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "fix" }], baseRefOid: "base1" }),
+    );
+    const after = classifyReview(
+      pr({ reviewDecision: "CHANGES_REQUESTED", reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "fix" }], baseRefOid: "base2" }),
+    );
+    expect(before.reasons).toEqual(after.reasons);
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+    expect(after.fingerprint).toContain("base:base2");
   });
 
   // anton-091jr review round 2 (chatgpt-codex-connector): a dismissed review followed by a

@@ -464,12 +464,6 @@ export function classifyReview(pr: PrReview): Actionable {
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");
-    // Keyed on the base branch's current tip, not a constant string (anton-091jr review round 4,
-    // chatgpt-codex-connector): if the base advances while the PR head stays put and the conflict
-    // persists or reappears, this changes even though the reason text reads identically, so it never
-    // matches a stale answered row taken against the old base. Falls back to the plain reason when a
-    // caller-built fixture omits `baseRefOid`.
-    fingerprint.push(`merge conflicts with base:${pr.baseRefOid ?? "unknown"}`);
   }
   const waiting = threadsNeedingAttention(pr);
   if (waiting.length > 0) {
@@ -480,6 +474,16 @@ export function classifyReview(pr: PrReview): Actionable {
       const last = t.comments[t.comments.length - 1];
       fingerprint.push(`thread:${t.id}:${last?.id ?? "none"}`);
     }
+  }
+  if (reasons.length > 0) {
+    // Keyed on the base branch's current tip for EVERY actionable reason, not just CONFLICTING
+    // (anton-091jr review round 5, chatgpt-codex-connector): the review-fix worker unconditionally
+    // premerges the base before running gates, so a base that advances while the head and the
+    // actionable reasons stay put is still a changed execution input. Without this, a mergeable PR
+    // with an answered/no-push round would keep matching the stale answered row forever even though
+    // the next run would premerge a different base. Falls back to the plain reason when a
+    // caller-built fixture omits `baseRefOid`.
+    fingerprint.push(`base:${pr.baseRefOid ?? "unknown"}`);
   }
   return { actionable: reasons.length > 0, reasons, fingerprint };
 }
