@@ -66,6 +66,15 @@ export interface PrReview {
    * case callers fall back to the project's configured base branch.
    */
   baseRefName?: string;
+  /**
+   * The base branch's current tip commit SHA. Folded into the merge-conflict fingerprint (anton-091jr
+   * review round 4, chatgpt-codex-connector): the conflict reason string is otherwise a constant, so
+   * if the base branch advances while the PR head is unchanged and the conflict persists (or
+   * reappears), a stale answered-fingerprint row at the same head SHA keeps matching and the new
+   * conflict against the new base never re-triggers a fix round. Optional for the same reason as
+   * `baseRefName` — a caller-built fixture may omit it.
+   */
+  baseRefOid?: string;
   /** The PR head's commit SHA — what distinguishes "same doomed input" from new commits (anton-bzm7s). */
   headSha: string;
   url: string;
@@ -93,6 +102,7 @@ interface GhPrView {
   mergeable?: string | null;
   headRefName: string;
   baseRefName?: string;
+  baseRefOid?: string;
   headRefOid?: string;
   url: string;
   reviews?: Array<{
@@ -164,7 +174,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,baseRefName,headRefOid,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,reviews,statusCheckRollup",
     ],
     signal,
   );
@@ -193,6 +203,7 @@ export async function getPrReview(
     mergeable: view.mergeable ?? null,
     headRefName: view.headRefName,
     baseRefName: view.baseRefName,
+    baseRefOid: view.baseRefOid,
     headSha: view.headRefOid ?? "",
     url: view.url,
     reviews,
@@ -453,7 +464,12 @@ export function classifyReview(pr: PrReview): Actionable {
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");
-    fingerprint.push("merge conflicts with the base branch");
+    // Keyed on the base branch's current tip, not a constant string (anton-091jr review round 4,
+    // chatgpt-codex-connector): if the base advances while the PR head stays put and the conflict
+    // persists or reappears, this changes even though the reason text reads identically, so it never
+    // matches a stale answered row taken against the old base. Falls back to the plain reason when a
+    // caller-built fixture omits `baseRefOid`.
+    fingerprint.push(`merge conflicts with base:${pr.baseRefOid ?? "unknown"}`);
   }
   const waiting = threadsNeedingAttention(pr);
   if (waiting.length > 0) {
