@@ -250,6 +250,28 @@ function outcomeIdsMention(outcomeIds: string, outcomeId: string): boolean {
   return outcomeIds.split(/[^A-Za-z0-9._-]+/).includes(outcomeId);
 }
 
+const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\b/i;
+
+/** An existing epic's `## Outcome IDs` body, verbatim, or "" when the section is absent. Free text
+ * (unlike Goal/Acceptance, "Outcome IDs" is not a section `validateBeadContract` judges), so a
+ * plain heading scan rather than the contract's slugged-heading machinery — same shape as
+ * `extractSection` in ticket-dialog-utils.ts. */
+function extractOutcomeIdsSection(description: string): string {
+  const lines = description.split("\n");
+  const body: string[] = [];
+  let inSection = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (/^##\s+/.test(trimmed)) {
+      if (inSection) break;
+      inSection = OUTCOME_IDS_HEADING.test(trimmed);
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
 /**
  * Refuse a draft whose feature outcome id names nothing `.product/PRODUCT.md` currently offers for
  * new work — a typo, or one marked `(retired)` — or, for a NEW epic, whose `## Outcome IDs` never
@@ -336,13 +358,28 @@ async function draftEpicNode(
  * Only the EXISTING-epic path needs this: a NEW epic lands in the same atomic plan as its child, so
  * there is no board state to re-judge. Call it only while holding the epic's write lock — a verdict
  * is worth exactly as long as nothing can move the epic before the child write it authorizes (see
- * {@link createDraftFeature}). */
-async function assertEpicEligible(project: Project, epicId: string): Promise<void> {
+ * {@link createDraftFeature}).
+ *
+ * Also re-checks the outcome the new-epic path already enforces at draft time
+ * ({@link assertOutcomeUsable}): a chosen epic whose `## Outcome IDs` names a set that does NOT
+ * include the feature's own outcome would otherwise land a feature its parent's declared outcomes
+ * don't cover — the epic then undersells what it groups. A MISSING section is not a contradiction —
+ * an epic that predates this convention, or was never asked to state one, has nothing to conflict
+ * with — so only a section that is present and silent on this id is refused; nothing here mutates
+ * that epic to add it, since a silent auto-edit of another bead's contract is a worse surprise than
+ * asking the founder to fix the mismatch (or pick another epic). */
+async function assertEpicEligible(project: Project, epicId: string, outcomeId: string): Promise<void> {
   const all = await loadAllIssues(project.repoPath);
   const bead = all.find((b) => b.id === epicId);
   if (!bead) throw new DraftEpicError(`epic ${epicId} is not on the board`);
   const reason = ineligibleReason(bead, all);
   if (reason) throw new DraftEpicError(reason);
+  const outcomeIds = extractOutcomeIdsSection(bead.description ?? "");
+  if (outcomeIds && !outcomeIdsMention(outcomeIds, outcomeId)) {
+    throw new DraftOutcomeError(
+      `epic ${epicId}'s Outcome IDs don't include "${outcomeId}" — the feature's own outcome must be one of the outcomes its epic serves`,
+    );
+  }
 }
 
 /** Plan-local handles for the epic+feature tree a NEW-epic draft lands in one write. */
@@ -426,7 +463,7 @@ export async function createDraftFeature(
   if (!epicId) throw new DraftEpicError("no epic chosen — a feature must attach to one");
 
   const id = await withBeadWriteLock(project.repoPath, epicId, async () => {
-    await assertEpicEligible(project, epicId);
+    await assertEpicEligible(project, epicId, draft.feature.outcomeId.trim());
     return beads.create(project.repoPath, {
       title,
       type: feature.type,

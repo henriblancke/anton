@@ -183,6 +183,26 @@ describe("save", () => {
     expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(false);
   });
 
+  it("refuses to save a Why the ticket already carried cleared to empty", async () => {
+    stubFetch(detail({ description: "## Goal\n\nShip it\n\n## Why\n\nCustomers keep asking for it" }));
+    const { result } = mount();
+    await waitFor(() => expect(result.current.loaded).not.toBeNull());
+    expect(result.current.loaded!.draft.why).toBe("Customers keep asking for it");
+
+    act(() => result.current.set("why", ""));
+    act(() => result.current.set("goal", "Ship it, better"));
+    await act(async () => {
+      await result.current.save();
+    });
+
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "PATCH")).toBe(false);
+    expect(toast.error).toHaveBeenCalledWith(
+      "Why can't be cleared once a ticket carries it — restore it or leave it as is",
+    );
+    // The edit stays put — this is a refusal, not a silent revert.
+    expect(result.current.loaded!.draft.why).toBe("");
+  });
+
   it("keeps the edits and surfaces the server's error when the save fails", async () => {
     stubFetch(detail(), { patchStatus: 500 });
     const onSaved = vi.fn();

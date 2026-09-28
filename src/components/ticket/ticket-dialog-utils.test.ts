@@ -10,6 +10,7 @@ import {
   resolutionOf,
   runToastMessage,
   stripContractSections,
+  wouldClearWhy,
   type TicketDraft,
 } from "@/components/ticket/ticket-dialog-utils";
 import { parseAcceptance, parseGoal } from "@/lib/tickets";
@@ -224,6 +225,18 @@ describe("contract editing", () => {
     expect(description.indexOf("## Why")).toBeGreaterThan(-1);
     expect(description.indexOf("## Why")).toBeLessThan(description.indexOf("## Acceptance Criteria"));
     expect(description).toContain("## Why\n\nServes the reports outcome");
+  });
+
+  it("flags clearing a Why the ticket already carries, but not editing or never having had one", () => {
+    const withWhy = draftFromDetail({
+      ...contractDetail,
+      description: "## Goal\n\ng\n\n## Why\n\nServes the reports outcome\n\n## Acceptance\n\n- [ ] a",
+    });
+    expect(wouldClearWhy(withWhy, { ...withWhy, why: "" })).toBe(true);
+    expect(wouldClearWhy(withWhy, { ...withWhy, why: "Still serves it, reworded" })).toBe(false);
+    expect(wouldClearWhy(withWhy, { ...withWhy, goal: "New goal" })).toBe(false);
+    // No Why to begin with — an empty draft field is not a regression.
+    expect(wouldClearWhy(original, { ...original, why: "" })).toBe(false);
   });
 
   it("round-trips an edited acceptance so parseAcceptance (section-first) reads the new text", () => {

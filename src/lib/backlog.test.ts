@@ -489,6 +489,54 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  // The prior fix only checked a NEW epic's Outcome IDs; an EXISTING epic that already declares a
+  // different set is the same drift the review flagged as still open.
+  it("refuses an existing epic whose Outcome IDs contradict the feature's own outcome", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description: "## Goal\n\ng\n\n## Outcome IDs\n\noutcome:something-else",
+      }),
+    );
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(project(), {
+      feature: FEATURE,
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(rejection?.message).toContain("p-1");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("accepts an existing epic whose Outcome IDs already include the feature's own outcome", async () => {
+    boardIs(
+      bead({
+        id: "p-1",
+        issue_type: "epic",
+        description: "## Goal\n\ng\n\n## Outcome IDs\n\noutcome:reports-are-shareable",
+      }),
+    );
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
+  it("accepts an existing epic with no Outcome IDs section at all — nothing to contradict", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic", description: "## Goal\n\nno outcome ids yet" }));
+    vi.spyOn(beads, "create").mockResolvedValue("p-9");
+
+    await expect(
+      createDraftFeature(project(), { feature: FEATURE, epic: { kind: "existing", id: "p-1" } }),
+    ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
+  });
+
   // The epic's Outcome IDs are the outcomes its features add up to serving — a new epic that omits
   // its own feature's outcome is exactly the drift the review flagged.
   it("refuses a new epic whose Outcome IDs never mention the feature's own outcome", async () => {

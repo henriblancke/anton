@@ -252,6 +252,18 @@ export function hasTicketChanges(original: TicketDraft, draft: TicketDraft): boo
 }
 
 /**
+ * Whether saving `draft` would silently drop a `## Why` the ticket already carries. Unlike
+ * Goal/Acceptance, the contract gate deliberately never validates Why (skills/bd/SKILL.md) — nothing
+ * else stops `composeDescription` from omitting an emptied Why and the PATCH landing a ticket that
+ * looks written but has lost its motivation, and can still pass every later approval check. The
+ * dialog refuses the save outright rather than silently keeping the old value or dropping the
+ * section, so clearing Why is always a deliberate, visible choice.
+ */
+export function wouldClearWhy(original: TicketDraft, draft: TicketDraft): boolean {
+  return original.why.trim() !== "" && draft.why.trim() === "";
+}
+
+/**
  * Only a parentless task/bug is a run target of its own (mirrors `beads.isRunTarget`, which the
  * approve/claim routes gate on): a child ticket runs via its epic's PR, and a parentless
  * `learning`/`chore`/etc. is never runnable, so its controls would only ever 422.

@@ -86,6 +86,17 @@ describe("parseOutcomes", () => {
     ]);
   });
 
+  it("skips an id that can't survive as an outcome:<id> label", () => {
+    const markdown = [
+      "## Outcomes",
+      "- `release readiness` — a space can't appear in a label suffix.",
+      "- `-leading-dash` — a leading dash isn't label-safe either.",
+      "- `valid-id` — This one is label-safe.",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "valid-id"]);
+  });
+
   it("lets a later bullet override the built-in codebase-health entry", () => {
     const markdown = ["## Outcomes", "- `codebase-health` — Custom summary for this project."].join("\n");
 

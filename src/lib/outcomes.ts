@@ -6,6 +6,8 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { AREA_SHAPE } from "./epic-patch";
+
 export interface ProjectOutcome {
   /** Stable id, referenced elsewhere by an `outcome:<id>` label. */
   id: string;
@@ -50,6 +52,10 @@ function parseBullet(line: string): ProjectOutcome | undefined {
   const retired = RETIRED_MARKER.test(summary);
   if (retired) summary = summary.replace(RETIRED_MARKER, "").trim();
   if (!id || !summary) return undefined;
+  // An id that can't survive as an `outcome:<id>` label (a leading `-`, a space, ...) would be
+  // offered here yet rejected by the Add-work schema (AREA_SHAPE) the moment it's chosen — treat
+  // it the same as any other malformed bullet, and skip it, rather than advertise a dead end.
+  if (!AREA_SHAPE.test(id)) return undefined;
   return { id, summary, retired };
 }
 
