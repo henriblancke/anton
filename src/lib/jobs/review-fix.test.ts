@@ -693,10 +693,19 @@ process.exit(0);
     expect(reply).toBeDefined();
   });
 
-  it("a reply failure is not counted as delivered, even though the run stays green", async () => {
+  it("a reply failure on a fixed thread still counts as delivered when the resolve went through — a resolved thread never resurfaces for a later round to retry", async () => {
     process.env.ANTON_TEST_FAIL_REPLIES = "1";
 
     const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    await expect(run([item], [thread()], true)).resolves.toEqual([item]);
+
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
+
+  it("a reply failure on a non-fixed thread (no resolve to fall back on) is not counted as delivered", async () => {
+    process.env.ANTON_TEST_FAIL_REPLIES = "1";
+
+    const item = { id: "RT_1", outcome: "left" as const, reply: "style-only, skipped" };
     await expect(run([item], [thread()], true)).resolves.toEqual([]);
   });
 });

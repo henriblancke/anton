@@ -1084,10 +1084,12 @@ interface ThreadReplyArgs {
  * for the reply. A "fixed" claim without a push is a fabrication — leave that thread untouched,
  * reply and reaction both.
  *
- * Returns only the outcomes whose reply actually reached the PR — the reply is the one side effect
- * that makes a thread stop being actionable, so a GitHub failure there (rate limit, outage) must
+ * Returns only the outcomes that actually reached the PR in a way that stops the thread being
+ * re-triaged: a posted reply, or — for a "fixed" outcome — a resolve that went through on its own
+ * (a resolved thread is gone from `threadsNeedingAttention` regardless of whether the reply landed,
+ * so its delivery must be counted here or nowhere; PR #335 review). A GitHub failure on both must
  * not report as delivered: the thread is still waiting on anton and would otherwise be counted as
- * answered nowhere anyone can see it (PR #335 review). Callers that persist "what this round did"
+ * answered nowhere anyone can see it. Callers that persist "what this round did"
  * (`recordReviewRound`, `refreshFixRoundsBody`) must use this return value, not the raw report.
  */
 export async function applyThreadOutcomes(args: {
@@ -1107,7 +1109,11 @@ export async function applyThreadOutcomes(args: {
 }
 
 /** Reply on the thread, resolve it when the fix landed, and log what was said. Returns whether
- * the reply itself posted — the reaction and resolve are best-effort extras on top of it. */
+ * the outcome reached GitHub in a way that makes the thread stop being actionable: either the
+ * reply posted, or — for a "fixed" outcome — the resolve went through even though the reply
+ * itself failed (a resolved thread never resurfaces for a later round to retry, so its delivery
+ * would otherwise be lost from every round/PR-body count for good). The reaction stays best-effort
+ * on top of both. */
 async function recordThreadOutcome(
   args: ThreadReplyArgs,
   thread: ReviewThread,
@@ -1120,13 +1126,13 @@ async function recordThreadOutcome(
     replyToReviewComment(repo, number, anchorId, `${ANTON_MARK} ${note}`, signal),
   );
   await safe(() => reactToReviewComment(repo, anchorId, reactionForOutcome(item.outcome), signal));
-  if (item.outcome === "fixed")
-    await safe(() => resolveReviewThread(repo, thread.id, signal));
+  const resolved =
+    item.outcome === "fixed" && (await safe(() => resolveReviewThread(repo, thread.id, signal)));
   await appendSessionLog(
     logPath,
     `[review-fix] thread ${thread.id}: ${item.outcome} — ${note}\n`,
   );
-  return replied;
+  return replied || resolved;
 }
 
 /**
