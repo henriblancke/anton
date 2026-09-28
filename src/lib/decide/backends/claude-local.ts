@@ -176,19 +176,29 @@ function readNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-/** Every option's probability, or `undefined` if the report is missing one — a partial distribution
- * is exactly as untrustworthy as none, since decide() has no way to fill the gap itself. */
+/** How far a distribution's total may drift from 1 and still be trusted — wide enough for a model's
+ * own rounding, narrow enough to reject something like `{fix: 0.8, decline: 0.8, human: 0.8}`, which
+ * is not a probability distribution at all. */
+const DISTRIBUTION_SUM_TOLERANCE = 0.05;
+
+/** Every option's probability, or `undefined` if the report is missing one, any value falls outside
+ * `[0, 1]`, or the total drifts too far from 1 — a malformed distribution is exactly as untrustworthy
+ * as a missing one, since decide() has no way to repair it and would otherwise read a stray high value
+ * as real confidence. */
 function readDistribution(
   raw: unknown,
   options: readonly string[],
 ): Record<string, number> | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
   const distribution: Record<string, number> = {};
+  let sum = 0;
   for (const option of options) {
     const probability = readNumber((raw as Record<string, unknown>)[option]);
-    if (probability === undefined) return undefined;
+    if (probability === undefined || probability < 0 || probability > 1) return undefined;
     distribution[option] = probability;
+    sum += probability;
   }
+  if (Math.abs(sum - 1) > DISTRIBUTION_SUM_TOLERANCE) return undefined;
   return distribution;
 }
 

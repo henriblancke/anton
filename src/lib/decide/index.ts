@@ -109,6 +109,12 @@ export async function decide(input: DecideInput): Promise<DecideResult> {
 
   const rule = fireHardRule(point, state);
   if (rule) {
+    // `HardRuleOutcome.value` is only the broad `AnswerValue` union, so a rule that answers outside
+    // its own point's question (an unknown choice, an out-of-range score) is a type error TypeScript
+    // cannot catch — the same boundary a model answer crosses below, applied before a rule is trusted.
+    if (!isValidAnswer(point.question, rule.value)) {
+      return fallback(point, mode, "invalid hard-rule answer");
+    }
     return {
       point: point.id,
       mode,

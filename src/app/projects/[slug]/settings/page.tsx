@@ -122,7 +122,7 @@ export default async function ProjectSettingsPage({
   // called.
   const decisionPoints: DecisionPointRow[] = await Promise.all(
     listPoints().map(async (point) => {
-      const { agreed, settled } = await latestAgreement(point.id).catch(() => ({
+      const { agreed, settled } = await latestAgreement(point.id, project.id).catch(() => ({
         point: point.id,
         settled: 0,
         agreed: 0,

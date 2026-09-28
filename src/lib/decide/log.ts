@@ -231,11 +231,16 @@ const isJudgmentEvidence = and(
  * Compared as encoded JSON, which is what makes the comparison honest across question shapes: a
  * `score` point answering `1` and an operator answering `"1"` disagree, and a string equality over
  * raw text would call them the same.
+ *
+ * Scoped to `projectId` when given, since the same point runs across every project: without it, one
+ * project's successes or failures bleed into another's figure and can encourage a promotion to `auto`
+ * that this project's own history never earned.
  */
 export async function agreement(
   db: AntonDb,
   point: string,
   window: number = DECISION_AGREEMENT_WINDOW,
+  projectId?: string,
 ): Promise<DecisionAgreement> {
   const rows = await db
     .select({
@@ -243,7 +248,13 @@ export async function agreement(
       operatorAnswer: schema.decisions.operatorAnswer,
     })
     .from(schema.decisions)
-    .where(and(eq(schema.decisions.point, point), isJudgmentEvidence))
+    .where(
+      and(
+        eq(schema.decisions.point, point),
+        isJudgmentEvidence,
+        projectId === undefined ? undefined : eq(schema.decisions.projectId, projectId),
+      ),
+    )
     // The id breaks a `settledAt` tie, as `pickerTrackRecord` does for its own second-resolution
     // column: two decisions settled in the same second would otherwise leave the window's
     // composition — and the counts read off it — up to SQLite's row order.
@@ -329,9 +340,10 @@ export async function listDecisions(
   return rows.map(toDecisionView);
 }
 
-/** UI read path over the shared anton.db — the figure a Settings row shows per point. */
-export function latestAgreement(point: string): Promise<DecisionAgreement> {
-  return agreement(getDb(), point);
+/** UI read path over the shared anton.db — the figure a Settings row shows per point, scoped to the
+ * project asking so it never shows another project's successes or failures. */
+export function latestAgreement(point: string, projectId?: string): Promise<DecisionAgreement> {
+  return agreement(getDb(), point, DECISION_AGREEMENT_WINDOW, projectId);
 }
 
 /** UI read path over the shared anton.db. */
