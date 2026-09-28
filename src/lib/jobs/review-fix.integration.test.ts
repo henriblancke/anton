@@ -173,9 +173,11 @@ if(a[0]==='pr'&&a[1]==='view'){
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
 if(a[0]==='api'&&a[1]==='graphql'){
   if(q.includes('resolveReviewThread')){log('resolve');console.log('{}');process.exit(0);}
-  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{
+    pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[
     {id:'RT_1',isResolved:false,isOutdated:false,path:'feature.txt',line:1,
-     comments:{nodes:[{databaseId:100,author:{login:'alice'},body:'rename foo to bar here too'}]}}
+     comments:{totalCount:1,nodes:[{databaseId:100,author:{login:'alice'},body:'rename foo to bar here too'}]}}
   ]}}}}}));
   process.exit(0);
 }
