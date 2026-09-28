@@ -327,6 +327,7 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       baseBranch: "main",
       number: 7,
       claimOwner: "review-fix:job-test",
+      expectedHeadSha: "",
     });
 
   it("a review-fix gate failing on a module the lockfile declares", async () => {

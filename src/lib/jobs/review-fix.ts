@@ -508,15 +508,6 @@ async function handleEpic(args: {
   const verdict = classifyReview(pr);
   if (!verdict.actionable) return "clean"; // nothing to fix on this PR yet.
 
-  // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
-  // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
-  // chatgpt-codex-connector). Best-effort: a write hiccup here must not fail a legitimate attempt.
-  try {
-    recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
-  } catch (e) {
-    consoleLog.error("recordReviewFixAttempt failed before PR fix", e);
-  }
-
   // Claim the checkout for the whole fix. review-fix writes no run row, so without it the branch
   // reads as nobody's: the execute run's teardown (its bead is still open, so it releases the
   // worktree) would force-remove the directory claude is fixing in, discarding the fix and failing
@@ -525,15 +516,40 @@ async function handleEpic(args: {
   return withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts, alreadyAhead, preSessionHead } = await prepareFixWorktree({
-      ctx,
-      repo,
-      branch,
-      settings,
-      baseBranch: prBaseBranch,
-      number,
-      claimOwner,
-    });
+    const { worktree, conflicts, alreadyAhead, preSessionHead, headSynced } =
+      await prepareFixWorktree({
+        ctx,
+        repo,
+        branch,
+        settings,
+        baseBranch: prBaseBranch,
+        number,
+        claimOwner,
+        expectedHeadSha: pr.headSha,
+      });
+
+    // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
+    // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
+    // chatgpt-codex-connector). Gated on `headSynced` (PR #338 review, chatgpt-codex-connector,
+    // round 2): `fetchOrigin` above is best-effort, and when it fails the worktree stays on
+    // whatever `origin/${branch}` last resolved to locally — NOT the `pr.headSha` this fingerprint
+    // names. Persisting `pr.headSha`/`verdict.fingerprint` anyway would tell `parkedAtHead` a
+    // revision was tested when the session actually ran (and the gate failed) against stale code;
+    // the next sweep sees the same unchanged GitHub head/fingerprint and suppresses every retry
+    // forever, even though that revision was never fetched, let alone tested. Skipping the write
+    // here just leaves the job's payload at its enqueue-time snapshot — worst case a redundant
+    // retry, never an indefinite false-suppression.
+    if (headSynced) {
+      try {
+        recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
+      } catch (e) {
+        consoleLog.error("recordReviewFixAttempt failed before PR fix", e);
+      }
+    } else {
+      consoleLog.info(
+        `PR #${number}: origin sync did not reach reported head ${pr.headSha} — not recording attempt fingerprint to avoid parking a suppression at an untested revision`,
+      );
+    }
 
     const { pushed, answeredAllThreads } = await runFixSession({
       db,
@@ -611,6 +627,14 @@ export async function prepareFixWorktree(args: {
   number: number;
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
+  /**
+   * `pr.headSha` the caller classified its fix attempt against — compared against what the sync
+   * below actually lands on, so a best-effort `fetchOrigin` failure can be told apart from a real
+   * sync (see `headSynced` below). Empty when the caller has no head to verify against (e.g. a
+   * synthetic `PrReview` in tests) — `headSynced` is unconditionally true in that case, since there
+   * is nothing to compare.
+   */
+  expectedHeadSha: string;
 }): Promise<{
   worktree: Worktree;
   conflicts: string[];
@@ -627,8 +651,18 @@ export async function prepareFixWorktree(args: {
    * `fabricatedFix` then can't tell apart from a genuine fix).
    */
   preSessionHead: string;
+  /**
+   * Did the fetch + fast-forward sync above actually land the worktree on `expectedHeadSha`? Both
+   * git steps are best-effort (a repo with no reachable origin still gets the review-comment flow)
+   * — when `fetchOrigin` fails silently, the fast-forward merge just resolves `origin/${branch}` to
+   * whatever it last was locally, which can be stale. `false` here tells the caller the session
+   * below (if any) ran, and any gate it hit failed, against code that was NOT what GitHub reports
+   * as the PR's current head — so persisting an attempt fingerprint keyed on `expectedHeadSha` would
+   * misrepresent that revision as tested (PR #338 review, chatgpt-codex-connector, round 2).
+   */
+  headSynced: boolean;
 }> {
-  const { ctx, repo, branch, settings, baseBranch, number, claimOwner } = args;
+  const { ctx, repo, branch, settings, baseBranch, number, claimOwner, expectedHeadSha } = args;
 
   const worktree = await createWorktree({
     repoPath: repo,
@@ -677,6 +711,17 @@ export async function prepareFixWorktree(args: {
     mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
+  // Read RIGHT after the sync above, before the premerge can land its own commit and move HEAD
+  // again — this is the one point where the worktree's actual position can be checked against what
+  // `fetchOrigin`/the ff-only merge were SUPPOSED to reach. `expectedHeadSha === ""` (no head to
+  // verify against, e.g. a synthetic `PrReview` in tests) trusts the sync unconditionally, matching
+  // this function's pre-existing behavior before this check existed.
+  const syncedHead = await readWorktreeState(worktree.path).then(
+    (s) => s.head,
+    () => "",
+  );
+  const headSynced = expectedHeadSha === "" || syncedHead === expectedHeadSha;
+
   // Snapshot "ahead of origin" right after the fast-forward sync above and BEFORE the premerge
   // below — the premerge's own auto-merge commit (see its "clean auto-merge" comment) would
   // otherwise put the branch ahead for a reason that has nothing to do with a prior session's or
@@ -719,7 +764,7 @@ export async function prepareFixWorktree(args: {
     (s) => s.head,
     () => "",
   );
-  return { worktree, conflicts, alreadyAhead, preSessionHead };
+  return { worktree, conflicts, alreadyAhead, preSessionHead, headSynced };
 }
 
 /**
