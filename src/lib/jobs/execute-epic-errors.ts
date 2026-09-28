@@ -136,11 +136,24 @@ export interface RecoverableWork {
    * `git stash apply <sha>` by hand.
    */
   readonly restoreFailures: readonly string[];
+  /**
+   * Whether the stash list itself could not be read (anton-wjfkn, PR #333 review round 3) — `stashes`
+   * is `[]` because nothing could be confirmed, not because a read said so. A reader (the block note,
+   * the run row) must not tell an operator the tree — or the stash stack — is the only place to look
+   * when this is true; it doesn't know that. Optional/absent reads the same as `false`: every reader
+   * that predates this field already treated an empty `stashes` as a confirmed empty stack, which is
+   * still the honest answer for {@link StashedWorkError} (only ever built from a non-empty read).
+   */
+  readonly readFailed?: boolean;
 }
 
 /** Whether this stop left uncommitted work behind — the one question the worktree teardown asks. */
 export function holdsRecoverableWork(e: unknown): boolean {
-  return e instanceof StashedWorkError || e instanceof AgentYieldedError;
+  return (
+    e instanceof StashedWorkError ||
+    e instanceof AgentYieldedError ||
+    e instanceof StashBaselineUnreadableError
+  );
 }
 
 /**
@@ -243,6 +256,48 @@ export class AgentYieldedError extends Error implements RunFailureParts, Recover
     this.name = "PoisonError"; // classified as poison by the runner
     this.structural = structural;
     this.selfReport = selfReport;
+  }
+
+  /** {@link RecoverableWork.readFailed}, read off this class's own `stashReadFailed` field — the
+   * name callers that construct this error already use. */
+  get readFailed(): boolean {
+    return this.stashReadFailed;
+  }
+}
+
+/**
+ * anton could not even READ this ticket's stash BASELINE before any of its steps ran (anton-wjfkn, PR
+ * #333 review round 2) — so whether the checkout already held uncommitted work when this attempt
+ * started (loose in the tree, or already on the stash stack from a neighbour's push or an earlier
+ * stop) is simply unknown.
+ *
+ * A plain rethrow of that read failure would settle this ticket as an ORDINARY setup error —
+ * indistinguishable at the teardown from any other reason a ticket failed, and an ordinary failure's
+ * worktree is force-removed as the run's residue. That is wrong precisely when it matters most: a
+ * RESUME of a checkout a human gate or an earlier yield already left dirty, where this read failure is
+ * transient and the tree it interrupted was never anton's to discard on a guess. So this is its own
+ * class, {@link RecoverableWork}-shaped like {@link StashedWorkError} and {@link AgentYieldedError},
+ * purely so {@link holdsRecoverableWork} recognises the stop and the teardown keeps the checkout
+ * instead of assuming it was safe to remove. `stashes`/`restoreFailures` are always empty — there was
+ * nothing to name, only something that could not be ruled out — and `readFailed` is always true.
+ */
+export class StashBaselineUnreadableError extends Error implements RunFailureParts, RecoverableWork {
+  readonly structural: string;
+  readonly selfReport: AntonResult | null = null;
+  readonly stashes: readonly string[] = [];
+  readonly restoreFailures: readonly string[] = [];
+  readonly readFailed = true;
+  constructor(ticketId: string, cause: unknown) {
+    const reason = cause instanceof Error ? cause.message : String(cause);
+    const structural =
+      `${ticketId} could not read this worktree's stash list before its steps ran (${reason}). ` +
+      `Whether the checkout already held uncommitted work when this attempt started — loose in the ` +
+      `tree, or already on the stash stack from an earlier stop — is unknown, so the run halts here ` +
+      `rather than guess: the worktree is KEPT rather than removed. Retry once the read succeeds, ` +
+      `then resume the run.`;
+    super(structural);
+    this.name = "PoisonError"; // classified as poison by the runner
+    this.structural = structural;
   }
 }
 

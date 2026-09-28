@@ -21,6 +21,7 @@ import {
   NeedsHumanError,
   NoDeliveryError,
   selfReportSuffix,
+  StashBaselineUnreadableError,
   StashedWorkError,
 } from "./execute-epic-errors";
 import {
@@ -99,13 +100,24 @@ export async function runTicket(args: {
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
 
   try {
-    // Read INSIDE the try, deliberately not wrapped in its own catch (anton-wjfkn): a stash baseline
-    // anton could not read is not "no stashes", and treating it as one would let a PRE-EXISTING entry
-    // (a neighbour's, or an earlier failed attempt's own) get misread as gained during this ticket and
-    // spliced into this worktree by `refuseStashedDelivery`. Letting the read failure fall straight
-    // into this catch stops the ticket the same safe way any other setup failure does, with the
-    // baseline left unknown rather than guessed at.
-    const stash = ticketStashRecovery(worktreePath, run.branch, await readStashEntries(worktreePath));
+    // Read INSIDE the try, deliberately not wrapped in a catch that discards the failure (anton-wjfkn):
+    // a stash baseline anton could not read is not "no stashes", and treating it as one would let a
+    // PRE-EXISTING entry (a neighbour's, or an earlier failed attempt's own) get misread as gained
+    // during this ticket and spliced into this worktree by `refuseStashedDelivery`. A read failure is
+    // instead wrapped as its own conservative stop (PR #333 review round 2): a bare rethrow would
+    // settle this ticket as an ORDINARY failure, and an ordinary failure's worktree is force-removed at
+    // teardown — indistinguishable from any other setup error, even when this same checkout is a RESUME
+    // already holding uncommitted work from an earlier stop (a human-gate park, an earlier yield) this
+    // ticket never touched. `StashBaselineUnreadableError` reads the same conservative way the teardown
+    // already reads a `StashedWorkError`/`AgentYieldedError`: keep the checkout, halt the run, let a
+    // human look rather than guess whether this tree was safe to discard.
+    let stashBaseline: readonly StashEntry[];
+    try {
+      stashBaseline = await readStashEntries(worktreePath);
+    } catch (baselineError) {
+      throw new StashBaselineUnreadableError(ticket.id, baselineError);
+    }
+    const stash = ticketStashRecovery(worktreePath, run.branch, stashBaseline);
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress, stash });
     const settlement = await ticketSettlement(run, progress);
     // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
@@ -410,7 +422,16 @@ function ticketStashRecovery(
  * the agent STASHED its own work. `git stash` produces a tree byte-identical to one nothing touched,
  * so before this gate may call an empty tree a zero diff it asks {@link StashRecovery} whether the
  * worktree gained an entry since the ticket's baseline — and refuses the delivery block if it did.
- * See {@link refuseStashedDelivery} for what it does instead.
+ *
+ * The same ask stands ahead of EVERY success path, not only the zero-diff one (anton-wjfkn, PR #333
+ * review round 2): a PARTIAL stash is exactly as real as a whole one. An agent can commit most of its
+ * diff and stash the rest — deliberately or by mistake — which leaves `committed` true, or leave a
+ * genuinely stale step's zero diff beside an unrelated stash it never meant to ship. Either way, a
+ * gained entry means some of this ticket's change is sitting on the stack, unaccounted for by whatever
+ * the tree or the branch says — so `stash.gained()` is read up front, before `committed` is even
+ * branched on, and both success paths below (a verified `satisfied` claim, and an ordinary commit)
+ * are refused exactly as the zero-diff one always was. See {@link refuseStashedDelivery} for what it
+ * does instead.
  */
 export async function assertDelivered(
   ticket: Bead,
@@ -428,6 +449,15 @@ export async function assertDelivered(
   progress.committed = committed;
   progress.delivered = false;
   const { selfReport } = progress;
+  // Asked before either success path below may return (anton-wjfkn, PR #333 review round 2) — see the
+  // doc comment above for why a committed or verified-satisfied tree is not exempt. Deliberately NOT
+  // caught into `[]` (PR #333 review): a `git stash list` failure here is not "no new stash", and
+  // swallowing it would let a committed-but-incomplete ticket close as delivered. Let it fall into the
+  // ticket's own catch, exactly like the baseline read does.
+  const stashed = await stash.gained();
+  if (stashed.length > 0) {
+    await refuseStashedDelivery(ticket, progress, stashed, stash, committed);
+  }
   if (!committed) {
     // A satisfied step settles on the branch's answer, never on the claim (anton-nuft). The read is
     // skipped when the claim names nothing: parsing already rejects such a line, but the type does
@@ -440,17 +470,8 @@ export async function assertDelivered(
       progress.delivered = true;
       return;
     }
-    // Before the tree may be called EMPTY, ask whether it is merely SET ASIDE (anton-wjfkn). Asked
-    // only here, on the one path that would otherwise report "nothing landed" over work that exists.
-    // Deliberately NOT caught into `[]` (PR #333 review): the same reasoning as the baseline read
-    // above applies to this later one — a `git stash list` failure here is not "no new stash", and
-    // swallowing it would report a stashed change as ordinary no-delivery. Let it fall into the
-    // ticket's own catch, exactly like the baseline read does.
-    const stashed = await stash.gained();
-    if (stashed.length > 0) {
-      await refuseStashedDelivery(ticket, progress, stashed, stash);
-    }
-    // Empty tree: the delivery-evidence gate blocks + halts. Cross-check the self-report and
+    // Empty tree, and confirmed nothing was merely set aside (the stash check above already refused
+    // that reading): the delivery-evidence gate blocks + halts. Cross-check the self-report and
     // fold it into the reason (anton-j5i8): a `delivered` claim on an empty tree is the exact
     // false success the gate exists to catch; a `blocked` self-report corroborates the block and
     // carries the agent's own reason forward; a `satisfied` claim that the branch did not bear out
@@ -533,23 +554,38 @@ export async function assertDelivered(
  * The apply is best-effort and its failure is reported rather than repaired: `applyStashEntry` leaves
  * every entry on the stack either way, so the only thing a failed apply costs is the convenience of
  * finding the work already in the tree. Nothing is ever dropped — see {@link applyStashEntry}.
+ *
+ * `committed` tells the two shapes this refusal covers apart (anton-wjfkn, PR #333 review round 2):
+ * the tree the commit step saw was either wholly empty, or it carries part of the change while the
+ * rest sits on the stack. Both are refused the same way — blocked, worktree kept, nothing closed as
+ * delivered — but the message must not claim "nothing was committed" over a commit that is right
+ * there on the branch.
  */
 async function refuseStashedDelivery(
   ticket: Bead,
   progress: TicketProgress,
   stashed: readonly StashEntry[],
   stash: StashRecovery,
+  committed: boolean,
 ): Promise<never> {
   const shas = stashed.map((e) => e.sha);
   const list = shas.map((sha) => `\`${sha}\``).join(", ");
   const recovery = await recoverStashed(stashed, stash);
+  const whatHappened = committed
+    ? `${ticket.id} committed only PART of its work: the worktree also gained ${shas.length} stash ` +
+      `${shas.length === 1 ? "entry" : "entries"} (${list}) while this ticket ran, so some of the ` +
+      `change is on the branch and the rest was set aside rather than committed`
+    : `${ticket.id} delivered nothing because its work is STASHED, not absent: the worktree gained ` +
+      `${shas.length} stash ${shas.length === 1 ? "entry" : "entries"} (${list}) while this ticket ran, ` +
+      `so the empty tree the commit step saw is work the agent set aside rather than work it never did`;
+  const verdictClause = committed
+    ? `the commit alone is not the whole change, so closing the ticket as delivered would ship it ` +
+      `PARTIAL`
+    : `nothing was verified or committed, so this is no delivery`;
   const structural =
-    `${ticket.id} delivered nothing because its work is STASHED, not absent: the worktree gained ` +
-    `${shas.length} stash ${shas.length === 1 ? "entry" : "entries"} (${list}) while this ticket ran, ` +
-    `so the empty tree the commit step saw is work the agent set aside rather than work it never did. ` +
-    `${recovery.summary}. Blocking the ticket and halting the epic — nothing was ` +
-    `verified or committed, so this is no delivery — but the worktree is KEPT rather than removed, ` +
-    `because that stash is the only record of the change. Read it with ` +
+    `${whatHappened}. ${recovery.summary}. Blocking the ticket and halting the epic — ${verdictClause} ` +
+    `— but the worktree is KEPT rather than removed, because that stash ` +
+    `${committed ? "may hold the rest of it" : "is the only record of the change"}. Read it with ` +
     `\`git stash show -p <sha>\` and restore it with \`git stash apply <sha>\`, then finish the ` +
     `ticket by hand or resume the run. Agents must never stash their own work: the harness reads the ` +
     `worktree as the delivery.`;

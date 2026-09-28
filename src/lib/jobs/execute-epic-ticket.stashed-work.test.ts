@@ -18,7 +18,12 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
-import { AgentYieldedError, holdsRecoverableWork, StashedWorkError } from "./execute-epic-errors";
+import {
+  AgentYieldedError,
+  holdsRecoverableWork,
+  StashBaselineUnreadableError,
+  StashedWorkError,
+} from "./execute-epic-errors";
 import {
   assertDelivered,
   recordStepReport,
@@ -191,11 +196,10 @@ describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero 
   });
 
   /**
-   * The stash read is asked ONLY where it changes the answer. A committed tree is a delivery whatever
-   * is on the stack — an agent may legitimately have stashed and unstashed mid-work — and asking there
-   * would trade one false success for another.
+   * The stash is checked even on a committed tree (anton-wjfkn, PR #333 review round 2): a commit that
+   * closes cleanly with nothing gained on the stack is exactly as ordinary a delivery as it always was.
    */
-  it("asks nothing of the stash when the ticket committed", async () => {
+  it("asks the stash even when the ticket committed, and delivers when it gained nothing", async () => {
     const asked = { gained: false };
     const stash: StashRecovery = {
       gained: async () => {
@@ -208,7 +212,43 @@ describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero 
     await expect(
       assertDelivered(TICKET, { committed: true }, progress(), neverAsked, stash),
     ).resolves.toBeUndefined();
-    expect(asked.gained).toBe(false);
+    expect(asked.gained).toBe(true);
+  });
+
+  /**
+   * The gap this closes (anton-wjfkn, PR #333 review round 2): an agent that commits most of its diff
+   * and stashes the rest — deliberately or by mistake — used to sail through here, because the stash
+   * check only ever ran on the zero-diff path. `committed: true` must not exempt a ticket from it: the
+   * commit alone is not proof the whole change is on the branch.
+   */
+  it("refuses delivery when the ticket committed only part of its work and the rest is stashed", async () => {
+    const { stash } = stashing([SHA_A]);
+    const p = progress();
+
+    const err = await failure(assertDelivered(TICKET, { committed: true }, p, neverAsked, stash));
+
+    expect(err).toBeInstanceOf(StashedWorkError);
+    expect((err as StashedWorkError).stashes).toEqual([SHA_A]);
+    expect(err?.message).toContain("committed only PART");
+    expect(err?.message).toContain(SHA_A);
+    expect(err?.message).toContain("worktree is KEPT");
+    // The tree fact stays true — a commit really did land — even though the ticket is refused.
+    expect(p).toMatchObject({ committed: true, delivered: false });
+  });
+
+  /**
+   * The same check runs AHEAD of the `satisfied` branch entirely (anton-wjfkn, PR #333 review round
+   * 2) — the branch is never even asked. A verified commit proves that ticket's earlier work landed,
+   * not that this session left nothing else behind.
+   */
+  it("refuses delivery over a gained stash before a satisfied claim is ever verified", async () => {
+    const { stash } = stashing([SHA_A]);
+    const p = progress({ outcome: "satisfied", commit: "deadbeef" });
+
+    const err = await failure(assertDelivered(TICKET, { committed: false }, p, neverAsked, stash));
+
+    expect(err).toBeInstanceOf(StashedWorkError);
+    expect(p).toMatchObject({ committed: false, delivered: false });
   });
 
   it("leaves the plain zero-diff block exactly as it was when the stack gained nothing", async () => {
@@ -330,6 +370,9 @@ describe("a yielded turn is its own outcome, not a clean exit (anton-wjfkn)", ()
     expect(err.message).not.toContain("loose in the run's worktree");
     expect(err.stashes).toEqual([]);
     expect(err.stashReadFailed).toBe(true);
+    // `RecoverableWork.readFailed` is an alias of the class's own `stashReadFailed` field, so a
+    // reader that only has the interface (a `blockFailedTicket` cast) still sees it.
+    expect(err.readFailed).toBe(true);
     expect(holdsRecoverableWork(err)).toBe(true);
   });
 
@@ -347,15 +390,43 @@ describe("a yielded turn is its own outcome, not a clean exit (anton-wjfkn)", ()
   });
 
   /**
-   * The one question the worktree teardown asks. Both classes hold uncommitted work, so a
-   * `--force` release over either is how a recoverable stop becomes lost work — and neither
-   * ordinary block nor a plain failure may be kept, or every failed run leaks a checkout.
+   * The one question the worktree teardown asks. All three classes hold uncommitted (or possibly
+   * uncommitted) work, so a `--force` release over any of them is how a recoverable stop becomes lost
+   * work — and neither ordinary block nor a plain failure may be kept, or every failed run leaks a
+   * checkout.
    */
-  it("marks both classes as holding recoverable work, and nothing else", () => {
+  it("marks all three recoverable-work classes, and nothing else", () => {
     expect(holdsRecoverableWork(new StashedWorkError("stashed", [SHA_A]))).toBe(true);
     expect(holdsRecoverableWork(new AgentYieldedError(TICKET.id, ["Monitor"]))).toBe(true);
+    expect(holdsRecoverableWork(new StashBaselineUnreadableError(TICKET.id, new Error("boom")))).toBe(
+      true,
+    );
     expect(holdsRecoverableWork(new Error("an ordinary failure"))).toBe(false);
     expect(holdsRecoverableWork(undefined)).toBe(false);
+  });
+});
+
+/**
+ * anton could not even read the ticket's stash BASELINE before any of its steps ran (anton-wjfkn, PR
+ * #333 review round 2) — a resumed checkout that already held uncommitted work from an earlier stop
+ * (a human-gate park, a prior yield) must not be force-removed just because this transient read failed.
+ */
+describe("a baseline read failure is its own conservative stop, not an ordinary failure (anton-wjfkn)", () => {
+  it("names the ticket and the underlying read failure, and is poison-classified", () => {
+    const err = new StashBaselineUnreadableError(TICKET.id, new Error("git stash list exploded"));
+
+    expect(err.name).toBe("PoisonError");
+    expect(err.message).toContain(TICKET.id);
+    expect(err.message).toContain("git stash list exploded");
+    expect(err.message).toContain("KEPT");
+  });
+
+  it("carries no shas — nothing could be confirmed, so nothing is named", () => {
+    const err = new StashBaselineUnreadableError(TICKET.id, new Error("boom"));
+
+    expect(err.stashes).toEqual([]);
+    expect(err.restoreFailures).toEqual([]);
+    expect(err.readFailed).toBe(true);
   });
 });
 
@@ -366,10 +437,11 @@ describe("a yielded turn is its own outcome, not a clean exit (anton-wjfkn)", ()
  */
 describe("the block note tells an operator to RECOVER, not to re-implement (anton-wjfkn)", () => {
   const note = (
-    kind: "stashed-work" | "agent-yielded",
+    kind: "stashed-work" | "agent-yielded" | "baseline-unreadable",
     stashes: string[] = [],
     restoreFailures: string[] = [],
     selfReport: TicketProgress["selfReport"] = null,
+    opts: { committed?: boolean; readFailed?: boolean } = {},
   ) =>
     ticketBlockNote({
       ticketId: TICKET.id,
@@ -377,9 +449,10 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
       selfReport,
       sessionId: "sess-1",
       branch: "anton/anton-wjfkn",
-      committed: false,
+      committed: opts.committed ?? false,
       stashes,
       restoreFailures,
+      readFailed: opts.readFailed,
       worktreePath: "/tmp/anton-worktrees/wjfkn",
     });
 
@@ -457,6 +530,50 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
     const text = note("stashed-work", [SHA_A]);
 
     expect(text).toContain("anton put the work back");
+  });
+
+  /**
+   * anton-wjfkn, PR #333 review round 2: a `stashed-work` stop can now carry a real commit (a partial
+   * commit beside a partial stash). The note must say PART, not claim nothing was committed at all —
+   * and the shared evidence clause (checked elsewhere) already reflects the commit independently.
+   */
+  it("says the commit was only PART of the work when the ticket committed alongside a gained stash", () => {
+    const text = note("stashed-work", [SHA_A], [], null, { committed: true });
+
+    expect(text).toContain("committed only PART of its work");
+    expect(text).not.toContain("Nothing was verified or committed");
+    expect(text).toContain("would ship it PARTIAL");
+    expect(text).toContain("[session sess-1, committed on anton/anton-wjfkn @ unknown]");
+  });
+
+  /**
+   * anton-wjfkn, PR #333 review round 3: a failed FINAL stash read leaves `stashes` empty for lack of
+   * a read, not because the stack is confirmed empty — the note must say so rather than claim the
+   * worktree is the whole story.
+   */
+  it("says the stash list is unknown, not confirmed empty, when the read failed", () => {
+    const readFailed = note("agent-yielded", [], [], null, { readFailed: true });
+    const confirmedEmpty = note("agent-yielded", [], [], null, { readFailed: false });
+
+    expect(readFailed).toContain("UNKNOWN");
+    expect(readFailed).toContain("git stash list");
+    expect(confirmedEmpty).not.toContain("UNKNOWN");
+    expect(confirmedEmpty).not.toContain("git stash list");
+  });
+
+  /**
+   * anton-wjfkn, PR #333 review round 2: a baseline anton could not even read before this ticket's
+   * steps ran gets its own kind, distinct from an agent action — nothing here is the agent's doing.
+   */
+  it("describes a baseline read failure as anton's own stop, not the agent's", () => {
+    const text = note("baseline-unreadable", [], [], null, { readFailed: true });
+
+    expect(text).toContain("anton could not read this worktree's stash list");
+    expect(text).toContain("before this ticket's steps even ran");
+    expect(text).not.toContain("STASHED its own work");
+    expect(text).not.toContain("ENDED ITS TURN");
+    expect(text).toContain("Do NOT re-implement it from scratch");
+    expect(text).toContain(`bd update ${TICKET.id} --status open`);
   });
 
   // anton-wjfkn round 3 review: this note is re-surfaced to an operator through
