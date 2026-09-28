@@ -580,6 +580,23 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
       expect(getPrReviewMock).toHaveBeenCalledTimes(1);
     });
 
+    // PR #335 review (src/lib/review-rounds.ts:259): a `closed` orphan row must stay eligible for
+    // reconciliation — GitHub allows reopening a closed PR (never a merged one), so a row this same
+    // sweep already stamped `closed` is the one row most likely to need upgrading to `merged` next.
+    it("upgrades an already-closed orphan row once GitHub shows it reopened and merged", async () => {
+      listMock.mockResolvedValue([]);
+      insertUnsettledRound(9);
+      t.db
+        .update(schema.reviewRounds)
+        .set({ prState: "closed", prStateAt: new Date(clock.now()) })
+        .where(eq(schema.reviewRounds.prNumber, 9))
+        .run();
+      getPrReviewMock.mockResolvedValue(openPr(9, { state: "MERGED" }));
+
+      await dispatch();
+      expect(prStateOf(9)).toBe("merged");
+    });
+
     it("never reconciles on a targeted single-epic run", async () => {
       listMock.mockResolvedValue([target("e-1", 1)]);
       insertUnsettledRound(9); // orphaned, but this run is scoped to epicBeadId "e-1"

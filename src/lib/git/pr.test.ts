@@ -388,4 +388,39 @@ process.exit(0);
     expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
     expect(review.threadsComplete).toBe(false);
   });
+
+  // PR #335 review (src/lib/git/pr.ts:313): a page with reviewThreads and pageInfo but a missing or
+  // null `nodes` used to fall through `page.nodes ?? []` as an empty page while `complete` stayed
+  // true — persisting an authoritative zero thread count for a page GitHub never actually returned.
+  it("marks the read incomplete when a page reports reviewThreads with nodes missing", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: null,
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads).toEqual([]);
+    expect(review.threadsComplete).toBe(false);
+  });
 });

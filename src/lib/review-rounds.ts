@@ -244,19 +244,31 @@ export async function recordPrTerminalState(
 }
 
 /**
- * Every PR this project has an UNSETTLED round for (`pr_state IS NULL`) — regardless of whether its
- * target is still on the board. A target that leaves the board (another instance's
+ * Every PR this project has a NON-FINAL round for (`pr_state IS NULL` or `'closed'`) — regardless of
+ * whether its target is still on the board. A target that leaves the board (another instance's
  * `finalizeMergedTarget` closes the epic and clears `stage:in-review`) drops out of `inReviewEpics`
  * for good, so a null row a race left behind (PR #335 review: `getPrReview`'s own state read can
  * still be stale by the time it resolves, even on the post-insert freshness check) would otherwise
  * never be revisited by the per-target triage loop. A caller reconciles these independently of board
  * membership — orphaned or not, restamping is idempotent (`recordPrTerminalState`).
+ *
+ * `closed` rows are included, not just `null`, because closed is not final the way merged is: GitHub
+ * allows reopening a closed PR (never a merged one — see `recordPrReopened`). An orphaned PR stamped
+ * `closed` by this same reconciliation has no target left in `inReviewEpics` to observe a later
+ * reopen-and-merge via `recordPrReopened`/`recordPrTerminalState`, so excluding `closed` here would
+ * strand that row at the wrong terminal state forever once GitHub moved on. `merged` rows are excluded
+ * since they truly are final.
  */
 export async function unsettledPrNumbers(db: AntonDb, projectId: string): Promise<number[]> {
   const rows = await db
     .selectDistinct({ prNumber: schema.reviewRounds.prNumber })
     .from(schema.reviewRounds)
-    .where(and(eq(schema.reviewRounds.projectId, projectId), isNull(schema.reviewRounds.prState)));
+    .where(
+      and(
+        eq(schema.reviewRounds.projectId, projectId),
+        or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed")),
+      ),
+    );
   return rows.map((r) => r.prNumber);
 }
 

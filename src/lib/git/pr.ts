@@ -310,14 +310,20 @@ async function getReviewThreads(
         complete = false;
         break;
       }
-      allNodes.push(...page.nodes ?? []);
+      if (!Array.isArray(page.nodes)) {
+        // A missing, null, or non-array `nodes` is a malformed response, not "no threads" — flag it
+        // so a degraded read isn't persisted as a genuinely thread-free PR.
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
       // Each thread's comments connection is capped at first:50 with no cursor of its own — a
       // thread that has collected more comments than that (a long back-and-forth) silently drops
       // everything past comment 50, including the most recent one. threadsNeedingAttention treats
       // the last *fetched* comment as authoritative, so a truncated thread can misreport an anton
       // reply (or a human follow-up after it) as never having happened. totalCount lets us detect
       // that without a second, nested pagination loop — flag the read incomplete instead.
-      if ((page.nodes ?? []).some((n) => (n.comments?.totalCount ?? 0) > (n.comments?.nodes?.length ?? 0))) {
+      if (page.nodes.some((n) => (n.comments?.totalCount ?? 0) > (n.comments?.nodes?.length ?? 0))) {
         complete = false;
       }
       if (!page.pageInfo) {
