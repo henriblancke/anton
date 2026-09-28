@@ -15,6 +15,7 @@ import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { beads, LABELS } from "../beads/bd";
 import { selfBuildVersion } from "../build/drift";
 import * as schema from "../db/schema";
+import { classifyReview } from "../git/pr";
 import { getJob, type Clock } from "./queue";
 
 // Records every `pushBranch` call's args while delegating to the real implementation — so a test
@@ -809,10 +810,25 @@ process.exit(0);`,
 
       // The round answers the review feedback but pushes no commit — simulated directly (what
       // actually decides push-vs-answer, `runFixSession`, is exercised by the push-path e2e test
-      // above; only the dispatcher's read of the settled state is under test here). The fingerprint
-      // is keyed on the requesting review's own identity, not the display reason text (anton-091jr
-      // review round 2) — this fixture's review carries neither `id` nor `submittedAt`, so
-      // `classifyReview` falls back to `review:?:<author>`.
+      // above; only the dispatcher's read of the settled state is under test here). Built through
+      // `classifyReview` itself (anton-091jr review round 6, chatgpt-codex-connector) rather than
+      // hand-written, so it always matches the real fingerprint shape — including the body-hash
+      // suffix on the `review:*` entry and the trailing `base:*` entry appended for every actionable
+      // reason — instead of drifting out of sync with `classifyReview`'s own encoding.
+      const answeredFingerprint = classifyReview({
+        number: 21,
+        state: "OPEN",
+        reviewDecision: "CHANGES_REQUESTED",
+        mergeable: "MERGEABLE",
+        headRefName: answerBranch,
+        headSha: "sha-answer",
+        url: "u",
+        reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "fix it" }],
+        failingChecks: [],
+        failingCheckAttempts: [],
+        pendingChecks: 0,
+        threads: [],
+      }).fingerprint;
       tdb.db
         .update(schema.jobs)
         .set({
@@ -821,7 +837,7 @@ process.exit(0);`,
             projectId,
             epicBeadId: answerEpic,
             headSha: "sha-answer",
-            answeredFingerprint: ["review:?:alice"],
+            answeredFingerprint,
           }),
         })
         .where(eq(schema.jobs.id, answeredId))

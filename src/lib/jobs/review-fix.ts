@@ -1146,13 +1146,24 @@ async function runFixSession(args: {
       };
     }
 
-    await notifyReReview({
-      repo,
-      number,
-      pr,
-      reasons: verdict.reasons,
-      signal: ctx.signal,
-    });
+    // Gated on `sessionProducedChange`, not raw `pushed` — same reason as `applyThreadOutcomes` and
+    // `refreshFixRoundsBody` above: a base-sync-only push must not tell reviewers anton "pushed a
+    // fix" when the session itself left every reported thread unanswered (PR #338 review,
+    // @chatgpt-codex-connector).
+    if (sessionProducedChange) {
+      await notifyReReview({
+        repo,
+        number,
+        pr,
+        reasons: verdict.reasons,
+        signal: ctx.signal,
+      });
+    } else {
+      await appendSessionLog(
+        logPath,
+        `[review-fix] PR #${number}: push was a base-branch sync only; skipping re-review notification\n`,
+      );
+    }
     return { pushed: true, answeredAllThreads: true };
   } catch (e) {
     if (!sessionSettled) await endSession(db, clock, sessionId, "failed");
