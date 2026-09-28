@@ -336,6 +336,48 @@ process.exit(0);
     expect(review.threadsComplete).toBe(false);
   });
 
+  // PR #335 review (src/lib/git/pr.ts:355): a well-formed `comments: { totalCount: 0, nodes: [] }`
+  // passed every earlier malformed check (comments present, totalCount a number, nodes an array,
+  // totalCount not above nodes.length) and was kept as a genuinely comment-free, complete thread.
+  // threadsNeedingAttention then read its missing last comment as "never replied to" and
+  // dispatched it every sweep, while triageOutcomes could never report an outcome for it (no
+  // comments[0] to anchor on) — a thread always has at least one anchor comment, so totalCount: 0
+  // is malformed too and must be dropped like the other cases.
+  it("drops a thread whose comments connection reports totalCount 0 with an empty nodes array", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 0, nodes: [] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
   it("preserves already-fetched pages when a later page fails", async () => {
     // Overwrite the fake gh so page 2 errors (page 1 still reports hasNextPage) — the first page's
     // unresolved thread must survive rather than the whole fetch collapsing to [].

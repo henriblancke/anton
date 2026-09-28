@@ -352,6 +352,17 @@ async function getReviewThreads(
           if (typeof n.id === "string") truncatedThreadIds.add(n.id);
           continue;
         }
+        if (n.comments.totalCount === 0) {
+          // A thread always has at least one anchor comment — totalCount: 0 is a malformed
+          // response (e.g. the comments became unavailable), not a genuine comment-free thread.
+          // threadsNeedingAttention would otherwise treat the missing last comment as "never
+          // replied to" and dispatch it forever, while triageOutcomes can never report an
+          // outcome for it (no comments[0] to anchor on) — drop it like the other malformed
+          // cases so it never surfaces as actionable (PR #335 review).
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
         if (n.comments.totalCount > n.comments.nodes.length) {
           complete = false;
           if (typeof n.id === "string") truncatedThreadIds.add(n.id);

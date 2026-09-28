@@ -16,7 +16,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyMigrationFile, applyMigrationsTo } from "./testing";
 
-const MIGRATION = "0059_review_rounds.sql";
+const MIGRATION = "0062_review_rounds.sql";
 
 /** The reverse, read out of the migration's own header so the tested recipe is the documented one. */
 function reverseStatements(): string[] {
@@ -54,7 +54,7 @@ beforeEach(() => {
 
 afterEach(() => sqlite.close());
 
-describe("drizzle/0059 — the per-round review record", () => {
+describe("drizzle/0062 — the per-round review record", () => {
   it("applies to a populated db and leaves every existing row untouched", () => {
     applyMigrationFile(sqlite, MIGRATION);
 
