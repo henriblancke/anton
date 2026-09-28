@@ -24,6 +24,7 @@ import {
 const POINT: DecisionPoint = {
   id: "review-nit",
   question: { kind: "choice", options: ["fix", "decline", "human"] },
+  instruction: "Should this review nit be fixed, declined, or escalated to a human?",
   consequence: "low",
   threshold: 0.8,
   defaultMode: "shadow",
@@ -138,14 +139,14 @@ describe("write", () => {
 describe("the input digest", () => {
   it("covers only the fields the point declared", () => {
     const declared = decisionInputHash(POINT, { nitText: "prefer const" });
-    const withSecret = decisionInputHash(POINT, {
+    const withUndeclaredField = decisionInputHash(POINT, {
       nitText: "prefer const",
-      apiToken: "sk-live-hunter2",
+      undeclaredField: "must never move the digest",
     });
 
     // The narrowing is the untrusted-text boundary: state the backend never saw must not move the
     // digest, or the log would claim a decision over inputs nothing was asked about.
-    expect(withSecret).toBe(declared);
+    expect(withUndeclaredField).toBe(declared);
   });
 
   it("is stable across key order and moves when a declared field changes", () => {
@@ -293,6 +294,7 @@ describe("replay — agreement(point)", () => {
       ...POINT,
       id: "review-score",
       question: { kind: "score", min: 0, max: 10 },
+      instruction: "How confident is this fix, from 0 to 10?",
       stateFields: [],
       escapeValue: undefined,
     };
@@ -322,6 +324,32 @@ describe("replay — agreement(point)", () => {
 
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 2, agreed: 2 });
     expect(await agreement(test.db, other.id)).toMatchObject({ settled: 1, agreed: 0 });
+  });
+
+  it("is measured per project — one project's record does not bleed into another's", async () => {
+    // `recordShadow` logs under "proj-a"; settle two agreements there.
+    await settleMany([true, true]);
+
+    // The same point, decided the same way, but for a different project — and disagreeing.
+    const result = await decide({ point: POINT, state: {}, mode: "shadow", ask: async () => ANSWER() });
+    const id = await recordDecision(test.db, clock, {
+      result,
+      point: POINT,
+      state: {},
+      projectId: "proj-b",
+    });
+    await settleDecision(test.db, clock, id!, { operatorAnswer: "decline" });
+
+    expect(await agreement(test.db, POINT.id, DECISION_AGREEMENT_WINDOW, "proj-a")).toMatchObject({
+      settled: 2,
+      agreed: 2,
+    });
+    expect(await agreement(test.db, POINT.id, DECISION_AGREEMENT_WINDOW, "proj-b")).toMatchObject({
+      settled: 1,
+      agreed: 0,
+    });
+    // Unscoped still folds every project together, for a caller that genuinely wants the global figure.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 3, agreed: 2 });
   });
 
   it("rolls the window — a point fixed lately is not judged by the record it replaced", async () => {

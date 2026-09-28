@@ -1457,6 +1457,7 @@ describe("settings route — decision-point modes (anton-xky9e)", () => {
       definePoint({
         id,
         question: { kind: "yes-no" },
+        instruction: "Test-only decision point.",
         consequence: "low",
         threshold: 0.8,
         defaultMode: "shadow",

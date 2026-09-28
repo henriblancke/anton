@@ -10,6 +10,7 @@ afterEach(() => resetRegistryForTests());
 const CHOICE_POINT = {
   id: "review-nit",
   question: { kind: "choice", options: ["fix", "decline", "human"] },
+  instruction: "Should this review nit be fixed, declined, or escalated to a human?",
   consequence: "low",
   threshold: 0.8,
   defaultMode: "shadow",
@@ -32,6 +33,11 @@ describe("definePoint", () => {
 
   it("rejects a missing id", () => {
     expect(() => definePoint({ ...CHOICE_POINT, id: "" })).toThrow(/needs an id/);
+  });
+
+  it("rejects a missing or blank instruction", () => {
+    expect(() => definePoint({ ...CHOICE_POINT, instruction: "" })).toThrow(/needs an instruction/);
+    expect(() => definePoint({ ...CHOICE_POINT, instruction: "   " })).toThrow(/needs an instruction/);
   });
 
   it("rejects a threshold outside [0, 1]", () => {
@@ -59,6 +65,7 @@ describe("definePoint", () => {
       definePoint({
         id: "confidence-score",
         question: { kind: "score", min: 0, max: 1 },
+        instruction: "How confident is this fix, from 0 to 1?",
         consequence: "med",
         threshold: 0.9,
         defaultMode: "shadow",
@@ -74,6 +81,7 @@ describe("definePoint", () => {
       definePoint({
         id: "should-retry",
         question: { kind: "yes-no" },
+        instruction: "Should this failed job be retried?",
         consequence: "med",
         threshold: 0.9,
         defaultMode: "shadow",
@@ -84,10 +92,31 @@ describe("definePoint", () => {
     ).toThrow(/escapeValue only applies to choice/);
   });
 
+  it.each`
+    label                          | min          | max
+    ${"a non-finite min"}          | ${Number.NaN} | ${1}
+    ${"a non-finite max"}          | ${0}          | ${Number.POSITIVE_INFINITY}
+    ${"min greater than max"}      | ${1}          | ${0}
+  `("rejects a score question with $label", ({ min, max }) => {
+    expect(() =>
+      definePoint({
+        id: "confidence-score",
+        question: { kind: "score", min, max },
+        instruction: "How confident is this fix, from 0 to 1?",
+        consequence: "med",
+        threshold: 0.9,
+        defaultMode: "shadow",
+        stateFields: [],
+        hardRules: [],
+      }),
+    ).toThrow(/score bounds/);
+  });
+
   it("accepts a score question with no escapeValue", () => {
     const point = definePoint({
       id: "confidence-score",
       question: { kind: "score", min: 0, max: 1 },
+      instruction: "How confident is this fix, from 0 to 1?",
       consequence: "med",
       threshold: 0.9,
       defaultMode: "shadow",
@@ -101,6 +130,7 @@ describe("definePoint", () => {
     const point = definePoint({
       id: "should-retry",
       question: { kind: "yes-no" },
+      instruction: "Should this failed job be retried?",
       consequence: "med",
       threshold: 0.9,
       defaultMode: "shadow",

@@ -20,6 +20,7 @@ import type { DecisionPoint } from "./points";
 const POINT: DecisionPoint = {
   id: "review-nit",
   question: { kind: "choice", options: ["fix", "decline", "human"] },
+  instruction: "Should this review nit be fixed, declined, or escalated to a human?",
   consequence: "low",
   threshold: 0.8,
   defaultMode: "shadow",

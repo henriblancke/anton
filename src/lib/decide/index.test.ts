@@ -12,6 +12,7 @@ function choicePoint(overrides: Partial<DecisionPoint> = {}): DecisionPoint {
   return {
     id: "review-nit",
     question: { kind: "choice", options: ["fix", "decline", "human"] },
+    instruction: "Should this review nit be fixed, declined, or escalated to a human?",
     consequence: "low",
     threshold: 0.8,
     defaultMode: "shadow",
@@ -26,6 +27,7 @@ function scorePoint(overrides: Partial<DecisionPoint> = {}): DecisionPoint {
   return {
     id: "confidence-score",
     question: { kind: "score", min: 0, max: 1 },
+    instruction: "How confident is this fix, from 0 to 1?",
     consequence: "med",
     threshold: 0.7,
     defaultMode: "shadow",
@@ -39,6 +41,7 @@ function yesNoPoint(overrides: Partial<DecisionPoint> = {}): DecisionPoint {
   return {
     id: "should-retry",
     question: { kind: "yes-no" },
+    instruction: "Should this failed job be retried?",
     consequence: "med",
     threshold: 0.7,
     defaultMode: "shadow",
@@ -161,6 +164,31 @@ describe("hard rules", () => {
       ask: vi.fn(),
     });
     expect(result.acted).toBe(true);
+  });
+
+  it("falls back when a hard rule answers outside its own point's question", async () => {
+    // `HardRuleOutcome.value` is only the broad `AnswerValue` union, so TypeScript cannot catch a rule
+    // that answers with a choice value not in `options` — this is the runtime boundary that must.
+    const answersGarbage: HardRule = () => ({ value: "not-an-option", reason: "buggy rule" });
+    const point = choicePoint({ hardRules: [answersGarbage], threshold: 0 });
+    const ask = vi.fn();
+    const result = await decide({ point, state: {}, mode: "auto", ask });
+
+    expect(ask).not.toHaveBeenCalled();
+    expect(result.decidedBy).toBe("fallback");
+    expect(result.reason).toBe("invalid hard-rule answer");
+    expect(result.answer).toBeUndefined();
+    expect(result.acted).toBe(false);
+  });
+
+  it("falls back when a hard rule answers an out-of-range score", async () => {
+    const answersGarbage: HardRule = () => ({ value: 99, reason: "buggy rule" });
+    const point = scorePoint({ hardRules: [answersGarbage], threshold: 0 });
+    const result = await decide({ point, state: {}, mode: "auto", ask: vi.fn() });
+
+    expect(result.decidedBy).toBe("fallback");
+    expect(result.reason).toBe("invalid hard-rule answer");
+    expect(result.acted).toBe(false);
   });
 
   it("defers to the model when no rule fires", async () => {

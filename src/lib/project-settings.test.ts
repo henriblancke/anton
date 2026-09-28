@@ -128,6 +128,7 @@ describe("resolveDecisionMode", () => {
     return definePoint({
       id: "test-point",
       question: { kind: "yes-no" },
+      instruction: "Test-only decision point.",
       consequence: "low",
       threshold: 0.8,
       defaultMode: "shadow",

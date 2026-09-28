@@ -59,6 +59,11 @@ export type HardRule = (state: DecisionState) => HardRuleOutcome | undefined;
 export interface DecisionPoint {
   readonly id: string;
   readonly question: Question;
+  /** The proposition a backend must actually evaluate — a point's id and `stateFields` names are not
+   * instructions, so without this a model has nothing to answer but the shape of the reply, and can
+   * clear the confidence threshold while answering an arbitrary question. Sent verbatim to the model
+   * (see `buildPrompt`, claude-local.ts). */
+  readonly instruction: string;
   /** What a wrong answer costs. Informational today — no gate in this pipeline reads it yet, because
    * nothing here is wired into a job (out of scope, anton-528bw); it exists so the Settings surface
    * and the eventual backend can key off it without a registry shape change. */
@@ -75,6 +80,9 @@ export interface DecisionPoint {
 
 function validate(point: DecisionPoint): void {
   if (!point.id) throw new Error("decide: a decision point needs an id");
+  if (!point.instruction.trim()) {
+    throw new Error(`decide: "${point.id}" needs an instruction stating what it asks a backend`);
+  }
   if (!(point.threshold >= 0 && point.threshold <= 1)) {
     throw new Error(`decide: "${point.id}" threshold must be within [0, 1], got ${point.threshold}`);
   }
@@ -85,7 +93,13 @@ function validate(point: DecisionPoint): void {
     if (point.escapeValue === undefined || !point.question.options.includes(point.escapeValue)) {
       throw new Error(`decide: "${point.id}" needs an escapeValue that is one of its own options`);
     }
-  } else if (point.escapeValue !== undefined) {
+  } else if (point.question.kind === "score") {
+    const { min, max } = point.question;
+    if (!Number.isFinite(min) || !Number.isFinite(max) || min > max) {
+      throw new Error(`decide: "${point.id}" score bounds must be finite with min <= max, got [${min}, ${max}]`);
+    }
+  }
+  if (point.question.kind !== "choice" && point.escapeValue !== undefined) {
     throw new Error(
       `decide: "${point.id}" is a ${point.question.kind} question — escapeValue only applies to choice`,
     );
