@@ -17,6 +17,7 @@ import {
   enqueueReviewFixPrIfAbsent,
   enqueueScheduledTypeIfAbsent,
   getJob,
+  invalidateReviewFixAttempt,
   resumeBudgetDeferredJobs,
   resumeJob,
   reviewFixPrParkedAtHead,
@@ -545,6 +546,36 @@ describe("enqueueReviewFixPrIfAbsent", () => {
       });
       expect(b).toBeDefined();
       expect(b).not.toBe(a);
+      expect(activeRows()).toHaveLength(2);
+    });
+
+    /**
+     * PR #338 review, chatgpt-codex-connector: an attempt that ran against unsynced local refs must
+     * not leave its enqueue-time `headSha`/`fingerprint` snapshot in place. For a transient fetch
+     * failure the GitHub head typically hasn't moved, so that stale snapshot still matches the
+     * current head — if the attempt then parks, a fresh sweep at the SAME (unmoved) head would find
+     * it and suppress every retry forever, even though the parked attempt never actually tested that
+     * revision. `invalidateReviewFixAttempt` clears the snapshot so the parked row no longer matches.
+     */
+    it("invalidateReviewFixAttempt clears the snapshot so an unsynced attempt's park does not suppress the unchanged head", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1"],
+      })!;
+
+      // The worker picks up job `a`, but refs never sync — invalidate instead of refreshing.
+      invalidateReviewFixAttempt(t.db, a);
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      // GitHub's head never moved (the fetch failure was transient) — a naive skip-the-write would
+      // still match here and wrongly suppress.
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1"])).toBe(false);
+      expect(
+        enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+          headSha: "sha1",
+          fingerprint: ["thread:1:c1"],
+        }),
+      ).toBeDefined();
       expect(activeRows()).toHaveLength(2);
     });
 

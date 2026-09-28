@@ -124,6 +124,7 @@ import { finalizeMergedEpic } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
 import {
+  invalidateReviewFixAttempt,
   recordReviewFixAnswered,
   recordReviewFixAttempt,
   reviewFixPrAnsweredUnchanged,
@@ -539,9 +540,11 @@ async function handleEpic(args: {
     // fingerprint anyway would tell `parkedAtHead` a revision was tested when the session actually
     // ran (and the gate failed) against stale head or base code; the next sweep sees the same
     // unchanged GitHub head/base/fingerprint and suppresses every retry forever, even though that
-    // revision was never fetched, let alone tested. Skipping the write here just leaves the job's
-    // payload at its enqueue-time snapshot — worst case a redundant retry, never an indefinite
-    // false-suppression.
+    // revision was never fetched, let alone tested. Skipping the write alone is NOT enough, though:
+    // the job's payload would still carry its enqueue-time snapshot, which for a transient fetch
+    // failure typically still matches the (unmoved) GitHub head — so the false-suppression this gate
+    // exists to prevent would happen anyway via that stale snapshot. The `else` branch below clears
+    // it instead of leaving it in place.
     if (refsSynced) {
       try {
         recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
@@ -549,6 +552,15 @@ async function handleEpic(args: {
         consoleLog.error("recordReviewFixAttempt failed before PR fix", e);
       }
     } else {
+      // Clear the job's own enqueue-time snapshot too, not just skip the refresh above — otherwise
+      // a stale headSha/fingerprint pair that still matches the (unmoved) GitHub head survives on
+      // this row and, if this attempt parks, wrongly suppresses every future retry at that head (PR
+      // #338 review, chatgpt-codex-connector). See `invalidateReviewFixAttempt`'s doc.
+      try {
+        invalidateReviewFixAttempt(db, ctx.jobId);
+      } catch (e) {
+        consoleLog.error("invalidateReviewFixAttempt failed before PR fix", e);
+      }
       consoleLog.info(
         `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — not recording attempt fingerprint to avoid parking a suppression at an untested revision`,
       );

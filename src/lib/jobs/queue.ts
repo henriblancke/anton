@@ -822,6 +822,45 @@ export function recordReviewFixAttempt(
 }
 
 /**
+ * Clear THIS `review-fix-pr` job's stored `headSha`/`fingerprint` when the attempt ran against
+ * unsynced local refs ({@link handleEpic}'s `refsSynced` guard skips {@link recordReviewFixAttempt}
+ * in that case). Leaving the write skipped is not enough on its own: the payload then still carries
+ * whatever {@link enqueueReviewFixPrIfAbsent} snapshotted at enqueue time, and for a transient fetch
+ * failure — the common case — GitHub's head hasn't actually moved since, so that stale snapshot
+ * still matches the CURRENT head. If this attempt then hits a `PoisonError` and parks,
+ * {@link parkedAtHead}'s next-pass lookup filters in SQL on that exact `headSha`, finds this row, and
+ * suppresses every future retry at that head — even though the revision it parked on was never
+ * actually tested (PR #338 review, chatgpt-codex-connector). Deleting `headSha` (not just blanking
+ * `fingerprint`) is what actually breaks the match: `parkedAtHead`'s SQL `json_extract` needs an
+ * equal `headSha` to find the row at all, whereas a stored `fingerprint` of `undefined` reads as
+ * "match any fingerprint" and would still suppress. Best-effort like {@link recordReviewFixAttempt}:
+ * a write hiccup here must not turn a legitimate (if unsynced) attempt into a job failure.
+ */
+export function invalidateReviewFixAttempt(db: AntonDb, jobId: string): void {
+  db.transaction((tx) => {
+    const row = tx
+      .select({ payloadJson: schema.jobs.payloadJson })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, jobId))
+      .limit(1)
+      .all()[0];
+    if (!row) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payloadJson);
+    } catch {
+      payload = {};
+    }
+    delete payload.headSha;
+    delete payload.fingerprint;
+    tx.update(schema.jobs)
+      .set({ payloadJson: JSON.stringify(payload) })
+      .where(eq(schema.jobs.id, jobId))
+      .run();
+  });
+}
+
+/**
  * Enqueue one of the SCHEDULED job types (board-picker, nightly-stringer, …) for a project unless a
  * job of that type is already COVERING it under `coveredBy` — the same one-active-per-(type,
  * project) coalescing `Scheduler.tickOnce` and `runScheduleNow` (schedules.ts) already apply,
