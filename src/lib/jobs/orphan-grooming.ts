@@ -131,7 +131,14 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
         // description would otherwise stay stuck missing `## Outcome IDs` forever. Patch it in
         // place rather than leaving the gap for the next contract-gap sweep to flag.
         const description = `${(existing.description ?? "").trimEnd()}\n\n## Outcome IDs\n\n${ORPHAN_EPIC_VARS.outcome_ids}`;
-        await safe(() => beads.update(repo, epicId, { description }, existing.labels ?? []));
+        const patched = await safe(() => beads.update(repo, epicId, { description }, existing.labels ?? []));
+        // Thrown BEFORE any linking below: once an orphan is parented here it stops being an orphan,
+        // so a sweep with nothing left to bucket returns early (`orphans.length === 0`) and never
+        // revisits this epic — a swallowed failure here would leave it missing `## Outcome IDs`
+        // permanently. Failing now keeps every orphan loose so the next sweep retries the patch.
+        if (!patched) {
+          throw new Error(`orphan-grooming: failed to add Outcome IDs to reused epic ${epicId}`);
+        }
       }
     } else {
       const skeleton = await orphanEpicSkeleton(repo);

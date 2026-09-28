@@ -8,7 +8,8 @@
  * already reads (`humanNotesPromptBlock`, lib/jobs/step-registry.ts) — so the implementer that picks
  * the bead up next is shown the steer without a new prompt seam.
  */
-import { beads, labelValuesOf, type Bead } from "./beads/bd";
+import { outcomeIdsOf } from "./backlog";
+import { beads, type Bead } from "./beads/bd";
 import { refreshAllIssues } from "./beads/issues";
 import { formatHumanNote } from "./beads/notes";
 import { resolveOperator } from "./operator";
@@ -331,7 +332,7 @@ async function noteStrandedFollowUp(
  */
 async function tagDetachedOutcome(context: FollowUpContext, existing: Bead): Promise<void> {
   const current = existing.labels ?? [];
-  const missing = labelValuesOf(context.target.labels, "outcome")
+  const missing = outcomeIdsOf(context.target)
     .map((id) => `outcome:${id}`)
     .filter((label) => !current.includes(label));
   if (missing.length > 0) await beads.tag(context.repo, existing.id, missing);
@@ -366,7 +367,7 @@ async function reconcileHalfCreatedContract(
     targetId: target.id,
     parentId,
     pipeline,
-    outcomeIds: labelValuesOf(target.labels, "outcome"),
+    outcomeIds: outcomeIdsOf(target),
   });
   if (existing.description !== description) {
     await beads.update(repo, existing.id, { description });
@@ -391,7 +392,7 @@ async function createFollowUp(context: FollowUpContext, all: Bead[]): Promise<Ap
   const { repo, target, ticket, request, author, body, pipeline } = context;
   const parentId =
     context.shippedPr === undefined && isBoardCard(target, all) ? target.id : undefined;
-  const outcomeIds = labelValuesOf(target.labels, "outcome");
+  const outcomeIds = outcomeIdsOf(target);
   const followUpId = await beads.create(repo, {
     title: request.summary,
     type: "task",

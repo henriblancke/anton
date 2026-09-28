@@ -1,4 +1,4 @@
-import { beads, labelValueOf, type Bead, type GraphPlanNode } from "./beads/bd";
+import { beads, labelValueOf, labelValuesOf, type Bead, type GraphPlanNode } from "./beads/bd";
 import { ownerOf } from "./beads/claim";
 import { withBeadWriteLock } from "./beads/claim-lock";
 import { validateBeadContract, type ContractViolation } from "./beads/contract";
@@ -299,6 +299,21 @@ export function extractOutcomeIdsSection(description: string): { present: boolea
     if (inSection) body.push(line);
   }
   return { present, body: body.join("\n").trim() };
+}
+
+/**
+ * A run target's outcome id(s), wherever its tier stores them. A feature-tier target carries them as
+ * `outcome:<id>` labels (the Add-work path labels only feature nodes), but a standalone epic run
+ * target (no feature children, execute-epic's own tier) never gets that label — its contract stores
+ * them as free text in its own `## Outcome IDs` section instead. Falling back to the label read alone
+ * would make every standalone epic look like it predates outcome ids and silently drop its declared
+ * outcomes wherever a caller derives them from the target.
+ */
+export function outcomeIdsOf(target: Bead): string[] {
+  const labeled = labelValuesOf(target.labels, "outcome");
+  if (labeled.length > 0) return labeled;
+  const { present, body } = extractOutcomeIdsSection(target.description ?? "");
+  return present ? outcomeIdTokens(body) : [];
 }
 
 /**

@@ -7,8 +7,8 @@
  * these tickets live now — and because every step of it is a guarded write against a board other
  * operators share. Nothing here decides WHICH tickets move; see review-fix-rehome.ts for that.
  */
-import { beads, LABELS, labelValuesOf, ownerOf, type Bead } from "../beads/bd";
-import { extractOutcomeIdsSection, outcomeIdTokens } from "../backlog";
+import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
+import { outcomeIdsOf } from "../backlog";
 import { beadSkeleton } from "../beads/formula";
 import { olderOf, tryList, type ReadBead } from "./review-fix-board";
 import { safe } from "./safe";
@@ -262,21 +262,6 @@ async function newFollowUpEpic(
   } catch {
     return undefined;
   }
-}
-
-/**
- * The merged run target's own outcome id(s) — what its follow-up epic inherits. A feature-tier
- * target carries them as `outcome:<id>` labels (the Add-work path labels only feature nodes), but a
- * standalone epic run target (no feature children, execute-epic's own tier) never gets that label —
- * its contract stores them as free text in its own `## Outcome IDs` section instead. Falling back to
- * the label read alone would make every standalone epic look like it predates outcome ids and
- * silently drop its declared outcomes onto the follow-up.
- */
-function outcomeIdsOf(epic: Bead): string[] {
-  const labeled = labelValuesOf(epic.labels, "outcome");
-  if (labeled.length > 0) return labeled;
-  const { present, body } = extractOutcomeIdsSection(epic.description ?? "");
-  return present ? outcomeIdTokens(body) : [];
 }
 
 /**
