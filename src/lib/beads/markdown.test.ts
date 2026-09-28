@@ -79,6 +79,7 @@ describe("scanMarkdown", () => {
           fenced: true,
           delimiter: true,
           commented: false,
+          html: false,
           headingRest: false,
           visible: "",
           masked: "```js",
@@ -88,6 +89,7 @@ describe("scanMarkdown", () => {
           fenced: true,
           delimiter: false,
           commented: false,
+          html: false,
           headingRest: false,
           visible: "## Acceptance",
           masked: "## Acceptance",
@@ -97,6 +99,7 @@ describe("scanMarkdown", () => {
           fenced: true,
           delimiter: true,
           commented: false,
+          html: false,
           headingRest: false,
           visible: "",
           masked: "```",
@@ -106,6 +109,7 @@ describe("scanMarkdown", () => {
           fenced: false,
           delimiter: false,
           commented: false,
+          html: false,
           headingRest: false,
           visible: "after",
           masked: "after",
@@ -472,11 +476,11 @@ it("closes a fence nested in a list and blockquote whose closer spells the `>` m
 describe("renderedLines", () => {
   it("drops fence delimiters, strips comments, and keeps fenced content flagged as literal", () => {
     expect(renderedLines("# A\n<!-- c -->\n```\nx\n```\n\nend")).toEqual([
-      { text: "# A", fenced: false, heading: true },
-      { text: "", fenced: false, heading: false },
-      { text: "x", fenced: true, heading: false },
-      { text: "", fenced: false, heading: false },
-      { text: "end", fenced: false, heading: false },
+      { text: "# A", fenced: false, html: false, heading: true },
+      { text: "", fenced: false, html: false, heading: false },
+      { text: "x", fenced: true, html: false, heading: false },
+      { text: "", fenced: false, html: false, heading: false },
+      { text: "end", fenced: false, html: false, heading: false },
     ]);
   });
 

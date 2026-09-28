@@ -284,13 +284,16 @@ function outcomeIdsMention(outcomeIds: string, outcomeId: string): boolean {
 const OUTCOME_IDS_HEADING = /^##\s*Outcome IDs\s*$/i;
 
 /** An existing epic's `## Outcome IDs` section: whether the heading is present at all, and its body
- * verbatim ("" for an absent OR a blank-but-present section — those two are NOT the same case to a
+ * ("" for an absent OR a blank-but-present section — those two are NOT the same case to a
  * caller, so `present` carries the distinction). Free text (unlike Goal/Acceptance, "Outcome IDs"
  * is not a section `validateBeadContract` judges), so a plain heading scan rather than the
  * contract's slugged-heading machinery — same shape as `extractSection` in ticket-dialog-utils.ts.
  * Uses `scanMarkdown`'s AST-aware heading metadata (`heading?.depth === 2`), not a raw `/^##\s+/`
  * text test, so a fenced example whose line merely reads `## Outcome IDs` isn't mistaken for the
- * genuine section. */
+ * genuine section. A fenced or raw-HTML line within the section is dropped entirely, and every
+ * other line is read through its masked `visible` text — so a fenced code example, a `<script>`/
+ * `<pre>` block, or an HTML comment (inline or spanning the whole line) never contributes a bogus
+ * id to the body that {@link outcomeIdTokens} and {@link outcomeIdsOf} later tokenize. */
 export function extractOutcomeIdsSection(description: string): { present: boolean; body: string } {
   const lines = description.split("\n");
   const scanned = scanMarkdown(description);
@@ -318,7 +321,13 @@ export function extractOutcomeIdsSection(description: string): { present: boolea
       if (inSection) present = true;
       continue;
     }
-    if (inSection) body.push(line);
+    if (!inSection) continue;
+    const scannedLine = scanned[i];
+    // A fenced or raw-HTML line renders as an example, not a declared id — drop it entirely rather
+    // than let outcomeIdTokens read its source text as a real one. `visible` (not the raw line)
+    // already masks out HTML-comment content the same way, inline or spanning the whole line.
+    if (scannedLine?.fenced || scannedLine?.html) continue;
+    body.push(scannedLine?.visible ?? line);
   }
   if (inSection) occurrences.push(body.join("\n").trim());
   return { present, body: occurrences.filter(Boolean).join("\n\n") };

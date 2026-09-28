@@ -858,6 +858,21 @@ describe("reconcileFollowUpDescription", () => {
     expect(reconciled.indexOf(WHY_BODY)).toBeLessThan(reconciled.indexOf("## Acceptance Criteria"));
   });
 
+  // PR #334 review: `sectionsNamed` matched a heading by slug at any depth, so a legacy hand-made
+  // bead with no real `## Why` but an unrelated nested `### Why` under Goal or Context was mistaken
+  // for one already having it — the repair never ran and the follow-up could finish (and resume)
+  // without a genuine level-two Why section.
+  it("still inserts ## Why when only a nested ### Why heading is present", () => {
+    const handMade = "## Goal\nharden the retry\n\n### Why\nA sub-heading under Goal, not a real Why section.\n";
+    const reconciled = reconcileFollowUpDescription(handMade, edited);
+    // The nested `### Why` is part of Goal's own section body (nothing ends it early), so the real
+    // `## Why` this reconcile inserts lands after it — the fix under test is only that it gets
+    // inserted at all, rather than being suppressed by mistaking the nested heading for the genuine one.
+    expect(reconciled).toContain(
+      `## Goal\nharden the retry\n\n### Why\nA sub-heading under Goal, not a real Why section.\n\n${WHY_BODY}`,
+    );
+  });
+
   it("closes a fence the hand-made description ends inside before appending — a heading in a fence is literal code to the judge", () => {
     const unclosed = "## Goal\nharden the retry\n\n## Context\nMade by hand:\n```ts\nretry();";
     const reconciled = reconcileFollowUpDescription(unclosed, edited);

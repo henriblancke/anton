@@ -44,8 +44,9 @@ const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
  * Collects EVERY occurrence rather than stopping at the first, mirroring
  * {@link extractOutcomeIdsSection} in backlog.ts — a PRODUCT.md authored (or merged) with more than
  * one `## Outcomes` heading must not have ids declared only in a later occurrence silently dropped.
- * Lines stay {@link RenderedLine}s (not bare strings) so a caller can skip fenced ones — a fenced
- * example bullet renders as code, not a real outcome, but source-level slicing here would have lost
+ * Lines stay {@link RenderedLine}s (not bare strings) so a caller can skip fenced or raw-HTML
+ * ones — a fenced example bullet renders as code and a bullet-shaped line inside a `<script>`/`<pre>`
+ * block renders as nothing, neither a real outcome, but source-level slicing here would have lost
  * that distinction before the caller ever sees it.
  */
 function outcomesSections(markdown: string): RenderedLine[] | undefined {
@@ -91,7 +92,9 @@ export function parseOutcomes(markdown: string): ProjectOutcome[] {
   const outcomes = new Map<string, ProjectOutcome>([[BUILT_IN_OUTCOME.id, BUILT_IN_OUTCOME]]);
   const section = outcomesSections(markdown);
   for (const line of section ?? []) {
-    if (line.fenced) continue;
+    // Raw HTML (a `<script>`/`<pre>` block) renders no Markdown structure, so an outcome-shaped
+    // line inside one is not a real bullet — same reasoning as skipping a fenced line.
+    if (line.fenced || line.html) continue;
     const outcome = parseBullet(line.text);
     if (!outcome) continue;
     if (outcome.id === BUILT_IN_OUTCOME.id) {

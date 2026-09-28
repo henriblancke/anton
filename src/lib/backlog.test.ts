@@ -193,6 +193,30 @@ describe("extractOutcomeIdsSection", () => {
   it("still splits a genuine comma-separated list on the same line", () => {
     expect(outcomeIdTokens("outcome:a, outcome:b")).toEqual(["a", "b"]);
   });
+
+  // PR #334 review: a genuine `## Outcome IDs` section may still contain a fenced or commented
+  // example line — it must not be copied into the section body, or outcomeIdTokens treats the
+  // example as a real declared id.
+  it("excludes a fenced example line from the section body", () => {
+    const { body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\n```\noutcome:example-id\n```\n\noutcome:real-id",
+    );
+    expect(outcomeIdTokens(body)).toEqual(["real-id"]);
+  });
+
+  it("excludes an HTML-commented example line from the section body", () => {
+    const { body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\n<!-- outcome:example-id -->\n\noutcome:real-id",
+    );
+    expect(outcomeIdTokens(body)).toEqual(["real-id"]);
+  });
+
+  it("excludes a line inside a raw HTML block from the section body", () => {
+    const { body } = extractOutcomeIdsSection(
+      "## Outcome IDs\n\n<pre>\noutcome:example-id\n</pre>\n\noutcome:real-id",
+    );
+    expect(outcomeIdTokens(body)).toEqual(["real-id"]);
+  });
 });
 
 describe("outcomeIdsOf", () => {

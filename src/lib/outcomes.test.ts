@@ -145,6 +145,20 @@ describe("parseOutcomes", () => {
     expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "real-id"]);
   });
 
+  // PR #334 review: an outcome-shaped line inside a raw HTML block (e.g. `<pre>`) is not fenced,
+  // but Markdown still renders no outcome bullet there — it must not parse as a real one either.
+  it("skips an outcome-shaped line inside a raw HTML block", () => {
+    const markdown = [
+      "## Outcomes",
+      "<pre>",
+      "- `example-id` — Example summary",
+      "</pre>",
+      "- `real-id` — This one is outside the block.",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "real-id"]);
+  });
+
   // PR #334 review: a PRODUCT.md with `## Outcomes` declared twice (e.g. after a merge) used to
   // only ever read the first occurrence, silently dropping ids declared solely in a later one.
   it("collects bullets from every ## Outcomes occurrence, not just the first", () => {

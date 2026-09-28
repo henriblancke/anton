@@ -205,7 +205,11 @@ export function reconcileFollowUpWhy(description: string, ticket: Bead, outcomeI
  */
 function ensureWhy(description: string, ticket: Bead, outcomeIds: string[]): string {
   const lines = scanMarkdown(description);
-  if (sectionsNamed(lines, WHY_KEYS).length > 0) return description;
+  // Only a top-level `## Why` satisfies the contract — a nested `### Why` under Goal or Context
+  // (a legacy follow-up's unrelated sub-heading) must not be mistaken for it, or this silently
+  // suppresses the repair a run target actually needs.
+  const hasWhy = sectionsNamed(lines, WHY_KEYS).some(({ start }) => lines[start]!.heading!.depth === 2);
+  if (hasWhy) return description;
   const whyLines = [`## Why`, followUpWhy(ticket, outcomeIds)];
   const [goalSection] = sectionsNamed(lines, GOAL_KEYS);
   if (goalSection) {
