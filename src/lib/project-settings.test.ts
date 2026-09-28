@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { mergeSettings, resolveWarmConfig, type ProjectSettings } from "./project-settings";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  mergeSettings,
+  resolveDecisionMode,
+  resolveWarmConfig,
+  type ProjectSettings,
+} from "./project-settings";
+import { definePoint, resetRegistryForTests, type DecisionPoint } from "./decide/points";
 
 /**
  * Direct unit tests for `mergeSettings`'s per-key merge precedence (anton-33h0) — the pure function
@@ -77,6 +83,12 @@ describe("mergeSettings", () => {
     expect(next.repairAutonomy).toEqual({ "ref-stale": "shadow", "dep-missing": "apply" });
   });
 
+  it("deep-merges decisionModes: promoting one point leaves the others", () => {
+    const current: ProjectSettings = { decisionModes: { "point-a": "shadow" } };
+    const next = mergeSettings(current, { decisionModes: { "point-b": "auto" } });
+    expect(next.decisionModes).toEqual({ "point-a": "shadow", "point-b": "auto" });
+  });
+
   it("clears a nested object wholesale on an explicit undefined, not just its known knobs", () => {
     const current: ProjectSettings = { budgetPolicy: { daytimeReservePct: 25 } };
     const next = mergeSettings(current, { budgetPolicy: undefined });
@@ -105,5 +117,42 @@ describe("resolveWarmConfig", () => {
   it("turns warming off only on an explicit false", () => {
     expect(resolveWarmConfig({ warmEnabled: false }).enabled).toBe(false);
     expect(resolveWarmConfig({ warmEnabled: true }).enabled).toBe(true);
+  });
+});
+
+/** How far a decide() call may go on this project, per point (anton-xky9e). */
+describe("resolveDecisionMode", () => {
+  afterEach(resetRegistryForTests);
+
+  function point(overrides: Partial<DecisionPoint> = {}): DecisionPoint {
+    return definePoint({
+      id: "test-point",
+      question: { kind: "yes-no" },
+      consequence: "low",
+      threshold: 0.8,
+      defaultMode: "shadow",
+      stateFields: [],
+      hardRules: [],
+      ...overrides,
+    });
+  }
+
+  it("falls back to the point's own defaultMode when nothing is stored", () => {
+    expect(resolveDecisionMode({}, point())).toBe("shadow");
+  });
+
+  it("reads the operator's override for that point", () => {
+    const settings: ProjectSettings = { decisionModes: { "test-point": "auto" } };
+    expect(resolveDecisionMode(settings, point())).toBe("auto");
+  });
+
+  it("leaves a different point's mode alone", () => {
+    const settings: ProjectSettings = { decisionModes: { "other-point": "auto" } };
+    expect(resolveDecisionMode(settings, point())).toBe("shadow");
+  });
+
+  it("falls back to defaultMode on a hand-edited, unreadable value", () => {
+    const settings = { decisionModes: { "test-point": "armed" } } as unknown as ProjectSettings;
+    expect(resolveDecisionMode(settings, point())).toBe("shadow");
   });
 });

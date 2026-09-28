@@ -29,6 +29,7 @@ import {
   REVIEW_MIN_SCORE_RANGE,
   REVIEW_FIX_CONCURRENCY_RANGE,
   budgetPolicySchema,
+  decisionModeOverridesSchema,
   formulaVariantsSchema,
   modelRoutesSchema,
   pickerAutonomySchema,
@@ -225,6 +226,7 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     settingsField("scanSeverity", schemaValue(scanSeverityPolicySchema, pathDetail)),
     settingsField("proposalAutonomy", schemaValue(proposalAutonomySchema, pathDetail)),
     settingsField("repairAutonomy", schemaValue(repairAutonomySchema, pathDetail)),
+    settingsField("decisionModes", schemaValue(decisionModeOverridesSchema, pathDetail)),
     settingsField(
       "valueLabels",
       schemaValue(valueLabelsSchema, messageDetail("invalid label"), { clearOnEmptyArray: true }),

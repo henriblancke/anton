@@ -4,9 +4,10 @@
  * persist to projects.settings_json; an unknown agent id / non-array / non-boolean 400s;
  * "" / null clears each key back to the default; GET after PATCH restores what was saved.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
+import { definePoint, resetRegistryForTests } from "@/lib/decide/points";
 
 let tdb: TestDb;
 
@@ -1433,6 +1434,75 @@ describe("settings route — proposal autonomy policy (anton-nbyy)", () => {
       "acceptance-missing": "propose",
       oversized: "propose",
     });
+  });
+});
+
+/**
+ * Per-point decision mode (anton-xky9e), the settings surface over decide()'s own registry. Unlike
+ * `repairAutonomy`/`proposalAutonomy` the key set is not a fixed enum this module can import — a
+ * point is registered by whichever job step calls `definePoint` — so validity is checked against the
+ * LIVE registry instead, which these tests seed and tear down themselves.
+ */
+describe("settings route — decision-point modes (anton-xky9e)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+    resetRegistryForTests();
+    for (const id of ["test-point-a", "test-point-b"]) {
+      definePoint({
+        id,
+        question: { kind: "yes-no" },
+        consequence: "low",
+        threshold: 0.8,
+        defaultMode: "shadow",
+        stateFields: [],
+        hardRules: [],
+      });
+    }
+  });
+  afterEach(resetRegistryForTests);
+
+  it("takes a mode per point, merges it, and rejects what it cannot read", async () => {
+    const res = await PATCH(patchReq({ decisionModes: { "test-point-a": "auto" } }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.decisionModes).toEqual({ "test-point-a": "auto" });
+
+    const merged = await PATCH(
+      patchReq({ decisionModes: { "test-point-b": "assist" } }),
+      ctx("tmp"),
+    );
+    expect((await merged.json()).settings.decisionModes).toEqual({
+      "test-point-a": "auto",
+      "test-point-b": "assist",
+    });
+
+    for (const bad of [
+      { "point-from-the-future": "auto" }, // not a registered point
+      { "test-point-a": "armed" }, // not one of the four modes
+      { "test-point-a": true },
+      "auto",
+    ]) {
+      const bogus = await PATCH(patchReq({ decisionModes: bad }), ctx("tmp"));
+      expect(bogus.status).toBe(400);
+      expect((await bogus.json()).error).toMatch(/decisionModes/);
+    }
+    expect(persisted().decisionModes).toEqual({
+      "test-point-a": "auto",
+      "test-point-b": "assist",
+    });
+  });
+
+  it("clears on null — each point falls back to its own default, not to a shared one", async () => {
+    await PATCH(patchReq({ decisionModes: { "test-point-a": "auto" } }), ctx("tmp"));
+    const res = await PATCH(patchReq({ decisionModes: null }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.decisionModes).toBeUndefined();
+    expect("decisionModes" in persisted()).toBe(false);
   });
 });
 
