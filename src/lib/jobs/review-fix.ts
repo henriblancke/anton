@@ -63,6 +63,7 @@ import {
   needsHooksPathOverrideForMerge,
   pushBranch,
   readPullRequestBody,
+  resolveCommitSha,
   resolveHooksPathOverride,
   resolveHooksPathOverrideForMerge,
   stageAll,
@@ -516,7 +517,7 @@ async function handleEpic(args: {
   return withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts, alreadyAhead, preSessionHead, headSynced } =
+    const { worktree, conflicts, alreadyAhead, preSessionHead, refsSynced } =
       await prepareFixWorktree({
         ctx,
         repo,
@@ -526,20 +527,22 @@ async function handleEpic(args: {
         number,
         claimOwner,
         expectedHeadSha: pr.headSha,
+        expectedBaseRefOid: pr.baseRefOid,
       });
 
     // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
     // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
-    // chatgpt-codex-connector). Gated on `headSynced` (PR #338 review, chatgpt-codex-connector,
-    // round 2): `fetchOrigin` above is best-effort, and when it fails the worktree stays on
-    // whatever `origin/${branch}` last resolved to locally — NOT the `pr.headSha` this fingerprint
-    // names. Persisting `pr.headSha`/`verdict.fingerprint` anyway would tell `parkedAtHead` a
-    // revision was tested when the session actually ran (and the gate failed) against stale code;
-    // the next sweep sees the same unchanged GitHub head/fingerprint and suppresses every retry
-    // forever, even though that revision was never fetched, let alone tested. Skipping the write
-    // here just leaves the job's payload at its enqueue-time snapshot — worst case a redundant
-    // retry, never an indefinite false-suppression.
-    if (headSynced) {
+    // chatgpt-codex-connector). Gated on `refsSynced` (PR #338 review, chatgpt-codex-connector,
+    // rounds 2-3): `fetchOrigin` above is best-effort for both the head branch and the base
+    // branch, and when it fails for either the worktree/`origin/<base>` stay on whatever they last
+    // resolved to locally — NOT what `pr.headSha`/`pr.baseRefOid` report. Persisting the
+    // fingerprint anyway would tell `parkedAtHead` a revision was tested when the session actually
+    // ran (and the gate failed) against stale head or base code; the next sweep sees the same
+    // unchanged GitHub head/base/fingerprint and suppresses every retry forever, even though that
+    // revision was never fetched, let alone tested. Skipping the write here just leaves the job's
+    // payload at its enqueue-time snapshot — worst case a redundant retry, never an indefinite
+    // false-suppression.
+    if (refsSynced) {
       try {
         recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
       } catch (e) {
@@ -547,7 +550,7 @@ async function handleEpic(args: {
       }
     } else {
       consoleLog.info(
-        `PR #${number}: origin sync did not reach reported head ${pr.headSha} — not recording attempt fingerprint to avoid parking a suppression at an untested revision`,
+        `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — not recording attempt fingerprint to avoid parking a suppression at an untested revision`,
       );
     }
 
@@ -630,11 +633,24 @@ export async function prepareFixWorktree(args: {
   /**
    * `pr.headSha` the caller classified its fix attempt against — compared against what the sync
    * below actually lands on, so a best-effort `fetchOrigin` failure can be told apart from a real
-   * sync (see `headSynced` below). Empty when the caller has no head to verify against (e.g. a
-   * synthetic `PrReview` in tests) — `headSynced` is unconditionally true in that case, since there
-   * is nothing to compare.
+   * sync (see `refsSynced` below). Empty when the caller has no head to verify against (e.g. a
+   * synthetic `PrReview` in tests) — `refsSynced` is unconditionally true for this half of the
+   * check in that case, since there is nothing to compare.
    */
   expectedHeadSha: string;
+  /**
+   * `pr.baseRefOid` the caller classified its fix attempt against — compared against what
+   * `origin/<baseBranch>` actually resolves to after the fetch below, for the same reason
+   * `expectedHeadSha` is checked against the synced head: `fetchOrigin` below fetches the base
+   * branch too, and is just as best-effort. A silent failure there leaves `origin/<baseBranch>`
+   * stale, so `premergeBase` merges an old base commit and the gates run against a tree that
+   * doesn't match what GitHub reports as the PR's current base — even though the head fetch
+   * succeeded and `syncedHead === expectedHeadSha` (PR #338 review, chatgpt-codex-connector,
+   * round 3). Undefined/empty when the caller has no base to verify against (e.g. a synthetic
+   * `PrReview` in tests, or no `baseBranch` at all) — that half of the check is then
+   * unconditionally true, matching `expectedHeadSha`'s own fallback.
+   */
+  expectedBaseRefOid: string | undefined;
 }): Promise<{
   worktree: Worktree;
   conflicts: string[];
@@ -652,17 +668,28 @@ export async function prepareFixWorktree(args: {
    */
   preSessionHead: string;
   /**
-   * Did the fetch + fast-forward sync above actually land the worktree on `expectedHeadSha`? Both
-   * git steps are best-effort (a repo with no reachable origin still gets the review-comment flow)
-   * — when `fetchOrigin` fails silently, the fast-forward merge just resolves `origin/${branch}` to
-   * whatever it last was locally, which can be stale. `false` here tells the caller the session
-   * below (if any) ran, and any gate it hit failed, against code that was NOT what GitHub reports
-   * as the PR's current head — so persisting an attempt fingerprint keyed on `expectedHeadSha` would
-   * misrepresent that revision as tested (PR #338 review, chatgpt-codex-connector, round 2).
+   * Did the fetch above actually land the worktree's HEAD on `expectedHeadSha` AND
+   * `origin/<baseBranch>` on `expectedBaseRefOid`? Both git steps are best-effort (a repo with no
+   * reachable origin still gets the review-comment flow) — when `fetchOrigin` fails silently for
+   * either ref, that ref just resolves to whatever it last was locally, which can be stale. `false`
+   * here tells the caller the session below (if any) ran, and any gate it hit failed, against code
+   * that was NOT what GitHub reports as the PR's current head or base — so persisting an attempt
+   * fingerprint keyed on `expectedHeadSha`/`expectedBaseRefOid` would misrepresent that revision as
+   * tested (PR #338 review, chatgpt-codex-connector, rounds 2-3).
    */
-  headSynced: boolean;
+  refsSynced: boolean;
 }> {
-  const { ctx, repo, branch, settings, baseBranch, number, claimOwner, expectedHeadSha } = args;
+  const {
+    ctx,
+    repo,
+    branch,
+    settings,
+    baseBranch,
+    number,
+    claimOwner,
+    expectedHeadSha,
+    expectedBaseRefOid,
+  } = args;
 
   const worktree = await createWorktree({
     repoPath: repo,
@@ -720,7 +747,21 @@ export async function prepareFixWorktree(args: {
     (s) => s.head,
     () => "",
   );
-  const headSynced = expectedHeadSha === "" || syncedHead === expectedHeadSha;
+  const headMatches = expectedHeadSha === "" || syncedHead === expectedHeadSha;
+
+  // Same check for the base ref `fetchOrigin` above also fetched (best-effort, just like the head
+  // fetch above) — resolved directly via `rev-parse` rather than `readWorktreeState` since the
+  // worktree's own HEAD hasn't merged it in yet (that's `premergeBase`, below). No `baseBranch`
+  // (nothing gets premerged, so a stale base ref can't feed the gates) or no `expectedBaseRefOid`
+  // (a synthetic `PrReview` in tests) trusts the sync unconditionally, matching `expectedHeadSha`'s
+  // own fallback.
+  const baseMatches =
+    !baseBranch ||
+    !expectedBaseRefOid ||
+    (await resolveCommitSha(worktree.path, `origin/${baseBranch}`).catch(() => "")) ===
+      expectedBaseRefOid;
+
+  const refsSynced = headMatches && baseMatches;
 
   // Snapshot "ahead of origin" right after the fast-forward sync above and BEFORE the premerge
   // below — the premerge's own auto-merge commit (see its "clean auto-merge" comment) would
@@ -764,7 +805,7 @@ export async function prepareFixWorktree(args: {
     (s) => s.head,
     () => "",
   );
-  return { worktree, conflicts, alreadyAhead, preSessionHead, headSynced };
+  return { worktree, conflicts, alreadyAhead, preSessionHead, refsSynced };
 }
 
 /**

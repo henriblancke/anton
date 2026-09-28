@@ -74,6 +74,9 @@ vi.mock("../claude/driver", () => ({ runClaude: (...a: unknown[]) => runClaudeMo
 // as "behind" and merge on every test regardless of what's actually under test.
 const isAncestorMock = vi.fn();
 const mergeIntoCurrentMock = vi.fn();
+// Defaults to rejecting like the real `rev-parse` would against the plain temp dir `worktreePath`
+// stands in for (not a real git repo) — tests that care about the base-ref check override this.
+const resolveCommitShaMock = vi.fn().mockRejectedValue(new Error("not a git repo"));
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
@@ -84,6 +87,7 @@ vi.mock("../git/ops", async () => {
     branchAheadOfRemote: vi.fn().mockResolvedValue(false),
     needsHooksPathOverrideForMerge: vi.fn().mockResolvedValue(false),
     resolveHooksPathOverrideForMerge: vi.fn().mockResolvedValue(undefined),
+    resolveCommitSha: (...a: unknown[]) => resolveCommitShaMock(...a),
   };
 });
 
@@ -328,6 +332,7 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       number: 7,
       claimOwner: "review-fix:job-test",
       expectedHeadSha: "",
+      expectedBaseRefOid: undefined,
     });
 
   it("a review-fix gate failing on a module the lockfile declares", async () => {
@@ -398,6 +403,77 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     // The one `mergeIntoCurrent` call is the unconditional origin/<branch> sync; premergeBase's own
     // merge is never attempted once `isAncestor` says the base is already caught up.
     expect(mergeIntoCurrentMock).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 3: `headSynced` (now `refsSynced`) used to check
+  // only the worktree's own head, so a `fetchOrigin` that fetched the head branch fine but silently
+  // failed for the base branch still reported "synced" — the premerge then ran against a STALE
+  // `origin/<baseBranch>`, yet the fingerprint got persisted as if the PR's advertised base had
+  // actually been tested.
+  describe("refsSynced also verifies the fetched base ref against pr.baseRefOid", () => {
+    const runWithBase = (expectedBaseRefOid: string | undefined) =>
+      prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "", // isolate the assertion to the base-ref half of the check
+        expectedBaseRefOid,
+      });
+
+    it("is true when the fetched origin/<base> resolves to the PR's reported baseRefOid", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-current");
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(true);
+    });
+
+    it("is false when origin/<base> resolves to a STALE sha (fetchOrigin silently failed for it)", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-stale");
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("is false when resolving origin/<base> fails outright", async () => {
+      resolveCommitShaMock.mockRejectedValue(new Error("unknown revision"));
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("trusts the sync unconditionally when the caller has no baseRefOid to verify against", async () => {
+      resolveCommitShaMock.mockResolvedValue("whatever-it-resolves-to");
+
+      const result = await runWithBase(undefined);
+
+      expect(result.refsSynced).toBe(true);
+    });
+
+    it("trusts the sync unconditionally when there is no baseBranch at all (nothing gets premerged)", async () => {
+      resolveCommitShaMock.mockResolvedValue("irrelevant");
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: undefined,
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "",
+        expectedBaseRefOid: "base-sha-current",
+      });
+
+      expect(result.refsSynced).toBe(true);
+      expect(resolveCommitShaMock).not.toHaveBeenCalled();
+    });
   });
 });
 
