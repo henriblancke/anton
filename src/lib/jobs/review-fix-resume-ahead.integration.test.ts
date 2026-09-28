@@ -3,8 +3,9 @@
  * claude session — the operator fixed what a red gate named (a migration re-stamp, say) and hit
  * resume rather than re-running the whole review-fix session. Drives the REAL handler + REAL runner
  * + REAL bd/git against a temp repo with a bare origin, fake `claude`/`gh`, across three PRs: ahead
- * of origin with a green gate (push, no claude), ahead with a red gate (park, nothing pushed, no
- * claude), and nothing ahead (dispatches claude as before). Skipped without bd + git.
+ * of origin with a green gate (push, no claude), ahead with a red gate (one bounded claude follow-up
+ * round, still red, park with nothing pushed — anton-pwekp), and nothing ahead (dispatches claude as
+ * before). Skipped without bd + git.
  */
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
@@ -252,9 +253,10 @@ process.exit(0);`,
       expect(edits[0]?.body).toContain("### Review-fix rounds");
     });
 
-    it("parks a red gate on an already-ahead branch and pushes nothing", async () => {
+    it("gives an already-ahead red gate one claude follow-up round, then parks when it's still red", async () => {
       const { epicId, branch } = await makeEpicAheadBy("Ahead + red gate", 102, 1);
       registerBranch(102, branch);
+      // Always red — the follow-up round cannot possibly turn this green, so it must still park.
       await setSettings({ testCommand: "exit 1" });
 
       g(repo, ["fetch", "-q", "origin"]);
@@ -270,11 +272,16 @@ process.exit(0);`,
       g(repo, ["fetch", "-q", "origin"]);
       expect(revParse(repo, `origin/${branch}`)).toBe(originTipBefore);
 
-      // claude was never dispatched.
-      expect(readFileSync(claudeCallLog, "utf8").trim()).toBe("");
+      // The fast path still skips the MAIN claude dispatch, but a red gate now earns exactly one
+      // bounded follow-up round before parking (anton-pwekp) — never zero, never more than one.
+      const calls = readFileSync(claudeCallLog, "utf8").trim().split("\n").filter(Boolean);
+      expect(calls).toHaveLength(1);
     });
 
     it("dispatches claude normally when nothing is committed ahead of the remote", async () => {
+      // claudeCallLog is cumulative across this describe block's tests (the prior red-gate test
+      // now also earns one follow-up dispatch) — count only the calls THIS test adds.
+      const callsBefore = readFileSync(claudeCallLog, "utf8").trim().split("\n").filter(Boolean).length;
       const { epicId, branch } = await makeEpicAheadBy("Nothing ahead", 103, 0);
       registerBranch(103, branch);
       await setSettings({});
@@ -285,7 +292,7 @@ process.exit(0);`,
 
       // claude WAS dispatched exactly once — the normal path, unchanged by the fast path above.
       const calls = readFileSync(claudeCallLog, "utf8").trim().split("\n").filter(Boolean);
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(callsBefore + 1);
 
       g(repo, ["fetch", "-q", "origin"]);
       const remoteLog = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/${branch}`], {

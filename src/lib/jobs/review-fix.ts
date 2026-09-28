@@ -102,11 +102,12 @@ import {
   resolveWarmConfig,
   type ProjectSettings,
 } from "../projects";
-import { captureVerifyGates } from "./shell";
+import { captureVerifyGates, type VerifyGateOutcome } from "./shell";
 import { tailLines } from "./review-context";
-import { findOpenRunForEpic } from "../runs";
+import { findOpenRunForEpic, type RunRow } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
+import type { ClaudeEvent } from "../claude/driver";
 import {
   buildReviewFixPrompt,
   fabricatedFix,
@@ -721,6 +722,9 @@ async function runFixSession(args: {
   // re-review notification) throws — that would erase delivery evidence for a push that already
   // reached the remote (PR #320 review).
   let sessionSettled = false;
+  // Set the instant the one bounded follow-up round is dispatched (anton-pwekp), so a PoisonError
+  // that reaches the catch below can tell the PR whether a fix round was already attempted.
+  let gateFollowUpAttempted = false;
 
   try {
     // A resume can land here with the fix already committed on the branch — an operator resolving
@@ -745,7 +749,23 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
       );
-      await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+      await runGatesWithFollowUp({
+        db,
+        clock,
+        ctx,
+        projectId,
+        epic,
+        settings,
+        worktree,
+        pr,
+        run,
+        number,
+        logPath,
+        onEvent,
+        onFollowUpAttempted: () => {
+          gateFollowUpAttempted = true;
+        },
+      });
       const pushed = await commitAndPushFix(
         repo,
         worktree.path,
@@ -834,7 +854,23 @@ async function runFixSession(args: {
       await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal);
     }
 
-    await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+    await runGatesWithFollowUp({
+      db,
+      clock,
+      ctx,
+      projectId,
+      epic,
+      settings,
+      worktree,
+      pr,
+      run,
+      number,
+      logPath,
+      onEvent,
+      onFollowUpAttempted: () => {
+        gateFollowUpAttempted = true;
+      },
+    });
 
     const pushed = await commitAndPushFix(
       repo,
@@ -890,7 +926,14 @@ async function runFixSession(args: {
     // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
     // only a stale badge, not why anton stopped (anton-gvqk3).
     if (isPoisonError(e)) {
-      await notifyGateParked({ repo, number, error: e, conflicts, signal: ctx.signal });
+      await notifyGateParked({
+        repo,
+        number,
+        error: e,
+        conflicts,
+        fixRoundAttempted: gateFollowUpAttempted,
+        signal: ctx.signal,
+      });
     }
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
@@ -899,24 +942,31 @@ async function runFixSession(args: {
 /**
  * Tell the PR why anton stopped: the gate/blocker a poison park named, plus whether a base-branch
  * merge is already resolved and committed locally (unpushed) so the reader isn't left guessing what
- * state the branch is in. Carries {@link ANTON_MARK} like every other anton comment, so the review
- * sweep's own `threadsNeedingAttention` never mistakes it for a human's. Idempotent against the PR's
- * comment history rather than any local state — a resumed job parking on the SAME gate is a fresh
- * process with nothing of its own to remember, but the PR remembers what was already said on it.
+ * state the branch is in, and whether a bounded follow-up round already tried to fix the gate
+ * (anton-pwekp) — so the reader isn't left assuming a retry would help. Carries {@link ANTON_MARK}
+ * like every other anton comment, so the review sweep's own `threadsNeedingAttention` never mistakes
+ * it for a human's. Idempotent against the PR's comment history rather than any local state — a
+ * resumed job parking on the SAME gate is a fresh process with nothing of its own to remember, but
+ * the PR remembers what was already said on it.
  */
 export async function notifyGateParked(args: {
   repo: string;
   number: number;
   error: Error;
   conflicts: string[];
+  /** Did the one bounded follow-up round already run against this gate before it parked? */
+  fixRoundAttempted?: boolean;
   signal: AbortSignal;
 }): Promise<void> {
-  const { repo, number, error, conflicts, signal } = args;
+  const { repo, number, error, conflicts, fixRoundAttempted, signal } = args;
   const mergeNote =
     conflicts.length > 0
       ? " The base branch merge was resolved and committed locally (not yet pushed)."
       : "";
-  const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}`;
+  const fixRoundNote = fixRoundAttempted
+    ? " A follow-up fix round already ran against this gate; it failed again."
+    : "";
+  const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}${fixRoundNote}`;
   const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
   if (existing.includes(body)) return;
   await safe(() => commentOnPr(repo, number, body, signal));
@@ -945,6 +995,24 @@ const GATE_FAILURE_OUTPUT_CHARS = 3000;
  * below: `captureVerifyGates` REJECTS for those (it never returns a red outcome for them), so they
  * propagate as an ordinary error the runner still retries.
  */
+async function captureRedGate(
+  settings: ProjectSettings,
+  cwd: string,
+  signal: AbortSignal,
+  logPath: string,
+): Promise<VerifyGateOutcome | undefined> {
+  const outcomes = await captureVerifyGates(resolveVerifyGates(settings), cwd, signal, logPath);
+  return outcomes.find((o) => !o.ok);
+}
+
+/** Opening sentence unchanged (existing readers parse it) — the gate output tail is appended. */
+function gateFailurePoison(red: VerifyGateOutcome, number: number): PoisonError {
+  return new PoisonError(
+    `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
+      tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
+  );
+}
+
 export async function runTestGate(
   settings: ProjectSettings,
   cwd: string,
@@ -952,14 +1020,151 @@ export async function runTestGate(
   logPath: string,
   number: number,
 ): Promise<void> {
-  const outcomes = await captureVerifyGates(resolveVerifyGates(settings), cwd, signal, logPath);
-  const red = outcomes.find((o) => !o.ok);
+  const red = await captureRedGate(settings, cwd, signal, logPath);
+  if (red) throw gateFailurePoison(red, number);
+}
+
+/**
+ * Run the verify gates; on red, give the fix ONE bounded follow-up claude round — in the same
+ * worktree, with the gate's own label + tailed output in its prompt — and re-run the gates before
+ * giving up (anton-pwekp). A deterministic gate failure the agent could fix (a migration
+ * re-stamp, a lint error) reaches it exactly once: green after the follow-up returns normally so
+ * the caller pushes as usual; still red parks with the SECOND run's output, exactly as a first-try
+ * red would have without this round. Called from both the normal dispatch path and the
+ * already-ahead fast path in `runFixSession`, each call site gets at most one follow-up — there is
+ * no loop here to bound.
+ *
+ * Transient failures (an aborted signal, a killed process) never reach the follow-up at all:
+ * `captureRedGate` (via `captureVerifyGates`) REJECTS for those rather than returning a red
+ * outcome, so they propagate as an ordinary retryable error out of this function without spending
+ * the round.
+ */
+async function runGatesWithFollowUp(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+  projectId: string;
+  epic: Bead;
+  settings: ProjectSettings;
+  worktree: Worktree;
+  pr: PrReview;
+  run: RunRow | undefined;
+  number: number;
+  logPath: string;
+  onEvent: (event: ClaudeEvent) => void;
+  /** Called once the follow-up round is actually dispatched, so the caller can note it for the park comment. */
+  onFollowUpAttempted: () => void;
+}): Promise<void> {
+  const {
+    db,
+    clock,
+    ctx,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    run,
+    number,
+    logPath,
+    onEvent,
+    onFollowUpAttempted,
+  } = args;
+
+  const red = await captureRedGate(settings, worktree.path, ctx.signal, logPath);
   if (!red) return;
-  // Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
-  throw new PoisonError(
-    `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
-      tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
+
+  await appendSessionLog(
+    logPath,
+    `[review-fix] PR #${number}: ${red.label} gate failed (exit ${red.code}); running one follow-up fix round before parking\n`,
   );
+  onFollowUpAttempted();
+  await runGateFixFollowUp({
+    db,
+    clock,
+    ctx,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    run,
+    number,
+    onEvent,
+    red,
+  });
+
+  const red2 = await captureRedGate(settings, worktree.path, ctx.signal, logPath);
+  if (red2) throw gateFailurePoison(red2, number);
+}
+
+/**
+ * The bounded follow-up round itself: one claude dispatch over the gate's own label + tailed
+ * output, via the same `reviewFixContext` protocol as the main fix (so the gate-failure section
+ * sits beside conflicts/threads rather than needing a parallel prompt). Mirrors the main dispatch
+ * in `runFixSession` (routing, model, metering, permission mode) so this round is billed and
+ * routed identically; an unsuccessful claude result throws a plain (retryable) error, same as the
+ * main dispatch — only the SECOND gate run decides whether this attempt parks.
+ */
+async function runGateFixFollowUp(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+  projectId: string;
+  epic: Bead;
+  settings: ProjectSettings;
+  worktree: Worktree;
+  pr: PrReview;
+  run: RunRow | undefined;
+  number: number;
+  onEvent: (event: ClaudeEvent) => void;
+  red: VerifyGateOutcome;
+}): Promise<void> {
+  const { db, clock, ctx, projectId, epic, settings, worktree, pr, run, number, onEvent, red } = args;
+
+  const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
+    epic,
+    pr,
+    reasons: [`the ${red.label} gate failed after the fix (exit ${red.code})`],
+    conflicts: [],
+    gateFailure: { label: red.label, output: tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS) },
+    settings,
+    projectDir: worktree.path,
+  });
+
+  const routing = claudeRouting(settings);
+  await ctx.claudeReached(quotaMeterKey(settings));
+  const result = await metered(
+    db,
+    clock,
+    {
+      projectId,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step: "review-fix-gate",
+      stepHandler: "review-fix",
+      runId: run?.id,
+      beadId: epic.id,
+      modelRequested: settings.model,
+      agentTag: labelValueOf(epic.labels, "agent"),
+      ...attribution,
+    },
+    runClaude,
+  )({
+    cwd: worktree.path,
+    prompt,
+    appendSystemPrompt,
+    model: resolveReviewFixModel(settings, epic),
+    routing,
+    permissionMode: settings.permissionMode ?? "bypassPermissions",
+    signal: ctx.signal,
+    onEvent,
+  });
+  if (!result.ok) {
+    throw new Error(
+      `claude reported an error fixing the ${red.label} gate for PR #${number}: ${result.text ?? "unknown"}`,
+    );
+  }
 }
 
 /**

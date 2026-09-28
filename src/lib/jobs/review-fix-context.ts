@@ -55,11 +55,13 @@ export async function buildReviewFixPrompt(args: {
   pr: PrReview;
   reasons: string[];
   conflicts: string[];
+  /** A gate that just failed after a prior fix session — the bounded follow-up round's own context. */
+  gateFailure?: GateFailure;
   settings: ProjectSettings;
   /** The worktree the fix runs in (for resolving a project-local agent prompt). */
   projectDir: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string; attribution: ReasoningAttribution }> {
-  const { epic, pr, reasons, conflicts, settings, projectDir } = args;
+  const { epic, pr, reasons, conflicts, gateFailure, settings, projectDir } = args;
 
   // Compose the same layered system prompt used for execution (base + agent + seed). Use the
   // epic's agent tag if it has one.
@@ -76,9 +78,21 @@ export async function buildReviewFixPrompt(args: {
   const attribution: ReasoningAttribution = override
     ? { promptBodyDigest: textDigest(override) }
     : { skillId: "review-fix", skillDigest: bundledSkillDigest("review-fix"), skillIsDefault: true };
-  const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, reasons, conflicts)].join("\n");
+  const prompt = [
+    reasoning,
+    "",
+    "---",
+    "",
+    reviewFixContext(epic, pr, reasons, conflicts, gateFailure),
+  ].join("\n");
 
   return { prompt, appendSystemPrompt, attribution };
+}
+
+/** A verify gate that failed after a fix session — label + tailed output, for the follow-up round's prompt. */
+export interface GateFailure {
+  label: string;
+  output: string;
 }
 
 /**
@@ -90,7 +104,13 @@ export async function buildReviewFixPrompt(args: {
  * Assembled from independent section builders (each returns its own lines, empty when it does not
  * apply) so the shape stays flat and every section is testable in isolation.
  */
-export function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], conflicts: string[] = []): string {
+export function reviewFixContext(
+  epic: Bead,
+  pr: PrReview,
+  reasons: string[],
+  conflicts: string[] = [],
+  gateFailure?: GateFailure,
+): string {
   const threads = threadsNeedingAttention(pr);
   return [
     ...headerSection(epic, pr, reasons),
@@ -99,6 +119,7 @@ export function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], co
     ...clusterSection(threads),
     ...failingChecksSection(pr),
     ...conflictsSection(conflicts),
+    ...gateFailureSection(gateFailure),
     ...reportingFormatSection(threads),
   ]
     .join("\n")
@@ -180,6 +201,28 @@ function conflictsSection(conflicts: string[]): string[] {
     `in the following files. Resolve the markers (pick the semantically correct result — never`,
     `blindly one side); the merge is concluded for you afterwards:`,
     ...conflicts.map((f) => `- ${f}`),
+    ``,
+  ];
+}
+
+/**
+ * The bounded follow-up round's own context (anton-pwekp): the fixer just ran, its verify gates
+ * came back red, and this is the ONE extra round the gate gets before the job parks. Tailed output
+ * already trimmed by the caller — this section renders whatever it's handed verbatim.
+ */
+function gateFailureSection(gateFailure: GateFailure | undefined): string[] {
+  if (!gateFailure) return [];
+  return [
+    `## Gate failure (one follow-up round)`,
+    ``,
+    `The ${gateFailure.label} gate failed after the fix above. This is the only extra round the`,
+    `gate gets — if it fails again, the PR is parked for a human. Resolve what it's complaining`,
+    `about (a deterministic gate failure like a migration re-stamp or a lint error is usually a`,
+    `small, targeted fix, not a re-diagnosis of the review feedback):`,
+    ``,
+    "```",
+    gateFailure.output,
+    "```",
     ``,
   ];
 }

@@ -75,6 +75,23 @@ describe("buildReviewFixPrompt — reasoning attribution", () => {
     });
     expect(other.promptBodyDigest).not.toBe(attribution.promptBodyDigest);
   });
+
+  // anton-pwekp: the follow-up round's prompt must actually carry the gate output, not just the
+  // reasoning contract — this is what the agent sees when deciding what to fix.
+  it("carries the gate label + output in the prompt when a gate just failed", async () => {
+    const { prompt } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["the tests gate failed after the fix (exit 3)"],
+      conflicts: [],
+      gateFailure: { label: "tests", output: "boom-output" },
+      settings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+    });
+    expect(prompt).toContain("## Gate failure (one follow-up round)");
+    expect(prompt).toContain("tests gate failed after the fix above");
+    expect(prompt).toContain("boom-output");
+  });
 });
 
 describe("labelValue", () => {
@@ -149,6 +166,22 @@ describe("reviewFixContext", () => {
     expect(out).toContain("Merge conflicts:");
     expect(out).toContain("- src/a.ts");
     expect(out).toContain("- src/b.ts");
+  });
+
+  // anton-pwekp: the bounded follow-up round's own context, beside conflictsSection.
+  it("includes the gate failure section when a gate just failed", () => {
+    const out = reviewFixContext(epic, makePr(), ["gate failed"], [], {
+      label: "tests",
+      output: "boom-output",
+    });
+    expect(out).toContain("## Gate failure (one follow-up round)");
+    expect(out).toContain("The tests gate failed after the fix above.");
+    expect(out).toContain("boom-output");
+  });
+
+  it("omits the gate failure section when no gate failed", () => {
+    const out = reviewFixContext(epic, makePr(), ["conflicts"], ["src/a.ts"]);
+    expect(out).not.toContain("## Gate failure");
   });
 
   function threadOn(path: string, id: string): ReviewThread {
