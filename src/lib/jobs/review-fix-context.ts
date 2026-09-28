@@ -50,6 +50,10 @@ export interface TriagedOutcome {
  * and `recordReviewRound` counts through it, so the recorded per-outcome counts are exactly the
  * outcomes the PR has a record of. Counting the raw report instead would report fixes no thread was
  * ever answered with.
+ *
+ * `report` is deduped by thread id first, keeping only the first reported outcome per id: nothing
+ * stops the model from naming the same thread twice, and without this a duplicate would both reply
+ * to the thread twice and count twice toward `RoundCounts` (PR #335 review).
  */
 export function triageOutcomes(
   pr: PrReview,
@@ -57,8 +61,11 @@ export function triageOutcomes(
   pushed: boolean,
 ): TriagedOutcome[] {
   const waiting = threadsNeedingAttention(pr);
+  const seenIds = new Set<string>();
   const triaged: TriagedOutcome[] = [];
   for (const item of report) {
+    if (seenIds.has(item.id)) continue;
+    seenIds.add(item.id);
     const thread = waiting.find((t) => t.id === item.id);
     const anchor = thread?.comments[0];
     if (!thread || !anchor) continue;

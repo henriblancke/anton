@@ -21,7 +21,7 @@
  * connection.
  */
 import { randomUUID } from "node:crypto";
-import { and, count, eq, isNull } from "drizzle-orm";
+import { and, count, eq, isNull, or } from "drizzle-orm";
 import { schema } from "./db";
 import { threadsNeedingAttention, type PrReview, type ReviewThread } from "./git/pr";
 import { triageOutcomes, type ThreadOutcome } from "./jobs/review-fix-context";
@@ -171,10 +171,12 @@ export async function recordReviewRound(
  * not append-only, and the reason `pr_state` lives on the round rather than in a second table keyed
  * by PR: a round cannot know its PR's fate while it is still running.
  *
- * Best-effort by contract — it NEVER throws. Only rows that carry no terminal state yet are
- * stamped, so the FIRST observation of an end wins: a merged PR cannot later become closed, and a
- * finalization that runs twice (it is deliberately resumable) must not revise a fact already
- * recorded.
+ * Best-effort by contract — it NEVER throws. `merged` is the only truly final state GitHub reports —
+ * a `closed` PR can still be reopened and later merged — so a later `merged` observation is allowed
+ * to supersede an earlier `closed` stamp. Every other transition is a no-op: `merged` is never
+ * overwritten (by `closed` or by a repeated `merged`), and a `closed` stamped once stays until a
+ * `merged` supersedes it. That keeps a finalization that runs twice (it is deliberately resumable)
+ * from revising a fact already recorded.
  *
  * Writes nothing when the PR has no rows — a PR whose every round predates this table, or one anton
  * only ever polled. That is the intended gap: a reader reports the rounds it has, and a synthesized
@@ -193,7 +195,9 @@ export async function recordPrTerminalState(
         and(
           eq(schema.reviewRounds.projectId, input.projectId),
           eq(schema.reviewRounds.prNumber, input.prNumber),
-          isNull(schema.reviewRounds.prState),
+          input.state === "merged"
+            ? or(isNull(schema.reviewRounds.prState), eq(schema.reviewRounds.prState, "closed"))
+            : isNull(schema.reviewRounds.prState),
         ),
       );
   } catch {

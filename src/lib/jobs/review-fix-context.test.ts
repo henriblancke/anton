@@ -310,4 +310,16 @@ describe("triageOutcomes", () => {
 
     expect(triageOutcomes(pr, report, true).map((t) => t.item.id)).toEqual(["RT_2", "RT_1"]);
   });
+
+  it("keeps only the first reported outcome for a duplicated thread id", () => {
+    const pr = makePr({ threads: [thread("RT_1", [["alice", "rename foo"]])] });
+    const report: ThreadOutcome[] = [
+      { id: "RT_1", outcome: "left" },
+      { id: "RT_1", outcome: "fixed" },
+    ];
+
+    const triaged = triageOutcomes(pr, report, true);
+    expect(triaged).toHaveLength(1);
+    expect(triaged[0].item.outcome).toBe("left");
+  });
 });

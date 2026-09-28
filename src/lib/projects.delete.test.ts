@@ -158,6 +158,15 @@ async function seedProject(slug: string) {
     logPath,
   });
 
+  // No foreign key ties this to the project (review-rounds.ts), so nothing but the teardown
+  // itself sweeps it — a table left out here silently outlives every project it belonged to.
+  await db.insert(schema.reviewRounds).values({
+    id: randomUUID(),
+    projectId,
+    prNumber: 1,
+    round: 1,
+  });
+
   return { projectId, burnSampleId, wt, branch, logPath };
 }
 
@@ -184,6 +193,12 @@ async function projectRowCounts(projectId: string) {
     burnSamples: (
       await db.select().from(schema.burnSamples).where(eq(schema.burnSamples.projectId, projectId))
     ).length,
+    reviewRounds: (
+      await db
+        .select()
+        .from(schema.reviewRounds)
+        .where(eq(schema.reviewRounds.projectId, projectId))
+    ).length,
   };
 }
 
@@ -207,6 +222,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       sessions: 0,
       autopilotDisarms: 0,
       burnSamples: 0,
+      reviewRounds: 0,
     });
 
     // Worktree dir + branch removed; session log deleted.
@@ -267,6 +283,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       sessions: 1,
       autopilotDisarms: 2,
       burnSamples: 1,
+      reviewRounds: 1,
     });
   });
 });

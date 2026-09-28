@@ -305,7 +305,7 @@ async function deleteSessionLogs(db: AntonDb, projectId: string): Promise<void> 
  * Teardown step 4 — drop the project's anton.db rows atomically, children before parents (no ON
  * DELETE CASCADE in the schema): sessions → runs → jobs → schedules → run-health → picker plan →
  * picker verdicts → picker starts → claude invocations → hygiene → scan summaries → autopilot
- * disarms → escalations →
+ * disarms → escalations → review rounds →
  * burn samples (detached, not deleted) → quota-attempt ledger → projects.
  */
 function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
@@ -317,6 +317,9 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
       tx.delete(schema.jobs).where(eq(schema.jobs.projectId, projectId)).run();
       tx.delete(schema.schedules).where(eq(schema.schedules.projectId, projectId)).run();
       tx.delete(schema.runHealthReports).where(eq(schema.runHealthReports.projectId, projectId)).run();
+      // No foreign key (review-rounds.ts: a best-effort write must never be blocked by one), so
+      // nothing forces this cleanup — left out, a project's review history outlives the project.
+      tx.delete(schema.reviewRounds).where(eq(schema.reviewRounds.projectId, projectId)).run();
       tx
         .delete(schema.boardPickerPlans)
         .where(eq(schema.boardPickerPlans.projectId, projectId))

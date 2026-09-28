@@ -291,6 +291,26 @@ describe("recordPrTerminalState", () => {
     expect(rows()[0].prStateAt?.getTime()).toBe(T0);
   });
 
+  it("lets a later merged observation supersede an earlier closed stamp — a reopened PR", async () => {
+    await record(331);
+    await recordPrTerminalState(t.db, clock, {
+      projectId: PROJECT,
+      prNumber: 331,
+      state: "closed",
+    });
+
+    // GitHub allows a closed PR to be reopened and later merged; closed is not final the way
+    // merged is, so the correction must land.
+    await recordPrTerminalState(t.db, { now: () => T0 + 9000 }, {
+      projectId: PROJECT,
+      prNumber: 331,
+      state: "merged",
+    });
+
+    expect(rows()[0]).toMatchObject({ prState: "merged" });
+    expect(rows()[0].prStateAt?.getTime()).toBe(T0 + 9000);
+  });
+
   it("writes nothing for a PR with no recorded rounds", async () => {
     // A PR whose rounds all predate this table, or one anton only ever polled. The gap reads as "not
     // measured"; a synthesized row would report a PR nobody reviewed.
