@@ -711,6 +711,24 @@ process.exit(0);
     const item = { id: "RT_1", outcome: "left" as const, reply: "style-only, skipped" };
     await expect(run([item], [thread()], true)).resolves.toEqual([]);
   });
+
+  it("a session-log write failure is best-effort — the delivered reply/resolve still counts (PR #335 review)", async () => {
+    // logPath points at a directory, not a file, so appendSessionLog's appendFile rejects (EISDIR)
+    // while the reply/resolve calls above it in recordThreadOutcome have already gone through.
+    const item = { id: "RT_1", outcome: "fixed" as const, reply: "renamed foo to bar" };
+    const delivered = await applyThreadOutcomes({
+      repo: sandbox,
+      number: 7,
+      pr: pr([thread()]),
+      report: [item],
+      pushed: true,
+      signal: new AbortController().signal,
+      logPath: sandbox,
+    });
+
+    expect(delivered).toEqual([item]);
+    expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
 });
 
 /**
