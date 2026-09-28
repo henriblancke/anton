@@ -325,12 +325,17 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
       return toModelAnswer(point.question, report, modelVersion);
     } catch (error) {
       // A driver-level failure (timeout/abort, quota, stall, a non-zero exit before any result
-      // shaped) never reaches the branches above, so it carries no modelVersion — but the backend is
-      // always known, and that alone is enough for recordDecision() to attribute the attempt rather
-      // than log a null-backend row (see the module doc's "TIMEOUT AND INVALID OUTPUT" note).
+      // shaped) never reaches the branches above, so it carries no `answeringModel` — but when the
+      // caller pinned `config.model` (a replacement being evaluated), that IS the model this attempt
+      // was attributed to; dropping it here would let agreement() keep reading the predecessor model
+      // as "current" for as long as the replacement keeps failing before it can answer at all
+      // (anton-528bw PR #332 review). Left undefined only when no model was pinned, matching the
+      // module doc's "TIMEOUT AND INVALID OUTPUT" note that backend alone is still enough to attribute
+      // the attempt.
       if (error instanceof ModelCallError) throw error;
       throw new ModelCallError(error instanceof Error ? error.message : String(error), {
         backend: BACKEND,
+        modelVersion: config.model,
       });
     } finally {
       clearTimeout(timer);

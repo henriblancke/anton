@@ -339,6 +339,20 @@ describe("replay — agreement(point)", () => {
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 0, agreed: 0 });
   });
 
+  it("refuses to settle a row against a different point, even when the id matches", async () => {
+    const id = await recordShadow();
+    const other: DecisionPoint = { ...POINT, id: "stall-retry" };
+
+    // "fix" is valid for `other` too (same options), so isValidAnswer alone would let this through —
+    // but `id` names a review-nit row, not a stall-retry one. Settling it here would otherwise stamp
+    // `settledAt` on review-nit's row using an answer meant for a different point, permanently and
+    // unfixably (first-write-wins) corrupting review-nit's evidence (PR #332 review).
+    expect(await settleDecision(test.db, clock, id, { point: other, operatorAnswer: "fix" })).toBe(false);
+
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 0, agreed: 0 });
+    expect(await agreement(test.db, other.id)).toMatchObject({ settled: 0, agreed: 0 });
+  });
+
   it("is measured per point — one point's record says nothing about another's", async () => {
     await settleMany([true, true]);
     const other: DecisionPoint = { ...POINT, id: "stall-retry" };

@@ -186,6 +186,11 @@ export interface SettleDecisionInput {
  * would otherwise stamp `settledAt` permanently and read as a disagreement in {@link agreement}
  * forever after, with no way to correct it (PR #332 review).
  *
+ * The WHERE also pins `point` to `input.point.id`, not just `id`: validating `operatorAnswer`
+ * above only proves it fits `input.point`'s own question shape, so a caller passing an `id` that
+ * belongs to a different point would otherwise settle THAT row against the wrong point's answer —
+ * again permanent, again unfixable once `agreement()` has counted it (PR #332 review).
+ *
  * Unlike {@link recordDecision} this does NOT swallow: a settle is the operator's own act, and a
  * caller that asked whether it landed must be able to tell "already settled" (false) from "the write
  * failed" (a throw). Collapsing the two would let a route report success over a lost answer. An
@@ -211,7 +216,13 @@ export async function settleDecision(
       settledAt: secDate(clock.now()),
       settleSeq: nextSettleSeq(),
     })
-    .where(and(eq(schema.decisions.id, id), isNull(schema.decisions.settledAt)))
+    .where(
+      and(
+        eq(schema.decisions.id, id),
+        eq(schema.decisions.point, input.point.id),
+        isNull(schema.decisions.settledAt),
+      ),
+    )
     .returning({ id: schema.decisions.id });
   return rows.length > 0;
 }

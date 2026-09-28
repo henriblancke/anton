@@ -464,6 +464,35 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     expect((error as ModelCallError).backend).toBe("claude-local");
     expect((error as ModelCallError).modelVersion).toBeUndefined();
   });
+
+  it("attributes the configured replacement model on a timeout, even with no result back", async () => {
+    // config.model names the model this attempt was actually evaluating — unlike the no-override
+    // case above, that identity is known before the driver ever runs, so a timeout must not drop it.
+    // Losing it here would let agreement() keep reading the predecessor model as "current" for as
+    // long as the replacement keeps timing out (PR #332 review).
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      model: "claude-6-2026-10",
+      timeoutMs: 20,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(
+        (options) =>
+          new Promise((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          }),
+      ),
+    });
+
+    const error = await ask(choicePoint(), { nitText: "x" }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelCallError);
+    expect((error as ModelCallError).backend).toBe("claude-local");
+    expect((error as ModelCallError).modelVersion).toBe("claude-6-2026-10");
+  });
 });
 
 describe("claudeLocalBackend — metered, ledger phase declared", () => {
