@@ -443,7 +443,7 @@ describe("recordPrReopened", () => {
     };
     await expect(
       recordPrReopened({ update: boom } as unknown as AntonDb, { projectId: PROJECT, prNumber: 331 }),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
   });
 });
 

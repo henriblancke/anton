@@ -307,13 +307,17 @@ export async function unsettledPrNumbers(db: AntonDb, projectId: string): Promis
  * `merged` rows are never touched: GitHub does not allow reopening a merged PR.
  *
  * Best-effort by contract, the same rule every write on this table follows — never throws.
+ *
+ * Returns whether this call actually unsettled a row — false for the no-op cases above (never
+ * closed, already unsettled, merged) — so a caller reconciling PRs outside the normal round flow
+ * (PR #335 review) can count this as a real change instead of reporting a no-op poll.
  */
 export async function recordPrReopened(
   db: AntonDb,
   input: { projectId: string; prNumber: number },
-): Promise<void> {
+): Promise<boolean> {
   try {
-    await db
+    const written = await db
       .update(schema.reviewRounds)
       .set({ prState: null, prStateAt: null })
       .where(
@@ -322,8 +326,11 @@ export async function recordPrReopened(
           eq(schema.reviewRounds.prNumber, input.prNumber),
           eq(schema.reviewRounds.prState, "closed"),
         ),
-      );
+      )
+      .returning({ prNumber: schema.reviewRounds.prNumber });
+    return written.length > 0;
   } catch {
     // Swallowed on purpose — see the contract above.
+    return false;
   }
 }

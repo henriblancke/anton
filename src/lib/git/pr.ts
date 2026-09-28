@@ -340,6 +340,12 @@ async function getReviewThreads(
         complete = false;
         break;
       }
+      if (typeof page.pageInfo.hasNextPage !== "boolean") {
+        // hasNextPage missing or null is a malformed response, not "last page" — pagination could
+        // not be verified, so the nodes already fetched aren't confirmed as the full picture.
+        complete = false;
+        break;
+      }
       if (!page.pageInfo.hasNextPage) break;
       if (!page.pageInfo.endCursor) {
         // hasNextPage is true but no cursor to continue with — pagination can't proceed, so the

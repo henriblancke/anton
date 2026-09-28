@@ -281,6 +281,10 @@ async function dispatchInReview(args: {
   // identically — counted apart from `dispatched` so an operator reading the pass's note can tell
   // this suppressed target from a merely-idle one (a clean PR never reaches this loop's insides).
   let suppressed = 0;
+  // A row `recordPrReopened` actually unsettled — a reopened, still-clean PR whose only effect this
+  // pass is that write (anton PR #335 follow-up review): without counting it, `changed` below would
+  // report `false` even though a row moved, contradicting `JobEffect.changed`'s contract.
+  let reopened = 0;
   let lastError: unknown;
   for (const target of targets) {
     await ctx.heartbeat();
@@ -300,7 +304,9 @@ async function dispatchInReview(args: {
       // The counterpart observation (PR #335 review): a PR that reopens, stays clean, and closes
       // again would otherwise leave no evidence of the reopen for the next close to find.
       if (triage.state === "OPEN" && triage.prNumber !== undefined) {
-        await recordPrReopened(db, { projectId, prNumber: triage.prNumber });
+        if (await recordPrReopened(db, { projectId, prNumber: triage.prNumber })) {
+          reopened += 1;
+        }
       }
       if (!triage.needsFix) continue;
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
@@ -362,7 +368,9 @@ async function dispatchInReview(args: {
           // an orphan stamped `closed` that GitHub now reports reopened has no null row for the next
           // close to find (nothing here ever writes a fresh round), so without this the state chain
           // has no OPEN branch and a second close reads as a repeated poll of the first.
-          await recordPrReopened(db, { projectId, prNumber });
+          if (await recordPrReopened(db, { projectId, prNumber })) {
+            reopened += 1;
+          }
         }
       } catch (e) {
         // One unreadable orphaned PR must not block reconciling the rest — it stays null and is
@@ -378,15 +386,18 @@ async function dispatchInReview(args: {
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
-  if (targets.length === 0 && reconciled === 0) return { changed: false, note: "nothing in review" };
+  if (targets.length === 0 && reconciled === 0 && reopened === 0) {
+    return { changed: false, note: "nothing in review" };
+  }
 
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
   // nothing, and the counts together are what an operator checks the poll against.
   const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
   const reconciledNote = reconciled > 0 ? `, reconciled ${reconciled} orphaned PR(s)` : "";
+  const reopenedNote = reopened > 0 ? `, reopened ${reopened} PR(s)` : "";
   return {
-    changed: dispatched > 0 || reconciled > 0,
-    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}${reconciledNote}`,
+    changed: dispatched > 0 || reconciled > 0 || reopened > 0,
+    note: `examined ${targets.length} PR(s) in review, dispatched ${dispatched}${suppressedNote}${reconciledNote}${reopenedNote}`,
   };
 }
 
