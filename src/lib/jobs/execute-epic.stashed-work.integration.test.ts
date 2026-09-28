@@ -201,6 +201,104 @@ process.exit(0);`),
     });
 
     /**
+     * anton-wjfkn round 2 (pre-PR review): `refs/stash` is repository-wide, so a SIBLING ticket's own
+     * worktree pushing its own entry onto the shared stack mid-run is new to this ticket's baseline
+     * diff too. Fabricated here with `git stash create` + `git stash store` — the same shared-stack
+     * shape a concurrent worktree produces — carrying a subject that names a DIFFERENT branch, so a
+     * fix that scopes `gained()` only by "is it new" (and not by whose branch pushed it) would still
+     * adopt it: park over it, recover it, and hand its sha to this ticket's operator note as if it
+     * were this ticket's own recoverable work.
+     */
+    const stashingClaudeWithSiblingEntry = (name: string) =>
+      writeBin(
+        binDir,
+        name,
+        fakeClaudeReadingStdin(`const cp=require('child_process');
+const g=args=>cp.execFileSync('git',args,{cwd:process.cwd(),encoding:'utf8'});
+// The work: a real diff this ticket is owed, tracked edit and new file alike.
+fs.appendFileSync(path.join(process.cwd(),'AGENT_WORK.md'),'the agent\\'s work\\n');
+fs.writeFileSync(path.join(process.cwd(),'COVERAGE_FLOOR.md'),'171 lines of it\\n');
+// A SIBLING ticket's own worktree, pushing its own entry onto the same shared stash stack —
+// deliberately given a subject naming a DIFFERENT branch, and landing AFTER this ticket's baseline
+// read, exactly as a concurrent epic's own ticket would.
+fs.writeFileSync(path.join(process.cwd(),'SIBLING_ONLY.md'),'not this ticket\\'s work\\n');
+g(['add','-A']);
+const siblingCommit=g(['stash','create']).trim();
+g(['reset']);
+fs.unlinkSync(path.join(process.cwd(),'SIBLING_ONLY.md'));
+g(['stash','store','-m','On anton/some-other-ticket: their own work besides this ticket',siblingCommit]);
+// …then THIS ticket sets its own work aside to measure a baseline, exactly as the fati-8sme agent did.
+g(['stash','push','-u','-m','measuring the coverage baseline besides a sibling stash']);
+const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'system',subtype:'init',session_id:'stash-sibling'});
+e({type:'assistant',message:{content:[
+  {type:'text',text:'Coverage is 94.61 vs the 94.7 floor. Measuring the baseline, back in 20 minutes.'},
+  {type:'tool_use',name:'Bash',input:{command:'bun run test:coverage',run_in_background:true}},
+  {type:'tool_use',name:'ScheduleWakeup',input:{delaySeconds:1200}},
+]}});
+e({type:'result',subtype:'success',result:'Measuring the baseline, back in 20 minutes.',session_id:'stash-sibling',num_turns:4,is_error:false});
+process.exit(0);`),
+      );
+
+    it("does not adopt a sibling worktree's own stash entry that landed on the shared stack mid-run", async () => {
+      const featureId = await beads.create(repo, {
+        title: "A ticket whose run shares a stash stack with a sibling worktree",
+        type: "feature",
+        acceptance: "work file exists",
+        description: "## Goal\nImplement it without stashing.",
+      });
+      await beads.approve(repo, featureId);
+      const ticketId = createTicket(repo, {
+        title: "Raise coverage past the floor, beside a sibling's own stash",
+        parent: featureId,
+        acceptance: "work file exists",
+      });
+
+      const runner = makeEpicRunner(ctx);
+      process.env.ANTON_CLAUDE_BIN = stashingClaudeWithSiblingEntry("claude-stashing-sibling");
+      try {
+        const jobId = await driveEpicRun(runner, { projectId, epicBeadId: featureId });
+        const job = await getJob(tdb.db, jobId);
+        expect(job?.status).toBe("parked");
+
+        // Both entries land on the shared stack — the sibling's fabricated push and this ticket's own
+        // — beside whatever earlier cases in this suite already left there (the stack is never
+        // cleared between them, exactly as it is not between concurrent worktrees in production).
+        const stashes = stashList();
+        const own = stashes.find((line) =>
+          line.includes("measuring the coverage baseline besides a sibling stash"),
+        )!;
+        const sibling = stashes.find((line) =>
+          line.includes("their own work besides this ticket"),
+        )!;
+        expect(own).toBeDefined();
+        expect(sibling).toBeDefined();
+        const ownSha = own.split(" ")[0];
+        const siblingSha = sibling.split(" ")[0];
+
+        // The park names ONLY this ticket's own entry — the sibling's is never adopted as this
+        // ticket's recoverable work, however new it looked against the baseline.
+        expect(job?.lastError).toContain(ownSha);
+        expect(job?.lastError).not.toContain(siblingSha);
+
+        const ticket = await beads.show(repo, ticketId);
+        const noteText = JSON.stringify(ticket);
+        expect(noteText).toContain(ownSha);
+        expect(noteText).not.toContain(siblingSha);
+
+        // The restored tree carries only THIS ticket's own work — the sibling's entry was never
+        // applied into it.
+        const run = (await tdb.db.select().from(schema.runs)).find((r) => r.epicBeadId === featureId)!;
+        const worktree = run.worktreePath!;
+        expect(readFileSync(join(worktree, "AGENT_WORK.md"), "utf8")).toContain("the agent's work");
+        expect(readFileSync(join(worktree, "COVERAGE_FLOOR.md"), "utf8")).toContain("171 lines of it");
+        expect(existsSync(join(worktree, "SIBLING_ONLY.md"))).toBe(false);
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = successClaude;
+      }
+    });
+
+    /**
      * The same set-aside tree reaching the DELIVERY GATE rather than the yield check — the second,
      * independent way the incident's tree could have been misread.
      *

@@ -19,7 +19,12 @@
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { AgentYieldedError, holdsRecoverableWork, StashedWorkError } from "./execute-epic-errors";
-import { assertDelivered, recordStepReport, type StashRecovery } from "./execute-epic-ticket";
+import {
+  assertDelivered,
+  recordStepReport,
+  stashEntryOnBranch,
+  type StashRecovery,
+} from "./execute-epic-ticket";
 import type { TicketProgress } from "./execute-epic-ticket-settle";
 import { ticketBlockNote } from "./execute-epic-ticket-settle";
 import type { StepFacts } from "./step-registry";
@@ -69,6 +74,47 @@ const NO_STASH: StashRecovery = {
 };
 
 const failure = (run: Promise<unknown>) => run.then(() => null, (e: Error) => e);
+
+/**
+ * anton-wjfkn round 2 (pre-PR review): `refs/stash` is repository-wide, and anton runs several
+ * epics' worktrees off one repo concurrently — a sibling ticket's OWN push can land between this
+ * ticket's baseline read and its own gained-check, which the baseline-by-sha diff alone cannot
+ * distinguish from this ticket's own entry. The subject is the one field that names whose checkout
+ * pushed it, so `gained()` must scope by it too.
+ */
+describe("stashEntryOnBranch — telling a sibling worktree's push from this ticket's own (anton-wjfkn)", () => {
+  it("matches an explicit `git stash push -m` on this ticket's branch", () => {
+    expect(stashEntryOnBranch({ sha: SHA_A, subject: "On anton/anton-wjfkn: measuring" }, "anton/anton-wjfkn")).toBe(
+      true,
+    );
+  });
+
+  it("matches a bare autostash (`WIP on <branch>`) on this ticket's branch", () => {
+    expect(
+      stashEntryOnBranch({ sha: SHA_A, subject: "WIP on anton/anton-wjfkn: abc1234 msg" }, "anton/anton-wjfkn"),
+    ).toBe(true);
+  });
+
+  it("refuses a sibling ticket's entry pushed from a DIFFERENT branch", () => {
+    expect(stashEntryOnBranch({ sha: SHA_A, subject: "On anton/anton-other: their work" }, "anton/anton-wjfkn")).toBe(
+      false,
+    );
+  });
+
+  // A prefix match (`anton/anton-wjfkn-2` starting with `anton/anton-wjfkn`) is exactly the kind of
+  // false positive an unanchored substring check would produce — the branch name must match to the
+  // colon, not merely appear as a prefix of a longer one.
+  it("refuses a branch name that only shares this ticket's branch as a prefix", () => {
+    expect(
+      stashEntryOnBranch({ sha: SHA_A, subject: "On anton/anton-wjfkn-2: their work" }, "anton/anton-wjfkn"),
+    ).toBe(false);
+  });
+
+  it("treats a branch name containing regex metacharacters as a literal", () => {
+    expect(stashEntryOnBranch({ sha: SHA_A, subject: "On feature/a.b+c: work" }, "feature/a.b+c")).toBe(true);
+    expect(stashEntryOnBranch({ sha: SHA_A, subject: "On featureXaXbXc: work" }, "feature/a.b+c")).toBe(false);
+  });
+});
 
 describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero diff (anton-wjfkn)", () => {
   it("refuses the no-delivery block when the worktree gained a stash entry", async () => {

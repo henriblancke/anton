@@ -97,7 +97,7 @@ export async function runTicket(args: {
   const baseline = await readTicketBaseline(worktreePath);
   const ticketCtx = narrowToTicket(run, ticket, session, budget, baseline);
   const progress: TicketProgress = { committed: false, delivered: false, selfReport: null };
-  const stash = ticketStashRecovery(worktreePath, await readStashEntries(worktreePath));
+  const stash = ticketStashRecovery(worktreePath, run.branch, await readStashEntries(worktreePath));
 
   try {
     await walkTicketSteps({ run, steps: args.steps, ticket, ticketCtx, session, progress, stash });
@@ -330,24 +330,52 @@ export interface StashRecovery {
 }
 
 /**
- * The production {@link StashRecovery} for one ticket, closed over the stash stack as it stood BEFORE
- * any of the ticket's steps ran.
+ * Whether a stash entry's reflog subject names `branch` — git's own record of which checkout pushed
+ * it: `On <branch>: <message>` for an explicit `git stash push -m`, `WIP on <branch>: <sha> <subject>`
+ * for an autostash (anton-wjfkn round 2 review).
  *
- * The baseline is what makes the answer this ticket's own. `refs/stash` lives in the shared git dir,
- * so every worktree on this machine pushes onto one stack — a run executing tickets in parallel
- * worktrees has siblings' entries on it, and an absolute read would attribute them here: the ticket
- * would park `stashed-work` over a neighbour's entry and, worse, APPLY that neighbour's changes into
- * this worktree. Diffing against the baseline by sha keeps both halves honest, and it is only a
- * one-way guard — an entry that was already there and has since been popped elsewhere simply drops out
- * of the delta, which is the correct answer.
+ * The baseline diff in {@link ticketStashRecovery} tells a NEW entry from an old one, but `refs/stash`
+ * is repository-wide — every worktree cut from this repo pushes onto the same stack, and anton runs
+ * several epics' worktrees off one repo concurrently. A sibling ticket's OWN push landing between this
+ * ticket's baseline read and its own gained-check is new to the delta too, and an absolute "is it new"
+ * read would misattribute it here — parking `stashed-work` over a neighbour's entry and, worse, calling
+ * {@link applyStashEntry} to splice that neighbour's changes into this worktree. The subject is the one
+ * field that says whose checkout it came from, so scoping the delta by it (not just by sha) is what
+ * keeps a sibling's entry out of this ticket's recovery.
+ */
+export function stashEntryOnBranch(entry: StashEntry, branch: string): boolean {
+  const escaped = branch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`^(?:WIP on|On) ${escaped}:`).test(entry.subject);
+}
+
+/**
+ * The production {@link StashRecovery} for one ticket, closed over the stash stack as it stood BEFORE
+ * any of the ticket's steps ran, and over the ticket's own branch.
+ *
+ * The baseline is what makes the answer this ticket's own IN TIME. `refs/stash` lives in the shared
+ * git dir, so every worktree on this machine pushes onto one stack — a run executing tickets in
+ * parallel worktrees has siblings' entries on it, and an absolute read would attribute them here: the
+ * ticket would park `stashed-work` over a neighbour's entry and, worse, APPLY that neighbour's changes
+ * into this worktree. Diffing against the baseline by sha keeps both halves honest for an entry that
+ * predates this ticket's run — but a sibling ticket can push its OWN entry after this ticket's baseline
+ * was read, which the sha diff alone cannot tell apart from this ticket's entry. The branch filter is
+ * what makes the answer this ticket's own IN OWNERSHIP: only an entry whose reflog subject names this
+ * ticket's own branch survives ({@link stashEntryOnBranch}). Together they are a two-way guard — an
+ * entry that was already there and has since been popped elsewhere simply drops out of the delta
+ * (correct), and an entry pushed by a different checkout drops out regardless of when it landed
+ * (anton-wjfkn round 2).
  */
 function ticketStashRecovery(
   worktreePath: string,
+  branch: string,
   baseline: readonly StashEntry[],
 ): StashRecovery {
   const before = new Set(baseline.map((e) => e.sha));
   return {
-    gained: async () => (await readStashEntries(worktreePath)).filter((e) => !before.has(e.sha)),
+    gained: async () =>
+      (await readStashEntries(worktreePath)).filter(
+        (e) => !before.has(e.sha) && stashEntryOnBranch(e, branch),
+      ),
     apply: (sha) => applyStashEntry(worktreePath, sha),
   };
 }
