@@ -452,9 +452,27 @@ export async function assertDelivered(
   // Asked before either success path below may return (anton-wjfkn, PR #333 review round 2) — see the
   // doc comment above for why a committed or verified-satisfied tree is not exempt. Deliberately NOT
   // caught into `[]` (PR #333 review): a `git stash list` failure here is not "no new stash", and
-  // swallowing it would let a committed-but-incomplete ticket close as delivered. Let it fall into the
-  // ticket's own catch, exactly like the baseline read does.
-  const stashed = await stash.gained();
+  // swallowing it would let a committed-but-incomplete ticket close as delivered. Wrapped into the
+  // SAME `RecoverableWork`-shaped stop the baseline read throws (PR #333 review round 3) — not left to
+  // propagate bare: `holdsRecoverableWork` only recognises `StashedWorkError`/`AgentYieldedError`/
+  // `StashBaselineUnreadableError`, so a bare rejection here would reach `settleFailedTicket` as an
+  // ORDINARY failure. With `committed` still false at that point (the common case this whole gate
+  // exists for), an ordinary failure is neither blocked nor kept — `releaseFailedTicket`'s block
+  // condition is all-false, so the ticket is silently reset to `open` with no note, and the worktree
+  // is torn down as if this were plain setup residue, discarding whatever the tree or an unread stash
+  // entry actually held. With `committed` true, it would fall into the generic `post-commit` kind
+  // instead of naming the stash this ticket may still be carrying.
+  let stashed: readonly StashEntry[];
+  try {
+    stashed = await stash.gained();
+  } catch (readError) {
+    throw new StashBaselineUnreadableError(
+      ticket.id,
+      readError,
+      "while its delivery gate was checking whether the tree was merely set aside",
+      "at this point",
+    );
+  }
   if (stashed.length > 0) {
     await refuseStashedDelivery(ticket, progress, stashed, stash, committed);
   }

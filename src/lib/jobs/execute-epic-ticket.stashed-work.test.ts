@@ -262,13 +262,14 @@ describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero 
   });
 
   /**
-   * A stash read that FAILS must not be read as "gained none" either (PR #333 review): a `git stash
-   * list` failure after the agent stashed work is not "no new stash", and reporting a zero-diff block
-   * over it would tell the operator the tree is genuinely empty when an unread stash might hold the
-   * change. Left to propagate, exactly like the ticket's baseline stash read — the ticket stops the
-   * same safe way any other setup failure does, with the answer left unknown rather than guessed at.
+   * A stash read that FAILS must not be read as "gained none" either (PR #333 review round 2), and a
+   * bare rethrow is just as wrong as guessing (PR #333 review round 3): a `git stash list` failure
+   * here is not "no new stash", and a bare `Error` is invisible to `holdsRecoverableWork`, so the
+   * teardown would force-remove this worktree and (with `committed: false`) silently reopen the
+   * ticket with no note at all. Wrapped into the SAME `RecoverableWork`-shaped stop the baseline read
+   * throws, so the worktree is kept and the block note says the stash state is unknown.
    */
-  it("propagates a stash read failure rather than guessing the stack gained nothing", async () => {
+  it("wraps a stash read failure into a RecoverableWork stop, exactly like the baseline read", async () => {
     const stash: StashRecovery = {
       gained: async () => {
         throw new Error("git stash list exploded");
@@ -279,7 +280,31 @@ describe("assertDelivered — an empty tree that is merely SET ASIDE is no zero 
     const err = await failure(assertDelivered(TICKET, { committed: false }, progress(), neverAsked, stash));
 
     expect(err).not.toBeInstanceOf(StashedWorkError);
+    expect(err).toBeInstanceOf(StashBaselineUnreadableError);
+    expect(holdsRecoverableWork(err)).toBe(true);
+    expect((err as StashBaselineUnreadableError).readFailed).toBe(true);
     expect(err?.message).toContain("git stash list exploded");
+    expect(err?.message).toContain("KEPT");
+  });
+
+  /**
+   * The same wrap applies over a COMMITTED tree (PR #333 review round 3): a partial commit beside an
+   * unreadable stash list is exactly the case the gate must not silently drop into an ordinary
+   * `post-commit` block, losing the fact that some of the change may still be sitting unread on the
+   * stack.
+   */
+  it("wraps a stash read failure the same way when the ticket already committed", async () => {
+    const stash: StashRecovery = {
+      gained: async () => {
+        throw new Error("git stash list exploded");
+      },
+      apply: async () => true,
+    };
+
+    const err = await failure(assertDelivered(TICKET, { committed: true }, progress(), neverAsked, stash));
+
+    expect(err).toBeInstanceOf(StashBaselineUnreadableError);
+    expect(holdsRecoverableWork(err)).toBe(true);
   });
 });
 
@@ -562,18 +587,29 @@ describe("the block note tells an operator to RECOVER, not to re-implement (anto
   });
 
   /**
-   * anton-wjfkn, PR #333 review round 2: a baseline anton could not even read before this ticket's
-   * steps ran gets its own kind, distinct from an agent action — nothing here is the agent's doing.
+   * anton-wjfkn, PR #333 review round 2: a stash list anton could not even read gets its own kind,
+   * distinct from an agent action — nothing here is the agent's doing.
    */
-  it("describes a baseline read failure as anton's own stop, not the agent's", () => {
+  it("describes a stash read failure as anton's own stop, not the agent's", () => {
     const text = note("baseline-unreadable", [], [], null, { readFailed: true });
 
     expect(text).toContain("anton could not read this worktree's stash list");
-    expect(text).toContain("before this ticket's steps even ran");
     expect(text).not.toContain("STASHED its own work");
     expect(text).not.toContain("ENDED ITS TURN");
     expect(text).toContain("Do NOT re-implement it from scratch");
     expect(text).toContain(`bd update ${TICKET.id} --status open`);
+  });
+
+  /**
+   * anton-wjfkn, PR #333 review round 3: this same kind now also covers the delivery gate's OWN read
+   * (after the commit step, possibly alongside a real commit) — the opening must not claim "before
+   * its steps ran" over a stop that can carry a commit right there in the evidence clause.
+   */
+  it("says nothing about WHEN the read failed, so a committed round-3 stop isn't misdescribed", () => {
+    const text = note("baseline-unreadable", [], [], null, { readFailed: true, committed: true });
+
+    expect(text).not.toContain("steps");
+    expect(text).toContain("[session sess-1, committed on anton/anton-wjfkn @ unknown]");
   });
 
   // anton-wjfkn round 3 review: this note is re-surfaced to an operator through

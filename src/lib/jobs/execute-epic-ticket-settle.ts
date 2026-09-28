@@ -1232,8 +1232,12 @@ function recoverableWorkBody(
       : kind === "agent-yielded"
         ? `the agent ENDED ITS TURN to wait on a background job and never reported an outcome, so it ` +
           `stopped mid-work while its session exited cleanly.`
-        : `anton could not read this worktree's stash list before this ticket's steps even ran, so ` +
-          `whether the checkout already held uncommitted work when this attempt started is unknown.`;
+        : // Deliberately silent on WHEN the read failed (PR #333 review round 3): this kind now covers
+          // both the baseline read (before any step ran) and the delivery gate's own read (after the
+          // commit step, possibly over a real commit) — a fixed "before its steps ran" claim would be
+          // false for the second and confuse an operator staring at a commit that plainly exists.
+          `anton could not read this worktree's stash list — the read itself failed, so whether the ` +
+          `checkout holds uncommitted work anton has not accounted for is unknown.`;
   // Three true answers to "is the change actually in the worktree": all of it (nothing failed, or
   // nothing was ever stashed to begin with), none of it (every apply failed), or some of it.
   const recoveryClause =

@@ -266,20 +266,22 @@ export class AgentYieldedError extends Error implements RunFailureParts, Recover
 }
 
 /**
- * anton could not even READ this ticket's stash BASELINE before any of its steps ran (anton-wjfkn, PR
- * #333 review round 2) — so whether the checkout already held uncommitted work when this attempt
- * started (loose in the tree, or already on the stash stack from a neighbour's push or an earlier
- * stop) is simply unknown.
+ * anton could not even READ this ticket's stash list, at one of two points a stash read gates a
+ * settlement (anton-wjfkn, PR #333 review round 2 and round 3) — so whether the checkout holds
+ * uncommitted work anton hasn't accounted for (loose in the tree, or on the stash stack from a
+ * neighbour's push or an earlier stop) is simply unknown.
  *
- * A plain rethrow of that read failure would settle this ticket as an ORDINARY setup error —
- * indistinguishable at the teardown from any other reason a ticket failed, and an ordinary failure's
- * worktree is force-removed as the run's residue. That is wrong precisely when it matters most: a
- * RESUME of a checkout a human gate or an earlier yield already left dirty, where this read failure is
- * transient and the tree it interrupted was never anton's to discard on a guess. So this is its own
- * class, {@link RecoverableWork}-shaped like {@link StashedWorkError} and {@link AgentYieldedError},
- * purely so {@link holdsRecoverableWork} recognises the stop and the teardown keeps the checkout
- * instead of assuming it was safe to remove. `stashes`/`restoreFailures` are always empty — there was
- * nothing to name, only something that could not be ruled out — and `readFailed` is always true.
+ * A plain rethrow of that read failure would settle this ticket as an ORDINARY setup/delivery
+ * failure — indistinguishable at the teardown from any other reason a ticket failed, and an ordinary
+ * failure's worktree is force-removed as the run's residue. That is wrong precisely when it matters
+ * most: a RESUME of a checkout a human gate or an earlier yield already left dirty, or a ticket that
+ * committed real work and merely couldn't confirm the stack alongside it — either way this read
+ * failure is transient and the tree was never anton's to discard on a guess. So both read sites throw
+ * this one class, {@link RecoverableWork}-shaped like {@link StashedWorkError} and
+ * {@link AgentYieldedError}, purely so {@link holdsRecoverableWork} recognises the stop and the
+ * teardown keeps the checkout instead of assuming it was safe to remove. `stashes`/`restoreFailures`
+ * are always empty — there was nothing to name, only something that could not be ruled out — and
+ * `readFailed` is always true.
  */
 export class StashBaselineUnreadableError extends Error implements RunFailureParts, RecoverableWork {
   readonly structural: string;
@@ -287,11 +289,22 @@ export class StashBaselineUnreadableError extends Error implements RunFailurePar
   readonly stashes: readonly string[] = [];
   readonly restoreFailures: readonly string[] = [];
   readonly readFailed = true;
-  constructor(ticketId: string, cause: unknown) {
+  constructor(
+    ticketId: string,
+    cause: unknown,
+    /**
+     * WHEN this read happened, and what is left unaccounted for as a result — the one thing the two
+     * call sites cannot share, since the delivery-gate's read runs after this ticket's own steps
+     * (round 3) rather than before any of them (round 2). Defaults to the baseline read's own
+     * wording, the original and still the more common call site.
+     */
+    when: string = "before its steps ran",
+    unaccounted: string = "when this attempt started",
+  ) {
     const reason = cause instanceof Error ? cause.message : String(cause);
     const structural =
-      `${ticketId} could not read this worktree's stash list before its steps ran (${reason}). ` +
-      `Whether the checkout already held uncommitted work when this attempt started — loose in the ` +
+      `${ticketId} could not read this worktree's stash list ${when} (${reason}). ` +
+      `Whether the checkout already held uncommitted work ${unaccounted} — loose in the ` +
       `tree, or already on the stash stack from an earlier stop — is unknown, so the run halts here ` +
       `rather than guess: the worktree is KEPT rather than removed. Retry once the read succeeds, ` +
       `then resume the run.`;
