@@ -8,6 +8,7 @@
  * operators share. Nothing here decides WHICH tickets move; see review-fix-rehome.ts for that.
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
 import { extractOutcomeIdsSection, outcomeIdsOf } from "../backlog";
 import { beadSkeleton } from "../beads/formula";
 import { unterminatedCloser } from "../beads/markdown";
@@ -121,26 +122,36 @@ export async function resolveFollowUp(
  * this bead and closes the merged source, no later sweep ever re-selects that closed epic to retry
  * the patch, so a failed update here must hold finalization back rather than let the caller reach a
  * runnable epic that permanently lacks the section.
+ *
+ * Locked, and re-read inside the lock (PR #334 review, mirroring orphan-grooming's own reuse
+ * repair): `reused` is a snapshot from {@link electFollowUp}'s read, and `reconcileLosers` runs an
+ * awaited round trip between that read and this patch — a founder editing this bead's description
+ * in that window must not have their edit silently discarded by `beads.update` replacing the whole
+ * field with the stale copy.
  */
 async function reconcileReusedContract(ctx: FollowUpContext, reused: Bead): Promise<boolean> {
-  const description = reused.description ?? "";
-  if (extractOutcomeIdsSection(description).present) return true;
-  const outcomeIds = outcomeIdsOf(ctx.epic);
-  const kept = description.trimEnd();
-  const closer = unterminatedCloser(kept);
-  const patched = [
-    kept,
-    ...(closer ? [closer] : []),
-    ``,
-    `## Outcome IDs`,
-    ``,
-    // Direct patch, not a formula render — unlike newFollowUpEpic's placeholder dance
-    // ({@link blankOutcomeIdsPlaceholder}), an empty id list here is written genuinely empty.
-    ...(outcomeIds.length > 0 ? [outcomeIds.map((id) => `outcome:${id}`).join(", ")] : []),
-  ].join("\n");
-  return safe(() =>
-    beads.update(ctx.repo, reused.id, { description: patched }, reused.labels ?? []),
-  );
+  return withBeadWriteLock(ctx.repo, reused.id, async () => {
+    const fresh = await ctx.reread(reused.id);
+    if (!fresh) return false;
+    const description = fresh.description ?? "";
+    if (extractOutcomeIdsSection(description).present) return true;
+    const outcomeIds = outcomeIdsOf(ctx.epic);
+    const kept = description.trimEnd();
+    const closer = unterminatedCloser(kept);
+    const patched = [
+      kept,
+      ...(closer ? [closer] : []),
+      ``,
+      `## Outcome IDs`,
+      ``,
+      // Direct patch, not a formula render — unlike newFollowUpEpic's placeholder dance
+      // ({@link blankOutcomeIdsPlaceholder}), an empty id list here is written genuinely empty.
+      ...(outcomeIds.length > 0 ? [outcomeIds.map((id) => `outcome:${id}`).join(", ")] : []),
+    ].join("\n");
+    return safe(() =>
+      beads.update(ctx.repo, reused.id, { description: patched }, fresh.labels ?? []),
+    );
+  });
 }
 
 /**
