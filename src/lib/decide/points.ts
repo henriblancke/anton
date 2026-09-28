@@ -154,8 +154,13 @@ export function listPoints(): readonly DecisionPoint[] {
  * copies of the rule would let a row claim a digest over state the backend never saw.
  */
 export function narrowState(point: DecisionPoint, state: DecisionState): DecisionState {
-  const picked: Record<string, unknown> = {};
-  for (const field of point.stateFields) picked[field] = state[field];
+  // Prototype-free: a declared field named "__proto__" must land as an own property,
+  // not reassign the object's prototype via the inherited setter (which would silently
+  // drop it from both the backend prompt and decisionInputHash).
+  const picked: Record<string, unknown> = Object.create(null);
+  for (const field of point.stateFields) {
+    Object.defineProperty(picked, field, { value: state[field], enumerable: true, writable: true, configurable: true });
+  }
   return picked;
 }
 

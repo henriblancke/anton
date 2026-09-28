@@ -3,7 +3,7 @@
  * not surface as a wrong decision three calls later.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { definePoint, getPoint, listPoints, resetRegistryForTests } from "./points";
+import { definePoint, getPoint, listPoints, narrowState, resetRegistryForTests } from "./points";
 
 afterEach(() => resetRegistryForTests());
 
@@ -165,5 +165,26 @@ describe("resetRegistryForTests", () => {
     resetRegistryForTests();
     expect(listPoints()).toEqual([]);
     expect(getPoint("review-nit")).toBeUndefined();
+  });
+});
+
+describe("narrowState", () => {
+  it("picks only the point's declared fields", () => {
+    const point = { ...CHOICE_POINT, stateFields: ["nitText"] };
+    expect(narrowState(point, { nitText: "x", secret: "y" })).toEqual({ nitText: "x" });
+  });
+
+  it("preserves a declared field named `__proto__` as an own property instead of the inherited setter", () => {
+    // Assigning `picked["__proto__"] = …` on a plain object literal reassigns the object's
+    // prototype rather than creating an own property, silently dropping the field from both
+    // the backend prompt and decisionInputHash.
+    const point = { ...CHOICE_POINT, stateFields: ["__proto__"] };
+    // Computed key: an object literal's bare `__proto__:` sets the prototype instead of
+    // creating an own property, so the input itself needs the same own-property trick.
+    const state = { ["__proto__"]: "malicious-looking-value" };
+    const narrowed = narrowState(point, state);
+
+    expect(Object.getOwnPropertyDescriptor(narrowed, "__proto__")?.value).toBe("malicious-looking-value");
+    expect(Object.keys(narrowed)).toEqual(["__proto__"]);
   });
 });

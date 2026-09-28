@@ -330,6 +330,27 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     expect(Number.isNaN(answer.confidence)).toBe(true);
   });
 
+  it("resolves to a deliberately-invalid answer when the reply carries a key outside the registered options", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      // An undeclared "other" key would otherwise be silently ignored while the registered
+      // options still summed close enough to 1 to look valid on their own.
+      runClaude: fakeDispatcher(async () =>
+        ok('```json\n{"probabilities": {"fix": 0.9, "decline": 0.05, "human": 0.05, "other": 0.9}}\n```'),
+      ),
+    });
+
+    const answer = await ask(choicePoint(), { nitText: "x" });
+
+    expect(answer.value).toBeUndefined();
+    expect(Number.isNaN(answer.confidence)).toBe(true);
+  });
+
   it("rejects when the reply carries no parseable json block", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({

@@ -90,7 +90,7 @@ function reportFormatSection(question: Question): string {
     case "choice":
       lines.push(
         "```json",
-        `{"probabilities": {${question.options.map((option) => `"${option}": <0..1>`).join(", ")}}}`,
+        `{"probabilities": {${question.options.map((option) => `${JSON.stringify(option)}: <0..1>`).join(", ")}}}`,
         "```",
         ``,
         "`probabilities` is MANDATORY: one entry per option above, each a number from 0 to 1, the",
@@ -200,6 +200,12 @@ function readDistribution(
   options: readonly string[],
 ): Record<string, number> | undefined {
   if (typeof raw !== "object" || raw === null) return undefined;
+  // An extra key outside the registered options means the reported map isn't the
+  // required one-entry-per-option distribution — its sum can't be trusted either.
+  const optionSet = new Set(options);
+  for (const key of Object.keys(raw)) {
+    if (!optionSet.has(key)) return undefined;
+  }
   // Prototype-free: a registered option named "__proto__" must land as an own
   // property, not reassign the object's prototype via the inherited setter.
   const distribution: Record<string, number> = Object.create(null);
