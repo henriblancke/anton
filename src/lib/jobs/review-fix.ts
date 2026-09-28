@@ -301,7 +301,10 @@ async function dispatchInReview(args: { db: AntonDb; ctx: JobContext }): Promise
         dispatched += 1;
         continue;
       }
-      if (triage.headSha && reviewFixPrParkedAtHead(db, projectId, target.id, triage.headSha)) {
+      if (
+        triage.headSha &&
+        reviewFixPrParkedAtHead(db, projectId, target.id, triage.headSha, triage.fingerprint)
+      ) {
         suppressedParked += 1;
         consoleLog.info(
           `epic ${target.id}: suppressed — parked review-fix-pr at unchanged head ${triage.headSha}`,
@@ -512,7 +515,7 @@ async function handleEpic(args: {
   return withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts, alreadyAhead } = await prepareFixWorktree({
+    const { worktree, conflicts, alreadyAhead, preSessionHead } = await prepareFixWorktree({
       ctx,
       repo,
       branch,
@@ -535,6 +538,7 @@ async function handleEpic(args: {
       verdict,
       conflicts,
       alreadyAhead,
+      preSessionHead,
       branch,
       number,
     });
@@ -597,7 +601,23 @@ export async function prepareFixWorktree(args: {
   number: number;
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
-}): Promise<{ worktree: Worktree; conflicts: string[]; alreadyAhead: boolean }> {
+}): Promise<{
+  worktree: Worktree;
+  conflicts: string[];
+  alreadyAhead: boolean;
+  /**
+   * Worktree HEAD once this function is done touching it — i.e. BEFORE claude or the gate
+   * follow-up runs. A clean, conflict-free base premerge lands its own commit right here, inside
+   * this function, well before any review-fix work happens (see `premergeBase`'s "clean
+   * auto-merge" comment) — so this is the boundary `runFixSession` diffs against to tell "this
+   * round's session/gate follow-up actually changed something" apart from "the branch merely sits
+   * ahead of origin because of a base sync that has nothing to do with the review feedback"
+   * (PR #338 review, chatgpt-codex-connector: a clean base-only premerge otherwise makes
+   * `commitAndPushFix` return `pushed: true` for a round where claude changed nothing, which
+   * `fabricatedFix` then can't tell apart from a genuine fix).
+   */
+  preSessionHead: string;
+}> {
   const { ctx, repo, branch, settings, baseBranch, number, claimOwner } = args;
 
   const worktree = await createWorktree({
@@ -679,7 +699,17 @@ export async function prepareFixWorktree(args: {
     await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
     await ctx.heartbeat();
   }
-  return { worktree, conflicts, alreadyAhead };
+  // Read AFTER the premerge above, not before — a clean auto-merge already landed its own commit by
+  // this point (see the field's own doc on the return type), and that commit must count as part of
+  // the pre-session baseline, not as evidence of a session-produced change. Best-effort like every
+  // other git read on this path: a failed read falls back to "" (never a real sha, so the later
+  // diff reads as "changed") rather than aborting a fix over a HEAD read anton doesn't strictly need
+  // yet — the same tolerance `branchAheadOfRemote` above already applies to a git hiccup here.
+  const preSessionHead = await readWorktreeState(worktree.path).then(
+    (s) => s.head,
+    () => "",
+  );
+  return { worktree, conflicts, alreadyAhead, preSessionHead };
 }
 
 /**
@@ -809,6 +839,8 @@ async function runFixSession(args: {
   conflicts: string[];
   /** Ahead of origin before this run touched anything — see {@link prepareFixWorktree}. */
   alreadyAhead: boolean;
+  /** Worktree HEAD before claude/the gate follow-up ran — see {@link prepareFixWorktree}. */
+  preSessionHead: string;
   branch: string;
   number: number;
 }): Promise<RunFixSessionResult> {
@@ -825,6 +857,7 @@ async function runFixSession(args: {
     verdict,
     conflicts,
     alreadyAhead,
+    preSessionHead,
     branch,
     number,
   } = args;
@@ -1036,24 +1069,36 @@ async function runFixSession(args: {
     await endSession(db, clock, sessionId, "done", pushed);
     sessionSettled = true;
 
+    // `pushed` alone is not proof this round's claude/gate-follow-up work produced anything: a clean
+    // base premerge (see `prepareFixWorktree`'s `preSessionHead` doc) can already have HEAD ahead of
+    // origin before claude ever ran, so `commitAndPushFix` returns `pushed: true` for that merge
+    // alone even when claude changed nothing. `fabricatedFix` must be told THIS, not raw `pushed` —
+    // otherwise a claude report that (incorrectly) claims a thread "fixed" gets accepted as real
+    // just because the ambient base sync happened to go out on the same push (PR #338 review,
+    // chatgpt-codex-connector).
+    const { head: postSessionHead } = await readWorktreeState(worktree.path);
+    const sessionProducedChange = postSessionHead !== preSessionHead;
+
     const report = parseThreadReport(result.text);
     const answeredIds = await applyThreadOutcomes({
       repo,
       number,
       pr,
       report,
-      pushed,
+      pushed: sessionProducedChange,
       signal: ctx.signal,
       logPath,
     });
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
-    // no thread report (CI-only/conflict-only/no-inline-threads trigger).
+    // no thread report (CI-only/conflict-only/no-inline-threads trigger). Gated on
+    // `sessionProducedChange`, not raw `pushed`, for the same reason as `applyThreadOutcomes` above —
+    // the "Review-fix rounds" region must not credit a base-sync-only push with a fix nobody made.
     await refreshFixRoundsBody({
       repo,
       number,
       report,
-      pushed,
+      pushed: sessionProducedChange,
       now: new Date(clock.now()),
       logPath,
       reasons: verdict.reasons,

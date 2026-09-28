@@ -561,7 +561,12 @@ export function enqueueReviewFixPrIfAbsent(
       );
       if (existing) return undefined;
 
-      if (opts?.headSha && parkedAtHead(tx, projectId, epicBeadId, opts.headSha)) return undefined;
+      if (
+        opts?.headSha &&
+        parkedAtHead(tx, projectId, epicBeadId, opts.headSha, opts.fingerprint)
+      ) {
+        return undefined;
+      }
 
       if (
         opts?.headSha &&
@@ -578,7 +583,9 @@ export function enqueueReviewFixPrIfAbsent(
           type: "review-fix-pr",
           projectId,
           payloadJson: JSON.stringify(
-            opts?.headSha ? { projectId, epicBeadId, headSha: opts.headSha } : { projectId, epicBeadId },
+            opts?.headSha
+              ? { projectId, epicBeadId, headSha: opts.headSha, fingerprint: opts.fingerprint }
+              : { projectId, epicBeadId },
           ),
           status: "queued",
           runAt: secDate(nowMs),
@@ -595,40 +602,72 @@ export function enqueueReviewFixPrIfAbsent(
   }
 }
 
-/** Id of a `parked` `review-fix-pr` job for this target whose payload's `headSha` matches. */
+/**
+ * Id of a `parked` `review-fix-pr` job for this target whose payload's `headSha` matches AND whose
+ * stored `fingerprint` (the `classifyReview` fingerprint this attempt was dispatched against, saved
+ * into the payload at enqueue time above) is unchanged from `fingerprint` — mirroring
+ * {@link answeredUnchanged}'s same two-part identity for a `done` row. A red gate parked at head X
+ * used to stay suppressed at head X forever, even once the PR's BASE advanced enough to fix the gate
+ * or change the premerged tree — `classifyReview` (src/lib/git/pr.ts) folds the base tip into every
+ * actionable fingerprint for exactly this reason, but this suppression ignored it and matched on the
+ * (unchanged) PR head alone, parking the target indefinitely until a human resumed the job or the PR
+ * branch itself was pushed to (PR #338 review, chatgpt-codex-connector). `fingerprint === undefined`
+ * (a caller with nothing finer to check, or a legacy parked row from before this field existed) falls
+ * back to the old headSha-only match — there is no base-change evidence to admit a retry with.
+ */
 function parkedAtHead(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,
   headSha: string,
+  fingerprint?: string[],
 ): string | undefined {
-  return firstJobId(
-    tx,
-    and(
-      eq(schema.jobs.type, "review-fix-pr"),
-      eq(schema.jobs.projectId, projectId),
-      eq(schema.jobs.status, "parked"),
-      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
-    ),
-  );
+  const row = tx
+    .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "review-fix-pr"),
+        eq(schema.jobs.projectId, projectId),
+        eq(schema.jobs.status, "parked"),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt))
+    .limit(1)
+    .all()[0];
+  if (!row) return undefined;
+  if (fingerprint === undefined) return row.id;
+  let payload: { fingerprint?: string[] };
+  try {
+    payload = JSON.parse(row.payloadJson);
+  } catch {
+    return row.id;
+  }
+  return payload.fingerprint === undefined ||
+    JSON.stringify(payload.fingerprint) === JSON.stringify(fingerprint)
+    ? row.id
+    : undefined;
 }
 
 /**
- * Is a target's most recent `review-fix-pr` attempt parked at the SAME head as `headSha` — i.e. is
- * a fresh enqueue for it currently suppressed by {@link enqueueReviewFixPrIfAbsent}'s head check?
- * Exported so a caller that already knows a target needs a fix, but got no job id back, can tell an
- * operator WHY: suppressed (a red gate parked on this exact commit, nothing to retry yet) versus
- * merely covered by a job already in flight. Read-only and outside any transaction — a harmless race
- * with the enqueue's own check, at worst a beat-stale log line.
+ * Is a target's most recent `review-fix-pr` attempt parked at the SAME head as `headSha` AND the
+ * SAME `classifyReview` fingerprint — i.e. is a fresh enqueue for it currently suppressed by
+ * {@link enqueueReviewFixPrIfAbsent}'s park check? Exported so a caller that already knows a target
+ * needs a fix, but got no job id back, can tell an operator WHY: suppressed (a red gate parked on
+ * this exact commit and fingerprint, nothing to retry yet) versus merely covered by a job already in
+ * flight. Read-only and outside any transaction — a harmless race with the enqueue's own check, at
+ * worst a beat-stale log line.
  */
 export function reviewFixPrParkedAtHead(
   db: AntonDb,
   projectId: string,
   epicBeadId: string,
   headSha: string,
+  fingerprint?: string[],
 ): boolean {
-  return parkedAtHead(db, projectId, epicBeadId, headSha) !== undefined;
+  return parkedAtHead(db, projectId, epicBeadId, headSha, fingerprint) !== undefined;
 }
 
 /**

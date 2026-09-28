@@ -522,6 +522,32 @@ describe("enqueueReviewFixPrIfAbsent", () => {
       expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeDefined();
     });
 
+    it("lifts the suppression once the fingerprint changes at the same head (a base advance)", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1", "base:oid1"],
+      })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      // Same head, but the base tip moved — classifyReview folds that into the fingerprint even
+      // though nothing was pushed to the PR branch itself, and a fresh premerge could fix the gate
+      // or change the tree the gate ran against (PR #338 review, chatgpt-codex-connector).
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1", "base:oid1"])).toBe(
+        true,
+      );
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1", "base:oid2"])).toBe(
+        false,
+      );
+
+      const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1", "base:oid2"],
+      });
+      expect(b).toBeDefined();
+      expect(b).not.toBe(a);
+      expect(activeRows()).toHaveLength(2);
+    });
+
     it("a resumed (un-parked) job re-enqueues normally and is not re-suppressed", async () => {
       const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", { headSha: "sha1" })!;
       t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
