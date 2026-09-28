@@ -216,6 +216,31 @@ describe("classifyReview", () => {
     expect(first.reasons).toEqual(second.reasons);
     expect(first.fingerprint).not.toEqual(second.fingerprint);
   });
+
+  // anton-091jr review round 3 (chatgpt-codex-connector): editing an already-submitted
+  // CHANGES_REQUESTED review's body leaves its id, author, submittedAt, and the PR head all
+  // unchanged, so the fingerprint must key on the body too — otherwise the amended feedback matches
+  // a stale answered row and the dispatcher suppresses it forever.
+  it("changes fingerprint when a review's body is edited with id/author/submittedAt unchanged", () => {
+    const before = classifyReview(
+      pr({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [
+          { author: "alice", state: "CHANGES_REQUESTED", body: "fix this", id: "PRR_1", submittedAt: "2026-01-01T00:00:00Z" },
+        ],
+      }),
+    );
+    const after = classifyReview(
+      pr({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [
+          { author: "alice", state: "CHANGES_REQUESTED", body: "fix this instead, and also that", id: "PRR_1", submittedAt: "2026-01-01T00:00:00Z" },
+        ],
+      }),
+    );
+    expect(before.reasons).toEqual(after.reasons);
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+  });
 });
 
 describe("threadsNeedingAttention", () => {

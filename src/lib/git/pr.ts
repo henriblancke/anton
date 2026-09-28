@@ -5,6 +5,7 @@
  * (ANTON_GH_BIN, shared with git/ops.ts) so tests point it at a fake. See DESIGN §4.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { GH_BIN_ENV } from "./ops";
 
@@ -391,6 +392,11 @@ export interface Actionable {
   fingerprint: string[];
 }
 
+/** Short, edit-sensitive stand-in for a review body in the fingerprint — full text is unbounded. */
+function hashReviewBody(body: string): string {
+  return createHash("sha1").update(body).digest("hex").slice(0, 12);
+}
+
 /**
  * Pure classifier: does this PR need anton to act? Actionable when the PR is OPEN and a reviewer
  * requested changes, a CI check is failing, the branch conflicts with its base, or an unresolved
@@ -420,10 +426,14 @@ export function classifyReview(pr: PrReview): Actionable {
     // chatgpt-codex-connector): if an answered review is dismissed and a DIFFERENT reviewer then
     // requests changes at the same head, the count alone can return to the same value and match a
     // stale answered row even though the actual requester changed. `id` is gh's stable review node
-    // id; `submittedAt` is the fallback for a caller-built fixture that omits it.
+    // id; `submittedAt` is the fallback for a caller-built fixture that omits it. Also folds in a
+    // hash of the review body (anton-091jr review round 3, chatgpt-codex-connector): a reviewer can
+    // edit an already-submitted CHANGES_REQUESTED review's body without touching its id, author,
+    // submittedAt, or the PR head, so without this the amended feedback would match a stale
+    // answered row and get suppressed forever.
     if (changesRequested.length > 0) {
       const ids = changesRequested
-        .map((r) => `${r.id ?? r.submittedAt ?? "?"}:${r.author}`)
+        .map((r) => `${r.id ?? r.submittedAt ?? "?"}:${r.author}:${hashReviewBody(r.body)}`)
         .sort();
       for (const id of ids) fingerprint.push(`review:${id}`);
     } else {
