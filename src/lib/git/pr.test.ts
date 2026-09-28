@@ -180,12 +180,12 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   if (!hasCursor) {
     process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
-      nodes: [{ id: 'RT_1', isResolved: true, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'bot' }, body: 'old, resolved' }] } }],
+      nodes: [{ id: 'RT_1', isResolved: true, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'bot' }, body: 'old, resolved' }] } }],
     } } } } }));
   } else {
     process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       pageInfo: { hasNextPage: false, endCursor: null },
-      nodes: [{ id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { nodes: [{ databaseId: 2, author: { login: 'alice' }, body: 'please fix' }] } }],
+      nodes: [{ id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'alice' }, body: 'please fix' }] } }],
     } } } } }));
   }
   process.exit(0);
@@ -242,6 +242,42 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
     pageInfo: { hasNextPage: false, endCursor: null },
     nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 63, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review (src/lib/git/pr.ts:326): a thread missing its `comments` connection (or
+  // `totalCount`) entirely used to fall back to 0 on both sides of the truncation check, so the
+  // comparison never fired and `complete` stayed true — losing the thread's comments and reviewer
+  // attribution while the persisted round still claimed to be complete.
+  it("marks the read incomplete when a thread's comments connection is missing entirely", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: null }],
   } } } } }));
   process.exit(0);
 }

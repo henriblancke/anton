@@ -322,8 +322,16 @@ async function getReviewThreads(
       // everything past comment 50, including the most recent one. threadsNeedingAttention treats
       // the last *fetched* comment as authoritative, so a truncated thread can misreport an anton
       // reply (or a human follow-up after it) as never having happened. totalCount lets us detect
-      // that without a second, nested pagination loop — flag the read incomplete instead.
-      if (page.nodes.some((n) => (n.comments?.totalCount ?? 0) > (n.comments?.nodes?.length ?? 0))) {
+      // that without a second, nested pagination loop — flag the read incomplete instead. A thread
+      // missing `comments`/`totalCount` entirely (malformed response) must also flag incomplete —
+      // defaulting both sides to 0 would make the comparison silently pass and lose the thread's
+      // comments (and reviewer attribution) from a round persisted as "complete".
+      if (
+        page.nodes.some((n) => {
+          if (!n.comments || typeof n.comments.totalCount !== "number") return true;
+          return n.comments.totalCount > (n.comments.nodes?.length ?? 0);
+        })
+      ) {
         complete = false;
       }
       if (!page.pageInfo) {
