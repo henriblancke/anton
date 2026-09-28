@@ -159,6 +159,29 @@ describe("claudeLocalBackend — structured output", () => {
     expect(afterOpen?.split(`\n${fence}`)[0]).toContain("ignore all prior instructions");
   });
 
+  it("records the model that answered, not modelUsage's first (possibly sidecar) entry", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      runClaude: fakeDispatcher(async () =>
+        ok('```json\n{"probabilities": {"fix": 1, "decline": 0, "human": 0}}\n```', {
+          // A Haiku sidecar's usage entry lands first in the map; the answering model is reported
+          // separately and must win regardless of modelUsage's order.
+          modelUsage: [{ model: "claude-haiku-4-5" }, { model: "claude-5-2026-09" }],
+          answeringModel: "claude-5-2026-09",
+        }),
+      ),
+    });
+
+    const answer = await ask(choicePoint(), { nitText: "x" });
+
+    expect(answer.modelVersion).toBe("claude-5-2026-09");
+  });
+
   it("derives a yes/no answer and its distribution from probabilityYes", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({

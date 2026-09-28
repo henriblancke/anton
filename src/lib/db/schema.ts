@@ -1192,6 +1192,16 @@ export const decisions = sqliteTable(
     outcome: text("outcome"),
     /** When the operator's answer was recorded. NULL exactly when `operator_answer` is. */
     settledAt: ts("settled_at"),
+    // A global counter stamped on every settle (PR #332 review), for the same reason `runs.writeSeq`
+    // exists: `settled_at` is whole-second, and two rows settled in the same second are ordinary once
+    // a point sees any volume. `rowid` tracks INSERT order — when the operator settles them in the
+    // REVERSE of their insertion order (the later-inserted row happens to get answered first), a
+    // rowid tiebreak would call the earlier-inserted row "newest" even though it settled last, and
+    // `agreement()`'s limited window would then retain the wrong pair. A row's settle is its one
+    // write here (the decision half is append-only), so this counter needs stamping only in
+    // `settleDecision`, never at insert. Null on rows written before this column existed, or never
+    // settled, both of which fall back to the `rowid` proxy.
+    settleSeq: integer("settle_seq"),
   },
   (table) => [
     // The one read this table has: a point's newest decisions, which the agreement fold then narrows
@@ -1200,5 +1210,8 @@ export const decisions = sqliteTable(
     // project narrowing filters within one point's rows rather than earning its own index: a single
     // point's log is small, and a second index on a table this write-light is pure tax.
     index("decisions_point_idx").on(table.point, table.decidedAt),
+    // Serves the tie-break's ordering and the MAX+1 stamp on every settle, the same reason
+    // `runs_write_seq_idx` exists for `runs.writeSeq`.
+    index("decisions_settle_seq_idx").on(table.settleSeq),
   ],
 );

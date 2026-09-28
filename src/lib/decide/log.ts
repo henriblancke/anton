@@ -101,6 +101,16 @@ function decodeAnswer(encoded: string | null): AnswerValue | undefined {
   }
 }
 
+/**
+ * The next `settle_seq` value, computed as MAX+1 in the same statement — the same pattern
+ * `nextWriteSeq` (runs.ts) uses for `runs.writeSeq`, and for the same reason: a plain read-then-write
+ * from application code races two settles landing in the same tick, while a subquery inside the
+ * UPDATE itself is one atomic statement.
+ */
+function nextSettleSeq() {
+  return sql`(SELECT IFNULL(MAX(w.settle_seq), 0) + 1 FROM decisions w)`;
+}
+
 export interface RecordDecisionInput {
   /** The decision as decide() produced it — every field of the log's first half comes from here. */
   result: DecideResult;
@@ -184,6 +194,7 @@ export async function settleDecision(
       operatorAction: input.operatorAction ?? null,
       ...(input.outcome === undefined ? {} : { outcome: input.outcome }),
       settledAt: secDate(clock.now()),
+      settleSeq: nextSettleSeq(),
     })
     .where(and(eq(schema.decisions.id, id), isNull(schema.decisions.settledAt)))
     .returning({ id: schema.decisions.id });
@@ -268,10 +279,19 @@ export async function agreement(
   const scope = and(pointScope, isJudgmentEvidence);
   // `decidedAt`/`settledAt` are whole-second values (`secDate`), so two decisions logged in the
   // same second need a tiebreaker with real ordering. `id` is a `randomUUID()` — no chronological
-  // meaning at all — so ties use SQLite's append-only rowid instead, the same pattern
-  // `claude-invocations.ts` and `run-attempts.ts` use for their own second-resolution columns.
+  // meaning at all. `rowid` tracks INSERT order, which is the right proxy for a `decidedAt` tie
+  // (the decision half is written once, at insert) but the wrong one for a `settledAt` tie: the
+  // operator can settle two rows in the REVERSE of their insertion order, and a rowid tiebreak would
+  // then call the earlier-inserted row "newest" even though it settled last — retaining the wrong
+  // answer in a limited agreement window (PR #332 review). `settleSeq` is stamped at settle time
+  // (`nextSettleSeq`), so it orders by settlement itself; `rowid` remains the fallback for rows
+  // settled before that column existed.
   const rowidDesc = desc(sql`rowid`);
-  const orderNewestFirst = [desc(schema.decisions.settledAt), rowidDesc] as const;
+  const orderNewestFirst = [
+    desc(schema.decisions.settledAt),
+    desc(schema.decisions.settleSeq),
+    rowidDesc,
+  ] as const;
 
   // A hard rule's answer carries neither `backend` nor `modelVersion` (it is deterministic, not
   // model trust). If the newest answer is a rule hit, the newest-answered row overall is that

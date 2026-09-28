@@ -29,6 +29,12 @@ export interface ClaudeResult {
   durationApiMs?: number;
   /** Final assistant/result text — the `result` field when present, else the last assistant text block. */
   text?: string;
+  /**
+   * The model that authored {@link text} (anton-528bw) — read off the same assistant message's own
+   * `model` field, never guessed from `modelUsage`'s key order, which lists every model the session
+   * touched (sidecars included) with no guarantee the answering model comes first.
+   */
+  answeringModel?: string;
   /** True if claude reported an error result subtype. */
   isError?: boolean;
 }
@@ -261,6 +267,7 @@ export function toClaudeResult(stream: StreamState): ClaudeResult {
     // success, observed on `claude --resume`) so the agent's final text — and its ANTON-RESULT
     // self-report — isn't lost, which would let partial work close as a false success (anton-juar).
     text: typeof raw.result === "string" ? raw.result : stream.lastAssistantText,
+    answeringModel: stream.lastAssistantModel,
     isError: !!raw.is_error,
   };
 }

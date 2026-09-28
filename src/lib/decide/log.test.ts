@@ -471,4 +471,16 @@ describe("replay — agreement(point)", () => {
     // `second` was inserted after `first`, so a window of one must hold ITS answer.
     expect(await agreement(test.db, POINT.id, 1)).toMatchObject({ settled: 1, agreed: 1 });
   });
+
+  it("breaks a same-second settle tie by SETTLEMENT order, even in the reverse of insertion order", async () => {
+    // `first` is inserted before `second`, but the operator answers `second` first and `first`
+    // last — all within the same clock tick, so `settledAt` collides too. `first` settled LAST, so
+    // it is the newest thing the operator said, even though `rowid` would call it the older row.
+    const first = await recordShadow();
+    const second = await recordShadow();
+    await settleDecision(test.db, clock, second, { operatorAnswer: "decline" });
+    await settleDecision(test.db, clock, first, { operatorAnswer: "fix" });
+
+    expect(await agreement(test.db, POINT.id, 1)).toMatchObject({ settled: 1, agreed: 1 });
+  });
 });

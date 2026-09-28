@@ -307,7 +307,11 @@ export function claudeLocalBackend(config: ClaudeLocalConfig): ModelCaller {
           `decide/claude-local: no parseable structured-output block for "${point.id}"`,
         );
       }
-      const modelVersion = result.modelUsage[0]?.model ?? config.model ?? "unknown";
+      // `answeringModel` names the model that actually authored `result.text` (the report parsed
+      // above); `modelUsage`'s key order is unspecified and can put an ordinary Haiku sidecar
+      // first, which would tag the decision with the wrong model and let `agreement()` carry a
+      // predecessor version's record across a model switch (anton-528bw PR #332 review).
+      const modelVersion = result.answeringModel ?? config.model ?? result.modelUsage[0]?.model ?? "unknown";
       return toModelAnswer(point.question, report, modelVersion);
     } finally {
       clearTimeout(timer);
