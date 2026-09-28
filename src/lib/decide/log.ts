@@ -69,9 +69,15 @@ export function decisionInputHash(point: DecisionPoint, state: DecisionState): s
   return hash.digest("hex").slice(0, 32);
 }
 
+/** A declared field the caller's state never set (`narrowState` inserts `undefined` for it, and
+ * `buildPrompt`'s own `JSON.stringify` in claude-local.ts drops it from the prompt entirely) must
+ * digest differently from an explicit `null` — the backend DOES see the latter. `JSON.stringify`
+ * collapses both to the same string otherwise (it returns `undefined`, the JS value, for `undefined`
+ * itself), so `undefined` is caught up front rather than left to fall through. */
 function encodeValue(value: unknown): string {
+  if (value === undefined) return "\u0000missing";
   try {
-    return JSON.stringify(value) ?? "null";
+    return JSON.stringify(value) ?? "\u0000missing";
   } catch {
     return "\u0000unencodable";
   }
@@ -235,6 +241,12 @@ const isJudgmentEvidence = and(
  * Scoped to `projectId` when given, since the same point runs across every project: without it, one
  * project's successes or failures bleed into another's figure and can encourage a promotion to `auto`
  * that this project's own history never earned.
+ *
+ * Also scoped to the CURRENT backend/model version: a row records both specifically to pin trust to
+ * the model that earned it, so a point re-pointed at a new backend or model must be judged only on
+ * what that one has produced, never on its predecessor's record. The active pair is read off the
+ * newest judged row itself — a hard rule has neither (it is deterministic, not model trust), so a
+ * point currently settled by a rule is left unscoped rather than filtered against nothing.
  */
 export async function agreement(
   db: AntonDb,
@@ -242,6 +254,23 @@ export async function agreement(
   window: number = DECISION_AGREEMENT_WINDOW,
   projectId?: string,
 ): Promise<DecisionAgreement> {
+  const scope = and(
+    eq(schema.decisions.point, point),
+    isJudgmentEvidence,
+    projectId === undefined ? undefined : eq(schema.decisions.projectId, projectId),
+  );
+  // The id breaks a `settledAt` tie, as `pickerTrackRecord` does for its own second-resolution
+  // column: two decisions settled in the same second would otherwise leave the window's
+  // composition — and the counts read off it — up to SQLite's row order.
+  const orderNewestFirst = [desc(schema.decisions.settledAt), desc(schema.decisions.id)] as const;
+
+  const [active] = await db
+    .select({ backend: schema.decisions.backend, modelVersion: schema.decisions.modelVersion })
+    .from(schema.decisions)
+    .where(scope)
+    .orderBy(...orderNewestFirst)
+    .limit(1);
+
   const rows = await db
     .select({
       answer: schema.decisions.answer,
@@ -250,15 +279,16 @@ export async function agreement(
     .from(schema.decisions)
     .where(
       and(
-        eq(schema.decisions.point, point),
-        isJudgmentEvidence,
-        projectId === undefined ? undefined : eq(schema.decisions.projectId, projectId),
+        scope,
+        active?.backend && active.modelVersion
+          ? and(
+              eq(schema.decisions.backend, active.backend),
+              eq(schema.decisions.modelVersion, active.modelVersion),
+            )
+          : undefined,
       ),
     )
-    // The id breaks a `settledAt` tie, as `pickerTrackRecord` does for its own second-resolution
-    // column: two decisions settled in the same second would otherwise leave the window's
-    // composition — and the counts read off it — up to SQLite's row order.
-    .orderBy(desc(schema.decisions.settledAt), desc(schema.decisions.id))
+    .orderBy(...orderNewestFirst)
     .limit(window);
   const agreed = rows.filter((row) => row.answer === row.operatorAnswer).length;
   return { point, settled: rows.length, agreed };

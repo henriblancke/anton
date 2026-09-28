@@ -268,6 +268,27 @@ describe("claudeLocalBackend — invalid output and errors", () => {
     await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow(/no parseable/);
   });
 
+  it("rejects a malformed final block rather than falling back to an earlier, valid one", async () => {
+    const tdb = makeProjectDb();
+    const ask = claudeLocalBackend({
+      db: tdb.db,
+      clock,
+      cwd: "/tmp/wt",
+      routing: UNROUTED,
+      dimensions: { ...DIMENSIONS, projectId: tdb.projectId },
+      // A model correcting itself mid-reply: a valid draft, then a final block that doesn't parse.
+      // The draft must never stand in for the answer the model actually finished on.
+      runClaude: fakeDispatcher(async () =>
+        ok(
+          '```json\n{"probabilities": {"fix": 1, "decline": 0, "human": 0}}\n```\n' +
+            "actually, wait —\n```json\n{not valid json\n```",
+        ),
+      ),
+    });
+
+    await expect(ask(choicePoint(), { nitText: "x" })).rejects.toThrow(/no parseable/);
+  });
+
   it("rejects when claude reports the session itself failed", async () => {
     const tdb = makeProjectDb();
     const ask = claudeLocalBackend({

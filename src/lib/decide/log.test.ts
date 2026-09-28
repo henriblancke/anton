@@ -174,6 +174,14 @@ describe("the input digest", () => {
     // Still distinguishable from an absent field — an input nobody can serialize is an input.
     expect(decisionInputHash(point, { cycle })).not.toBe(decisionInputHash(point, {}));
   });
+
+  it("distinguishes a declared field that is absent from one explicitly set to null", () => {
+    const point: DecisionPoint = { ...POINT, stateFields: ["nitText"] };
+
+    // The backend never sees the absent field at all (buildPrompt's own JSON.stringify drops it),
+    // but does see an explicit null — so the two must not digest identically.
+    expect(decisionInputHash(point, {})).not.toBe(decisionInputHash(point, { nitText: null }));
+  });
 });
 
 describe("settle", () => {
@@ -350,6 +358,35 @@ describe("replay — agreement(point)", () => {
     });
     // Unscoped still folds every project together, for a caller that genuinely wants the global figure.
     expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 3, agreed: 2 });
+  });
+
+  it("scopes to the active model version — a new model is not judged by its predecessor's record", async () => {
+    // The old model earned a poor record.
+    await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    nowMs += 60_000;
+    const oldId = await recordShadow(ANSWER({ modelVersion: "claude-4" }));
+    await settleDecision(test.db, clock, oldId, { operatorAnswer: "decline" });
+    nowMs += 60_000;
+
+    // The point is re-pointed at a new model, which has agreed once so far.
+    const newId = await recordShadow(ANSWER({ modelVersion: "claude-5" }));
+    await settleDecision(test.db, clock, newId, { operatorAnswer: "fix" });
+
+    // Only the new model's own (single) settled row counts — the old model's disagreement does not
+    // bleed in just because it is still inside the raw window.
+    expect(await agreement(test.db, POINT.id)).toMatchObject({ settled: 1, agreed: 1 });
+  });
+
+  it("leaves a rule-decided point unscoped — a hard rule has no model version to pin trust to", async () => {
+    const ruledPoint: DecisionPoint = {
+      ...POINT,
+      hardRules: [() => ({ value: "fix", reason: "always fix" })],
+    };
+    const result = await decide({ point: ruledPoint, state: {}, mode: "shadow", ask: async () => ANSWER() });
+    const id = await recordDecision(test.db, clock, { result, point: ruledPoint, state: {} });
+    await settleDecision(test.db, clock, id!, { operatorAnswer: "fix" });
+
+    expect(await agreement(test.db, ruledPoint.id)).toMatchObject({ settled: 1, agreed: 1 });
   });
 
   it("rolls the window — a point fixed lately is not judged by the record it replaced", async () => {

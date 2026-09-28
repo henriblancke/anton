@@ -183,20 +183,23 @@ function buildPrompt(point: DecisionPoint, state: DecisionState): string {
   ].join("\n");
 }
 
-/** The last fenced ```json block that parses, scanning from the end — mirrors `parsePmReport`'s own
- * scan, so an earlier draft or an unrelated json block the session quoted cannot stand in for the
- * report. `undefined` when nothing in the reply parses, which the caller treats as a failed call. */
+/** The LAST fenced ```json block in the reply, parsed — never an earlier one. A model correcting or
+ * retracting a draft answer produces exactly this shape: an earlier valid block followed by a
+ * malformed final one. Falling back to that earlier block would resolve to the withdrawn answer, not
+ * the reply the model actually finished on — so a final block that fails to parse is treated the same
+ * as no block at all, per the reporting format's own "nothing after it" contract. `undefined` when the
+ * reply has no fenced json block or its last one fails to parse; the caller treats either as a failed
+ * call. */
 function lastParsedJsonBlock(text: string | undefined): unknown {
   if (!text) return undefined;
   const blocks = [...text.matchAll(/```json\s*\n([\s\S]*?)```/g)];
-  for (let i = blocks.length - 1; i >= 0; i--) {
-    try {
-      return JSON.parse(blocks[i]?.[1] ?? "");
-    } catch {
-      continue;
-    }
+  const last = blocks[blocks.length - 1];
+  if (!last) return undefined;
+  try {
+    return JSON.parse(last[1] ?? "");
+  } catch {
+    return undefined;
   }
-  return undefined;
 }
 
 function readNumber(value: unknown): number | undefined {
