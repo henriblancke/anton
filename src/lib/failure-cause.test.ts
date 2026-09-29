@@ -136,6 +136,12 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("infra");
   });
 
+  it("classifies a server-restart interruption as infra, not unknown (PR #339 review)", () => {
+    // reconcileInterruptedRuns (runs.ts) settles an orphaned `running` row with this exact,
+    // unappended message when anton itself crashed or restarted mid-run.
+    expect(classifyFailureCause("interrupted by server restart")).toBe("infra");
+  });
+
   it("classifies a deterministic non-zero claude exit as agent", () => {
     const error =
       "claude exited with code 1: I've made the changes but two tests still fail due to a flaky mock " +

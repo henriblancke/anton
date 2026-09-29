@@ -41,10 +41,13 @@ const QUOTA_RE =
 /**
  * git/push/worktree/hooks failures (git/ops.ts `classifyPushFailure`, git/worktree.ts's rebase
  * recovery). `git push failed (exit N): ...` and the `[worktree] ... could not be rebased ...`
- * messages are each constructed in exactly one place, so their literal phrasing is stable.
+ * messages are each constructed in exactly one place, so their literal phrasing is stable. Also
+ * covers `reconcileInterruptedRuns` (runs.ts) settling a row orphaned by a crashed anton process as
+ * `"interrupted by server restart"` — the entire, unappended message — which is an infra event, not
+ * the agent's or a gate's doing, and would otherwise fall through to `unknown`.
  */
 const INFRA_RE =
-  /git push failed|pre-push hook declined|pre-receive hook declined|\[worktree\]|could not be rebased|could not read Username|index\.lock|gpg failed to sign|could not resolve host|remote end hung up|non-fast-forward/i;
+  /git push failed|pre-push hook declined|pre-receive hook declined|\[worktree\]|could not be rebased|could not read Username|index\.lock|gpg failed to sign|could not resolve host|remote end hung up|non-fast-forward|^interrupted by server restart$/i;
 
 /**
  * The claude driver's own failure shapes (driver-exit.ts `exitCodeError`/`stallError`/
