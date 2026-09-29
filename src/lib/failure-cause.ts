@@ -25,11 +25,17 @@ const GATE_RE = /\bgate failed\b/i;
  * The quota banners Claude Code itself emits verbatim on an exhausted usage/spend/session limit or
  * rate-limited/billing-stopped API call (see driver-limits.ts, where each of these is documented as
  * "observed verbatim in anton.db"). `runs.error` stores `UsageLimitError.message`, which is that
- * banner text unmodified, so matching the banners directly — rather than re-deriving driver-limits'
- * channel-aware logic — is enough for a single recorded string.
+ * banner text unmodified and always leading — driver-limits.ts's own channel scan trusts each banner
+ * only as the leading content of the channel it came from — so every alternative below is anchored to
+ * the start of the recorded string. That anchor is load-bearing: `exitCodeError` (driver-exit.ts)
+ * prefixes a deterministic failure with `claude exited with code N: ` followed by the agent's own
+ * freeform report, and that report can itself quote one of these phrases (e.g. narrating a fix to the
+ * spend-limit matcher) without the run having hit quota. An unanchored match would misfile that
+ * deterministic exit as `quota`; anchoring means only a genuine banner — which is never preceded by
+ * that exit-code prefix — matches at all.
  */
 const QUOTA_RE =
-  /usage limit reached|5-hour limit reached|weekly limit reached|monthly spend limit|session limit\b[\s\S]{0,40}?resets?|out of usage credits|"type"\s*:\s*"rate_limit_error"|\[429\]|\[402\][\s\S]{0,200}?requires more credits/i;
+  /^\s*(?:(?:claude ai\s+)?usage limit reached|5-hour limit reached|weekly limit reached|(?:you['’]ve\s+)?(?:hit|reached) your monthly spend limit\b[\s\S]{0,80}?(?:claude\.ai\/settings\/usage|\/usage-credits\b)|you['’]ve hit your session limit\b[\s\S]{0,40}?resets?|you['’]re out of usage credits\b|API Error:[\s\S]{0,120}?(?:"type"\s*:\s*"rate_limit_error"|\[429\])|API Error:[\s\S]{0,120}?\[402\][\s\S]{0,200}?requires more credits)/i;
 
 /**
  * git/push/worktree/hooks failures (git/ops.ts `classifyPushFailure`, git/worktree.ts's rebase

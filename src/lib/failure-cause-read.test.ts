@@ -155,4 +155,19 @@ describe("runsByCause", () => {
 
     expect(rows.map((r) => r.runId)).toEqual(["after"]);
   });
+
+  it("excludes a row that settled before the window even when a later write bumped updatedAt", async () => {
+    // Mirrors execute-epic-claim.ts writing baseForkSha/attempts onto a row well after it settled:
+    // endedAt stays in the past, but updatedAt alone would clear an `updatedAt >= since` prefilter.
+    await seed({
+      id: "stale-touch",
+      status: "failed",
+      endedAt: SETTLED,
+      updatedAt: SETTLED + 3_600_000,
+    });
+
+    const rows = await runsByCause(t.db, PROJECT, new Date(SETTLED + 1_000));
+
+    expect(rows).toEqual([]);
+  });
 });

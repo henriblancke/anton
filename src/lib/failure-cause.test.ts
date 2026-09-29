@@ -157,6 +157,12 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("agent");
   });
 
+  it("classifies a deterministic exit whose own report merely quotes a quota phrase as agent, not quota", () => {
+    const error =
+      "claude exited with code 1: Narrowed the monthly spend limit matcher, but the push failed.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
   it("classifies the measured 'operation was aborted' reason as unknown, not agent", () => {
     expect(classifyFailureCause("The operation was aborted")).toBe("unknown");
   });

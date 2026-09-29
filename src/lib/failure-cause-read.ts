@@ -43,14 +43,21 @@ function causeOf(status: (typeof SETTLED_STATUSES)[number], error: string | null
  *
  * `updatedAt` is always at or after `endedAt` — both are stamped from the same settle write
  * (`updateRun`), and a park that never gets an `endedAt` still advances `updatedAt` on that same
- * write — so filtering the query on `updatedAt` is a safe pre-filter for the settle time this
- * function actually reports (`endedAt` falling back to `updatedAt`, never the reverse).
+ * write — so filtering the query on `updatedAt` is a safe INDEX PRE-FILTER: it can never exclude a
+ * row whose true settle time (`endedAt` falling back to `updatedAt`) falls in the window. It is not
+ * sufficient on its own, though: `updateRun` (runs.ts) bumps `updatedAt` to `clock.now()` on every
+ * write to a row, not just the settling one, so a row that actually settled before `since` can still
+ * have `updatedAt >= since` after a later, unrelated write (e.g. `execute-epic-claim.ts` recording
+ * `baseForkSha`/`baseRefreshOutcome` on a row that can still be `parked`). The `settledAt < since`
+ * check below drops exactly those rows in JS, so the query's `updatedAt` filter only ever narrows the
+ * scan — the reported window is always enforced against the real settle time.
  */
 export async function runsByCause(
   db: AntonDb,
   projectId: string,
   since: Date | undefined,
 ): Promise<RunCause[]> {
+  const sinceEpoch = since ? toEpoch(since) : undefined;
   const rows = await db
     .select({
       id: schema.runs.id,
@@ -71,6 +78,7 @@ export async function runsByCause(
   for (const row of rows) {
     const settledAt = toEpoch(row.endedAt) ?? toEpoch(row.updatedAt);
     if (settledAt === undefined) continue;
+    if (sinceEpoch !== undefined && settledAt < sinceEpoch) continue;
     out.push({
       runId: row.id,
       cause: causeOf(row.status as (typeof SETTLED_STATUSES)[number], row.error),
