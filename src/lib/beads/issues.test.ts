@@ -1605,4 +1605,20 @@ describe("sameTargetEligibilityState (P2 review, PR #274, issues.ts:373)", () =>
 
     expect(sameTargetEligibilityState(board, [contractGutted])).toBe(false);
   });
+
+  it("flags drift when a target gains a PR pointer with status/labels otherwise unchanged (P1 review, PR #274, issues.ts:414)", () => {
+    // linkPr writes metadata.pr and the stage:in-review label as two separate calls, so the PR
+    // pointer can land before the label does — deriveStage reads the pointer directly and already
+    // sees `in-review` in that gap, while every other field this key compares stays identical.
+    const noPrYet: Bead = {
+      id: "t-1",
+      title: "Ship it",
+      status: "open",
+      issue_type: "task",
+    };
+    const board = [noPrYet];
+    const prLinked = { ...noPrYet, metadata: { pr: "gh-44" } };
+
+    expect(sameTargetEligibilityState(board, [prLinked])).toBe(false);
+  });
 });

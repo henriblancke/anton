@@ -405,13 +405,23 @@ async function recheckBlocksConsistency(
  * status, labels, or ancestors — without both fields here the two keys still compared equal, so the
  * locked approval/picker guard could approve and claim a target whose acceptance criteria had just
  * been gutted.
+ *
+ * `beads.getPrRef` is in the key too (P1 review, PR #274, issues.ts:414): `linkPr` writes
+ * `metadata.pr` and the `stage:in-review` label as two separate calls under one lock, so a
+ * shared-server writer can land the PR pointer before its label update lands. `deriveStage` reads
+ * the PR pointer directly (board.ts), so a bead can already derive as `in-review` while every field
+ * this key compared before stayed identical. Without the PR ref here, `sameTargetEligibilityState`
+ * waved a board through that still looked `backlog`, and the approve route's locked
+ * `deriveStage(locked)` steal-guard read that same stale bead — `locked` comes from this same
+ * consistency-checked read, not a fresh single-bead `bd show` — so a takeover could be approved
+ * against a run that had already reached review.
  */
 function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
   const byId = new Map(list.map((bead) => [bead.id, bead]));
   return (id: string) => {
     const bead = byId.get(id);
     if (!bead) return undefined;
-    return `${bead.status}:${bead.issue_type}:${bead.priority}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${bead.acceptance_criteria ?? ""}:${bead.acceptance ?? ""}:${ownerOf(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
+    return `${bead.status}:${bead.issue_type}:${bead.priority}:${[...(bead.labels ?? [])].sort().join(",")}:${bead.description ?? ""}:${bead.acceptance_criteria ?? ""}:${bead.acceptance ?? ""}:${ownerOf(bead) ?? ""}:${beads.getPrRef(bead) ?? ""}:${ancestorChain(id, list).join(">")}`;
   };
 }
 
