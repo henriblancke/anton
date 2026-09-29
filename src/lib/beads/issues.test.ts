@@ -1518,6 +1518,42 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
   });
 
+  it("re-verifies a board that ALREADY carries gate-only cycle members from an earlier hydration, instead of rejecting them as drift (P2 review, PR #274, issues.ts:772)", async () => {
+    // Unlike the test above, `board` here already carries g-1/g-2 — as it would once a PRIOR call
+    // hydrated them onto the retained snapshot and evidence later expired. Both gates also carry
+    // `blocks` edges on each other (the way two gates actually blocking one another would), so the
+    // outer consistency re-list this refresh runs is NOT a no-op edge-free fast path. A plain
+    // `loadAllIssues(cwd)` re-list — the ordinary work listing — structurally omits both gates (no
+    // work bead's edge dangles toward either), so comparing `board` against that would misread their
+    // absence as drift and decline to attach otherwise-valid, unchanged evidence.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    const board = [solo, gateA, gateB];
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+    const generation = issueSnapshotGeneration(REPO);
+
+    const returned = await ensureCycleEvidence(REPO, board, generation);
+
+    expect(returned).toBe(board);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
+
   it("declines to attach evidence when gate hydration reveals the named cycle was repaired and a different one opened", async () => {
     // Same drift as `attachCyclesBestEffort`'s equivalent test: the gate-only cycle hydration is its
     // own live `bd list`, wide enough a gap for another shared-server writer to repair cycle A
