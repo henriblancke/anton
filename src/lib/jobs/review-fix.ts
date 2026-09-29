@@ -1312,12 +1312,16 @@ async function premergeBase(
   // `reset --hard` that would discard the merge AND those retained edits together (PR #338 review,
   // chatgpt-codex-connector, round 32). There is no rollback that can both undo a bypassed merge
   // commit and keep arbitrary pre-existing dirty state, so the only safe move is to never start:
-  // skip the premerge here, the same no-op this function already takes when the base is up to date,
-  // and let a later pass retry once the checkout is clean. Only gated on a POSITIVE dirty read
-  // (`preMergeState` resolved and its status is non-empty) — a failed read falls through to the
-  // existing behavior below, unchanged.
+  // skip the premerge here and let a later pass retry once the checkout is clean. Unlike the
+  // genuine up-to-date no-op above, this is `failed: true` (PR #338 review, chatgpt-codex-connector,
+  // round 33): the base still hasn't landed in the tree, and the caller folds `failed` into
+  // `refsSynced` — reporting `false` here would tell `prepareFixWorktree`'s caller the checkout is
+  // synced with the PR's advertised base when it demonstrably isn't, letting the session and gates
+  // run against a stale tree and `commitFix` stage the pre-existing dirty edits into the push. Only
+  // gated on a POSITIVE dirty read (`preMergeState` resolved and its status is non-empty) — a failed
+  // read falls through to the existing behavior below, unchanged.
   if (preMergeState && preMergeState.status !== "") {
-    return { conflicts: [], merged: false, failed: false };
+    return { conflicts: [], merged: false, failed: true };
   }
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true, noFf: true });
@@ -2876,7 +2880,17 @@ async function publishUnpushedSentinel(args: {
   if (!existing.commentsComplete) return false;
   // Dedup on the hidden marker, not full-body equality — see `unpushedSentinelMarker`.
   if (existing.comments.some((c) => c.body.includes(marker))) return true;
-  const posted = await safe(() => commentOnPr(repo, number, body, signal));
+  // Same rethrow-on-abort guard as the history read above (PR #338 review, P2,
+  // chatgpt-codex-connector, round 2): `safe()` swallows every error including a cancellation that
+  // fires mid-post, which would return `false` as an ordinary "couldn't publish" outcome and let the
+  // caller settle a timed-out job as a normal `incomplete` completion instead of retrying it.
+  const posted = await commentOnPr(repo, number, body, signal).then(
+    () => true,
+    (err) => {
+      if (signal.aborted) throw err;
+      return false;
+    },
+  );
   if (posted) {
     await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);
   }
