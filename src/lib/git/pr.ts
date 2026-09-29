@@ -102,13 +102,15 @@ export interface PrReview {
   threadsComplete: boolean;
   /**
    * Top-level PR comments (the same surface `commentOnPr`/`getPrComments` read/write — not inline
-   * review comments), oldest first. Lets `classifyReview` tell a genuine human reply apart from
-   * anton's own posts (ANTON_MARK-prefixed, filtered the same way `threadsNeedingAttention` ignores
-   * its own inline replies): a `needs-human` round is otherwise unactionable on every other axis, so
-   * without this a human answering anton's request the one place it was actually posted — a plain
-   * top-level reply — left the fingerprint byte-identical and the round suppressed forever (PR #338
-   * review, chatgpt-codex-connector). Optional because a caller-built fixture (tests) has no reason
-   * to populate it.
+   * review comments), oldest first. Fetched via `getPrTopLevelComments` (paginated GraphQL, not the
+   * REST `gh pr view --json comments`, which caps at 100 with no cursor and would otherwise drop a
+   * human reply past page 1 on a long-running PR). Lets `classifyReview` tell a genuine human reply
+   * apart from anton's own posts (ANTON_MARK-prefixed, filtered the same way `threadsNeedingAttention`
+   * ignores its own inline replies): a `needs-human` round is otherwise unactionable on every other
+   * axis, so without this a human answering anton's request the one place it was actually posted — a
+   * plain top-level reply — left the fingerprint byte-identical and the round suppressed forever (PR
+   * #338 review, chatgpt-codex-connector). Optional because a caller-built fixture (tests) has no
+   * reason to populate it.
    */
   comments?: Array<{ id: string; author: string; body: string }>;
 }
@@ -142,7 +144,6 @@ interface GhPrView {
     completedAt?: string; // checkRun — changes on rerun even when detailsUrl is absent
     createdAt?: string; // statusContext equivalent of completedAt
   }>;
-  comments?: Array<{ id?: string; author?: { login?: string }; body?: string }>;
 }
 
 /** Is a single statusCheckRollup entry failing? Handles both checkRun + statusContext shapes. */
@@ -193,7 +194,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,reviews,statusCheckRollup,comments",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,reviews,statusCheckRollup",
     ],
     signal,
   );
@@ -215,13 +216,10 @@ export async function getPrReview(
     submittedAt: r.submittedAt,
   }));
 
-  const comments = (view.comments ?? [])
-    .filter((c): c is { id: string; author?: { login?: string }; body?: string } => typeof c.id === "string")
-    .map((c) => ({
-      id: c.id,
-      author: c.author?.login ?? "unknown",
-      body: c.body ?? "",
-    }));
+  const [threadsResult, comments] = await Promise.all([
+    getReviewThreads(repoPath, number, signal),
+    getPrTopLevelComments(repoPath, number, signal),
+  ]);
 
   return {
     number: view.number,
@@ -238,8 +236,99 @@ export async function getPrReview(
     failingCheckAttempts,
     pendingChecks,
     comments,
-    ...(await getReviewThreads(repoPath, number, signal)),
+    ...threadsResult,
   };
+}
+
+const PR_COMMENTS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    comments(first:100 after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id author{login} body}
+    }
+  }}
+}`;
+
+interface RawPrCommentNode {
+  id?: string;
+  author?: { login?: string } | null;
+  body?: string;
+}
+
+interface PrCommentsPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        comments?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: RawPrCommentNode[];
+        };
+      };
+    };
+  };
+}
+
+/**
+ * Top-level PR comments via GraphQL, paginated the same way as `getReviewThreads` — `gh pr view
+ * --json comments` issues `comments(first:100)` with no cursor, so a PR that has collected over 100
+ * top-level comments silently drops everything past the first page, including whichever comment was
+ * a human's actual reply. `classifyReview`'s `latestHumanComment` reads the LAST entry as the most
+ * recent one, so a truncated fetch doesn't just miss a comment — it keeps returning a stale "latest"
+ * and a `needs-human` round it already answered stays suppressed forever (PR #338 review,
+ * chatgpt-codex-connector).
+ *
+ * Best-effort: a later page failing keeps the pages already fetched rather than discarding
+ * everything, mirroring `getReviewThreads` — some history beats none for the (ephemeral,
+ * unpersisted) fingerprint this feeds.
+ */
+async function getPrTopLevelComments(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<Array<{ id: string; author: string; body: string }>> {
+  const allNodes: RawPrCommentNode[] = [];
+  try {
+    const nwo = await nameWithOwner(repoPath, signal);
+    if (!nwo) return [];
+    const [owner, repo] = nwo.split("/");
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: PrCommentsPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${PR_COMMENTS_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as PrCommentsPage;
+      } catch {
+        break;
+      }
+      const page = parsed.data?.repository?.pullRequest?.comments;
+      if (!page || !Array.isArray(page.nodes)) break;
+      allNodes.push(...page.nodes);
+      if (!page.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      cursor = page.pageInfo.endCursor;
+    }
+  } catch {
+    return [];
+  }
+
+  return allNodes
+    .filter((c): c is RawPrCommentNode & { id: string } => typeof c.id === "string")
+    .map((c) => ({
+      id: c.id,
+      author: c.author?.login ?? "unknown",
+      body: c.body ?? "",
+    }));
 }
 
 /**

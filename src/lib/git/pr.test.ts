@@ -401,6 +401,63 @@ process.exit(0);
     expect(review.threadsComplete).toBe(true);
   });
 
+  // PR #338 review (chatgpt-codex-connector, P2): `gh pr view --json comments` issues
+  // `comments(first:100)` with no cursor, so a PR with over 100 top-level comments silently drops
+  // everything past page 1 — including a human's actual reply, which is exactly what
+  // `classifyReview`'s `latestHumanComment` needs to release a suppressed needs-human round.
+  // `getPrTopLevelComments` fetches this over GraphQL instead, following `pageInfo.hasNextPage`
+  // the same way `getReviewThreads` already does.
+  it("paginates top-level PR comments instead of truncating at 100", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'CONFLICTING',
+    headRefName: 'anton/epic-1', headRefOid: 'sha-new', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  const hasCursor = a.some((x) => x.startsWith('cursor='));
+  if (query.includes('reviewThreads')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+    } } } } }));
+    process.exit(0);
+  }
+  if (!hasCursor) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+      pageInfo: { hasNextPage: true, endCursor: 'COMMENTS_PAGE2' },
+      nodes: [{ id: 'IC_1', author: { login: 'bot' }, body: 'old status update' }],
+    } } } } }));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ id: 'IC_2', author: { login: 'alice' }, body: 'actually, hold off' }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.comments?.map((c) => c.id)).toEqual(["IC_1", "IC_2"]);
+    // The human's reply lived on page 2 — proving classifyReview's fingerprint keys on it is the
+    // whole point: a truncated fetch would key on the page-1 comment forever and never release a
+    // needs-human round the human already answered on page 2.
+    const fingerprint = classifyReview(review).fingerprint;
+    expect(fingerprint.some((f) => f.startsWith("comment:IC_2:"))).toBe(true);
+  });
+
   it("excludes a thread whose own comments connection is truncated, but keeps a healthy sibling", async () => {
     // RT_1 reports totalCount above what comments(first:50) actually returned — a >50-comment
     // back-and-forth. Its last *fetched* comment is not its true latest, so classifyReview/
