@@ -1676,6 +1676,7 @@ export async function commitAll(
   // such a hook pass a flattened stand-in while the actual merge shape goes unverified (PR #338
   // review, chatgpt-codex-connector, round 9).
   let mergeHeadPath: string | undefined;
+  let mergeMsgPath: string | undefined;
   if (extraParents.length > 0) {
     mergeHeadPath = await git(worktreePath, [
       "rev-parse",
@@ -1684,11 +1685,23 @@ export async function commitAll(
       "MERGE_HEAD",
     ]);
     await writeFile(mergeHeadPath, extraParents.map((parent) => `${parent}\n`).join(""));
+    // `-m` reports its source as `message` to `prepare-commit-msg`, even with `MERGE_HEAD` present
+    // and the resulting commit carrying multiple parents — a hook branching on that source argument
+    // would see the wrong one. Writing the message to `MERGE_MSG` and committing with `--no-edit`
+    // instead runs the same path `git merge` itself uses, so the hook sees source `merge` (PR #338
+    // review, chatgpt-codex-connector, round 10).
+    mergeMsgPath = await git(worktreePath, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "MERGE_MSG",
+    ]);
+    await writeFile(mergeMsgPath, originalMessage);
   }
   try {
     await gitCommit(
       worktreePath,
-      ["commit", "-m", originalMessage],
+      extraParents.length > 0 ? ["commit", "--no-edit"] : ["commit", "-m", originalMessage],
       options.hooksPath,
       options.timeoutMs,
       options.signal,
@@ -1697,16 +1710,41 @@ export async function commitAll(
     // Hooks rejected it, or the commit timed out before one was created: put the branch back
     // exactly where it started rather than leaving HEAD at the boundary's parent with the
     // boundary's own changes sitting staged but uncommitted — and, when one was written, a stray
-    // `MERGE_HEAD` claiming a merge that never landed.
+    // `MERGE_HEAD`/`MERGE_MSG` claiming a merge that never landed. `MERGE_HEAD` must be removed
+    // BEFORE the reset: git refuses a `reset --soft` while it is present ("Cannot do a soft reset
+    // in the middle of a merge"), which would otherwise leave HEAD at the boundary's parent with
+    // the boundary's changes staged, poisoning a later retry instead of restoring the marked
+    // boundary for one (PR #338 review, chatgpt-codex-connector, round 10). Both cleanup steps run
+    // even if one of them fails, so a failure in either is still reported rather than swallowed.
+    const cleanupErrors: string[] = [];
+    if (mergeHeadPath) {
+      try {
+        await rm(mergeHeadPath, { force: true });
+      } catch (rmError) {
+        cleanupErrors.push(`removing MERGE_HEAD failed (${(rmError as Error).message})`);
+      }
+    }
+    if (mergeMsgPath) {
+      try {
+        await rm(mergeMsgPath, { force: true });
+      } catch (rmError) {
+        cleanupErrors.push(`removing MERGE_MSG failed (${(rmError as Error).message})`);
+      }
+    }
     try {
       await git(worktreePath, ["reset", "--soft", originalHead]);
-      if (mergeHeadPath) await rm(mergeHeadPath, { force: true });
-    } catch (restoreError) {
+    } catch (resetError) {
+      cleanupErrors.push(
+        `resetting HEAD to ${originalHead} failed (${(resetError as Error).message})`,
+      );
+    }
+    if (cleanupErrors.length > 0) {
       throw tagCommitAttempt(
         new Error(
           `git commit failed while verifying hooks over the boundary commit, and restoring ` +
-            `HEAD to ${originalHead} afterward also failed — the worktree may be left with the ` +
-            `boundary's changes staged but uncommitted: ${(restoreError as Error).message}`,
+            `HEAD to ${originalHead} afterward also failed (${cleanupErrors.join("; ")}) — the ` +
+            `worktree may be left with the boundary's changes staged but uncommitted: ` +
+            `${(error as Error).message}`,
           { cause: error },
         ),
         "amend",

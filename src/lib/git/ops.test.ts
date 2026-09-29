@@ -4271,6 +4271,127 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     },
   );
 
+  // PR #338 review round 10 (chatgpt-codex-connector): passing `-m` reports its source as `message`
+  // to `prepare-commit-msg`, even with `MERGE_HEAD` present and the resulting commit carrying two
+  // parents — a hook branching on that source argument would take the non-merge path on a commit
+  // that is, in fact, a real merge. Writing `MERGE_MSG` and committing with `--no-edit` instead must
+  // report the source as `merge`.
+  it.runIf(process.platform !== "win32")(
+    "reports commit source 'merge' to prepare-commit-msg when verifying a two-parent boundary commit",
+    async () => {
+      const sourceSeen = join(sandbox, "commit-source-seen");
+      const hook = join(repo, ".git", "hooks", "prepare-commit-msg");
+
+      g(["checkout", "-q", "-b", "feature5"]);
+      writeFileSync(join(repo, "work.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "work.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+
+      g(["checkout", "-q", "feature5"]);
+      try {
+        execFileSync("git", ["-C", repo, "merge", "--no-edit", "main"], { stdio: "ignore" });
+      } catch {
+        // Expected — `work.ts` conflicts. Resolved below, leaving MERGE_HEAD set for the boundary
+        // commit to pick up.
+      }
+      writeFileSync(join(repo, "work.ts"), "resolved\n");
+
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+
+      // Installed only now — `--no-verify` above (used to set up the fixture) still runs
+      // `prepare-commit-msg`, which would otherwise pollute `sourceSeen` with unrelated `message`
+      // entries from those setup commits.
+      writeFileSync(
+        hook,
+        ["#!/bin/sh", `echo "$2" >> ${JSON.stringify(sourceSeen)}`, "exit 0", ""].join("\n"),
+        "utf8",
+      );
+      chmodSync(hook, 0o755);
+
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+      });
+      expect(amended).toBe(true);
+
+      // The hook ran exactly once (for the verifying commit) and saw the merge source, not
+      // `message` — proof `-m` was never used for this commit.
+      expect(readFileSync(sourceSeen, "utf8").trim().split("\n")).toEqual(["merge"]);
+
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      expect(
+        execFileSync("git", ["-C", repo, "log", "-1", "--format=%B", finalSha], {
+          encoding: "utf8",
+        }).trim(),
+      ).toBe("boundary");
+    },
+  );
+
+  // PR #338 review round 10 (chatgpt-codex-connector): a hook rejecting the verifying commit used to
+  // reset `--soft` back to `originalHead` while `MERGE_HEAD` was still on disk from the failed
+  // attempt — git refuses a soft reset in the middle of a merge, so the recovery itself failed and
+  // left HEAD at the boundary's parent with the boundary's changes staged. `MERGE_HEAD` must be
+  // removed before the reset runs.
+  it.runIf(process.platform !== "win32")(
+    "recovers a rejected two-parent boundary commit by clearing MERGE_HEAD before resetting",
+    async () => {
+      const hook = join(repo, ".git", "hooks", "pre-commit");
+      writeFileSync(hook, ["#!/bin/sh", "exit 1", ""].join("\n"), "utf8");
+      chmodSync(hook, 0o755);
+
+      g(["checkout", "-q", "-b", "feature6"]);
+      writeFileSync(join(repo, "work.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "work.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+
+      g(["checkout", "-q", "feature6"]);
+      try {
+        execFileSync("git", ["-C", repo, "merge", "--no-edit", "main"], { stdio: "ignore" });
+      } catch {
+        // Expected — `work.ts` conflicts. Resolved below, leaving MERGE_HEAD set for the boundary
+        // commit to pick up.
+      }
+      writeFileSync(join(repo, "work.ts"), "resolved\n");
+
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+      const boundarySha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      await expect(commitAll(repo, "boundary", { amendToVerifyHooks: true })).rejects.toThrow();
+
+      // Recovery must land the branch back exactly where the rejected attempt started, with no
+      // stray MERGE_HEAD/MERGE_MSG left behind and nothing staged.
+      const after = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      expect(after).toBe(boundarySha);
+      expect(existsSync(join(repo, ".git", "MERGE_HEAD"))).toBe(false);
+      expect(existsSync(join(repo, ".git", "MERGE_MSG"))).toBe(false);
+      const status = execFileSync("git", ["-C", repo, "status", "--porcelain"], {
+        encoding: "utf8",
+      }).trim();
+      expect(status).toBe("");
+    },
+  );
+
   // PR #338 review round 8 (chatgpt-codex-connector): `boundaryHead..originalHead` used to walk the
   // FULL ancestry rather than just the first-parent chain, so a base tip pulled in by a later clean
   // merge — reachable from `HEAD` but not from the boundary, exactly like an ordinary descendant
