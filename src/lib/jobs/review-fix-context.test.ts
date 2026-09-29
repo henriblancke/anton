@@ -176,6 +176,29 @@ describe("reviewFixContext", () => {
     expect(out).not.toContain("## Reporting format (required)");
   });
 
+  // PR #338 review (chatgpt-codex-connector): the sentinel schema must permit "needs-human" too —
+  // otherwise a non-thread reason that genuinely needs a product decision has no outcome claude can
+  // report, and the needs-human flow (classifyReview folding in a human's top-level reply) never
+  // activates.
+  it("permits needs-human alongside fixed/left in the sentinel-only reporting format", () => {
+    const out = reviewFixContext(epic, makePr({ failingChecks: ["build"] }), ["failing checks: build"]);
+    expect(out).toContain('"outcome":"fixed" | "left" | "needs-human"');
+  });
+
+  it("permits needs-human for the sentinel entry in the mixed (threads + non-thread) format too", () => {
+    const threads: ReviewThread[] = [threadOn("src/a.ts", "RT_1")];
+    const out = reviewFixContext(
+      epic,
+      makePr({ threads, failingChecks: ["build"] }),
+      ["failing checks: build", "1 unresolved review thread(s)"],
+      [],
+      undefined,
+      true,
+    );
+    expect(out).toContain('with outcome "fixed", "left", or');
+    expect(out).toContain('"needs-human"');
+  });
+
   // PR #338 review (chatgpt-codex-connector): a round with BOTH inline threads and a non-thread
   // reason (a failing check here) must ask for the sentinel too, not just the per-thread report —
   // otherwise claude never has a chance to acknowledge the non-thread reason and
@@ -199,6 +222,35 @@ describe("reviewFixContext", () => {
     const out = reviewFixContext(epic, makePr({ threads }), ["1 unresolved review thread(s)"]);
     expect(out).toContain('{"threads":[{"id":"<thread id>"');
     expect(out).not.toContain(NON_THREAD_REPORT_ID);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): when a human answers a prior needs-human sentinel with
+  // a top-level PR comment, the fixer must see the reply — classifyReview already changes the
+  // fingerprint on it, so without this the session dispatched off that change can't see what was
+  // said and may just repeat the same request.
+  it("surfaces top-level human PR comments, excluding anton's own posts", () => {
+    const out = reviewFixContext(
+      epic,
+      makePr({
+        comments: [
+          { id: "1", author: "anton", body: `${ANTON_MARK} anton did not push a fix — needs a call` },
+          { id: "2", author: "alice", body: "go with option B" },
+        ],
+      }),
+      ["needs a product decision"],
+    );
+    expect(out).toContain("Top-level PR comments");
+    expect(out).toContain("- @alice: go with option B");
+    expect(out).not.toContain("needs a call");
+  });
+
+  it("omits the human-comments section when there are none besides anton's own", () => {
+    const out = reviewFixContext(
+      epic,
+      makePr({ comments: [{ id: "1", author: "anton", body: `${ANTON_MARK} left as-is` }] }),
+      ["failing checks: build"],
+    );
+    expect(out).not.toContain("Top-level PR comments");
   });
 
   it("lists merge conflicts when present", () => {

@@ -14,7 +14,7 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { bundledSkillDigest, loadSkill } from "../claude/prompt";
 import { textDigest } from "../claude/skill-stamp.mjs";
 import type { ReasoningAttribution } from "../claude-invocations";
-import { threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
+import { ANTON_MARK, threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
 import { type ProjectSettings } from "../projects";
 
 /** One reported outcome for an inline review thread, parsed from claude's final message. */
@@ -188,6 +188,7 @@ export function reviewFixContext(
   return [
     ...headerSection(epic, pr, reasons),
     ...(gateOnly ? [] : reviewerSummarySection(pr)),
+    ...(gateOnly ? [] : humanCommentsSection(pr)),
     ...(gateOnly ? [] : threadsSection(threads)),
     ...(gateOnly ? [] : clusterSection(threads)),
     ...(gateOnly ? [] : failingChecksSection(pr)),
@@ -246,6 +247,24 @@ function reviewerSummarySection(pr: PrReview): string[] {
   return [
     `Reviewer summaries requesting changes:`,
     ...changeReviews.map((r) => `- @${r.author}: ${r.body.trim()}`),
+    ``,
+  ];
+}
+
+/**
+ * Top-level PR comments from a human (not anton's own ANTON_MARK-prefixed posts) — most commonly a
+ * reply to a prior `needs-human` sentinel, posted the one place `classifyReview` looks for it (PR
+ * #338 review, chatgpt-codex-connector). Without this, `classifyReview`'s fingerprint changes
+ * enough to dispatch a fresh fix session, but the session never sees what the human actually said —
+ * it can only repeat the same request.
+ */
+function humanCommentsSection(pr: PrReview): string[] {
+  const replies = (pr.comments ?? []).filter((c) => !c.body.startsWith(ANTON_MARK));
+  if (replies.length === 0) return [];
+  return [
+    `Top-level PR comments (not inline review threads) — a reply here may answer a prior`,
+    `"needs-human" request:`,
+    ...replies.map((c) => `- @${c.author}: ${c.body.trim()}`),
     ``,
   ];
 }
@@ -329,7 +348,7 @@ function reportingFormatSection(
       `message with a fenced json block naming what you did about it:`,
       ``,
       "```json",
-      `{"threads":[{"id":"${NON_THREAD_REPORT_ID}","outcome":"fixed" | "left","reply":"one-line summary of what you changed, or why nothing needed to change"}]}`,
+      `{"threads":[{"id":"${NON_THREAD_REPORT_ID}","outcome":"fixed" | "left" | "needs-human","reply":"one-line summary of what you changed, why nothing needed to change, or what decision is needed"}]}`,
       "```",
     ];
   }
@@ -351,8 +370,9 @@ function reportingFormatSection(
           `This round is ALSO actionable for a reason with no inline thread (a failing check, a`,
           `merge conflict, or a reviewer summary with no inline comments — see "Why this needs`,
           `action" above). Report that too: add one more entry to the same "threads" array, keyed`,
-          `on the sentinel id "${NON_THREAD_REPORT_ID}", with outcome "fixed" or "left" and a`,
-          `one-line reply summarizing what you did about it.`,
+          `on the sentinel id "${NON_THREAD_REPORT_ID}", with outcome "fixed", "left", or`,
+          `"needs-human", and a one-line reply summarizing what you did about it (or what decision`,
+          `is needed).`,
         ]
       : []),
   ];
