@@ -1659,6 +1659,15 @@ describe("fingerprintHasNonThreadReasons", () => {
     expect(fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1"])).toBe(false);
   });
 
+  it("is false when the only extra entry is the comment cache-buster (PR #338 round)", () => {
+    // `classifyReview` appends `comment:<id>` under the same unconditional `reasons.length > 0`
+    // guard as `base:<oid>` — a pure cache-buster for a plain top-level human reply, not a real
+    // non-thread reason. Same exclusion as `base:*` for the same reason.
+    expect(fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1", "comment:IC_1"])).toBe(
+      false,
+    );
+  });
+
   it("is true when a real non-thread reason (a failing check) is present", () => {
     expect(fingerprintHasNonThreadReasons(["check:build", "base:sha-1"])).toBe(true);
   });

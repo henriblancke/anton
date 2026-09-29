@@ -1297,7 +1297,9 @@ export function allWaitingThreadsAnswered(
  * (PR #338 review, chatgpt-codex-connector and claude).
  */
 export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): boolean {
-  return fingerprint.some((f) => !f.startsWith("thread:") && !f.startsWith("base:"));
+  return fingerprint.some(
+    (f) => !f.startsWith("thread:") && !f.startsWith("base:") && !f.startsWith("comment:"),
+  );
 }
 
 /**
