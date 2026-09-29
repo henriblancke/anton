@@ -1045,25 +1045,27 @@ export function classifyReview(pr: PrReview): Actionable {
   }
   if (pr.failingChecks.length > 0) {
     reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
-    if (pr.checksComplete === false) {
-      // A degraded check-rollup read (a later GraphQL page failed — `getPrCheckRollup`) can't be
-      // trusted to carry the PR's true, complete set of check contexts: a context beyond the page
-      // that failed could be the one that newly failed or reran, in which case the `check:*`
-      // entries built from the truncated list below would compute the SAME fingerprint as before
-      // and match a stale answered row even though something genuinely changed. A fixed, distinct
-      // marker — mirroring `reviews:incomplete` above — means this checkpoint can never match an
-      // answered row recorded while the read was complete (PR #338 review, chatgpt-codex-connector).
-      fingerprint.push("checks:incomplete");
-    } else {
-      // Keyed on the attempt identity, not the name — a check that goes green and fails again at
-      // the same PR head gets a fresh `detailsUrl`/`completedAt`, so this changes the fingerprint
-      // even though `failingChecks`' display names read identically to the prior failure. Falls back
-      // to the plain names when a caller-built fixture leaves `failingCheckAttempts` empty; sorted so
-      // ordering never depends on `gh`'s own rollup order.
-      const attempts =
-        pr.failingCheckAttempts.length > 0 ? pr.failingCheckAttempts : pr.failingChecks;
-      for (const id of [...attempts].sort()) fingerprint.push(`check:${id}`);
-    }
+  }
+  if (pr.checksComplete === false) {
+    // Unconditional on `failingChecks.length`, unlike the `reviewsComplete` handling above
+    // (anton-091jr PR #338 review, @claude): `pr.reviewDecision` is a separate, non-paginated `gh
+    // pr view` field, so a degraded reviews page never hides that changes were requested — only
+    // which reviewer. Checks have no such independent signal — `failingChecks` is itself derived
+    // from the same potentially-truncated `getPrCheckRollup` read this branch exists to distrust.
+    // A page-2 fetch failure with an all-green page 1 sets `checksComplete: false` and leaves
+    // `failingChecks` at `[]`, so gating this on `failingChecks.length > 0` would skip both the
+    // reason and the `checks:incomplete` marker and let a PR with a real failing check on the
+    // unfetched page look clean forever.
+    reasons.push("check rollup read incomplete (a failing check may be on an unfetched page)");
+    fingerprint.push("checks:incomplete");
+  } else if (pr.failingChecks.length > 0) {
+    // Keyed on the attempt identity, not the name — a check that goes green and fails again at
+    // the same PR head gets a fresh `detailsUrl`/`completedAt`, so this changes the fingerprint
+    // even though `failingChecks`' display names read identically to the prior failure. Falls back
+    // to the plain names when a caller-built fixture leaves `failingCheckAttempts` empty; sorted so
+    // ordering never depends on `gh`'s own rollup order.
+    const attempts = pr.failingCheckAttempts.length > 0 ? pr.failingCheckAttempts : pr.failingChecks;
+    for (const id of [...attempts].sort()) fingerprint.push(`check:${id}`);
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");

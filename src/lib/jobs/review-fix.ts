@@ -1326,6 +1326,22 @@ async function premergeBase(
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true, noFf: true });
     if (merge.conflicts.length === 0) {
+      // Confirm the merge actually landed a commit before marking HEAD as an unverified boundary
+      // (PR #338 review, chatgpt-codex-connector): the `isAncestor` check above is best-effort and a
+      // transient failure reads as "not caught up" (see its own comment), so this can still reach
+      // `git merge --no-ff` when `baseRef` is ALREADY an ancestor of HEAD — which git resolves as
+      // "Already up to date." and creates no commit at all. Without this, the pre-existing HEAD
+      // (some earlier, already-pushed PR commit) would get marked `bare: true` even though it isn't
+      // the merge and carries real fix content, and the later replay could soft-reset past it and
+      // recommit it from its parent, producing a non-fast-forward push that retries indefinitely.
+      // Only checked when `preMergeHead` was actually read — an unreadable baseline leaves this
+      // exactly as unable to tell the two cases apart as before.
+      if (preMergeHead) {
+        const postMergeHead = await resolveCommitSha(worktreePath, "HEAD").catch(() => "");
+        if (postMergeHead === preMergeHead) {
+          return { conflicts: [], merged: false, failed: false };
+        }
+      }
       // Hooks were bypassed to land this commit (see this function's own doc) — mark it as an
       // unverified boundary unconditionally, not only when carrying forward a PRE-EXISTING marker
       // (round 5's original fix here): even a merge onto an otherwise fully-verified tip produces a
@@ -1568,13 +1584,24 @@ export async function mainRoundChangesSurvived(
     .then((out) => out.split("\n").map((line) => line.trim()).filter(Boolean))
     .catch(() => undefined);
   if (changedPaths === undefined || changedPaths.length === 0) return false;
-  const blobAt = (commit: string, path: string): Promise<string | undefined> =>
-    git(worktreePath, ["rev-parse", `${commit}:${path}`]).catch(() => undefined);
+  // Tree entry (mode + blob), not blob sha alone (PR #338 review, chatgpt-codex-connector): the
+  // mode lives on the tree entry, not the blob object, so a follow-up that flips a path's mode
+  // (e.g. reverts an executable bit the main round set) while leaving its content untouched
+  // resolves to the SAME blob sha at both commits — `rev-parse <commit>:<path>` can't see the
+  // difference, and this would credit the main round's fix as having survived a pushed tree that
+  // no longer carries it.
+  const treeEntryAt = (commit: string, path: string): Promise<string | undefined> =>
+    git(worktreePath, ["ls-tree", commit, "--", path])
+      .then((out) => {
+        const [mode, , blob] = (out.split("\n").find(Boolean) ?? "").split(/\s+/);
+        return mode && blob ? `${mode}:${blob}` : undefined;
+      })
+      .catch(() => undefined);
   const survived = await Promise.all(
     changedPaths.map(async (path) => {
       const [atGate, atFinal] = await Promise.all([
-        blobAt(preGateHead, path),
-        blobAt(postSessionHead, path),
+        treeEntryAt(preGateHead, path),
+        treeEntryAt(postSessionHead, path),
       ]);
       return atGate === atFinal;
     }),
@@ -2091,11 +2118,14 @@ async function runFixSession(args: {
  * resumed job parking on the SAME gate is a fresh process with nothing of its own to remember, but
  * the PR remembers what was already said on it.
  *
- * Skips posting entirely when the comment history is a degraded read (`commentsComplete: false`,
- * PR #338 review round 2, chatgpt-codex-connector): a missing page could hide the very sentinel this
- * is deduping against, so an absent match there proves nothing and posting anyway risks a duplicate.
- * A resumed job hitting the same gate calls this again, so a transient fetch failure just delays the
- * notification rather than losing it.
+ * Posts best-effort even when the comment history is a degraded read (`commentsComplete: false`,
+ * including the fetch-failure fallback below) rather than skipping — unlike `publishUnpushedSentinel`,
+ * this is the ONLY call site: it fires from the catch block of a poison park, and a parked job is not
+ * retried by the normal sweep at the same head (see `suppressed — parked review-fix-pr at unchanged
+ * head` above), so nothing calls this again until a human runs `resumeJob` or the head changes. A
+ * degraded read here would therefore not just "delay" the notification, it would drop it until one of
+ * those happens — worse than the small chance of a duplicate comment from deduping against a partial
+ * comment list (PR #338 review round 3, @claude).
  */
 export async function notifyGateParked(args: {
   repo: string;
@@ -2119,7 +2149,6 @@ export async function notifyGateParked(args: {
     comments: [],
     commentsComplete: false,
   }));
-  if (!existing.commentsComplete) return;
   if (existing.comments.some((c) => c.body === body)) return;
   await safe(() => commentOnPr(repo, number, body, signal));
 }
@@ -2885,8 +2914,12 @@ const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
  * retry's, and the dedup check below would never recognize its own already-posted notice.
  */
 function unpushedSentinelMarker(headSha: string, fingerprint: readonly string[]): string {
+  // `JSON.stringify`, not a `,`-joined string (PR #338 review round 3, @chatgpt-codex-connector): a
+  // fingerprint entry can itself carry a comma (a check name, an attempt URL), so a plain join lets
+  // two DIFFERENT arrays — e.g. `["check:a,check:b", "base:x"]` and `["check:a", "check:b",
+  // "base:x"]` — hash to the same marker. `JSON.stringify` delimits each element unambiguously.
   const hash = createHash("sha1")
-    .update(`${headSha}|${fingerprint.join(",")}`)
+    .update(`${headSha}|${JSON.stringify(fingerprint)}`)
     .digest("hex")
     .slice(0, 12);
   return `<!-- anton:unpushed-round:${hash} -->`;

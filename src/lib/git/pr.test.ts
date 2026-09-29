@@ -113,6 +113,16 @@ describe("classifyReview", () => {
     expect(degraded.fingerprint).not.toEqual(complete.fingerprint);
   });
 
+  // anton-091jr PR #338 review (@claude): unlike `reviewDecision`, `failingChecks` is itself
+  // derived from the same paginated `getPrCheckRollup` read `checksComplete` distrusts, so a
+  // degraded read with an all-green fetched page (`failingChecks: []`) must still be actionable —
+  // gating on `failingChecks.length > 0` would silently treat it as clean.
+  it("is actionable on a degraded check-rollup read even when the fetched page reports no failing checks", () => {
+    const v = classifyReview(pr({ failingChecks: [], checksComplete: false }));
+    expect(v.actionable).toBe(true);
+    expect(v.fingerprint).toContain("checks:incomplete");
+  });
+
   it("is actionable when an unresolved thread awaits anton (even without CHANGES_REQUESTED)", () => {
     const v = classifyReview(pr({ threads: [thread()] }));
     expect(v.actionable).toBe(true);

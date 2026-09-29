@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +24,7 @@ import {
   claimOwnerFor,
   fingerprintHasNonThreadReasons,
   inReviewEpics,
+  mainRoundChangesSurvived,
   makeReviewFixHandler,
   makeReviewFixPrHandler,
   notifyGateParked,
@@ -2003,6 +2005,71 @@ describe("runTestGate (anton-h0hwc)", () => {
   });
 });
 
+// PR #338 review round 3 (chatgpt-codex-connector): the mode lives on the tree entry, not the blob
+// object, so comparing `rev-parse <commit>:<path>` blob shas alone can't see a mode-only change —
+// a follow-up round that reverts a path's executable bit while leaving its content untouched must
+// still read as "did not survive".
+describe("mainRoundChangesSurvived", () => {
+  let dir: string;
+
+  function g(args: string[]): string {
+    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "anton-survived-"));
+    g(["init", "-q", "-b", "main"]);
+    g(["config", "user.email", "a@b.c"]);
+    g(["config", "user.name", "test"]);
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns false when a follow-up flips a path's mode even though its content is unchanged", async () => {
+    writeFileSync(join(dir, "script.sh"), "echo hi\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o755);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: make script.sh executable"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o644);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert the mode"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns true when the follow-up leaves the main round's content and mode untouched", async () => {
+    writeFileSync(join(dir, "script.sh"), "echo hi\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o755);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: make script.sh executable"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "unrelated.txt"), "x\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: unrelated change"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(true);
+  });
+});
+
 // anton-gvqk3: a gate parking the fix session must say so on the PR itself — the run-log entry
 // runTestGate already produces is invisible to a human reading only the PR, who otherwise sees a
 // stale CONFLICTING/CI badge and nothing about why anton stopped.
@@ -2152,11 +2219,13 @@ process.exit(0);
     expect(postedComments()).toHaveLength(2);
   });
 
-  // PR #338 review round 2 (chatgpt-codex-connector, P2): a page fetch failing partway through
-  // `getPrTopLevelComments` used to be indistinguishable from "no comments yet" — an absent match
-  // in that truncated list proved nothing, so this dedup check could post a duplicate sentinel a
-  // missing page was already carrying. `commentsComplete: false` must make it skip posting instead.
-  it("skips posting when the comment history read is incomplete, to avoid a duplicate", async () => {
+  // PR #338 review round 3 (@claude): this is the only call site, firing from a poison park's catch
+  // block — a parked job isn't retried by the normal sweep at the same head, so nothing calls this
+  // again until a human resumes it or the head changes. Skipping on a degraded read (the round-2 fix
+  // below) would therefore drop the notification rather than merely delay it, so it now posts
+  // best-effort — deduping against whatever partial history it could read — and accepts the small
+  // risk of an occasional duplicate over silently parking with no PR-facing explanation.
+  it("still posts when the comment history read is incomplete, favoring a possible duplicate over silence", async () => {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
       fakeGh,
@@ -2182,6 +2251,6 @@ process.exit(0);
       signal: new AbortController().signal,
     });
 
-    expect(postedComments()).toHaveLength(0);
+    expect(postedComments()).toHaveLength(1);
   });
 });
