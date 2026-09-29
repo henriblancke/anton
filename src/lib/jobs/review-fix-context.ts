@@ -241,12 +241,40 @@ function headerSection(epic: Bead, pr: PrReview, reasons: string[]): string[] {
   ];
 }
 
+/**
+ * Cap on how many CHANGES_REQUESTED review bodies this section renders directly into the prompt —
+ * prompt-budget only, never fingerprinting: `classifyReview` (pr.ts) still folds EVERY submitted
+ * review into its fingerprint regardless of this cap, so nothing here weakens dedup/suppression.
+ * A long-running PR with a bot reviewer resubmitting every round can rack up 100+ CHANGES_REQUESTED
+ * reviews with a body; passing all of them unbounded risked exhausting the model's context before
+ * it ever reached the actual current feedback (PR #338 review, chatgpt-codex-connector). Keeps the
+ * MOST RECENT entries — pr.reviews returns oldest-first, so this section is the tail — since those
+ * are what a fix round is actually meant to respond to, mirroring {@link humanCommentsSection}'s
+ * same "latest, not everything" bound for top-level comments.
+ */
+const MAX_REVIEWER_SUMMARIES = 20;
+
+/** Cap on one review body's own contribution — an unbounded single body could alone blow the budget the count cap above is meant to protect. */
+const MAX_REVIEWER_SUMMARY_CHARS = 2000;
+
 function reviewerSummarySection(pr: PrReview): string[] {
   const changeReviews = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED" && r.body.trim());
   if (changeReviews.length === 0) return [];
+  const bounded = changeReviews.slice(-MAX_REVIEWER_SUMMARIES);
+  const omitted = changeReviews.length - bounded.length;
   return [
     `Reviewer summaries requesting changes:`,
-    ...changeReviews.map((r) => `- @${r.author}: ${r.body.trim()}`),
+    ...(omitted > 0
+      ? [`(${omitted} older review summar${omitted === 1 ? "y" : "ies"} omitted for length)`]
+      : []),
+    ...bounded.map((r) => {
+      const body = r.body.trim();
+      const truncated =
+        body.length > MAX_REVIEWER_SUMMARY_CHARS
+          ? `${body.slice(0, MAX_REVIEWER_SUMMARY_CHARS)}… (truncated)`
+          : body;
+      return `- @${r.author}: ${truncated}`;
+    }),
     ``,
   ];
 }

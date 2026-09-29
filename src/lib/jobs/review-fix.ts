@@ -749,19 +749,41 @@ async function handleEpic(args: {
 
     // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
     // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
-    // chatgpt-codex-connector).
-    try {
-      recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
-    } catch (e) {
-      // A failed write here is worse than a skipped one: the row still carries whatever
-      // `enqueueReviewFixPrIfAbsent` snapshotted at enqueue time, which this session is about to
-      // run past without having recorded. If that stale pair still matches the (unmoved) GitHub
-      // head, a later park would wrongly suppress a revision this attempt never tested (PR #338
-      // review, chatgpt-codex-connector). Invalidate rather than merely log so the stale snapshot
-      // can't outlive this attempt; let `invalidateReviewFixAttempt`'s own failure propagate and
-      // fail this attempt outright.
-      consoleLog.error("recordReviewFixAttempt failed before PR fix — invalidating stale snapshot", e);
+    // chatgpt-codex-connector). Skipped when any of the underlying reads came back degraded
+    // (PR #338 review, chatgpt-codex-connector, round 8): a fingerprint built from a truncated
+    // page carries `reviews:incomplete`/`comments:incomplete`/`checks:incomplete`/a partial thread
+    // list, and if THIS attempt then parks, that degraded fingerprint becomes `parkedAtHead`'s
+    // match target. A transient read failure tends to reproduce the SAME degraded shape on the
+    // next pass too, so the park would keep matching and suppress every future dispatch at this
+    // head even once a human's feedback lands on the very page that failed to load — exactly the
+    // silent-suppression bug the `:incomplete` markers exist to prevent, just one write earlier.
+    // Invalidating instead (clearing headSha too, not just skipping the write) means a later park
+    // can never match this row on `headSha`, so the next pass retries rather than staying
+    // suppressed on unverified state.
+    if (
+      pr.threadsComplete === false ||
+      pr.commentsComplete === false ||
+      pr.reviewsComplete === false ||
+      pr.checksComplete === false
+    ) {
       invalidateReviewFixAttempt(db, ctx.jobId);
+      consoleLog.info(
+        `PR #${number}: review read was incomplete — not recording this attempt's fingerprint as a park identity`,
+      );
+    } else {
+      try {
+        recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
+      } catch (e) {
+        // A failed write here is worse than a skipped one: the row still carries whatever
+        // `enqueueReviewFixPrIfAbsent` snapshotted at enqueue time, which this session is about to
+        // run past without having recorded. If that stale pair still matches the (unmoved) GitHub
+        // head, a later park would wrongly suppress a revision this attempt never tested (PR #338
+        // review, chatgpt-codex-connector). Invalidate rather than merely log so the stale snapshot
+        // can't outlive this attempt; let `invalidateReviewFixAttempt`'s own failure propagate and
+        // fail this attempt outright.
+        consoleLog.error("recordReviewFixAttempt failed before PR fix — invalidating stale snapshot", e);
+        invalidateReviewFixAttempt(db, ctx.jobId);
+      }
     }
 
     const { pushed, answeredAllThreads } = await runFixSession({

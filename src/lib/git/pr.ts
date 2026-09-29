@@ -606,7 +606,17 @@ async function getPrCheckRollup(
         // No commits at all on the PR yet — a real, complete (empty) rollup, not a fetch failure.
         break;
       }
-      const rollup = commitNode.commit?.statusCheckRollup;
+      if (!commitNode.commit) {
+        // `commit` is non-null in GitHub's schema whenever a commit node is returned at all — a
+        // present `commitNode` with an absent `commit` is a malformed/partial payload, not "no
+        // checks configured". The optional chain below would otherwise read straight through to
+        // `undefined` and this fell out of the loop as a genuine empty rollup with
+        // `rollupComplete: true`, letting a check-only actionable PR classify as clean off a read
+        // that never actually inspected its checks (PR #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      const rollup = commitNode.commit.statusCheckRollup;
       if (rollup === null || rollup === undefined) {
         // No checks configured for this commit — same as above, a real empty rollup.
         break;

@@ -1606,6 +1606,7 @@ export async function runHookDirectly(
   hooksPath?: string,
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
+  hookArgs: string[] = [],
 ): Promise<void> {
   const hooksDir = await git(
     worktreePath,
@@ -1616,7 +1617,7 @@ export async function runHookDirectly(
   if (!existsSync(hookPath)) return;
   if (process.platform !== "win32" && (statSync(hookPath).mode & 0o111) === 0) return;
   const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
-  await runBoundedProcess(hookPath, [], {
+  await runBoundedProcess(hookPath, hookArgs, {
     cwd: worktreePath,
     env: await gitHookEnv(worktreePath, hooksPath),
     timeoutMs,
@@ -1645,13 +1646,23 @@ async function runIgnoreMissingHook(
   hooksPath?: string,
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
+  hookArgs: string[] = [],
 ): Promise<void> {
   if (await supportsGitHookRun()) {
     const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
     await runBoundedProcess(
       "git",
-      [...configArgs, "-C", worktreePath, "hook", "run", "--ignore-missing", hookName],
+      [
+        ...configArgs,
+        "-C",
+        worktreePath,
+        "hook",
+        "run",
+        "--ignore-missing",
+        hookName,
+        ...(hookArgs.length > 0 ? ["--", ...hookArgs] : []),
+      ],
       {
         env: { ...process.env, GIT_EDITOR: ":" },
         timeoutMs,
@@ -1661,15 +1672,16 @@ async function runIgnoreMissingHook(
       },
     );
   } else {
-    await runHookDirectly(worktreePath, hookName, hooksPath, requestedTimeoutMs, signal);
+    await runHookDirectly(worktreePath, hookName, hooksPath, requestedTimeoutMs, signal, hookArgs);
   }
 }
 
 /**
  * A `core.hooksPath` mirroring the worktree's real hooks directory via symlinks, minus
- * `pre-commit` — passed to the verifying `git commit` call `commitAll`'s merge-replay path makes,
- * so that call runs every OTHER configured hook (crucially `commit-msg`, which a real `git merge`
- * also invokes for the merge commit message) without also invoking `pre-commit`.
+ * `pre-commit` AND `post-commit` — passed to the verifying `git commit` call `commitAll`'s
+ * merge-replay path makes, so that call runs every OTHER configured hook (crucially `commit-msg`,
+ * which a real `git merge` also invokes for the merge commit message) without also invoking
+ * either of the two hooks that are specific to a plain `git commit` rather than a `git merge`.
  *
  * A real `git merge` never runs `pre-commit` directly — githooks(5) documents that only the STOCK
  * `pre-merge-commit` sample hook happens to chain into `pre-commit` itself; a project's own custom
@@ -1680,15 +1692,34 @@ async function runIgnoreMissingHook(
  * project's own `pre-merge-commit` chose to chain it, and can reject/repeatedly park a merge the
  * project's actual workflow accepts (PR #338 review, chatgpt-codex-connector, P2).
  *
+ * `post-commit` is excluded for the mirror image of the same reason (PR #338 review,
+ * chatgpt-codex-connector, round 15): githooks(5) documents `post-commit` as a `git commit`-only
+ * hook and `post-merge` as `git merge`'s own completion hook — verified against real git 2.43, a
+ * `git merge --no-edit` runs `post-merge` and never `post-commit`, while a plain `git commit` runs
+ * the reverse. Replaying this boundary via `git commit` would otherwise fire `post-commit` (which
+ * the real merge workflow never runs and may not expect) while never firing `post-merge` (whose
+ * side effects — e.g. a lockfile regeneration or submodule sync a project's own `post-merge` does
+ * — the project's actual `git merge` step depends on). The caller runs `post-merge` explicitly via
+ * {@link runIgnoreMissingHook} once the commit lands, mirroring how `pre-merge-commit` is already
+ * run explicitly above; excluding `post-commit` here stops it firing a second, unwanted time.
+ *
  * `undefined` when the real hooks directory doesn't exist at all (nothing configured, so nothing
  * to skip) or the mirror can't be built — falls back to the caller's own `hooksPath`, matching this
  * function's behavior before this mirror existed, rather than failing the whole commit over a
- * best-effort hygiene step.
+ * best-effort hygiene step. That fallback is a deliberate fail-CLOSED choice (PR #338 review,
+ * chatgpt-codex-connector, P1): a single failed `symlink()` — e.g. a platform/filesystem that
+ * restricts symlink creation — used to be swallowed per-entry, silently omitting just that one
+ * hook from the mirror while still returning it, so the verifying commit could run with a
+ * PARTIAL mirror and skip a required `commit-msg`/`prepare-commit-msg`/other hook while still
+ * being treated as fully verified. Any failed link now aborts the whole mirror build instead, and
+ * the caller runs with the real `hooksPath` — re-running `pre-commit` unnecessarily for this one
+ * commit is the safe direction to fail in, unlike silently dropping an arbitrary other hook.
  */
-async function hooksPathSkippingPreCommit(
+async function hooksPathForMergeReplay(
   worktreePath: string,
   hooksPath: string | undefined,
 ): Promise<string | undefined> {
+  let mirror: string | undefined;
   try {
     const realHooksDir = await git(
       worktreePath,
@@ -1696,14 +1727,18 @@ async function hooksPathSkippingPreCommit(
       hooksPath,
     );
     if (!existsSync(realHooksDir)) return undefined;
-    const mirror = resolve(tmpdir(), `anton-merge-hooks-${randomUUID()}`);
+    mirror = resolve(tmpdir(), `anton-merge-hooks-${randomUUID()}`);
     await mkdir(mirror, { recursive: true });
     for (const entry of await readdir(realHooksDir)) {
-      if (entry === "pre-commit") continue;
-      await symlink(resolve(realHooksDir, entry), resolve(mirror, entry)).catch(() => {});
+      if (entry === "pre-commit" || entry === "post-commit") continue;
+      await symlink(resolve(realHooksDir, entry), resolve(mirror, entry));
     }
     return mirror;
   } catch {
+    // A failure partway through leaves some links already made — clean those up rather than
+    // leaking a half-built mirror into tmpdir, since the caller falls back to `options.hooksPath`
+    // and never receives this path to remove itself.
+    if (mirror) await rm(mirror, { recursive: true, force: true }).catch(() => {});
     return undefined;
   }
 }
@@ -1929,12 +1964,17 @@ export async function commitAll(
   // review, chatgpt-codex-connector, round 9).
   let mergeHeadPath: string | undefined;
   let mergeMsgPath: string | undefined;
-  // Symlink mirror of the real hooks dir, minus `pre-commit` — built only when
+  // Symlink mirror of the real hooks dir, minus `pre-commit`/`post-commit` — built only when
   // `options.verifiedBoundaryIsBareMerge` says the verify commit stands in for a real `git merge`'s
   // own automatic path rather than a conflict resolution concluded via an ordinary `git commit` (see
-  // that option's own doc, and {@link hooksPathSkippingPreCommit}). Removed in `finally` below
+  // that option's own doc, and {@link hooksPathForMergeReplay}). Removed in `finally` below
   // regardless of how the commit turns out.
   let mergeCommitHooksPath: string | undefined;
+  // Real git only runs `post-merge` for the same auto-merge path this option stands in for
+  // (githooks(5); verified against git 2.43) — a manually conflict-resolved merge concluded via an
+  // ordinary `git commit`, in real git too, never fires it. Captured before the commit so the flag
+  // survives into the success path below regardless of which branch built `mergeCommitHooksPath`.
+  const shouldReplayPostMerge = extraParents.length > 0 && Boolean(options.verifiedBoundaryIsBareMerge);
   // Setup (resolving/writing MERGE_HEAD and MERGE_MSG) lives inside this same try — HEAD already
   // moved to `resetHead` above, so a failure here (e.g. an unwritable git dir) needs the identical
   // restoration the commit failure path below already performs, not an uncaught throw that leaves
@@ -1994,7 +2034,7 @@ export async function commitAll(
       ]);
       await writeFile(mergeMsgPath, originalMessage);
       if (options.verifiedBoundaryIsBareMerge) {
-        mergeCommitHooksPath = await hooksPathSkippingPreCommit(worktreePath, options.hooksPath);
+        mergeCommitHooksPath = await hooksPathForMergeReplay(worktreePath, options.hooksPath);
       }
     }
     await gitCommit(
@@ -2091,6 +2131,38 @@ export async function commitAll(
     // rolled back) commit into a reported failure.
     if (mergeCommitHooksPath) {
       await rm(mergeCommitHooksPath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  // Reaching here means the verifying commit landed (the `catch` above either rethrew or fell
+  // through past a rollback). Replay `post-merge` now, the same completion hook a real
+  // `git merge --no-edit` fires right after building this exact commit shape (PR #338 review,
+  // chatgpt-codex-connector, round 15) — `commitAll` never otherwise runs it, since this whole
+  // path commits via `git commit`, which githooks(5) documents as a `post-commit`-only command.
+  // Run against the REAL `options.hooksPath`, not `mergeCommitHooksPath` — that mirror exists only
+  // to shape what `git commit` itself invokes and is already torn down by the `finally` above;
+  // `post-merge` is invoked directly via `runIgnoreMissingHook`, same as `pre-merge-commit` above.
+  // `"0"` matches the single argument githooks(5) documents `post-merge` receiving: a squash-merge
+  // flag, always `0` here since this replay never stands in for a squash merge. Failure is logged,
+  // not thrown — githooks(5) is explicit that `post-merge` "cannot affect the outcome of git
+  // merge": the commit this hook reports on already landed and is already hook-verified, so
+  // treating a failing `post-merge` as this function's own failure would incorrectly imply the
+  // commit itself is unverified or should be retried.
+  if (shouldReplayPostMerge) {
+    try {
+      await runIgnoreMissingHook(
+        worktreePath,
+        "post-merge",
+        options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+        ["0"],
+      );
+    } catch (error) {
+      console.warn(
+        `[git] post-merge hook failed after replaying a bare-merge boundary commit in ${worktreePath} — ` +
+          `the commit already landed and was not rolled back`,
+        error,
+      );
     }
   }
   if (extraParents.length === 0) {

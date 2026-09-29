@@ -4306,7 +4306,8 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
   // Contrast with the conflict-resolution tests above, which correctly DO expect `pre-commit` to run
   // (concluding a real conflicted merge is an ordinary `git commit` in git's own hook lifecycle).
   it.runIf(process.platform !== "win32")(
-    "skips pre-commit for a boundary marked as a bare clean auto-merge, but still runs other hooks",
+    "skips pre-commit and post-commit for a boundary marked as a bare clean auto-merge, but still " +
+      "runs other commit hooks and replays post-merge (PR #338 review, chatgpt-codex-connector, round 15)",
     async () => {
       g(["checkout", "-q", "-b", "feature-bare"]);
       writeFileSync(join(repo, "feature.ts"), "feature\n");
@@ -4339,7 +4340,7 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
       writeFileSync(rejectMarker, "");
 
       // Installed only now, right before the verify commit under test — every earlier commit/merge
-      // in this test's own setup would otherwise also count toward `postCommitRuns` below.
+      // in this test's own setup would otherwise also count toward the marker files below.
       const postCommitRuns = join(sandbox, "post-commit-runs");
       const postCommitHook = join(repo, ".git", "hooks", "post-commit");
       writeFileSync(
@@ -4349,6 +4350,29 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
       );
       chmodSync(postCommitHook, 0o755);
 
+      // `commit-msg` fires on both a plain `git commit` and a real `git merge` — proof that the
+      // mirror still runs hooks OTHER than the two excluded from it, not just that everything got
+      // disabled.
+      const commitMsgRuns = join(sandbox, "commit-msg-runs");
+      const commitMsgHook = join(repo, ".git", "hooks", "commit-msg");
+      writeFileSync(
+        commitMsgHook,
+        ["#!/bin/sh", `echo ran >> ${JSON.stringify(commitMsgRuns)}`, "exit 0", ""].join("\n"),
+        "utf8",
+      );
+      chmodSync(commitMsgHook, 0o755);
+
+      // `post-merge` — real git only fires this for the auto-merge path this replay stands in for.
+      // Records its single argument too: githooks(5) documents a squash-merge flag, always `0` here.
+      const postMergeRuns = join(sandbox, "post-merge-runs");
+      const postMergeHook = join(repo, ".git", "hooks", "post-merge");
+      writeFileSync(
+        postMergeHook,
+        ["#!/bin/sh", `echo "ran $1" >> ${JSON.stringify(postMergeRuns)}`, "exit 0", ""].join("\n"),
+        "utf8",
+      );
+      chmodSync(postMergeHook, 0o755);
+
       const { committed: amended } = await commitAll(repo, "boundary", {
         amendToVerifyHooks: true,
         verifyFrom: boundarySha,
@@ -4356,7 +4380,9 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
       });
       expect(amended).toBe(true);
       expect(existsSync(hookRuns)).toBe(false);
-      expect(readFileSync(postCommitRuns, "utf8").trim().split("\n")).toHaveLength(1);
+      expect(existsSync(postCommitRuns)).toBe(false);
+      expect(readFileSync(commitMsgRuns, "utf8").trim().split("\n")).toHaveLength(1);
+      expect(readFileSync(postMergeRuns, "utf8").trim().split("\n")).toEqual(["ran 0"]);
 
       const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
         encoding: "utf8",
