@@ -1518,11 +1518,19 @@ export function probeCycleEvidence(cwd: string): void {
                     for (const gate of stagedGates) board.push(gate);
                     hydrateIssueSnapshot(cwd, board, generation);
                     generation = issueSnapshotGeneration(cwd);
-                  } else if (!consistent && cycleEvidenceFor(board) !== undefined) {
+                  } else if (
+                    !consistent &&
+                    cycleEvidenceFor(board) !== undefined &&
+                    cycleEvidenceCheckedAtFor(board) === staleCheckedAt
+                  ) {
                     // This refresh explicitly REJECTED the board/evidence pairing — leaving a stale
                     // sidecar attached here would still read as present to `cycleEvidenceFor`. Clear
                     // it and fail closed, mirroring `attachCyclesBestEffort`'s identical rejection path
-                    // (issues.ts:828).
+                    // (issues.ts:828). Guarded by the same `staleCheckedAt` check as the sibling
+                    // rejection below (issues.ts:1546-1550): a racing `ensureCycleEvidence`/
+                    // `probeCycleEvidence` sharing this same retained board can attach fresher evidence
+                    // while this hydration attempt was in flight, and that newer result must survive
+                    // this rejection rather than be clobbered.
                     clearCycleEvidence(board);
                     markCycleEvidenceUnavailable(cwd);
                   }
