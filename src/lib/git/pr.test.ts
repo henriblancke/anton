@@ -94,6 +94,25 @@ describe("classifyReview", () => {
     expect(before.fingerprint).not.toEqual(after.fingerprint);
   });
 
+  // PR #338 review (chatgpt-codex-connector, P2): `reviewsComplete: false` means `pr.reviews` may
+  // be missing the very CHANGES_REQUESTED review that changed since the last answered round — the
+  // per-review `review:*` identity built from a truncated list can't be trusted, so a fixed cache-
+  // busting marker takes its place instead (mirroring `comments:incomplete`).
+  it("fingerprints a degraded reviews read distinctly from a complete one, instead of the truncated review list", () => {
+    const review = { author: "alice", state: "CHANGES_REQUESTED", body: "fix this", id: "PRR_1" };
+    const complete = classifyReview(
+      pr({ reviewDecision: "CHANGES_REQUESTED", reviews: [review], reviewsComplete: true }),
+    );
+    expect(complete.fingerprint.some((f) => f.startsWith("review:PRR_1:"))).toBe(true);
+
+    const degraded = classifyReview(
+      pr({ reviewDecision: "CHANGES_REQUESTED", reviews: [review], reviewsComplete: false }),
+    );
+    expect(degraded.fingerprint).toContain("reviews:incomplete");
+    expect(degraded.fingerprint.some((f) => f.startsWith("review:"))).toBe(false);
+    expect(degraded.fingerprint).not.toEqual(complete.fingerprint);
+  });
+
   it("is actionable when an unresolved thread awaits anton (even without CHANGES_REQUESTED)", () => {
     const v = classifyReview(pr({ threads: [thread()] }));
     expect(v.actionable).toBe(true);
@@ -520,6 +539,60 @@ process.exit(0);
     // re-trigger a fix round for bob's genuinely new feedback.
     const fingerprint = classifyReview(review).fingerprint;
     expect(fingerprint.some((f) => f.startsWith("review:PRR_2:bob:"))).toBe(true);
+  });
+
+  // PR #338 review (chatgpt-codex-connector, P2): `getPrReview` used to discard `reviewsComplete`
+  // entirely, so a degraded submitted-reviews read (a later page missing/malformed `pageInfo`) was
+  // indistinguishable from a genuinely complete one. `classifyReview` needs the flag to avoid keying
+  // its CHANGES_REQUESTED fingerprint on a truncated `reviews` list that might be hiding the very
+  // review that changed since the last answered round.
+  it("marks submitted reviews incomplete when a page is missing pageInfo entirely", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: 'CHANGES_REQUESTED', mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', headRefOid: 'sha-new', url: 'https://github.com/o/r/pull/7',
+    statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  if (query.includes('reviewThreads')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+    } } } } }));
+    process.exit(0);
+  }
+  if (query.includes('comments(')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+      pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+    } } } } }));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviews: {
+    nodes: [{ id: 'PRR_1', author: { login: 'alice' }, state: 'CHANGES_REQUESTED', body: 'fix this', submittedAt: '2026-01-01T00:00:00Z' }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.reviews.map((r) => r.id)).toEqual(["PRR_1"]);
+    expect(review.reviewsComplete).toBe(false);
+    // The degraded read must not fingerprint the individual reviews it DID get — that would compute
+    // the same value every later degraded read produces too, matching a stale answered row forever.
+    const fingerprint = classifyReview(review).fingerprint;
+    expect(fingerprint).toContain("reviews:incomplete");
+    expect(fingerprint.some((f) => f.startsWith("review:"))).toBe(false);
   });
 
   // PR #338 review (chatgpt-codex-connector, P2): a page with valid `nodes` but a missing/malformed

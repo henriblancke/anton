@@ -1714,6 +1714,16 @@ describe("fingerprintHasNonThreadReasons", () => {
     ).toBe(false);
   });
 
+  // PR #338 review (chatgpt-codex-connector): `classifyReview` pushes this same-shaped, exact
+  // sibling constant for a degraded REVIEWS read — `"comments:incomplete"`'s
+  // `startsWith("comment:")` exclusion doesn't match it (different word, no colon after "comment"),
+  // so it needs its own exact-match exclusion.
+  it("is false when the only extra entry is the reviews-incomplete cache-buster", () => {
+    expect(
+      fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1", "reviews:incomplete"]),
+    ).toBe(false);
+  });
+
   it("is true when a real non-thread reason (a failing check) is present", () => {
     expect(fingerprintHasNonThreadReasons(["check:build", "base:sha-1"])).toBe(true);
   });
@@ -1738,24 +1748,31 @@ describe("fingerprintHasNonThreadReasons", () => {
  * human reply the failed page was hiding.
  */
 describe("shouldRecordAnswered", () => {
-  it("records when nothing pushed, every thread answered, and the comment read was complete", () => {
-    expect(shouldRecordAnswered(false, true, true)).toBe(true);
+  it("records when nothing pushed, every thread answered, and the comment/review reads were complete", () => {
+    expect(shouldRecordAnswered(false, true, true, true)).toBe(true);
   });
 
-  it("records when commentsComplete is undefined (a caller-built fixture that never set it)", () => {
-    expect(shouldRecordAnswered(false, true, undefined)).toBe(true);
+  it("records when commentsComplete/reviewsComplete are undefined (a caller-built fixture that never set them)", () => {
+    expect(shouldRecordAnswered(false, true, undefined, undefined)).toBe(true);
   });
 
   it("does not record when the comment read was degraded, even though everything else answered", () => {
-    expect(shouldRecordAnswered(false, true, false)).toBe(false);
+    expect(shouldRecordAnswered(false, true, false, true)).toBe(false);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): mirrors the comment-completeness gate above — a
+  // degraded REVIEWS read can hide a new CHANGES_REQUESTED review, so recording this round as
+  // answered would let a later, still-degraded read match this stale row and suppress it forever.
+  it("does not record when the reviews read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, true, false)).toBe(false);
   });
 
   it("does not record when something was pushed", () => {
-    expect(shouldRecordAnswered(true, true, true)).toBe(false);
+    expect(shouldRecordAnswered(true, true, true, true)).toBe(false);
   });
 
   it("does not record when a thread was left unanswered", () => {
-    expect(shouldRecordAnswered(false, false, true)).toBe(false);
+    expect(shouldRecordAnswered(false, false, true, true)).toBe(false);
   });
 });
 

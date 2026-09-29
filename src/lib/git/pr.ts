@@ -125,6 +125,16 @@ export interface PrReview {
    * fixture (tests) has no reason to populate it.
    */
   commentsComplete?: boolean;
+  /**
+   * Whether `reviews` is the PR's WHOLE submitted-review history, or a degraded read — a later
+   * GraphQL page failed or returned a malformed response (see `getPrReviews`). `false` means a
+   * genuinely new CHANGES_REQUESTED review, or an edit to one, could be sitting on the page that
+   * failed to load: `classifyReview`'s per-review fingerprint would then keep matching a stale
+   * answered row against the truncated list it DID get, silently suppressing the hidden review
+   * forever. Mirrors `commentsComplete` — optional, defaulting to "complete", for the same reason
+   * (a caller-built fixture has no reason to populate it).
+   */
+  reviewsComplete?: boolean;
 }
 
 interface GhPrView {
@@ -230,6 +240,7 @@ export async function getPrReview(
     headSha: view.headRefOid ?? "",
     url: view.url,
     reviews: reviewsResult.reviews,
+    reviewsComplete: reviewsResult.reviewsComplete,
     failingChecks,
     failingCheckAttempts,
     pendingChecks,
@@ -840,7 +851,17 @@ export function classifyReview(pr: PrReview): Actionable {
     // edit an already-submitted CHANGES_REQUESTED review's body without touching its id, author,
     // submittedAt, or the PR head, so without this the amended feedback would match a stale
     // answered row and get suppressed forever.
-    if (changesRequested.length > 0) {
+    if (pr.reviewsComplete === false) {
+      // A degraded reviews read (a later GraphQL page failed — `getPrReviews`) can't be trusted to
+      // carry the true, complete set of CHANGES_REQUESTED reviews: the very review that would
+      // change this identity might be sitting on the page that failed, in which case the
+      // `review:*` entries built from the truncated list below would compute the SAME fingerprint
+      // as before and match a stale answered row even though something genuinely changed. A fixed,
+      // distinct marker — mirroring `comments:incomplete` above — means this checkpoint can never
+      // match an answered row recorded while the read was complete (PR #338 review, chatgpt-codex-
+      // connector).
+      fingerprint.push("reviews:incomplete");
+    } else if (changesRequested.length > 0) {
       const ids = changesRequested
         .map((r) => `${r.id ?? r.submittedAt ?? "?"}:${r.author}:${hashReviewBody(r.body)}`)
         .sort();

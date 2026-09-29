@@ -782,13 +782,13 @@ async function handleEpic(args: {
       branch,
       number,
     });
-    if (shouldRecordAnswered(pushed, answeredAllThreads, pr.commentsComplete)) {
+    if (shouldRecordAnswered(pushed, answeredAllThreads, pr.commentsComplete, pr.reviewsComplete)) {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
       // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz). See
-      // {@link shouldRecordAnswered} for why a degraded comment read (`commentsComplete === false`)
-      // skips this entirely rather than recording under a reusable placeholder value (PR #338 review
-      // round 2, chatgpt-codex-connector).
+      // {@link shouldRecordAnswered} for why a degraded comment or reviews read (`commentsComplete
+      // === false`, `reviewsComplete === false`) skips this entirely rather than recording under a
+      // reusable placeholder value (PR #338 review round 2, chatgpt-codex-connector).
       // Gated on `answeredAllThreads` (anton-091jr review, chatgpt-codex-connector): a report that
       // never arrived (a claude error text with no reporting contract) or left some of the threads
       // this round was actually asked about untouched must NOT be recorded as answered — that thread
@@ -1017,6 +1017,42 @@ export async function prepareFixWorktree(args: {
     expectedHeadSha === "" ||
     (await resolveCommitSha(repo, `origin/${branch}`).catch(() => undefined)) === expectedHeadSha;
 
+  const syncRef = `origin/${branch}`;
+
+  // Reconcile a leftover BARE premerge boundary against the freshly-fetched remote tip (PR #338
+  // review, chatgpt-codex-connector, P1) — a prior attempt's `premergeBase` can land a clean,
+  // hook-bypassed base-only merge and then crash before claude (or an operator) ever builds on top
+  // of it, leaving HEAD on a commit with no real fix underneath. If the PR's head has since advanced
+  // on GitHub (another push, a force-push, an operator's own commit), that bare commit and the new
+  // remote tip diverge — neither is an ancestor of the other, since the bare commit's own content
+  // merged in the OLD tip plus the base, not whatever landed on the new tip. The ff-only merge below
+  // then fails against that exact divergent state on EVERY sweep (swallowed by `safe`, so
+  // `headMatches` never becomes true), locking this checkout out of ever reaching the new head
+  // without a human resetting it by hand. Reset the bare boundary away — back to its own first
+  // parent, the tip it premerged ON TOP OF — before attempting the sync, so the ff-only merge has a
+  // genuine ancestor of the new tip to fast-forward from.
+  //
+  // Gated on the FETCHED `syncRef` not already being an ancestor of this commit (not the reverse):
+  // the "remote unchanged" resume path — a crashed premerge with nothing else touching the branch —
+  // already fast-forwards fine as a no-op and is recognized via `aheadBeforeFetch`'s own descendant
+  // check below; resetting it here too would just force a redundant re-premerge of a boundary that
+  // was never actually stuck.
+  const preSyncHead = await readWorktreeState(worktree.path).then(
+    (s) => s.head,
+    () => "",
+  );
+  if (
+    preSyncHead &&
+    (await isBareUnverifiedBoundaryCommit(worktree.path, preSyncHead)) &&
+    !(await isAncestor(worktree.path, syncRef, preSyncHead).catch(() => true))
+  ) {
+    const staleBoundaryParents = await commitParentShas(worktree.path, preSyncHead).catch(() => []);
+    const priorTip = staleBoundaryParents[0];
+    if (priorTip) {
+      await safe(() => git(worktree.path, ["reset", "--hard", priorTip]));
+    }
+  }
+
   // Override `core.hooksPath` for the fast-forward below ONLY when the incoming ref itself doesn't
   // carry it (see needsHooksPathOverrideForMerge) — a value resolved before this merge is either
   // exactly right (a generated directory like Husky's `.husky/_`, never tracked by any ref) or
@@ -1027,7 +1063,6 @@ export async function prepareFixWorktree(args: {
   // can pass for a submodule-backed hooksPath that is self-consistent right now but about to go stale
   // the instant this merge changes the gitlink — resolveHooksPathOverrideForMerge validates any
   // submodule substitute against the INCOMING ref specifically (PR #263 review, round 21).
-  const syncRef = `origin/${branch}`;
   const syncHooksPath = (await needsHooksPathOverrideForMerge(repo, worktree.path, syncRef))
     ? await resolveHooksPathOverrideForMerge(repo, worktree.path, syncRef)
     : undefined;
@@ -1215,7 +1250,10 @@ async function premergeBase(
       // must find this exact commit to re-verify the merge's own diff, not just whatever `commitFix`
       // commits on top of it afterward.
       try {
-        await markUnverifiedBoundary(worktreePath);
+        // `bare: true` — this merge landed with no claude session involved at all, so unlike
+        // `commitFix`'s own bypass commit, there is no fix content underneath it (PR #338 review,
+        // chatgpt-codex-connector: see `isBareUnverifiedBoundaryCommit`'s doc).
+        await markUnverifiedBoundary(worktreePath, { bare: true });
       } catch (error) {
         // The merge landed cleanly even though writing its marker failed (concurrent note-ref lock
         // contention, say) — left in place, `HEAD` would carry the still-unverified content with no
@@ -1337,13 +1375,14 @@ export function allWaitingThreadsAnswered(
  * Does `verdict.fingerprint` carry an actionable reason besides an unresolved thread? Excludes
  * `thread:*` (fed to {@link allWaitingThreadsAnswered} as per-thread evidence instead), `base:*` —
  * `classifyReview` (src/lib/git/pr.ts) appends a `base:<oid>` entry to every nonempty fingerprint
- * as a pure cache-busting key, not a real reason — and `comment:*`/`comments:incomplete`, the
- * top-level-comment cache-busting entries from the same function. Without excluding
- * `comments:incomplete` too, a PR whose only actionable reason is an unresolved inline thread, read
- * during a degraded top-level-comment page load, would read as having a non-thread reason and
- * demand a {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never existed —
- * failing a round that correctly reported only the real thread (PR #338 review, chatgpt-codex-
- * connector and claude).
+ * as a pure cache-busting key, not a real reason — and `comment:*`/`comments:incomplete`/
+ * `reviews:incomplete`, the top-level-comment and reviews cache-busting entries from the same
+ * function. Without excluding `comments:incomplete`/`reviews:incomplete` too, a PR whose only
+ * actionable reason is an unresolved inline thread, read during a degraded top-level-comment or
+ * reviews page load, would read as having a non-thread reason and demand a
+ * {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never existed — failing a
+ * round that correctly reported only the real thread (PR #338 review, chatgpt-codex-connector and
+ * claude).
  */
 export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): boolean {
   return fingerprint.some(
@@ -1351,30 +1390,34 @@ export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): 
       !f.startsWith("thread:") &&
       !f.startsWith("base:") &&
       !f.startsWith("comment:") &&
-      f !== "comments:incomplete",
+      f !== "comments:incomplete" &&
+      f !== "reviews:incomplete",
   );
 }
 
 /**
  * Should this round's outcome be persisted via `recordReviewFixAnswered` (queue.ts)? Requires the
  * same delivered-evidence bar {@link allWaitingThreadsAnswered} already computed
- * (`answeredAllThreads`), AND a complete top-level-comment read (`commentsComplete !== false`).
+ * (`answeredAllThreads`), AND complete top-level-comment and reviews reads (`commentsComplete !==
+ * false`, `reviewsComplete !== false`).
  *
- * The comment-completeness requirement exists because `classifyReview` (src/lib/git/pr.ts) folds a
- * degraded comment read into a FIXED, deterministic `"comments:incomplete"` fingerprint entry —
- * the same value on every degraded read, regardless of what's actually on the PR, because it can't
- * trust that read to name the true latest human reply. Recording a round under that entry would let
- * every LATER degraded read match this stale row and stay suppressed forever, even past a human
- * reply that the very page which failed to load was hiding (PR #338 review round 2,
- * chatgpt-codex-connector). Skipping the record entirely — rather than recording some other,
- * non-reusable placeholder — means the next pass, degraded or not, is never suppressed by this one.
+ * The completeness requirements exist because `classifyReview` (src/lib/git/pr.ts) folds a degraded
+ * comment or reviews read into a FIXED, deterministic `"comments:incomplete"`/`"reviews:incomplete"`
+ * fingerprint entry — the same value on every degraded read, regardless of what's actually on the
+ * PR, because it can't trust that read to name the true latest human reply or CHANGES_REQUESTED
+ * review. Recording a round under that entry would let every LATER degraded read match this stale
+ * row and stay suppressed forever, even past a human reply or a new review that the very page which
+ * failed to load was hiding (PR #338 review round 2, chatgpt-codex-connector). Skipping the record
+ * entirely — rather than recording some other, non-reusable placeholder — means the next pass,
+ * degraded or not, is never suppressed by this one.
  */
 export function shouldRecordAnswered(
   pushed: boolean,
   answeredAllThreads: boolean,
   commentsComplete: boolean | undefined,
+  reviewsComplete: boolean | undefined,
 ): boolean {
-  return !pushed && answeredAllThreads && commentsComplete !== false;
+  return !pushed && answeredAllThreads && commentsComplete !== false && reviewsComplete !== false;
 }
 
 /**
@@ -2115,29 +2158,52 @@ async function runGateFixFollowUp(args: {
  */
 const UNVERIFIED_BOUNDARY_NOTES_REF = "refs/notes/anton-review-fix-boundary";
 
-async function markUnverifiedBoundary(worktreePath: string): Promise<void> {
+/**
+ * Tag written into the boundary note by `premergeBase`'s OWN clean-merge mark only — never by
+ * `commitFix` — recording provenance explicitly rather than leaving `isBareUnverifiedBoundaryCommit`
+ * to infer it from merge topology (PR #338 review, chatgpt-codex-connector). A bypassed `commitFix`
+ * call that concludes a premerge's leftover `MERGE_HEAD` (claude resolved the base-merge conflicts
+ * as part of addressing review feedback) produces a commit with the exact same two-parent shape as a
+ * bare, fix-free premerge — the two are only distinguishable by who actually wrote the note.
+ */
+const BARE_PREMERGE_NOTE_TAG = "bare-base-premerge";
+
+async function markUnverifiedBoundary(
+  worktreePath: string,
+  options: { bare?: boolean } = {},
+): Promise<void> {
+  const note = options.bare
+    ? `hooks bypassed for this commit; not yet re-verified [${BARE_PREMERGE_NOTE_TAG}]`
+    : "hooks bypassed for this commit; not yet re-verified";
   await git(worktreePath, [
     "notes",
     `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`,
     "add",
     "-f",
     "-m",
-    "hooks bypassed for this commit; not yet re-verified",
+    note,
     "HEAD",
   ]);
+}
+
+/** The boundary note's own text, or `undefined` when `commit` carries no marker at all. */
+async function unverifiedBoundaryNote(
+  worktreePath: string,
+  commit: string,
+): Promise<string | undefined> {
+  try {
+    return await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "show", commit]);
+  } catch (error) {
+    if (exitedWith(error, 1)) return undefined;
+    throw error;
+  }
 }
 
 async function commitCarriesUnverifiedBoundaryMarker(
   worktreePath: string,
   commit: string,
 ): Promise<boolean> {
-  try {
-    await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "show", commit]);
-    return true;
-  } catch (error) {
-    if (exitedWith(error, 1)) return false;
-    throw error;
-  }
+  return (await unverifiedBoundaryNote(worktreePath, commit)) !== undefined;
 }
 
 /**
@@ -2146,33 +2212,29 @@ async function commitCarriesUnverifiedBoundaryMarker(
  * merely hasn't cleared re-verification yet (PR #338 review, chatgpt-codex-connector: keep failed
  * premerges out of the resume fast path)?
  *
- * The marker alone can't tell those apart: `commitFix`'s own bypass commit (a real fix, pending
- * re-verify) and `premergeBase`'s clean auto-merge (base content only, no fix at all) both call
- * {@link markUnverifiedBoundary} unconditionally. What tells them apart is shape — `commitFix`'s
- * bypass commit is an ordinary single-parent commit (`commitAll` never merges), while
- * `premergeBase`'s auto-merge is a two-parent merge of the branch's prior tip and the base ref. A
- * marked commit that is ALSO a merge is therefore never claude's own work landing directly on
- * `commit`; it can only be the premerge's boundary sitting bare, which is exactly the case the
- * resume fast path must not mistake for "review feedback already addressed".
+ * Answered from the marker's own provenance tag ({@link BARE_PREMERGE_NOTE_TAG}), not merge
+ * topology — a bare, fix-free `premergeBase` auto-merge and a bypassed `commitFix` call that
+ * concludes a premerge's leftover conflicted merge (claude resolved the base-merge conflicts while
+ * addressing the actual review feedback) are BOTH two-parent commits, so a parent-count check can't
+ * tell a real fix from an empty premerge; only `markUnverifiedBoundary`'s caller knows which one it
+ * is (PR #338 review, chatgpt-codex-connector).
  *
- * Fails closed toward `true` (forcing the slower claude dispatch over the resume fast path) when
- * either git lookup itself fails — the fast path pushing straight past unaddressed feedback is
- * the worse outcome of the two.
+ * Fails closed toward `true` (forcing the slower claude dispatch over the resume fast path) when the
+ * note lookup itself fails — the fast path pushing straight past unaddressed feedback is the worse
+ * outcome of the two.
  */
 async function isBareUnverifiedBoundaryCommit(
   worktreePath: string,
   commit: string,
 ): Promise<boolean> {
-  const carriesMarker = await commitCarriesUnverifiedBoundaryMarker(worktreePath, commit).catch(
-    () => true,
-  );
-  if (!carriesMarker) return false;
+  let note: string | undefined;
   try {
-    const parents = await commitParentShas(worktreePath, commit);
-    return parents.length >= 2;
+    note = await unverifiedBoundaryNote(worktreePath, commit);
   } catch {
     return true;
   }
+  if (note === undefined) return false;
+  return note.includes(BARE_PREMERGE_NOTE_TAG);
 }
 
 /**
