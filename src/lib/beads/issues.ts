@@ -434,14 +434,27 @@ function eligibilityKeyOf(list: Bead[]): (id: string) => string | undefined {
  * comparison above looks at (status/labels/description/ancestors of ids `board` already has), so a brand-new
  * child with an invalid tier or incomplete contract would otherwise slip through unnoticed and the
  * stale `board` would still wave the pairing through (P2 review, PR #274, issues.ts:373).
+ *
+ * A brand-new bead with no ancestor on `board` at all — not a descendant of anything `board` already
+ * has — is rejected too, but only when it is itself a run target (P2 review, PR #274, issues.ts:444):
+ * a shared-server writer's new parentless task/bug or feature lands in exactly this gap, and its
+ * ancestor chain never touches `boardIds` because it never had a parent to begin with. The prior
+ * version waved that case through as "unrelated, so safe" — but `loadAllIssues` returns `board`
+ * anyway, and the board-picker (board-picker.ts:87-145) ranks and immediately starts from it, so a
+ * newly landed priority-0 candidate could be skipped entirely while a lower-ranked target already on
+ * `board` gets approved and claimed. A non-run-target newcomer (a chore, a parented ticket, a
+ * container epic) still passes through unnoticed — it can't be started on its own, so there's nothing
+ * for the picker to miss.
  */
 export function sameTargetEligibilityState(board: Bead[], fresh: Bead[]): boolean {
   const [keyBoard, keyFresh] = [eligibilityKeyOf(board), eligibilityKeyOf(fresh)];
   if (!board.every((bead) => keyBoard(bead.id) === keyFresh(bead.id))) return false;
   const boardIds = new Set(board.map((bead) => bead.id));
-  return fresh.every(
-    (bead) => boardIds.has(bead.id) || !ancestorChain(bead.id, fresh).some((id) => boardIds.has(id)),
-  );
+  return fresh.every((bead) => {
+    if (boardIds.has(bead.id)) return true;
+    if (ancestorChain(bead.id, fresh).some((id) => boardIds.has(id))) return false;
+    return !beads.isRunTarget(bead, fresh);
+  });
 }
 
 /**

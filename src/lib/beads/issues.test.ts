@@ -1572,11 +1572,18 @@ describe("sameTargetEligibilityState (P2 review, PR #274, issues.ts:373)", () =>
     expect(sameTargetEligibilityState(board, [epic, newChild])).toBe(false);
   });
 
-  it("stays consistent when fresh only adds a bead unrelated to any board id", () => {
+  it("stays consistent when fresh adds a bead unrelated to any board id that isn't itself a run target", () => {
     const board = [epic];
-    const unrelated: Bead = { id: "u-1", title: "Unrelated", status: "open", issue_type: "task" };
+    const unrelatedChore: Bead = { id: "u-1", title: "Unrelated", status: "open", issue_type: "chore" };
 
-    expect(sameTargetEligibilityState(board, [epic, unrelated])).toBe(true);
+    expect(sameTargetEligibilityState(board, [epic, unrelatedChore])).toBe(true);
+  });
+
+  it("flags drift when fresh adds a new parentless run target unrelated to any board id (P2 review, PR #274, issues.ts:444)", () => {
+    const board = [epic];
+    const newTarget: Bead = { id: "u-1", title: "New target", status: "open", issue_type: "task" };
+
+    expect(sameTargetEligibilityState(board, [epic, newTarget])).toBe(false);
   });
 
   it("stays consistent when nothing changed", () => {
