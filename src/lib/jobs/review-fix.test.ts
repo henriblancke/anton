@@ -85,6 +85,9 @@ vi.mock("../claude/driver", () => ({ runClaude: (...a: unknown[]) => runClaudeMo
 // `isAncestor` would otherwise reject and premergeBase's own `.catch(() => false)` would read that
 // as "behind" and merge on every test regardless of what's actually under test.
 const isAncestorMock = vi.fn();
+// Stands in for "was the LOCAL branch already ahead of origin/<branch> BEFORE prepareFixWorktree
+// fetched anything" — defaults to false (no pre-existing local commits), matching a fresh checkout.
+const branchAheadOfRemoteMock = vi.fn().mockResolvedValue(false);
 const mergeIntoCurrentMock = vi.fn();
 // Defaults to rejecting like the real `rev-parse` would against the plain temp dir `worktreePath`
 // stands in for (not a real git repo) — tests that care about the base-ref check override this.
@@ -131,7 +134,7 @@ vi.mock("../git/ops", async () => {
     },
     mergeIntoCurrent: (...a: unknown[]) => mergeIntoCurrentMock(...a),
     isAncestor: (...a: unknown[]) => isAncestorMock(...a),
-    branchAheadOfRemote: vi.fn().mockResolvedValue(false),
+    branchAheadOfRemote: (...a: unknown[]) => branchAheadOfRemoteMock(...a),
     needsHooksPathOverrideForMerge: vi.fn().mockResolvedValue(false),
     resolveHooksPathOverrideForMerge: vi.fn().mockResolvedValue(undefined),
     resolveCommitSha: (...a: unknown[]) => resolveCommitShaMock(...a),
@@ -552,7 +555,14 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
   describe("refsSynced treats a descendant checkout as synced, not just an exact match", () => {
     // `readWorktreeState` is real (only `git/ops` functions named in the mock above are stubbed) and
     // `worktreePath` is a plain temp dir, not a real git repo, so it always resolves to "" here —
-    // `isAncestorMock` is what stands in for "is the checkout ahead of `expectedHeadSha`".
+    // `isAncestorMock` is what stands in for "is the checkout ahead of `expectedHeadSha`". The
+    // descendant allowance only applies when the branch was already ahead of origin BEFORE the fetch
+    // (see the race-condition describe block below), so these tests — about the ancestry check
+    // itself, not the guard in front of it — set that precondition true.
+    beforeEach(() => {
+      branchAheadOfRemoteMock.mockResolvedValue(true);
+    });
+
     const runWithHead = (expectedHeadSha: string) =>
       prepareFixWorktree({
         ctx: fakeCtx(),
@@ -589,6 +599,36 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       const result = await runWithHead("expected-head-sha");
 
       expect(result.refsSynced).toBe(false);
+    });
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 9: if the PR branch advances remotely between the
+  // caller's `getPrReview` and `prepareFixWorktree`'s own fetch, the freshly fetched `origin/<branch>`
+  // is a descendant of `expectedHeadSha` too — indistinguishable, by ancestry alone, from the resume
+  // path's pre-existing local commits. Only a branch that was ALREADY ahead of origin before the
+  // fetch (i.e. not just a fresh checkout the fetch itself advanced) may use the descendant
+  // allowance; otherwise a descendant checkout must still force a fresh PR read rather than run the
+  // gates against a commit GitHub no longer reports as the head.
+  describe("refsSynced does not trust a descendant checkout the fetch itself just produced", () => {
+    it("is false when the branch was NOT already ahead before the fetch, even if the synced checkout is a descendant of expectedHeadSha", async () => {
+      branchAheadOfRemoteMock.mockResolvedValue(false); // nothing local pre-dates this fetch
+      isAncestorMock.mockResolvedValue(true); // the freshly-fetched tip descends from expectedHeadSha
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha",
+        expectedBaseRefOid: undefined,
+      });
+
+      expect(result.refsSynced).toBe(false);
+      // The guard short-circuits before even asking — a descendant fetched just now proves nothing.
+      expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
     });
   });
 

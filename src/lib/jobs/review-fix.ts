@@ -939,6 +939,19 @@ export async function prepareFixWorktree(args: {
   await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
   await ctx.heartbeat();
 
+  // Snapshot "local branch already ahead of origin" BEFORE the fetch/sync below can move
+  // `origin/<branch>` — the only way to tell "this worktree already carried commits past
+  // `expectedHeadSha` before we asked origin for anything" (the supported resume path, see
+  // `alreadyAhead` below) apart from "origin answered with a tip newer than what `getPrReview`
+  // reported, and the ff-only merge below just fast-forwarded local onto it" (a race between that
+  // read and this fetch). Both leave `syncedHead` strictly ahead of `expectedHeadSha`; only the
+  // resume case is safe to trust as "synced", since in the race case the checks/reviews/fingerprint
+  // the caller classified are for a commit that is no longer the branch's real tip (PR #338 review,
+  // chatgpt-codex-connector, round 9) — a plain ff-only merge otherwise has no local-only commits to
+  // land it ahead of a freshly-fetched `origin/<branch>`, so seeing it ahead only *after* the fetch
+  // can't distinguish the two.
+  const aheadBeforeFetch = await branchAheadOfRemote(repo, branch);
+
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
@@ -976,10 +989,22 @@ export async function prepareFixWorktree(args: {
   // legitimately sits ahead of what GitHub reports (PR #338 review, chatgpt-codex-connector, round
   // 4). Treating that as unsynced deleted the job's attempt identity every single pass, so a parked
   // gate could never be matched by a later sweep and kept re-dispatching against the same commits.
+  //
+  // But that descendant allowance only holds when the LOCAL branch was already ahead of origin
+  // BEFORE this function fetched anything (`aheadBeforeFetch` above) — i.e. the extra commits are
+  // known to be the resume path's own unpushed work, not something the fetch just pulled in. Without
+  // that guard, a PR branch that advances remotely between the caller's `getPrReview` and the fetch
+  // above produces the exact same shape: a freshly fetched `origin/<branch>` that is a descendant of
+  // `expectedHeadSha`, fast-forwarded onto local by the ff-only merge — and accepting it as synced
+  // would run the checks/reviews/fingerprint the caller classified against a commit that is no
+  // longer the branch's real tip (PR #338 review, chatgpt-codex-connector, round 9). When
+  // `aheadBeforeFetch` is false, only an exact match counts as synced — anything else forces a fresh
+  // PR read on the next pass instead.
   const headMatches =
     expectedHeadSha === "" ||
     syncedHead === expectedHeadSha ||
-    (await isAncestor(worktree.path, expectedHeadSha, syncedHead).catch(() => false));
+    (aheadBeforeFetch &&
+      (await isAncestor(worktree.path, expectedHeadSha, syncedHead).catch(() => false)));
 
   // Same check for the base ref `fetchOrigin` above also fetched (best-effort, just like the head
   // fetch above) — resolved directly via `rev-parse` rather than `readWorktreeState` since the
