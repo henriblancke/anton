@@ -11,7 +11,13 @@ import {
   type RecoverableClaudeError,
 } from "../jobs/errors";
 import { createStreamState, type StreamState } from "./driver-events";
-import { exitError, toClaudeResult, transientSignature, type ClaudeExit } from "./driver-exit";
+import {
+  exitError,
+  isRecoverableClaudeText,
+  toClaudeResult,
+  transientSignature,
+  type ClaudeExit,
+} from "./driver-exit";
 
 function stream(overrides: Partial<StreamState> = {}): StreamState {
   return { ...createStreamState(), ...overrides };
@@ -214,6 +220,43 @@ describe("exitError", () => {
       exit({ stream: stream({ resultRaw: { type: "result", is_error: true, result: "the local endpoint returned 500" } }) }),
     );
     expect(real).toBeNull();
+  });
+
+  it("stably tags a clean-exit is_error transient result so its stored message stays recognizable as recoverable (PR #339 review)", () => {
+    // failureError's is_error+transient branch used to surface bare `resultText` with no stable
+    // envelope at all, so once `settleRunRow` stored `.message` as plain text there was nothing left
+    // for `isRecoverableClaudeText` to anchor on — a genuine upstream drop classified as "unknown".
+    const err = exitError(
+      exit({
+        stream: stream({
+          resultRaw: { type: "result", is_error: true, result: "Connection closed mid-response (ECONNRESET)" },
+        }),
+      }),
+    );
+
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(err?.message.startsWith("claude reported a transient error result")).toBe(true);
+    expect(isRecoverableClaudeText(err!.message)).toBe(true);
+  });
+
+  it("keeps a transient nonzero exit recognizable even when the surfaced detail prefers the agent's own report over the stderr signature (PR #339 review)", () => {
+    // exitCodeError prefers the agent's own result summary for the surfaced `detail`, so when the
+    // transient signature was matched only in stderr the rendered message can end up with no
+    // transient wording anywhere in it — `isRecoverableClaudeText` used to reconstruct recoverability
+    // by re-scanning that text and missed exactly this case, misclassifying a real upstream drop as
+    // a deterministic agent failure.
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr: "Connection closed mid-response",
+        stream: stream({ resultRaw: { type: "result", is_error: true, result: "three tests fail" } }),
+      }),
+    );
+
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(recoverable(err).signature).toBe("connection-closed");
+    expect(err?.message).not.toMatch(/connection closed/i);
+    expect(isRecoverableClaudeText(err!.message)).toBe(true);
   });
 });
 

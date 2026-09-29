@@ -48,23 +48,26 @@ const INFRA_RE =
 
 /**
  * The claude driver's own failure shapes (driver-exit.ts `exitCodeError`/`stallError`/
- * `failureError`/`modelRefusalError`), plus `execute-epic-ticket.ts`'s `BlockedByAgentError`, plus
- * every `dispatchClaude` call site's own `failure()` callback (steps/agent.ts, steps/describe.ts,
- * review-gate.ts, review-fix.ts, product-master-steps.ts, nightly-stringer-triage.ts) for a session
- * that exited cleanly but self-reported `is_error` — a deterministic non-zero exit, a stall kill, a
- * missing result event, a refused model id, an explicit self-reported block, or a clean exit the
+ * `failureError`/`modelRefusalError`), plus `execute-epic-ticket.ts`'s `BlockedByAgentError` and
+ * `NoDeliveryError`, plus every `dispatchClaude` call site's own `failure()` callback
+ * (steps/agent.ts, steps/describe.ts, review-gate.ts, review-fix.ts, product-master-steps.ts,
+ * nightly-stringer-triage.ts) for a session that exited cleanly but self-reported `is_error` — a
+ * deterministic non-zero exit, a stall kill, a missing result event, a refused model id, an
+ * explicit self-reported block, a clean exit that left zero diff to deliver, or a clean exit the
  * model itself flagged as failed. Each message is built in exactly one function as the ENTIRE error
  * string (never appended to other text), so its full phrasing is stable and every alternative below
- * is anchored to the start — including the self-report one: `BlockedByAgentError`'s message always
- * opens with `${ticket.id} was self-reported blocked by the agent`, so anchoring on that ticket-id
- * prefix (the same shape `bd`-produced ids take elsewhere, e.g. gardener/relink.ts's `ID_PATTERN`)
- * still matches the real producer while refusing a bare, unanchored occurrence of the phrase quoted
- * inside nested diagnostic output — e.g. a failing assertion's captured output, or a top-level gate
- * failure whose own `BlockedByAgentError`-related test fixture happens to echo it — which would
- * otherwise outrank the gate/infra matcher that should actually own that failure.
+ * is anchored to the start — including the ticket-id ones: `BlockedByAgentError`'s message always
+ * opens with `${ticket.id} was self-reported blocked by the agent`, and `NoDeliveryError`'s
+ * zero-diff/preserved-adoption messages (execute-epic-ticket.ts) always open with
+ * `${ticket.id} produced no delivery:`, so anchoring on that ticket-id prefix (the same shape
+ * `bd`-produced ids take elsewhere, e.g. gardener/relink.ts's `ID_PATTERN`) still matches the real
+ * producer while refusing a bare, unanchored occurrence of the phrase quoted inside nested
+ * diagnostic output — e.g. a failing assertion's captured output, or a top-level gate failure whose
+ * own `BlockedByAgentError`-related test fixture happens to echo it — which would otherwise outrank
+ * the gate/infra matcher that should actually own that failure.
  */
 const AGENT_RE =
-  /^claude exited with code|^claude produced no output for .*killed as stalled|^claude exited without a result event|^claude refused to start: the model|^(?:claude|the product-master session|scan-triage|describer) reported an error\b|^[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)* was self-reported blocked by the agent\b/i;
+  /^claude exited with code|^claude produced no output for .*killed as stalled|^claude exited without a result event|^claude refused to start: the model|^(?:claude|the product-master session|scan-triage|describer) reported an error\b|^[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)* (?:was self-reported blocked by the agent\b|produced no delivery:)/i;
 
 /**
  * The authoritative leading envelope every gate-failure site builds as the WHOLE message's start:

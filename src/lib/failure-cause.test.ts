@@ -161,6 +161,22 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("infra");
   });
 
+  it("classifies a claude exit whose transient signature was matched only in stderr — never in the surfaced agent-report detail — as infra, not agent (PR #339 review)", () => {
+    // driver-exit.ts's exitCodeError prefers the agent's own result summary for the surfaced detail,
+    // so the transient phrasing can be entirely absent from the message text; only the appended
+    // `(transient: <signature>)` tag carries the recoverable signal.
+    const error = "claude exited with code 1: three tests fail (transient: connection-closed)";
+    expect(classifyFailureCause(error)).toBe("infra");
+  });
+
+  it("classifies a clean-exit is_error transient result as infra, not unknown (PR #339 review)", () => {
+    // driver-exit.ts's failureError builds this exact envelope for an is_error result carrying a
+    // transient signature on an otherwise-clean (exit 0) run.
+    const error =
+      "claude reported a transient error result (connection-closed): Connection closed mid-response (ECONNRESET)";
+    expect(classifyFailureCause(error)).toBe("infra");
+  });
+
   it("classifies a refused/nonexistent model id as agent", () => {
     const error =
       'claude refused to start: the model "claude-opus-4-8" doesn\'t exist, or the configured account ' +
@@ -237,6 +253,30 @@ describe("classifyFailureCause", () => {
       "verify gate failed for anton-abcd (exit 1)\n\n> vitest run\n\nFAIL src/lib/failure-cause.test.ts\n" +
       'AssertionError: expected "anton-y1u2y was self-reported blocked by the agent (blocked — ' +
       'dep-missing — waiting on anton-abcd) even though it committed changes." to be classified as agent';
+    expect(classifyFailureCause(error)).toBe("gate");
+  });
+
+  it("classifies a zero-diff no-delivery block as agent, not unknown (PR #339 review)", () => {
+    const error =
+      "anton-a1b2 produced no delivery: claude exited cleanly and passed the verify gates but left no " +
+      "changes to commit (zero diff). Blocking the ticket for operator review and halting the epic — " +
+      "nothing landed, so closing it would be a false success.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
+  it("classifies a preserved-adoption no-delivery block as agent, not unknown (PR #339 review)", () => {
+    const error =
+      "anton-a1b2 produced no delivery: claude left no changes to commit (zero diff) and no " +
+      "`ANTON-RESULT` from this run says the ticket is finished, so the only work on the branch is " +
+      "the explicitly incomplete commit a previous attempt PRESERVED when it ran out of time.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
+  it("classifies a gate failure whose captured output quotes a no-delivery phrase as gate, not agent", () => {
+    const error =
+      "verify gate failed for anton-abcd (exit 1)\n\n> vitest run\n\nFAIL src/lib/failure-cause.test.ts\n" +
+      'AssertionError: expected "anton-a1b2 produced no delivery: claude exited cleanly and passed ' +
+      'the verify gates" to be classified as agent';
     expect(classifyFailureCause(error)).toBe("gate");
   });
 

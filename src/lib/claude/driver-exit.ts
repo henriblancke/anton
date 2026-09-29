@@ -123,11 +123,23 @@ function signatureOf(raw: string): string {
  * transient `exitCodeError` case above. Reusing `TRANSIENT_STDERR_RE` here (rather than duplicating
  * its vocabulary) keeps "what counts as recoverable" defined in exactly one place, the same file
  * that builds every `RecoverableClaudeError` this classifier has to recognize.
+ *
+ * The exit-code envelope's surfaced detail prefers the agent's own result summary over stderr
+ * (`exitCodeError`), so a signature matched solely in stderr (e.g. a 503) can leave the rendered
+ * message with no transient wording at all — the plain `TRANSIENT_STDERR_RE.test(message)` check
+ * below then misses it, misclassifying a real upstream drop as a deterministic agent failure. Both
+ * `exitCodeError` and `failureError`'s `is_error`+transient branch append a stable
+ * `(transient: <signature>)` tag whenever they actually build a `RecoverableClaudeError`, precisely
+ * so this function never has to reconstruct that fact from prose that may not carry it — the
+ * anchored suffix check is checked as an alternative to (never a replacement for) the historical
+ * phrase-scan, since `runs.error` rows written before that tag existed still rely on it.
  */
 export function isRecoverableClaudeText(message: string): boolean {
   if (/^claude exited without a result event\b/.test(message)) return true;
   if (/^claude produced no output for .*killed as stalled\b/i.test(message)) return true;
-  return /^claude exited with code \d+: /.test(message) && TRANSIENT_STDERR_RE.test(message);
+  if (/^claude reported a transient error result\b/i.test(message)) return true;
+  if (!/^claude exited with code \d+: /.test(message)) return false;
+  return TRANSIENT_STDERR_RE.test(message) || /\(transient: [^)]+\)$/.test(message);
 }
 
 /** The final result text, or "" when the run emitted no result event (or a non-string one). */
@@ -237,8 +249,11 @@ function exitCodeError(exit: ClaudeExit, sessionId: string | undefined): Error {
   if (modelRefusal) return modelRefusal;
   const message = `claude exited with code ${exit.code}: ${detail.slice(-2000)}`;
   const signature = transientSignature(resultText, exit.stderr, exit.stream.resultRaw !== undefined);
+  // The surfaced `detail` above can omit the transient wording entirely (it preferred a resultText
+  // that doesn't carry it, while the signature was matched in stderr) — append a stable tag so
+  // `isRecoverableClaudeText` can still recognize this as recoverable from the stored string alone.
   return signature
-    ? new RecoverableClaudeError(message, { sessionId, signature })
+    ? new RecoverableClaudeError(`${message} (transient: ${signature})`, { sessionId, signature })
     : new Error(message);
 }
 
@@ -263,11 +278,14 @@ function failureError(exit: ClaudeExit): Error | null {
 
   const resultText = resultTextOf(exit);
   const signature = transientSignature(resultText, exit.stderr, true);
+  // Stable-prefixed rather than bare `resultText`: the model-authored text can say anything (or
+  // nothing), so it alone can never be recognized as recoverable once stored as plain `runs.error`
+  // text — `isRecoverableClaudeText` anchors on this exact envelope.
   return signature
-    ? new RecoverableClaudeError(resultText || "claude reported a transient error result", {
-        sessionId,
-        signature,
-      })
+    ? new RecoverableClaudeError(
+        `claude reported a transient error result (${signature})${resultText ? `: ${resultText}` : ""}`,
+        { sessionId, signature },
+      )
     : null;
 }
 
