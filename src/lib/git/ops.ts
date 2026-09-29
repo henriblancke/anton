@@ -1683,28 +1683,33 @@ export async function commitAll(
   // review, chatgpt-codex-connector, round 9).
   let mergeHeadPath: string | undefined;
   let mergeMsgPath: string | undefined;
-  if (extraParents.length > 0) {
-    mergeHeadPath = await git(worktreePath, [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "MERGE_HEAD",
-    ]);
-    await writeFile(mergeHeadPath, extraParents.map((parent) => `${parent}\n`).join(""));
-    // `-m` reports its source as `message` to `prepare-commit-msg`, even with `MERGE_HEAD` present
-    // and the resulting commit carrying multiple parents — a hook branching on that source argument
-    // would see the wrong one. Writing the message to `MERGE_MSG` and committing with `--no-edit`
-    // instead runs the same path `git merge` itself uses, so the hook sees source `merge` (PR #338
-    // review, chatgpt-codex-connector, round 10).
-    mergeMsgPath = await git(worktreePath, [
-      "rev-parse",
-      "--path-format=absolute",
-      "--git-path",
-      "MERGE_MSG",
-    ]);
-    await writeFile(mergeMsgPath, originalMessage);
-  }
+  // Setup (resolving/writing MERGE_HEAD and MERGE_MSG) lives inside this same try — HEAD already
+  // moved to `resetHead` above, so a failure here (e.g. an unwritable git dir) needs the identical
+  // restoration the commit failure path below already performs, not an uncaught throw that leaves
+  // the branch rewound with the boundary's changes merely staged (PR #338 review, chatgpt-codex-
+  // connector).
   try {
+    if (extraParents.length > 0) {
+      mergeHeadPath = await git(worktreePath, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "MERGE_HEAD",
+      ]);
+      await writeFile(mergeHeadPath, extraParents.map((parent) => `${parent}\n`).join(""));
+      // `-m` reports its source as `message` to `prepare-commit-msg`, even with `MERGE_HEAD` present
+      // and the resulting commit carrying multiple parents — a hook branching on that source argument
+      // would see the wrong one. Writing the message to `MERGE_MSG` and committing with `--no-edit`
+      // instead runs the same path `git merge` itself uses, so the hook sees source `merge` (PR #338
+      // review, chatgpt-codex-connector, round 10).
+      mergeMsgPath = await git(worktreePath, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "MERGE_MSG",
+      ]);
+      await writeFile(mergeMsgPath, originalMessage);
+    }
     await gitCommit(
       worktreePath,
       extraParents.length > 0 ? ["commit", "--no-edit"] : ["commit", "-m", originalMessage],

@@ -558,8 +558,11 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     // `isAncestorMock` is what stands in for "is the checkout ahead of `expectedHeadSha`". The
     // descendant allowance only applies when the branch was already ahead of origin BEFORE the fetch
     // (see the race-condition describe block below), so these tests — about the ancestry check
-    // itself, not the guard in front of it — set that precondition true.
+    // itself, not the guard in front of it — set that precondition true: the pre-fetch tracking sha
+    // resolves to exactly `expectedHeadSha` (proving real, current knowledge of origin), same as
+    // `branchAheadOfRemote` reporting real local-only commits on top of it.
     beforeEach(() => {
+      resolveCommitShaMock.mockResolvedValue("expected-head-sha");
       branchAheadOfRemoteMock.mockResolvedValue(true);
     });
 
@@ -611,6 +614,7 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
   // gates against a commit GitHub no longer reports as the head.
   describe("refsSynced does not trust a descendant checkout the fetch itself just produced", () => {
     it("is false when the branch was NOT already ahead before the fetch, even if the synced checkout is a descendant of expectedHeadSha", async () => {
+      resolveCommitShaMock.mockResolvedValue("expected-head-sha"); // known, current pre-fetch tracking sha
       branchAheadOfRemoteMock.mockResolvedValue(false); // nothing local pre-dates this fetch
       isAncestorMock.mockResolvedValue(true); // the freshly-fetched tip descends from expectedHeadSha
 
@@ -628,6 +632,56 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
 
       expect(result.refsSynced).toBe(false);
       // The guard short-circuits before even asking — a descendant fetched just now proves nothing.
+      expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+    });
+
+    // PR #338 review, chatgpt-codex-connector, round 10: `branchAheadOfRemote` itself fails OPEN
+    // (returns `true`) when `origin/<branch>` is unresolvable locally — indistinguishable, by that
+    // return value alone, from a genuine pre-existing local-only commit. A pre-fetch tracking sha
+    // that never resolved is exactly the "unknown" case, so it must not be trusted as evidence of a
+    // real resume, even though `branchAheadOfRemote` itself reports "ahead".
+    it("is false when the pre-fetch tracking sha never resolves, even though branchAheadOfRemote fails open to true", async () => {
+      resolveCommitShaMock.mockRejectedValue(new Error("unknown revision: origin/anton/fix-7"));
+      branchAheadOfRemoteMock.mockResolvedValue(true); // the fail-open fallback, not real evidence
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha",
+        expectedBaseRefOid: undefined,
+      });
+
+      expect(result.refsSynced).toBe(false);
+      expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+    });
+
+    // Same "unknown" case, but the pre-fetch tracking sha DOES resolve — just to something other
+    // than `expectedHeadSha`, meaning the local repo's knowledge of origin was stale rather than
+    // current at snapshot time. Still not trustworthy evidence of a real resume.
+    it("is false when the pre-fetch tracking sha resolves to something other than expectedHeadSha", async () => {
+      resolveCommitShaMock.mockResolvedValue("some-other-stale-sha");
+      branchAheadOfRemoteMock.mockResolvedValue(true);
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha",
+        expectedBaseRefOid: undefined,
+      });
+
+      expect(result.refsSynced).toBe(false);
       expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
     });
   });

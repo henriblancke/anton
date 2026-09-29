@@ -950,7 +950,25 @@ export async function prepareFixWorktree(args: {
   // chatgpt-codex-connector, round 9) — a plain ff-only merge otherwise has no local-only commits to
   // land it ahead of a freshly-fetched `origin/<branch>`, so seeing it ahead only *after* the fetch
   // can't distinguish the two.
-  const aheadBeforeFetch = await branchAheadOfRemote(repo, branch);
+  //
+  // `branchAheadOfRemote` alone isn't enough evidence: it deliberately returns `true` when
+  // `origin/<branch>` is absent locally or its `rev-list` fails (fail-open, so a repo with no
+  // reachable origin doesn't block the review-comment flow elsewhere) — that "unknown" case reads
+  // identically to a genuine resume, so it can't tell apart from the race above either. Requiring the
+  // pre-fetch tracking ref to have actually resolved, AND to already equal `expectedHeadSha` — the
+  // head `getPrReview` reported — proves the local repo's knowledge of origin was both real and
+  // current at that moment, so any extra local commits on top of it are trustworthy resume work, not
+  // a raced fetch dressed up by the fallback (PR #338 review, chatgpt-codex-connector, round 10).
+  // Skipped entirely when `expectedHeadSha === ""` (a synthetic `PrReview` in tests) — `headMatches`
+  // below trusts the sync unconditionally in that case, so `aheadBeforeFetch`'s value can't affect it.
+  const preFetchTrackingSha =
+    expectedHeadSha === ""
+      ? undefined
+      : await resolveCommitSha(repo, `origin/${branch}`).catch(() => undefined);
+  const aheadBeforeFetch =
+    expectedHeadSha !== "" &&
+    preFetchTrackingSha === expectedHeadSha &&
+    (await branchAheadOfRemote(repo, branch));
 
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),

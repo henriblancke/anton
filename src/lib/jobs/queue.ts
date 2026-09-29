@@ -615,6 +615,15 @@ export function enqueueReviewFixPrIfAbsent(
  * (a caller with nothing finer to check, or a legacy parked row from before this field existed) falls
  * back to the old headSha-only match — there is no base-change evidence to admit a retry with.
  *
+ * Filtered on `status` in JS against the target's single most recent SETTLED row at this head (any
+ * status outside {@link ACTIVE_STATUSES}, not `parked` alone) — same reasoning as
+ * {@link answeredUnchanged}'s own comment on why it can't filter `status = "done"` in SQL: a target
+ * that parks at fingerprint A, later settles an answered/no-push attempt at fingerprint B on the same
+ * head, and then cycles back to A needs the newer B row to win the ordering, not be skipped by a SQL
+ * `status = "parked"` filter that can only ever see the older A park — otherwise the stale A row is
+ * resurrected and the PR stays suppressed indefinitely even though the target has since moved past it
+ * (PR #338 review, chatgpt-codex-connector).
+ *
  * Ordered on `updatedAt` DESC with {@link JOB_INSERT_ORDER} as the tie-break, same as
  * {@link answeredUnchanged} — `updatedAt` is second-truncated, so two attempts for the same head but
  * different fingerprints parking within the same second would otherwise sort arbitrarily, and SQLite
@@ -629,13 +638,13 @@ function parkedAtHead(
   fingerprint?: string[],
 ): string | undefined {
   const row = tx
-    .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson })
+    .select({ id: schema.jobs.id, status: schema.jobs.status, payloadJson: schema.jobs.payloadJson })
     .from(schema.jobs)
     .where(
       and(
         eq(schema.jobs.type, "review-fix-pr"),
         eq(schema.jobs.projectId, projectId),
-        eq(schema.jobs.status, "parked"),
+        notInArray(schema.jobs.status, [...ACTIVE_STATUSES]),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
@@ -643,7 +652,7 @@ function parkedAtHead(
     .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1)
     .all()[0];
-  if (!row) return undefined;
+  if (!row || row.status !== "parked") return undefined;
   if (fingerprint === undefined) return row.id;
   let payload: { fingerprint?: string[] };
   try {
