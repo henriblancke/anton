@@ -1538,6 +1538,51 @@ export function shouldRecordAnswered(
 }
 
 /**
+ * Did the main round's own commit survive, unaltered, all the way to what actually gets pushed?
+ * `preGateHead` is the boundary commit the main round itself produced (see `runFixSession`'s own
+ * snapshot, taken right after `commitFix` and before gates or the gate-fix follow-up touch
+ * anything); `postSessionHead` is the tip after gates and the one bounded follow-up round have run.
+ *
+ * A gate-fix follow-up's prompt carries only the gate's failure output, never review feedback — so
+ * whatever it edits is not evidence for any "fixed" claim in the main round's own report. Comparing
+ * `preGateHead` to `preSessionHead` alone (raw commit identity) proves the main round committed
+ * SOMETHING, but not that the same content is still what's on the branch: a follow-up that reverts a
+ * path the main round changed, while making the gate pass some other way, still leaves that
+ * comparison reading "changed" even though the fix itself never reaches the push (PR #338 review,
+ * chatgpt-codex-connector: validate `fixed` claims against the final post-follow-up tree, not merely
+ * the intermediate main-round commit). This walks every path the main round touched and requires the
+ * follow-up left each one exactly as the main round committed it.
+ *
+ * Fails closed throughout: a missing `preSessionHead`, no commit from the main round, or any git
+ * read that errors reads as "did not survive" rather than risk crediting a claim the round never
+ * actually delivered.
+ */
+export async function mainRoundChangesSurvived(
+  worktreePath: string,
+  preSessionHead: string | undefined,
+  preGateHead: string,
+  postSessionHead: string,
+): Promise<boolean> {
+  if (preSessionHead === undefined || preGateHead === preSessionHead) return false;
+  const changedPaths = await git(worktreePath, ["diff", "--name-only", preSessionHead, preGateHead])
+    .then((out) => out.split("\n").map((line) => line.trim()).filter(Boolean))
+    .catch(() => undefined);
+  if (changedPaths === undefined || changedPaths.length === 0) return false;
+  const blobAt = (commit: string, path: string): Promise<string | undefined> =>
+    git(worktreePath, ["rev-parse", `${commit}:${path}`]).catch(() => undefined);
+  const survived = await Promise.all(
+    changedPaths.map(async (path) => {
+      const [atGate, atFinal] = await Promise.all([
+        blobAt(preGateHead, path),
+        blobAt(postSessionHead, path),
+      ]);
+      return atGate === atFinal;
+    }),
+  );
+  return survived.every(Boolean);
+}
+
+/**
  * Drive claude to resolve the review feedback, then commit/push the fix and notify the reviewers.
  * Wrapped in a recorded session so the UI can follow it and a mid-flight failure marks the session
  * failed before propagating (the runner then applies quota backoff / retry / park). Answers whether
@@ -1865,12 +1910,21 @@ async function runFixSession(args: {
       postSessionTree !== preSessionTree;
     // `report` is parsed from `result.text` — the main round's OWN final message, produced before
     // gates (and any gate-fix follow-up) ever ran. Whether a "fixed" claim in it is real must be
-    // checked against what THAT round committed, not what the whole session ended up pushing: the
-    // follow-up's prompt carries the gate's failure output and nothing about review feedback, so its
-    // edits are evidence the *gate* got fixed, never evidence for any claim in this report. Using
+    // checked against what THAT round committed AND what actually survived to the final pushed tree,
+    // not merely that the main round committed something: the follow-up's prompt carries the gate's
+    // failure output and nothing about review feedback, so its edits are evidence the *gate* got
+    // fixed, never evidence for any claim in this report — and if the follow-up happens to revert a
+    // path the main round changed while making the gate pass some other way, the claim behind it must
+    // not be credited (PR #338 review, chatgpt-codex-connector: validate `fixed` claims against the
+    // final post-follow-up tree, not merely the intermediate main-round commit). Using
     // `sessionProducedChange` here let a gate-only follow-up validate a fabricated "fixed" claim on
     // an inline thread the follow-up never looked at (PR #338 review, chatgpt-codex-connector).
-    const mainRoundProducedChange = preSessionHead !== undefined && preGateHead !== preSessionHead;
+    const mainRoundProducedChange = await mainRoundChangesSurvived(
+      worktree.path,
+      preSessionHead,
+      preGateHead,
+      postSessionHead,
+    );
 
     const report = parseThreadReport(result.text);
     // `delivered` is the subset of `report` whose reply actually posted (PR #335 review) — what
