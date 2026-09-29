@@ -847,7 +847,7 @@ async function handleEpic(args: {
       // them either. Storing the pre-reply fingerprint verbatim would compare against a shape the
       // next sweep can never reproduce, so the suppression check would always miss and hand this PR
       // a brand new fix session despite nothing about it having changed.
-      const postReplyFingerprint = verdict.fingerprint.filter((f) => !f.startsWith("thread:"));
+      const postReplyFingerprint = stripThreadFingerprint(verdict.fingerprint);
       try {
         recordReviewFixAnswered(db, ctx.jobId, pr.headSha, postReplyFingerprint);
       } catch (e) {
@@ -1303,7 +1303,22 @@ async function premergeBase(
   if (upToDate) return { conflicts: [], merged: false, failed: false };
   // Read BEFORE the merge below can move HEAD (PR #338 review, chatgpt-codex-connector, round 5):
   // the rollback path below needs a target to restore to if writing the marker fails.
-  const preMergeHead = await readWorktreeState(worktreePath).then((s) => s.head, () => "");
+  const preMergeState = await readWorktreeState(worktreePath).then((s) => s, () => undefined);
+  const preMergeHead = preMergeState?.head ?? "";
+  // A dirty checkout (a reused review-fix worktree can carry uncommitted tracked edits — an
+  // operator's own change, a resumed session's in-progress work) must never enter the merge below:
+  // a non-overlapping merge can land cleanly while retaining those edits, and if the
+  // unverified-boundary marker write then fails, the rollback a few lines down is an unconditional
+  // `reset --hard` that would discard the merge AND those retained edits together (PR #338 review,
+  // chatgpt-codex-connector, round 32). There is no rollback that can both undo a bypassed merge
+  // commit and keep arbitrary pre-existing dirty state, so the only safe move is to never start:
+  // skip the premerge here, the same no-op this function already takes when the base is up to date,
+  // and let a later pass retry once the checkout is clean. Only gated on a POSITIVE dirty read
+  // (`preMergeState` resolved and its status is non-empty) — a failed read falls through to the
+  // existing behavior below, unchanged.
+  if (preMergeState && preMergeState.status !== "") {
+    return { conflicts: [], merged: false, failed: false };
+  }
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true, noFf: true });
     if (merge.conflicts.length === 0) {
@@ -1461,6 +1476,19 @@ export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): 
       f !== "reviews:incomplete" &&
       f !== "checks:incomplete",
   );
+}
+
+/**
+ * Strip `thread:*` entries from a `classifyReview` fingerprint — the same normalization
+ * `postReplyFingerprint` applies before {@link recordReviewFixAnswered} (PR #338 review,
+ * chatgpt-codex-connector). Any site that derives a stable identity from a fingerprint that might
+ * be read again AFTER this round's thread replies have already posted must go through this first:
+ * once posted, those threads are no longer waiting, so a fresh `classifyReview` fingerprint (a
+ * retry after a crash, a later sweep) never reproduces them — comparing against the raw, un-thread-
+ * stripped fingerprint this round classified against would then never match again.
+ */
+function stripThreadFingerprint(fingerprint: readonly string[]): string[] {
+  return fingerprint.filter((f) => !f.startsWith("thread:"));
 }
 
 /**
@@ -1939,7 +1967,12 @@ async function runFixSession(args: {
           number,
           sentinel,
           headSha: pr.headSha,
-          fingerprint: verdict.fingerprint,
+          // Stripped of `thread:*` entries (see `stripThreadFingerprint`'s doc): the inline threads
+          // in this same report were just replied to above via `applyThreadOutcomes`, so a retry
+          // that crashes before `recordReviewFixAnswered` recomputes a fresh `classifyReview`
+          // fingerprint that already lacks those now-answered threads — comparing against the raw
+          // fingerprint here would never match it, and the marker below would never dedup.
+          fingerprint: stripThreadFingerprint(verdict.fingerprint),
           signal: ctx.signal,
           logPath,
         });
@@ -2785,6 +2818,13 @@ const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
  * retry, which can reword `reply` for what is semantically the same round. Comparing full comment
  * bodies would then treat that reword as a brand-new notice and repost on every crash-retry (PR
  * #338 review, chatgpt-codex-connector).
+ *
+ * `fingerprint` must already be run through {@link stripThreadFingerprint} — same as
+ * `postReplyFingerprint` before `recordReviewFixAnswered` (PR #338 review, chatgpt-codex-connector,
+ * round 33). A mixed round replies to its inline threads (`applyThreadOutcomes`) before it ever
+ * reaches this call, so those threads are no longer waiting by the time a crash-retry recomputes a
+ * fresh `classifyReview` fingerprint — an un-stripped fingerprint here would never match that
+ * retry's, and the dedup check below would never recognize its own already-posted notice.
  */
 function unpushedSentinelMarker(headSha: string, fingerprint: readonly string[]): string {
   const hash = createHash("sha1")
