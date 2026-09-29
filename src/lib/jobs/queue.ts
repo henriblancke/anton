@@ -684,6 +684,12 @@ export function reviewFixPrParkedAtHead(
  * Filtering on `status = "done"` directly, as an earlier revision did, let that older row win the
  * ordering instead of the newer `parked` one, permanently resuppressing a round the PR had already
  * moved past (PR #338 review, chatgpt-codex-connector).
+ *
+ * Ordered on `updatedAt` DESC with {@link JOB_INSERT_ORDER} as the tie-break, same as
+ * {@link latestExecuteEpicJob} — `updatedAt` is second-truncated, so an answered A attempt and a
+ * newer parked B attempt settling inside the same second would otherwise sort arbitrarily, and
+ * SQLite could hand back the older `done` A row instead of the newer `parked` B, reintroducing the
+ * exact resuppression bug above.
  */
 function answeredUnchanged(
   tx: Pick<AntonDb, "select">,
@@ -704,7 +710,7 @@ function answeredUnchanged(
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
     )
-    .orderBy(desc(schema.jobs.updatedAt))
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1)
     .all()[0];
   if (!row || row.status !== "done") return undefined;
