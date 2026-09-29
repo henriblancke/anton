@@ -131,6 +131,11 @@ describe("classifyFailureCause", () => {
     ).toBe("infra");
   });
 
+  it("classifies a pre-push hook decline whose own output quotes a gate failure as infra, not gate", () => {
+    const error = "a local pre-push hook declined the push: lint gate failed for anton-8x1k (exit 1)";
+    expect(classifyFailureCause(error)).toBe("infra");
+  });
+
   it("classifies a deterministic non-zero claude exit as agent", () => {
     const error =
       "claude exited with code 1: I've made the changes but two tests still fail due to a flaky mock " +
@@ -172,6 +177,13 @@ describe("classifyFailureCause", () => {
   it("classifies a deterministic exit whose own report narrates a gate failure as agent, not gate", () => {
     const error = "claude exited with code 1: the lint gate failed locally before I could push.";
     expect(classifyFailureCause(error)).toBe("agent");
+  });
+
+  it("classifies a gate failure whose captured test output merely quotes a stall/no-result phrase as gate, not agent", () => {
+    const error =
+      "verify gate failed for anton-abcd (exit 1)\n\n> vitest run\n\nFAIL src/lib/claude/driver-exit.test.ts\n" +
+      'AssertionError: expected error message "claude exited without a result event" to be thrown';
+    expect(classifyFailureCause(error)).toBe("gate");
   });
 
   it("classifies an explicit self-reported agent block as agent", () => {
