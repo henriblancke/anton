@@ -979,6 +979,13 @@ describe("loadAllIssues", () => {
     listMock.mockImplementationOnce(async () => {
       throw new Error("bd: database is locked");
     }); // the shared loader's own (non-strict) gate read — degrades, swallowed
+    // The `boardStillMatchesCycles` re-list (thread on issues.ts:1292, PR #274 review): the shared
+    // board's own `blocks` edge means attaching evidence to it must re-list and compare before
+    // trusting the generation match alone, mirroring `attachCyclesBestEffort`.
+    listMock.mockImplementationOnce(async () => [target]); // re-list's own work read — unchanged
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // re-list's own (non-strict) gate read — degrades, swallowed
     listMock.mockImplementationOnce(async () => [gate]); // this call's own strict re-fetch — succeeds
     cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
 
@@ -1547,6 +1554,36 @@ describe("refreshAllIssuesRead", () => {
 
     expect(board.map((b) => b.id)).toEqual(["t-1"]);
     expect(generation).toBe(issueSnapshotGeneration(REPO));
+  });
+
+  it("declines to attach cycle evidence a concurrent non-cycles refresh's board is stale for (thread on issues.ts:1292, PR #274 review)", async () => {
+    // A concurrent, non-authoritative `refreshAllIssues(REPO)` (no `withCycles`) wins the shared
+    // single-flight loader with a genuinely cyclic board (t-1 <-> t-2). This caller's own
+    // generation guard sees no local move — nothing refreshed THIS process's snapshot — but on a
+    // shared-server board another machine can repair the very cycle `fetchCyclesShared` is about to
+    // report on in the gap between that shared board read and this call's own fetch settling.
+    // Without the `boardStillMatchesCycles` re-list, the generation match alone would let an empty
+    // "no cycles" result land on this still-cyclic-looking board as if it described the same
+    // revision — exactly the bug `attachCyclesBestEffort` already guards against.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockImplementationOnce(async () => [cyclic, other]); // the one shared work read
+    listMock.mockImplementationOnce(async () => [repaired, other]); // this call's own re-list — already repaired
+    cyclesMock.mockResolvedValue([]); // reports the repair, but for the graph as of THIS fetch
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssuesRead(REPO, { withCycles: true });
+
+    const [, { beads: approvalBoard }] = await Promise.all([ordinary, approval]);
+
+    // The retained board itself is untouched — only the evidence attachment is gated — so the
+    // caller still sees the stale, pre-repair content, but without a cycle-free stamp on it.
+    expect(approvalBoard.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(approvalBoard)).toBeUndefined();
   });
 });
 

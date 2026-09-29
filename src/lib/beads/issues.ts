@@ -1277,6 +1277,13 @@ export async function refreshAllIssuesRead(
     // `withCycles: true` today, so this was latent, but the next one to add it would inherit a
     // refresh that 500s on a slow or unreadable `bd dep cycles` instead of returning a board with
     // no cycle evidence attached, same as a cold read degrades.
+    //
+    // Captured before the first await below, mirroring `attachCyclesBestEffort`'s identical
+    // `staleCheckedAt` guard: a racing `ensureCycleEvidence`/`probeCycleEvidence` sharing this
+    // same board can attach a newer, successful result while this call's own fetch or consistency
+    // re-list is in flight, and that newer result must survive this call rather than being
+    // clobbered.
+    const staleCheckedAt = cycleEvidenceCheckedAtFor(board);
     try {
       // Keyed and guarded by `boardGeneration`, not a fresh `issueSnapshotGeneration(cwd)` read
       // here (PR #274 review, round 15): the snapshot can move again while this fetch is in
@@ -1284,12 +1291,39 @@ export async function refreshAllIssuesRead(
       // result onto `board` under — a generation that no longer describes the graph `cycles` was
       // actually fetched for.
       const cycles = await fetchCyclesShared(cwd, boardGeneration);
-      if (issueSnapshotGeneration(cwd) === boardGeneration) {
-        // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
-        // and issues.ts:296) — otherwise this forced-refresh attach leaves `checkedAt` at its
-        // zero default and the next poll reads this fresh evidence as already expired.
-        attachCycleEvidence(board, cycles);
-        markCycleEvidenceRecovered(cwd);
+      if (issueSnapshotGeneration(cwd) === boardGeneration && cycleEvidenceMissingOrStale(board)) {
+        // The generation guard alone only catches THIS process replacing its own snapshot, not a
+        // shared-server board moving under a DIFFERENT machine without this process's generation
+        // advancing (P2 review, PR #274, issues.ts:1292): another writer can repair or introduce a
+        // cycle between the loader's own board read above and this fetch settling. Always re-list
+        // and compare, same as `attachCyclesBestEffort`/`ensureCycleEvidence` — never attach on the
+        // generation match alone.
+        const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
+        const consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await loadAllIssues(cwd));
+        // Re-check generation and evidence AFTER the re-list await too, same reasoning as
+        // `attachCyclesBestEffort`: the inner `loadAllIssues` call can itself take long enough for
+        // the snapshot to move or for a concurrent enrichment path to attach evidence to this same
+        // `board` first.
+        if (consistent && issueSnapshotGeneration(cwd) === boardGeneration && cycleEvidenceMissingOrStale(board)) {
+          // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
+          // and issues.ts:296) — otherwise this forced-refresh attach leaves `checkedAt` at its
+          // zero default and the next poll reads this fresh evidence as already expired.
+          attachCycleEvidence(board, cycles);
+          markCycleEvidenceRecovered(cwd);
+        } else if (
+          !consistent &&
+          issueSnapshotGeneration(cwd) === boardGeneration &&
+          cycleEvidenceCheckedAtFor(board) === staleCheckedAt
+        ) {
+          // The re-list rejected the pairing — leaving a stale sidecar attached here would still
+          // read as present to `cycleEvidenceFor`, letting a caller derive a verdict off cycles the
+          // recheck just disowned. Clear it and fail closed, mirroring
+          // `attachCyclesBestEffort`/`ensureCycleEvidence`'s identical rejection branches.
+          if (cycleEvidenceFor(board) !== undefined) {
+            clearCycleEvidence(board);
+            markCycleEvidenceUnavailable(cwd);
+          }
+        }
       }
     } catch (e) {
       console.warn(
@@ -1297,6 +1331,14 @@ export async function refreshAllIssuesRead(
           `without cycle evidence; startability projections fail closed until the next successful read: ` +
           (e instanceof Error ? e.message : String(e)),
       );
+      // Same fail-closed handling as `attachCyclesBestEffort`'s catch: evidence was already
+      // missing-or-stale before this attempt, so a prior WeakMap entry left in place would keep
+      // reporting an expired verdict as authoritative until some later call happens to succeed.
+      if (cycleEvidenceCheckedAtFor(board) === staleCheckedAt) {
+        const hadEvidence = cycleEvidenceFor(board) !== undefined;
+        clearCycleEvidence(board);
+        if (hadEvidence) markCycleEvidenceUnavailable(cwd);
+      }
     }
   }
   // Same race, for gates (PR #274 review): `refreshIssueSnapshot`'s single-flight is loader-blind, so
