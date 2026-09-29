@@ -8,6 +8,7 @@
  * here `"unknown"` rather than `"other"`, so a genuinely unrecognized failure is never folded into
  * `"agent"` and mistaken for a model regression.
  */
+import { isRecoverableClaudeText } from "./claude/driver-exit";
 import { isStaleCheckoutDeferral } from "./jobs/errors";
 
 export type FailureCause = "infra" | "gate" | "freshness" | "quota" | "agent" | "unknown";
@@ -84,6 +85,14 @@ const PATTERNS: Array<{ cause: Exclude<FailureCause, "unknown">; pattern: Matche
   // any of the other classes' vocabulary.
   { cause: "freshness", pattern: isStaleCheckoutDeferral },
   { cause: "quota", pattern: QUOTA_RE },
+  // Recoverable driver shapes before the agent envelope below: `exitCodeError`/`failureError`
+  // (driver-exit.ts) build a `RecoverableClaudeError` for a transient network/upstream drop, a
+  // truncated stream, or a stalled session — none of which is the agent's own doing — but once an
+  // in-session resume exhausts, `settleRunRow` stores that error's `.message` as plain text, sharing
+  // the exact same `claude exited with code N: ...` envelope as a deterministic agent failure.
+  // `isRecoverableClaudeText` is the one place (driver-exit.ts) that knows which shapes are actually
+  // transient; checking it here means a real outage no longer inflates the `agent` bucket.
+  { cause: "infra", pattern: isRecoverableClaudeText },
   // Agent before gate/infra: `exitCodeError` wraps the agent's own freeform report as
   // `claude exited with code N: <report>`, and that report can narrate a gate or git failure in
   // prose ("the pre-push hook declined while I was working") without the run having hit either —

@@ -113,6 +113,23 @@ function signatureOf(raw: string): string {
   return raw.toLowerCase().replace(/\s+/g, "-");
 }
 
+/**
+ * True when `message` is text this file constructs for a `RecoverableClaudeError` — a transient
+ * driver-level death (a truncated stream, a stalled session, or a network/upstream drop), never a
+ * deterministic agent-authored failure. `failure-cause.ts` needs this: once an in-session resume
+ * exhausts (or never gets attempted), `settleRunRow` stores the error's `.message` as plain text, so
+ * classifying a settled run's cause has nothing but that string to go on — and a deterministic
+ * `claude exited with code N: <the agent's own report>` shares the exact same envelope as the
+ * transient `exitCodeError` case above. Reusing `TRANSIENT_STDERR_RE` here (rather than duplicating
+ * its vocabulary) keeps "what counts as recoverable" defined in exactly one place, the same file
+ * that builds every `RecoverableClaudeError` this classifier has to recognize.
+ */
+export function isRecoverableClaudeText(message: string): boolean {
+  if (/^claude exited without a result event\b/.test(message)) return true;
+  if (/^claude produced no output for .*killed as stalled\b/i.test(message)) return true;
+  return /^claude exited with code \d+: /.test(message) && TRANSIENT_STDERR_RE.test(message);
+}
+
 /** The final result text, or "" when the run emitted no result event (or a non-string one). */
 function resultTextOf(exit: ClaudeExit): string {
   const raw = exit.stream.resultRaw;

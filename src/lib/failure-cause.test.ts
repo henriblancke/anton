@@ -143,12 +143,22 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("agent");
   });
 
-  it("classifies a stalled claude session as agent", () => {
-    expect(classifyFailureCause("claude produced no output for 5m — killed as stalled")).toBe("agent");
+  it("classifies a stalled claude session as infra, not agent — a driver watchdog kill, not the agent's doing", () => {
+    expect(classifyFailureCause("claude produced no output for 5m — killed as stalled")).toBe("infra");
   });
 
-  it("classifies a claude exit with no result event as agent", () => {
-    expect(classifyFailureCause("claude exited without a result event")).toBe("agent");
+  it("classifies a claude exit with no result event as infra, not agent — a truncated stream, not a deterministic failure", () => {
+    expect(classifyFailureCause("claude exited without a result event")).toBe("infra");
+  });
+
+  it("classifies a claude exit whose detail carries a transient network signature as infra, not agent", () => {
+    const error = "claude exited with code 1: Connection closed mid-response (ECONNRESET)";
+    expect(classifyFailureCause(error)).toBe("infra");
+  });
+
+  it("classifies a claude exit whose detail carries a bare upstream status code as infra, not agent", () => {
+    const error = "claude exited with code 1: API Error: 503 Service Unavailable";
+    expect(classifyFailureCause(error)).toBe("infra");
   });
 
   it("classifies a refused/nonexistent model id as agent", () => {
