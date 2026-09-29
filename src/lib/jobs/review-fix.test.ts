@@ -31,6 +31,7 @@ import {
   refreshFixRoundsBody,
   resolveReviewFixModel,
   runTestGate,
+  shouldRecordAnswered,
   type ThreadOutcome,
 } from "./review-fix";
 import { NON_THREAD_REPORT_ID } from "./review-fix-context";
@@ -1714,6 +1715,36 @@ describe("fingerprintHasNonThreadReasons", () => {
 
   it("is false for an empty fingerprint", () => {
     expect(fingerprintHasNonThreadReasons([])).toBe(false);
+  });
+});
+
+/**
+ * `shouldRecordAnswered` gates `recordReviewFixAnswered` on a complete comment-history read, on top
+ * of the existing `!pushed && answeredAllThreads` bar (PR #338 review round 2, chatgpt-codex-
+ * connector): `classifyReview` (src/lib/git/pr.ts) folds a degraded read into the fixed,
+ * deterministic `"comments:incomplete"` fingerprint entry, so persisting a round recorded under
+ * that value would let every later degraded read match it and stay suppressed forever — even past a
+ * human reply the failed page was hiding.
+ */
+describe("shouldRecordAnswered", () => {
+  it("records when nothing pushed, every thread answered, and the comment read was complete", () => {
+    expect(shouldRecordAnswered(false, true, true)).toBe(true);
+  });
+
+  it("records when commentsComplete is undefined (a caller-built fixture that never set it)", () => {
+    expect(shouldRecordAnswered(false, true, undefined)).toBe(true);
+  });
+
+  it("does not record when the comment read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, false)).toBe(false);
+  });
+
+  it("does not record when something was pushed", () => {
+    expect(shouldRecordAnswered(true, true, true)).toBe(false);
+  });
+
+  it("does not record when a thread was left unanswered", () => {
+    expect(shouldRecordAnswered(false, false, true)).toBe(false);
   });
 });
 

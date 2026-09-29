@@ -775,10 +775,13 @@ async function handleEpic(args: {
       branch,
       number,
     });
-    if (!pushed && answeredAllThreads) {
+    if (shouldRecordAnswered(pushed, answeredAllThreads, pr.commentsComplete)) {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
-      // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz).
+      // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz). See
+      // {@link shouldRecordAnswered} for why a degraded comment read (`commentsComplete === false`)
+      // skips this entirely rather than recording under a reusable placeholder value (PR #338 review
+      // round 2, chatgpt-codex-connector).
       // Gated on `answeredAllThreads` (anton-091jr review, chatgpt-codex-connector): a report that
       // never arrived (a claude error text with no reporting contract) or left some of the threads
       // this round was actually asked about untouched must NOT be recorded as answered — that thread
@@ -810,6 +813,10 @@ async function handleEpic(args: {
       } catch (e) {
         consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
       }
+    } else if (!pushed && pr.commentsComplete === false) {
+      consoleLog.info(
+        `PR #${number}: comment history read was incomplete — not recording answered`,
+      );
     } else if (!pushed) {
       consoleLog.info(
         `PR #${number}: round left thread(s) unaddressed (no/incomplete report) — not recording answered`,
@@ -1294,6 +1301,28 @@ export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): 
   return fingerprint.some(
     (f) => !f.startsWith("thread:") && !f.startsWith("base:") && !f.startsWith("comment:"),
   );
+}
+
+/**
+ * Should this round's outcome be persisted via `recordReviewFixAnswered` (queue.ts)? Requires the
+ * same delivered-evidence bar {@link allWaitingThreadsAnswered} already computed
+ * (`answeredAllThreads`), AND a complete top-level-comment read (`commentsComplete !== false`).
+ *
+ * The comment-completeness requirement exists because `classifyReview` (src/lib/git/pr.ts) folds a
+ * degraded comment read into a FIXED, deterministic `"comments:incomplete"` fingerprint entry —
+ * the same value on every degraded read, regardless of what's actually on the PR, because it can't
+ * trust that read to name the true latest human reply. Recording a round under that entry would let
+ * every LATER degraded read match this stale row and stay suppressed forever, even past a human
+ * reply that the very page which failed to load was hiding (PR #338 review round 2,
+ * chatgpt-codex-connector). Skipping the record entirely — rather than recording some other,
+ * non-reusable placeholder — means the next pass, degraded or not, is never suppressed by this one.
+ */
+export function shouldRecordAnswered(
+  pushed: boolean,
+  answeredAllThreads: boolean,
+  commentsComplete: boolean | undefined,
+): boolean {
+  return !pushed && answeredAllThreads && commentsComplete !== false;
 }
 
 /**

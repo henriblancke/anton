@@ -1483,6 +1483,69 @@ export function exitedWith(error: unknown, code: number): boolean {
 }
 
 /**
+ * Parses `git --version`'s stdout and reports whether that git has a `hook` subcommand at all —
+ * `git hook run` was added in the 2.36.0 release (see its RelNotes), and this project's README
+ * places no minimum git version, so a 2.35-or-older git must not be assumed. A version string that
+ * doesn't parse assumes support rather than silently downgrading every caller to the direct
+ * fallback (PR #338 review round 13, chatgpt-codex-connector).
+ */
+export function gitVersionSupportsHookRun(versionOutput: string): boolean {
+  const match = /git version (\d+)\.(\d+)/.exec(versionOutput);
+  if (!match) return true;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 2 || (major === 2 && minor >= 36);
+}
+
+let gitHookRunSupport: Promise<boolean> | undefined;
+
+/** Cached, memoized wrapper around {@link gitVersionSupportsHookRun} — the installed git binary can't change mid-run. */
+async function supportsGitHookRun(): Promise<boolean> {
+  if (!gitHookRunSupport) {
+    gitHookRunSupport = execFileAsync("git", ["--version"], { timeout: 5_000 })
+      .then(({ stdout }) => gitVersionSupportsHookRun(stdout))
+      .catch(() => true);
+  }
+  return gitHookRunSupport;
+}
+
+/**
+ * Fallback for `git hook run --ignore-missing <hook>` on git < 2.36, which has no `hook`
+ * subcommand at all. Resolves the same effective hooks directory `git hook run` would have looked
+ * up (`rev-parse --git-path hooks`, honoring the same `core.hooksPath` override the caller
+ * resolved) and, mirroring `--ignore-missing`, no-ops when the hook isn't there or isn't marked
+ * executable — git itself never runs a hook lacking the executable bit, so neither does this. A
+ * non-zero exit throws, propagating into the same rollback a rejected `git commit` triggers.
+ */
+export async function runHookDirectly(worktreePath: string, hookName: string, hooksPath?: string): Promise<void> {
+  const hooksDir = await git(
+    worktreePath,
+    ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    hooksPath,
+  );
+  const hookPath = resolve(hooksDir, hookName);
+  if (!existsSync(hookPath)) return;
+  if (process.platform !== "win32" && (statSync(hookPath).mode & 0o111) === 0) return;
+  await execFileAsync(hookPath, [], {
+    cwd: worktreePath,
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+}
+
+/**
+ * Run `hookName` the way `git hook run --ignore-missing <hookName>` would — via the real
+ * subcommand on git ≥2.36, or {@link runHookDirectly} on older git that doesn't have it.
+ */
+async function runIgnoreMissingHook(worktreePath: string, hookName: string, hooksPath?: string): Promise<void> {
+  if (await supportsGitHookRun()) {
+    await git(worktreePath, ["hook", "run", "--ignore-missing", hookName], hooksPath);
+  } else {
+    await runHookDirectly(worktreePath, hookName, hooksPath);
+  }
+}
+
+/**
  * Stage everything in the worktree — `git add -A`, extracted so a caller can stage BEFORE asking
  * {@link resolveHooksPathOverride} anything (PR #263 review, round 37; see {@link commitAll}'s own
  * doc comment for why that order matters). Idempotent: calling it again right after — as
@@ -1719,11 +1782,9 @@ export async function commitAll(
       // `core.hooksPath` override `gitCommit` below resolves, and propagates a non-zero exit the same
       // way a rejected `git commit` does, into the identical rollback below. `--ignore-missing` no-ops
       // when the project has no such hook, matching what `git merge` itself would have done.
-      await git(
-        worktreePath,
-        ["hook", "run", "--ignore-missing", "pre-merge-commit"],
-        options.hooksPath,
-      );
+      // `runIgnoreMissingHook` falls back to running the hook file directly on git < 2.36, which
+      // predates the `hook` subcommand entirely (PR #338 review round 13, chatgpt-codex-connector).
+      await runIgnoreMissingHook(worktreePath, "pre-merge-commit", options.hooksPath);
     }
     await gitCommit(
       worktreePath,

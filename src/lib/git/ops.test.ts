@@ -32,6 +32,8 @@ import {
   diffAgainstBase,
   findOpenPullRequest,
   gitCommonDir,
+  gitVersionSupportsHookRun,
+  runHookDirectly,
   listDirBlobsAtRev,
   listFilesAtRev,
   lookupOpenPullRequest,
@@ -4669,6 +4671,112 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
         { encoding: "utf8" },
       );
       expect(finalMessage).toContain("Reviewed-by: hook");
+    },
+  );
+});
+
+describe("gitVersionSupportsHookRun", () => {
+  it("supports 2.36.0 exactly — the release that added `git hook run`", () => {
+    expect(gitVersionSupportsHookRun("git version 2.36.0\n")).toBe(true);
+  });
+
+  it("supports a newer git, including a vendor-suffixed build string", () => {
+    expect(gitVersionSupportsHookRun("git version 2.39.2 (Apple Git-143)\n")).toBe(true);
+  });
+
+  it("supports a newer major version", () => {
+    expect(gitVersionSupportsHookRun("git version 3.0.0\n")).toBe(true);
+  });
+
+  it("rejects git older than 2.36, including a platform-suffixed build string", () => {
+    expect(gitVersionSupportsHookRun("git version 2.35.1.windows.1\n")).toBe(false);
+    expect(gitVersionSupportsHookRun("git version 2.20.1\n")).toBe(false);
+  });
+
+  it("assumes support when the version string doesn't parse, rather than silently degrading", () => {
+    expect(gitVersionSupportsHookRun("not a version string")).toBe(true);
+  });
+});
+
+// PR #338 review (chatgpt-codex-connector, P1): `git hook run` was added in git 2.36 — this
+// project's README places no minimum git version, so an older installed git would have thrown
+// before ever reaching `pre-merge-commit`, permanently blocking the boundary-commit verify path
+// (`commitAll`'s `amendToVerifyHooks`) from ever pushing. `runHookDirectly` is the fallback that
+// path takes on such a git; these tests exercise it directly (real git, real hook scripts) rather
+// than faking an old git binary to force the fallback through the version-detection wrapper.
+describe("runHookDirectly (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-run-hook-directly-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  it.runIf(process.platform !== "win32")("runs an executable hook that's present", async () => {
+    const ran = join(sandbox, "ran");
+    const hook = join(repo, ".git", "hooks", "pre-merge-commit");
+    writeFileSync(hook, ["#!/bin/sh", `echo ran >> ${JSON.stringify(ran)}`, "exit 0", ""].join("\n"));
+    chmodSync(hook, 0o755);
+
+    await runHookDirectly(repo, "pre-merge-commit");
+
+    expect(readFileSync(ran, "utf8").trim()).toBe("ran");
+  });
+
+  it("no-ops (mirroring --ignore-missing) when the hook file doesn't exist", async () => {
+    await expect(runHookDirectly(repo, "pre-merge-commit")).resolves.toBeUndefined();
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "no-ops when the hook file exists but isn't marked executable — git itself would skip it too",
+    async () => {
+      const ran = join(sandbox, "ran");
+      const hook = join(repo, ".git", "hooks", "pre-merge-commit");
+      writeFileSync(hook, ["#!/bin/sh", `echo ran >> ${JSON.stringify(ran)}`, "exit 0", ""].join("\n"));
+      // Deliberately no chmodSync — leaves it non-executable.
+
+      await runHookDirectly(repo, "pre-merge-commit");
+
+      expect(existsSync(ran)).toBe(false);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")("propagates a non-zero exit from the hook", async () => {
+    const hook = join(repo, ".git", "hooks", "pre-merge-commit");
+    writeFileSync(hook, ["#!/bin/sh", "exit 1", ""].join("\n"));
+    chmodSync(hook, 0o755);
+
+    await expect(runHookDirectly(repo, "pre-merge-commit")).rejects.toThrow();
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "honors a core.hooksPath override, the same way `git hook run` would",
+    async () => {
+      const altHooks = join(sandbox, "alt-hooks");
+      mkdirSync(altHooks);
+      const ran = join(sandbox, "ran-alt");
+      const hook = join(altHooks, "pre-merge-commit");
+      writeFileSync(hook, ["#!/bin/sh", `echo ran >> ${JSON.stringify(ran)}`, "exit 0", ""].join("\n"));
+      chmodSync(hook, 0o755);
+      // A hook of the same name sitting in the DEFAULT hooks dir must be ignored once an override
+      // is passed — proves the override, not just the default, is what gets resolved and run.
+      const defaultHook = join(repo, ".git", "hooks", "pre-merge-commit");
+      writeFileSync(defaultHook, ["#!/bin/sh", "exit 1", ""].join("\n"));
+      chmodSync(defaultHook, 0o755);
+
+      await runHookDirectly(repo, "pre-merge-commit", altHooks);
+
+      expect(readFileSync(ran, "utf8").trim()).toBe("ran");
     },
   );
 });
