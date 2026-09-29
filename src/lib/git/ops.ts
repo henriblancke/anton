@@ -1580,7 +1580,7 @@ export async function commitAll(
   } catch {
     nothingStaged = false;
   }
-  if (!nothingStaged) {
+  if (!nothingStaged && !options.amendToVerifyHooks) {
     try {
       await gitCommit(
         worktreePath,
@@ -1594,54 +1594,75 @@ export async function commitAll(
     }
     return { committed: true };
   }
-  if (options.amendToVerifyHooks) {
-    // Nothing new landed, but HEAD is a prior hook-bypassed commit that still needs the project's
-    // real hooks run against it before it publishes (PR #338 review, chatgpt-codex-connector).
-    //
-    // A bare `commit --amend --no-edit` does NOT do this for a hook that inspects the STAGED diff
-    // (lint-staged and friends): such a hook diffs the index against the commit being amended —
-    // the boundary commit itself — and since nothing new is staged that diff is empty, so the hook
-    // validates nothing and the boundary's real changes reach the remote unchecked (PR #338 review
-    // round 2, chatgpt-codex-connector). `reset --soft HEAD^` fixes that without touching the tree
-    // this is about to commit: it moves the branch pointer back to the boundary's parent while
-    // leaving the index untouched, so the index (still the boundary's tree) now reads as staged
-    // against the new HEAD and the hook sees the real diff. What follows is then an ordinary,
-    // hook-verified commit of that same tree back on top of the same parent — a different git
-    // command from `--amend`, but the same observable result: same tree, same parent, same message,
-    // only the sha and commit date move.
-    const originalHead = await resolveCommitSha(worktreePath, "HEAD");
-    const originalMessage = await git(worktreePath, ["log", "-1", "--format=%B", "HEAD"]);
-    await git(worktreePath, ["reset", "--soft", "HEAD^"]);
-    try {
-      await gitCommit(
-        worktreePath,
-        ["commit", "-m", originalMessage],
-        options.hooksPath,
-        options.timeoutMs,
-        options.signal,
-      );
-    } catch (error) {
-      // Hooks rejected it, or the commit timed out before one was created: put the branch back
-      // exactly where it started rather than leaving HEAD at the boundary's parent with the
-      // boundary's own changes sitting staged but uncommitted.
-      try {
-        await git(worktreePath, ["reset", "--soft", originalHead]);
-      } catch (restoreError) {
-        throw tagCommitAttempt(
-          new Error(
-            `git commit failed while verifying hooks over the boundary commit, and restoring ` +
-              `HEAD to ${originalHead} afterward also failed — the worktree may be left with the ` +
-              `boundary's changes staged but uncommitted: ${(restoreError as Error).message}`,
-            { cause: error },
-          ),
-          "amend",
-        );
-      }
-      throw tagCommitAttempt(error, "amend");
-    }
-    return { committed: true };
+  if (!options.amendToVerifyHooks) {
+    return { committed: false };
   }
-  return { committed: false };
+  // HEAD is a prior hook-bypassed boundary commit that still needs the project's real hooks to see
+  // its FULL diff before it publishes (PR #338 review, chatgpt-codex-connector) — regardless of
+  // whether anything new got staged above. A hook that inspects the STAGED diff (lint-staged and
+  // friends) diffs the index against the commit it's being compared to; leaving the boundary's own
+  // tree already committed underneath a follow-up's own staged edits hides the boundary's changes
+  // from that diff just as completely as an empty index does — so branching on `nothingStaged` here
+  // (a bare amend, or an ordinary commit stacked on the untouched boundary) validates only whatever
+  // the follow-up itself staged and never re-checks the boundary's own files (PR #338 review round
+  // 3, chatgpt-codex-connector). `reset --soft` back to the boundary's own parent — EVERY parent it
+  // had, not just the first, so a boundary commit that itself resolved a conflicted base premerge (a
+  // genuine two-parent merge) doesn't get flattened to one when this replays it — moves the branch
+  // pointer back while leaving the index untouched, so the index (the boundary's tree, plus
+  // whatever the follow-up staged) now reads as staged against that parent and the hook sees the
+  // combined diff. What follows is an ordinary, hook-verified commit of that tree.
+  const originalHead = await resolveCommitSha(worktreePath, "HEAD");
+  const originalMessage = await git(worktreePath, ["log", "-1", "--format=%B", "HEAD"]);
+  const originalParents = await commitParentShas(worktreePath, originalHead);
+  await git(worktreePath, ["reset", "--soft", originalParents[0] ?? `${originalHead}^`]);
+  try {
+    await gitCommit(
+      worktreePath,
+      ["commit", "-m", originalMessage],
+      options.hooksPath,
+      options.timeoutMs,
+      options.signal,
+    );
+  } catch (error) {
+    // Hooks rejected it, or the commit timed out before one was created: put the branch back
+    // exactly where it started rather than leaving HEAD at the boundary's parent with the
+    // boundary's own changes sitting staged but uncommitted.
+    try {
+      await git(worktreePath, ["reset", "--soft", originalHead]);
+    } catch (restoreError) {
+      throw tagCommitAttempt(
+        new Error(
+          `git commit failed while verifying hooks over the boundary commit, and restoring ` +
+            `HEAD to ${originalHead} afterward also failed — the worktree may be left with the ` +
+            `boundary's changes staged but uncommitted: ${(restoreError as Error).message}`,
+          { cause: error },
+        ),
+        "amend",
+      );
+    }
+    throw tagCommitAttempt(error, "amend");
+  }
+  // The commit just made only ever carries the ONE parent the reset above pointed at — a boundary
+  // commit with further parents (the two-parent merge case above) needs them restored now. Pure
+  // metadata rewrite of the commit that just passed hook verification, never a second hook run
+  // (`commit-tree` invokes none, and neither does `reset`): same tree, same message, only the
+  // parent list changes back to what the original boundary commit actually had.
+  const extraParents = originalParents.slice(1);
+  if (extraParents.length > 0) {
+    const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
+    const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
+    const reparented = await git(worktreePath, [
+      "commit-tree",
+      tree,
+      "-p",
+      originalParents[0] ?? verifiedHead,
+      ...extraParents.flatMap((parent) => ["-p", parent]),
+      "-m",
+      originalMessage,
+    ]);
+    await git(worktreePath, ["reset", "--soft", reparented]);
+  }
+  return { committed: true };
 }
 
 /**

@@ -4121,6 +4121,151 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     expect(committed).toBe(false);
     expect(existsSync(hookRuns)).toBe(false);
   });
+
+  // PR #338 review round 3 (chatgpt-codex-connector): a boundary commit that resolved a conflicted
+  // base premerge (`git commit` while `MERGE_HEAD` is set builds a real two-parent merge commit,
+  // regardless of `--no-verify`/a custom `-m`) used to lose its second parent the moment
+  // `amendToVerifyHooks` replayed it — `reset --soft HEAD^` only ever moves to the FIRST parent, so
+  // the ordinary commit that followed silently flattened a merge into a single-parent commit.
+  it.runIf(process.platform !== "win32")(
+    "preserves both parents of a boundary commit that resolved a conflicted merge",
+    async () => {
+      // `--no-verify` here only keeps this setup from tripping the shared hook fixture above —
+      // unrelated to the behavior under test, which is the boundary/verify commits below.
+      g(["checkout", "-q", "-b", "feature"]);
+      writeFileSync(join(repo, "work.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+      const featureTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "work.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+      const mainTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "feature"]);
+      try {
+        execFileSync("git", ["-C", repo, "merge", "--no-edit", "main"], { stdio: "ignore" });
+      } catch {
+        // Expected — `work.ts` conflicts. Resolved below, leaving MERGE_HEAD set for the boundary
+        // commit to pick up.
+      }
+      writeFileSync(join(repo, "work.ts"), "resolved\n");
+
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+      expect(existsSync(hookRuns)).toBe(false);
+
+      const boundarySha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const boundaryParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", boundarySha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(boundaryParents).toEqual([featureTip, mainTip]);
+
+      // Nothing new to stage — the re-verify pass must keep BOTH parents, not just the first.
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+      });
+      expect(amended).toBe(true);
+      expect(readFileSync(hookRuns, "utf8").trim().split("\n")).toHaveLength(1);
+
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const finalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", finalSha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(finalParents).toEqual([featureTip, mainTip]);
+      expect(
+        execFileSync("git", ["-C", repo, "show", `${finalSha}:work.ts`], { encoding: "utf8" }),
+      ).toBe("resolved\n");
+    },
+  );
+});
+
+// PR #338 review round 3 (chatgpt-codex-connector): a hook that inspects the STAGED diff (like
+// lint-staged) diffs the index against the commit it's being compared to. Once the gate follow-up
+// stages a file of its OWN, `commitAll` used to take the ordinary commit path and never re-check the
+// boundary's own files — the hook would see only the follow-up's diff, letting the boundary's real
+// (hook-bypassed) changes reach the remote unchecked as long as the follow-up touched anything at
+// all.
+suite("commitAll (real git · amendToVerifyHooks when the follow-up stages something new)", () => {
+  let sandbox: string;
+  let repo: string;
+  let stagedDiffs: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commit-amend-followup-"));
+    repo = join(sandbox, "repo");
+    stagedDiffs = join(sandbox, "staged-diffs");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+
+    // Records the names of every file staged at each invocation, one line per run.
+    const hook = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(
+      hook,
+      [
+        "#!/bin/sh",
+        `git diff --cached --name-only | tr '\\n' ',' >> ${JSON.stringify(stagedDiffs)}`,
+        `echo >> ${JSON.stringify(stagedDiffs)}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "verifies the boundary's own files, not just the follow-up's, when the follow-up stages a disjoint file",
+    async () => {
+      writeFileSync(join(repo, "boundary-file.ts"), "export const boundary = 1;\n");
+      await commitAll(repo, "boundary", { bypassHooks: true });
+      expect(existsSync(stagedDiffs)).toBe(false);
+
+      writeFileSync(join(repo, "followup-file.ts"), "export const followup = 1;\n");
+      const { committed } = await commitAll(repo, "boundary", { amendToVerifyHooks: true });
+      expect(committed).toBe(true);
+
+      const diffs = readFileSync(stagedDiffs, "utf8").trim().split("\n");
+      // Exactly one hook invocation, seeing BOTH files staged together — never one run per file, and
+      // never a run that saw only the follow-up's own file.
+      expect(diffs).toHaveLength(1);
+      expect(diffs[0]).toContain("boundary-file.ts");
+      expect(diffs[0]).toContain("followup-file.ts");
+
+      const files = execFileSync("git", ["-C", repo, "ls-tree", "-r", "--name-only", "HEAD"], {
+        encoding: "utf8",
+      });
+      expect(files).toContain("boundary-file.ts");
+      expect(files).toContain("followup-file.ts");
+    },
+  );
 });
 
 // PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only

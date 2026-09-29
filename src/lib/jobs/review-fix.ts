@@ -58,6 +58,8 @@ import {
   commitAll,
   commitAttemptMode,
   commitParentShas,
+  exitedWith,
+  git,
   isAncestor,
   readWorktreeState,
   fetchOrigin,
@@ -1373,20 +1375,13 @@ async function runFixSession(args: {
     // bounded gate-fix follow-up round below and re-dispatches a whole new review session against
     // the exact same failure instead.
     //
-    // `boundaryCommitted` is threaded through to `commitAndPushFix` below (PR #338 review,
-    // chatgpt-codex-connector, round 2): when the follow-up round makes no further changes, that
-    // call's own `commitFix` would otherwise see a clean index and never invoke git at all, letting
-    // this hook-bypassed commit reach the remote having never had the project's real hooks run on it.
-    const { committed: boundaryCommitted } = await commitFix(
-      repo,
-      worktree.path,
-      epic.id,
-      branch,
-      number,
-      settings,
-      ctx.signal,
-      { bypassHooks: true },
-    );
+    // This commit is marked as an unverified boundary (see `markUnverifiedBoundary`), so
+    // `commitAndPushFix` below re-verifies it via `commitFix`'s own marker check even when the
+    // follow-up round makes no further changes — a clean index would otherwise mean `commitAll`
+    // never invokes git at all, letting this hook-bypassed commit reach the remote unverified.
+    await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal, {
+      bypassHooks: true,
+    });
     // Snapshot the boundary BEFORE gates/the follow-up round can touch anything — see
     // `mainRoundProducedChange` below for why this, not `postSessionHead`, is what `report`'s own
     // claims get checked against.
@@ -1418,7 +1413,6 @@ async function runFixSession(args: {
       number,
       settings,
       ctx.signal,
-      boundaryCommitted,
     );
 
     // Persist the outcome BEFORE the fallible thread/notification work below — a push that reached
@@ -1830,6 +1824,46 @@ async function runGateFixFollowUp(args: {
 }
 
 /**
+ * A git note — never pushed, see `pushBranch`'s own `git push` args below, which name only `branch`
+ * — marking the commit it's attached to as a hook-bypassed boundary commit `commitFix` hasn't yet
+ * re-verified. Written by `commitFix` itself right after it makes one (see below) and read back by
+ * `commitFix` on every OTHER call, so a boundary commit's unverified status survives past the
+ * runFixSession call graph that created it — a job retry, or a resumed "already ahead" fast path,
+ * is a brand-new process with none of this round's in-memory state, and used to trust an
+ * `amendToVerifyHooks`/`boundaryCommitted` flag that only ever reflected what THIS call happened to
+ * know, not what the worktree's actual HEAD carries (PR #338 review round 3, chatgpt-codex-connector:
+ * a hook rejecting the re-verify commit restores HEAD to that same unverified boundary commit, and
+ * the next dispatch — finding the branch already ahead of origin — took the fast path and pushed it
+ * exactly as rejected). A note survives because it lives on the commit object itself, in a ref this
+ * file never pushes; a commit that gets genuinely re-verified always lands under a NEW sha (an
+ * ordinary `git commit`, or `commitAll`'s own reset + recommit), so the marker simply doesn't carry
+ * forward onto it — no explicit removal needed.
+ */
+const UNVERIFIED_BOUNDARY_NOTES_REF = "refs/notes/anton-review-fix-boundary";
+
+async function markUnverifiedBoundary(worktreePath: string): Promise<void> {
+  await git(worktreePath, [
+    "notes",
+    `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`,
+    "add",
+    "-f",
+    "-m",
+    "hooks bypassed for this commit; not yet re-verified",
+    "HEAD",
+  ]);
+}
+
+async function headCarriesUnverifiedBoundaryMarker(worktreePath: string): Promise<boolean> {
+  try {
+    await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "show", "HEAD"]);
+    return true;
+  } catch (error) {
+    if (exitedWith(error, 1)) return false;
+    throw error;
+  }
+}
+
+/**
  * Stage whatever is in the worktree and commit it, with the recovery a commit timeout needs. Split
  * out of `commitAndPushFix` (anton-vtex7) so `runFixSession` can land a resolved base merge BEFORE
  * the verify gates run, while the push itself still waits behind them. Returns whether a commit
@@ -1840,14 +1874,18 @@ async function runGateFixFollowUp(args: {
  * commit passes this — it exists to snapshot "what the main round changed" before gates run, not to
  * publish anything, and a project's own pre-commit hook enforcing the same check a verify gate does
  * would otherwise reject it before the gate (and its bounded follow-up round) ever gets a chance.
- * `commitAndPushFix`'s own call never bypasses.
+ * `commitAndPushFix`'s own call never bypasses. A commit made this way is marked with
+ * {@link markUnverifiedBoundary} so every later call — this round's own, or a future retry's —
+ * knows to re-verify it.
  *
  * `amendToVerifyHooks` covers the case that boundary commit's doc comment used to promise but didn't
  * keep (PR #338 review, chatgpt-codex-connector, round 2): when the follow-up round adds nothing new
  * to stage, there is nothing left for `commitAndPushFix`'s call to actually commit, so the
  * hook-bypassed boundary commit would otherwise reach the remote having never had the project's real
- * hooks run over it. Passed only when that boundary commit is this round's own — see
- * `commitAndPushFix`.
+ * hooks run over it. The caller need not pass this explicitly for that case — whenever
+ * `bypassHooks` is unset, this function checks {@link headCarriesUnverifiedBoundaryMarker} itself
+ * and forces it on, so a fresh process picks up exactly where an in-memory flag would have (round 3
+ * of the same review).
  */
 async function commitFix(
   repo: string,
@@ -1872,6 +1910,12 @@ async function commitFix(
   // `post-commit` runs after HEAD advances. A timeout can therefore reject `commitAll` after the
   // fix landed; recognize only a forward move on this run's branch, never an unrelated rewrite.
   const before = await readWorktreeState(worktreePath);
+  // See this function's own doc comment: a bypass call never needs this (it's about to BECOME the
+  // unverified boundary, not verify one), but every other call must ask the worktree itself, not
+  // trust whatever this round happens to remember.
+  const amendToVerifyHooks =
+    options.amendToVerifyHooks ||
+    (!options.bypassHooks && (await headCarriesUnverifiedBoundaryMarker(worktreePath)));
   let committed: boolean;
   try {
     ({ committed } = await commitAll(
@@ -1880,7 +1924,7 @@ async function commitFix(
       {
         hooksPath,
         bypassHooks: options.bypassHooks,
-        amendToVerifyHooks: options.amendToVerifyHooks,
+        amendToVerifyHooks,
         timeoutMs: resolveCommitTimeoutMs(settings),
         signal,
       },
@@ -1898,13 +1942,13 @@ async function commitFix(
         { cause: error },
       );
     }
-    // `options.amendToVerifyHooks` is what the CALLER asked for, not necessarily what `commitAll`
+    // `amendToVerifyHooks` above is what this call ASKED FOR, not necessarily what `commitAll`
     // actually ran: it only takes the amend path when nothing new was staged, so a gate follow-up
     // that DID stage new changes on top of a prior boundary commit gets an ordinary commit even when
     // this was passed (PR #338 review round 2, chatgpt-codex-connector). Trust the mode `commitAll`
     // tagged the error with over the request; only the request survives a non-commit failure (e.g.
     // `stageAll` itself throwing, which never reaches either `gitCommit` call inside `commitAll`).
-    const requestedMode = options.amendToVerifyHooks ? "amend" : "commit";
+    const requestedMode = amendToVerifyHooks ? "amend" : "commit";
     const attemptedAmend = (commitAttemptMode(error) ?? requestedMode) === "amend";
     if (attemptedAmend) {
       // An amend REPLACES the tip rather than adding on top of it, so `before.head` is never an
@@ -1932,6 +1976,9 @@ async function commitFix(
     }
     committed = true;
   }
+  if (committed && options.bypassHooks) {
+    await markUnverifiedBoundary(worktreePath);
+  }
   return { committed, hooksPath };
 }
 
@@ -1942,13 +1989,12 @@ async function commitFix(
  * Otherwise there is genuinely nothing to send — a clean no-op, not a silent skip of pending work.
  * Returns whether anything was pushed.
  *
- * `boundaryCommitted` (PR #338 review, chatgpt-codex-connector, round 2): true only when
- * `runFixSession`'s pre-gate `commitFix` call actually created a hook-bypassed commit this round.
- * When the follow-up round below stages nothing new, `commitFix` would otherwise find a clean index
- * and never touch git at all — silently letting that bypassed commit reach the remote unverified.
- * Passing it through as `amendToVerifyHooks` makes this call re-run hooks via `--amend` in exactly
- * that case. The "already ahead" fast path in `runFixSession` never makes a boundary commit, so it
- * omits this and gets the old no-op-when-clean behavior.
+ * Re-verification of a hook-bypassed boundary commit (PR #338 review, chatgpt-codex-connector,
+ * rounds 2-3) is entirely `commitFix`'s own concern now — see
+ * {@link headCarriesUnverifiedBoundaryMarker} — so this function no longer needs a
+ * `boundaryCommitted` flag threaded in from the caller's own call graph; that flag only ever
+ * reflected THIS round's memory, not the worktree, and so missed the case of a retry that never
+ * re-ran `runFixSession`'s pre-gate `commitFix` call at all (the "already ahead" fast path).
  */
 async function commitAndPushFix(
   repo: string,
@@ -1958,7 +2004,6 @@ async function commitAndPushFix(
   number: number,
   settings: ProjectSettings,
   signal: AbortSignal,
-  boundaryCommitted = false,
 ): Promise<boolean> {
   const { committed, hooksPath } = await commitFix(
     repo,
@@ -1968,7 +2013,6 @@ async function commitAndPushFix(
     number,
     settings,
     signal,
-    { amendToVerifyHooks: boundaryCommitted },
   );
   const pushed = committed || (await branchAheadOfRemote(repo, branch));
   // From the worktree, not `repo` (the base checkout) — see pushBranch's doc comment: a project's
