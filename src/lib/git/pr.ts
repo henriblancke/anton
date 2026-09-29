@@ -100,6 +100,17 @@ export interface PrReview {
    * checking this would report zero or understated counts indistinguishable from a clean PR.
    */
   threadsComplete: boolean;
+  /**
+   * Top-level PR comments (the same surface `commentOnPr`/`getPrComments` read/write — not inline
+   * review comments), oldest first. Lets `classifyReview` tell a genuine human reply apart from
+   * anton's own posts (ANTON_MARK-prefixed, filtered the same way `threadsNeedingAttention` ignores
+   * its own inline replies): a `needs-human` round is otherwise unactionable on every other axis, so
+   * without this a human answering anton's request the one place it was actually posted — a plain
+   * top-level reply — left the fingerprint byte-identical and the round suppressed forever (PR #338
+   * review, chatgpt-codex-connector). Optional because a caller-built fixture (tests) has no reason
+   * to populate it.
+   */
+  comments?: Array<{ id: string; author: string; body: string }>;
 }
 
 interface GhPrView {
@@ -131,6 +142,7 @@ interface GhPrView {
     completedAt?: string; // checkRun — changes on rerun even when detailsUrl is absent
     createdAt?: string; // statusContext equivalent of completedAt
   }>;
+  comments?: Array<{ id?: string; author?: { login?: string }; body?: string }>;
 }
 
 /** Is a single statusCheckRollup entry failing? Handles both checkRun + statusContext shapes. */
@@ -181,7 +193,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,reviews,statusCheckRollup,comments",
     ],
     signal,
   );
@@ -203,6 +215,14 @@ export async function getPrReview(
     submittedAt: r.submittedAt,
   }));
 
+  const comments = (view.comments ?? [])
+    .filter((c): c is { id: string; author?: { login?: string }; body?: string } => typeof c.id === "string")
+    .map((c) => ({
+      id: c.id,
+      author: c.author?.login ?? "unknown",
+      body: c.body ?? "",
+    }));
+
   return {
     number: view.number,
     state: view.state,
@@ -217,6 +237,7 @@ export async function getPrReview(
     failingChecks,
     failingCheckAttempts,
     pendingChecks,
+    comments,
     ...(await getReviewThreads(repoPath, number, signal)),
   };
 }
@@ -608,6 +629,15 @@ export function classifyReview(pr: PrReview): Actionable {
     // the next run would premerge a different base. Falls back to the plain reason when a
     // caller-built fixture omits `baseRefOid`.
     fingerprint.push(`base:${pr.baseRefOid ?? "unknown"}`);
+    // Folds in the latest top-level PR comment that ISN'T one of anton's own posts (ANTON_MARK
+    // prefix, same filter `threadsNeedingAttention` applies to inline replies) — a `needs-human`
+    // round is deliberately unactionable on every other axis, so a human answering anton's request
+    // the one place it was actually posted (a plain top-level reply, not a review or an inline
+    // thread) otherwise leaves the fingerprint byte-identical and the round suppressed forever (PR
+    // #338 review, chatgpt-codex-connector). Omitted entirely when there is no such comment yet, to
+    // leave the fingerprint of the (overwhelmingly common) comment-free PR unchanged.
+    const latestHumanComment = [...(pr.comments ?? [])].reverse().find((c) => !c.body.startsWith(ANTON_MARK));
+    if (latestHumanComment) fingerprint.push(`comment:${latestHumanComment.id}`);
   }
   return { actionable: reasons.length > 0, reasons, fingerprint };
 }

@@ -974,6 +974,21 @@ export async function prepareFixWorktree(args: {
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
 
+  // Recheck the remote tip immediately after fetching — `aheadBeforeFetch` only proves the
+  // PRE-fetch tracking ref matched `expectedHeadSha`; it says nothing about whether the branch
+  // advanced remotely DURING the fetch. If it did, the ff-only merge below either fast-forwards
+  // onto commits beyond what `expectedHeadSha` names (so `syncedHead` is a descendant of the NEW
+  // tip, not evidence about the old one) or fails outright on a diverged tip (swallowed by `safe`,
+  // leaving `syncedHead` at its old pre-fetch value) — either way, treating the resulting
+  // `syncedHead` as a descendant of `expectedHeadSha` worth trusting is exactly the race this
+  // function's other comments describe, just not caught by them (PR #338 review,
+  // chatgpt-codex-connector, round 11). Requiring the POST-fetch tracking ref to still equal
+  // `expectedHeadSha` closes it: a remote-advance during the fetch fails this and forces
+  // `headMatches` down to the exact-match branch only, which a stale `syncedHead` can't satisfy.
+  const remoteTipUnchanged =
+    expectedHeadSha === "" ||
+    (await resolveCommitSha(repo, `origin/${branch}`).catch(() => undefined)) === expectedHeadSha;
+
   // Override `core.hooksPath` for the fast-forward below ONLY when the incoming ref itself doesn't
   // carry it (see needsHooksPathOverrideForMerge) — a value resolved before this merge is either
   // exactly right (a generated directory like Husky's `.husky/_`, never tracked by any ref) or
@@ -1017,11 +1032,17 @@ export async function prepareFixWorktree(args: {
   // would run the checks/reviews/fingerprint the caller classified against a commit that is no
   // longer the branch's real tip (PR #338 review, chatgpt-codex-connector, round 9). When
   // `aheadBeforeFetch` is false, only an exact match counts as synced — anything else forces a fresh
-  // PR read on the next pass instead.
+  // PR read on the next pass instead. Also requires `remoteTipUnchanged` (above): `aheadBeforeFetch`
+  // alone only proves the race hadn't happened BEFORE this fetch, not that this fetch itself didn't
+  // just cause it — without the post-fetch recheck, a remote advance during the fetch reads as the
+  // same "local descendant of `expectedHeadSha`" shape as a genuine resume, whether the ff-only merge
+  // above fast-forwarded past the new tip or failed and left the stale pre-fetch `syncedHead` in place
+  // (PR #338 review, chatgpt-codex-connector, round 11).
   const headMatches =
     expectedHeadSha === "" ||
     syncedHead === expectedHeadSha ||
     (aheadBeforeFetch &&
+      remoteTipUnchanged &&
       (await isAncestor(worktree.path, expectedHeadSha, syncedHead).catch(() => false)));
 
   // Same check for the base ref `fetchOrigin` above also fetched (best-effort, just like the head

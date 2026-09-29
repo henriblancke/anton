@@ -629,6 +629,14 @@ export function enqueueReviewFixPrIfAbsent(
  * different fingerprints parking within the same second would otherwise sort arbitrarily, and SQLite
  * could hand back the older mismatched row instead of the newer one matching the current fingerprint
  * (PR #338 review, chatgpt-codex-connector).
+ *
+ * NOT filtered on `headSha` in SQL — the single most recent settled row is selected across EVERY
+ * head first, and only THEN checked against `headSha`, same as {@link answeredUnchanged}. A
+ * force-push cycle from head A to B and back to A used to resurrect an old `parked`-at-A row while
+ * ignoring a newer, more relevant settled attempt at B: filtering by `headSha` before ordering makes
+ * that older A row the "most recent…at head A" match even though a B attempt intervened, so a target
+ * whose fingerprint also happened to return to its A value stayed parked despite the newer attempt
+ * having moved the state on (PR #338 review, chatgpt-codex-connector, round 12).
  */
 function parkedAtHead(
   tx: Pick<AntonDb, "select">,
@@ -646,20 +654,20 @@ function parkedAtHead(
         eq(schema.jobs.projectId, projectId),
         notInArray(schema.jobs.status, [...ACTIVE_STATUSES]),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
     )
     .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1)
     .all()[0];
   if (!row || row.status !== "parked") return undefined;
-  if (fingerprint === undefined) return row.id;
-  let payload: { fingerprint?: string[] };
+  let payload: { headSha?: string; fingerprint?: string[] };
   try {
     payload = JSON.parse(row.payloadJson);
   } catch {
-    return row.id;
+    return undefined;
   }
+  if (payload.headSha !== headSha) return undefined;
+  if (fingerprint === undefined) return row.id;
   return payload.fingerprint === undefined ||
     JSON.stringify(payload.fingerprint) === JSON.stringify(fingerprint)
     ? row.id
@@ -688,17 +696,25 @@ export function reviewFixPrParkedAtHead(
 /**
  * Id of a `done` `review-fix-pr` job for this target that answered its round (see
  * {@link recordReviewFixAnswered}) at the SAME head SHA and the SAME `classifyReview` fingerprint —
- * anton-dfuvz. Filtered on `headSha` in SQL like {@link parkedAtHead}; `answeredFingerprint` is a
- * JSON array, so its equality is checked in JS after parsing rather than trying to express array
- * equality in the query. Compared against ONLY the target's single most recent settled row at this
- * head (any status outside {@link ACTIVE_STATUSES} — `done`, `parked`, `failed`, or `cancelled` —
- * counts as settled, not `done` alone) — never a search over history for any matching row — so a
- * fingerprint that cycled A→B→A admits the fresh A round instead of being resuppressed by a stale
- * row: if the newest settled row is a `parked` B (a red gate that parked the intervening round), it
- * simply isn't `done`, so it doesn't match, regardless of what an older `done` row once answered.
- * Filtering on `status = "done"` directly, as an earlier revision did, let that older row win the
- * ordering instead of the newer `parked` one, permanently resuppressing a round the PR had already
- * moved past (PR #338 review, chatgpt-codex-connector).
+ * anton-dfuvz. `answeredFingerprint` is a JSON array, so its equality is checked in JS after parsing
+ * rather than trying to express array equality in the query. Compared against ONLY the target's
+ * single most recent settled row OVERALL (any status outside {@link ACTIVE_STATUSES} — `done`,
+ * `parked`, `failed`, or `cancelled` — counts as settled, not `done` alone) — never a search over
+ * history for any matching row — so a fingerprint that cycled A→B→A admits the fresh A round instead
+ * of being resuppressed by a stale row: if the newest settled row is a `parked` B (a red gate that
+ * parked the intervening round), it simply isn't `done`, so it doesn't match, regardless of what an
+ * older `done` row once answered. Filtering on `status = "done"` directly, as an earlier revision
+ * did, let that older row win the ordering instead of the newer `parked` one, permanently
+ * resuppressing a round the PR had already moved past (PR #338 review, chatgpt-codex-connector).
+ *
+ * NOT filtered on `headSha` in SQL — deliberately: the row is selected as the single most recent
+ * settled attempt ACROSS EVERY head, and only THEN checked against `headSha`. Filtering by `headSha`
+ * up front (an earlier revision did this) selects the most recent settled row AT THAT HEAD, which is
+ * a different — and wrong — question: a force-push cycle from head A to B and back to A resurrects
+ * the old answered-A row while ignoring a newer, more relevant B attempt that intervened, and if the
+ * fingerprint also happens to return to its A value, a fresh enqueue for the reverted target is
+ * wrongly suppressed even though a newer attempt (at B) has since moved the state on (PR #338
+ * review, chatgpt-codex-connector, round 12).
  *
  * Ordered on `updatedAt` DESC with {@link JOB_INSERT_ORDER} as the tie-break, same as
  * {@link latestExecuteEpicJob} — `updatedAt` is second-truncated, so an answered A attempt and a
@@ -722,19 +738,19 @@ function answeredUnchanged(
         eq(schema.jobs.projectId, projectId),
         notInArray(schema.jobs.status, [...ACTIVE_STATUSES]),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
     )
     .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1)
     .all()[0];
   if (!row || row.status !== "done") return undefined;
-  let payload: { answeredFingerprint?: string[] };
+  let payload: { headSha?: string; answeredFingerprint?: string[] };
   try {
     payload = JSON.parse(row.payloadJson);
   } catch {
     return undefined;
   }
+  if (payload.headSha !== headSha) return undefined;
   return payload.answeredFingerprint !== undefined &&
     JSON.stringify(payload.answeredFingerprint) === JSON.stringify(fingerprint)
     ? row.id
