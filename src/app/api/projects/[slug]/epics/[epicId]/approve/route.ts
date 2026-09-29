@@ -358,6 +358,20 @@ export const POST = withProject<{ slug: string; epicId: string }>(async (request
   if (willEnqueue) {
     await ensureCycleEvidence(project.repoPath, allBeads, allBeadsGeneration);
   }
+  // `ensureCycleEvidence` can return normally with evidence still unattached — a generation move, or
+  // any other field on `allBeads` (a label, an ancestor) drifting from a fresh re-list, makes it fail
+  // closed by clearing the sidecar rather than throwing (see its own doc). Passing that `undefined`
+  // through to `structureGaps` here is deliberate, not an oversight (P2 review, PR #274: "Reject
+  // approval when cycle enrichment loses its snapshot" asked this site to refuse instead) — this read
+  // is advisory, not the authoritative one. `approveAndClaim` below is called with `needsCycles:
+  // willEnqueue` (same flag), whose `loadAllIssues({ withCycles: true })` either attaches fresh
+  // evidence to the LOCKED board or throws; it can never silently wave a real cycle through. Refusing
+  // HERE instead regressed exactly the race tolerance the pre-lock gate exists to have: a concurrent
+  // label move or a feature attaching mid-approval (see the "reports the child gates the LOCKED board
+  // carries" and "422s a target that became a container" tests below) trips this same
+  // `sameTargetEligibilityState`/ancestor-chain check inside `ensureCycleEvidence`'s consistency
+  // re-list — with nothing to do with cycles — and a hard 422 here would reject those benign races
+  // pre-lock instead of letting the locked re-check answer them correctly.
   const structural = willEnqueue
     ? structureGaps(epicId, allBeads, { cycles: cycleEvidenceFor(allBeads) })
     : { blocking: [], advisory: [] };

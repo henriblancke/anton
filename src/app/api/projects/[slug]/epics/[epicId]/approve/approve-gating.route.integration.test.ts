@@ -305,6 +305,41 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — gating (temp an
     }
   });
 
+  it("still refuses a genuine blocks cycle even when the pre-lock cycle-evidence read comes back empty (P2 review, PR #274: the locked re-check is the authoritative one)", async () => {
+    // `ensureCycleEvidence` can return normally without attaching evidence — a generation move, or
+    // any other field drifting between its internal re-list and `allBeads`, makes it decline rather
+    // than throw. A review comment argued the pre-lock gate should refuse outright when that happens,
+    // reading a missing `cycles` option as "unknown" rather than "no cycles reported" — but the
+    // pre-lock read is advisory: simulate the exact loss (mock it to a no-op) alongside a REAL cycle
+    // the locked path's own `loadAllIssues({ withCycles: true })` still discovers, and prove the
+    // request is refused anyway, off the authoritative locked recheck. (A hard refusal at the pre-lock
+    // site was tried and reverted — see the route's own comment — because it also rejects benign,
+    // already-tested races: a label move or a feature landing mid-approval trips this same
+    // consistency check for reasons that have nothing to do with cycles.)
+    const target = await beads.create(repo, {
+      title: "Lost cycle snapshot target",
+      type: "task",
+      acceptance: "- [ ] it works",
+    });
+    const issuesModule = await import("@/lib/beads/issues");
+    const ensureSpy = vi
+      .spyOn(issuesModule, "ensureCycleEvidence")
+      .mockImplementation(async (_cwd, board) => board);
+    const cyclesSpy = vi.spyOn(beads, "depCycles").mockResolvedValue([{ ids: [target], raw: { cycle: [target] } }]);
+    try {
+      const res = await approve(target);
+      expect(res.status).toBe(422);
+      const body = await res.json();
+      expect(body.rules).toEqual(["blocks-cycle"]);
+      expect(body.error).toContain(target);
+      expect(beads.isApproved(await beads.show(repo, target))).toBe(false);
+      expect(await executeEpicJobs(target)).toHaveLength(0);
+    } finally {
+      ensureSpy.mockRestore();
+      cyclesSpy.mockRestore();
+    }
+  });
+
   it("approves a childless, parentless feature and reports both shapes as advisory", async () => {
     // A feature with no tickets is a legitimate single-ticket run (beads.groupsChildren), and a
     // parentless one runs fine — it just shows on no roadmap. Refusing either would strand honest
