@@ -113,6 +113,18 @@ export interface PrReview {
    * reason to populate it.
    */
   comments?: Array<{ id: string; author: string; body: string }>;
+  /**
+   * Whether `comments` is the PR's WHOLE top-level comment history, or a degraded read — a page
+   * fetch failed or returned a malformed response (see `getPrTopLevelComments`). `false` makes a
+   * short or stale `comments` distinguishable from a genuinely complete one: `classifyReview` must
+   * not derive its answered-suppression checkpoint from a `comments` list that might be missing the
+   * very reply that would release it, and the PR #338-comment dedup checks in review-fix.ts
+   * (`notifyGateParked`, `publishUnpushedSentinel`) must not read an absent match in a degraded list
+   * as "definitely not posted yet" (PR #338 review round 2, chatgpt-codex-connector). Optional,
+   * defaulting to "complete", for the same reason `comments` itself is optional — a caller-built
+   * fixture (tests) has no reason to populate it.
+   */
+  commentsComplete?: boolean;
 }
 
 interface GhPrView {
@@ -216,7 +228,7 @@ export async function getPrReview(
     submittedAt: r.submittedAt,
   }));
 
-  const [threadsResult, comments] = await Promise.all([
+  const [threadsResult, commentsResult] = await Promise.all([
     getReviewThreads(repoPath, number, signal),
     getPrTopLevelComments(repoPath, number, signal),
   ]);
@@ -235,7 +247,8 @@ export async function getPrReview(
     failingChecks,
     failingCheckAttempts,
     pendingChecks,
-    comments,
+    comments: commentsResult.comments,
+    commentsComplete: commentsResult.commentsComplete,
     ...threadsResult,
   };
 }
@@ -277,19 +290,24 @@ interface PrCommentsPage {
  * and a `needs-human` round it already answered stays suppressed forever (PR #338 review,
  * chatgpt-codex-connector).
  *
- * Best-effort: a later page failing keeps the pages already fetched rather than discarding
- * everything, mirroring `getReviewThreads` — some history beats none for the (ephemeral,
- * unpersisted) fingerprint this feeds.
+ * Best-effort: a later page's fetch failing keeps the pages already fetched rather than discarding
+ * everything, mirroring `getReviewThreads` — some history beats none for the dedup checks
+ * (`notifyGateParked`, `publishUnpushedSentinel`) this feeds. But "some beats none" is only safe
+ * when the caller can tell it apart from "all": a missing page can hide the very comment a caller is
+ * checking for, so `commentsComplete: false` flags exactly that degraded case, and every caller of
+ * this list (`classifyReview`'s fingerprint, the two dedup checks above) must treat a degraded read
+ * as "unknown", never as "confirmed absent" (PR #338 review round 2, chatgpt-codex-connector).
  */
 export async function getPrTopLevelComments(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
-): Promise<Array<{ id: string; author: string; body: string }>> {
+): Promise<{ comments: Array<{ id: string; author: string; body: string }>; commentsComplete: boolean }> {
   const allNodes: RawPrCommentNode[] = [];
+  let complete = true;
   try {
     const nwo = await nameWithOwner(repoPath, signal);
-    if (!nwo) return [];
+    if (!nwo) return { comments: [], commentsComplete: false };
     const [owner, repo] = nwo.split("/");
 
     let cursor: string | undefined;
@@ -310,25 +328,36 @@ export async function getPrTopLevelComments(
         );
         parsed = JSON.parse(raw) as PrCommentsPage;
       } catch {
+        // Keep the pages already fetched, but flag the read as incomplete — a failed page (the exact
+        // bug this fixes) still degrades to a short list rather than one silently mistaken for the
+        // PR's whole comment history.
+        complete = false;
         break;
       }
       const page = parsed.data?.repository?.pullRequest?.comments;
       if (!page || !Array.isArray(page.nodes)) break;
       allNodes.push(...page.nodes);
-      if (!page.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      if (!page.pageInfo?.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        // hasNextPage is true but there's no cursor to continue with — can't proceed, so the nodes
+        // fetched so far aren't the full picture.
+        complete = false;
+        break;
+      }
       cursor = page.pageInfo.endCursor;
     }
   } catch {
-    return [];
+    return { comments: [], commentsComplete: false };
   }
 
-  return allNodes
+  const comments = allNodes
     .filter((c): c is RawPrCommentNode & { id: string } => typeof c.id === "string")
     .map((c) => ({
       id: c.id,
       author: c.author?.login ?? "unknown",
       body: c.body ?? "",
     }));
+  return { comments, commentsComplete: complete };
 }
 
 /**
@@ -738,14 +767,25 @@ export function classifyReview(pr: PrReview): Actionable {
     // thread) otherwise leaves the fingerprint byte-identical and the round suppressed forever (PR
     // #338 review, chatgpt-codex-connector). Omitted entirely when there is no such comment yet, to
     // leave the fingerprint of the (overwhelmingly common) comment-free PR unchanged.
-    const humanComment = latestHumanComment(pr.comments);
-    // Hashes the body too, not just the id (PR #338 review, chatgpt-codex-connector): GitHub
-    // preserves a comment's id across an edit, so a human editing their answered top-level reply —
-    // the exact input meant to release the needs-human suppression — would otherwise leave this
-    // fingerprint byte-identical to the stale answered row and stay suppressed forever, mirroring
-    // why `changesRequested` above hashes a review's body rather than trusting its id alone.
-    if (humanComment) {
-      fingerprint.push(`comment:${humanComment.id}:${hashReviewBody(humanComment.body)}`);
+    if (pr.commentsComplete === false) {
+      // A degraded top-level-comment read (a later GraphQL page failed — `getPrTopLevelComments`)
+      // can't be trusted to name the true latest human reply: the very reply that would release a
+      // needs-human suppression might be sitting on the page that failed, in which case the stale
+      // fallback below would compute the SAME fingerprint entry as before and match a stale answered
+      // row even though something genuinely changed. A fixed, distinct marker instead of a
+      // `comment:*` entry means this checkpoint can never match an answered row recorded while the
+      // read was complete (PR #338 review round 2, chatgpt-codex-connector).
+      fingerprint.push("comments:incomplete");
+    } else {
+      const humanComment = latestHumanComment(pr.comments);
+      // Hashes the body too, not just the id (PR #338 review, chatgpt-codex-connector): GitHub
+      // preserves a comment's id across an edit, so a human editing their answered top-level reply —
+      // the exact input meant to release the needs-human suppression — would otherwise leave this
+      // fingerprint byte-identical to the stale answered row and stay suppressed forever, mirroring
+      // why `changesRequested` above hashes a review's body rather than trusting its id alone.
+      if (humanComment) {
+        fingerprint.push(`comment:${humanComment.id}:${hashReviewBody(humanComment.body)}`);
+      }
     }
   }
   return { actionable: reasons.length > 0, reasons, fingerprint };

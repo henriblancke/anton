@@ -2077,4 +2077,37 @@ process.exit(0);
 
     expect(postedComments()).toHaveLength(2);
   });
+
+  // PR #338 review round 2 (chatgpt-codex-connector, P2): a page fetch failing partway through
+  // `getPrTopLevelComments` used to be indistinguishable from "no comments yet" — an absent match
+  // in that truncated list proved nothing, so this dedup check could post a duplicate sentinel a
+  // missing page was already carrying. `commentsComplete: false` must make it skip posting instead.
+  it("skips posting when the comment history read is incomplete, to avoid a duplicate", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'api' && a[1] === 'graphql') { process.exit(1); }
+if (a[0] === 'pr' && a[1] === 'comment') {
+  fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    await notifyGateParked({
+      repo: sandbox,
+      number: 7,
+      error: new PoisonError("tests gate failed after review-fix for PR #7 (exit 3)\n\nboom"),
+      conflicts: [],
+      signal: new AbortController().signal,
+    });
+
+    expect(postedComments()).toHaveLength(0);
+  });
 });

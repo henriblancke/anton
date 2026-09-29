@@ -1752,6 +1752,12 @@ async function runFixSession(args: {
  * it for a human's. Idempotent against the PR's comment history rather than any local state — a
  * resumed job parking on the SAME gate is a fresh process with nothing of its own to remember, but
  * the PR remembers what was already said on it.
+ *
+ * Skips posting entirely when the comment history is a degraded read (`commentsComplete: false`,
+ * PR #338 review round 2, chatgpt-codex-connector): a missing page could hide the very sentinel this
+ * is deduping against, so an absent match there proves nothing and posting anyway risks a duplicate.
+ * A resumed job hitting the same gate calls this again, so a transient fetch failure just delays the
+ * notification rather than losing it.
  */
 export async function notifyGateParked(args: {
   repo: string;
@@ -1771,8 +1777,12 @@ export async function notifyGateParked(args: {
     ? " A follow-up fix round already ran against this gate; it failed again."
     : "";
   const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}${fixRoundNote}`;
-  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => []);
-  if (existing.some((c) => c.body === body)) return;
+  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => ({
+    comments: [],
+    commentsComplete: false,
+  }));
+  if (!existing.commentsComplete) return;
+  if (existing.comments.some((c) => c.body === body)) return;
   await safe(() => commentOnPr(repo, number, body, signal));
 }
 
@@ -2439,7 +2449,10 @@ const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
  * Returns whether the explanation actually reached GitHub (already posted, or posted just now) —
  * the caller must not let `allWaitingThreadsAnswered` credit this round when a transient
  * `gh pr comment` failure meant nobody ever saw why nothing changed (PR #338 review,
- * @chatgpt-codex-connector).
+ * @chatgpt-codex-connector), or when the comment history read back is a degraded one
+ * (`commentsComplete: false`) that can't rule out the sentinel already being present on a missing
+ * page (PR #338 review round 2, @chatgpt-codex-connector) — posting anyway risks a duplicate, and
+ * crediting the round risks suppressing a genuinely-unanswered one forever.
  */
 async function publishUnpushedSentinel(args: {
   repo: string;
@@ -2451,8 +2464,12 @@ async function publishUnpushedSentinel(args: {
   const { repo, number, sentinel, signal, logPath } = args;
   const note = sentinel.reply?.trim() || defaultReply(sentinel.outcome);
   const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}`;
-  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => []);
-  if (existing.some((c) => c.body === body)) return true;
+  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => ({
+    comments: [],
+    commentsComplete: false,
+  }));
+  if (!existing.commentsComplete) return false;
+  if (existing.comments.some((c) => c.body === body)) return true;
   const posted = await safe(() => commentOnPr(repo, number, body, signal));
   if (posted) {
     await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);
