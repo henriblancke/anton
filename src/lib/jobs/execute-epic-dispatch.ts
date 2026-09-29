@@ -1075,6 +1075,22 @@ export async function branchDelivery(
   return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
 }
 
+/**
+ * The id of an already-dispatched ticket that blocks-depends on `ticket` — evidence that this
+ * run's dispatch order ran a dependent ahead of its prerequisite, which a valid topological order
+ * ({@link orderTickets}) never produces. The only way it happens is the cycle fallback: `blocks`
+ * edges among the run's own tickets that `orderTickets` could not place, so it dispatched in
+ * source order instead. Reading raw edges rather than re-deriving cycle membership is deliberate —
+ * whatever put `dependent` in `onBranch` ahead of `ticket` already proves the order was never
+ * validated, regardless of which cycle (if more than one) is responsible.
+ */
+function dependentDispatchedAhead(ticket: Bead, all: Bead[], onBranch: ReadonlySet<string>): string | undefined {
+  for (const e of beads.edgesOf(all)) {
+    if (e.type === "blocks" && e.to === ticket.id && onBranch.has(e.from)) return e.from;
+  }
+  return undefined;
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -1191,6 +1207,27 @@ async function dispatchTicket(
   // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
   // operate on a live bead (a standalone target is never closed, so it needs no reopen).
   if (doneOnBoard && ticket.status === "closed") {
+    // A closed member is what let the board's cycle gate wave this ticket's `blocks` loop through
+    // as resolved (tiers.mjs `cycleMembers`'s `allLive` — one closed member breaks a live
+    // deadlock). That is only true when the close carried real, landed work; a cross-machine
+    // resume finding no commit for it here means it did not, so the loop is live again the moment
+    // this reopen runs. If the ticket that blocks-depends on it already dispatched — only
+    // possible because `orderTickets` (execute-epic-board.ts) fell back to source order over that
+    // same cycle — the run has already executed one side of the loop ahead of the prerequisite
+    // the other side encoded (P2 review, PR #274). Fail loud instead of reopening into an order
+    // the graph itself says is impossible.
+    const dependent = dependentDispatchedAhead(ticket, all, onBranch);
+    if (dependent) {
+      throw new PoisonEpic(
+        `${ticket.id} must be regenerated — it is closed on the board but its commit is missing ` +
+          `from this branch — but ${dependent} already ran ahead of it in this run's dispatch ` +
+          `order. That order came from a \`blocks\` cycle between them that the board's structure ` +
+          `gate treats as resolved once one member closes; ${ticket.id} closing without its work ` +
+          `landing here means the loop never actually resolved. Break the cycle ` +
+          `(\`bd dep remove ${dependent} ${ticket.id}\` or the reverse, whichever edge is stale) ` +
+          `and re-run.`,
+      );
+    }
     await reopenForRegeneration(repo, ticket);
   }
   try {

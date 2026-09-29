@@ -947,4 +947,31 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(reopenMock).not.toHaveBeenCalled();
     expect(runTicketMock).not.toHaveBeenCalled();
   });
+
+  // The board's cycle gate (tiers.mjs `cycleMembers`) waves a `blocks` cycle through as resolved
+  // once ONE member closes — true only when that close carried real, landed work. Here it did not:
+  // the closed child's commit is missing from this branch, so this reopen is the loop finding out
+  // the cycle was never actually resolved. Its dependent already dispatched (source order is all
+  // `orderTickets` had once the cycle made a topological sort impossible), so the run already ran
+  // one side of the loop ahead of the prerequisite the other side encoded (P2 review, PR #274).
+  // Park loud rather than reopen into an order the graph itself says is impossible.
+  it("fails loud instead of reopening a closed child whose dependent already dispatched ahead of it", async () => {
+    const dependent = bead("anton-b", {
+      dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+    } as Partial<Bead>);
+    const child = closedChild("anton-a") as Bead;
+    (child as unknown as { dependencies: unknown[] }).dependencies = [
+      { issue_id: "anton-a", depends_on_id: "anton-b", type: "blocks" },
+    ];
+    showMock.mockResolvedValue(child);
+
+    // Source order — the cycle's fallback — dispatches the dependent before the child it waits on.
+    const run = makeRun([dependent, child], new AbortController().signal);
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a must be regenerated.*anton-b already ran ahead of it/,
+    );
+    expect(reopenMock).not.toHaveBeenCalled();
+  });
 });
