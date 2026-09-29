@@ -11,7 +11,7 @@
  * call is warranted at all are `review-fix.ts`'s job — this module owns none of that.
  */
 import { BODY_REGION_END, BODY_REGION_START, MAX_BODY_REGION_CHARS, markerLines } from "./steps/prompts";
-import { fabricatedFix, type ThreadOutcome } from "./review-fix-context";
+import { fabricatedFix, NON_THREAD_REPORT_ID, type ThreadOutcome } from "./review-fix-context";
 
 /** One review-fix round: the date it pushed, and one line per thread it actually fixed. */
 export interface FixRound {
@@ -70,14 +70,33 @@ function sanitizeSummary(text: string): string {
  */
 /**
  * The `reasons` a caller may hand `fixRoundFrom`/`refreshFixRoundsBody` as its fallback, gated on
- * the RAW model report (before `applyThreadOutcomes`'s delivery filtering) being empty — never on
- * `delivered` being empty. A nonempty report whose every reply/resolve failed to reach GitHub is
- * NOT the CI-only/conflict-only case the fallback exists for: those threads are still undelivered,
- * waiting on a retry, not resolved, so reporting `reasons` here would claim the round answered
- * findings it never actually got a word to GitHub about.
+ * the RAW model report (before `applyThreadOutcomes`'s delivery filtering) carrying no REAL thread
+ * entry — never on `delivered` being empty. A nonempty report whose every reply/resolve failed to
+ * reach GitHub is NOT the CI-only/conflict-only case the fallback exists for: those threads are
+ * still undelivered, waiting on a retry, not resolved, so reporting `reasons` here would claim the
+ * round answered findings it never actually got a word to GitHub about.
+ *
+ * The {@link NON_THREAD_REPORT_ID} sentinel never counts as a real thread entry — `triageOutcomes`
+ * matches it against no actual PR thread, so `applyThreadOutcomes` always drops it from `delivered`
+ * regardless of what it claims. Without unwrapping it here, a CI-only/conflict-only round that
+ * genuinely pushed a fix and correctly reported the sentinel as `"fixed"` read as a NONEMPTY raw
+ * report (the sentinel itself), so this used to fall through to `[]` — no fallback reasons — while
+ * `delivered` was also `[]` (the sentinel matches no thread), leaving `refreshFixRoundsBody` with
+ * neither a thread entry nor a fallback reason and recording no round at all (PR #338 review,
+ * chatgpt-codex-connector). A sentinel reporting `"fixed"` is translated straight into the body
+ * entry via its own reply (more specific than the generic verdict reasons); a sentinel reporting
+ * `"left"`/`"needs-human"` means the fixer explicitly did nothing about the trigger, so no entry is
+ * owed. Only a report with NO sentinel at all (the model skipped the reporting contract entirely)
+ * still falls back to the verdict's own `reasons`.
  */
 export function fallbackReasonsFor(rawReport: ThreadOutcome[], reasons: string[]): string[] {
-  return rawReport.length === 0 ? reasons : [];
+  const realThreadEntries = rawReport.filter((item) => item.id !== NON_THREAD_REPORT_ID);
+  if (realThreadEntries.length > 0) return [];
+  const sentinel = rawReport.find((item) => item.id === NON_THREAD_REPORT_ID);
+  if (!sentinel) return reasons;
+  if (sentinel.outcome !== "fixed") return [];
+  const summary = sentinel.reply?.trim();
+  return summary ? [summary] : reasons;
 }
 
 export function fixRoundFrom(

@@ -16,7 +16,7 @@ import {
   renderFixRounds,
   type FixRound,
 } from "./review-fix-body";
-import type { ThreadOutcome } from "./review-fix-context";
+import { NON_THREAD_REPORT_ID, type ThreadOutcome } from "./review-fix-context";
 
 const now = new Date("2026-09-23T12:00:00Z");
 
@@ -32,6 +32,33 @@ describe("fallbackReasonsFor", () => {
     // model DID emit a reporting contract, so this is not the no-report case the fallback exists
     // for — those threads are still waiting on a retry, not answered.
     const rawReport: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "renamed foo to bar" }];
+    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([]);
+  });
+
+  it("translates a sentinel-only 'fixed' report into its own reply, not the generic reasons", () => {
+    // A CI-only/conflict-only/no-inline-thread round that genuinely pushed a fix reports the
+    // NON_THREAD_REPORT_ID sentinel as the sole entry (`applyThreadOutcomes` always drops it from
+    // `delivered` since it matches no real PR thread). Its own reply is more specific than the
+    // generic verdict reasons and must back the body entry (PR #338 review, chatgpt-codex-connector).
+    const rawReport: ThreadOutcome[] = [
+      { id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "re-stamped the stale migration" },
+    ];
+    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([
+      "re-stamped the stale migration",
+    ]);
+  });
+
+  it("falls back to the generic reasons when the sentinel reports 'fixed' with no reply text", () => {
+    const rawReport: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed" }];
+    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([
+      "failing checks: claude-review",
+    ]);
+  });
+
+  it("reports nothing when the sentinel explicitly declines the trigger", () => {
+    const rawReport: ThreadOutcome[] = [
+      { id: NON_THREAD_REPORT_ID, outcome: "left", reply: "nothing needed to change" },
+    ];
     expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([]);
   });
 });

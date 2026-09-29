@@ -1645,20 +1645,30 @@ export async function commitAll(
   // The commit just made only ever carries the ONE parent the reset above pointed at — a boundary
   // commit with further parents (the two-parent merge case above) needs them restored now. Pure
   // metadata rewrite of the commit that just passed hook verification, never a second hook run
-  // (`commit-tree` invokes none, and neither does `reset`): same tree, same message, only the
-  // parent list changes back to what the original boundary commit actually had.
+  // (`commit-tree` invokes none, and neither does `reset`): same tree, only the parent list changes
+  // back to what the original boundary commit actually had. The message is re-read from
+  // `verifiedHead` rather than reused from `originalMessage` — a `prepare-commit-msg`/`commit-msg`
+  // hook that edited the message (e.g. appending a required trailer) left that edit on the commit
+  // hooks just verified, and `originalMessage` was captured before hooks ran (PR #338 review,
+  // chatgpt-codex-connector). Likewise `commit-tree` — unlike `git commit` — never signs on its own
+  // even under `commit.gpgSign`, so re-signing is opt-in via `-S`, applied only when the verified
+  // commit itself carries a signature (`%G?` reports anything but `N`), to match it rather than
+  // unconditionally sign or unconditionally drop the signature.
   const extraParents = originalParents.slice(1);
   if (extraParents.length > 0) {
     const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
     const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
+    const verifiedMessage = await git(worktreePath, ["log", "-1", "--format=%B", verifiedHead]);
+    const signatureStatus = await git(worktreePath, ["log", "-1", "--format=%G?", verifiedHead]);
     const reparented = await git(worktreePath, [
       "commit-tree",
       tree,
       "-p",
       originalParents[0] ?? verifiedHead,
       ...extraParents.flatMap((parent) => ["-p", parent]),
+      ...(signatureStatus !== "N" ? ["-S"] : []),
       "-m",
-      originalMessage,
+      verifiedMessage,
     ]);
     await git(worktreePath, ["reset", "--soft", reparented]);
   }

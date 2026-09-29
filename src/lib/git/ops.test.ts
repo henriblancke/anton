@@ -4194,6 +4194,75 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
       ).toBe("resolved\n");
     },
   );
+
+  // PR #338 review (chatgpt-codex-connector): the two-parent reconstruction used to rebuild the
+  // final commit-tree message from `originalMessage` — captured from the boundary commit BEFORE the
+  // verify pass ran — so a `commit-msg` hook that edits the message (e.g. appending a required
+  // trailer) had its edit silently discarded the moment a merge boundary needed reparenting. The
+  // message must come from the just-verified commit instead.
+  it.runIf(process.platform !== "win32")(
+    "keeps a commit-msg hook's edit when reparenting a two-parent boundary commit",
+    async () => {
+      const commitMsgHook = join(repo, ".git", "hooks", "commit-msg");
+      writeFileSync(
+        commitMsgHook,
+        ["#!/bin/sh", 'echo "Reviewed-by: hook" >> "$1"', "exit 0", ""].join("\n"),
+        "utf8",
+      );
+      chmodSync(commitMsgHook, 0o755);
+
+      g(["checkout", "-q", "-b", "feature2"]);
+      writeFileSync(join(repo, "work.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+      const featureTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "work.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+      const mainTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "feature2"]);
+      try {
+        execFileSync("git", ["-C", repo, "merge", "--no-edit", "main"], { stdio: "ignore" });
+      } catch {
+        // Expected — `work.ts` conflicts. Resolved below.
+      }
+      writeFileSync(join(repo, "work.ts"), "resolved\n");
+
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary commit", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+
+      const { committed: amended } = await commitAll(repo, "boundary commit", {
+        amendToVerifyHooks: true,
+      });
+      expect(amended).toBe(true);
+
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const finalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", finalSha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(finalParents).toEqual([featureTip, mainTip]);
+
+      const finalMessage = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%B", finalSha],
+        { encoding: "utf8" },
+      );
+      expect(finalMessage).toContain("Reviewed-by: hook");
+    },
+  );
 });
 
 // PR #338 review round 3 (chatgpt-codex-connector): a hook that inspects the STAGED diff (like
