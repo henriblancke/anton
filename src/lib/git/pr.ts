@@ -25,6 +25,18 @@ async function gh(repoPath: string, args: string[], signal?: AbortSignal): Promi
   return stdout;
 }
 
+/**
+ * A paginated-read catch must tell a caller's own cancellation apart from GitHub actually failing —
+ * a caller-aborted `signal` (job timeout, lease loss) is not a degraded read to fall back on, it's
+ * the caller no longer wanting an answer. Swallowing it into `{ complete: false }` lets the
+ * dispatcher act on a stale/partial `PrReview` after the run that requested it already gave up,
+ * instead of the abort propagating so the runner retries the whole read (PR #338 review,
+ * chatgpt-codex-connector).
+ */
+function rethrowIfAborted(err: unknown, signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw err;
+}
+
 /** Parse the PR number from a beads external-ref (`gh-123`) or a PR url. Returns undefined if none. */
 export function prNumberFromRef(ref: string | undefined): number | undefined {
   if (!ref) return undefined;
@@ -337,7 +349,8 @@ export async function getPrTopLevelComments(
           signal,
         );
         parsed = JSON.parse(raw) as PrCommentsPage;
-      } catch {
+      } catch (err) {
+        rethrowIfAborted(err, signal);
         // Keep the pages already fetched, but flag the read as incomplete — a failed page (the exact
         // bug this fixes) still degrades to a short list rather than one silently mistaken for the
         // PR's whole comment history.
@@ -381,7 +394,8 @@ export async function getPrTopLevelComments(
       }
       cursor = page.pageInfo.endCursor;
     }
-  } catch {
+  } catch (err) {
+    rethrowIfAborted(err, signal);
     return { comments: [], commentsComplete: false };
   }
 
@@ -471,7 +485,8 @@ export async function getPrReviews(
           signal,
         );
         parsed = JSON.parse(raw) as PrReviewsPage;
-      } catch {
+      } catch (err) {
+        rethrowIfAborted(err, signal);
         complete = false;
         break;
       }
@@ -500,7 +515,8 @@ export async function getPrReviews(
       }
       cursor = page.pageInfo.endCursor;
     }
-  } catch {
+  } catch (err) {
+    rethrowIfAborted(err, signal);
     return { reviews: [], reviewsComplete: false };
   }
 
@@ -597,7 +613,8 @@ async function getPrCheckRollup(
           signal,
         );
         parsed = JSON.parse(raw) as PrCheckRollupPage;
-      } catch {
+      } catch (err) {
+        rethrowIfAborted(err, signal);
         complete = false;
         break;
       }
@@ -648,7 +665,8 @@ async function getPrCheckRollup(
       }
       cursor = page.pageInfo.endCursor;
     }
-  } catch {
+  } catch (err) {
+    rethrowIfAborted(err, signal);
     return { rollup: [], rollupComplete: false };
   }
   return { rollup: allNodes, rollupComplete: complete };
@@ -796,7 +814,8 @@ async function getReviewThreads(
           signal,
         );
         parsed = JSON.parse(raw) as ReviewThreadsPage;
-      } catch {
+      } catch (err) {
+        rethrowIfAborted(err, signal);
         // Keep the pages already fetched, but flag the read as incomplete — a failed first page
         // still degrades to an empty, incomplete list.
         complete = false;
@@ -901,7 +920,8 @@ async function getReviewThreads(
       }
       cursor = page.pageInfo.endCursor;
     }
-  } catch {
+  } catch (err) {
+    rethrowIfAborted(err, signal);
     return { threads: [], threadsComplete: false };
   }
 

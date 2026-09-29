@@ -151,7 +151,17 @@ if(a[0]==='pr'&&a[1]==='comment'){
   process.exit(0);
 }
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
-if(a[0]==='api'&&a[1]==='graphql'){console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){
+  const q=a.find(x=>x.startsWith('query='))||'';
+  const empty={pageInfo:{hasNextPage:false,endCursor:null},nodes:[]};
+  let pullRequest={};
+  if(q.includes('reviewThreads(')) pullRequest={reviewThreads:empty};
+  else if(q.includes('comments(first:100')) pullRequest={comments:empty};
+  else if(q.includes('reviews(first:100')) pullRequest={reviews:empty};
+  else if(q.includes('commits(last:1)')) pullRequest={commits:{nodes:[]}};
+  console.log(JSON.stringify({data:{repository:{pullRequest}}}));
+  process.exit(0);
+}
 process.exit(0);`,
       );
 

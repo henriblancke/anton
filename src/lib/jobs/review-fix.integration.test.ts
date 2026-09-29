@@ -840,7 +840,22 @@ if(a[0]==='api'&&a[1]==='graphql'){
     }}}}]}}}}}));
     process.exit(0);
   }
-  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));
+  const empty={pageInfo:{hasNextPage:false,endCursor:null},nodes:[]};
+  if(q.includes('comments(first:100')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{comments:empty}}}}));
+    process.exit(0);
+  }
+  if(q.includes('reviews(first:100')){
+    // No id/submittedAt fields — matches the synthetic PrReview the test builds its expected
+    // fingerprint from below (author/state/body only), so both fall back to the same "?"
+    // identity in classifyReview's review fingerprint key.
+    console.log(JSON.stringify({data:{repository:{pullRequest:{reviews:{
+      pageInfo:{hasNextPage:false,endCursor:null},
+      nodes:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}],
+    }}}}}));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:empty}}}}));
   process.exit(0);
 }
 process.exit(0);`,

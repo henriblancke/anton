@@ -225,6 +225,12 @@ process.exit(0);`,
       // the operator's commit either.
       const operatorClone = mkdtempSync(join(tmpdir(), "anton-operator-"));
       g(operatorClone, ["clone", "-q", bdRepo.bare!, "."]);
+      // A fresh clone carries no repo-local git identity (git config is per-repo, not inherited
+      // from the clone source) — a CI runner with no global user.name/email would otherwise fail
+      // the commit below with "Please tell me who you are", unlike a dev machine that usually has
+      // one set globally.
+      g(operatorClone, ["config", "user.email", "operator@example.com"]);
+      g(operatorClone, ["config", "user.name", "anton-operator"]);
       g(operatorClone, ["checkout", "-q", branch]);
       writeFileSync(join(operatorClone, "operator-change.txt"), "operator pushed directly\n");
       g(operatorClone, ["add", "-A"]);

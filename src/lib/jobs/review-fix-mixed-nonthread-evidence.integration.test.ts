@@ -137,10 +137,21 @@ if(a[0]==='api'&&a[1]==='graphql'){
     }}}}]}}}}}));
     process.exit(0);
   }
-  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[
-    {id:'RT_1',isResolved:false,isOutdated:false,path:'feature.txt',line:1,
-     comments:{nodes:[{databaseId:100,author:{login:'alice'},body:'please fix this too'}]}}
-  ]}}}}}));
+  const empty={pageInfo:{hasNextPage:false,endCursor:null},nodes:[]};
+  if(q.includes('comments(first:100')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{comments:empty}}}}));
+    process.exit(0);
+  }
+  if(q.includes('reviews(first:100')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{reviews:empty}}}}));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{
+    pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[
+      {id:'RT_1',isResolved:false,isOutdated:false,path:'feature.txt',line:1,
+       comments:{totalCount:1,nodes:[{databaseId:100,author:{login:'alice'},body:'please fix this too'}]}}
+    ]}}}}}));
   process.exit(0);
 }
 if(a.some(x=>String(x).includes('/replies'))){console.log('{}');process.exit(0);}

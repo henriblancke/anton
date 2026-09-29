@@ -47,6 +47,7 @@
  * and finalizing a merge clears `stage:in-review` so a later pass no longer treats the epic as
  * in-review (never finalized twice).
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
@@ -1930,6 +1931,8 @@ async function runFixSession(args: {
           repo,
           number,
           sentinel,
+          headSha: pr.headSha,
+          fingerprint: verdict.fingerprint,
           signal: ctx.signal,
           logPath,
         });
@@ -2768,6 +2771,23 @@ const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
   outcome === "fixed" ? "addressed in the latest push" : "left as-is";
 
 /**
+ * Stable identity for an unpushed-round notice — headSha + actionable fingerprint, the same pair
+ * `recordReviewFixAnswered`/`reviewFixPrAnsweredUnchanged` already key a round's identity on
+ * (anton-dfuvz). NOT the model-authored `reply` text: a worker crash between posting this comment
+ * and settling the job (before `recordReviewFixAnswered` or job settlement) re-runs the model on
+ * retry, which can reword `reply` for what is semantically the same round. Comparing full comment
+ * bodies would then treat that reword as a brand-new notice and repost on every crash-retry (PR
+ * #338 review, chatgpt-codex-connector).
+ */
+function unpushedSentinelMarker(headSha: string, fingerprint: readonly string[]): string {
+  const hash = createHash("sha1")
+    .update(`${headSha}|${fingerprint.join(",")}`)
+    .digest("hex")
+    .slice(0, 12);
+  return `<!-- anton:unpushed-round:${hash} -->`;
+}
+
+/**
  * Publish the {@link NON_THREAD_REPORT_ID} sentinel's explanation as a normal PR comment for an
  * unpushed round — the only case where `refreshFixRoundsBody` never runs (it returns immediately
  * when nothing pushed), so the sentinel's reply would otherwise never reach anywhere a reviewer can
@@ -2787,18 +2807,22 @@ async function publishUnpushedSentinel(args: {
   repo: string;
   number: number;
   sentinel: ThreadOutcome;
+  headSha: string;
+  fingerprint: readonly string[];
   signal: AbortSignal;
   logPath: string;
 }): Promise<boolean> {
-  const { repo, number, sentinel, signal, logPath } = args;
+  const { repo, number, sentinel, headSha, fingerprint, signal, logPath } = args;
   const note = sentinel.reply?.trim() || defaultReply(sentinel.outcome);
-  const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}`;
+  const marker = unpushedSentinelMarker(headSha, fingerprint);
+  const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}\n${marker}`;
   const existing = await getPrTopLevelComments(repo, number, signal).catch(() => ({
     comments: [],
     commentsComplete: false,
   }));
   if (!existing.commentsComplete) return false;
-  if (existing.comments.some((c) => c.body === body)) return true;
+  // Dedup on the hidden marker, not full-body equality — see `unpushedSentinelMarker`.
+  if (existing.comments.some((c) => c.body.includes(marker))) return true;
   const posted = await safe(() => commentOnPr(repo, number, body, signal));
   if (posted) {
     await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);
