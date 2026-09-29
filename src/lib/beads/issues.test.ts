@@ -427,6 +427,38 @@ describe("loadAllIssues", () => {
     expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
   });
 
+  it("rejects rather than attach cycle evidence to a board that never got the gate hydration it names (P2 badge review, PR #274, issues.ts:284)", async () => {
+    // Same gate-only cycle as the test above, but the hydration read that would bring g-1/g-2 onto
+    // `board` fails. Swallowing it the way `opts.strictGates ?? false` used to (degrading to `[]`,
+    // indistinguishable from "neither id is a gate") would still attach `cycles` to a board missing
+    // both members it names — `cycleMembers` then can't map either id and reports an unscoped,
+    // board-wide fault instead of this read simply failing closed.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? Promise.reject(new Error("bd: database is locked")) : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    await expect(loadAllIssues(REPO, { withCycles: true })).rejects.toThrow("bd: database is locked");
+  });
+
+  it("degrades to a board without cycle evidence when gate hydration fails and the caller opted into it", async () => {
+    // Same failing hydration as above, but this caller set `degradeCyclesOnFailure` — mirrors how a
+    // failed `bd dep cycles` fetch itself already degrades instead of rejecting.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? Promise.reject(new Error("bd: database is locked")) : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true, degradeCyclesOnFailure: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-3"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("bd: database is locked");
+  });
+
   it("retries when a gate-only cycle gets repaired and a different one opens between the cycles fetch and the gate hydration read (P2 review, PR #274, issues.ts:254)", async () => {
     // `dangling` stays empty (no work bead points at either gate), so the hydration read below is
     // the FIRST time `board` learns of any gate at all — a fresh `bd list --type gate` landing after

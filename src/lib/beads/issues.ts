@@ -281,7 +281,26 @@ export async function loadAllIssues(
   const knownIds = new Set(board.map((b) => b.id));
   const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
   if (missingCycleIds.length > 0) {
-    const hydratedGates = await loadGateIssues(cwd, opts.strictGates ?? false, missingCycleIds);
+    let hydratedGates: Bead[];
+    try {
+      // Strict, not `opts.strictGates` (P2 review, PR #274, issues.ts:284) — mirrors the
+      // already-fixed hydration in `attachCyclesBestEffort`/`ensureCycleEvidence`/
+      // `probeCycleEvidence` (issues.ts:823 etc). A caller that left `strictGates` unset still
+      // wants a best-effort ORDINARY board read, but a swallowed failure HERE degrades to `[]`,
+      // indistinguishable from "no matching gates" — `cycles` then gets attached to `board` missing
+      // the very members it names, and `cycleMembers` reports an unscoped, board-wide fault instead
+      // of leaving evidence unattached. Letting it throw routes the failure to the catch below,
+      // which treats it exactly like a failed `bd dep cycles` fetch.
+      hydratedGates = await loadGateIssues(cwd, true, missingCycleIds);
+    } catch (e) {
+      if (!opts.degradeCyclesOnFailure) throw e;
+      console.warn(
+        `[beads.issues] ${cwd}: gate hydration for cycle evidence failed on a re-check that opted ` +
+          `into graceful degradation — returning the board without cycle evidence rather than ` +
+          `pairing it with an incomplete one: ` + (e instanceof Error ? e.message : String(e)),
+      );
+      return board;
+    }
     // Only a hydration that actually lands new beads can have observed a newer graph than `cycles`
     // did — `missingCycleIds` naming an id that isn't a gate either (an ordinary elsewhere cycle
     // `board` was never going to carry) reads back empty and changes nothing, so paying for a cycles
