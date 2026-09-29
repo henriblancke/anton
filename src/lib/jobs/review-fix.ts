@@ -1236,16 +1236,18 @@ interface RunFixSessionResult {
  * and PR #338 review, chatgpt-codex-connector — the latter caught this check only firing when
  * `waitingIds` was empty, so a mixed round with both threads and a non-thread reason could report
  * every thread and never once be asked about the failing check/summary). Positive evidence is
- * `report` naming the {@link NON_THREAD_REPORT_ID} sentinel with a non-fabricated, non-`needs-human`
- * outcome:
+ * `report` naming the {@link NON_THREAD_REPORT_ID} sentinel with a non-fabricated outcome:
  * - same `fabricatedFix` rule `applyThreadOutcomes` applies to a real thread reply, so a claude run
  *   can't claim "fixed" on the sentinel when nothing was actually pushed (PR #338 review,
  *   chatgpt-codex-connector).
- * - `needs-human` never counts either: unlike a real thread (where a delivered "needs-human" reply
- *   actually posts to the PR, which is what makes it safe to stop re-triaging), the sentinel id
- *   matches no real GitHub thread, so `applyThreadOutcomes` skips it and nothing is ever posted
- *   anywhere a human would see it. Crediting it as evidence would silently suppress a PR that is
- *   genuinely waiting on a person's decision, forever (PR #338 review, chatgpt-codex-connector).
+ * - a `needs-human` sentinel counts the same as `left`: the sentinel id matches no real GitHub
+ *   thread, so `applyThreadOutcomes` never posts it — but the unpushed caller in `runFixSession`
+ *   publishes it as a top-level PR comment via `publishUnpushedSentinel` and ANDs that publish's
+ *   own success into its `answeredAllThreads` result. This function only ever sees the sentinel
+ *   after it was already asked for, so treating its mere presence as real evidence relies on that
+ *   caller-side gate, not a second one here (PR #338 review, chatgpt-codex-connector: publication
+ *   succeeding while this function still hard-rejected `needs-human` meant the request was visible
+ *   on the PR yet every sweep kept dispatching a fresh session against it anyway).
  */
 export function allWaitingThreadsAnswered(
   waitingIds: ReadonlySet<string>,
@@ -1256,7 +1258,7 @@ export function allWaitingThreadsAnswered(
 ): boolean {
   if (hasNonThreadReasons) {
     const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
-    if (!sentinel || sentinel.outcome === "needs-human" || fabricatedFix(sentinel, pushed)) return false;
+    if (!sentinel || fabricatedFix(sentinel, pushed)) return false;
   }
   for (const id of waitingIds) {
     if (!answeredIds.has(id)) return false;
@@ -1658,10 +1660,12 @@ async function runFixSession(args: {
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
       // `refreshFixRoundsBody` above returned immediately for an unpushed round — its explanation
-      // never reached the PR body. Without publishing it here, a "left" sentinel that
-      // `allWaitingThreadsAnswered` is about to accept as answered (below) would suppress this
+      // never reached the PR body. Without publishing it here, a "left" or "needs-human" sentinel
+      // that `allWaitingThreadsAnswered` is about to accept as answered (below) would suppress this
       // fingerprint+headSha forever while the reviewer never learns why nothing changed (PR #338
-      // review, @chatgpt-codex-connector).
+      // review, @chatgpt-codex-connector) — and for "needs-human" specifically, treat a successful
+      // publish as the round's answer rather than forcing a retry every sweep even though the human
+      // request is already visible on the PR (PR #338 review, chatgpt-codex-connector).
       const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
       // Defaults to true: when there's no sentinel to publish (or it's fabricated),
       // `allWaitingThreadsAnswered` below already rejects it on its own — this flag only needs to

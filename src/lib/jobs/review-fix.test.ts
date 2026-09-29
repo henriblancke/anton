@@ -1616,15 +1616,17 @@ describe("allWaitingThreadsAnswered", () => {
     expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, false)).toBe(false);
   });
 
-  it("rejects a 'needs-human' sentinel — nothing ever posts it anywhere a human would see it", () => {
+  it("accepts a 'needs-human' sentinel as real evidence for a non-thread reason", () => {
+    // Publication (`publishUnpushedSentinel`) is the caller's own gate, ANDed into
+    // `answeredAllThreads` alongside this function's result (PR #338 review, chatgpt-codex-
+    // connector) — from this function's own perspective, a real (non-fabricated) sentinel counts
+    // the same regardless of outcome, same as "left" above.
     const report: ThreadOutcome[] = [
       { id: NON_THREAD_REPORT_ID, outcome: "needs-human", reply: "needs a product call" },
     ];
-    // Even with a push, and even with every real thread answered, a needs-human sentinel must never
-    // count as evidence the non-thread reason was actually handled.
-    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(false);
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(true);
     expect(allWaitingThreadsAnswered(new Set(["RT_1"]), new Set(["RT_1"]), report, true, true)).toBe(
-      false,
+      true,
     );
   });
 
