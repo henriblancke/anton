@@ -385,6 +385,14 @@ const orderTickets = (tickets) => {
 // real run still holds it behind B. Filter abandoned (any status) only when printing, so what's
 // shown matches dispatch without needing an abandoned ticket to ever be reported as itself runnable.
 const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");
+// Mirrors beads.supersededBy (bd.ts): closed, with a `supersedes` edge pointing at the survivor
+// that replaced it. The real dispatch loop (execute-epic-dispatch.ts partitionTickets) checks this
+// and, in the normal no-delivery case, records the retirement and skips the ticket without
+// dispatching it — so a superseded ticket left in here would print as a numbered dispatch step the
+// executor never actually runs.
+const isSuperseded = (b) =>
+  b.status === "closed" &&
+  (b.dependencies ?? []).some((d) => d.type === "supersedes" && d.issue_id === b.id && d.depends_on_id);
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
   // A feature with no children doesn't group them (beads.groupsChildren) — the runtime reads it as
@@ -394,7 +402,7 @@ for (const feature of all.filter((b) => b.issue_type === "feature")) {
   const children = runTickets(feature.id);
   const ordered = orderTickets(children.length > 0 ? children : [feature]);
   const held = heldIds(feature, ordered.filter((t) => t.status !== "closed"));
-  const tickets = ordered.filter((t) => !isAbandoned(t));
+  const tickets = ordered.filter((t) => !isAbandoned(t) && !isSuperseded(t));
   const dispatchable = tickets.filter((t) => !held.has(t.id));
   for (const [index, ticket] of dispatchable.entries())
     console.log(`  ${index + 1}. ${ticket.id}\t${ticket.title}`);

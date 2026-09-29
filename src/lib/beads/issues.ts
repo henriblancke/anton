@@ -1183,6 +1183,7 @@ export async function ensureCycleEvidence(
 export async function allIssues(
   cwd: string,
   opts?: SnapshotReadOptions & { withCycles?: boolean },
+  attempt = 0,
 ): Promise<Bead[]> {
   // Read via `readIssueSnapshot`, not `getIssueSnapshot`, so the generation passed to
   // `attachCyclesBestEffort` below is the one this exact `board` array was returned with, not a
@@ -1195,6 +1196,25 @@ export async function allIssues(
   // content never moves keeps a long-expired verdict until some unrelated poll happens to refresh it.
   if (opts?.withCycles && cycleEvidenceMissingOrStale(board)) {
     await attachCyclesBestEffort(cwd, board, generation);
+    // A generation mismatch here means the snapshot was replaced while `attachCyclesBestEffort` was
+    // mid-fetch: it correctly declines to attach anything in that case, but `board` is still the
+    // RETIRED array with its expired sidecar intact — `cycleEvidenceFor` can't tell that apart from
+    // fresh evidence, so a caller (e.g. the settings page) would treat stale cycle/eligibility state
+    // as authoritative. Retry against the current snapshot, mirroring `readAllIssues`'s identical
+    // retry (issues.ts:1242), bounded by the same `MAX_ENRICHMENT_RETRIES`.
+    if (issueSnapshotGeneration(cwd) !== generation) {
+      if (attempt < MAX_ENRICHMENT_RETRIES) {
+        return allIssues(cwd, opts, attempt + 1);
+      }
+      // Retry budget exhausted and the graph is still moving: this path is best-effort by contract
+      // (see `attachCyclesBestEffort`'s doc) and must not fail a bead read that would otherwise
+      // succeed, so fail closed on the sidecar instead of throwing. Every `cycleEvidenceFor` consumer
+      // already treats `undefined` as "unavailable" and degrades safely on it.
+      if (cycleEvidenceFor(board) !== undefined) {
+        clearCycleEvidence(board);
+        markCycleEvidenceUnavailable(cwd);
+      }
+    }
   }
   return board;
 }

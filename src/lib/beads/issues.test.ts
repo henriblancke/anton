@@ -857,12 +857,53 @@ describe("loadAllIssues", () => {
     const [boardA, boardB] = await Promise.all([readerA, readerB]);
 
     // Reader A's board predates the move: the generation guard refuses to stamp the stale-graph
-    // result onto it, so it stays without evidence rather than report a cycle the current graph no
-    // longer necessarily has.
-    expect(cycleEvidenceFor(boardA)).toBeUndefined();
-    // Reader B's board is the current one and gets its own, fresh evidence.
+    // result onto it. Rather than hand back that retired array with no evidence (or, worse, a stale
+    // sidecar left over from an earlier call), `allIssues` retries against the CURRENT snapshot —
+    // mirroring `readAllIssues` — so both readers converge on the same current board and evidence.
+    expect(boardA.map((b) => b.id)).toEqual(["t-2"]);
+    expect(cycleEvidenceFor(boardA)).toEqual([]);
     expect(boardB.map((b) => b.id)).toEqual(["t-2"]);
     expect(cycleEvidenceFor(boardB)).toEqual([]);
+  });
+
+  it("does not serve a warm board's stale sidecar when a refresh's content move stops the enrichment mid-fetch (P2 review, PR #274)", async () => {
+    // Unlike the "does not reuse a cycles fetch" test above, this board comes in with EXPIRED
+    // evidence already attached (not merely missing) — the reviewer's exact scenario: a warm
+    // snapshot whose TTL refresh discovers changed content while `attachCyclesBestEffort` is
+    // awaiting its own fetch. `board` is the same retained array before and after the move, so a
+    // decline that leaves it untouched would hand back the OLD, now-provably-stale sidecar as if it
+    // were still trustworthy.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const warm = await allIssues(REPO, { withCycles: true });
+    expect(cycleEvidenceFor(warm)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      let resolveCycles!: (v: unknown) => void;
+      cyclesMock.mockImplementationOnce(() => new Promise((resolve) => { resolveCycles = resolve; }));
+
+      const reader = allIssues(REPO, { withCycles: true });
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+
+      // The board moves while that refresh is still in flight — the race the generation guard
+      // exists to catch.
+      listMock.mockResolvedValue([{ ...target, id: "t-2", dependencies: [] }]);
+      await refreshIssueSnapshot(REPO, async () => [{ ...target, id: "t-2", dependencies: [] }]);
+      cyclesMock.mockResolvedValueOnce([]); // for the retry against the moved snapshot
+
+      resolveCycles([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+      const board = await reader;
+
+      // Must reflect the current board with its own fresh evidence — never the retired array's
+      // expired sidecar, which would read to a caller (e.g. the settings page) as authoritative.
+      expect(board.map((b) => b.id)).toEqual(["t-2"]);
+      expect(cycleEvidenceFor(board)).toEqual([]);
+    } finally {
+      dateSpy.mockRestore();
+    }
   });
 
   it("retries readAllIssues rather than pair a pre-move board with the post-move version (PR #274 review)", async () => {
