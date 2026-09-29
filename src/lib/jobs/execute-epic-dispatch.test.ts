@@ -974,4 +974,30 @@ describe("the cross-machine reopen of a closed child", () => {
     );
     expect(reopenMock).not.toHaveBeenCalled();
   });
+
+  // The opposite source order (P2 review, PR #274 round 2): the closed member comes FIRST, so
+  // `onBranch` is still empty when it is evaluated — the dependent hasn't run yet either. That is
+  // not evidence the order is safe; it is the other half of the same unresolved cycle, and letting
+  // this one through would reopen and regenerate `anton-a` ahead of `anton-b`, the prerequisite
+  // `anton-a`'s OWN edge names, then run `anton-b` after it — violating the cycle's other edge.
+  it("fails loud instead of reopening a closed child ahead of its own unresolved prerequisite", async () => {
+    const dependent = bead("anton-b", {
+      dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+    } as Partial<Bead>);
+    const child = closedChild("anton-a") as Bead;
+    (child as unknown as { dependencies: unknown[] }).dependencies = [
+      { issue_id: "anton-a", depends_on_id: "anton-b", type: "blocks" },
+    ];
+    showMock.mockResolvedValue(child);
+
+    // Source order — the cycle's fallback — puts the closed child FIRST, ahead of the dependent it
+    // is itself waiting on.
+    const run = makeRun([child, dependent], new AbortController().signal);
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a must be regenerated.*regenerating it now would run it ahead of anton-b, its own `blocks` prerequisite/,
+    );
+    expect(reopenMock).not.toHaveBeenCalled();
+  });
 });
