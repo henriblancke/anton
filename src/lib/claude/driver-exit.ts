@@ -93,10 +93,13 @@ const TRANSIENT_RESULT_RE =
  * verbatim for both the gateway-billing and rate-limit envelopes) — a shape a model narrating its
  * own failure would not organically type, unlike the generic prose `TRANSIENT_STDERR_RE` also
  * matches ("internal server error", a bare "500", "overloaded", …). `isRecoverableClaudeText`'s
- * legacy fallback trusts only this narrower shape against the merged `claude exited with code N:
- * <detail>` envelope, since `detail` there can be the model-authored result text.
+ * legacy fallback trusts only this narrower shape, and only when it OPENS the surfaced detail
+ * (never a quoted occurrence deeper in the string): the merged `claude exited with code N: <detail>`
+ * envelope's `detail` can be the model's own freeform result text, and a deterministic failure that
+ * merely narrates or quotes "API Error: 503" mid-sentence (e.g. describing a test fixture) must not
+ * be misread as Claude Code's own diagnostic (review finding on PR #339).
  */
-const TRANSIENT_STDERR_ENVELOPE_RE = /\bAPI Error:\s*\d{3}\b/i;
+const TRANSIENT_STDERR_ENVELOPE_RE = /^API Error:\s*\d{3}\b/i;
 
 /**
  * Coarsely categorize a transient failure so the runner can refuse to resume twice on the SAME
@@ -156,17 +159,21 @@ function signatureOf(raw: string): string {
  *     model-authored text, since `detail` may in fact be the model's own result summary.
  *   - `TRANSIENT_STDERR_ENVELOPE_RE` — Claude Code's own `API Error: <status>` diagnostic prefix,
  *     not wording a model would organically type while narrating a failure, so it stays safe to
- *     trust even unanchored in the merged message.
+ *     trust — but only when it opens the surfaced `detail`, never a quoted occurrence deeper in
+ *     the agent's own prose (review finding on PR #339): checked against `detail` alone, not the
+ *     merged message, so an anchored `^` actually means "starts the detail."
  */
 export function isRecoverableClaudeText(message: string): boolean {
   if (/^claude exited without a result event\b/.test(message)) return true;
   if (/^claude produced no output for .*killed as stalled\b/i.test(message)) return true;
   if (/^claude reported a transient error result\b/i.test(message)) return true;
-  if (!/^claude exited with code (?:\d+|null): /.test(message)) return false;
+  const prefixMatch = message.match(/^claude exited with code (?:\d+|null): /);
+  if (!prefixMatch) return false;
+  const detail = message.slice(prefixMatch[0].length);
   return (
     /\(transient: [^)]+\)$/.test(message) ||
     TRANSIENT_RESULT_RE.test(message) ||
-    TRANSIENT_STDERR_ENVELOPE_RE.test(message)
+    TRANSIENT_STDERR_ENVELOPE_RE.test(detail)
   );
 }
 

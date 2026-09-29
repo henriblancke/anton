@@ -32,6 +32,22 @@ const QUOTA_PARK_PREFIX = "usage-limit";
  */
 const BOARD_UNREACHABLE_PARK_PREFIX = "board-unreachable";
 
+/**
+ * The park reason `execute-epic-settle.ts` writes verbatim when this run's lease was lost to
+ * another machine already executing the same target (anton-jz1, `isRunAlreadyLiveError`) — a
+ * duplicate-lease race, not a failure: the other run is the one doing the work, and this row just
+ * yielded to it. Filtered out of {@link runsByCause} entirely (review finding on PR #339) rather
+ * than left to fall into `unknown`, so a race that resolves itself on its own never shows up in a
+ * cause breakdown meant to point at what to fix.
+ *
+ * `BlockedTailError`/`ReviewBlockedError` parks (a held-ticket tail, a blocked review) are the same
+ * kind of non-failure wait, but unlike this marker their messages carry no stable, greppable prefix
+ * — they're the operator-facing instructions themselves, built fresh per run — so there is nothing
+ * here to anchor a filter on without also changing what `execute-epic-settle.ts` writes. Left as
+ * `unknown` until that write-side change lands.
+ */
+const RUN_LIVE_ELSEWHERE_PARK_PREFIX = "run-live-elsewhere";
+
 const SETTLED_STATUSES = ["failed", "parked"] as const;
 
 export interface RunCause {
@@ -95,6 +111,7 @@ export async function runsByCause(
     const settledAt = toEpoch(row.endedAt) ?? toEpoch(row.updatedAt);
     if (settledAt === undefined) continue;
     if (sinceEpoch !== undefined && settledAt < sinceEpoch) continue;
+    if (row.status === "parked" && row.error?.startsWith(RUN_LIVE_ELSEWHERE_PARK_PREFIX)) continue;
     out.push({
       runId: row.id,
       cause: causeOf(row.status as (typeof SETTLED_STATUSES)[number], row.error),

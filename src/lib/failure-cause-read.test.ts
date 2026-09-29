@@ -140,6 +140,27 @@ describe("runsByCause", () => {
     expect(byId.get("board-park")).not.toBe("unknown");
   });
 
+  it("excludes a run-live-elsewhere park entirely — a duplicate lease, not a failure (review finding)", async () => {
+    await seed({
+      id: "live-elsewhere",
+      status: "parked",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      // The literal marker `execute-epic-settle.ts` writes when this run's lease was lost to
+      // another machine already running the same target.
+      error: "run-live-elsewhere",
+    });
+    await seed({
+      id: "live-elsewhere-orphan",
+      status: "parked",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      error: "run-live-elsewhere (orphan PR anton/anton-abc found on GitHub)",
+    });
+
+    expect(await runsByCause(t.db, PROJECT, undefined)).toEqual([]);
+  });
+
   it("places an old row with no endedAt using updatedAt", async () => {
     await seed({ id: "legacy", status: "failed", updatedAt: SETTLED, error: "gate failed" });
 

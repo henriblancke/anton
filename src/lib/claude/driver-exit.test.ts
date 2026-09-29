@@ -276,6 +276,14 @@ describe("exitError", () => {
     expect(isRecoverableClaudeText(message)).toBe(true);
   });
 
+  it("does not treat an unanchored quote of the API-error envelope in agent prose as recoverable (review finding)", () => {
+    // The agent's own result text merely quotes Claude Code's `API Error: <status>` envelope while
+    // narrating a real, deterministic failure (e.g. describing a test fixture) — it must OPEN the
+    // surfaced detail to count as Claude Code's own diagnostic, not just appear somewhere in it.
+    const message = "claude exited with code 1: the API Error: 503 fixture still fails";
+    expect(isRecoverableClaudeText(message)).toBe(false);
+  });
+
   it("recognizes a tagged signal-exit message even though its code is null, not a digit (anton-r0tb follow-up)", () => {
     // A signal kill leaves `exit.code` null (ClaudeExit.code is nullable, driver.ts passes the
     // nullable `close` code straight through), so `exitCodeError` can build
