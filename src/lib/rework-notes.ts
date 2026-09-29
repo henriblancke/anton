@@ -12,6 +12,7 @@ import {
   ACCEPTANCE_HEADING,
   ACCEPTANCE_KEYS,
   CONTEXT_KEYS,
+  GOAL_KEYS,
   isTicketContractHeading,
 } from "./beads/contract";
 import {
@@ -99,6 +100,11 @@ export interface FollowUpContractArgs {
   targetId: string;
   parentId?: string;
   pipeline?: ReworkPipeline;
+  /** The run target's own `outcome:<id>` label(s) ({@link labelValuesOf}, lib/rework-modes.ts) —
+   * a scan-produced target can carry more than one (skills/scan-triage/SKILL.md), so this is every
+   * value, not just the first. Empty for a target that predates outcome ids, same upgrade gap
+   * {@link outcomesConfigured} exempts. */
+  outcomeIds?: string[];
 }
 
 /**
@@ -112,10 +118,13 @@ export interface FollowUpContractArgs {
  * request in the founder's own words and order; this section is what "done" means, box by box.
  */
 export function followUpDescription(args: FollowUpContractArgs): string {
-  const { summary, instructions, findings, ticket, targetId, parentId, pipeline } = args;
+  const { summary, instructions, findings, ticket, targetId, parentId, pipeline, outcomeIds } = args;
   return [
     `## Goal`,
     goalBody(summary),
+    ``,
+    `## Why`,
+    followUpWhy(ticket, outcomeIds ?? []),
     ``,
     `## ${ACCEPTANCE_HEADING}`,
     ...followUpAcceptance(instructions, findings),
@@ -137,13 +146,17 @@ export function followUpDescription(args: FollowUpContractArgs): string {
 /**
  * A half-created follow-up's description, brought in line with the request finishing it
  * (lib/rework-modes.ts). Only what the request DECIDES is touched: the Acceptance section, derived
- * from its instructions and findings, and the Context line saying where the bead runs. Everything
- * else stays as written. The bead matched on title and edge alone, so it may be one a founder made
- * by hand, or a remnant whose Context, Out of scope or Verify they have edited since — and
- * regenerating the whole contract to refresh the boxes would silently discard that authorship.
+ * from its instructions and findings, the Context line saying where the bead runs, and a `## Why`
+ * that is missing outright. Everything else stays as written. The bead matched on title and edge
+ * alone, so it may be one a founder made by hand, or a remnant whose Context, Out of scope or
+ * Verify they have edited since — and regenerating the whole contract to refresh the boxes would
+ * silently discard that authorship.
  *
  * A description with no Acceptance section gets the request's appended, since a bead without one is
- * refused at approval; a blank one gets the whole contract, there being nothing to keep.
+ * refused at approval; a blank one gets the whole contract, there being nothing to keep. `## Why` is
+ * inserted the same way when the section is absent entirely ({@link ensureWhy}) — this is the last
+ * pass that ever looks at a half-created follow-up before the note that finishes it, so a Why
+ * missing now stays missing for good.
  */
 export function reconcileFollowUpDescription(
   current: string | undefined,
@@ -154,8 +167,67 @@ export function reconcileFollowUpDescription(
     current,
     followUpAcceptance(args.instructions, args.findings),
   );
-  return replaceRunsUnder(withAcceptance, args.targetId, args.parentId);
+  const withWhy = ensureWhy(withAcceptance, args.ticket, args.outcomeIds ?? []);
+  return replaceRunsUnder(withWhy, args.targetId, args.parentId);
 }
+
+/**
+ * Add a missing `## Why` to a follow-up that isn't half-created — a legacy bead finished before
+ * Why became part of the contract, detached after its target merges ({@link resumeFollowUp} in
+ * rework-modes.ts). That path only reads {@link ensureWhy} through
+ * {@link reconcileFollowUpDescription}, which `resumeFollowUp` calls solely on the `match.partial`
+ * branch; an already-completed follow-up never takes it, so it would otherwise stand approved
+ * without Why forever (the contract gate doesn't validate that section — skills/bd/SKILL.md).
+ * Never touches Acceptance or the run-location line: unlike a half-created bead, a completed one's
+ * acceptance already reflects a shipped request and is not this pass's to rewrite.
+ */
+export function reconcileFollowUpWhy(description: string, ticket: Bead, outcomeIds: string[]): string {
+  return ensureWhy(description, ticket, outcomeIds);
+}
+
+/**
+ * Insert a `## Why` section when the half-created bead has none at all — a remnant that predates
+ * this requirement, or one a founder made by hand without it ({@link reconcileFollowUpDescription}).
+ * Landed right after `## Goal`, the contract's own order (skills/bd/SKILL.md: Goal, Why, Acceptance,
+ * Context, Out of scope, Verify) — appending it after Verify instead would leave a normal five-section
+ * bead reading Goal → Acceptance → Context → Out of scope → Verify → Why, an order the founder never
+ * wrote and no later pass straightens out, since the contract judge doesn't score Why's position and
+ * nothing else here ever revisits a bead once it has one.
+ *
+ * A description with no Goal section at all (a remnant even more stripped-down than the usual
+ * half-created follow-up) falls back to appending after everything else, closing any fence or HTML
+ * comment the description ends inside ({@link unterminatedCloser}) exactly as {@link replaceAcceptance}'s
+ * own no-section fallback does.
+ *
+ * Never touches a Why that IS there, authored or still a placeholder — only the founder should
+ * rewrite their own words, and unlike Acceptance and the run-location line, `## Why` is not a
+ * section this reconcile owns the content of.
+ */
+function ensureWhy(description: string, ticket: Bead, outcomeIds: string[]): string {
+  const lines = scanMarkdown(description);
+  // Only a top-level `## Why` satisfies the contract — a nested `### Why` under Goal or Context
+  // (a legacy follow-up's unrelated sub-heading) must not be mistaken for it, or this silently
+  // suppresses the repair a run target actually needs.
+  const hasWhy = sectionsNamed(lines, WHY_KEYS).some(({ start }) => lines[start]!.heading!.depth === 2);
+  if (hasWhy) return description;
+  const whyLines = [`## Why`, followUpWhy(ticket, outcomeIds)];
+  const [goalSection] = sectionsNamed(lines, GOAL_KEYS);
+  if (goalSection) {
+    const texts = lines.map((line) => line.text);
+    const before = withoutTrailingBlank(texts.slice(0, goalSection.end));
+    let after = texts.slice(goalSection.end);
+    while (after.length > 0 && after[0]!.trim() === "") after = after.slice(1);
+    return [...before, ``, ...whyLines, ``, ...after].join("\n");
+  }
+  const kept = description.trimEnd();
+  const closer = unterminatedCloser(kept);
+  return [kept, ...(closer ? [closer] : []), ``, ...whyLines].join("\n");
+}
+
+/** Named apart from {@link CONTEXT_KEYS} and its kind (beads/contract.ts) because `## Why` is not
+ * one of the ticket tier's judged contract sections there — {@link ensureWhy} still needs to find
+ * it by the same heading-scanning `sectionsNamed` every other reconcile here uses. */
+const WHY_KEYS = ["why"];
 
 /**
  * The Acceptance section's body swapped for `boxes`, bounded exactly as the contract judge bounds it
@@ -597,6 +669,26 @@ function goalBody(summary: string): string {
     isHeading(text) ||
     THEMATIC_BREAK.test(text);
   return block ? `\\${text}` : text;
+}
+
+/**
+ * Which outcome the follow-up serves, and how — the `## Why` every ticket's contract requires
+ * (src/prompts/BEADS.md). A follow-up doesn't ask the founder this the way a fresh draft does
+ * ({@link FeatureDraft.why}, lib/backlog.ts) — it continues work the outcome was already decided
+ * for, so it inherits the run target's own answer rather than asking again.
+ *
+ * `outcomeIds` is empty for a target that predates outcome ids — the same upgrade gap
+ * {@link outcomesConfigured} exempts a fresh draft from (lib/outcomes.ts). Nothing to carry over
+ * there, so the sentence names the origin ticket instead of a label that doesn't exist yet. A
+ * scan-produced target can name more than one outcome (skills/scan-triage/SKILL.md); every one is
+ * named here, not just the first, since dropping one would misreport what this bead carries over.
+ */
+function followUpWhy(ticket: Bead, outcomeIds: string[]): string {
+  return outcomeIds.length > 0
+    ? `Serves ${outcomeIds.map((id) => `outcome:${id}`).join(", ")}, the same outcome${outcomeIds.length > 1 ? "s" : ""} ` +
+        `${ticket.id} served — this bead carries the next iteration its self-review prompted.`
+    : `Continues the outcome ${ticket.id} served; that ticket predates \`.product/PRODUCT.md\`'s ` +
+        `outcome ids, so none carries over as a label here either.`;
 }
 
 /** Why this bead exists — and, for a REDIRECTED send-back, why it exists here rather than on the original. */

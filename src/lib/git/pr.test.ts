@@ -35,6 +35,7 @@ function pr(overrides: Partial<PrReview> = {}): PrReview {
     failingChecks: [],
     pendingChecks: 0,
     threads: [],
+    threadsComplete: true,
     ...overrides,
   };
 }
@@ -179,12 +180,12 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   if (!hasCursor) {
     process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
-      nodes: [{ id: 'RT_1', isResolved: true, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'bot' }, body: 'old, resolved' }] } }],
+      nodes: [{ id: 'RT_1', isResolved: true, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'bot' }, body: 'old, resolved' }] } }],
     } } } } }));
   } else {
     process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       pageInfo: { hasNextPage: false, endCursor: null },
-      nodes: [{ id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { nodes: [{ databaseId: 2, author: { login: 'alice' }, body: 'please fix' }] } }],
+      nodes: [{ id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'alice' }, body: 'please fix' }] } }],
     } } } } }));
   }
   process.exit(0);
@@ -216,6 +217,243 @@ process.exit(0);
     // The unresolved thread lived on page 2 — proving it actually reached the classifier is the
     // whole point: a truncated fetch would report this PR clean.
     expect(classifyReview(review).actionable).toBe(true);
+    expect(review.threadsComplete).toBe(true);
+  });
+
+  it("excludes a thread whose own comments connection is truncated, but keeps a healthy sibling", async () => {
+    // RT_1 reports totalCount above what comments(first:50) actually returned — a >50-comment
+    // back-and-forth. Its last *fetched* comment is not its true latest, so classifyReview/
+    // threadsNeedingAttention/applyThreadOutcomes must never see it as up to date: it is dropped
+    // from the returned list entirely rather than kept with stale content (PR #335 review). RT_2
+    // is unaffected — page-level truncation of one thread must not cost every other thread on the
+    // same page.
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 63, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'also fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review follow-up: a comment node without a numeric `databaseId` (e.g. a pending/draft
+  // review comment) passes the totalCount === nodes.length check below, so the array-level
+  // validation reported the read complete — but the mapping's `.filter((c) => typeof c?.databaseId
+  // === "number")` silently drops that node afterward, leaving a thread whose "true latest" comment
+  // vanished while `threadsComplete` still read true. Catch it at validation time instead.
+  it("marks the read incomplete when a comment node lacks a numeric databaseId, even though totalCount matches", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: null, author: { login: 'alice' }, body: 'please fix' }] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'also fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review (src/lib/git/pr.ts:339): a thread node with a missing/null `id` can't be
+  // tracked in truncatedThreadIds, so the final filter drops it silently — without flagging the
+  // read incomplete, threadsComplete could stay true while a real thread vanished from the result.
+  it("marks the read incomplete when a thread node has a missing or null id", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: null, isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'also fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review (src/lib/git/pr.ts:339): a thread missing its `comments` connection (or
+  // `totalCount`) entirely was flagged incomplete but kept, mapping to `comments: []` — so
+  // threadsNeedingAttention saw an actionable thread with no anchor comment a triage outcome
+  // could ever attach to. Drop it like the other malformed-comments cases.
+  it("drops a thread whose comments connection is missing entirely, and marks the read incomplete", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: null }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads).toEqual([]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review (src/lib/git/pr.ts:346): a thread reporting `comments: { totalCount: 0, nodes:
+  // null }` used to compare 0 > (null?.length ?? 0) and read as a genuinely empty, complete
+  // history — persisting an unreplyable, unattributable thread as actionable. A non-array truthy
+  // `nodes` must also never reach `.filter()` downstream.
+  it("drops a thread whose comments.nodes is null even when totalCount is 0", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 0, nodes: null } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review (src/lib/git/pr.ts:355): a well-formed `comments: { totalCount: 0, nodes: [] }`
+  // passed every earlier malformed check (comments present, totalCount a number, nodes an array,
+  // totalCount not above nodes.length) and was kept as a genuinely comment-free, complete thread.
+  // threadsNeedingAttention then read its missing last comment as "never replied to" and
+  // dispatched it every sweep, while triageOutcomes could never report an outcome for it (no
+  // comments[0] to anchor on) — a thread always has at least one anchor comment, so totalCount: 0
+  // is malformed too and must be dropped like the other cases.
+  it("drops a thread whose comments connection reports totalCount 0 with an empty nodes array", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [
+      { id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 0, nodes: [] } },
+      { id: 'RT_2', isResolved: false, isOutdated: false, path: 'b.ts', line: 5, comments: { totalCount: 1, nodes: [{ databaseId: 2, author: { login: 'bob' }, body: 'fix this' }] } },
+    ],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_2"]);
+    expect(review.threadsComplete).toBe(false);
   });
 
   it("preserves already-fetched pages when a later page fails", async () => {
@@ -240,7 +478,7 @@ if (a[0] === 'api' && a[1] === 'graphql') {
   if (!hasCursor) {
     process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
       pageInfo: { hasNextPage: true, endCursor: 'PAGE2' },
-      nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+      nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
     } } } } }));
     process.exit(0);
   }
@@ -255,5 +493,135 @@ process.exit(0);
     const review = await getPrReview(sandbox, 7);
     expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
     expect(classifyReview(review).actionable).toBe(true);
+    // The fetch never reached page 2 — a caller persisting counts from this must not read them as
+    // the PR's whole thread history (PR #335 review).
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  it("marks the read incomplete outright when the GraphQL call fails before any page lands", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') { process.stderr.write('boom'); process.exit(1); }
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads).toEqual([]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  it("marks the read incomplete when a page reports reviewThreads with no pageInfo at all", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    // The node already fetched survives, but pagination could not even be checked — must not be
+    // persisted as a complete thread history.
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  it("marks the read incomplete when hasNextPage is true but endCursor is missing", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: true, endCursor: null },
+    nodes: [{ id: 'RT_1', isResolved: false, isOutdated: false, path: 'a.ts', line: 1, comments: { totalCount: 1, nodes: [{ databaseId: 1, author: { login: 'alice' }, body: 'please fix' }] } }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    // Can't continue pagination without a cursor, so the fetched page isn't the full picture.
+    expect(review.threads.map((t) => t.id)).toEqual(["RT_1"]);
+    expect(review.threadsComplete).toBe(false);
+  });
+
+  // PR #335 review (src/lib/git/pr.ts:313): a page with reviewThreads and pageInfo but a missing or
+  // null `nodes` used to fall through `page.nodes ?? []` as an empty page while `complete` stayed
+  // true — persisting an authoritative zero thread count for a page GitHub never actually returned.
+  it("marks the read incomplete when a page reports reviewThreads with nodes missing", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: null,
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.threads).toEqual([]);
+    expect(review.threadsComplete).toBe(false);
   });
 });

@@ -255,12 +255,34 @@ describe("toClaudeResult", () => {
       durationApiMs: undefined,
       text: "done",
       isError: false,
+      // A session that armed no wake-up on its last message yields nothing (anton-wjfkn) — the
+      // ordinary case, and the one the ticket walk reads as "this agent finished its turn".
+      pendingYields: [],
     });
 
     expect(toClaudeResult(stream({ resultRaw: { type: "result", num_turns: "3" } }))).toMatchObject({
       numTurns: undefined,
       costUsd: undefined,
     });
+  });
+
+  /**
+   * anton-wjfkn: a session that armed a wake-up on its final message ended its turn rather than its
+   * work. The exit is 0 and the agent typically emits no `ANTON-RESULT`, so the stream is the only
+   * place that intent survives — and the ticket walk settles on this result, so it has to carry it.
+   */
+  it("carries the yield-shaped tools the last assistant message armed", () => {
+    const result = toClaudeResult(
+      stream({
+        resultRaw: { type: "result", is_error: false, result: "back in 20 minutes" },
+        pendingYields: ["Bash (run_in_background)", "ScheduleWakeup"],
+      }),
+    );
+
+    expect(result.pendingYields).toEqual(["Bash (run_in_background)", "ScheduleWakeup"]);
+    // Still a nominally successful run: the misreading this closes is precisely that `ok` and the
+    // exit code say nothing about whether the agent was finished.
+    expect(result.ok).toBe(true);
   });
 
   it("carries the per-model usage and the durations the result reported (anton-77l9)", () => {
@@ -298,6 +320,15 @@ describe("toClaudeResult", () => {
     expect(
       toClaudeResult(stream({ resultRaw: { type: "result", duration_ms: "9s" } })).durationMs,
     ).toBeUndefined();
+  });
+
+  it("carries the model that authored the last assistant text as answeringModel", () => {
+    expect(
+      toClaudeResult(
+        stream({ resultRaw: { type: "result", result: "done" }, lastAssistantModel: "claude-5-2026-09" }),
+      ).answeringModel,
+    ).toBe("claude-5-2026-09");
+    expect(toClaudeResult(stream({ resultRaw: { type: "result", result: "done" } })).answeringModel).toBeUndefined();
   });
 
   it("falls back to the last assistant text only when the result field is absent", () => {

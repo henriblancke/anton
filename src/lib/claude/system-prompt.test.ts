@@ -172,6 +172,40 @@ describe("loadBaseSystemPrompt (real file)", () => {
     expect(base).toContain("CONTINUATION of this");
     expect(base).toMatch(/previous attempt at THIS ticket/);
   });
+
+  /**
+   * anton-wjfkn: the two things the 2026-09-27 incident's agent did that the contract had not
+   * forbidden. It stashed its own work to measure a coverage baseline, then ended its turn to wait for
+   * the measurement — and anton read the resulting empty tree and silent exit as a clean zero-diff
+   * finish. The runtime now refuses to settle either shape, but the prompt is what stops them
+   * happening at all, so each ban is pinned rather than left to drift out on a later edit.
+   */
+  it("forbids stashing the agent's own work, naming the reason", async () => {
+    _resetBaseSystemPromptCache();
+    const base = await loadBaseSystemPrompt();
+
+    expect(base).toMatch(/`git stash`/);
+    expect(base).toMatch(/\bnever\b/i);
+    // The WHY, not just the rule: a stashed tree is indistinguishable from a ticket that did nothing.
+    expect(base).toMatch(/working tree IS your delivery/i);
+    // And the alternative, so an agent that genuinely needs a baseline has somewhere to go.
+    expect(base).toMatch(/git show <base>:<path>/);
+    expect(base).toMatch(/blocked — other/);
+  });
+
+  it("forbids ending the turn to wait on a background job, and requires foreground checks", async () => {
+    _resetBaseSystemPromptCache();
+    const base = await loadBaseSystemPrompt();
+
+    // All three ways a session can hand its turn back — the exact set `driver-events` detects.
+    expect(base).toContain("ScheduleWakeup");
+    expect(base).toContain("Monitor");
+    expect(base).toContain("run_in_background");
+    expect(base).toMatch(/FOREGROUND/);
+    // The turn ends with ANTON-RESULT and no other way.
+    expect(base).toMatch(/only thing that ends your turn is the `ANTON-RESULT` line/);
+    expect(base).toMatch(/Your turn ends with this line and no other way/);
+  });
 });
 
 describe("buildExecutionSystemPrompt self-verification section", () => {

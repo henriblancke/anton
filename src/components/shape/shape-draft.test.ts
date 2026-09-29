@@ -10,7 +10,9 @@ import {
   draftAreaValid,
   draftBody,
   draftGaps,
+  draftOutcomeIdValid,
   isAreaValid,
+  isOutcomeIdValid,
   NEW_EPIC,
   submitHint,
   type ShapeDraftFields,
@@ -19,6 +21,8 @@ import {
 const FEATURE = {
   title: "Export a report view to CSV",
   goal: "A customer can take a report out of the app as CSV.",
+  why: "Serves outcome:reports-are-shareable — a report is worthless if it never leaves the app.",
+  outcomeId: "reports-are-shareable",
   acceptance: "- [ ] every report view has a working CSV export button",
   context: "touches: src/app/reports; follow src/lib/export.ts",
   outOfScope: "- PDF export",
@@ -30,9 +34,10 @@ const EPIC = {
   goal: "Every report view leaves the app in a format a customer can open.",
   successCriteria: "- [ ] every report view exports",
   area: "reports",
+  outcomeIds: "outcome:reports-are-shareable",
 };
 
-const EMPTY_EPIC = { title: "", goal: "", successCriteria: "", area: "" };
+const EMPTY_EPIC = { title: "", goal: "", successCriteria: "", area: "", outcomeIds: "" };
 
 /** A draft attached to an epic already on the board — the common case. */
 const FULL: ShapeDraftFields = { feature: FEATURE, epicId: "anton-1", epic: EMPTY_EPIC };
@@ -60,11 +65,29 @@ describe("draftGaps", () => {
   it("names each missing piece the way the panel labels it", () => {
     expect(
       draftGaps({
-        feature: { title: "", goal: "", acceptance: "", context: "", outOfScope: "", verify: "" },
+        feature: {
+          title: "",
+          goal: "",
+          why: "",
+          outcomeId: "",
+          acceptance: "",
+          context: "",
+          outOfScope: "",
+          verify: "",
+        },
         epicId: "anton-1",
         epic: EMPTY_EPIC,
       }),
-    ).toEqual(["a title", "a goal", "acceptance criteria", "context", "out of scope", "verify"]);
+    ).toEqual([
+      "a title",
+      "a goal",
+      "why",
+      "which outcome this serves",
+      "acceptance criteria",
+      "context",
+      "out of scope",
+      "verify",
+    ]);
   });
 
   it("asks for the new epic's own contract only while one is being created", () => {
@@ -73,6 +96,7 @@ describe("draftGaps", () => {
       "an epic outcome",
       "epic success criteria",
       "an area",
+      "which outcome(s) the epic serves",
     ]);
     // Picking an existing epic drops those — the panel no longer collects them.
     expect(draftGaps({ ...FULL, epic: EMPTY_EPIC })).toEqual([]);
@@ -112,24 +136,65 @@ describe("isAreaValid", () => {
   });
 });
 
+describe("isOutcomeIdValid", () => {
+  it("accepts label-safe ids and the not-yet-typed empty state", () => {
+    for (const id of ["reports-are-shareable", "billing.core", "data_ingest", "v2-api", ""]) {
+      expect(isOutcomeIdValid(id), id).toBe(true);
+    }
+  });
+
+  it("rejects values bd could not round-trip through outcome:<value>", () => {
+    for (const id of ["two words", "outcome:reports", "-leading"]) {
+      expect(isOutcomeIdValid(id), id).toBe(false);
+    }
+  });
+
+  // A malformed outcome id is a validation error, not a missing field, exactly like a malformed
+  // area — the panel must say WHY, not just stay disabled with the gap list empty.
+  it("blocks submit without adding a gap", () => {
+    const draft = { ...FULL, feature: { ...FEATURE, outcomeId: "two words" } };
+    expect(draftGaps(draft)).toEqual([]);
+    expect(canSubmitDraft(draft)).toBe(false);
+  });
+
+  // Unlike the epic's area, the feature's outcome id is sent on EVERY draft — new epic or
+  // existing — so it stays judged regardless of which epic branch the panel is in.
+  it("is judged the same whether the epic is new or already on the board", () => {
+    expect(draftOutcomeIdValid({ ...FULL, feature: { ...FEATURE, outcomeId: "two words" } })).toBe(
+      false,
+    );
+    expect(
+      draftOutcomeIdValid({ ...FULL_NEW_EPIC, feature: { ...FEATURE, outcomeId: "two words" } }),
+    ).toBe(false);
+  });
+});
+
 describe("submitHint", () => {
   it("names the gaps while any field is empty", () => {
-    expect(submitHint(["a goal", "verify"], true)).toBe("Needs a goal, verify");
+    expect(submitHint(["a goal", "verify"], true, true)).toBe("Needs a goal, verify");
   });
 
   it("clips a long list — the footer is one line, not the whole checklist", () => {
-    expect(submitHint(["an epic", "a title", "a goal", "context", "verify"], true)).toBe(
+    expect(submitHint(["an epic", "a title", "a goal", "context", "verify"], true, true)).toBe(
       "Needs an epic, a title, a goal + 2 more",
     );
   });
 
-  it("explains a malformed area, which is a gap-less refusal", () => {
-    expect(submitHint([], false)).toContain("label-safe");
+  it("explains a malformed area and outcome together when both are invalid", () => {
+    expect(submitHint([], false, false)).toContain("Area and outcome");
+  });
+
+  it("names only the area when the outcome id is unrendered or valid", () => {
+    expect(submitHint([], false, true)).toBe("Area must be a single label-safe word");
+  });
+
+  it("names only the outcome when the area is unrendered or valid — the existing-epic flow", () => {
+    expect(submitHint([], true, false)).toBe("Outcome must be a single label-safe word");
   });
 
   it("reads as ready once the draft is complete", () => {
-    expect(submitHint([], true)).toContain("feature");
-    expect(submitHint([], true)).toContain("unapproved");
+    expect(submitHint([], true, true)).toContain("feature");
+    expect(submitHint([], true, true)).toContain("unapproved");
   });
 });
 

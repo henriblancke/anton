@@ -5,12 +5,15 @@
  * them alone (anton-cmz); the loose tickets we bucket are non-runnable ticket types like `chore`.
  * Exempt types (`learning`, `molecule`, custom) ride on no run, so grooming leaves them loose too.
  */
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import type { Bead } from "../beads/bd";
 import { validateBeadContract } from "../beads/contract";
 import {
   findOrphans,
-  ORPHAN_EPIC_DESCRIPTION,
+  orphanEpicSkeleton,
   ORPHAN_EPIC_LABEL,
   ORPHAN_EPIC_TITLE,
 } from "./orphan-grooming";
@@ -89,23 +92,50 @@ describe("findOrphans", () => {
 });
 
 describe("the grooming epic anton writes for itself", () => {
-  const epic: Bead = {
-    id: "e-orphans",
-    title: ORPHAN_EPIC_TITLE,
-    status: "open",
-    issue_type: "epic",
-    labels: [ORPHAN_EPIC_LABEL],
-    description: ORPHAN_EPIC_DESCRIPTION,
-  };
-
-  it("uses the epic tier's rubric heading, not a ticket's `## Acceptance`", () => {
-    // `bd create --validate` refuses an epic without `## Success Criteria`, and gardener's lint
-    // sweep would file this self-created epic as a standing hygiene finding on every run.
-    expect(ORPHAN_EPIC_DESCRIPTION).toContain("## Success Criteria");
-    expect(ORPHAN_EPIC_DESCRIPTION).not.toContain("## Acceptance");
+  const temps: string[] = [];
+  afterEach(() => {
+    for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
 
-  it("satisfies the epic contract anton enforces on every other bead", () => {
+  // No `.beads/formulas` copy — resolves to anton's bundled formula (src/lib/beads/formula.ts),
+  // same as any project that hasn't overridden it locally.
+  function tempRepo(): string {
+    const repoPath = mkdtempSync(join(tmpdir(), "anton-orphan-grooming-"));
+    temps.push(repoPath);
+    return repoPath;
+  }
+
+  async function epicFor(repo: string): Promise<Bead> {
+    const skeleton = await orphanEpicSkeleton(repo);
+    return {
+      id: "e-orphans",
+      title: ORPHAN_EPIC_TITLE,
+      status: "open",
+      issue_type: "epic",
+      labels: [ORPHAN_EPIC_LABEL],
+      description: skeleton.description,
+    };
+  }
+
+  it("uses the epic tier's rubric heading, not a ticket's `## Acceptance`", async () => {
+    // `bd create --validate` refuses an epic without `## Success Criteria`, and gardener's lint
+    // sweep would file this self-created epic as a standing hygiene finding on every run.
+    const epic = await epicFor(tempRepo());
+    expect(epic.description).toContain("## Success Criteria");
+    expect(epic.description).not.toContain("## Acceptance");
+  });
+
+  // Rendered through the same formula every other producer uses (BEADS.md: "An epic's description
+  // carries `## Outcome IDs` alongside its Goal and Success Criteria") — not hand-rolled, so this
+  // stays in step when the formula changes rather than silently drifting from the contract.
+  it("carries `## Outcome IDs` naming the built-in codebase-health outcome", async () => {
+    const epic = await epicFor(tempRepo());
+    expect(epic.description).toContain("## Outcome IDs");
+    expect(epic.description).toContain("outcome:codebase-health");
+  });
+
+  it("satisfies the epic contract anton enforces on every other bead", async () => {
+    const epic = await epicFor(tempRepo());
     const blocking = validateBeadContract(epic).filter((v) => v.severity === "blocking");
     expect(blocking).toEqual([]);
   });

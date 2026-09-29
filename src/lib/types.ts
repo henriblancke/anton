@@ -693,6 +693,12 @@ export interface EpicDetail {
    * renders no crumb at all rather than an empty one.
    */
   parentEpic?: EpicCrumb;
+  /**
+   * Whether this bead is a bead anton RUNS (`beads.isRunTarget`) rather than a container epic the
+   * page also serves. Only a run target has a ledger — a container's features each own one — so this
+   * is what gates the Ledger link, off the same judgement the ledger route 404s on.
+   */
+  runTarget?: boolean;
 }
 
 /** Just enough of the parent epic to render (and link) its badge. */

@@ -87,6 +87,40 @@ function writeFakeHangingClaudeWithChild(name: string, childPidPath: string): st
   return path;
 }
 
+/**
+ * A fake that arms a backgrounded `Bash` call on its last assistant message, spawns a real
+ * descendant to stand in for that background command, and then EXITS AT ONCE — the yielded-turn
+ * case (PR #333 review): claude's own process ends while the tool call it armed keeps running in
+ * the same group.
+ */
+function writeFakeClaudeThatYieldsWithChild(name: string, childPidPath: string): string {
+  const path = join(dir, name);
+  const events: FakeClaudeEvent[] = [
+    { type: "system", subtype: "init", session_id: "sess-yield-tree" },
+    {
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", name: "Bash", input: { run_in_background: true, command: "sleep" } }],
+      },
+    },
+    { type: "result", subtype: "success", is_error: false, session_id: "sess-yield-tree", result: "" },
+  ];
+  const body = [
+    "#!/usr/bin/env node",
+    "const { spawn } = require('node:child_process');",
+    "const { writeFileSync } = require('node:fs');",
+    `const lines = ${JSON.stringify(events.map((e) => JSON.stringify(e)))};`,
+    "for (const l of lines) { process.stdout.write(l + \"\\n\"); }",
+    "const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)']);",
+    `writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));`,
+    "process.exit(0);",
+    "",
+  ].join("\n");
+  writeFileSync(path, body, "utf8");
+  chmodSync(path, 0o755);
+  return path;
+}
+
 /** Whether a pid is still around — asked with no grace period at all. */
 function alive(pid: number): boolean {
   try {
@@ -1175,6 +1209,60 @@ describe("runClaude", () => {
 
       groupGone = true;
       await expect(run).rejects.toMatchObject({ signature: "stalled" });
+    } finally {
+      spawnHooks.groupAlive = null;
+    }
+  });
+
+  // The race PR #333 review caught: claude's own process can END ITS TURN — and exit — while the
+  // background command its last message armed keeps running in the group. The ticket walk treats
+  // this as a yielded stop and recovers a stash into the worktree right after `runClaude` resolves,
+  // so that descendant must be gone BEFORE this promise settles, not merely claude's own `close`.
+  it.runIf(process.platform !== "win32")(
+    "kills the background command a yielded turn left running in the group",
+    async () => {
+      const childPidPath = join(dir, "yielded-child.pid");
+      const bin = writeFakeClaudeThatYieldsWithChild("yielded-tree-claude", childPidPath);
+      process.env[CLAUDE_BIN_ENV] = bin;
+
+      const result = await runClaude({ cwd: dir, prompt: "background then yield", routing: UNROUTED });
+
+      expect(result.pendingYields).toEqual(["Bash (run_in_background)"]);
+      // The promise only resolves once the descendant's group is confirmed gone, so this must
+      // already be true — asserted anyway so a regression fails loudly rather than flaking.
+      expect(alive(Number(readFileSync(childPidPath, "utf8")))).toBe(false);
+    },
+  );
+
+  // The same property proven directly, the same way the stalled case is above: only the live group
+  // holds the resolution back, not claude's own (already-fired) `close`.
+  it("holds a yielded session's resolution until its process group is gone", async () => {
+    const bin = writeFakeClaude("yielded-held-claude", [
+      { type: "system", subtype: "init", session_id: "sess-yield-held" },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", name: "Bash", input: { run_in_background: true, command: "sleep" } }],
+        },
+      },
+      { type: "result", subtype: "success", is_error: false, session_id: "sess-yield-held", result: "" },
+    ]);
+    process.env[CLAUDE_BIN_ENV] = bin;
+    let groupGone = false;
+    spawnHooks.groupAlive = () => !groupGone;
+
+    try {
+      const run = runClaude({ cwd: dir, prompt: "background then yield", routing: UNROUTED });
+      const outcome = await Promise.race([
+        run.then(() => "settled", () => "settled"),
+        new Promise((r) => setTimeout(() => r("waiting"), 800)),
+      ]);
+      // Well past claude's own close: only the live group holds this back.
+      expect(outcome).toBe("waiting");
+
+      groupGone = true;
+      const result = await run;
+      expect(result.pendingYields).toEqual(["Bash (run_in_background)"]);
     } finally {
       spawnHooks.groupAlive = null;
     }

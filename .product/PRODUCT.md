@@ -49,6 +49,17 @@ keeps working the PR (review comments + red CI) until it's mergeable, which is t
 - review-fix closes reviewer comments and CI failures without a human re-driving the PR.
 - The board stays trustworthy — stage is always derived live from beads, never a stale cache.
 
+## Outcomes
+Stable ids a run target points at (an `outcome:<id>` label) to say which of the above it serves.
+Parsed by `src/lib/outcomes.ts`; `codebase-health` is built in and always resolves even if this
+section omits it.
+
+- `no-touch-delivery` — Approved epics reach an open, green, review-clean PR with no human touch between approve and merge.
+- `self-driving-review` — review-fix closes reviewer comments and CI failures without a human re-driving the PR.
+- `trustworthy-board` — The board stays trustworthy: stage is always derived live from beads, never a stale cache.
+- `codebase-health` — Tests, types, and lint stay green as the code changes; debt found by scanning gets paid down.
+- `oriented-operator` — Every run target says which outcome it serves and why, so the board reads as a plan.
+
 ## Stack
 Next.js 16 (App Router) + React 19, Drizzle ORM over SQLite (`anton.db`, app/execution state
 only), Zod 4, Tailwind 4, Vitest, TypeScript, bun. beads is the work source of truth — Dolt-synced

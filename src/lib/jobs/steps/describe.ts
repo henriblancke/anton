@@ -284,7 +284,14 @@ async function resolveDescribeContract(
   const skillId = labelValueOf(ctx.step?.labels, "skill");
   if (skillId) {
     const skill = await loadBaseProjectSkill(ctx.worktreePath, baseRev, skillId);
-    if (skill) return { reasoning: skill.text, attribution: { skillId, skillDigest: skill.digest } };
+    // `skillIsDefault: false` — this is a `skill:<id>` LABEL the project named explicitly, never the
+    // bundled fallback below, even when `skillId` collides with one of its names (PR #331 review).
+    if (skill) {
+      return {
+        reasoning: skill.text,
+        attribution: { skillId, skillDigest: skill.digest, skillIsDefault: false },
+      };
+    }
   }
   const projectPrompt = resolveDescribeConfig(ctx.settings).prompt;
   if (projectPrompt) {
@@ -292,7 +299,7 @@ async function resolveDescribeContract(
   }
   return {
     reasoning: await loadSkill("describe"),
-    attribution: { skillId: "describe", skillDigest: bundledSkillDigest("describe") },
+    attribution: { skillId: "describe", skillDigest: bundledSkillDigest("describe"), skillIsDefault: true },
   };
 }
 

@@ -3,6 +3,7 @@
  * what it reports, and what it refuses to swallow.
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 
 import { selfBuildVersion } from "../../build/drift";
 import { systemPromptDigest } from "../../claude/system-prompt";
@@ -365,5 +366,62 @@ describe("dispatchClaude", () => {
     expect(rows[0].modelReported).toBeNull();
     expect(rows[0].inputTokens).toBeNull();
     expect(rows[0].outcome).toBe("error");
+  });
+});
+
+/**
+ * anton-wjfkn: a session that armed a wake-up, a monitor or a background job on its FINAL message and
+ * emitted no `ANTON-RESULT` handed its turn back — to something an autonomous ticket run never
+ * delivers. The dispatch reports that as a fact about the stream, because the agent's silence is
+ * precisely what makes it invisible any other way: the process exits 0 with nothing to parse.
+ */
+describe("dispatchClaude — a yielded turn (anton-wjfkn)", () => {
+  const yielding = (pendingYields: string[], text?: string) =>
+    fakeClaude({ ok: true, ...(text !== undefined ? { text } : {}), modelUsage: [], pendingYields });
+
+  it("reports the armed tools when the session signed off with nothing", async () => {
+    const claude = yielding(["ScheduleWakeup"], "waiting on the coverage run");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    const result = await dispatchClaude(ctx, args());
+
+    expect(result.facts?.yielded).toEqual(["ScheduleWakeup"]);
+    expect(result.facts?.selfReport).toBeNull();
+  });
+
+  /**
+   * An arm the agent then signed off over is not a yield: it said what it did, and the leftover
+   * `Monitor` is the settled ticket's business to ignore. Only the SILENT yield is unreadable any
+   * other way, which is the whole reason this fact exists.
+   */
+  it("reports nothing when the session still emitted an ANTON-RESULT", async () => {
+    const claude = yielding(["Monitor"], "all set\n\nANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    const result = await dispatchClaude(ctx, args());
+
+    expect(result.facts?.yielded).toBeUndefined();
+    expect(result.facts?.selfReport?.outcome).toBe("delivered");
+  });
+
+  it("reports nothing for an ordinary dispatch that armed no yield", async () => {
+    const claude = fakeClaude("done\n\nANTON-RESULT: delivered");
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    expect((await dispatchClaude(ctx, args())).facts?.yielded).toBeUndefined();
+  });
+
+  it("logs the yield to the session, beside the self-report it never got", async () => {
+    const claude = yielding(["Bash (run_in_background)", "ScheduleWakeup"]);
+    const ctx = sandbox.context({ deps: { runClaude: claude.run } });
+
+    const result = await dispatchClaude(ctx, args());
+
+    const [row] = await sandbox.tdb.db.select().from(schema.sessions);
+    const log = readFileSync(row.logPath!, "utf8");
+    expect(log).toContain("[yielded]");
+    expect(log).toContain("Bash (run_in_background), ScheduleWakeup");
+    expect(log).toContain("no ANTON-RESULT");
+    expect(result.facts?.yielded).toHaveLength(2);
   });
 });

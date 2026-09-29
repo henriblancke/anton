@@ -136,6 +136,15 @@ describe("loadStepReasoning", () => {
     expect(resolved.skillDigest).toMatch(/^[0-9a-f]{12}$/);
   });
 
+  // A `skill:<id>` label is the project's own explicit choice, never anton's scaffolding fallback —
+  // even when the id collides with one of the four names that fallback uses (`review`, `describe`,
+  // `review-fix`, `scan-triage`). `prompt-series.ts`'s `isScaffoldingFallback` reads this flag to tell
+  // the two apart instead of guessing from the id alone (PR #331 review).
+  it("stamps skillIsDefault: false, even when the id collides with a scaffolding name", async () => {
+    const resolved = await projectSkill("review", "Review it our way.");
+    expect(resolved.skillIsDefault).toBe(false);
+  });
+
   // The same `skill:<id>` is different TEXT in another repo, and different text here after an edit
   // — an id alone would pool two cohorts that ran different instructions under one key.
   it("digests a project-local skill apart from the bundled one of the same name", async () => {
@@ -169,7 +178,12 @@ describe("loadStepReasoning", () => {
     });
 
     const degraded = await loadStepReasoning(ctx(["step:claude", "skill:smoke"]), "custom");
-    expect(degraded).toEqual({ text: resolved.text, skillId: "smoke", skillDigest: undefined });
+    expect(degraded).toEqual({
+      text: resolved.text,
+      skillId: "smoke",
+      skillDigest: undefined,
+      skillIsDefault: false,
+    });
   });
 
   // An agent dispatched with no instruction would burn a session and report whatever it invented.

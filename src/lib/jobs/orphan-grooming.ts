@@ -8,8 +8,12 @@
  * epic across runs (found by its `source:orphan-grooming` label) so repeated runs don't spawn a new
  * epic each time. Idempotent — a ticket already parented is no longer an orphan, so re-runs are safe.
  */
+import { extractOutcomeIdsSection } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { isTicketTier, SUCCESS_HEADING } from "../beads/contract";
+import { withBeadWriteLock } from "../beads/claim-lock";
+import { isTicketTier } from "../beads/contract";
+import { beadSkeleton } from "../beads/formula";
+import { unterminatedCloser } from "../beads/markdown";
 import { getProjectById } from "../projects";
 import { PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
@@ -33,19 +37,26 @@ export const ORPHAN_EPIC_LABEL = LABELS.source("orphan-grooming");
 export const ORPHAN_EPIC_TITLE = "Loose tickets — needs triage";
 
 /**
- * The grooming epic's body. anton writes this bead for itself, so it must satisfy the same epic
- * contract anton enforces on everyone else — `## Goal` plus the epic tier's `## Success Criteria`
- * ({@link SUCCESS_HEADING}). Spelled `## Acceptance` it is an epic bd's own validator refuses, and
- * gardener's lint sweep would file a permanent hygiene finding against it on every run.
+ * The grooming epic's content vars. anton writes this bead for itself, so it must satisfy the
+ * same epic contract every other producer renders through — `beadSkeleton` (src/prompts/BEADS.md)
+ * — rather than a hand-rolled description the contract gate never sees drift from it.
+ *
+ * `codebase-health` is the outcome id every project has whether or not `.product/PRODUCT.md`
+ * lists it ({@link BUILT_IN_OUTCOME} in outcomes.ts) — triaging loose tickets is board hygiene,
+ * not any one feature's outcome, so it's the only id that's always a valid, safe choice here.
  */
-export const ORPHAN_EPIC_DESCRIPTION = [
-  "## Goal",
-  "Bucket for orphaned tickets (no parent epic) collected by anton's orphan-grooming job.",
-  "Review, split into real epics, and approve — or close what isn't worth doing.",
-  "",
-  `## ${SUCCESS_HEADING}`,
-  "- [ ] Every ticket here is triaged: moved to a real epic or closed.",
-].join("\n");
+export const ORPHAN_EPIC_VARS = {
+  outcome:
+    "Bucket for orphaned tickets (no parent epic) collected by anton's orphan-grooming job. " +
+    "Review, split into real epics, and approve — or close what isn't worth doing.",
+  success_criteria: "- [ ] Every ticket here is triaged: moved to a real epic or closed.",
+  outcome_ids: "outcome:codebase-health",
+};
+
+/** Render the grooming epic's contract markdown through the project's own bead formula. */
+export async function orphanEpicSkeleton(repo: string) {
+  return beadSkeleton(repo, "epic", ORPHAN_EPIC_VARS);
+}
 
 /** Set of bead ids that are the child in a parent-child edge (i.e. have a parent). */
 function parentedIds(all: Bead[]): Set<string> {
@@ -108,16 +119,49 @@ export function makeOrphanGroomingHandler(deps: OrphanGroomingDeps): JobHandler 
     await ctx.heartbeat();
 
     // Reuse an open grooming epic if one exists, else create one.
-    let epicId = all.find(
+    const existing = all.find(
       (b) => beads.isEpic(b) && b.status !== "closed" && b.labels?.includes(ORPHAN_EPIC_LABEL),
-    )?.id;
+    );
 
+    let epicId: string;
     let createdEpic = false;
-    if (!epicId) {
+    if (existing) {
+      epicId = existing.id;
+      // Locked, and re-read inside the lock: `existing` is a snapshot from the `all` read above, and
+      // a founder editing this epic's description between that read and this patch must not have
+      // their edit silently discarded by `beads.update` replacing the whole field with the stale one.
+      await withBeadWriteLock(repo, epicId, async () => {
+        const fresh = await beads.show(repo, epicId);
+        if (extractOutcomeIdsSection(fresh.description ?? "").present) return;
+        // An epic from before outcome ids landed (anton-cdeki) is reused as-is on every subsequent
+        // sweep — it's found by its `source:orphan-grooming` label, never by contract shape, so its
+        // description would otherwise stay stuck missing `## Outcome IDs` forever. Patch it in
+        // place rather than leaving the gap for the next contract-gap sweep to flag.
+        const kept = (fresh.description ?? "").trimEnd();
+        const closer = unterminatedCloser(kept);
+        const description = [
+          kept,
+          ...(closer ? [closer] : []),
+          ``,
+          `## Outcome IDs`,
+          ``,
+          ORPHAN_EPIC_VARS.outcome_ids,
+        ].join("\n");
+        const patched = await safe(() => beads.update(repo, epicId, { description }, fresh.labels ?? []));
+        // Thrown BEFORE any linking below: once an orphan is parented here it stops being an orphan,
+        // so a sweep with nothing left to bucket returns early (`orphans.length === 0`) and never
+        // revisits this epic — a swallowed failure here would leave it missing `## Outcome IDs`
+        // permanently. Failing now keeps every orphan loose so the next sweep retries the patch.
+        if (!patched) {
+          throw new Error(`orphan-grooming: failed to add Outcome IDs to reused epic ${epicId}`);
+        }
+      });
+    } else {
+      const skeleton = await orphanEpicSkeleton(repo);
       epicId = await beads.create(repo, {
         title: ORPHAN_EPIC_TITLE,
         type: "epic",
-        description: ORPHAN_EPIC_DESCRIPTION,
+        description: skeleton.description,
       });
       await beads.tag(repo, epicId, [ORPHAN_EPIC_LABEL]);
       createdEpic = true;

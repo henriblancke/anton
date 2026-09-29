@@ -11,6 +11,7 @@ import {
   draftFromDetail,
   hasTicketChanges,
   runToastMessage,
+  wouldClearWhy,
   type TicketDraft,
   type TicketPatchBody,
 } from "./ticket-dialog-utils";
@@ -171,6 +172,10 @@ function useTicketSave(
   const [saving, setSaving] = useState(false);
 
   async function save() {
+    if (loaded !== null && wouldClearWhy(draftFromDetail(loaded.detail), loaded.draft)) {
+      toast.error("Why can't be cleared once a ticket carries it — restore it or leave it as is");
+      return;
+    }
     const patch = pendingPatch(loaded);
     if (patch === null) return;
     setSaving(true);

@@ -330,6 +330,7 @@ describe("the attribution stamps", () => {
     agentTag: "nextjs",
     skillId: "review",
     skillDigest: "77b1a3f19c2e",
+    skillIsDefault: true,
     promptId: undefined,
   };
 
@@ -344,6 +345,7 @@ describe("the attribution stamps", () => {
       agentTag: "nextjs",
       skillId: "review",
       skillDigest: "77b1a3f19c2e",
+      skillIsDefault: true,
     });
     // NULL, never a placeholder: `loadStepReasoning` resolves prompt XOR skill, so a skill-backed
     // step genuinely has no prompt id — and a reader must be able to tell that from "not recorded".
@@ -361,6 +363,7 @@ describe("the attribution stamps", () => {
       agentTag: null,
       skillId: null,
       skillDigest: null,
+      skillIsDefault: null,
       promptId: null,
       // The invocation itself is still the fact the table exists to hold.
       beadId: "anton-77l9",

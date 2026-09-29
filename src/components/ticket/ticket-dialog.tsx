@@ -136,6 +136,14 @@ function TicketDialogForm({
       />
 
       <ContractField
+        label="Why"
+        value={draft.why}
+        onChange={(v) => model.set("why", v)}
+        rows={3}
+        placeholder="The motivation — why this ticket, why now."
+      />
+
+      <ContractField
         label="Acceptance"
         value={draft.acceptance}
         onChange={(v) => model.set("acceptance", v)}

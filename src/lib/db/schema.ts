@@ -993,6 +993,15 @@ export const claudeInvocations = sqliteTable(
     skillId: text("skill_id"),
     skillDigest: text("skill_digest"),
     /**
+     * Whether `skill_id` named anton's own bundled default (the describe/review/review-fix/
+     * scan-triage fallback a resolver takes when a project configured no override) rather than
+     * something a project explicitly chose (PR #331 review). A project is free to name its own
+     * skill `review`, and its row must not be read as the scaffolding fallback just because the id
+     * collides — see `isScaffoldingFallback` in `prompt-series.ts`, the sole reader. Null on a row a
+     * resolver never marked either way, and on every row written before this column existed.
+     */
+    skillIsDefault: integer("skill_is_default", { mode: "boolean" }),
+    /**
      * The `prompt:<id>` a `step:claude` resolved — the sibling of `skill_id`, and mutually exclusive
      * with it by construction, since `loadStepReasoning` dispatches exactly one.
      */
@@ -1097,5 +1106,241 @@ export const runAttempts = sqliteTable(
     // The only read this table has: one run's attempts, in order. Both halves of it — the fold over
     // a settled run, and the open row `recordAttemptEnd` closes — seek on exactly this pair.
     index("run_attempts_run_idx").on(table.runId, table.attempt),
+  ],
+);
+
+/**
+ * THE DECISION LOG (anton-q5ixf): one append-only row per `decide()` call, plus the operator's own
+ * answer to the same question whenever it arrives.
+ *
+ * It exists because `shadow` mode has no other product. A point in shadow computes exactly the answer
+ * `auto` would have acted on and then acts on nothing — so unless the answer is written down beside
+ * what the operator actually did, nothing measures whether the point is trustworthy, and the only way
+ * to promote one would be to guess. Every row is therefore half of a pair: the decision at the moment
+ * it was made, and later `operator_answer` — the settle. Agreement is the fold over settled pairs
+ * (`agreement`, decide/log.ts).
+ *
+ * The decision half is never revised. A row records what was decided with the information of that
+ * instant, so a re-decision writes a NEW row rather than touching the previous one — the same
+ * append-only rule as `claude_invocations` and `run_attempts`, and for the same reason: a row is only
+ * ever true of the call that produced it.
+ *
+ * `answer` and `operator_answer` hold JSON-encoded `AnswerValue`s (string | number | boolean) rather
+ * than raw text, so the three question shapes round-trip through one column and agreement can compare
+ * them as a plain string equality — `1` and `"1"` are different answers and must not read as the same
+ * one.
+ */
+export const decisions = sqliteTable(
+  "decisions",
+  {
+    id: text("id").primaryKey(),
+    /**
+     * The project the decision was made for. NOT a foreign key, like `run_attempts` and unlike most
+     * of this schema: the log write is best-effort (`recordDecision` swallows), and a reference the
+     * writer cannot satisfy is one more way for it to reject a row about a decision that really
+     * happened. Null for a decision made outside any project.
+     */
+    projectId: text("project_id"),
+    /** The registered `DecisionPoint.id` this row answers — what `agreement` is measured per. */
+    point: text("point").notNull(),
+    /** The `DecisionMode` in force for this call, which is what makes `acted` legible. */
+    mode: text("mode").notNull(),
+    /** `DecidedBy`: `rule` | `model` | `fallback`. */
+    decidedBy: text("decided_by").notNull(),
+    /**
+     * The decided answer, JSON-encoded. NULL means decide() produced NO answer — `off` mode, or a
+     * fallback to a human — which is never an answer of any kind and so is excluded from agreement
+     * outright: a backend that times out all week is a broken backend, not a point that disagrees
+     * with its operator.
+     */
+    answer: text("answer"),
+    confidence: real("confidence").notNull(),
+    /** Per-option probabilities as JSON, for `choice`/`yes-no` backends that report them. */
+    distribution: text("distribution"),
+    backend: text("backend"),
+    /** Pinned, not derived: a promotion is earned by a specific model, never by its successor. */
+    modelVersion: text("model_version"),
+    /**
+     * A digest of the state the point actually sent (`decisionInputHash`) — narrowed by the point's
+     * own `stateFields` before it is hashed, so the log carries no more of the caller's state than
+     * the backend saw. Hashed rather than stored: the inputs are unbounded untrusted text (a PR
+     * comment, a bead body), and this column is only ever compared for equality.
+     */
+    inputHash: text("input_hash").notNull(),
+    /**
+     * A digest of the point's own definition at decide() time (`pointDefinitionHash`, decide/log.ts)
+     * — instruction, question shape, escape value, and hard rules. A release can change a point's
+     * judgment logic while keeping its id and model, and a row from the old definition is not
+     * evidence for the new one: `agreement()` restricts its window to rows matching the CURRENT
+     * definition, the same reason it restricts to the current backend/model cohort. NULL on rows
+     * written before this column existed, which `agreement()` keeps as evidence unconditionally
+     * rather than retroactively invalidating history it has no definition to compare against.
+     */
+    pointDefinitionHash: text("point_definition_hash"),
+    /** What was TAKEN, not what was answered: true only where mode was `auto` and the threshold held. */
+    acted: integer("acted", { mode: "boolean" }).notNull(),
+    /** Why a hard rule fired, or why a fallback was taken — carried so a row explains itself. */
+    reason: text("reason"),
+    decidedAt: ts("decided_at").notNull().default(now),
+    /**
+     * What the operator's own answer to this question turned out to be, JSON-encoded in the same
+     * vocabulary as `answer`. NULL while unsettled, which is the state most rows are in at any moment
+     * — agreement counts settled pairs and never guesses at an open one.
+     */
+    operatorAnswer: text("operator_answer"),
+    /**
+     * The act that produced that answer, in the caller's own vocabulary (`fix`, `park`, `release`) —
+     * kept beside `operator_answer` for the reason `picker_verdicts.action` sits beside its verdict:
+     * the affordance and the answer it implies are different facts, and only the answer is evidence.
+     */
+    operatorAction: text("operator_action"),
+    /**
+     * How it turned out afterwards, in the caller's own vocabulary. Separate from the settle because
+     * it is knowable later — the operator's choice and whether that choice worked out are two
+     * observations, sometimes days apart ({@link recordDecisionOutcome}).
+     */
+    outcome: text("outcome"),
+    /** When the operator's answer was recorded. NULL exactly when `operator_answer` is. */
+    settledAt: ts("settled_at"),
+    // A global counter stamped on every settle (PR #332 review), for the same reason `runs.writeSeq`
+    // exists: `settled_at` is whole-second, and two rows settled in the same second are ordinary once
+    // a point sees any volume. `rowid` tracks INSERT order — when the operator settles them in the
+    // REVERSE of their insertion order (the later-inserted row happens to get answered first), a
+    // rowid tiebreak would call the earlier-inserted row "newest" even though it settled last, and
+    // `agreement()`'s limited window would then retain the wrong pair. A row's settle is its one
+    // write here (the decision half is append-only), so this counter needs stamping only in
+    // `settleDecision`, never at insert. Null on rows written before this column existed, or never
+    // settled, both of which fall back to the `rowid` proxy.
+    settleSeq: integer("settle_seq"),
+  },
+  (table) => [
+    // The one read this table has: a point's newest decisions, which the agreement fold then narrows
+    // to the settled ones. `decided_at` trails `point` because the point is always an equality
+    // predicate and the window is a range — the reverse order would leave the seek to the range. A
+    // project narrowing filters within one point's rows rather than earning its own index: a single
+    // point's log is small, and a second index on a table this write-light is pure tax.
+    index("decisions_point_idx").on(table.point, table.decidedAt),
+    // Serves the tie-break's ordering and the MAX+1 stamp on every settle, the same reason
+    // `runs_write_seq_idx` exists for `runs.writeSeq`.
+    index("decisions_settle_seq_idx").on(table.settleSeq),
+  ],
+);
+
+/**
+ * The per-ROUND review record (anton-1pjo0): what each PR-fix round was handed by GitHub's reviewers
+ * and how anton answered it — one append-only row per round that actually dispatched claude.
+ *
+ * It exists because the review-fix job reads these counts and throws them away. A thread count is
+ * only observable while the PR is open and the threads are unresolved: once it merges, GitHub reports
+ * the end state, and "3 threads from 2 reviewers, 2 fixed and 1 left" is unreconstructable from it.
+ * Nothing else in anton.db carries it — `claude_invocations` meters the SPEND of a round and says
+ * nothing about what the round was for, and the self-review score is anton grading itself, which is
+ * the measure this record exists to check from outside.
+ *
+ * One row per ROUND, never per JOB, deliberately: most review-fix jobs are polling ticks that dispatch
+ * no claude at all (15,818 of them had spent zero tokens when this was measured), so a row per job
+ * would count the poller and drown the rounds that did work. A tick with nothing actionable writes
+ * NOTHING — absence of a row means "no review happened", which is exactly true of a poll.
+ *
+ * Shaped like `run_attempts` and `claude_invocations`, and for their reasons: rows are append-only
+ * FACTS about one round, never revised — a later round writes a NEW row rather than updating the
+ * previous one, so `Σ threads_*` over a PR's rows is its whole review history. The ONE exception is
+ * `pr_state`/`pr_state_at`, stamped across the PR's rows when finalize learns how it ended: a round
+ * cannot know its PR's fate while it is running, and the alternative (a second table keyed by PR)
+ * would be a join for one word.
+ *
+ * The same never-fail-the-work rule as the spend ledger: a write that throws is swallowed. A round
+ * that fixed the PR must not fail because a meter could not be written, and a lost write costs one
+ * round's counts — never the fix.
+ *
+ * No backfill: PRs that merged before this landed have no thread record, which reads as "not
+ * measured" and never as a PR that carried no review.
+ */
+export const reviewRounds = sqliteTable(
+  "review_rounds",
+  {
+    id: text("id").primaryKey(),
+    /**
+     * NOT a foreign key, like `run_attempts` and `quota_attempts`: a round is recorded on a
+     * best-effort path, and a reference the writer cannot satisfy is one more way for a meter to
+     * reject a row about review that really happened.
+     */
+    projectId: text("project_id"),
+    /**
+     * The run target bead the PR belongs to — the feature, so the feature ledger and the trend fold
+     * roll a PR's rounds up the same way they roll its invocations (`ledgerScope`, feature-scope.ts).
+     */
+    beadId: text("bead_id"),
+    /**
+     * The review-fix job that ran this round. The join to its own spend: `claude_invocations` keys on
+     * `job_id` too, and without it a round's counts and the tokens it cost share no column at all.
+     */
+    jobId: text("job_id"),
+    prNumber: integer("pr_number").notNull(),
+    /**
+     * 1-based, per PR: this round's ordinal among the rows already recorded for the same PR. Derived
+     * at insert rather than read off the PR body's rounds region — that region is capped and drops its
+     * oldest entries (`MAX_ROUNDS`, review-fix-body.ts), so it stops being a counter once a PR passes
+     * the cap.
+     */
+    round: integer("round").notNull(),
+    /** Every inline thread the PR carried when this round read it, resolved ones included. */
+    threadsSeen: integer("threads_seen").notNull().default(0),
+    threadsUnresolved: integer("threads_unresolved").notNull().default(0),
+    threadsOutdated: integer("threads_outdated").notNull().default(0),
+    /**
+     * The threads claude was actually handed — `threadsNeedingAttention` (git/pr.ts), which drops an
+     * unresolved thread whose last comment is already anton's. Kept beside `threads_unresolved`
+     * because the two diverge on every re-review, and without it the outcome counts below cannot be
+     * reconciled: an unresolved thread anton never answered and one it answered last round are the
+     * same number in `threads_unresolved` and different work.
+     */
+    threadsActionable: integer("threads_actionable").notNull().default(0),
+    /**
+     * Whether the thread-count columns above are the PR's WHOLE inline history, or a degraded
+     * GraphQL read (`getReviewThreads`, git/pr.ts) — a failed first page, or a later page that broke
+     * the fetch loop. False makes a real zero-thread round distinguishable from one where the read
+     * itself failed and `threads_seen`/`threads_unresolved`/`threads_outdated`/`threads_actionable`
+     * are an understated prefix, not the PR's actual count (PR #335 review).
+     */
+    threadsComplete: integer("threads_complete", { mode: "boolean" }).notNull().default(true),
+    /**
+     * How anton answered, in `ThreadOutcome`'s own vocabulary (review-fix-context.ts). Counted from
+     * the outcomes that SURVIVED triage, so a "fixed" claim with nothing pushed — a fabrication
+     * (`fabricatedFix`) — is not counted as a fix.
+     */
+    outcomesFixed: integer("outcomes_fixed").notNull().default(0),
+    outcomesLeft: integer("outcomes_left").notNull().default(0),
+    outcomesNeedsHuman: integer("outcomes_needs_human").notNull().default(0),
+    /**
+     * Threads per reviewer login, serialized (`{"<login>": <threads>}`) — the split that makes a bot's
+     * volume and a human's distinguishable, which is the whole point of measuring from outside anton.
+     * A blob rather than a child table: the read is "this PR's reviewers", never "this reviewer across
+     * projects", and a row carries a handful of logins.
+     */
+    byAuthorJson: text("by_author_json").notNull().default("{}"),
+    /**
+     * How the PR ENDED — `merged` | `closed` — stamped across the PR's rows by finalize, and null
+     * until then. Null forever on a PR that is still open, or one whose finalize never ran, which is a
+     * real gap and never "closed": a reader reports the rounds it has and how many PRs it could not
+     * settle.
+     */
+    prState: text("pr_state"),
+    /** When the terminal state above was stamped. Null while `pr_state` is. */
+    prStateAt: ts("pr_state_at"),
+    recordedAt: ts("recorded_at").notNull().default(now),
+  },
+  (table) => [
+    // The read every trend question starts from: one project's rounds over a window. `recorded_at`
+    // trails the project id for `claude_invocations`' reason — the project is always an equality
+    // predicate while the window is a range, and the reverse order would leave the seek to the range.
+    index("review_rounds_project_idx").on(table.projectId, table.recordedAt),
+    // Both of the PR-scoped writes: the ordinal derivation above counts a PR's rows, and finalize
+    // stamps `pr_state` across them. Neither should scan the table to find one PR's handful of rounds.
+    index("review_rounds_pr_idx").on(table.projectId, table.prNumber, table.round),
+    // The feature roll-up's seek: `bead_id IN (<the scope>)`, single-column like
+    // `claude_invocations_bead_idx` because a feature rolls up its WHOLE review history — there is no
+    // window to leave to the index, unlike the project read above.
+    index("review_rounds_bead_idx").on(table.beadId),
   ],
 );

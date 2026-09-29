@@ -63,6 +63,7 @@ import {
 import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE, isModelRoutableStepId } from "./jobs/step-ids";
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
+import { DECISION_MODES, getPoint, type DecisionMode, type DecisionPoint } from "./decide/points";
 
 /** Parsed project settings (settingsJson). All optional; sensible defaults applied by callers. */
 export interface ProjectSettings {
@@ -412,6 +413,15 @@ export interface ProjectSettings {
    * weighs. See gardener/repair-autonomy.ts.
    */
   repairAutonomy?: RepairAutonomyOverrides;
+  /**
+   * How far anton may go answering each registered decision point on this project (anton-xky9e), the
+   * operator's override of {@link DecisionPoint.defaultMode}. Absent → the point's own shipped
+   * default (usually `shadow`); a stored value need only carry the points the operator has actually
+   * promoted or demoted. Validated with {@link decisionModeOverridesSchema}, which refuses an id
+   * decide()'s own registry does not carry — a run reads this back through {@link resolveDecisionMode}
+   * before ever calling decide(), never the other way round.
+   */
+  decisionModes?: Record<string, DecisionMode>;
   /**
    * The operator's standing answer to the cadence offer arming the board-picker makes (anton-3xa9,
    * design R7.1): true = keep product-master weekly, and never ask again. Absent = not yet asked.
@@ -815,6 +825,46 @@ export function resolveRepairAutonomy(settings: ProjectSettings): RepairAutonomy
  */
 export function resolveAutonomyPolicy(settings: ProjectSettings): ProposalAutonomyPolicy {
   return resolveProposalAutonomyPolicy(settings.proposalAutonomy);
+}
+
+/**
+ * Per-point decision mode as submitted (anton-xky9e), keyed by the registered `DecisionPoint.id`s
+ * decide()'s own registry carries. Unlike {@link proposalAutonomySchema} the key set can't be a fixed
+ * enum: points are declared wherever a job step calls `definePoint`, not by a list this module could
+ * import without depending on every point's own module. An id the live registry does not recognise is
+ * refused with a 400 rather than persisted — an override for a point that does not exist would be
+ * silently ignored the moment {@link resolveDecisionMode} reads it back.
+ *
+ * A point's value may also be `null` — a per-point delete, distinct from clearing the whole field
+ * (`decisionModes: null`, handled by `isClear`). Selecting a point's own `defaultMode` back is
+ * exactly this: {@link mergeSettings} drops the key rather than storing the default as an explicit
+ * override, so a later release that changes the point's shipped default carries this project along
+ * instead of leaving it pinned to the value that was current when the operator picked it.
+ */
+export const decisionModeOverridesSchema = z
+  .record(z.string(), z.enum(DECISION_MODES).nullable())
+  .superRefine((overrides, ctx) => {
+    for (const id of Object.keys(overrides)) {
+      if (!getPoint(id)) {
+        ctx.addIssue({ code: "custom", path: [id], message: `unknown decision point: ${id}` });
+      }
+    }
+  });
+
+/**
+ * How far anton may go answering ONE decision point on this project — the operator's override, or
+ * the point's own shipped default when there is none. The single seam a future decide() call site
+ * reads, so "absent means the point's default" can't drift between the settings surface and the
+ * call. Falls back to `defaultMode` on a stored id the registry has since dropped, the same direction
+ * {@link decisionModeOverridesSchema} refuses it going IN — an override nothing can act on must never
+ * silently authorise more than the point's own shipped default.
+ */
+export function resolveDecisionMode(
+  settings: ProjectSettings,
+  point: Pick<DecisionPoint, "id" | "defaultMode">,
+): DecisionMode {
+  const stored = settings.decisionModes?.[point.id];
+  return stored && (DECISION_MODES as readonly string[]).includes(stored) ? stored : point.defaultMode;
 }
 
 /**
@@ -1449,6 +1499,21 @@ export function mergeSettings(
     // Per CLASS, for the same reason.
     else if (k === "repairAutonomy") {
       next.repairAutonomy = { ...current.repairAutonomy, ...(v as object) };
+    }
+    // Per POINT, for the same reason: a client that renders only the points currently registered
+    // must not disarm the ones it didn't send. A point's value may be `null` — a per-point delete
+    // (see decisionModeOverridesSchema) — so a selection equal to the point's own default clears
+    // the override instead of pinning it as an explicit value.
+    else if (k === "decisionModes") {
+      // Prototype-free: a registered point named "__proto__" must land as an own property —
+      // assigning it on an ordinary object invokes the inherited prototype setter instead,
+      // which silently drops the override (the setter ignores a non-object/non-null value).
+      const merged: Record<string, DecisionMode> = Object.assign(Object.create(null), current.decisionModes);
+      for (const [id, mode] of Object.entries(v as Record<string, DecisionMode | null>)) {
+        if (mode === null) delete merged[id];
+        else merged[id] = mode;
+      }
+      next.decisionModes = merged;
     }
     else (next as Record<string, unknown>)[k] = v;
   }

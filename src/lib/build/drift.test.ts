@@ -19,6 +19,42 @@ vi.mock("./servers.mjs", async (importOriginal) => ({
   unstampedServers: vi.fn(async (): Promise<number[]> => []),
 }));
 
+/**
+ * Every worker thread the module under test started, as the path it was started from, plus how many
+ * are still up (anton-fzarz). The display read runs the identity scan off-thread, and "how many
+ * threads did this render cost" is the whole claim — one per read, shared across concurrent ones, and
+ * none left behind — so the constructor is counted rather than the timing observed.
+ *
+ * A subclass rather than a spy: `node:worker_threads` is ESM, whose namespace vitest cannot redefine.
+ */
+const spawnedWorkers: string[] = [];
+let openWorkers = 0;
+
+function liveWorkers(): number {
+  return openWorkers;
+}
+
+/**
+ * Named so a case that swaps this module out for a controllable fake (a race it must drive by hand
+ * rather than by timing) can restore it afterwards with the SAME factory — `vi.doUnmock` reverts to
+ * the real, uncounted module instead of this one, which would silently drop every later case back to
+ * an unmocked `Worker` (anton-fzarz review).
+ */
+async function countedWorkerThreadsMock(importOriginal: () => Promise<typeof import("node:worker_threads")>) {
+  const actual = await importOriginal();
+  class CountedWorker extends actual.Worker {
+    constructor(path: string | URL, options?: WorkerOptions) {
+      spawnedWorkers.push(String(path));
+      openWorkers++;
+      super(path, options);
+      this.once("exit", () => openWorkers--);
+    }
+  }
+  return { ...actual, Worker: CountedWorker };
+}
+
+vi.mock("node:worker_threads", countedWorkerThreadsMock);
+
 let dir: string;
 const realDb = process.env.ANTON_DB;
 
@@ -27,12 +63,19 @@ const recordPath = () => join(dir, `server-build.${process.pid}.json`);
 
 /**
  * A fresh module instance per case, in a process that has not booted a server — and boot is what's
- * under test. Resetting the registry is not enough to un-boot one: the boot identity is anchored on
- * `globalThis` precisely so it survives that (it has to cross Next's module registries), so the
- * anchor is cleared too.
+ * under test. Resetting the registry is not enough to un-boot one, or to clear what it cached: the
+ * boot identity and the on-disk read cache are anchored on `globalThis` precisely so they survive a
+ * registry reset (they have to cross Next's module registries), so those anchors are cleared too —
+ * otherwise a case run earlier in this file leaves its cached on-disk read for a later case sharing
+ * the same generation number to read back as its own. `warnedOffThread` is cleared for the same
+ * reason: it is process-wide by design (anton-fzarz review), so a case earlier in this file that hit
+ * the fallback path would otherwise suppress the warning assertion in a later one.
  */
 function unboot() {
   delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.bootedFrom")];
+  delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.onDiskCache")];
+  delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.onDiskInflight")];
+  delete (globalThis as unknown as Record<symbol, unknown>)[Symbol.for("anton.build.warnedOffThread")];
 }
 
 function freshModule() {
@@ -608,6 +651,13 @@ describe("serverBuildDrifts", () => {
     vi.resetModules(); // the request graph — a second instance of this module, in the same process
     const requestGraph = await import("./drift");
 
+    // The on-disk read cache is process-wide (anton-fzarz review) — exactly what a health render
+    // relies on to agree with the runner's own reads within the TTL — so the instrumentation graph's
+    // synchronous read above is still standing here. Past the TTL, same as the in-memory-fallback
+    // case, so this assertion is about the boot identity crossing registries, not a shared-cache hit.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000);
+
     const drifts = await requestGraph.serverBuildDrifts();
     expect(drifts).toHaveLength(1);
     expect(drifts[0]).toMatchObject({ pid: process.pid, self: true, runner: true });
@@ -884,5 +934,205 @@ describe("runnerBuildDrift", () => {
     writeFileSync(recordPath(), JSON.stringify({ ...mine, version: "0.0.1" }));
 
     expect((await runnerBuildDrift())?.state).toBe("outdated");
+  });
+});
+
+/**
+ * The display reads run the identity scan on a WORKER THREAD (anton-fzarz). `readBuildIdentity` spawns
+ * git synchronously — measured at 87–275 ms — and the health page and breaker band both read it on a
+ * 15-second cadence, so every operator refresh landing on a miss stalled every other request in the
+ * process behind it.
+ *
+ * What these cases hold is that moving the read off the loop changed no VERDICT: the same freshness
+ * rules — the generation invalidation, the shared in-flight read, the synchronous gate — answer
+ * exactly as they did, and an install that cannot start a thread still gets an answer.
+ */
+describe("off-thread identity reads", () => {
+  /** The worker constructions this case caused, as the paths they were started from. */
+  function workerPaths(): string[] {
+    return [...spawnedWorkers];
+  }
+
+  it("reads the code on disk on a worker thread rather than on the calling loop", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    spawnedWorkers.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000); // past the TTL, so this render must actually read
+
+    await serverBuildDrifts();
+
+    expect(workerPaths()).toHaveLength(1);
+    expect(workerPaths()[0]).toMatch(/src[/\\]lib[/\\]build[/\\]identity-worker\.mjs$/);
+  });
+
+  // The worker is one-shot: it posts one identity and exits, so nothing holds a thread — or a module
+  // graph of a runtime dir `anton update` is free to delete — open between reads.
+  it("starts one worker per read and leaves none running", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    spawnedWorkers.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+
+    vi.setSystemTime(Date.now() + 60_000);
+    await serverBuildDrifts();
+    vi.setSystemTime(Date.now() + 60_000);
+    await serverBuildDrifts();
+
+    expect(workerPaths()).toHaveLength(2);
+    expect(liveWorkers()).toBe(0);
+  });
+
+  // The whole point of the cache survives the move off-thread: a second render inside the window
+  // must not start a thread at all, or the 15-second rate limit would buy nothing.
+  it("answers a render inside the window from the cache, with no worker at all", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    spawnedWorkers.length = 0;
+
+    await serverBuildDrifts();
+    await serverBuildDrifts();
+
+    expect(workerPaths()).toHaveLength(0);
+  });
+
+  // Concurrent misses are the case the thread cost actually lands on: a thread per in-flight request
+  // is the multiplication this indirection exists to avoid. They share ONE read.
+  it("collapses concurrent misses into a single worker", async () => {
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    spawnedWorkers.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000);
+
+    const [first, second, third] = await Promise.all([serverBuildDrifts(), serverBuildDrifts(), serverBuildDrifts()]);
+
+    expect(workerPaths()).toHaveLength(1);
+    expect(first).toEqual(second);
+    expect(second).toEqual(third);
+  });
+
+  // The freshness rule the async read must not weaken (PR #217 review): a read that STARTED before
+  // the pull answers as it was taken, and the caller arriving after the pull gets its own worker
+  // rather than inheriting the pre-pull one.
+  it("does not hand a read started before the checkout moved to a caller arriving after it", async () => {
+    const app = join(dir, "app");
+    mkdirSync(app, { recursive: true });
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    const { checkoutMoved, recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: true });
+    spawnedWorkers.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000);
+
+    const inflight = serverBuildDrifts();
+    checkoutMoved(app);
+    const afterPull = serverBuildDrifts();
+    await Promise.all([inflight, afterPull]);
+
+    // Two reads for two generations — the pre-pull one is never reused across the invalidation.
+    expect(workerPaths()).toHaveLength(2);
+  });
+
+  // The gate is deliberately NOT moved off-thread (the ticket's own boundary): it runs off the request
+  // path, where a thread spawn would only add latency, and it must answer from a read taken after the
+  // pull it is asking about — which a shared async read cannot promise.
+  it("leaves the job-start gate reading synchronously", async () => {
+    const { recordServerBuild, serverBuildDrift } = await freshModule();
+    recordServerBuild({ runner: true });
+    spawnedWorkers.length = 0;
+
+    expect(serverBuildDrift({ fresh: true })).toBeNull();
+
+    expect(workerPaths()).toHaveLength(0);
+  });
+
+  // The race the ordering fix in `storeOnDisk` closes: an external `git pull` fires no
+  // `checkoutMoved`, so a display read the health page started BEFORE the pull and the gate's
+  // synchronous `fresh` read the pull's own caller takes AFTER it share one generation. Landing
+  // second in real time but issued first, the display read must lose the cache slot — or the gate's
+  // correct, post-pull store gets overwritten and every render inside the TTL reports the running
+  // server current again.
+  it("does not let a display read started before a pull overwrite the gate's post-pull store", async () => {
+    const app = join(dir, "app");
+    vi.stubEnv("ANTON_APP_ROOT", app);
+    let onDisk = { version: "0.4.0", revision: null };
+    vi.resetModules();
+    unboot();
+    const identity = await vi.importActual<typeof import("./identity.mjs")>("./identity.mjs");
+    vi.doMock("./identity.mjs", () => ({ ...identity, readBuildIdentity: () => onDisk }));
+
+    // A property, not a bare `let`: TS's control-flow narrowing sees this reassigned only inside the
+    // fake worker's `once` closure, never in this function's own linear flow, and would otherwise keep
+    // treating it as statically `null` right through the calls between the assignment and its use.
+    const worker: { deliver: ((value: unknown) => void) | null } = { deliver: null };
+    vi.doMock("node:worker_threads", () => ({
+      Worker: class {
+        once(event: string, cb: (value: unknown) => void) {
+          if (event === "message") worker.deliver = cb;
+        }
+        terminate() {
+          return Promise.resolve();
+        }
+      },
+    }));
+
+    const { recordServerBuild, serverBuildDrift, serverBuildDrifts } = await import("./drift");
+    // Restoring the real, counted worker must run even if an assertion below throws — a failure here
+    // is exactly the regression this test exists to catch, and leaving the bare-bones fake mocked in
+    // via `vi.doMock` would then break every later case in this file, masking the real failure
+    // (vi.resetModules() re-evaluates modules but does not undo a `doMock` factory registration).
+    try {
+      recordServerBuild({ runner: true }); // stamps "running" at 0.4.0 and fills the cache with it
+
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(Date.now() + 60_000); // past the TTL, so the render below must actually read
+
+      const displayRead = serverBuildDrifts(); // issued first — the worker is spawned, `deliver` is set
+
+      onDisk = { version: "0.4.1", revision: null }; // the external pull; nothing calls checkoutMoved
+      expect(serverBuildDrift({ fresh: true })?.state).toBe("outdated"); // the gate, issued after, stores 0.4.1
+
+      worker.deliver?.({ version: "0.4.0", revision: null }); // the slower read finally answers, with the STALE identity
+      const drifts = await displayRead;
+
+      // A render inside the window must still see the fresher, gate-stored identity — not the stale one
+      // the slower read delivered second, which would otherwise compare equal to "running" and go silent.
+      expect(serverBuildDrift()?.state).toBe("outdated");
+
+      // The IN-FLIGHT render's own resolved value must carry the same, fresher verdict — not the stale
+      // identity the worker delivered — since `serverBuildDrifts` caches whatever this promise resolves
+      // to for the next 15s. A losing read that returned its own stale value here would compare
+      // "0.4.0 running" against "0.4.0 stale disk" as current, banner nothing, and freeze that silence
+      // in the cache for the rest of the window (anton-fzarz review).
+      expect(drifts.find((d) => d.self)?.drift.state).toBe("outdated");
+    } finally {
+      // `vi.doUnmock` would instead revert to the unmocked module, silently dropping later cases'
+      // worker counts to zero — re-registering the same counted factory keeps counting intact.
+      vi.doMock("node:worker_threads", countedWorkerThreadsMock);
+    }
+  });
+
+  // An install whose worker file is missing — or a platform that refuses a thread — must still get a
+  // verdict. A display surface that reports nothing is the silence this whole module exists to end,
+  // so the blocking read stands in, and says so once rather than degrading in silence.
+  it("falls back to the synchronous read when no worker can be started", async () => {
+    const app = join(dir, "no-worker");
+    mkdirSync(join(app, ".next"), { recursive: true });
+    writeFileSync(join(app, "package.json"), JSON.stringify({ version: "0.4.0" }));
+    vi.stubEnv("ANTON_APP_ROOT", app); // a root with no src/lib/build/identity-worker.mjs under it
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { recordServerBuild, serverBuildDrifts } = await freshModule();
+    recordServerBuild({ runner: false });
+    writeFileSync(recordPath(), JSON.stringify({ ...JSON.parse(readFileSync(recordPath(), "utf8")), version: "0.0.1" }));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 60_000);
+
+    const drifts = await serverBuildDrifts();
+
+    // The verdict is the same one the worker would have produced — read on this loop instead.
+    expect(drifts).toHaveLength(1);
+    expect(drifts[0].drift.onDisk.version).toBe("0.4.0");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("identity-worker.mjs"), expect.anything());
   });
 });

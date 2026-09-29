@@ -8,6 +8,10 @@
  * operators share. Nothing here decides WHICH tickets move; see review-fix-rehome.ts for that.
  */
 import { beads, LABELS, ownerOf, type Bead } from "../beads/bd";
+import { withBeadWriteLock } from "../beads/claim-lock";
+import { extractOutcomeIdsSection, outcomeIdsOf } from "../backlog";
+import { beadSkeleton } from "../beads/formula";
+import { unterminatedCloser } from "../beads/markdown";
 import { olderOf, tryList, type ReadBead } from "./review-fix-board";
 import { safe } from "./safe";
 
@@ -98,12 +102,56 @@ export async function resolveFollowUp(
   const election = await electFollowUp(ctx, board);
   if (!election.ok) return election;
   const strandedRival = await reconcileLosers(ctx, election.losers, board);
-  if (election.reused)
+  if (election.reused) {
+    if (!(await reconcileReusedContract(ctx, election.reused)))
+      return { ok: false, unfinished: ctx.epic.id };
     return {
       ok: true,
       home: { id: election.reused.id, disposable: true, board, strandedRival },
     };
+  }
   return createFollowUp(ctx, board, strandedRival);
+}
+
+/**
+ * Patch `## Outcome IDs` onto a reused follow-up that predates it (anton-cdeki) — the same repair
+ * orphan-grooming's own reuse path applies to ITS reused epic (orphan-grooming.ts), for the same
+ * reason: this bead is found by its {@link REHOME_OF} stamp, never by contract shape, so a
+ * follow-up an earlier, pre-outcome-ids version of this job created would otherwise stay stuck
+ * missing the section forever. NOT best-effort: once the caller moves the remaining tickets onto
+ * this bead and closes the merged source, no later sweep ever re-selects that closed epic to retry
+ * the patch, so a failed update here must hold finalization back rather than let the caller reach a
+ * runnable epic that permanently lacks the section.
+ *
+ * Locked, and re-read inside the lock (PR #334 review, mirroring orphan-grooming's own reuse
+ * repair): `reused` is a snapshot from {@link electFollowUp}'s read, and `reconcileLosers` runs an
+ * awaited round trip between that read and this patch — a founder editing this bead's description
+ * in that window must not have their edit silently discarded by `beads.update` replacing the whole
+ * field with the stale copy.
+ */
+async function reconcileReusedContract(ctx: FollowUpContext, reused: Bead): Promise<boolean> {
+  return withBeadWriteLock(ctx.repo, reused.id, async () => {
+    const fresh = await ctx.reread(reused.id);
+    if (!fresh) return false;
+    const description = fresh.description ?? "";
+    if (extractOutcomeIdsSection(description).present) return true;
+    const outcomeIds = outcomeIdsOf(ctx.epic);
+    const kept = description.trimEnd();
+    const closer = unterminatedCloser(kept);
+    const patched = [
+      kept,
+      ...(closer ? [closer] : []),
+      ``,
+      `## Outcome IDs`,
+      ``,
+      // Direct patch, not a formula render — unlike newFollowUpEpic's placeholder dance
+      // ({@link blankOutcomeIdsPlaceholder}), an empty id list here is written genuinely empty.
+      ...(outcomeIds.length > 0 ? [outcomeIds.map((id) => `outcome:${id}`).join(", ")] : []),
+    ].join("\n");
+    return safe(() =>
+      beads.update(ctx.repo, reused.id, { description: patched }, fresh.labels ?? []),
+    );
+  });
 }
 
 /**
@@ -224,15 +272,32 @@ async function createFollowUp(
 /**
  * The follow-up bead itself. Deliberately NOT `approved`: approval is the founder's gate, and
  * re-running work a run already failed to deliver — after a timeout, possibly needing re-scoping
- * first — is exactly the decision that gate exists for. It carries the epic-tier contract (an
- * outcome and Success Criteria) so the approve route and execute-epic's own gate admit it rather
- * than refusing a target anton wrote.
+ * first — is exactly the decision that gate exists for. It carries the full epic-tier contract
+ * (an outcome, Success Criteria, and Outcome IDs) so the approve route and execute-epic's own gate
+ * admit it rather than refusing a target anton wrote — and rendering through {@link beadSkeleton}
+ * is what keeps this in step with the formula's own `epic` step, rather than a hand-rolled
+ * description the contract gate never sees drift from it (src/prompts/BEADS.md).
  */
 async function newFollowUpEpic(
   ctx: FollowUpContext,
 ): Promise<string | undefined> {
   const area = areaLabelOf(ctx.epic, ctx.all);
+  const outcomeIds = outcomeIdsOf(ctx.epic);
   try {
+    const skeleton = await beadSkeleton(ctx.repo, "epic", {
+      outcome:
+        `The pull request for ${ctx.epic.id} merged without ${ctx.ids}. The run that opened it ran ` +
+        `out of time, so that work is in no diff — this epic is its home, because a ticket parented ` +
+        `to an already-merged target is not something anton can run.\n\n` +
+        `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
+        `first if the timeout means they were too big.` +
+        (outcomeIds.length === 0
+          ? `\n\n${ctx.epic.id} predates \`.product/PRODUCT.md\`'s outcome ids, so none carries over ` +
+            `to this follow-up's \`## Outcome IDs\` below — it's left blank rather than guessed at.`
+          : ""),
+      success_criteria: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
+      outcome_ids: outcomeIdsBody(outcomeIds),
+    });
     return await beads.create(ctx.repo, {
       title: `${ctx.epic.title} — undelivered tickets`,
       type: "epic",
@@ -242,17 +307,47 @@ async function newFollowUpEpic(
       // Written in the SAME call as the bead, so no window exists in which the follow-up is on the
       // board without the stamp a retry finds it by.
       metadata: { [REHOME_OF]: ctx.epic.id },
-      description:
-        `The pull request for ${ctx.epic.id} merged without ${ctx.ids}. The run that opened it ran ` +
-        `out of time, so that work is in no diff — this epic is its home, because a ticket parented ` +
-        `to an already-merged target is not something anton can run.\n\n` +
-        `Approve this epic to have anton pick the work back up; re-scope or close the tickets ` +
-        `first if the timeout means they were too big.`,
-      acceptance: `- [ ] Every ticket below is delivered, or closed as no longer wanted.`,
+      description: blankOutcomeIdsPlaceholder(skeleton.description, outcomeIds),
+      acceptance: skeleton.acceptance,
     });
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Non-empty stand-in for "no outcome ids to carry over", passed as the `outcome_ids` template var
+ * so the formula's own var-resolution never falls back to its `outcome_ids` default (a "TODO —
+ * which outcome(s)..." prompt meant for a human filling in a draft) — that default is exactly as
+ * tokenizable as prose, so relying on it here would trade one fallback-corrupts-labels bug for
+ * another. {@link blankOutcomeIdsPlaceholder} strips it back out post-render, so the persisted
+ * section lands genuinely empty.
+ */
+const NO_OUTCOME_IDS_PLACEHOLDER = "outcome-ids-none";
+
+/**
+ * The follow-up's `## Outcome IDs` body. Mirrors {@link followUpWhy}'s split in rework-notes.ts:
+ * `outcomeIds` is empty for a merged target that predates outcome ids ({@link outcomesConfigured}
+ * exempts a fresh draft from the same gap), so there is nothing to carry over as a label.
+ */
+export function outcomeIdsBody(outcomeIds: string[]): string {
+  return outcomeIds.length > 0
+    ? outcomeIds.map((id) => `outcome:${id}`).join(", ")
+    : NO_OUTCOME_IDS_PLACEHOLDER;
+}
+
+/**
+ * Remove the {@link NO_OUTCOME_IDS_PLACEHOLDER} from a rendered description, leaving its `## Outcome
+ * IDs` section truly empty (PR #334 review) rather than filled with prose — the "why" lives in the
+ * `outcome` narrative instead (see {@link newFollowUpEpic}). An empty section is what `outcomeIdsOf`
+ * (backlog.ts) already reads as zero ids, so if THIS follow-up is itself later the target of another
+ * send-back, that re-read yields `[]` instead of tokenizing a sentence into bogus `outcome:<word>`
+ * labels.
+ */
+export function blankOutcomeIdsPlaceholder(description: string, outcomeIds: string[]): string {
+  return outcomeIds.length > 0
+    ? description
+    : description.replace(NO_OUTCOME_IDS_PLACEHOLDER, "").trimEnd();
 }
 
 /**

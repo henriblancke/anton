@@ -119,6 +119,7 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
       promptBodyDigest: reasoning.promptBodyDigest,
       skillId: reasoning.skillId,
       skillDigest: reasoning.skillDigest,
+      skillIsDefault: reasoning.skillIsDefault,
     },
     failure: (text) => `claude reported an error for step ${stepId}: ${text ?? "unknown"}`,
   });

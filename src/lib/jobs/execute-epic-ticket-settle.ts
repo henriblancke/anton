@@ -19,7 +19,7 @@ import { blockNoteEvidence } from "../beads/block-note";
 import { swapUnderLock } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { shortSha, type SatisfiedBy } from "../beads/satisfied-note";
-import { formatAntonResult, type AntonResult } from "../claude/anton-result";
+import type { AntonResult } from "../claude/anton-result";
 import {
   describeCommit,
   preservedCommitPrefix,
@@ -35,14 +35,19 @@ import { isUsageLimitError, PoisonEpic } from "./errors";
 import {
   BlockedByAgentError,
   CancelledAskError,
+  holdsRecoverableWork,
   NeedsHumanError,
   NoDeliveryError,
   ParkedOnPrereqError,
   ReorderedOnPrereqError,
   RepairedBlockError,
+  selfReportSuffix,
+  StashBaselineUnreadableError,
+  StashedWorkError,
   TicketRetiredError,
   TicketTimeoutError,
   WorktreeDirtyError,
+  type RecoverableWork,
 } from "./execute-epic-errors";
 import { mustPersist, mustRead } from "./execute-epic-persist";
 import { safe } from "./safe";
@@ -75,6 +80,16 @@ export interface TicketProgress {
    * delivery-evidence gate, never replaces it; a missing/unparseable line (null) falls through to it.
    */
   selfReport: AntonResult | null;
+  /**
+   * The yield-shaped tools a dispatching step's session armed on its LAST message while emitting no
+   * self-report (anton-wjfkn) — `ScheduleWakeup`, `Monitor`, a `run_in_background` call.
+   *
+   * Set only for the stop, never as history: an autonomous ticket session gets no wake-up, so a
+   * session that ends this way stopped mid-work and the walk raises {@link AgentYieldedError} at the
+   * step that did it. Absent — not `[]` — for every ordinary session, so the walk's check reads as the
+   * yes/no it is.
+   */
+  yielded?: readonly string[];
   /**
    * The ticket as the agent behind {@link selfReport} was PROMPTED with it — the snapshot plus the
    * notes read at dispatch (steps/agent.ts `readForDispatch`). The `already-shipped` repair fences
@@ -158,6 +173,16 @@ interface TicketFailureKinds {
   noDelivery: boolean;
   agentBlocked: boolean;
   /**
+   * The stop left UNCOMMITTED work behind (anton-wjfkn) — stashed, or loose in the tree because the
+   * agent handed its turn back mid-work.
+   *
+   * A human-review state like the two above, and blocked for the same reason: nothing landed, so
+   * reopening would re-queue the ticket into the ready pool and hide a stop that has work sitting in a
+   * worktree. What it is NOT is a zero diff, and every reader that acts on the distinction — the block
+   * note's remedy, the worktree teardown — reads this rather than inferring it from `noDelivery`.
+   */
+  recoverableWork: boolean;
+  /**
    * The ask is the RUN's wait, never the ticket's state (anton-287p.3). The run parks behind a human
    * gate and resumes THIS row once a person resolves it — and a `blocked` ticket is not claimable,
    * so blocking it would make that resume impossible: the resumed run dies on `bd update --claim`
@@ -165,6 +190,19 @@ interface TicketFailureKinds {
    * re-claims. What a human owes is on the gate, not on this bead.
    */
   needsHuman: boolean;
+}
+
+/**
+ * Which recoverable-work stop this is (anton-wjfkn, PR #333 review round 2) — the session log tag and
+ * the bead's block `kind` both have to tell the three classes apart, so the mapping lives in one place
+ * rather than drifting between two separate ternaries. Only meaningful once `holdsRecoverableWork(e)`
+ * is already known true; falls back to `"agent-yielded"` for anything else, exactly as the two
+ * call sites' own ternaries always have.
+ */
+function recoverableWorkKind(e: unknown): "stashed-work" | "agent-yielded" | "baseline-unreadable" {
+  if (e instanceof StashedWorkError) return "stashed-work";
+  if (e instanceof StashBaselineUnreadableError) return "baseline-unreadable";
+  return "agent-yielded";
 }
 
 /** Every way a ticket stops short, and what each owes the board. Always throws. */
@@ -196,11 +234,19 @@ export async function settleFailedTicket(args: {
     noDelivery: e instanceof NoDeliveryError,
     agentBlocked: e instanceof BlockedByAgentError,
     needsHuman: e instanceof NeedsHumanError,
+    recoverableWork: holdsRecoverableWork(e),
   };
   if (kinds.noDelivery) {
     await appendSessionLog(logPath, `[no-delivery] ${(e as Error).message}\n`).catch(() => {});
   } else if (kinds.agentBlocked) {
     await appendSessionLog(logPath, `[agent-blocked] ${(e as Error).message}\n`).catch(() => {});
+  } else if (kinds.recoverableWork) {
+    // Named for what it is rather than folded into `[no-delivery]` (anton-wjfkn): a reader tailing
+    // this log is the one deciding whether to go looking for the work, and the two lines send them
+    // opposite ways.
+    await appendSessionLog(logPath, `[${recoverableWorkKind(e)}] ${(e as Error).message}\n`).catch(
+      () => {},
+    );
   }
   await settleTicketTimeout({
     run,
@@ -211,6 +257,7 @@ export async function settleFailedTicket(args: {
     timeoutMs,
     standalone,
     ranOutOfTime,
+    recoverableWork: kinds.recoverableWork,
   });
   await settleAbortedTicket({ run, ticket, session, e });
   // Attempted only AFTER the abort path has had its say: a ticket someone killed or abandoned is
@@ -353,8 +400,16 @@ export async function settleTicketTimeout(args: {
   timeoutMs: number;
   standalone: boolean;
   ranOutOfTime: boolean;
+  /**
+   * The deadline's own failure is a `StashedWorkError`/`AgentYieldedError` (anton-wjfkn, PR #333
+   * review): the ticket's stop already carries uncommitted work the caller's own recoverable-work
+   * path knows how to settle — name the stashes, keep the worktree, never touch the tree. Passed by
+   * the caller (which already classifies `e` for its own session log) rather than derived from an
+   * `e` this function would otherwise need to accept just to ask.
+   */
+  recoverableWork: boolean;
 }): Promise<void> {
-  const { run, ticket, session, baseline, timeoutMs, standalone, ranOutOfTime } = args;
+  const { run, ticket, session, baseline, timeoutMs, standalone, ranOutOfTime, recoverableWork } = args;
   const { ctx, worktreePath, branch } = run;
   const repo = run.repoPath;
   const { logPath } = session;
@@ -366,7 +421,14 @@ export async function settleTicketTimeout(args: {
   const { committed, delivered } = args.progress;
   // `!ctx.signal.aborted` breaks the tie when both fired: an operator's kill outranks the budget,
   // and the abort path is the one that writes nothing to a board a human is deciding on.
-  if (ranOutOfTime && !ctx.signal.aborted) {
+  //
+  // `!recoverableWork` breaks a second tie the same way (PR #333 review): the deadline can fire while
+  // `yieldedMidWork`/`refuseStashedDelivery` is still listing or applying stashes, and the resulting
+  // error's OWN `holdsRecoverableWork` handling — reached via the caller's ordinary fall-through to
+  // `releaseFailedTicket` — already names the stashes and keeps the worktree. Falling into the
+  // rollback below instead would hard-reset the tree onto `baseline` and erase what that recovery
+  // just restored, then supersede the error with a bare `TicketTimeoutError` that says nothing of it.
+  if (ranOutOfTime && !ctx.signal.aborted && !recoverableWork) {
     // A delivery with no commit of its own is a SATISFIED step the deadline caught between the
     // gate's acceptance and its close (PR #253 review). Settled here exactly as the close would have
     // — resolved against the repository — so the run's ledger and the bead both learn which commit
@@ -750,7 +812,7 @@ async function releaseFailedTicket(args: {
   const { run, ticket, session, e } = args;
   const repo = run.repoPath;
   const { committed, selfReport } = args.progress;
-  const { noDelivery, agentBlocked, needsHuman } = args.kinds;
+  const { noDelivery, agentBlocked, needsHuman, recoverableWork } = args.kinds;
   if (isUsageLimitError(e)) return;
   // A RETIRED bead (anton-5bpd) is SETTLED, not released: the repair closed it as superseded by the
   // work that actually shipped it. Both branches below would undo that — `blocked` rewrites a
@@ -788,22 +850,28 @@ async function releaseFailedTicket(args: {
   // take the same gate, not the reclaimable-without-review path meant for a ticket that changed
   // nothing at all.
   const boardOnlyNoDelivery = noDelivery && !committed && isBoardOnlyRun(run, ticket);
-  if ((committed || noDelivery || agentBlocked) && !needsHuman && !staysClaimable) {
+  if ((committed || noDelivery || agentBlocked || recoverableWork) && !needsHuman && !staysClaimable) {
     await blockFailedTicket({
       run,
       ticket,
       sessionId: session.sessionId,
-      kind: boardOnlyNoDelivery
-        ? "board-only-no-evidence"
-        : noDelivery
-          ? "no-delivery"
-          : agentBlocked
-            ? "agent-blocked"
-            : "post-commit",
+      // Checked ahead of `committed`'s `post-commit` fallback: a stashed or yielded stop can also
+      // carry an earlier step's commit, and the remedy an operator needs is the one that names the
+      // uncommitted work — the commit is already on the branch and safe.
+      kind: recoverableWork
+        ? recoverableWorkKind(e)
+        : boardOnlyNoDelivery
+          ? "board-only-no-evidence"
+          : noDelivery
+            ? "no-delivery"
+            : agentBlocked
+              ? "agent-blocked"
+              : "post-commit",
       committed,
       selfReport,
       error: e,
       keepOpen: boardOnlyNoDelivery,
+      ...(recoverableWork ? { recoverable: e as RecoverableWork } : {}),
     });
   } else {
     await safe(() => beads.setStatus(repo, ticket.id, "open"));
@@ -961,6 +1029,8 @@ async function blockFailedTicket(args: {
   selfReport: AntonResult | null;
   error: unknown;
   keepOpen?: boolean;
+  /** The uncommitted work this stop is holding (anton-wjfkn) — the shas the note must name. */
+  recoverable?: RecoverableWork;
 }): Promise<void> {
   const { run, ticket, sessionId, kind, committed, selfReport, error, keepOpen } = args;
   const repo = run.repoPath;
@@ -996,7 +1066,24 @@ async function blockFailedTicket(args: {
     beads.note(
       repo,
       ticket.id,
-      ticketBlockNote({ kind, selfReport, error, sessionId, branch: run.branch, committed, head }),
+      ticketBlockNote({
+        ticketId: ticket.id,
+        kind,
+        selfReport,
+        error,
+        sessionId,
+        branch: run.branch,
+        committed,
+        head,
+        stashes: args.recoverable?.stashes,
+        restoreFailures: args.recoverable?.restoreFailures,
+        // Threaded through rather than dropped (anton-wjfkn, PR #333 review round 3): a failed final
+        // stash read leaves `stashes` empty for lack of a read, not because the stack is confirmed
+        // empty, and the durable bead note must say so rather than claim the worktree is the whole
+        // story.
+        readFailed: args.recoverable?.readFailed,
+        worktreePath: args.recoverable ? run.worktreePath : undefined,
+      }),
     ),
   );
   // Same reasoning as `blockTimedOutTicket`'s own unmarked halt: the note above carries the
@@ -1019,24 +1106,6 @@ async function blockFailedTicket(args: {
         `reclaim. Check the beads DB, then resume the run`,
     );
   }
-}
-
-/** Fold the parsed self-report into a zero-diff block reason, when one was emitted (anton-j5i8). */
-export function selfReportSuffix(selfReport: AntonResult | null): string {
-  if (!selfReport) return "";
-  if (selfReport.outcome === "delivered") {
-    return ` The agent self-reported ANTON-RESULT: delivered — a false success on an unchanged tree.`;
-  }
-  // A satisfied claim only reaches a no-delivery message when the branch did not bear it out
-  // (anton-nuft): the gate settles a verified one before any message is composed.
-  if (selfReport.outcome === "satisfied") {
-    return (
-      ` The agent self-reported ANTON-RESULT: ${formatAntonResult(selfReport)}, but that names no ` +
-      `commit this run's branch added over its base, so the claim is unverified — a false success ` +
-      `on an unchanged tree.`
-    );
-  }
-  return ` The agent self-reported ${formatAntonResult(selfReport)}, corroborating the block.`;
 }
 
 /**
@@ -1063,7 +1132,16 @@ export type TicketBlockKind =
   | "no-delivery"
   | "agent-blocked"
   | "post-commit"
-  | "board-only-no-evidence";
+  | "board-only-no-evidence"
+  /** The tree carried gained stash entries (anton-wjfkn) — recover, don't re-implement. The tree may
+   * be wholly empty, or carry a commit that is only part of the change (PR #333 review round 2). */
+  | "stashed-work"
+  /** The agent ended its turn to wait on a background job (anton-wjfkn) — its work is loose in the tree. */
+  | "agent-yielded"
+  /** anton could not read the stash baseline before this ticket's steps ran (anton-wjfkn, PR #333
+   * review round 2) — whether the checkout already held work is unknown, so it is kept rather than
+   * guessed at. */
+  | "baseline-unreadable";
 
 /**
  * The operator-facing note left on a ticket the run blocked (anton-vqql).
@@ -1079,6 +1157,11 @@ export type TicketBlockKind =
  * alone — never an empty quote, never the string "undefined".
  */
 export function ticketBlockNote(args: {
+  /** The ticket this note is written to — named in the recoverable-work remedy below (PR #333 review):
+   * `blockFailedTicket` always leaves the bead `blocked`, which bd's claim gate refuses, so the
+   * remedy must say to reopen it, not just to resume. Optional because only that remedy reads it;
+   * a caller that never reaches `stashed-work`/`agent-yielded` has no reason to supply one. */
+  ticketId?: string;
   kind: TicketBlockKind;
   /** The agent's parsed `ANTON-RESULT` line, when it emitted one. */
   selfReport: AntonResult | null;
@@ -1090,8 +1173,28 @@ export function ticketBlockNote(args: {
   committed: boolean;
   /** The committed tip, full sha; absent when the HEAD read failed. */
   head?: string;
+  /**
+   * The stash commits a `stashed-work` (or stash-carrying `agent-yielded`) stop is holding, newest
+   * first — the ONLY durable copy of the change, so the note names them in full: this bead is where an
+   * operator meets the stop, and a sha they cannot read off it is a sha they have to go find.
+   */
+  stashes?: readonly string[];
+  /**
+   * Which of `stashes` anton tried to reapply into the worktree and could NOT — see
+   * {@link RecoverableWork}. Undefined/empty reads as "every entry landed", which is also the honest
+   * answer when there was nothing to restore at all (an `agent-yielded` stop with no stash).
+   */
+  restoreFailures?: readonly string[];
+  /**
+   * Whether the stash list itself could not be read (anton-wjfkn, PR #333 review round 3) —
+   * {@link RecoverableWork.readFailed}. `stashes` empty then means UNKNOWN, not confirmed-none, and
+   * the note must say so rather than tell the operator the worktree is the only copy.
+   */
+  readFailed?: boolean;
+  /** The worktree kept for that recovery — the path the note sends the operator to. */
+  worktreePath?: string;
 }): string {
-  const { kind, sessionId, branch, committed, head } = args;
+  const { ticketId, kind, sessionId, branch, committed, head } = args;
   const reason = blockNoteDetail(args.selfReport?.reason ?? "");
   // A reason that flattens to nothing is NO reason — drop it, so the rendering falls back to the
   // category text rather than trailing an empty quote or a dangling dash.
@@ -1119,13 +1222,132 @@ export function ticketBlockNote(args: {
             ? failure
             : `${failure || "board-only ticket found no evidence of delivery"} — left open (not ` +
               `blocked) so a resumed run can reclaim and retry it without a manual status edit.`
-          : `run failed after committing work — needs review.` +
-            (failure ? ` It failed with: ${failure}` : "");
+          : kind === "stashed-work" || kind === "agent-yielded" || kind === "baseline-unreadable"
+            ? recoverableWorkBody(
+                ticketId ?? "<id>",
+                kind,
+                args.stashes ?? [],
+                args.restoreFailures ?? [],
+                args.worktreePath,
+                selfReport,
+                committed,
+                args.readFailed ?? false,
+              )
+            : `run failed after committing work — needs review.` +
+              (failure ? ` It failed with: ${failure}` : "");
 
   // Written through the shared grammar: the board's park gate reads this clause back to tell a
   // committed block (review and close) from a zero-diff one (reopen and re-run) — see block-note.ts.
   return blockNoteOneLine(
     `anton: ${body} [${blockNoteEvidence({ sessionId, branch, committed, head })}]`,
+  );
+}
+
+/**
+ * What a `stashed-work` / `agent-yielded` block tells the operator (anton-wjfkn): where the work is,
+ * and that the move is to RECOVER it — not to re-implement the ticket.
+ *
+ * The distinction is the whole point of these two kinds. A zero-diff note's remedy sends a person to
+ * implement the ticket from scratch; here the change exists, and doing that would throw it away or
+ * duplicate it. The stash shas are spelled out because this bead is the durable record: the run row's
+ * park text ages out of an operator's attention long before the bead does, and a stash entry nobody
+ * can name is a stash entry nobody recovers.
+ *
+ * "Do NOT re-implement it from scratch" LEADS the message rather than closing it (anton-wjfkn round 3
+ * review): this note is also read back through `execute-epic-board.ts`'s `clampNote`, which caps a
+ * held ticket's surfaced note at 300 characters for the run-row park — and a realistic instance of this
+ * body (a worktree path plus one or two 40-hex shas) runs past that cap. A trailing warning is exactly
+ * the clause a cap cuts, and it is the one sentence this whole note exists to deliver: the alternative
+ * reading — "run delivered nothing" — is what sent an operator to redo the 2026-09-27 incident's work
+ * in the first place. The full note, shas and commands included, is always still readable via
+ * `bd show <id>`; only the CLAMPED surface is at risk, and only the lead sentence is safe there.
+ *
+ * The restoration claim is equally load-bearing and equally capable of being wrong: `applyStashEntry`
+ * can fail (a conflict against the tree the entry was made from, a corrupt entry), and a note that says
+ * "anton put the work back" over a failed apply sends the operator to a worktree that does NOT hold the
+ * change — only the stash stack does. `restoreFailures` (a subset of `stashes`) is what tells this
+ * function which case it is actually in.
+ */
+function recoverableWorkBody(
+  ticketId: string,
+  kind: "stashed-work" | "agent-yielded" | "baseline-unreadable",
+  stashes: readonly string[],
+  restoreFailures: readonly string[],
+  worktreePath: string | undefined,
+  /**
+   * The agent's own self-report, when it emitted one (PR #333 review): dropped from this body before
+   * this parameter existed, even though the `no-delivery` and `agent-blocked` bodies both carry
+   * theirs — the one place an operator reading `bd show <id>` could see what the agent last claimed,
+   * for a stop whose run-row `error` (where `AgentYieldedError`/`StashedWorkError` otherwise put it)
+   * ages out of attention long before the bead does.
+   */
+  selfReport: AntonResult | null,
+  /**
+   * Whether this ticket's work landed on the branch too (anton-wjfkn, PR #333 review round 2) — a
+   * `stashed-work` stop can now carry a real commit alongside the gained stash (a partial commit plus
+   * a partial stash), and the closing verdict must not tell the operator nothing was committed when
+   * something plainly was.
+   */
+  committed: boolean,
+  /**
+   * The stash list itself could not be read (anton-wjfkn, PR #333 review round 3) — `stashes` is `[]`
+   * because nothing could be confirmed, not because the stack is confirmed empty. Always true for
+   * `baseline-unreadable`; only sometimes true for `agent-yielded`, whose FINAL read can independently
+   * fail after a successful earlier one.
+   */
+  readFailed: boolean,
+): string {
+  const where = worktreePath ? ` in \`${worktreePath}\`` : ``;
+  const restoredCount = stashes.length - restoreFailures.length;
+  const stashClause =
+    stashes.length > 0
+      ? ` The agent had stashed it: ${stashes.map((sha) => `\`${sha}\``).join(", ")} — read one with ` +
+        `\`git stash show -p <sha>\`, restore it with \`git stash apply <sha>\`.`
+      : readFailed
+        ? ` Whether anything was stashed is UNKNOWN — reading the worktree's stash list failed, so an ` +
+          `entry could be sitting on the stack invisible to this note. Check \`git stash list\` in ` +
+          `the worktree by hand before assuming this note has the whole picture.`
+        : ``;
+  const opening =
+    kind === "stashed-work"
+      ? committed
+        ? `run committed only PART of its work — the agent also STASHED the rest, so the commit on ` +
+          `the branch is not the whole change.`
+        : `run delivered nothing because the agent STASHED its own work — the empty tree was work set ` +
+          `aside, not work never done.`
+      : kind === "agent-yielded"
+        ? `the agent ENDED ITS TURN to wait on a background job and never reported an outcome, so it ` +
+          `stopped mid-work while its session exited cleanly.`
+        : // Deliberately silent on WHEN the read failed (PR #333 review round 3): this kind now covers
+          // both the baseline read (before any step ran) and the delivery gate's own read (after the
+          // commit step, possibly over a real commit) — a fixed "before its steps ran" claim would be
+          // false for the second and confuse an operator staring at a commit that plainly exists.
+          `anton could not read this worktree's stash list — the read itself failed, so whether the ` +
+          `checkout holds uncommitted work anton has not accounted for is unknown.`;
+  // Three true answers to "is the change actually in the worktree": all of it (nothing failed, or
+  // nothing was ever stashed to begin with), none of it (every apply failed), or some of it.
+  const recoveryClause =
+    stashes.length === 0
+      ? `anton KEPT that worktree${where} rather than removing it`
+      : restoreFailures.length === 0
+        ? `anton put the work back${where} and KEPT that worktree rather than removing it`
+        : restoredCount === 0
+          ? `anton could NOT put the work back into the tree${where} — reapplying it failed, so the ` +
+            `stash ${stashes.length === 1 ? "commit is" : "commits are"} the only copy — and KEPT ` +
+            `that worktree rather than removing it`
+          : `anton put ${restoredCount} of ${stashes.length} back into the tree${where} and could not ` +
+            `reapply ${restoreFailures.map((sha) => `\`${sha}\``).join(", ")}; anton KEPT that ` +
+            `worktree rather than removing it`;
+  const verdict = committed
+    ? `The commit alone is not the whole change, so closing this as delivered would ship it PARTIAL`
+    : `Nothing was verified or committed, so this is no delivery`;
+  return (
+    `Do NOT re-implement it from scratch. ${opening} ${recoveryClause}.` +
+    stashClause +
+    ` ${verdict} — recover the change there, then ` +
+    `finish the ticket by hand, or reopen it (\`bd update ${ticketId} --status open\` — this block ` +
+    `left it \`blocked\`, which the claim gate refuses) before resuming the run.` +
+    selfReportSuffix(selfReport)
   );
 }
 

@@ -68,6 +68,18 @@ function sanitizeSummary(text: string): string {
  * `undefined` only when neither source has anything to say: no thread report AND (nothing pushed
  * or no reasons given) — the caller's signal that the region, and `gh`, stay untouched.
  */
+/**
+ * The `reasons` a caller may hand `fixRoundFrom`/`refreshFixRoundsBody` as its fallback, gated on
+ * the RAW model report (before `applyThreadOutcomes`'s delivery filtering) being empty — never on
+ * `delivered` being empty. A nonempty report whose every reply/resolve failed to reach GitHub is
+ * NOT the CI-only/conflict-only case the fallback exists for: those threads are still undelivered,
+ * waiting on a retry, not resolved, so reporting `reasons` here would claim the round answered
+ * findings it never actually got a word to GitHub about.
+ */
+export function fallbackReasonsFor(rawReport: ThreadOutcome[], reasons: string[]): string[] {
+  return rawReport.length === 0 ? reasons : [];
+}
+
 export function fixRoundFrom(
   report: ThreadOutcome[],
   pushed: boolean,

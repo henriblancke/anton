@@ -64,13 +64,16 @@ async function seedInvocation(row: {
   recordedAt: Date;
   durationMs: number;
   modelReported?: string;
+  jobType?: string;
+  step?: string | null;
+  stepHandler?: string | null;
 }): Promise<void> {
   await t.db.insert(schema.claudeInvocations).values({
     id: row.id,
     projectId: t.projectId,
-    jobType: "execute-epic",
-    step: "implement",
-    stepHandler: "implement",
+    jobType: row.jobType ?? "execute-epic",
+    step: row.step === undefined ? "implement" : row.step,
+    stepHandler: row.stepHandler === undefined ? "implement" : row.stepHandler,
     runId: "r1",
     beadId: row.beadId,
     modelRequested: "claude-opus-5",
@@ -182,6 +185,34 @@ describe("featureLedger", () => {
 
     expect(ledger?.totals.recorded).toBe(false);
   });
+
+  it("keeps a scheduled pass's duration out of the feature's own timing (PR #329 review)", async () => {
+    // `ledgerTotals` already reports overhead outside the feature's bill (design §D4); the timing
+    // half must agree, or the Unallocated section's claim that this time is excluded is a lie.
+    fakeBoard(BOARD);
+    await seedInvocation({
+      id: "i1",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:10:00Z"),
+      durationMs: 10 * 60_000,
+    });
+    await seedInvocation({
+      id: "i2",
+      beadId: "feat-1",
+      recordedAt: new Date("2026-09-20T09:20:00Z"),
+      durationMs: 5 * 60_000,
+      jobType: "gardener",
+      step: null,
+      stepHandler: null,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1");
+
+    expect(ledger?.totals.overhead?.activeMs).toBe(5 * 60_000);
+    // Only the implement invocation's own 10 minutes — the gardener pass's 5 minutes never reach it.
+    expect(ledger?.timing.activeMs).toBe(10 * 60_000);
+    expect(ledger?.timing.invocations).toBe(1);
+  });
 });
 
 describe("featureLedger's friction half", () => {
@@ -194,6 +225,8 @@ describe("featureLedger's friction half", () => {
     lastError?: string;
     quotaParkCount?: number;
     failureParkCount?: number;
+    createdAt?: Date;
+    updatedAt?: Date;
   }): Promise<void> {
     await t.db.insert(schema.jobs).values({
       id: row.id,
@@ -204,6 +237,8 @@ describe("featureLedger's friction half", () => {
       ...(row.lastError ? { lastError: row.lastError } : {}),
       ...(row.quotaParkCount ? { quotaParkCount: row.quotaParkCount } : {}),
       ...(row.failureParkCount ? { failureParkCount: row.failureParkCount } : {}),
+      ...(row.createdAt ? { createdAt: row.createdAt } : {}),
+      ...(row.updatedAt ? { updatedAt: row.updatedAt } : {}),
     });
   }
 
@@ -213,6 +248,7 @@ describe("featureLedger's friction half", () => {
     beadId?: string;
     epicBeadId?: string;
     status?: string;
+    raisedAt?: Date;
   }): Promise<void> {
     await t.db.insert(schema.escalations).values({
       id: row.id,
@@ -223,6 +259,7 @@ describe("featureLedger's friction half", () => {
       ...(row.beadId ? { beadId: row.beadId } : {}),
       ...(row.epicBeadId ? { epicBeadId: row.epicBeadId } : {}),
       status: row.status ?? "open",
+      ...(row.raisedAt ? { raisedAt: row.raisedAt } : {}),
     });
   }
 
@@ -389,5 +426,170 @@ describe("featureLedger's friction half", () => {
 
     expect(ledger?.friction.humanGates).toBe(1);
     expect(ledger?.friction.humanTouches).toBe(1);
+  });
+
+  it("cuts every friction source at asOfMs, on its OWN clock — a rerun's own jobs, escalations, review rounds and send-back notes must not reach a preserved delivery's figures (PR #331 review)", async () => {
+    // A target still live on a rerun of an already-delivered feature must report ONLY the completed
+    // attempt's friction (`cohort-read.ts`'s `activeRunTargetIds`) — the rerun has no outcome yet, so
+    // its own interventions are exactly as premature as its own invocations would be.
+    const cutoff = new Date("2026-08-01T00:10:00Z");
+    fakeBoard([
+      BOARD[0]!,
+      bead({
+        id: "task-1",
+        parent: "feat-1",
+        notes: [
+          formatHumanNote(
+            originNoteBody("anton-old-followup"),
+            "Henri Blancke",
+            new Date("2026-08-01T00:05:00Z"),
+          ),
+          formatHumanNote(
+            originNoteBody("anton-new-followup"),
+            "Henri Blancke",
+            new Date("2026-09-25T00:05:00Z"),
+          ),
+        ].join("\n"),
+      }),
+    ]);
+    vi.spyOn(beads, "showWithComments").mockImplementation(async (_cwd, id) => ({
+      ...bead({ id }),
+      comments: [
+        {
+          text: formatReviewScoreComment({ round: 1, blocking: 0, advisory: 0, verdict: "clean" }),
+          created_at: "2026-08-01T00:01:00.000Z",
+        },
+        {
+          text: formatReviewScoreComment({ round: 1, blocking: 0, advisory: 0, verdict: "clean" }),
+          created_at: "2026-09-25T00:01:00.000Z",
+        },
+      ],
+    }));
+    await seedJob({
+      id: "j-old",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "cancelled",
+      createdAt: new Date("2026-08-01T00:00:00Z"),
+      updatedAt: new Date("2026-08-01T00:00:00Z"),
+    });
+    await seedJob({
+      id: "j-new",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "cancelled",
+      createdAt: new Date("2026-09-25T00:00:00Z"),
+      updatedAt: new Date("2026-09-25T00:00:00Z"),
+    });
+    await seedEscalation({
+      id: "e-old",
+      kind: "needs-human",
+      beadId: "feat-1",
+      raisedAt: new Date("2026-08-01T00:00:00Z"),
+    });
+    await seedEscalation({
+      id: "e-new",
+      kind: "needs-human",
+      beadId: "feat-1",
+      raisedAt: new Date("2026-09-25T00:00:00Z"),
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+
+    // Only the OLD job, escalation, review round and send-back note — every one before the cutoff —
+    // count; the still-live rerun's own activity is invisible until it has an outcome.
+    expect(ledger?.friction.cancels).toBe(1);
+    expect(ledger?.friction.humanGates).toBe(1);
+    expect(ledger?.friction.reviewRounds).toBe(1);
+    expect(ledger?.friction.sendBacks).toBe(1);
+  });
+
+  it("excludes a live rerun's job cancelled after the cutoff even though it was CREATED before it (PR #331 review, P2 follow-up)", async () => {
+    // An open rerun's execute job is necessarily enqueued before the run's own `attemptStartedAt` —
+    // so `asOfMs` (which sits at-or-after that start) can land AFTER the job's `createdAt` while the
+    // job is still live. If an operator then cancels it before the rerun settles, a creation-time
+    // cutoff would keep the row and its now-`cancelled` status would bill this preserved delivery for
+    // an interruption that belongs to the still-outcome-less rerun.
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-25T00:10:00Z");
+    await seedJob({
+      id: "j-live",
+      type: "execute-epic",
+      epicBeadId: "feat-1",
+      status: "cancelled",
+      createdAt: new Date("2026-09-25T00:00:00Z"),
+      updatedAt: new Date("2026-09-25T00:20:00Z"),
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+
+    expect(ledger?.friction.cancels).toBe(0);
+    expect(ledger?.friction.humanTouches).toBe(0);
+  });
+
+  it("excludes an event stamped in the SAME instant as an exclusive asOfMs cutoff — the open-attempt boundary (PR #331 review, boundary follow-up)", async () => {
+    // Run starts and invocation timestamps are both whole-second precision, so an open rerun's own
+    // first invocation can land in the exact same second as the cutoff `cohort-read.ts` derives from
+    // that rerun's `attemptStartedAt`. An inclusive comparison there would keep that unfinished
+    // invocation in the preserved delivery it is cut for.
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-25T00:00:00Z");
+    await seedInvocation({ id: "i-boundary", beadId: "feat-1", recordedAt: cutoff, durationMs: 60_000 });
+
+    const inclusive = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+    expect(inclusive?.rows).toHaveLength(1);
+
+    const exclusive = await featureLedger(t.db, t.projectId, "feat-1", {
+      asOfMs: cutoff.getTime(),
+      asOfExclusive: true,
+    });
+    expect(exclusive?.rows).toHaveLength(0);
+  });
+
+  it("keeps an event stamped in the same instant as an INCLUSIVE asOfMs cutoff — the prior-delivery fallback must still capture the delivery's own final event", async () => {
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-25T00:00:00Z");
+    await seedInvocation({ id: "i-delivery", beadId: "feat-1", recordedAt: cutoff, durationMs: 60_000 });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", {
+      asOfMs: cutoff.getTime(),
+      asOfExclusive: false,
+    });
+    expect(ledger?.rows).toHaveLength(1);
+  });
+
+  it("cuts delivery timestamps at asOfMs too — a rerun that completes between the cutoff and this read must not date or reorder a preserved delivery by its own new delivery (PR #331 review)", async () => {
+    // The preserved delivery actually finished at `preservedAt`. A concurrent rerun of the same target
+    // then completes AFTER `asOfMs` was chosen but its `endedAt` still lands before this read runs —
+    // exactly the race `asOfMs` exists to guard against for rows/jobs/friction. `deliveredAtMs` must
+    // stay pinned to the preserved delivery, not jump to the rerun's later, uncounted one.
+    fakeBoard(BOARD);
+    const cutoff = new Date("2026-09-01T00:00:00Z");
+    const preservedAt = new Date("2026-08-01T00:00:00Z");
+    const rerunDeliveredAt = new Date("2026-09-10T00:00:00Z");
+    await t.db.insert(schema.runs).values({
+      id: "r-preserved",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "done",
+      startedAt: new Date("2026-07-31T23:00:00Z"),
+      endedAt: preservedAt,
+      updatedAt: preservedAt,
+    });
+    await t.db.insert(schema.runs).values({
+      id: "r-rerun",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "done",
+      startedAt: new Date("2026-09-09T23:00:00Z"),
+      endedAt: rerunDeliveredAt,
+      updatedAt: rerunDeliveredAt,
+    });
+
+    const ledger = await featureLedger(t.db, t.projectId, "feat-1", { asOfMs: cutoff.getTime() });
+
+    expect(ledger?.deliveredAtMs).toBe(preservedAt.getTime());
   });
 });

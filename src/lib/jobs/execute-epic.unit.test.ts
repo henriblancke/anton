@@ -58,6 +58,7 @@ import {
   displacesSelfReport,
   recordStepReport,
   selfReportRank,
+  type StashRecovery,
 } from "./execute-epic-ticket";
 import { claudeResumeDecision, continuationPrompt } from "./execute-epic-ticket-claude";
 import { ticketClaimFailure } from "./execute-epic-ticket-bookends";
@@ -1676,6 +1677,19 @@ describe("stalePrBodyNote — the satisfied attribution rides the salvage too (P
 });
 
 /**
+ * The stash reads the delivery gate takes before it may call a tree EMPTY (anton-wjfkn) — here,
+ * answering that the worktree gained nothing. Shared by every gate case below whose subject is the
+ * pre-existing rows of the gate: those all assert on a genuinely empty tree, which is only what they
+ * mean while the stash says so. The set-aside answer has its own suite.
+ */
+const NO_STASH: StashRecovery = {
+  gained: async () => [],
+  apply: async () => {
+    throw new Error("assertDelivered applied a stash entry for a tree that gained none");
+  },
+};
+
+/**
  * The delivery-evidence gate's judgement on WHOSE work the commit is (anton-d967 / PR #228 review).
  *
  * A commit adopted from a previous attempt's preserved `WIP` is the one kind of evidence that says
@@ -1699,7 +1713,7 @@ describe("assertDelivered — an adopted preserve needs this run's agent to say 
   const neverAsked = async (): Promise<boolean> => {
     throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
   };
-  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked, NO_STASH);
 
   it("passes work THIS run committed, self-report or not", async () => {
     await expect(gate({ committed: true }, progress(null))).resolves.toBeUndefined();
@@ -1801,7 +1815,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     const evidence = branch(ON_BRANCH);
     const p = progress(satisfied(ON_BRANCH));
 
-    await expect(assertDelivered(ticket, { committed: false }, p, evidence.read)).resolves.toBeUndefined();
+    await expect(assertDelivered(ticket, { committed: false }, p, evidence.read, NO_STASH)).resolves.toBeUndefined();
 
     // The tree fact stays true — this ticket committed nothing — and the verdict is delivery.
     expect(p).toMatchObject({ committed: false, delivered: true });
@@ -1812,7 +1826,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     const evidence = branch(ON_BRANCH);
     const p = progress(satisfied("0123456"));
 
-    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read, NO_STASH));
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/anton-nuft produced no delivery: claude exited cleanly/);
@@ -1827,7 +1841,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     const evidence = branch(ON_BRANCH);
     const p = progress(satisfied());
 
-    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read));
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, evidence.read, NO_STASH));
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/produced no delivery/);
@@ -1838,7 +1852,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
   });
 
   it("parks a zero diff with no satisfied claim exactly as today — the message is unchanged", async () => {
-    const plain = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked));
+    const plain = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked, NO_STASH));
     expect(plain?.name).toBe("PoisonError");
     expect(plain?.message).toBe(
       "anton-nuft produced no delivery: claude exited cleanly and passed the verify gates but " +
@@ -1847,7 +1861,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     );
 
     const claimed = await failure(
-      assertDelivered(ticket, { committed: false }, progress({ outcome: "delivered" }), neverAsked),
+      assertDelivered(ticket, { committed: false }, progress({ outcome: "delivered" }), neverAsked, NO_STASH),
     );
     expect(claimed?.message).toBe(
       `${plain?.message} The agent self-reported ANTON-RESULT: delivered — a false success on an ` +
@@ -1860,6 +1874,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
         { committed: false },
         progress({ outcome: "blocked", klass: "other", reason: "the spec is empty" }),
         neverAsked,
+        NO_STASH,
       ),
     );
     expect(blocked?.message).toBe(
@@ -1870,7 +1885,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
   it("leaves a normal commit-backed delivery untouched, whatever the agent reported", async () => {
     for (const report of [null, { outcome: "delivered" as const }, satisfied(ON_BRANCH), satisfied("0123456")]) {
       const p = progress(report);
-      await expect(assertDelivered(ticket, { committed: true }, p, neverAsked)).resolves.toBeUndefined();
+      await expect(assertDelivered(ticket, { committed: true }, p, neverAsked, NO_STASH)).resolves.toBeUndefined();
       expect(p).toMatchObject({ committed: true, delivered: true });
     }
   });
@@ -1887,7 +1902,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
 
     const unaffirmed = progress(null);
     const plain = await failure(
-      assertDelivered(ticket, { committed: true, preservedAdoption: true }, unaffirmed, neverAsked),
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, unaffirmed, neverAsked, NO_STASH),
     );
     expect(plain?.name).toBe("PoisonError");
     expect(plain?.message).toBe(expected);
@@ -1897,7 +1912,7 @@ describe("assertDelivered — a satisfied step settles on evidence, never on the
     // the evidence on the branch is explicitly incomplete, and the branch is never asked.
     const claimed = progress(satisfied(ON_BRANCH));
     const refused = await failure(
-      assertDelivered(ticket, { committed: true, preservedAdoption: true }, claimed, neverAsked),
+      assertDelivered(ticket, { committed: true, preservedAdoption: true }, claimed, neverAsked, NO_STASH),
     );
     expect(refused?.message).toBe(expected);
     expect(claimed).toMatchObject({ committed: true, delivered: false });
@@ -1926,7 +1941,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     const p = progress({ outcome: "delivered" });
     const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
 
-    await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, check)).resolves.toBeUndefined();
+    await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check)).resolves.toBeUndefined();
     expect(p).toMatchObject({ committed: false, delivered: true });
   });
 
@@ -1949,7 +1964,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
           const check = async () => ({ found: true, ids: ["swept-1"], synced: false });
 
           const err = await failure(
-            assertDelivered(pendingTicket, { committed: false }, p, neverAsked, check),
+            assertDelivered(pendingTicket, { committed: false }, p, neverAsked, NO_STASH, check),
           );
 
           expect(err?.name).toBe("PoisonError");
@@ -1963,7 +1978,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         const check = async () => ({ found: true, ids: ["swept-1"], synced: true });
 
         await expect(
-          assertDelivered(pendingTicket, { committed: false }, p, neverAsked, check),
+          assertDelivered(pendingTicket, { committed: false }, p, neverAsked, NO_STASH, check),
         ).resolves.toBeUndefined();
         expect(p).toMatchObject({ committed: false, delivered: true, boardEvidenceIds: ["swept-1"] });
       });
@@ -1978,7 +1993,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       const p = progress({ outcome: "delivered" });
       const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: true });
 
-      await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, check)).resolves.toBeUndefined();
+      await expect(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check)).resolves.toBeUndefined();
       expect(p.boardEvidenceIds).toEqual(["swept-1", "swept-2"]);
     },
   );
@@ -1992,7 +2007,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       const p = progress({ outcome: "delivered" });
       const check = async () => ({ found: false, ids: [], synced: false, baselineUnavailable: true });
 
-      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check));
 
       expect(err?.name).toBe("PoisonError");
       expect(err?.message).toMatch(/anton-board produced no delivery/);
@@ -2009,7 +2024,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       const p = progress({ outcome: "delivered" });
       const check = async () => ({ found: false, ids: [], synced: false, evidenceUnavailable: true });
 
-      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check));
 
       expect(err?.name).toBe("PoisonError");
       expect(err?.message).toMatch(/anton-board produced no delivery/);
@@ -2031,7 +2046,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         evidenceUnavailable: true,
       });
 
-      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check));
 
       expect(err?.message).toMatch(/swept-1/);
       expect(err?.message).toMatch(/prior attempt/);
@@ -2051,7 +2066,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       };
 
       await expect(
-        assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution),
+        assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check, recordBoardAttribution),
       ).resolves.toBeUndefined();
 
       expect(recorded).toBe(true);
@@ -2067,7 +2082,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     };
 
     await expect(
-      failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution)),
+      failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check, recordBoardAttribution)),
     ).resolves.toBeInstanceOf(Error);
   });
 
@@ -2075,7 +2090,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     const p = progress({ outcome: "delivered" });
     const check = async () => ({ found: false, ids: [], synced: false });
 
-    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check));
 
     expect(err?.name).toBe("PoisonError");
     expect(err?.message).toMatch(/anton-board produced no delivery/);
@@ -2094,7 +2109,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       const p = progress(satisfiedReport);
       const check = async () => ({ found: false, ids: [], synced: false });
 
-      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+      const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check));
 
       expect(err?.name).toBe("PoisonError");
       expect(err?.message).toMatch(/anton-board produced no delivery/);
@@ -2123,7 +2138,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       };
 
       const err = await failure(
-        assertDelivered(ticket, { committed: false }, p, neverAsked, check, recordBoardAttribution),
+        assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check, recordBoardAttribution),
       );
 
       expect(err?.name).toBe("PoisonError");
@@ -2138,7 +2153,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     const p = progress({ outcome: "delivered" });
     const check = async () => ({ found: true, ids: ["swept-1", "swept-2"], synced: false });
 
-    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, check));
+    const err = await failure(assertDelivered(ticket, { committed: false }, p, neverAsked, NO_STASH, check));
 
     expect(err?.message).toMatch(/swept-1, swept-2/);
     expect(err?.message).toMatch(/could not be confirmed synced/);
@@ -2150,7 +2165,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       throw new Error("the board-only check ran without a `delivered` self-report");
     };
 
-    const missing = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked, check));
+    const missing = await failure(assertDelivered(ticket, { committed: false }, progress(null), neverAsked, NO_STASH, check));
     expect(missing?.message).toMatch(/produced no delivery/);
 
     const blocked = await failure(
@@ -2159,6 +2174,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         { committed: false },
         progress({ outcome: "blocked", klass: "other", reason: "couldn't find anything to sweep" }),
         neverAsked,
+        NO_STASH,
         check,
       ),
     );
@@ -2174,7 +2190,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
     // parameter's mere presence rather than re-deriving board-only-ness from the ticket's own
     // label (anton-fc5x review round 2, finding 1/3: that re-derivation is what missed a child
     // ticket dispatched under a board-only-labelled run TARGET).
-    const err = await failure(assertDelivered(codeTicket, { committed: false }, p, neverAsked, undefined));
+    const err = await failure(assertDelivered(codeTicket, { committed: false }, p, neverAsked, NO_STASH, undefined));
     expect(err?.message).toBe(
       "anton-code produced no delivery: claude exited cleanly and passed the verify gates but " +
         "left no changes to commit (zero diff). Blocking the ticket for operator review and " +
@@ -2194,7 +2210,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
       const p = progress({ outcome: "delivered" });
 
       await expect(
-        assertDelivered(inheritedChild, { committed: false }, p, neverAsked, check),
+        assertDelivered(inheritedChild, { committed: false }, p, neverAsked, NO_STASH, check),
       ).resolves.toBeUndefined();
       expect(p).toMatchObject({ committed: false, delivered: true });
     },
@@ -2210,7 +2226,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         const p = progress({ outcome: "delivered" });
         const check = async () => ({ found: false, ids: [], synced: false });
 
-        const err = await failure(assertDelivered(ticket, { committed: true }, p, neverAsked, check));
+        const err = await failure(assertDelivered(ticket, { committed: true }, p, neverAsked, NO_STASH, check));
 
         expect(err?.name).toBe("PoisonError");
         expect(err?.message).toMatch(/no bd write landed on the board since the ticket started/);
@@ -2222,7 +2238,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
           throw new Error("the board-only check ran without a `delivered` self-report");
         };
 
-        const err = await failure(assertDelivered(ticket, { committed: true }, progress(null), neverAsked, check));
+        const err = await failure(assertDelivered(ticket, { committed: true }, progress(null), neverAsked, NO_STASH, check));
 
         expect(err?.message).toMatch(/produced no delivery/);
       });
@@ -2234,7 +2250,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         const blockedReport = { outcome: "blocked" as const, klass: "other" as const, reason: "nothing to sweep" };
 
         const err = await failure(
-          assertDelivered(ticket, { committed: true }, progress(blockedReport), neverAsked, check),
+          assertDelivered(ticket, { committed: true }, progress(blockedReport), neverAsked, NO_STASH, check),
         );
 
         expect(err?.name).toBe("PoisonError");
@@ -2246,7 +2262,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         const check = async () => ({ found: true, ids: ["other-bead"], synced: true });
 
         await expect(
-          assertDelivered(ticket, { committed: true }, p, neverAsked, check),
+          assertDelivered(ticket, { committed: true }, p, neverAsked, NO_STASH, check),
         ).resolves.toBeUndefined();
         expect(p).toMatchObject({ committed: true, delivered: true });
       });
@@ -2259,7 +2275,7 @@ describe("assertDelivered — a board-only ticket settles on the board, never th
         };
 
         await expect(
-          assertDelivered(ticket, { committed: true }, p, neverAsked, check, recordBoardAttribution),
+          assertDelivered(ticket, { committed: true }, p, neverAsked, NO_STASH, check, recordBoardAttribution),
         ).resolves.toBeUndefined();
         expect(p).toMatchObject({ committed: true, delivered: true });
       });
@@ -2290,7 +2306,7 @@ describe("a run failure exposes anton's text and the agent's self-report as dist
   const neverAsked = async (): Promise<boolean> => {
     throw new Error("assertDelivered asked the branch about a case that has no satisfied claim");
   };
-  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked);
+  const gate = (facts: StepFacts, p: TicketProgress) => assertDelivered(ticket, facts, p, neverAsked, NO_STASH);
   const failure = (run: Promise<void>) => run.then(() => null, (e: Error) => e);
 
   it("splits a plain zero diff — no self-report, so the structural half is the whole message", async () => {

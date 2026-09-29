@@ -94,6 +94,13 @@ export interface InvocationDimensions {
   skillId?: string;
   skillDigest?: string;
   /**
+   * Whether {@link skillId} is anton's own bundled default (no override configured) rather than a
+   * project's explicit `skill:<id>` choice (PR #331 review) — set only by the four resolvers that
+   * have a genuine fallback branch (describe, review, review-fix, scan-triage); every explicit
+   * resolution leaves it unset. `prompt-series.ts`'s `isScaffoldingFallback` is the sole reader.
+   */
+  skillIsDefault?: boolean;
+  /**
    * 12-hex digest of the COMPOSED system prompt this invocation ran with (anton-tw37r). Passed by
    * the caller that composed it, never re-composed here: the text is edited in place, so a second
    * composition could digest a prompt that never ran.
@@ -134,7 +141,7 @@ export interface InvocationDimensions {
  */
 export type ReasoningAttribution = Pick<
   InvocationDimensions,
-  "promptId" | "promptBodyDigest" | "skillId" | "skillDigest"
+  "promptId" | "promptBodyDigest" | "skillId" | "skillDigest" | "skillIsDefault"
 >;
 
 /**
@@ -181,6 +188,7 @@ export function invocationRows(
     agentTag: dimensions.agentTag ?? null,
     skillId: dimensions.skillId ?? null,
     skillDigest: dimensions.skillDigest ?? null,
+    skillIsDefault: dimensions.skillIsDefault ?? null,
     promptId: dimensions.promptId ?? null,
     promptBodyDigest: dimensions.promptBodyDigest ?? null,
     numTurns: result.numTurns ?? null,

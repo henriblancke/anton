@@ -95,6 +95,15 @@ export const SECTIONS = [
     group: "While a run works",
     dirtyKeys: ["repairAutonomy"],
   },
+  // Beside repair autonomy — both are per-item judgment-call controls exercised while a run works.
+  // Self-contained like the work policy panel: choosing a point's mode is an act on that one point,
+  // not a field queued behind the shared Save bar.
+  {
+    id: "decide",
+    label: "Decision points",
+    group: "While a run works",
+    dirtyKeys: [],
+  },
   { id: "gates", label: "Verify gates", group: "Before the PR opens", dirtyKeys: ["gates"] },
   {
     id: "review",
