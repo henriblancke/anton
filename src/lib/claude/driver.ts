@@ -97,6 +97,13 @@ function abortError(): Error {
  * until the whole GROUP is gone — not merely until the direct child closes, which a descendant that
  * traps the signal or holds none of claude's pipes outlives — escalating SIGTERM → SIGKILL for
  * anything that ignores the first one.
+ *
+ * A YIELDED exit earns the same wait (PR #333 review): claude's own process can end its turn — and
+ * therefore its process — while the tool call its last message armed (a backgrounded `Bash`, a
+ * `Monitor`) is still running in the shared group. The ticket walk reads a yielded turn as a stop and
+ * recovers a stash into the worktree next, which must not race a descendant still writing it. So this
+ * exit is killed and waited out exactly like a stall, rather than resolved the instant claude's own
+ * `close` fires.
  */
 function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Promise<ClaudeResult> {
   return new Promise<ClaudeResult>((resolve, reject) => {
@@ -192,9 +199,11 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
      * settles. So the escalation is delivered NOW rather than waiting out its timer, and the
      * rejection waits for the group to actually go.
      *
-     * Both forced endings come through here. A stalled session's group-wide SIGKILL is a DELIVERY,
-     * not an exit — a tool process dies no more promptly for it than a cancelled one does — so the
-     * watchdog path needs the same wait, and (having no timer of its own) arms the bound here.
+     * All three forced endings come through here. A stalled session's group-wide SIGKILL is a
+     * DELIVERY, not an exit — a tool process dies no more promptly for it than a cancelled one does —
+     * so the watchdog path needs the same wait, and (having no timer of its own) arms the bound here.
+     * A yielded exit needs it for the same reason with no kill of its own to arm it either: nothing
+     * upstream signalled anything, claude simply ended its turn with a descendant still running.
      */
     const settleWhenGroupGone = (finish: () => void) => {
       if (settled) return;
@@ -235,8 +244,13 @@ function streamClaude(bin: string, args: string[], opts: RunClaudeOptions): Prom
         else resolve(toClaudeResult(stream));
       };
       // A stalled session was killed the same group-wide way a cancelled one is, so it inherits the
-      // same hazard: claude's `close` says nothing about the tool process still writing the tree.
-      if (watchdog.stalled) settleWhenGroupGone(finish);
+      // same hazard: claude's `close` says nothing about the tool process still writing the tree. A
+      // YIELDED exit (the last assistant message armed a `ScheduleWakeup`/`Monitor`/backgrounded
+      // `Bash` and nothing later cleared it) inherits it too, with no kill of its own: claude ended
+      // ITS turn, but the tool call it armed can still be running in the same group. The ticket walk
+      // reads this as a stop and recovers a stash into the worktree next, so the group must be gone —
+      // not merely claude's own process — before this settles (PR #333 review).
+      if (watchdog.stalled || stream.pendingYields.length > 0) settleWhenGroupGone(finish);
       else settle(finish);
     });
   });

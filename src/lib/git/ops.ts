@@ -1502,12 +1502,19 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
  *
  * `bypassHooks` runs the commit with this project's hooks off, and a run's ordinary commits never
  * ask for it: hooks are the project's own gate on content, and anton has no standing to skip them.
- * Its one caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a hook refused
+ * One caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a hook refused
  * before anything landed (PR #228 review) — a tree the project's own verify gates have already
  * passed, on its way to a commit that is explicitly incomplete and in no pull request. That caller
  * proves the tree is still the verified one first, via {@link stageAllAndHashTree}: a hook that
  * EDITS before it rejects leaves a different tree, and `--no-verify` would commit those post-gate
  * edits under a proof that never covered them.
+ *
+ * The other caller is review-fix's pre-gate boundary commit (PR #338 review, chatgpt-codex-connector):
+ * an internal snapshot of what the main round changed, taken BEFORE the verify gates run and never
+ * pushed on its own. A project's pre-commit hook that happens to enforce the same check a configured
+ * verify gate does would otherwise reject this commit outright, before the gate — and its one bounded
+ * follow-up round — ever gets a chance; the project's hooks still run on the real, hook-enforced
+ * commit `commitAndPushFix` makes once the gates are green and the fix is actually being published.
  *
  * `hooksPath`, when the caller passes one, MUST have been resolved AFTER whatever staging already
  * happened in the worktree — never before (PR #263 review, round 37). `resolveHooksPathOverride`'s
@@ -3942,6 +3949,77 @@ export async function restoreWorktreeState(
   }
   await git(worktreePath, ["reset", "--hard", state.head]);
   await git(worktreePath, ["clean", "-fd"]);
+}
+
+/**
+ * One entry on the repository's stash reflog: the commit that holds the stashed tree, and the
+ * subject git generated for it.
+ *
+ * The SHA is the identity, never the `stash@{n}` selector: the stack is shared by every worktree cut
+ * from one repository, so a concurrent run pushing its own entry renumbers everything below it — a
+ * selector read a moment ago can name a different entry by the time it is used.
+ */
+export interface StashEntry {
+  /** Full sha of the stash commit — stable while the entry exists, unlike its `stash@{n}` index. */
+  sha: string;
+  /** git's own reflog subject, e.g. `On anton/anton-wjfkn: <message>`. */
+  subject: string;
+}
+
+/**
+ * Every stash entry this repository currently holds, newest first — the read a zero-diff gate needs
+ * to tell an empty tree from one whose work is parked on the stash stack (anton-wjfkn).
+ *
+ * Repository-wide, because that is what the stash IS: `refs/stash` lives in the shared git dir, so a
+ * worktree's `git stash push` lands on the same stack as every sibling's. The gate compares against a
+ * baseline taken in the same worktree and is only interested in what GREW, which is why the caller
+ * diffs two reads rather than trusting one.
+ *
+ * PROPAGATES a failed read rather than manufacturing `[]` for it (anton-wjfkn round 3): the ticket
+ * baseline this feeds is a BEFORE snapshot a later read is diffed against, and an empty baseline reads
+ * identically to "this repository has never stashed" — a caller that swallowed a timeout or a
+ * corrupted-repo failure here would then misattribute every PRE-EXISTING entry (a sibling worktree's,
+ * or an earlier failed attempt's own) as gained during this ticket, and splice it into the worktree as
+ * this ticket's recovered work. Modern git exits 0 with empty output for the genuinely-empty case (no
+ * `refs/stash`, or no commits yet) — verified against the git this repo runs — so there is no clean
+ * non-zero exit left to fold into `[]` the way {@link symbolicHeadRef} does for a detached HEAD; every
+ * failure here is an operational one and must reach the caller as one.
+ */
+export async function readStashEntries(worktreePath: string): Promise<StashEntry[]> {
+  // `-z` for the same reason every other read here uses it: a stash message is free text the agent
+  // chose, and a newline in it would split one entry into two.
+  const raw = await git(worktreePath, ["stash", "list", "-z", "--format=%H%x00%gs"]);
+  const fields = raw.split("\0");
+  const entries: StashEntry[] = [];
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const [sha, subject] = [fields[i], fields[i + 1]];
+    if (sha && /^[0-9a-f]{40}$/.test(sha)) entries.push({ sha, subject: subject ?? "" });
+  }
+  return entries;
+}
+
+/**
+ * Put a stash entry's changes back into the working tree, by SHA — and deliberately LEAVE the entry
+ * on the stack (anton-wjfkn).
+ *
+ * `apply <sha>`, never `pop`: `pop` takes whatever sits at `stash@{0}`, and the stack is shared by
+ * every worktree cut from one repository, so on a machine running several tickets at once that entry
+ * can be a CONCURRENT run's — popping it would move another worktree's work into this one.
+ *
+ * The entry is not dropped because the restored copy is UNCOMMITTED: it lives only in a worktree that
+ * a later teardown or reaper pass may remove, and the stash commit is then the sole surviving copy of
+ * the work. Keeping both costs an operator one `git stash drop` once they have recovered it; dropping
+ * eagerly costs the change. Callers name the sha in whatever they park on, so the durable copy is
+ * always reachable.
+ *
+ * Answers whether the tree actually has the work: false means the apply failed (a conflict against
+ * the tree the entry was made from, a corrupt entry) and only the stack copy exists.
+ */
+export async function applyStashEntry(worktreePath: string, sha: string): Promise<boolean> {
+  return git(worktreePath, ["stash", "apply", sha]).then(
+    () => true,
+    () => false,
+  );
 }
 
 export interface PullRequest {

@@ -315,6 +315,7 @@ function contentLines(raw: string): RenderedLine[] {
     .map((l) => ({
       text: (l.fenced ? l.text : unquote(l.text)).trim(),
       fenced: l.fenced,
+      html: l.html,
       heading: l.heading,
     }))
     .filter((l) => l.text !== "" && (l.fenced || (!l.heading && !isScaffolding(l.text))));

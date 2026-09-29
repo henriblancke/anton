@@ -37,6 +37,17 @@ export interface ClaudeResult {
   answeringModel?: string;
   /** True if claude reported an error result subtype. */
   isError?: boolean;
+  /**
+   * Yield-shaped tools the session's LAST assistant message armed (anton-wjfkn) — a `ScheduleWakeup`,
+   * a `Monitor`, or a `run_in_background` call, by name.
+   *
+   * A clean exit carrying one of these is not a finished ticket: the agent handed its turn back to a
+   * wake-up that an autonomous run never delivers, so whatever it was in the middle of is unfinished
+   * and whatever it set aside to measure a baseline is still set aside. The callers that read one
+   * final message and settle the ticket on it use this to tell that stop from a real finish
+   * (`step:implement`'s report, and the delivery gate through it). Empty for every ordinary session.
+   */
+  pendingYields?: string[];
 }
 
 /** Everything known about a claude process that has ended — the whole input to the classification. */
@@ -269,5 +280,6 @@ export function toClaudeResult(stream: StreamState): ClaudeResult {
     text: typeof raw.result === "string" ? raw.result : stream.lastAssistantText,
     answeringModel: stream.lastAssistantModel,
     isError: !!raw.is_error,
+    pendingYields: stream.pendingYields,
   };
 }

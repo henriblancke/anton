@@ -51,6 +51,7 @@ import { makeReviewFixHandler, makeReviewFixPrHandler } from "./review-fix";
 import { createWorktree } from "../git/worktree";
 import { resetOperatorCache } from "../operator";
 import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
+import { applyMigrationFile } from "../db/testing";
 
 class FakeClock implements Clock {
   constructor(private t: number) {}
@@ -187,9 +188,11 @@ if(a[0]==='pr'&&a[1]==='view'){
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
 if(a[0]==='api'&&a[1]==='graphql'){
   if(q.includes('resolveReviewThread')){log('resolve');console.log('{}');process.exit(0);}
-  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{
+    pageInfo:{hasNextPage:false,endCursor:null},
+    nodes:[
     {id:'RT_1',isResolved:false,isOutdated:false,path:'feature.txt',line:1,
-     comments:{nodes:[{databaseId:100,author:{login:'alice'},body:'rename foo to bar here too'}]}}
+     comments:{totalCount:1,nodes:[{databaseId:100,author:{login:'alice'},body:'rename foo to bar here too'}]}}
   ]}}}}}));
   process.exit(0);
 }
@@ -299,6 +302,29 @@ process.exit(0);`,
     expect(ledger[0].skillDigest).toMatch(/^[0-9a-f]{12}$/);
     // Resolved inside the meter from process state, so the job passes no version and still records one.
     expect(ledger[0].antonVersion).toBe(selfBuildVersion());
+
+    // The round's own record (anton-z5e3g), on what a real fix actually wrote: this PR carried one
+    // inline thread from alice, the fixer reported it fixed, and the push above is what makes that
+    // claim real. The counts a merge would erase are now on the row.
+    const rounds = await tdb.db.select().from(schema.reviewRounds);
+    expect(rounds).toHaveLength(1);
+    expect(rounds[0]).toMatchObject({
+      projectId,
+      beadId: epicId,
+      prNumber: 7,
+      round: 1,
+      threadsSeen: 1,
+      threadsUnresolved: 1,
+      threadsActionable: 1,
+      outcomesFixed: 1,
+      outcomesLeft: 0,
+      outcomesNeedsHuman: 0,
+      // Still open — only finalize can know how a PR ended.
+      prState: null,
+    });
+    expect(JSON.parse(rounds[0].byAuthorJson)).toEqual({ alice: 1 });
+    // The join to this round's own spend: both rows name the job that ran it.
+    expect(rounds[0].jobId).toBe(ledger[0].jobId);
 
     // A review-fix session was recorded + finished.
     const sessions = await tdb.db.select().from(schema.sessions);
@@ -450,6 +476,30 @@ process.exit(0);`,
     }
   });
 
+  /**
+   * anton-z5e3g's never-fail rule, end-to-end: the round record is a meter, and a meter must not cost
+   * a delivery. The table is dropped out from under a live fix — the sharpest form of a write that
+   * cannot land, and the shape an un-migrated db takes — and the fix must still push and settle done.
+   */
+  it("pushes and settles done when the round record cannot be written at all", async () => {
+    tdb.sqlite.exec("DROP TABLE review_rounds");
+    try {
+      await expectOneFix(await runSweep());
+
+      // The fix itself landed: the whole contract is that losing the counts loses only the counts.
+      const remoteLog = execFileSync("git", ["-C", repo, "log", "--oneline", `origin/${branch}`], {
+        encoding: "utf8",
+      });
+      expect(remoteLog).toContain("address review feedback");
+      expect((await tdb.db.select().from(schema.sessions)).at(-1)?.status).toBe("done");
+    } finally {
+      // Restore the table for the suite's remaining cases (the db is shared across this file).
+      // Both migrations: 0063 adds threads_complete, which schema.reviewRounds still declares.
+      applyMigrationFile(tdb.sqlite, "0062_review_rounds.sql");
+      applyMigrationFile(tdb.sqlite, "0063_lush_ink.sql");
+    }
+  });
+
   it("is a no-op when the PR has nothing actionable (approved, checks green)", async () => {
     // Point gh at an 'approved & green' PR for this run.
     const greenGh = writeBin(
@@ -463,12 +513,16 @@ process.exit(0);`,
     const prev = process.env.ANTON_GH_BIN;
     process.env.ANTON_GH_BIN = greenGh;
     const before = (await tdb.db.select().from(schema.sessions)).length;
+    const beforeRounds = (await tdb.db.select().from(schema.reviewRounds)).length;
     try {
       // Nothing actionable → the dispatcher fans out nothing at all, so no worktree, claude session
       // or verify gate is ever reached. The poll costs one board read and one `gh pr view`.
       expect(await runSweep()).toEqual([]);
       const after = await tdb.db.select().from(schema.sessions);
       expect(after.length).toBe(before);
+      // And no round row (anton-z5e3g): a poll is not review. Counting this tick would drown the
+      // rounds that did work — most review-fix jobs are ticks exactly like this one.
+      expect(await tdb.db.select().from(schema.reviewRounds)).toHaveLength(beforeRounds);
     } finally {
       process.env.ANTON_GH_BIN = prev;
     }
@@ -828,6 +882,7 @@ process.exit(0);`,
         failingCheckAttempts: [],
         pendingChecks: 0,
         threads: [],
+        threadsComplete: true,
       }).fingerprint;
       tdb.db
         .update(schema.jobs)

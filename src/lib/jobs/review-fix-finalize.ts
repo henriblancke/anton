@@ -20,6 +20,7 @@ import {
   worktreePathFor,
   type Worktree,
 } from "../git/worktree";
+import { recordPrTerminalState } from "../review-rounds";
 import { findOpenRunForEpic, updateRun } from "../runs";
 import { IN_REVIEW, tryShow } from "./review-fix-board";
 import { safe } from "./safe";
@@ -67,6 +68,8 @@ export interface FinalizeMergedEpicArgs {
    * ones close alongside the epic unless the run left them undelivered ({@link undeliveredAtMerge}).
    */
   children: Bead[];
+  /** The merged PR's number — what its recorded rounds are stamped terminal by. */
+  prNumber: number;
   /** The merged PR's head branch — the local branch + worktree to clean up. */
   branch: string;
   /**
@@ -113,7 +116,7 @@ export function finalizeMergedEpic(args: FinalizeMergedEpicArgs): Promise<void> 
 async function finalizeMergedTarget(
   args: FinalizeMergedEpicArgs,
 ): Promise<void> {
-  const { db, clock, repo, projectId, epic, children, branch, all } = args;
+  const { db, clock, repo, projectId, epic, children, prNumber, branch, all } = args;
   const preserved = preservedAtMerge(epic, children);
   // The actor the finished run reserved its children for: execute-epic's claim cascade assigns
   // every child to the same operator it claimed the target for, so the target's assignee names it.
@@ -145,6 +148,10 @@ async function finalizeMergedTarget(
   // Only once the moves have landed can a ticket say where it ended up, so the notes come last.
   await notePreserved({ repo, epic, preserved, settled, plan, rerun, followUp });
   await removeMergedWorktree(repo, branch);
+  // How the PR ENDED, onto the rounds it collected (anton-z5e3g). Only here can it be known: a
+  // round cannot learn its own PR's fate while it is running. The write never throws and is
+  // first-observation-wins, so this step is as safe to repeat as every other one above.
+  await recordPrTerminalState(db, clock, { projectId, prNumber, state: "merged" });
   await finalizeRunRow(db, clock, projectId, epic.id);
   await closeFinalized(repo, epic, children, preserved, followUp);
 }

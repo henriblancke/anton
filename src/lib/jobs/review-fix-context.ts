@@ -42,6 +42,49 @@ export const NON_THREAD_REPORT_ID = "non-thread-reasons";
 export const fabricatedFix = (item: ThreadOutcome, pushed: boolean): boolean =>
   item.outcome === "fixed" && !pushed;
 
+/** One reported outcome matched to the thread it is about, and that thread's anchor comment. */
+export interface TriagedOutcome {
+  item: ThreadOutcome;
+  thread: ReviewThread;
+  /** The thread's opening comment — the REST id a reply/reaction anchors to. */
+  anchor: { id: number; author: string; body: string };
+}
+
+/**
+ * The reported outcomes anton ACTS ON, in the order claude reported them: those naming a thread
+ * still waiting on anton, that has a comment to anchor a reply to, and that are not a fabricated
+ * "fixed" ({@link fabricatedFix}). Everything else names review anton did nothing about — a stale or
+ * invented thread id, a thread a human resolved mid-round, a fix claim with no push behind it.
+ *
+ * Shared (anton-z5e3g) rather than reimplemented: `applyThreadOutcomes` replies through this filter
+ * and `recordReviewRound` counts through it, so the recorded per-outcome counts are exactly the
+ * outcomes the PR has a record of. Counting the raw report instead would report fixes no thread was
+ * ever answered with.
+ *
+ * `report` is deduped by thread id first, keeping only the first reported outcome per id: nothing
+ * stops the model from naming the same thread twice, and without this a duplicate would both reply
+ * to the thread twice and count twice toward `RoundCounts` (PR #335 review).
+ */
+export function triageOutcomes(
+  pr: PrReview,
+  report: ThreadOutcome[],
+  pushed: boolean,
+): TriagedOutcome[] {
+  const waiting = threadsNeedingAttention(pr);
+  const seenIds = new Set<string>();
+  const triaged: TriagedOutcome[] = [];
+  for (const item of report) {
+    if (seenIds.has(item.id)) continue;
+    seenIds.add(item.id);
+    const thread = waiting.find((t) => t.id === item.id);
+    const anchor = thread?.comments[0];
+    if (!thread || !anchor) continue;
+    if (fabricatedFix(item, pushed)) continue;
+    triaged.push({ item, thread, anchor });
+  }
+  return triaged;
+}
+
 /** Value of a `prefix:value` label (e.g. the epic's `agent:` tag), or undefined if absent. */
 export function labelValue(labels: string[] | undefined, prefix: string): string | undefined {
   const l = labels?.find((x) => x.startsWith(`${prefix}:`));

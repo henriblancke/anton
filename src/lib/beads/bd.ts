@@ -196,7 +196,14 @@ export type { BoardUnreachableCause, SyncMode, SyncOutcome } from "./dolt-sync";
 export { getSyncStatus, getSyncStatusToken, SYNC_STALL_MS } from "./sync-coalescer";
 export type { SyncRequest, SyncState, SyncStatus } from "./sync-coalescer";
 export { BD_BATCH_ENV, batchEnabled, batchOpArgs, encodeBatchOps, quoteBatchValue } from "./bd-args";
-export { buildPruneArgs, buildUpdateArgs, isMissingBatchCommand, LABEL_PREFIXES, labelValueOf } from "./bd-args";
+export {
+  buildPruneArgs,
+  buildUpdateArgs,
+  isMissingBatchCommand,
+  LABEL_PREFIXES,
+  labelValueOf,
+  labelValuesOf,
+} from "./bd-args";
 export type { BatchOp, BatchUpdateFields, BeadPatch, LabelPrefix, PruneAge } from "./bd-args";
 export { isBlockedByOpenIssues, isMissingBeadError, unclaimableStatus } from "./bd-errors";
 export { buildGateCheckArgs, buildGateCreateArgs, buildGateDiscoverArgs, gateReason, parseGateCheck } from "./gate";

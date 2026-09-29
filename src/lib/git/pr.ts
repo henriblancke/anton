@@ -93,6 +93,13 @@ export interface PrReview {
   pendingChecks: number;
   /** Inline review threads (resolved ones included; filter with threadsNeedingAttention). */
   threads: ReviewThread[];
+  /**
+   * Whether `threads` is the PR's WHOLE inline history, or a degraded read — the GraphQL call failed
+   * outright, or a later page did (see `getReviewThreads`). False makes an empty or short `threads`
+   * distinguishable from a genuinely thread-free PR: a counter that persists `threads.length` without
+   * checking this would report zero or understated counts indistinguishable from a clean PR.
+   */
+  threadsComplete: boolean;
 }
 
 interface GhPrView {
@@ -210,7 +217,7 @@ export async function getPrReview(
     failingChecks,
     failingCheckAttempts,
     pendingChecks,
-    threads: await getReviewThreads(repoPath, number, signal),
+    ...(await getReviewThreads(repoPath, number, signal)),
   };
 }
 
@@ -274,7 +281,7 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$c
       pageInfo{hasNextPage endCursor}
       nodes{
         id isResolved isOutdated path line
-        comments(first:50){nodes{databaseId author{login} body}}
+        comments(first:50){totalCount nodes{databaseId author{login} body}}
       }
     }
   }}
@@ -286,7 +293,10 @@ interface RawReviewThreadNode {
   isOutdated?: boolean;
   path?: string | null;
   line?: number | null;
-  comments?: { nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }> };
+  comments?: {
+    totalCount?: number;
+    nodes?: Array<{ databaseId?: number; author?: { login?: string } | null; body?: string }>;
+  };
 }
 
 interface ReviewThreadsPage {
@@ -304,27 +314,36 @@ interface ReviewThreadsPage {
 
 /**
  * Inline review threads via GraphQL — the only API that exposes thread resolution state and the
- * node ids `resolveReviewThread` needs. Best-effort — returns [] on any failure (same contract as
- * the old REST comment fetch), so a missing token degrades to "no inline feedback", not a crash.
+ * node ids `resolveReviewThread` needs. Best-effort — degrades to `{ threads: [], complete: false }`
+ * on any failure (same contract as the old REST comment fetch), so a missing token reads as "no
+ * inline feedback", not a crash.
  *
  * Paginated: a PR that has collected over 100 threads (routine on a long-running epic with a bot
  * reviewer commenting every round) used to have everything past the first page silently dropped,
  * including whichever thread was actually unresolved — `threadsNeedingAttention` never saw it, so
  * `classifyReview` reported the PR clean and the dispatcher skipped it with nothing to show for why.
  *
- * A later-page failure breaks the loop and returns the pages already fetched rather than throwing
- * to the outer catch and discarding every completed page — losing page 1's unresolved threads would
- * misclassify a >100-thread PR as clean the same way truncation did.
+ * A later-page failure breaks the loop and returns the pages already fetched (marked `complete:
+ * false`) rather than throwing to the outer catch and discarding every completed page — losing page
+ * 1's unresolved threads would misclassify a >100-thread PR as clean the same way truncation did.
+ * `classifyReview`/`threadsNeedingAttention` still act on the partial list (some feedback acted on
+ * beats none), but a caller PERSISTING counts from `threads` (e.g. `recordReviewRound`) must check
+ * `complete` first — a degraded read must not be indistinguishable from a genuinely thread-free PR.
  */
 async function getReviewThreads(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
-): Promise<ReviewThread[]> {
+): Promise<{ threads: ReviewThread[]; threadsComplete: boolean }> {
   const allNodes: RawReviewThreadNode[] = [];
+  // Threads whose comment connection is truncated (see below) — excluded from the returned list
+  // entirely rather than kept with a stale last-fetched comment, so a caller never re-triages or
+  // replies against a thread it cannot see the true latest state of (PR #335 review).
+  const truncatedThreadIds = new Set<string>();
+  let complete = true;
   try {
     const nwo = await nameWithOwner(repoPath, signal);
-    if (!nwo) return [];
+    if (!nwo) return { threads: [], threadsComplete: false };
     const [owner, repo] = nwo.split("/");
 
     let cursor: string | undefined;
@@ -345,27 +364,123 @@ async function getReviewThreads(
         );
         parsed = JSON.parse(raw) as ReviewThreadsPage;
       } catch {
-        // Keep the pages already fetched; a failed first page still degrades to [].
+        // Keep the pages already fetched, but flag the read as incomplete — a failed first page
+        // still degrades to an empty, incomplete list.
+        complete = false;
         break;
       }
       const page = parsed.data?.repository?.pullRequest?.reviewThreads;
-      allNodes.push(...(page?.nodes ?? []));
-      if (!page?.pageInfo?.hasNextPage || !page.pageInfo.endCursor) break;
+      if (!page) {
+        // Missing repository/pullRequest/reviewThreads is a malformed response, not "no threads" —
+        // flag it so a degraded read isn't persisted as a genuinely thread-free PR.
+        complete = false;
+        break;
+      }
+      if (!Array.isArray(page.nodes)) {
+        // A missing, null, or non-array `nodes` is a malformed response, not "no threads" — flag it
+        // so a degraded read isn't persisted as a genuinely thread-free PR.
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
+      // Each thread's comments connection is capped at first:50 with no cursor of its own — a
+      // thread that has collected more comments than that (a long back-and-forth) silently drops
+      // everything past comment 50, including the most recent one. threadsNeedingAttention treats
+      // the last *fetched* comment as authoritative, so a truncated thread can misreport an anton
+      // reply (or a human follow-up after it) as never having happened. totalCount lets us detect
+      // that without a second, nested pagination loop — flag the read incomplete AND remember which
+      // thread it was, so that specific thread is dropped from the returned list below rather than
+      // being re-triaged, duplicate-replied to, or resolved against stale context (PR #335 review:
+      // flagging the whole read incomplete wasn't enough — every consumer still saw the thread with
+      // comment 50 as its latest). A thread missing `comments`/`totalCount` entirely is a DIFFERENT
+      // failure (a malformed response, not a real thread with excess comments) — it still flags the
+      // whole read incomplete so a caller never persists it as a genuinely thread-free/complete
+      // round, but the thread itself is kept (its handful of comments, however few, are real and
+      // there is no "true latest" being hidden behind a totalCount the response never reported).
+      for (const n of page.nodes) {
+        if (typeof n?.id !== "string") {
+          // A thread node with no string id can't be tracked in truncatedThreadIds and gets
+          // silently dropped by the filter below — without this, threadsComplete could stay
+          // true while a real thread vanished from the result (PR #335 review).
+          complete = false;
+          continue;
+        }
+        if (!n.comments || typeof n.comments.totalCount !== "number") {
+          // comments missing entirely is a malformed response, not a real zero-comment thread — drop
+          // it like the other malformed-comments cases below, so it never surfaces as an actionable
+          // thread with no anchor comment to triage against (PR #335 review).
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
+        if (!Array.isArray(n.comments.nodes)) {
+          // totalCount present but nodes isn't an array (null, missing, or malformed) — comments
+          // are claimed but unreadable, so treat this like truncation: drop the thread below
+          // rather than persisting it as a genuinely comment-free, complete thread.
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
+        if (n.comments.totalCount === 0) {
+          // A thread always has at least one anchor comment — totalCount: 0 is a malformed
+          // response (e.g. the comments became unavailable), not a genuine comment-free thread.
+          // threadsNeedingAttention would otherwise treat the missing last comment as "never
+          // replied to" and dispatch it forever, while triageOutcomes can never report an
+          // outcome for it (no comments[0] to anchor on) — drop it like the other malformed
+          // cases so it never surfaces as actionable (PR #335 review).
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
+        if (n.comments.totalCount > n.comments.nodes.length) {
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+          continue;
+        }
+        // nodes.length matches totalCount, but a node can still lack a numeric databaseId (e.g. a
+        // pending/draft comment) — the mapping below silently filters those out, so a thread that
+        // looks array-complete here can end up with a stale or empty comment list post-filter while
+        // `complete` stays true. Catch it here so the whole read (and this thread) is flagged
+        // incomplete rather than persisted as if the dropped comment never existed (PR #335 review).
+        if (n.comments.nodes.some((c) => typeof c?.databaseId !== "number")) {
+          complete = false;
+          if (typeof n.id === "string") truncatedThreadIds.add(n.id);
+        }
+      }
+      if (!page.pageInfo) {
+        // No pageInfo at all is a malformed response, not "last page" — pagination could not
+        // even be checked, so the read is incomplete.
+        complete = false;
+        break;
+      }
+      if (typeof page.pageInfo.hasNextPage !== "boolean") {
+        // hasNextPage missing or null is a malformed response, not "last page" — pagination could
+        // not be verified, so the nodes already fetched aren't confirmed as the full picture.
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        // hasNextPage is true but no cursor to continue with — pagination can't proceed, so the
+        // nodes already fetched aren't the full picture.
+        complete = false;
+        break;
+      }
       cursor = page.pageInfo.endCursor;
     }
   } catch {
-    return [];
+    return { threads: [], threadsComplete: false };
   }
 
-  return allNodes
-    .filter((n) => typeof n?.id === "string")
+  const threads = allNodes
+    .filter((n) => typeof n?.id === "string" && !truncatedThreadIds.has(n.id))
     .map((n) => ({
       id: n.id!,
       isResolved: n.isResolved ?? false,
       isOutdated: n.isOutdated ?? false,
       path: n.path ?? undefined,
       line: n.line ?? undefined,
-      comments: (n.comments?.nodes ?? [])
+      comments: (Array.isArray(n.comments?.nodes) ? n.comments.nodes : [])
         .filter((c) => typeof c?.databaseId === "number")
         .map((c) => ({
           id: c.databaseId!,
@@ -373,6 +488,7 @@ async function getReviewThreads(
           body: c.body ?? "",
         })),
     }));
+  return { threads, threadsComplete: complete };
 }
 
 /**
@@ -520,7 +636,14 @@ export async function getPrComments(
   return (view.comments ?? []).map((c) => c.body ?? "");
 }
 
-/** Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId). */
+/**
+ * Reply within an inline review thread (REST replies endpoint, keyed by a comment databaseId).
+ *
+ * Throws rather than no-oping when the repo's `nameWithOwner` can't be resolved — the sole caller
+ * (`recordThreadOutcome`, review-fix.ts) wraps this in `safe()`, which reports whether the reply
+ * actually reached GitHub. A silent early return would report `true` for a reply nobody sent,
+ * miscounting an actionable thread as delivered (PR #335 review).
+ */
 export async function replyToReviewComment(
   repoPath: string,
   number: number,
@@ -529,7 +652,7 @@ export async function replyToReviewComment(
   signal?: AbortSignal,
 ): Promise<void> {
   const nwo = await nameWithOwner(repoPath, signal);
-  if (!nwo) return;
+  if (!nwo) throw new Error(`replyToReviewComment: could not resolve nameWithOwner for ${repoPath}`);
   await gh(
     repoPath,
     ["api", "--method", "POST", `repos/${nwo}/pulls/${number}/comments/${commentId}/replies`, "-f", `body=${body}`],

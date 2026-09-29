@@ -181,6 +181,80 @@ describeBd("review-fix merge finalization (real handler · real bd/git · fake g
     expect(run?.endedAt).toBeTruthy();
   });
 
+  /**
+   * anton-z5e3g: how the PR ENDED, stamped onto the rounds it collected. A round cannot know its own
+   * PR's fate while it is running, so this stamp is the only thing that can answer "did the review
+   * anton did on this PR lead anywhere" — and finalization is the only place the answer exists.
+   */
+  it("stamps merged across the rounds the PR collected", async () => {
+    process.env.ANTON_GH_BIN = ghForState(binDir, "gh-merged-stamp", "MERGED");
+    // Two rounds already recorded against this PR, as two earlier fix passes would have left them.
+    for (const round of [1, 2]) {
+      await tdb.db.insert(schema.reviewRounds).values({
+        id: randomUUID(),
+        projectId,
+        beadId: epicId,
+        prNumber: 7,
+        round,
+        recordedAt: new Date(clock.now()),
+      });
+    }
+
+    await runSweep();
+
+    const rounds = await tdb.db.select().from(schema.reviewRounds);
+    expect(rounds.map((r) => r.prState)).toEqual(["merged", "merged"]);
+    expect(rounds.every((r) => r.prStateAt !== null)).toBe(true);
+  });
+
+  it("stamps closed on a PR closed without merging — the one place anton observes that end", async () => {
+    process.env.ANTON_GH_BIN = ghForState(binDir, "gh-closed-stamp", "CLOSED");
+    await tdb.db.insert(schema.reviewRounds).values({
+      id: randomUUID(),
+      projectId,
+      beadId: epicId,
+      prNumber: 7,
+      round: 1,
+      recordedAt: new Date(clock.now()),
+    });
+
+    // A closed-unmerged PR is never dispatched (it is not actionable) and is never finalized, so the
+    // DISPATCHER's own triage read is the only observation of the close there is.
+    expect(await runSweep()).toEqual([]);
+
+    expect((await tdb.db.select().from(schema.reviewRounds))[0].prState).toBe("closed");
+  });
+
+  it("stamps closed from the per-PR job too, when the PR closes after its dispatch", async () => {
+    // The race the dispatcher cannot cover: the target was dispatched while its PR was OPEN and
+    // actionable, and the PR closed before the job ran. Whichever job first READS the end records it.
+    process.env.ANTON_GH_BIN = ghForState(binDir, "gh-closed-race", "CLOSED");
+    await tdb.db.insert(schema.reviewRounds).values({
+      id: randomUUID(),
+      projectId,
+      beadId: epicId,
+      prNumber: 7,
+      round: 1,
+      recordedAt: new Date(clock.now()),
+    });
+
+    // Enqueued directly — the dispatcher would decline this target now, which is the whole point.
+    await driveJob({
+      db: tdb.db,
+      clock,
+      type: "review-fix-pr",
+      handler: makeReviewFixPrHandler,
+      projectId,
+      payload: { projectId, epicBeadId: epicId },
+      config: { leaseMs: 30_000 },
+    });
+
+    expect((await tdb.db.select().from(schema.reviewRounds))[0].prState).toBe("closed");
+    // And nothing was finalized — a closed-unmerged PR is still left alone, PR ref and all.
+    expect((await beads.show(repo, epicId)).status).not.toBe("closed");
+    expect((await beads.show(repo, epicId)).labels ?? []).toContain(LABELS.stage("in-review"));
+  });
+
   it("is idempotent — a second sweep after finalization changes nothing and does not error", async () => {
     process.env.ANTON_GH_BIN = ghForState(binDir, "gh-merged2", "MERGED");
     await runSweep();

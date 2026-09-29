@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 60ddb0a8010d
+version: 470d8aa81818
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -45,6 +45,8 @@ Do not accept the idea at face value. Ask, one at a time, only what you can't an
 - What do they do today instead? Why is that painful enough to switch?
 - What's the smallest version that delivers the value? What are we *not* doing?
 - How will we know it worked? (a metric or an observable behavior)
+- **Which outcome does this serve, and how?** Name one id from `.product/PRODUCT.md`'s
+  `## Outcomes` — every feature answers this before it's shaped, never after.
 
 If the problem is speculative, say so plainly and recommend a cheaper validation step (a
 `domain:research` bead) before any `domain:eng` work. **Boil the lake, but validate before
@@ -118,7 +120,8 @@ the mapping onto the tiers is your job.
    plainly advance that outcome? Don't stretch a match to avoid step 3.
 3. **Nothing fits → create the epic.** State it as an outcome a stakeholder would recognise
    ("Reports are shareable outside the app"), not a restatement of the feature ("Add CSV export").
-   Give it exactly one `area:` label and Success Criteria that several features add up to.
+   Give it exactly one `area:` label, Success Criteria that several features add up to, and a
+   `## Outcome IDs` section naming the `.product/PRODUCT.md` id(s) it serves.
 4. **Can't name an outcome you believe in → ask the user.** Show the feature, the epics you
    considered, and why none fit; ask which epic it belongs to or whether it's a genuine one-off.
    Never leave a feature parentless to move on, and never mint a one-feature epic to silence the
@@ -136,6 +139,7 @@ For every feature and ticket, the description MUST contain, or it is not `shaped
 
 ```
 ## Goal                one sentence: outcome + why
+## Why                 which outcome (`.product/PRODUCT.md` `## Outcomes`) this serves, and how
 ## Acceptance Criteria - [ ] concrete, checkable
                        - [ ] concrete, checkable
 ## Context             touches: <files/areas> ; follow pattern in <file>
@@ -157,10 +161,12 @@ PR. Shape that as a ticket under the feature; when the work genuinely has nothin
 in `## Out of scope` and why. Silence is not a decision — the reviewer reads the bead, not your
 intent. Pure refactors, docs, and UI over existing data are outside the ADR and need neither.
 
-Set labels (`domain:`, `risk:`, `agent:`, `size:`) per the `bd` skill's conventions, plus one
-`area:` on the epic. Set dependency edges: `parent-child` from ticket to feature and from feature
-to epic, `blocks` for hard ordering. `risk:high` for schema/auth/payments/migrations/infra. A
-`size:L` ticket is a smell — split it; a `size:L` feature usually means two PRs. (Model routing
+Set labels (`domain:`, `risk:`, `agent:`, `size:`, `outcome:`) per the `bd` skill's conventions,
+plus one `area:` on the epic. `outcome:<id>` goes on the feature (the run target) — the id you
+named answering Phase 1's forcing question — and the epic's `## Outcome IDs` section lists what its
+features add up to serving. Set dependency edges: `parent-child` from ticket to feature and from
+feature to epic, `blocks` for hard ordering. `risk:high` for schema/auth/payments/migrations/infra.
+A `size:L` ticket is a smell — split it; a `size:L` feature usually means two PRs. (Model routing
 is the executor's call — don't set a `model:` label.)
 
 **Specify the what and the done, not the how.** No line-by-line implementation plans — the
