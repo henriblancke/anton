@@ -1740,39 +1740,46 @@ describe("fingerprintHasNonThreadReasons", () => {
 });
 
 /**
- * `shouldRecordAnswered` gates `recordReviewFixAnswered` on a complete comment-history read, on top
- * of the existing `!pushed && answeredAllThreads` bar (PR #338 review round 2, chatgpt-codex-
- * connector): `classifyReview` (src/lib/git/pr.ts) folds a degraded read into the fixed,
- * deterministic `"comments:incomplete"` fingerprint entry, so persisting a round recorded under
- * that value would let every later degraded read match it and stay suppressed forever — even past a
- * human reply the failed page was hiding.
+ * `shouldRecordAnswered` gates `recordReviewFixAnswered` on a complete thread, comment-history, and
+ * reviews read, on top of the existing `!pushed && answeredAllThreads` bar (PR #338 review round 2 /
+ * round 12, chatgpt-codex-connector): `classifyReview` (src/lib/git/pr.ts) folds a degraded read into
+ * a fixed, deterministic fingerprint entry, so persisting a round recorded under that value would let
+ * every later degraded read match it and stay suppressed forever — even past a human reply, or a new
+ * reply on a thread, the failed page was hiding.
  */
 describe("shouldRecordAnswered", () => {
-  it("records when nothing pushed, every thread answered, and the comment/review reads were complete", () => {
-    expect(shouldRecordAnswered(false, true, true, true)).toBe(true);
+  it("records when nothing pushed, every thread answered, and the thread/comment/review reads were complete", () => {
+    expect(shouldRecordAnswered(false, true, true, true, true)).toBe(true);
   });
 
   it("records when commentsComplete/reviewsComplete are undefined (a caller-built fixture that never set them)", () => {
-    expect(shouldRecordAnswered(false, true, undefined, undefined)).toBe(true);
+    expect(shouldRecordAnswered(false, true, true, undefined, undefined)).toBe(true);
+  });
+
+  // PR #338 review round 12 (chatgpt-codex-connector): a truncated thread page drops the hidden
+  // thread from both `waitingIds` and the fingerprint, so recording this round as answered would let
+  // a later, still-degraded read match this stale row and suppress a still-waiting thread forever.
+  it("does not record when the thread read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, false, true, true)).toBe(false);
   });
 
   it("does not record when the comment read was degraded, even though everything else answered", () => {
-    expect(shouldRecordAnswered(false, true, false, true)).toBe(false);
+    expect(shouldRecordAnswered(false, true, true, false, true)).toBe(false);
   });
 
   // PR #338 review (chatgpt-codex-connector): mirrors the comment-completeness gate above — a
   // degraded REVIEWS read can hide a new CHANGES_REQUESTED review, so recording this round as
   // answered would let a later, still-degraded read match this stale row and suppress it forever.
   it("does not record when the reviews read was degraded, even though everything else answered", () => {
-    expect(shouldRecordAnswered(false, true, true, false)).toBe(false);
+    expect(shouldRecordAnswered(false, true, true, true, false)).toBe(false);
   });
 
   it("does not record when something was pushed", () => {
-    expect(shouldRecordAnswered(true, true, true, true)).toBe(false);
+    expect(shouldRecordAnswered(true, true, true, true, true)).toBe(false);
   });
 
   it("does not record when a thread was left unanswered", () => {
-    expect(shouldRecordAnswered(false, false, true, true)).toBe(false);
+    expect(shouldRecordAnswered(false, false, true, true, true)).toBe(false);
   });
 });
 

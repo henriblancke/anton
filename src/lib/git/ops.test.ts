@@ -4297,6 +4297,79 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     },
   );
 
+  // PR #338 review, chatgpt-codex-connector, P2: a real `git merge`'s own automatic, conflict-free
+  // path never runs `pre-commit` directly (only `pre-merge-commit`, run explicitly elsewhere) — so
+  // re-verifying a BARE, fix-free auto-merge (`premergeBase`'s clean base sync) via a plain `git
+  // commit` must not add `pre-commit` either, or a project whose `pre-commit` legitimately rejects
+  // unrelated pre-existing content would have this replay reject a merge its real workflow accepts.
+  // Contrast with the conflict-resolution tests above, which correctly DO expect `pre-commit` to run
+  // (concluding a real conflicted merge is an ordinary `git commit` in git's own hook lifecycle).
+  it.runIf(process.platform !== "win32")(
+    "skips pre-commit for a boundary marked as a bare clean auto-merge, but still runs other hooks",
+    async () => {
+      g(["checkout", "-q", "-b", "feature-bare"]);
+      writeFileSync(join(repo, "feature.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "base.ts"), "base\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+      const mainTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "feature-bare"]);
+      // Clean, conflict-free auto-merge — the same shape `premergeBase` produces via
+      // `mergeIntoCurrent(..., { bypassHooks: true })`. `--no-verify` bypasses only
+      // `pre-merge-commit` here (nothing configured, so a no-op either way).
+      execFileSync("git", ["-C", repo, "merge", "--no-verify", "--no-edit", "main"], {
+        stdio: "ignore",
+      });
+      const boundarySha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      // Confirms the clean merge itself never invoked `pre-commit` (real git merge never does) —
+      // the baseline this test's whole premise rests on.
+      expect(existsSync(hookRuns)).toBe(false);
+
+      // `pre-commit` would reject if it ran at all.
+      writeFileSync(rejectMarker, "");
+
+      // Installed only now, right before the verify commit under test — every earlier commit/merge
+      // in this test's own setup would otherwise also count toward `postCommitRuns` below.
+      const postCommitRuns = join(sandbox, "post-commit-runs");
+      const postCommitHook = join(repo, ".git", "hooks", "post-commit");
+      writeFileSync(
+        postCommitHook,
+        ["#!/bin/sh", `echo ran >> ${JSON.stringify(postCommitRuns)}`, "exit 0", ""].join("\n"),
+        "utf8",
+      );
+      chmodSync(postCommitHook, 0o755);
+
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+        verifyFrom: boundarySha,
+        verifiedBoundaryIsBareMerge: true,
+      });
+      expect(amended).toBe(true);
+      expect(existsSync(hookRuns)).toBe(false);
+      expect(readFileSync(postCommitRuns, "utf8").trim().split("\n")).toHaveLength(1);
+
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const finalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", finalSha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(finalParents).toHaveLength(2);
+      expect(finalParents[1]).toBe(mainTip);
+    },
+  );
+
   // PR #338 review round 10 (chatgpt-codex-connector): passing `-m` reports its source as `message`
   // to `prepare-commit-msg`, even with `MERGE_HEAD` present and the resulting commit carrying two
   // parents — a hook branching on that source argument would take the non-merge path on a commit

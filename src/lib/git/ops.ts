@@ -7,7 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
-import { rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
@@ -1666,6 +1666,49 @@ async function runIgnoreMissingHook(
 }
 
 /**
+ * A `core.hooksPath` mirroring the worktree's real hooks directory via symlinks, minus
+ * `pre-commit` — passed to the verifying `git commit` call `commitAll`'s merge-replay path makes,
+ * so that call runs every OTHER configured hook (crucially `commit-msg`, which a real `git merge`
+ * also invokes for the merge commit message) without also invoking `pre-commit`.
+ *
+ * A real `git merge` never runs `pre-commit` directly — githooks(5) documents that only the STOCK
+ * `pre-merge-commit` sample hook happens to chain into `pre-commit` itself; a project's own custom
+ * `pre-merge-commit` (already run explicitly above via `runIgnoreMissingHook`) is under no
+ * obligation to, and most don't. A generic `git commit`, by contrast, ALWAYS fires `pre-commit`
+ * regardless of merge context — so committing this replay's merge shape via a plain `git commit`
+ * call re-runs a hook the real merge workflow it stands in for would only have run if that
+ * project's own `pre-merge-commit` chose to chain it, and can reject/repeatedly park a merge the
+ * project's actual workflow accepts (PR #338 review, chatgpt-codex-connector, P2).
+ *
+ * `undefined` when the real hooks directory doesn't exist at all (nothing configured, so nothing
+ * to skip) or the mirror can't be built — falls back to the caller's own `hooksPath`, matching this
+ * function's behavior before this mirror existed, rather than failing the whole commit over a
+ * best-effort hygiene step.
+ */
+async function hooksPathSkippingPreCommit(
+  worktreePath: string,
+  hooksPath: string | undefined,
+): Promise<string | undefined> {
+  try {
+    const realHooksDir = await git(
+      worktreePath,
+      ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+      hooksPath,
+    );
+    if (!existsSync(realHooksDir)) return undefined;
+    const mirror = resolve(tmpdir(), `anton-merge-hooks-${randomUUID()}`);
+    await mkdir(mirror, { recursive: true });
+    for (const entry of await readdir(realHooksDir)) {
+      if (entry === "pre-commit") continue;
+      await symlink(resolve(realHooksDir, entry), resolve(mirror, entry)).catch(() => {});
+    }
+    return mirror;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Stage everything in the worktree — `git add -A`, extracted so a caller can stage BEFORE asking
  * {@link resolveHooksPathOverride} anything (PR #263 review, round 37; see {@link commitAll}'s own
  * doc comment for why that order matters). Idempotent: calling it again right after — as
@@ -1761,6 +1804,26 @@ export async function commitAll(
      * Defaults to `HEAD` itself when unset, matching the original single-commit behavior.
      */
     verifyFrom?: string;
+    /**
+     * The boundary being re-verified is a BARE, fix-free auto-merge (`premergeBase`'s clean base
+     * sync landed with hooks bypassed, nothing built on top) — as opposed to a genuine multi-parent
+     * commit that concluded a manually-resolved conflict (claude resolving base-merge conflicts
+     * while addressing the actual review feedback, still a real `git commit` in git's own hook
+     * lifecycle). Only the caller knows which one it is (see `BARE_PREMERGE_NOTE_TAG`'s own doc in
+     * review-fix.ts) — `commitAll` has no notion of that provenance on its own.
+     *
+     * When `true` AND the verify commit turns out to carry more than one parent, the verifying
+     * commit below skips `pre-commit` (still running every other configured hook, `commit-msg`
+     * included): a real `git merge`'s own automatic, conflict-free path never invokes `pre-commit`
+     * directly — only `pre-merge-commit`, already run explicitly above — so committing this bare
+     * merge's replay via a plain `git commit` would otherwise fire a hook the real merge workflow
+     * this stands in for might never have run, and can reject (or repeatedly park) a merge the
+     * project's actual workflow accepts (PR #338 review, chatgpt-codex-connector, P2). A genuine
+     * conflict-resolution merge is concluded via an ORDINARY `git commit` in real git too, which
+     * always fires `pre-commit` — so this must stay `false`/unset for that case, matching prior
+     * behavior.
+     */
+    verifiedBoundaryIsBareMerge?: boolean;
   } = {},
 ): Promise<{ committed: boolean }> {
   await stageAll(worktreePath, options.hooksPath);
@@ -1866,6 +1929,12 @@ export async function commitAll(
   // review, chatgpt-codex-connector, round 9).
   let mergeHeadPath: string | undefined;
   let mergeMsgPath: string | undefined;
+  // Symlink mirror of the real hooks dir, minus `pre-commit` — built only when
+  // `options.verifiedBoundaryIsBareMerge` says the verify commit stands in for a real `git merge`'s
+  // own automatic path rather than a conflict resolution concluded via an ordinary `git commit` (see
+  // that option's own doc, and {@link hooksPathSkippingPreCommit}). Removed in `finally` below
+  // regardless of how the commit turns out.
+  let mergeCommitHooksPath: string | undefined;
   // Setup (resolving/writing MERGE_HEAD and MERGE_MSG) lives inside this same try — HEAD already
   // moved to `resetHead` above, so a failure here (e.g. an unwritable git dir) needs the identical
   // restoration the commit failure path below already performs, not an uncaught throw that leaves
@@ -1924,11 +1993,14 @@ export async function commitAll(
         "MERGE_MSG",
       ]);
       await writeFile(mergeMsgPath, originalMessage);
+      if (options.verifiedBoundaryIsBareMerge) {
+        mergeCommitHooksPath = await hooksPathSkippingPreCommit(worktreePath, options.hooksPath);
+      }
     }
     await gitCommit(
       worktreePath,
       extraParents.length > 0 ? ["commit", "--no-edit"] : ["commit", "-m", originalMessage],
-      options.hooksPath,
+      mergeCommitHooksPath ?? options.hooksPath,
       options.timeoutMs,
       options.signal,
     );
@@ -2013,6 +2085,13 @@ export async function commitAll(
     // this `catch` into the same post-commit verification the success path runs below (the
     // `extraParents`/`reduce_heads` repair), rather than rethrowing a stale error for a commit
     // that already made it through the project's real hooks.
+  } finally {
+    // Best-effort — the mirror is a scratch temp dir, never referenced again once the commit above
+    // has settled one way or the other, so a failed cleanup here must not turn a landed (or safely
+    // rolled back) commit into a reported failure.
+    if (mergeCommitHooksPath) {
+      await rm(mergeCommitHooksPath, { recursive: true, force: true }).catch(() => {});
+    }
   }
   if (extraParents.length === 0) {
     return { committed: true };
