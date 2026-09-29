@@ -64,7 +64,9 @@ import {
   isAncestor,
   readWorktreeState,
   fetchOrigin,
+  mergeInProgress,
   mergeIntoCurrent,
+  unmergedPaths,
   needsHooksPathOverrideForMerge,
   pushBranch,
   readPullRequestBody,
@@ -1320,7 +1322,22 @@ async function premergeBase(
   // run against a stale tree and `commitFix` stage the pre-existing dirty edits into the push. Only
   // gated on a POSITIVE dirty read (`preMergeState` resolved and its status is non-empty) — a failed
   // read falls through to the existing behavior below, unchanged.
+  //
+  // EXCEPT when the dirt is a merge THIS function itself left conflicted (`MERGE_HEAD` set) on an
+  // earlier attempt whose dispatched session crashed or was killed before `commitFix` could conclude
+  // it. That state is always resumable — the merge is exactly what this call would produce anyway —
+  // so blindly rejecting it as generic dirt instead reports `failed: true` forever: every retry finds
+  // the same still-conflicted checkout, `refsSynced` stays false, and the run parks each attempt as
+  // incomplete without ever exposing the unresolved conflicts to a session that could fix them (PR
+  // #338 review, chatgpt-codex-connector). Hand the still-unmerged paths back exactly as a fresh
+  // conflict would be — nothing here touches the tree, so a prior session's own partial resolution
+  // (staged, not yet committed) survives untouched. Any OTHER dirty checkout carries no `MERGE_HEAD`
+  // and still falls through to the unconditional reject.
   if (preMergeState && preMergeState.status !== "") {
+    if (await mergeInProgress(worktreePath)) {
+      const unresolved = await unmergedPaths(worktreePath).catch(() => []);
+      return { conflicts: unresolved, merged: true, failed: false };
+    }
     return { conflicts: [], merged: false, failed: true };
   }
   try {
@@ -2100,7 +2117,11 @@ async function runFixSession(args: {
         number,
         error: e,
         conflicts,
-        fixRoundAttempted: gateFollowUpAttempted,
+        // Scoped to the gate-failure poison itself (not just "a follow-up round ran at some point
+        // this attempt"): a follow-up that fixed the gate can still be followed by an unrelated
+        // commit/marker poison from `commitFix`/`commitAndPushFix` below, and that poison did not
+        // fail a second time — it never touched the gate at all (PR #338 review, @claude).
+        fixRoundAttempted: gateFollowUpAttempted && isGateFailurePoison(e),
         signal: ctx.signal,
       });
     }
@@ -2186,6 +2207,23 @@ async function captureRedGate(
   return outcomes.find((o) => !o.ok);
 }
 
+const GATE_FAILURE_POISON = Symbol("gateFailurePoison");
+
+/**
+ * Whether `error` is specifically the poison {@link gateFailurePoison} throws — not just any
+ * `PoisonError` reaching the same catch block. `gateFollowUpAttempted` (set the instant the
+ * follow-up round is dispatched, never reset once it succeeds) says nothing on its own about
+ * WHICH poison a later throw is: `commitFix`/`commitAndPushFix` raise their own `PoisonError`s
+ * for unrelated commit/marker failures, and those can still fire after a follow-up round already
+ * fixed the gate. Tagged the same way `commitAttemptMode` tags a commit error (git/ops.ts) —
+ * on the original object, not a wrapper, so identity and message survive for every other reader.
+ *
+ * Exported for tests only — every real caller is inside this module.
+ */
+export function isGateFailurePoison(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && GATE_FAILURE_POISON in error);
+}
+
 /**
  * Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
  *
@@ -2196,9 +2234,12 @@ async function captureRedGate(
  * taxonomy, not a new kind of stop.
  */
 function gateFailurePoison(red: VerifyGateOutcome, number: number): PoisonError {
-  return new PoisonError(
-    `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
-      tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
+  return Object.assign(
+    new PoisonError(
+      `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
+        tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
+    ),
+    { [GATE_FAILURE_POISON]: true },
   );
 }
 

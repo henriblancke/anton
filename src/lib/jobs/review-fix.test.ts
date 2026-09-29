@@ -24,6 +24,7 @@ import {
   claimOwnerFor,
   fingerprintHasNonThreadReasons,
   inReviewEpics,
+  isGateFailurePoison,
   mainRoundChangesSurvived,
   makeReviewFixHandler,
   makeReviewFixPrHandler,
@@ -2002,6 +2003,41 @@ describe("runTestGate (anton-h0hwc)", () => {
     const err: unknown = await promise.catch((e) => e);
     expect(err).not.toBeInstanceOf(PoisonError);
     expect((err as { name?: string })?.name).toBe("AbortError");
+  });
+});
+
+// PR #338 review, @claude: `notifyGateParked`'s "a follow-up round already ran against this gate;
+// it failed again" note must only ever describe THIS poison — not any PoisonError that happens to
+// reach the same catch block after a follow-up round was dispatched (e.g. an unrelated commit/marker
+// poison from `commitFix`/`commitAndPushFix`, raised even after the follow-up's own gate re-run came
+// back green).
+describe("isGateFailurePoison (PR #338 review, @claude)", () => {
+  it("is true for the poison runTestGate raises on a red gate", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-gate-poison-test-"));
+    try {
+      const err = await runTestGate(
+        { testCommand: "echo boom && exit 1" },
+        dir,
+        new AbortController().signal,
+        join(dir, "session.log"),
+        7,
+      ).catch((e) => e);
+      expect(isGateFailurePoison(err)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is false for an unrelated PoisonError — e.g. commitFix's own commit/marker failures", () => {
+    expect(
+      isGateFailurePoison(
+        new PoisonError("review fix for PR #7 rewrote branch instead of adding its commit"),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false for a plain (non-poison) error", () => {
+    expect(isGateFailurePoison(new Error("boom"))).toBe(false);
   });
 });
 

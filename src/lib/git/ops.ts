@@ -3487,12 +3487,40 @@ export async function mergeIntoCurrent(
     );
     return { ok: true, conflicts: [] };
   } catch (e) {
-    const conflicts = await diffPaths(worktreePath, ["--name-only", "--diff-filter=U"]).catch(() => []);
+    const conflicts = await unmergedPaths(worktreePath).catch(() => []);
     if (conflicts.length === 0) {
       await git(worktreePath, ["merge", "--abort"]).catch(() => {});
       throw e;
     }
     return { ok: false, conflicts };
+  }
+}
+
+/**
+ * Paths still carrying unresolved conflict markers (`git diff --diff-filter=U`) — the same query
+ * {@link mergeIntoCurrent} uses to decide a conflicted merge from any other failure, exported so a
+ * caller resuming a merge left in progress across process retries (review-fix's `premergeBase`) can
+ * ask the identical question a session later.
+ */
+export async function unmergedPaths(worktreePath: string): Promise<string[]> {
+  return diffPaths(worktreePath, ["--name-only", "--diff-filter=U"]);
+}
+
+/**
+ * Whether `worktreePath` has a merge in progress — `MERGE_HEAD` set, meaning some earlier `git
+ * merge` conflicted and was never concluded (by a commit or an abort). `mergeIntoCurrent` always
+ * leaves this behind on a conflicted merge and only ever clears it via a caller's later commit or
+ * its own `merge --abort` on a non-conflict failure — so its presence on a REUSED worktree, checked
+ * before this attempt has run any git command of its own, can only mean a previous attempt's own
+ * conflicted merge is still sitting there unresolved, not some unrelated dirty state (PR #338
+ * review, chatgpt-codex-connector).
+ */
+export async function mergeInProgress(worktreePath: string): Promise<boolean> {
+  try {
+    await git(worktreePath, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]);
+    return true;
+  } catch {
+    return false;
   }
 }
 
