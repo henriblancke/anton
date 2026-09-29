@@ -169,6 +169,17 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("infra");
   });
 
+  it("classifies a deterministic exit whose own report merely mentions a bare status code as agent, not infra (PR #339 review)", () => {
+    // The agent's own summary happens to quote a status code while reporting a real, deterministic
+    // failure — `transientSignature` finds nothing (narrow result-text regex), so no `(transient:
+    // ...)` tag was ever appended. `isRecoverableClaudeText` must not reconstruct one by re-scanning
+    // this untagged text with the broad stderr-only regex.
+    const error =
+      "claude exited with code 1: I fixed the retry loop but the endpoint still returns a 503 in the " +
+      "integration test, so it fails deterministically.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
   it("classifies a clean-exit is_error transient result as infra, not unknown (PR #339 review)", () => {
     // driver-exit.ts's failureError builds this exact envelope for an is_error result carrying a
     // transient signature on an otherwise-clean (exit 0) run.

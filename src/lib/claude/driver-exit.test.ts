@@ -258,6 +258,40 @@ describe("exitError", () => {
     expect(err?.message).not.toMatch(/connection closed/i);
     expect(isRecoverableClaudeText(err!.message)).toBe(true);
   });
+
+  it("never re-derives recoverability by re-scanning an untagged agent report for a bare status code (review finding)", () => {
+    // The agent's own result text merely mentions a status code while reporting a real, deterministic
+    // failure. `transientSignature` correctly finds no signal (narrow result-text regex), so
+    // `exitCodeError` builds a plain `Error` with no `(transient: ...)` tag — `isRecoverableClaudeText`
+    // must not reconstruct one by re-scanning the stored message with the broad stderr regex.
+    const message = "claude exited with code 1: the local endpoint still returns a 503 in the test.";
+    expect(isRecoverableClaudeText(message)).toBe(false);
+  });
+
+  it("still recognizes a legacy untagged message whose detail is Claude Code's own API-error envelope", () => {
+    // A `runs.error` row written before the `(transient: ...)` suffix existed carries no tag, but
+    // Claude Code's own `API Error: <status>` prefix is a machine-authored shape a model wouldn't
+    // organically type, so it stays a safe fallback signal.
+    const message = "claude exited with code 1: API Error: 503 Service Unavailable";
+    expect(isRecoverableClaudeText(message)).toBe(true);
+  });
+
+  it("recognizes a tagged signal-exit message even though its code is null, not a digit (anton-r0tb follow-up)", () => {
+    // A signal kill leaves `exit.code` null (ClaudeExit.code is nullable, driver.ts passes the
+    // nullable `close` code straight through), so `exitCodeError` can build
+    // `claude exited with code null: ... (transient: <signature>)` — a digit-only envelope guard
+    // would reject this before ever checking the anchored suffix.
+    const err = exitError(
+      exit({
+        code: null,
+        stderr: "socket hang up",
+        stream: stream({ resultRaw: { type: "result", is_error: true, result: "unrelated report" } }),
+      }),
+    );
+
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(isRecoverableClaudeText(err!.message)).toBe(true);
+  });
 });
 
 describe("transientSignature", () => {
