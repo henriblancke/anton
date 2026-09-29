@@ -1069,15 +1069,21 @@ export async function prepareFixWorktree(args: {
   // branch already carries committed work (anton-2wklm).
   const alreadyAhead = await branchAheadOfRemote(repo, branch);
 
-  // This premerge runs with the project's hooks bypassed (see `premergeBase`'s own doc) — its
-  // result is an internal, not-yet-published boundary the real gates below and the eventual
-  // hook-enforced commit in `commitAndPushFix` still verify, so there is no incoming-ref hooksPath
-  // to resolve here.
-  const { conflicts, merged, failed: baseMergeFailed } = await premergeBase(
-    worktree.path,
-    baseBranch,
-    number,
-  );
+  // Gated on `refsFetched` (PR #338 review, chatgpt-codex-connector, round 11): premerging against a
+  // base that hasn't been proven current would land a clean auto-merge commit on the branch's LOCAL
+  // history before the caller ever sees `refsSynced === false` and skips the session — that commit
+  // then persists (this checkout is reused across passes, not discarded on skip), so the very next
+  // pass reads the branch as `alreadyAhead` of origin and takes the fast path that pushes it straight
+  // through without ever addressing the review feedback. Skipping the premerge entirely when the refs
+  // themselves are unsynchronized leaves nothing for that next pass to find "ahead" of a legitimate
+  // resume, and the fresh fetch it performs re-attempts the premerge against a base actually proven
+  // current. This premerge runs with the project's hooks bypassed (see `premergeBase`'s own doc) —
+  // its result is an internal, not-yet-published boundary the real gates below and the eventual
+  // hook-enforced commit in `commitAndPushFix` still verify, so there is no incoming-ref hooksPath to
+  // resolve here.
+  const { conflicts, merged, failed: baseMergeFailed } = refsFetched
+    ? await premergeBase(worktree.path, baseBranch, number)
+    : { conflicts: [], merged: false, failed: false };
   await ctx.heartbeat();
   // Folded in here, after `premergeBase` returns, rather than into `refsFetched` above: a fetched
   // head/base that match GitHub exactly are still not "synced" if the merge landing that base

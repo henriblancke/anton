@@ -710,6 +710,40 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       expect(result.refsSynced).toBe(true);
     });
   });
+
+  // PR #338 review, chatgpt-codex-connector, round 11: premerging BEFORE the refs are proven
+  // synchronized used to land a clean auto-merge commit on the branch's local history even though
+  // `refsSynced` came back false — the caller skips the session on that signal but never undoes the
+  // commit, so the next pass reads the branch as `alreadyAhead` of origin and takes the fast path
+  // that pushes it straight through without ever addressing the review feedback. The premerge must
+  // not run at all when the refs themselves are unsynchronized.
+  describe("premergeBase does not run at all when the refs are unsynchronized", () => {
+    it("skips the base merge when the head is neither equal to nor a descendant of expectedHeadSha", async () => {
+      // Not up to date with the base, so premergeBase WOULD attempt a real merge if it ran at all —
+      // proves the skip is what stops the second `mergeIntoCurrent` call, not a coincidental no-op.
+      isAncestorMock.mockResolvedValue(false);
+      resolveCommitShaMock.mockRejectedValue(new Error("not a git repo")); // aheadBeforeFetch stays false
+      branchAheadOfRemoteMock.mockResolvedValue(false); // no pre-existing local-only commits either
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha", // mismatched against the ("") readWorktreeState fallback
+        expectedBaseRefOid: undefined, // isolate the assertion to the head half of the check
+      });
+
+      expect(result.refsSynced).toBe(false);
+      expect(result.conflicts).toEqual([]);
+      // Only the unconditional origin/<branch> sync — premergeBase's own merge attempt never runs.
+      expect(mergeIntoCurrentMock).toHaveBeenCalledTimes(1);
+      expect(markUnverifiedBoundaryNotesAddMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 /**
