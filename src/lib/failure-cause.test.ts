@@ -163,6 +163,25 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("agent");
   });
 
+  it("classifies a deterministic exit whose own report narrates a pre-push hook decline as agent, not infra", () => {
+    const error =
+      "claude exited with code 1: the pre-push hook declined while I was working through the last commit.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
+  it("classifies a deterministic exit whose own report narrates a gate failure as agent, not gate", () => {
+    const error = "claude exited with code 1: the lint gate failed locally before I could push.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
+  it("classifies an explicit self-reported agent block as agent", () => {
+    const error =
+      "anton-y1u2y was self-reported blocked by the agent (blocked — dep-missing — waiting on anton-abcd) " +
+      "even though it committed changes. Blocking the ticket for operator review and halting the epic — " +
+      "the agent declared the work incomplete, so closing it would be a false success.";
+    expect(classifyFailureCause(error)).toBe("agent");
+  });
+
   it("classifies the measured 'operation was aborted' reason as unknown, not agent", () => {
     expect(classifyFailureCause("The operation was aborted")).toBe("unknown");
   });

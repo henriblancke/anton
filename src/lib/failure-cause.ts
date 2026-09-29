@@ -47,12 +47,14 @@ const INFRA_RE =
 
 /**
  * The claude driver's own failure shapes (driver-exit.ts `exitCodeError`/`stallError`/
- * `failureError`/`modelRefusalError`) — a deterministic non-zero exit, a stall kill, a missing
- * result event, or a refused model id. Each message is built in exactly one function, so its
- * leading phrasing is stable even though the trailing detail (the agent's own report) is not.
+ * `failureError`/`modelRefusalError`), plus `execute-epic-ticket.ts`'s `BlockedByAgentError` —
+ * a deterministic non-zero exit, a stall kill, a missing result event, a refused model id, or an
+ * explicit self-reported block. Each message is built in exactly one function, so its leading
+ * phrasing (or, for the self-report, its one fixed phrase) is stable even though the trailing
+ * detail — the agent's own freeform report, for the exit-code case — is not.
  */
 const AGENT_RE =
-  /^claude exited with code|claude produced no output for .*killed as stalled|claude exited without a result event|^claude refused to start: the model/i;
+  /^claude exited with code|claude produced no output for .*killed as stalled|claude exited without a result event|^claude refused to start: the model|\bwas self-reported blocked by the agent\b/i;
 
 const PATTERNS: Array<{ cause: Exclude<FailureCause, "unknown">; pattern: Matcher }> = [
   // Freshness first: `isStaleCheckoutDeferral` is a prefix check on the one message
@@ -60,9 +62,16 @@ const PATTERNS: Array<{ cause: Exclude<FailureCause, "unknown">; pattern: Matche
   // any of the other classes' vocabulary.
   { cause: "freshness", pattern: isStaleCheckoutDeferral },
   { cause: "quota", pattern: QUOTA_RE },
+  // Agent before gate/infra: `exitCodeError` wraps the agent's own freeform report as
+  // `claude exited with code N: <report>`, and that report can narrate a gate or git failure in
+  // prose ("the pre-push hook declined while I was working") without the run having hit either —
+  // GATE_RE/INFRA_RE are unanchored and would otherwise match that embedded phrase first. Checking
+  // the driver's own envelope (always anchored, built in exactly one place) before the unanchored
+  // matchers means a real gate/infra failure — which never starts with this envelope — still
+  // reaches its own matcher untouched.
+  { cause: "agent", pattern: AGENT_RE },
   { cause: "gate", pattern: GATE_RE },
   { cause: "infra", pattern: INFRA_RE },
-  { cause: "agent", pattern: AGENT_RE },
 ];
 
 /**
