@@ -56,6 +56,7 @@ import { resolveModel } from "./model-routing";
 import {
   branchAheadOfRemote,
   commitAll,
+  commitAttemptMode,
   commitParentShas,
   isAncestor,
   readWorktreeState,
@@ -1897,7 +1898,15 @@ async function commitFix(
         { cause: error },
       );
     }
-    if (options.amendToVerifyHooks) {
+    // `options.amendToVerifyHooks` is what the CALLER asked for, not necessarily what `commitAll`
+    // actually ran: it only takes the amend path when nothing new was staged, so a gate follow-up
+    // that DID stage new changes on top of a prior boundary commit gets an ordinary commit even when
+    // this was passed (PR #338 review round 2, chatgpt-codex-connector). Trust the mode `commitAll`
+    // tagged the error with over the request; only the request survives a non-commit failure (e.g.
+    // `stageAll` itself throwing, which never reaches either `gitCommit` call inside `commitAll`).
+    const requestedMode = options.amendToVerifyHooks ? "amend" : "commit";
+    const attemptedAmend = (commitAttemptMode(error) ?? requestedMode) === "amend";
+    if (attemptedAmend) {
       // An amend REPLACES the tip rather than adding on top of it, so `before.head` is never an
       // ancestor of `after.head` even when it landed cleanly — `isAncestor` below would wrongly
       // poison every timed-out-but-actually-landed amend. Confirm instead that only the tip itself

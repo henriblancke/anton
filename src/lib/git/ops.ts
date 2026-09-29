@@ -1492,6 +1492,33 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
   await git(worktreePath, ["add", "-A"], hooksPath);
 }
 
+const COMMIT_ATTEMPT_MODE = Symbol("gitCommitAttemptMode");
+
+/**
+ * Which git operation `commitAll` was attempting when the error it threw was raised — `"commit"`
+ * for the ordinary staged-changes path, `"amend"` for the `amendToVerifyHooks` path. A caller
+ * recovering from a timeout or hook rejection needs this: which path the CALLER requested via
+ * `amendToVerifyHooks` is not always which path RAN, since `commitAll` only takes the amend path
+ * when nothing new was staged — a caller can ask for it and still get an ordinary commit if the fix
+ * session added changes on top of a prior boundary commit (PR #338 review round 2,
+ * chatgpt-codex-connector). Tagged on the ORIGINAL error object (not wrapped) so identity
+ * (`rejects.toBe`) and message (a timeout's `killed: true` / budget text, git's own exit-code
+ * message) survive unchanged for every other caller that doesn't care about the mode.
+ */
+export function commitAttemptMode(error: unknown): "commit" | "amend" | undefined {
+  if (error && typeof error === "object" && COMMIT_ATTEMPT_MODE in error) {
+    return (error as Record<typeof COMMIT_ATTEMPT_MODE, "commit" | "amend">)[COMMIT_ATTEMPT_MODE];
+  }
+  return undefined;
+}
+
+function tagCommitAttempt<E>(error: E, mode: "commit" | "amend"): E {
+  if (error && typeof error === "object") {
+    Object.assign(error, { [COMMIT_ATTEMPT_MODE]: mode });
+  }
+  return error;
+}
+
 /**
  * Stage everything in the worktree and commit. Returns `{ committed: false }` when there is
  * nothing to commit (claude made no changes) — the caller decides whether that's acceptable.
@@ -1554,28 +1581,64 @@ export async function commitAll(
     nothingStaged = false;
   }
   if (!nothingStaged) {
-    await gitCommit(
-      worktreePath,
-      ["commit", ...bypass, "-m", message],
-      options.hooksPath,
-      options.timeoutMs,
-      options.signal,
-    );
+    try {
+      await gitCommit(
+        worktreePath,
+        ["commit", ...bypass, "-m", message],
+        options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+      );
+    } catch (error) {
+      throw tagCommitAttempt(error, "commit");
+    }
     return { committed: true };
   }
   if (options.amendToVerifyHooks) {
     // Nothing new landed, but HEAD is a prior hook-bypassed commit that still needs the project's
     // real hooks run against it before it publishes (PR #338 review, chatgpt-codex-connector).
-    // `--amend --no-edit` re-runs pre-commit/commit-msg over the same tree and message without
-    // changing either. A rejection here throws straight out to the caller — deliberately NOT
-    // caught above, since this isn't the "nothing staged" case that catch exists for.
-    await gitCommit(
-      worktreePath,
-      ["commit", "--amend", "--no-edit"],
-      options.hooksPath,
-      options.timeoutMs,
-      options.signal,
-    );
+    //
+    // A bare `commit --amend --no-edit` does NOT do this for a hook that inspects the STAGED diff
+    // (lint-staged and friends): such a hook diffs the index against the commit being amended —
+    // the boundary commit itself — and since nothing new is staged that diff is empty, so the hook
+    // validates nothing and the boundary's real changes reach the remote unchecked (PR #338 review
+    // round 2, chatgpt-codex-connector). `reset --soft HEAD^` fixes that without touching the tree
+    // this is about to commit: it moves the branch pointer back to the boundary's parent while
+    // leaving the index untouched, so the index (still the boundary's tree) now reads as staged
+    // against the new HEAD and the hook sees the real diff. What follows is then an ordinary,
+    // hook-verified commit of that same tree back on top of the same parent — a different git
+    // command from `--amend`, but the same observable result: same tree, same parent, same message,
+    // only the sha and commit date move.
+    const originalHead = await resolveCommitSha(worktreePath, "HEAD");
+    const originalMessage = await git(worktreePath, ["log", "-1", "--format=%B", "HEAD"]);
+    await git(worktreePath, ["reset", "--soft", "HEAD^"]);
+    try {
+      await gitCommit(
+        worktreePath,
+        ["commit", "-m", originalMessage],
+        options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+      );
+    } catch (error) {
+      // Hooks rejected it, or the commit timed out before one was created: put the branch back
+      // exactly where it started rather than leaving HEAD at the boundary's parent with the
+      // boundary's own changes sitting staged but uncommitted.
+      try {
+        await git(worktreePath, ["reset", "--soft", originalHead]);
+      } catch (restoreError) {
+        throw tagCommitAttempt(
+          new Error(
+            `git commit failed while verifying hooks over the boundary commit, and restoring ` +
+              `HEAD to ${originalHead} afterward also failed — the worktree may be left with the ` +
+              `boundary's changes staged but uncommitted: ${(restoreError as Error).message}`,
+            { cause: error },
+          ),
+          "amend",
+        );
+      }
+      throw tagCommitAttempt(error, "amend");
+    }
     return { committed: true };
   }
   return { committed: false };
