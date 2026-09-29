@@ -4572,6 +4572,95 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
   );
 });
 
+// PR #338 review round 12 (chatgpt-codex-connector): `gitCommit`'s timeout races git's own hook
+// sequencing (githooks(5)) — the commit object and ref update land BEFORE `post-commit` runs, so a
+// `post-commit` that merely runs long (not one that rejects the commit) can cross the timeout
+// budget and have `gitCommit` reject even though HEAD already moved to the fully hook-verified
+// commit. Unlike the `pre-commit` hang covered above (which blocks the commit from ever being
+// created), this exercises a hang AFTER the ref has already moved, on the amend path — which used
+// to treat every rejection as proof nothing landed and `reset --soft` the verified commit away.
+suite("commitAll (real git · amendToVerifyHooks with a slow post-commit)", () => {
+  let sandbox: string;
+  let repo: string;
+  let started: string;
+  let marker: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const rev = (rev_: string) =>
+    execFileSync("git", ["-C", repo, "rev-parse", rev_], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commit-postcommit-race-"));
+    repo = join(sandbox, "repo");
+    started = join(sandbox, "hook-started");
+    marker = join(sandbox, "late-hook-write");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+
+    const hook = join(repo, ".git", "hooks", "post-commit");
+    writeFileSync(
+      hook,
+      [
+        "#!/bin/sh",
+        `trap 'exec >/dev/null 2>&1; sleep 1; : > ${JSON.stringify(marker)}; exit 0' TERM`,
+        `: > ${JSON.stringify(started)}`,
+        "sleep 30 &",
+        "wait",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+  });
+
+  afterEach(() => {
+    delete process.env[COMMIT_TIMEOUT_ENV];
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "keeps the hook-verified amend commit instead of resetting it away when post-commit hangs past the timeout",
+    async () => {
+      writeFileSync(join(repo, "work.ts"), "export const work = 1;\n");
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+      const boundaryParent = rev("HEAD^");
+
+      // A follow-up round's own staged change, so the verified commit's TREE differs from the
+      // boundary's — otherwise an amend that reuses the boundary's tree/parent/message could
+      // legitimately hash to the exact same sha as the boundary commit (git commits are
+      // content-addressed), making "did it reset back to the boundary" indistinguishable from
+      // "did it keep the freshly verified commit" by sha alone.
+      writeFileSync(join(repo, "follow-up.ts"), "export const followUp = 1;\n");
+
+      process.env[COMMIT_TIMEOUT_ENV] = "2000";
+      const { committed } = await commitAll(repo, "boundary", { amendToVerifyHooks: true });
+
+      // The commit landed and its hooks ran to completion (git waits for `post-commit`
+      // synchronously) before `gitCommit`'s timeout ever fired — so this must read as success, not
+      // the reported timeout.
+      expect(committed).toBe(true);
+      expect(existsSync(started)).toBe(true);
+
+      // HEAD must carry the follow-up's staged change — not reset back to the pre-amend boundary,
+      // which never had `follow-up.ts` — and its parent must still be the boundary's own parent,
+      // matching what a clean (non-raced) amend produces.
+      const committedFiles = execFileSync("git", ["-C", repo, "ls-tree", "-r", "--name-only", "HEAD"], {
+        encoding: "utf8",
+      });
+      expect(committedFiles).toContain("follow-up.ts");
+      expect(rev("HEAD^")).toBe(boundaryParent);
+    },
+  );
+});
+
 // PR #338 review round 3 (chatgpt-codex-connector): a hook that inspects the STAGED diff (like
 // lint-staged) diffs the index against the commit it's being compared to. Once the gate follow-up
 // stages a file of its OWN, `commitAll` used to take the ordinary commit path and never re-check the

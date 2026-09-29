@@ -1713,50 +1713,69 @@ export async function commitAll(
       options.signal,
     );
   } catch (error) {
-    // Hooks rejected it, or the commit timed out before one was created: put the branch back
-    // exactly where it started rather than leaving HEAD at the boundary's parent with the
-    // boundary's own changes sitting staged but uncommitted — and, when one was written, a stray
-    // `MERGE_HEAD`/`MERGE_MSG` claiming a merge that never landed. `MERGE_HEAD` must be removed
-    // BEFORE the reset: git refuses a `reset --soft` while it is present ("Cannot do a soft reset
-    // in the middle of a merge"), which would otherwise leave HEAD at the boundary's parent with
-    // the boundary's changes staged, poisoning a later retry instead of restoring the marked
-    // boundary for one (PR #338 review, chatgpt-codex-connector, round 10). Both cleanup steps run
-    // even if one of them fails, so a failure in either is still reported rather than swallowed.
-    const cleanupErrors: string[] = [];
-    if (mergeHeadPath) {
-      try {
-        await rm(mergeHeadPath, { force: true });
-      } catch (rmError) {
-        cleanupErrors.push(`removing MERGE_HEAD failed (${(rmError as Error).message})`);
+    // `gitCommit`'s timeout races git's own hook sequencing (githooks(5)): the commit object and
+    // ref update land BEFORE `post-commit` runs, so a `post-commit` that merely runs long — not
+    // one that rejects the commit — can cross the timeout budget and have `gitCommit` reject
+    // *after* HEAD already moved to the fully hook-verified commit. Check that before assuming
+    // nothing landed: unconditionally resetting here would silently discard an already-verified
+    // commit and poison a retry into re-running hooks whose side effects may not be idempotent
+    // (PR #338 review, chatgpt-codex-connector, round 12).
+    const headAfterError = await resolveCommitSha(worktreePath, "HEAD").catch(() => undefined);
+    const landed =
+      headAfterError !== undefined &&
+      headAfterError !== resetHead &&
+      (await isAncestor(worktreePath, resetHead, headAfterError).catch(() => false));
+    if (!landed) {
+      // Hooks rejected it, or the commit timed out before one was created: put the branch back
+      // exactly where it started rather than leaving HEAD at the boundary's parent with the
+      // boundary's own changes sitting staged but uncommitted — and, when one was written, a stray
+      // `MERGE_HEAD`/`MERGE_MSG` claiming a merge that never landed. `MERGE_HEAD` must be removed
+      // BEFORE the reset: git refuses a `reset --soft` while it is present ("Cannot do a soft reset
+      // in the middle of a merge"), which would otherwise leave HEAD at the boundary's parent with
+      // the boundary's changes staged, poisoning a later retry instead of restoring the marked
+      // boundary for one (PR #338 review, chatgpt-codex-connector, round 10). Both cleanup steps run
+      // even if one of them fails, so a failure in either is still reported rather than swallowed.
+      const cleanupErrors: string[] = [];
+      if (mergeHeadPath) {
+        try {
+          await rm(mergeHeadPath, { force: true });
+        } catch (rmError) {
+          cleanupErrors.push(`removing MERGE_HEAD failed (${(rmError as Error).message})`);
+        }
       }
-    }
-    if (mergeMsgPath) {
-      try {
-        await rm(mergeMsgPath, { force: true });
-      } catch (rmError) {
-        cleanupErrors.push(`removing MERGE_MSG failed (${(rmError as Error).message})`);
+      if (mergeMsgPath) {
+        try {
+          await rm(mergeMsgPath, { force: true });
+        } catch (rmError) {
+          cleanupErrors.push(`removing MERGE_MSG failed (${(rmError as Error).message})`);
+        }
       }
+      try {
+        await git(worktreePath, ["reset", "--soft", originalHead]);
+      } catch (resetError) {
+        cleanupErrors.push(
+          `resetting HEAD to ${originalHead} failed (${(resetError as Error).message})`,
+        );
+      }
+      if (cleanupErrors.length > 0) {
+        throw tagCommitAttempt(
+          new Error(
+            `git commit failed while verifying hooks over the boundary commit, and restoring ` +
+              `HEAD to ${originalHead} afterward also failed (${cleanupErrors.join("; ")}) — the ` +
+              `worktree may be left with the boundary's changes staged but uncommitted: ` +
+              `${(error as Error).message}`,
+            { cause: error },
+          ),
+          "amend",
+        );
+      }
+      throw tagCommitAttempt(error, "amend");
     }
-    try {
-      await git(worktreePath, ["reset", "--soft", originalHead]);
-    } catch (resetError) {
-      cleanupErrors.push(
-        `resetting HEAD to ${originalHead} failed (${(resetError as Error).message})`,
-      );
-    }
-    if (cleanupErrors.length > 0) {
-      throw tagCommitAttempt(
-        new Error(
-          `git commit failed while verifying hooks over the boundary commit, and restoring ` +
-            `HEAD to ${originalHead} afterward also failed (${cleanupErrors.join("; ")}) — the ` +
-            `worktree may be left with the boundary's changes staged but uncommitted: ` +
-            `${(error as Error).message}`,
-          { cause: error },
-        ),
-        "amend",
-      );
-    }
-    throw tagCommitAttempt(error, "amend");
+    // Fell through: the commit actually landed despite `gitCommit` reporting failure (the
+    // `post-commit` race above). Leave HEAD exactly where it is — no reset — and continue past
+    // this `catch` into the same post-commit verification the success path runs below (the
+    // `extraParents`/`reduce_heads` repair), rather than rethrowing a stale error for a commit
+    // that already made it through the project's real hooks.
   }
   if (extraParents.length === 0) {
     return { committed: true };
