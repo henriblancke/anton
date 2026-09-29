@@ -114,6 +114,32 @@ describe("runsByCause", () => {
     expect(byId.get("quota-park")).not.toBe("agent");
   });
 
+  it("classifies a board-unreachable park as infra, never as unknown", async () => {
+    await seed({
+      id: "board-park",
+      status: "parked",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      // The literal marker `execute-epic-settle.ts` writes on a board outage during lease publish
+      // — not matched by `classifyFailureCause`'s own patterns.
+      error: "board-unreachable",
+    });
+    await seed({
+      id: "board-park-orphan",
+      status: "parked",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      error: "board-unreachable (orphan PR anton/anton-abc found on GitHub)",
+    });
+
+    const rows = await runsByCause(t.db, PROJECT, undefined);
+    const byId = new Map(rows.map((r) => [r.runId, r.cause]));
+
+    expect(byId.get("board-park")).toBe("infra");
+    expect(byId.get("board-park-orphan")).toBe("infra");
+    expect(byId.get("board-park")).not.toBe("unknown");
+  });
+
   it("places an old row with no endedAt using updatedAt", async () => {
     await seed({ id: "legacy", status: "failed", updatedAt: SETTLED, error: "gate failed" });
 

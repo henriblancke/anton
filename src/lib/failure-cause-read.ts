@@ -22,6 +22,16 @@ import type { AntonDb } from "./jobs/queue";
  */
 const QUOTA_PARK_PREFIX = "usage-limit";
 
+/**
+ * The park reason `execute-epic-settle.ts` writes verbatim on a board outage during lease publish
+ * (`isBoardUnreachableError`, `settleRunRow`) — an anton-internal marker like {@link
+ * QUOTA_PARK_PREFIX}, not one of the raw error strings `classifyFailureCause`'s `INFRA_RE` matches.
+ * Checked before the general classifier for the same reason: left to fall through, this marker
+ * matches none of `classifyFailureCause`'s patterns and settles as `unknown`, hiding a genuine
+ * machine-wide infrastructure outage from the cause breakdown.
+ */
+const BOARD_UNREACHABLE_PARK_PREFIX = "board-unreachable";
+
 const SETTLED_STATUSES = ["failed", "parked"] as const;
 
 export interface RunCause {
@@ -31,9 +41,15 @@ export interface RunCause {
   settledAt: number;
 }
 
-/** A parked row's cause: `quota` for the fixed park marker, else the general classifier. */
+/**
+ * A parked row's cause: the fixed park markers first (`quota`, `infra` for a board outage), else
+ * the general classifier.
+ */
 function causeOf(status: (typeof SETTLED_STATUSES)[number], error: string | null): FailureCause {
-  if (status === "parked" && error?.startsWith(QUOTA_PARK_PREFIX)) return "quota";
+  if (status === "parked") {
+    if (error?.startsWith(QUOTA_PARK_PREFIX)) return "quota";
+    if (error?.startsWith(BOARD_UNREACHABLE_PARK_PREFIX)) return "infra";
+  }
   return classifyFailureCause(error);
 }
 
