@@ -14,6 +14,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import { parseGardenerPlan, proposalFingerprint, REASK_AFTER_DAYS } from "./detections";
 import {
   apply,
@@ -956,6 +957,25 @@ describe("the product master's moves", () => {
       expect(err.message).toMatch(/cannot confirm anton-a's approval is still degraded/);
       expect(err.message).toMatch(/cycle-free/);
       expect(calls.filter((c) => !c.startsWith("note anton-p1"))).toEqual([]);
+    });
+
+    // P2 review (PR #274, apply.ts:345): degrading to "no evidence" used to return the caller's
+    // `board` array unchanged even when that exact array already carried an OLDER sidecar from a
+    // prior, successful attach (evidence is keyed by array identity, and the approve route can hand
+    // in the same retained snapshot across checks). `approvalGaps` would then read the stale verdict
+    // straight off `cycleEvidenceFor(board)` instead of seeing evidence as missing, silently
+    // reusing a check that predates whatever moved. Clearing it is what makes the "next check sees
+    // missing evidence" claim in the guard's own log message true.
+    it("clears a stale sidecar rather than let a board that already moved keep an old verdict", async () => {
+      const board = [proposalFor(UNAPPROVE), startable({ labels: [LABELS.approved] }), blockedBy("anton-x", "anton-y")];
+      attachCycleEvidence(board, []);
+      // The re-list this guard makes answers with a DIFFERENT edge set, as if another writer resolved
+      // the edge in the gap — the same mismatch the sibling test below refuses on.
+      listByFlags(async () => [startable({ labels: [LABELS.approved] }), bead("anton-x")]);
+
+      await apply(proposalFor(UNAPPROVE), board).catch((e) => e);
+
+      expect(cycleEvidenceFor(board)).toBeUndefined();
     });
 
     // The board-review finding this closes (PR #274, apply.ts:276): `withCycleEvidenceIfNeeded`

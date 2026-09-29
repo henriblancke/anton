@@ -42,7 +42,7 @@
  * apply-steps.ts, and this file is what locks the proposal, asks the one for the other, and settles.
  */
 import { beads, LABELS, type Bead, type DepCycle } from "../beads/bd";
-import { attachCycleEvidence } from "../beads/cycle-evidence";
+import { attachCycleEvidence, clearCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
 import {
   loadAllIssues,
@@ -342,6 +342,11 @@ async function withCycleEvidenceIfNeeded(
           `approval-gap check fails closed on the missing evidence rather than pairing it with a ` +
           `board it may no longer describe`,
       );
+      // `board` may be the caller's retained snapshot, already carrying an older sidecar from a
+      // prior attach on this same array (evidence is keyed by array IDENTITY) — clear it so
+      // `cycleEvidenceFor` actually reports missing, not that stale prior verdict (P2 review, PR
+      // #274, apply.ts:345).
+      clearCycleEvidence(board);
       return board;
     }
     const hydratedBoard = await hydrateCycleOnlyGates(repo, board, cycles);
@@ -368,6 +373,9 @@ async function withCycleEvidenceIfNeeded(
           `approval-gap check fails closed on the missing evidence rather than pairing it with a ` +
           `board it may no longer describe`,
       );
+      // Same stale-sidecar hazard as the consistency check above — clear it (P2 review, PR #274,
+      // apply.ts:345).
+      clearCycleEvidence(board);
       return board;
     }
     return attachCycleEvidence(hydratedBoard, cycles);
@@ -377,6 +385,10 @@ async function withCycleEvidenceIfNeeded(
         `proceeding without cycle evidence, so its own approval-gap check fails closed on the ` +
         `missing evidence rather than this failing the whole apply: ${messageOf(e)}`,
     );
+    // The depCycles/loadAllIssues read itself failed here, but `board` can still already carry a
+    // sidecar attached by an EARLIER, successful call on this same array — clear it so the
+    // approval gap reads it as missing, not stale (P2 review, PR #274, apply.ts:345).
+    clearCycleEvidence(board);
     return board;
   }
 }
