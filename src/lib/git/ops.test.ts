@@ -4195,6 +4195,82 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     },
   );
 
+  // PR #338 review round 9 (chatgpt-codex-connector): the verifying commit used to always be built
+  // single-parent (`reset --soft` + a plain `commit`) with the boundary's other parent(s) spliced in
+  // only AFTERWARD via `commit-tree`, so a hook inspecting merge context (`MERGE_HEAD`, the parent
+  // count, `prepare-commit-msg`'s "merge" source) saw a flattened, non-merge commit — never the real
+  // shape the final pushed commit has. It must see `MERGE_HEAD` set during the SAME commit hooks run.
+  it.runIf(process.platform !== "win32")(
+    "runs the hook with MERGE_HEAD set when verifying a two-parent boundary commit",
+    async () => {
+      const mergeHeadSeen = join(sandbox, "merge-head-seen");
+      const hook = join(repo, ".git", "hooks", "pre-commit");
+      writeFileSync(
+        hook,
+        [
+          "#!/bin/sh",
+          `git rev-parse -q --verify MERGE_HEAD >> ${JSON.stringify(mergeHeadSeen)} 2>/dev/null || true`,
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      chmodSync(hook, 0o755);
+
+      g(["checkout", "-q", "-b", "feature4"]);
+      writeFileSync(join(repo, "work.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+      const featureTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "work.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+      const mainTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "feature4"]);
+      try {
+        execFileSync("git", ["-C", repo, "merge", "--no-edit", "main"], { stdio: "ignore" });
+      } catch {
+        // Expected — `work.ts` conflicts. Resolved below, leaving MERGE_HEAD set for the boundary
+        // commit to pick up.
+      }
+      writeFileSync(join(repo, "work.ts"), "resolved\n");
+
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+      expect(existsSync(mergeHeadSeen)).toBe(false);
+
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+      });
+      expect(amended).toBe(true);
+
+      // The hook ran exactly once (for the verifying commit) and saw MERGE_HEAD resolve to the
+      // OTHER parent it's merging in — proof it ran in genuine merge context, not a flattened
+      // single-parent stand-in.
+      const seen = readFileSync(mergeHeadSeen, "utf8").trim().split("\n");
+      expect(seen).toEqual([mainTip]);
+
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const finalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", finalSha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(finalParents).toEqual([featureTip, mainTip]);
+    },
+  );
+
   // PR #338 review round 8 (chatgpt-codex-connector): `boundaryHead..originalHead` used to walk the
   // FULL ancestry rather than just the first-parent chain, so a base tip pulled in by a later clean
   // merge — reachable from `HEAD` but not from the boundary, exactly like an ordinary descendant

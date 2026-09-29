@@ -7,6 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
@@ -1657,7 +1658,33 @@ export async function commitAll(
       }
     }
   }
+  // The selected boundary's own further parents, plus any merge parents a later commit in the
+  // replayed range introduced (`descendantMergeParents` above), need to land on the verifying
+  // commit below — computed before that commit so they can be fed to it directly, rather than
+  // spliced in afterward (see the `MERGE_HEAD` comment below for why afterward doesn't work).
+  const extraParents = [...boundaryParents.slice(1), ...descendantMergeParents].filter(
+    (parent, index, all) => parent !== boundaryParents[0] && all.indexOf(parent) === index,
+  );
   await git(worktreePath, ["reset", "--soft", boundaryParents[0] ?? `${boundaryHead}^`]);
+  const resetHead = await resolveCommitSha(worktreePath, "HEAD");
+  // When the boundary had more than one parent, write those extras to `MERGE_HEAD` before
+  // committing so `git commit` builds a genuine merge commit — HEAD (the reset target) plus every
+  // `MERGE_HEAD` entry, in file order — in the SAME shot the hooks run over. A hook that branches on
+  // merge context (checking `MERGE_HEAD`, the parent count, or `prepare-commit-msg`'s "merge"
+  // source) then sees the real topology the final pushed commit will have; committing single-parent
+  // first and splicing the extra parents in afterward via `commit-tree` — as this used to do — lets
+  // such a hook pass a flattened stand-in while the actual merge shape goes unverified (PR #338
+  // review, chatgpt-codex-connector, round 9).
+  let mergeHeadPath: string | undefined;
+  if (extraParents.length > 0) {
+    mergeHeadPath = await git(worktreePath, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "MERGE_HEAD",
+    ]);
+    await writeFile(mergeHeadPath, extraParents.map((parent) => `${parent}\n`).join(""));
+  }
   try {
     await gitCommit(
       worktreePath,
@@ -1669,9 +1696,11 @@ export async function commitAll(
   } catch (error) {
     // Hooks rejected it, or the commit timed out before one was created: put the branch back
     // exactly where it started rather than leaving HEAD at the boundary's parent with the
-    // boundary's own changes sitting staged but uncommitted.
+    // boundary's own changes sitting staged but uncommitted — and, when one was written, a stray
+    // `MERGE_HEAD` claiming a merge that never landed.
     try {
       await git(worktreePath, ["reset", "--soft", originalHead]);
+      if (mergeHeadPath) await rm(mergeHeadPath, { force: true });
     } catch (restoreError) {
       throw tagCommitAttempt(
         new Error(
@@ -1685,62 +1714,70 @@ export async function commitAll(
     }
     throw tagCommitAttempt(error, "amend");
   }
-  // The commit just made only ever carries the ONE parent the reset above pointed at — the selected
-  // boundary's own further parents AND any merge parents a later commit in the replayed range
-  // introduced (`descendantMergeParents` above) need restoring now. Pure metadata rewrite of the
-  // commit that just passed hook verification, never a second hook run
-  // (`commit-tree` invokes none, and neither does `reset`): same tree, only the parent list changes
-  // back to what the original boundary commit actually had. The message is re-read from
-  // `verifiedHead` rather than reused from `originalMessage` — a `prepare-commit-msg`/`commit-msg`
-  // hook that edited the message (e.g. appending a required trailer) left that edit on the commit
-  // hooks just verified, and `originalMessage` was captured before hooks ran (PR #338 review,
-  // chatgpt-codex-connector). Likewise `commit-tree` — unlike `git commit` — never signs on its own
-  // even under `commit.gpgSign`, so re-signing is opt-in via `-S`, applied only when the verified
-  // commit itself carries a signature (`%G?` reports anything but `N`), to match it rather than
-  // unconditionally sign or unconditionally drop the signature.
-  const extraParents = [...boundaryParents.slice(1), ...descendantMergeParents].filter(
-    (parent, index, all) => parent !== boundaryParents[0] && all.indexOf(parent) === index,
-  );
-  if (extraParents.length > 0) {
-    const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
-    const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
-    const verifiedMessage = await git(worktreePath, ["log", "-1", "--format=%B", verifiedHead]);
-    const signatureStatus = await git(worktreePath, ["log", "-1", "--format=%G?", verifiedHead]);
+  if (extraParents.length === 0) {
+    return { committed: true };
+  }
+  // `git commit` consumed `MERGE_HEAD` and removed it on success, building the commit from HEAD plus
+  // every listed parent — usually exactly `resetHead` followed by `extraParents`, matching the
+  // original boundary's topology already, with hooks having seen that real shape. The one case it
+  // does NOT preserve: git's own redundant-parent simplification (`reduce_heads` in
+  // `builtin/commit.c`, shared with `git merge`) silently drops any `MERGE_HEAD` entry that is
+  // already an ancestor of another listed parent — e.g. `verifyFrom` targeting a boundary whose own
+  // parent is an ancestor of a later merge's non-mainline parent. Detect that here and repair it with
+  // the same metadata-only `commit-tree` splice this function used before `MERGE_HEAD` existed —
+  // never a second hook run, just the parent list corrected on the commit hooks already verified.
+  const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
+  const expectedParents = [resetHead, ...extraParents];
+  const actualParents = await commitParentShas(worktreePath, verifiedHead);
+  const parentsMatch =
+    actualParents.length === expectedParents.length &&
+    actualParents.every((parent, index) => parent === expectedParents[index]);
+  if (parentsMatch) {
+    return { committed: true };
+  }
+  // The message is re-read from `verifiedHead` rather than reused from `originalMessage` — a
+  // `prepare-commit-msg`/`commit-msg` hook that edited the message (e.g. appending a required
+  // trailer) left that edit on the commit hooks just verified, and `originalMessage` was captured
+  // before hooks ran (PR #338 review, chatgpt-codex-connector). Likewise `commit-tree` — unlike `git
+  // commit` — never signs on its own even under `commit.gpgSign`, so re-signing is opt-in via `-S`,
+  // applied only when the verified commit itself carries a signature (`%G?` reports anything but
+  // `N`), to match it rather than unconditionally sign or unconditionally drop the signature.
+  const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
+  const verifiedMessage = await git(worktreePath, ["log", "-1", "--format=%B", verifiedHead]);
+  const signatureStatus = await git(worktreePath, ["log", "-1", "--format=%G?", verifiedHead]);
+  try {
+    const reparented = await git(worktreePath, [
+      "commit-tree",
+      tree,
+      "-p",
+      resetHead,
+      ...extraParents.flatMap((parent) => ["-p", parent]),
+      ...(signatureStatus !== "N" ? ["-S"] : []),
+      "-m",
+      verifiedMessage,
+    ]);
+    await git(worktreePath, ["reset", "--soft", reparented]);
+  } catch (error) {
+    // HEAD is already the (git-simplified) commit from the hook-verified commit above — a retry
+    // that only looks at HEAD would find that commit, not the original marked boundary, and could
+    // push it having silently dropped `extraParents`. Put the branch back exactly where it started
+    // (the untouched boundary) so a retry has the same marked commit this function itself started
+    // from, matching the recovery this function already does when the verify commit itself fails.
     try {
-      const reparented = await git(worktreePath, [
-        "commit-tree",
-        tree,
-        "-p",
-        boundaryParents[0] ?? verifiedHead,
-        ...extraParents.flatMap((parent) => ["-p", parent]),
-        ...(signatureStatus !== "N" ? ["-S"] : []),
-        "-m",
-        verifiedMessage,
-      ]);
-      await git(worktreePath, ["reset", "--soft", reparented]);
-    } catch (error) {
-      // HEAD is already the flattened single-parent commit from the hook-verified commit above —
-      // a retry that only looks at HEAD would find that commit, not the original marked boundary,
-      // and could push it having silently dropped `extraParents`. Put the branch back exactly where
-      // it started (the untouched boundary) so a retry has the same marked commit this function
-      // itself started from, matching the recovery this function already does when the verify
-      // commit itself fails.
-      try {
-        await git(worktreePath, ["reset", "--soft", originalHead]);
-      } catch (restoreError) {
-        throw tagCommitAttempt(
-          new Error(
-            `git commit-tree/reset failed while restoring the boundary commit's extra parents, and ` +
-              `restoring HEAD to ${originalHead} afterward also failed — the worktree may be left ` +
-              `at a flattened single-parent commit missing parent(s) ${extraParents.join(", ")}: ` +
-              `${(restoreError as Error).message}`,
-            { cause: error },
-          ),
-          "amend",
-        );
-      }
-      throw tagCommitAttempt(error, "amend");
+      await git(worktreePath, ["reset", "--soft", originalHead]);
+    } catch (restoreError) {
+      throw tagCommitAttempt(
+        new Error(
+          `git commit-tree/reset failed while restoring the boundary commit's extra parents, and ` +
+            `restoring HEAD to ${originalHead} afterward also failed — the worktree may be left ` +
+            `at a commit missing parent(s) ${extraParents.join(", ")}: ` +
+            `${(restoreError as Error).message}`,
+          { cause: error },
+        ),
+        "amend",
+      );
     }
+    throw tagCommitAttempt(error, "amend");
   }
   return { committed: true };
 }
