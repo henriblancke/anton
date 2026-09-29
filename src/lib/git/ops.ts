@@ -1706,17 +1706,41 @@ export async function commitAll(
     const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
     const verifiedMessage = await git(worktreePath, ["log", "-1", "--format=%B", verifiedHead]);
     const signatureStatus = await git(worktreePath, ["log", "-1", "--format=%G?", verifiedHead]);
-    const reparented = await git(worktreePath, [
-      "commit-tree",
-      tree,
-      "-p",
-      boundaryParents[0] ?? verifiedHead,
-      ...extraParents.flatMap((parent) => ["-p", parent]),
-      ...(signatureStatus !== "N" ? ["-S"] : []),
-      "-m",
-      verifiedMessage,
-    ]);
-    await git(worktreePath, ["reset", "--soft", reparented]);
+    try {
+      const reparented = await git(worktreePath, [
+        "commit-tree",
+        tree,
+        "-p",
+        boundaryParents[0] ?? verifiedHead,
+        ...extraParents.flatMap((parent) => ["-p", parent]),
+        ...(signatureStatus !== "N" ? ["-S"] : []),
+        "-m",
+        verifiedMessage,
+      ]);
+      await git(worktreePath, ["reset", "--soft", reparented]);
+    } catch (error) {
+      // HEAD is already the flattened single-parent commit from the hook-verified commit above —
+      // a retry that only looks at HEAD would find that commit, not the original marked boundary,
+      // and could push it having silently dropped `extraParents`. Put the branch back exactly where
+      // it started (the untouched boundary) so a retry has the same marked commit this function
+      // itself started from, matching the recovery this function already does when the verify
+      // commit itself fails.
+      try {
+        await git(worktreePath, ["reset", "--soft", originalHead]);
+      } catch (restoreError) {
+        throw tagCommitAttempt(
+          new Error(
+            `git commit-tree/reset failed while restoring the boundary commit's extra parents, and ` +
+              `restoring HEAD to ${originalHead} afterward also failed — the worktree may be left ` +
+              `at a flattened single-parent commit missing parent(s) ${extraParents.join(", ")}: ` +
+              `${(restoreError as Error).message}`,
+            { cause: error },
+          ),
+          "amend",
+        );
+      }
+      throw tagCommitAttempt(error, "amend");
+    }
   }
   return { committed: true };
 }
