@@ -676,10 +676,14 @@ export function reviewFixPrParkedAtHead(
  * anton-dfuvz. Filtered on `headSha` in SQL like {@link parkedAtHead}; `answeredFingerprint` is a
  * JSON array, so its equality is checked in JS after parsing rather than trying to express array
  * equality in the query. Compared against ONLY the target's single most recent settled row at this
- * head — never a search over history for any matching row — so a fingerprint that cycled A→B→A
- * admits the fresh A round instead of being resuppressed by a stale row: if the newest settled row
- * answered B, it simply doesn't match a fresh A fingerprint, regardless of what an older row once
- * answered (anton-091jr review, @claude, round 2).
+ * head (any status outside {@link ACTIVE_STATUSES} — `done`, `parked`, `failed`, or `cancelled` —
+ * counts as settled, not `done` alone) — never a search over history for any matching row — so a
+ * fingerprint that cycled A→B→A admits the fresh A round instead of being resuppressed by a stale
+ * row: if the newest settled row is a `parked` B (a red gate that parked the intervening round), it
+ * simply isn't `done`, so it doesn't match, regardless of what an older `done` row once answered.
+ * Filtering on `status = "done"` directly, as an earlier revision did, let that older row win the
+ * ordering instead of the newer `parked` one, permanently resuppressing a round the PR had already
+ * moved past (PR #338 review, chatgpt-codex-connector).
  */
 function answeredUnchanged(
   tx: Pick<AntonDb, "select">,
@@ -689,13 +693,13 @@ function answeredUnchanged(
   fingerprint: string[],
 ): string | undefined {
   const row = tx
-    .select({ id: schema.jobs.id, payloadJson: schema.jobs.payloadJson })
+    .select({ id: schema.jobs.id, status: schema.jobs.status, payloadJson: schema.jobs.payloadJson })
     .from(schema.jobs)
     .where(
       and(
         eq(schema.jobs.type, "review-fix-pr"),
         eq(schema.jobs.projectId, projectId),
-        eq(schema.jobs.status, "done"),
+        notInArray(schema.jobs.status, [...ACTIVE_STATUSES]),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
@@ -703,7 +707,7 @@ function answeredUnchanged(
     .orderBy(desc(schema.jobs.updatedAt))
     .limit(1)
     .all()[0];
-  if (!row) return undefined;
+  if (!row || row.status !== "done") return undefined;
   let payload: { answeredFingerprint?: string[] };
   try {
     payload = JSON.parse(row.payloadJson);

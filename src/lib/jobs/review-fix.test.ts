@@ -891,6 +891,55 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     expect(rows.some((r) => r.status === "queued")).toBe(true);
   });
 
+  // PR #338 review (chatgpt-codex-connector): an actionable fingerprint can cycle A→B→A at the same
+  // head (e.g. a reviewer's comment edited back). The intervening B round is admitted fresh here,
+  // then PARKS (a red test gate) instead of answering — the target's most recent SETTLED attempt is
+  // that parked B row, not the older `done` A row, so round A returning must be admitted fresh too,
+  // not resuppressed by the stale answered row.
+  it("admits a fresh job when a fingerprint cycles A→B→A and the intervening B round parked", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    // Round A: dispatched, then answered without a push.
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    // Round B: a new thread appears at the same head — a different fingerprint, so it's admitted
+    // fresh — then it parks (e.g. a red gate) rather than answering.
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, {
+        reviewDecision: "CHANGES_REQUESTED",
+        threads: [
+          {
+            id: "RT_new",
+            isResolved: false,
+            isOutdated: false,
+            comments: [{ id: 1, author: "alice", body: "one more thing" }],
+          },
+        ],
+      }),
+    );
+    await dispatch();
+    const afterRoundB = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(afterRoundB).toHaveLength(2);
+    const roundBId = afterRoundB.find((r) => r.status === "queued")!.id;
+    // Bumped later than round A's `updatedAt` (the fixed test clock never advances on its own) so
+    // "most recent settled row" is unambiguous, matching what a real park() call would do.
+    t.db
+      .update(schema.jobs)
+      .set({ status: "parked", updatedAt: new Date(clock.now() + 1000) })
+      .where(eq(schema.jobs.id, roundBId))
+      .run();
+
+    // Round A returns — same head, same fingerprint as the answered row. The stale `done` A row
+    // must not win over the newer `parked` B row when deciding whether this round was ever answered.
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(3);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
   it("admits a fresh job for a MERGED target even though a prior answered attempt matches its head", async () => {
     listMock.mockResolvedValue([target("e-1", 1)]);
     getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
