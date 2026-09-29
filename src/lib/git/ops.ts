@@ -1633,10 +1633,19 @@ export async function commitAll(
   // 7) whose non-mainline parent the reconstruction below would otherwise silently drop, since only
   // the SELECTED boundary's own parents get restored. Walk every commit in that range and collect any
   // parent that isn't itself part of the range, so a base tip merged in partway through survives.
+  // `--first-parent` is required here (PR #338 review, round 8, chatgpt-codex-connector): a plain
+  // `boundary..HEAD` range also enumerates commits reachable ONLY through a merge's second parent —
+  // e.g. the base tip a clean base merge pulled in — so that base tip lands in `replayedRange` as if
+  // it were itself a walked descendant, and the loop below then sees it as "already in range" and
+  // drops it from `descendantMergeParents` instead of preserving it. Restricting the walk to the
+  // first-parent chain keeps `replayedRange` to the actual mainline descendants, so a merge's other
+  // parents are always detected as outside that range.
   const replayedDescendants =
     boundaryHead === originalHead
       ? []
-      : (await git(worktreePath, ["rev-list", `${boundaryHead}..${originalHead}`]))
+      : (
+          await git(worktreePath, ["rev-list", "--first-parent", `${boundaryHead}..${originalHead}`])
+        )
           .split("\n")
           .filter(Boolean);
   const replayedRange = new Set([boundaryHead, ...replayedDescendants]);

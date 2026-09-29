@@ -4195,6 +4195,92 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     },
   );
 
+  // PR #338 review round 8 (chatgpt-codex-connector): `boundaryHead..originalHead` used to walk the
+  // FULL ancestry rather than just the first-parent chain, so a base tip pulled in by a later clean
+  // merge — reachable from `HEAD` but not from the boundary, exactly like an ordinary descendant
+  // commit — landed in `replayedRange` as if it were itself a walked commit. The loop then saw that
+  // base tip as "already in range" when it checked the merge's parents and dropped it from
+  // `descendantMergeParents` instead of restoring it, leaving the reconstructed commit behind its
+  // base.
+  it.runIf(process.platform !== "win32")(
+    "preserves a later clean merge's non-mainline parent when verifying from an earlier boundary",
+    async () => {
+      g(["checkout", "-q", "-b", "feature3"]);
+      writeFileSync(join(repo, "work.ts"), "boundary\n");
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+      const boundarySha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const boundaryParent = execFileSync(
+        "git",
+        ["-C", repo, "rev-parse", `${boundarySha}^`],
+        { encoding: "utf8" },
+      ).trim();
+
+      // An ordinary first-parent descendant on top of the boundary — never itself a merge.
+      writeFileSync(join(repo, "follow-up.ts"), "follow-up\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "follow-up"]);
+
+      // The base branch moves on independently of the feature branch.
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "main-only.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+      const mainTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      // A clean merge of main back into the feature branch — no conflicts, so a real two-parent
+      // merge commit lands automatically on top of the boundary.
+      g(["checkout", "-q", "feature3"]);
+      execFileSync("git", ["-C", repo, "merge", "-q", "--no-edit", "main"], { stdio: "ignore" });
+      const originalHead = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const originalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", originalHead],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(originalParents).toHaveLength(2);
+      expect(originalParents[1]).toBe(mainTip);
+
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+        verifyFrom: boundarySha,
+      });
+      expect(amended).toBe(true);
+      expect(readFileSync(hookRuns, "utf8").trim().split("\n")).toHaveLength(1);
+
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const finalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", finalSha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      // The reconstruction must keep the merge's non-mainline parent — the main tip pulled in by the
+      // clean merge — not just the boundary's own single parent.
+      expect(finalParents).toEqual([boundaryParent, mainTip]);
+
+      expect(
+        execFileSync("git", ["-C", repo, "show", `${finalSha}:main-only.ts`], {
+          encoding: "utf8",
+        }),
+      ).toBe("main\n");
+      expect(
+        execFileSync("git", ["-C", repo, "show", `${finalSha}:follow-up.ts`], {
+          encoding: "utf8",
+        }),
+      ).toBe("follow-up\n");
+    },
+  );
+
   // PR #338 review (chatgpt-codex-connector): the two-parent reconstruction used to rebuild the
   // final commit-tree message from `originalMessage` — captured from the boundary commit BEFORE the
   // verify pass ran — so a `commit-msg` hook that edits the message (e.g. appending a required
