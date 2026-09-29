@@ -368,11 +368,17 @@ const orderTickets = (tickets) => {
   return order.length === tickets.length ? order.map((id) => tickets.find((t) => t.id === id)) : tickets;
 };
 // Mirrors the `live` filter in execute-epic-dispatch.ts: an abandoned ticket is closed but was never
-// committed, and the executor drops it from the run entirely before computing held/dispatchable — but
-// only AFTER topologically ordering the full ticket set, not before. Filtering abandoned tickets out
-// ahead of orderTickets would remove them from the dependency graph, so a chain like A -> abandoned B
-// -> C could sort differently here than in the executor, which orders {A, B, C} together and only then
-// skips B. Order first, filter after, so the printed order can never diverge from the real dispatch.
+// committed, and the executor drops it from the run entirely before dispatching — but only AFTER
+// topologically ordering the full ticket set AND computing holds over it, not before. Filtering
+// abandoned tickets out ahead of orderTickets would remove them from the dependency graph, so a
+// chain like A -> abandoned B -> C could sort differently here than in the executor, which orders
+// {A, B, C} together. Filtering them out before heldIds is worse: if abandonAll added the label but
+// the batch close hasn't landed yet, B is still open and possibly still externally held itself: drop
+// B from the ticket set before computing holds and computeChildReadiness's internal-dependency
+// propagation (an internal `blocks` edge into a ticket that is itself held) never sees B, so C prints
+// dispatchable even though the real run still holds it behind B. Order first, compute holds over the
+// full set second, filter abandoned only when printing, so the printed order and held set can never
+// diverge from the real dispatch.
 const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
@@ -381,8 +387,9 @@ for (const feature of all.filter((b) => b.issue_type === "feature")) {
   // `run.tickets = run.standaloneRun ? [target] : freshChildren`). Mirror that here, or a legitimate
   // atomic feature prints only its header with an empty dispatch order below it.
   const children = runTickets(feature.id);
-  const tickets = orderTickets(children.length > 0 ? children : [feature]).filter((t) => !isAbandoned(t));
-  const held = heldIds(feature, tickets);
+  const ordered = orderTickets(children.length > 0 ? children : [feature]);
+  const held = heldIds(feature, ordered);
+  const tickets = ordered.filter((t) => !isAbandoned(t));
   const dispatchable = tickets.filter((t) => !held.has(t.id));
   for (const [index, ticket] of dispatchable.entries())
     console.log(`  ${index + 1}. ${ticket.id}\t${ticket.title}`);
