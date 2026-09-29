@@ -1535,15 +1535,25 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
 export async function commitAll(
   worktreePath: string,
   message: string,
-  options: { bypassHooks?: boolean; hooksPath?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+  options: {
+    bypassHooks?: boolean;
+    hooksPath?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    amendToVerifyHooks?: boolean;
+  } = {},
 ): Promise<{ committed: boolean }> {
   await stageAll(worktreePath, options.hooksPath);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
+  let nothingStaged: boolean;
   try {
     // Exits non-zero when there ARE staged changes → there is something to commit.
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
-    return { committed: false };
+    nothingStaged = true;
   } catch {
+    nothingStaged = false;
+  }
+  if (!nothingStaged) {
     await gitCommit(
       worktreePath,
       ["commit", ...bypass, "-m", message],
@@ -1553,6 +1563,22 @@ export async function commitAll(
     );
     return { committed: true };
   }
+  if (options.amendToVerifyHooks) {
+    // Nothing new landed, but HEAD is a prior hook-bypassed commit that still needs the project's
+    // real hooks run against it before it publishes (PR #338 review, chatgpt-codex-connector).
+    // `--amend --no-edit` re-runs pre-commit/commit-msg over the same tree and message without
+    // changing either. A rejection here throws straight out to the caller — deliberately NOT
+    // caught above, since this isn't the "nothing staged" case that catch exists for.
+    await gitCommit(
+      worktreePath,
+      ["commit", "--amend", "--no-edit"],
+      options.hooksPath,
+      options.timeoutMs,
+      options.signal,
+    );
+    return { committed: true };
+  }
+  return { committed: false };
 }
 
 /**

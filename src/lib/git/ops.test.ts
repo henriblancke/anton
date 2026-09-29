@@ -4027,6 +4027,102 @@ suite("commitAll (real git · a hook that outlives the kill)", () => {
 
 });
 
+// PR #338 review round 2 (chatgpt-codex-connector): review-fix's pre-gate boundary commit lands with
+// `bypassHooks: true`, and its doc promised the project's real hooks still run on the commit that
+// actually gets published — but when the follow-up round stages nothing new, `commitAll` used to
+// find a clean index and return `{ committed: false }` without invoking git at all, so those hooks
+// never ran on anything. `amendToVerifyHooks` re-runs them via `--amend --no-edit` in exactly that
+// case; this suite proves the hook actually fires (and can still reject) rather than being skipped.
+suite("commitAll (real git · amendToVerifyHooks)", () => {
+  let sandbox: string;
+  let repo: string;
+  let hookRuns: string;
+  let rejectMarker: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commit-amend-verify-"));
+    repo = join(sandbox, "repo");
+    hookRuns = join(sandbox, "hook-runs");
+    rejectMarker = join(sandbox, "reject");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+    writeFileSync(join(sandbox, "hook-run-count"), "0\n");
+
+    // Records that it ran (by appending to hookRuns) and rejects only while `rejectMarker` exists.
+    const hook = join(repo, ".git", "hooks", "pre-commit");
+    writeFileSync(
+      hook,
+      [
+        "#!/bin/sh",
+        `echo ran >> ${JSON.stringify(hookRuns)}`,
+        `test -f ${JSON.stringify(rejectMarker)} && exit 1`,
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    chmodSync(hook, 0o755);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it.runIf(process.platform !== "win32")(
+    "never runs the hook for the bypassed boundary commit, but does run it on amend once there is nothing left to stage",
+    async () => {
+      writeFileSync(join(repo, "work.ts"), "export const work = 1;\n");
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+      expect(existsSync(hookRuns)).toBe(false);
+
+      // Nothing new to stage — amendToVerifyHooks must still invoke the hook against the boundary
+      // commit's content rather than silently no-op'ing.
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+      });
+      expect(amended).toBe(true);
+      expect(readFileSync(hookRuns, "utf8").trim().split("\n")).toHaveLength(1);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "propagates a real hook rejection on amend instead of swallowing it as a plain no-op commit",
+    async () => {
+      writeFileSync(join(repo, "work.ts"), "export const work = 1;\n");
+      await commitAll(repo, "boundary", { bypassHooks: true });
+      const before = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      writeFileSync(rejectMarker, "");
+      await expect(commitAll(repo, "boundary", { amendToVerifyHooks: true })).rejects.toThrow();
+
+      const after = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      // A rejected hook must never advance HEAD — the caller (review-fix's `commitFix`) tells a real
+      // rejection from a benign timeout by comparing HEAD before/after.
+      expect(after).toBe(before);
+    },
+  );
+
+  it("no-ops exactly as before when amendToVerifyHooks is unset and nothing is staged", async () => {
+    const { committed } = await commitAll(repo, "nothing to do");
+    expect(committed).toBe(false);
+    expect(existsSync(hookRuns)).toBe(false);
+  });
+});
+
 // PR #228 review: the marker is EMPTY, so it is made with this project's hooks bypassed — the only
 // commit anton makes that may. A `pre-commit` that stages files of its own is the reason: run, it
 // either ships that content under a message saying the commit is empty, or leaves it loose in the
