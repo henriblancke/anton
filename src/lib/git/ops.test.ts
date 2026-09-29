@@ -4122,6 +4122,30 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     expect(existsSync(hookRuns)).toBe(false);
   });
 
+  // PR #338 review round 11 (chatgpt-codex-connector): `--no-verify` bypasses only `pre-commit` and
+  // `commit-msg` (git-commit(1)) — `prepare-commit-msg` is neither, so a project hook installed there
+  // could still reject or rewrite the boundary commit's message before the real, hook-verified commit
+  // ever runs. `bypassHooks` must disable it too, via a `core.hooksPath` override rather than relying
+  // on `--no-verify` alone.
+  it.runIf(process.platform !== "win32")(
+    "never runs a prepare-commit-msg hook for the bypassed boundary commit either",
+    async () => {
+      const prepareRuns = join(sandbox, "prepare-commit-msg-runs");
+      const hook = join(repo, ".git", "hooks", "prepare-commit-msg");
+      writeFileSync(
+        hook,
+        ["#!/bin/sh", `echo ran >> ${JSON.stringify(prepareRuns)}`, "exit 1", ""].join("\n"),
+        "utf8",
+      );
+      chmodSync(hook, 0o755);
+
+      writeFileSync(join(repo, "work.ts"), "export const work = 1;\n");
+      const { committed } = await commitAll(repo, "boundary", { bypassHooks: true });
+      expect(committed).toBe(true);
+      expect(existsSync(prepareRuns)).toBe(false);
+    },
+  );
+
   // PR #338 review round 3 (chatgpt-codex-connector): a boundary commit that resolved a conflicted
   // base premerge (`git commit` while `MERGE_HEAD` is set builds a real two-parent merge commit,
   // regardless of `--no-verify`/a custom `-m`) used to lose its second parent the moment

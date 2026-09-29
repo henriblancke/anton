@@ -1595,7 +1595,13 @@ export async function commitAll(
       await gitCommit(
         worktreePath,
         ["commit", ...bypass, "-m", message],
-        options.hooksPath,
+        // `--no-verify` alone bypasses only `pre-commit` and `commit-msg` (git-commit(1)) —
+        // `prepare-commit-msg` still fires and could reject or mutate this internal boundary commit
+        // before the project's real hooks ever see it on the verified commit below (PR #338 review,
+        // chatgpt-codex-connector, round 11). Routing a bypass through a `core.hooksPath` that
+        // resolves to nothing disables every hook for this invocation, the same technique
+        // {@link resolveHooksPathOverride}'s submodule case already uses.
+        options.bypassHooks ? disabledHooksPath() : options.hooksPath,
         options.timeoutMs,
         options.signal,
       );
