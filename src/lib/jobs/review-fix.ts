@@ -2490,8 +2490,18 @@ async function commitFix(
   // verify commit runs. `false` (never bare) when no marked ancestor was found at all — there is no
   // positive marker to read, so this must default to the pre-existing, fully-hook-verified behavior
   // rather than guess (PR #338 review, chatgpt-codex-connector, P2).
+  //
+  // `boundaryAncestor === before.head` (PR #338 review, chatgpt-codex-connector, round 15): the tag
+  // alone only says the OLDEST unpushed boundary started out bare — it says nothing about whether
+  // this very function's own earlier bypass call (or an operator) has since stacked a real,
+  // non-bare commit on top while resuming. Classifying from the tag alone kept treating that whole
+  // stack as bare, so `commitAll` picked the merge-replay hooks mirror (skips `pre-commit`) for a
+  // commit that also carries that later, genuinely-new content — exactly what a real `git merge`'s
+  // auto path never has to verify. Requiring the boundary to still BE `HEAD` restricts the bare
+  // lifecycle to the one case it actually models: nothing built above it yet.
   const boundaryIsBareMerge =
     boundaryAncestor !== undefined &&
+    boundaryAncestor === before.head &&
     (await classifyUnverifiedBoundaryCommit(worktreePath, boundaryAncestor)) === "bare";
   let committed: boolean;
   try {
