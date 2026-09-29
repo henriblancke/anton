@@ -1125,4 +1125,43 @@ process.exit(0);
       "build@https://ci/run/42|2026-01-01T00:00:00Z",
     ]);
   });
+
+  // anton-091jr review round 3 (chatgpt-codex-connector): `commits`/`nodes` entirely absent from an
+  // otherwise-successful response is a malformed payload, not "no commits yet" — it must flag
+  // checksComplete: false rather than reporting a clean, fully-inspected rollup.
+  it("flags checksComplete false when the commits connection is missing from the payload", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
+    reviews: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  if (query.includes('statusCheckRollup')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: {} } } }));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+    pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.checksComplete).toBe(false);
+    expect(review.failingChecks).toEqual([]);
+  });
 });

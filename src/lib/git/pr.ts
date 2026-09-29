@@ -601,7 +601,15 @@ async function getPrCheckRollup(
         complete = false;
         break;
       }
-      const commitNode = parsed.data?.repository?.pullRequest?.commits?.nodes?.[0];
+      const commitsNodes = parsed.data?.repository?.pullRequest?.commits?.nodes;
+      if (!Array.isArray(commitsNodes)) {
+        // `commits`/`nodes` themselves missing is a malformed/partial payload — distinct from a
+        // valid empty array, which is the genuine "no commits yet" case below (PR #338 review,
+        // chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      const commitNode = commitsNodes[0];
       if (!commitNode) {
         // No commits at all on the PR yet — a real, complete (empty) rollup, not a fetch failure.
         break;
