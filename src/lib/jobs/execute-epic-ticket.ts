@@ -133,10 +133,14 @@ export async function runTicket(args: {
   // through `settleFailedTicket`, which exists to fail an UNSETTLED ticket and would reopen/reblock
   // this one on a cleanup write that has nothing to do with whether its work landed.
   let finished: { settlement: TicketSettlement; closed: boolean; transitioned: boolean } | undefined;
-  // Whether `walkTicketSteps` was ever reached this attempt (PR #284 review, "Skip the failure audit
-  // when dispatch never started") — the two `NoDeliveryError` throws below fire BEFORE any step runs,
-  // so a catch reached from one of them has no dispatch to audit. Read only in the catch block, never
-  // reassigned there, so a throw from `walkTicketSteps` itself still reports `true`.
+  // Whether a step actually spawned an agent this attempt (PR #284 review, "Skip the failure audit
+  // when dispatch never started", and later "Delay ticket dispatch markers until an agent step
+  // starts") — flipped only by `walkTicketSteps`'s `onAgentDispatchStarting` callback, itself only
+  // called from `dispatchClaude`'s own dispatch boundary. Neither the two `NoDeliveryError` throws
+  // below (which fire BEFORE `walkTicketSteps` is ever called) nor a non-dispatching step failing
+  // inside the walk (a formula's `step:verify` ordered before `step:implement`) ever sets this —
+  // both are pre-dispatch failures with no agent run to audit. Read only in the catch block, never
+  // reassigned there.
   let dispatchStarted = false;
   // Hoisted so the catch block below can still see them when the throw happens while ESTABLISHING
   // the baseline, not just while acting on one (anton-fc5x PR #284 review, "Settle errors raised
@@ -269,21 +273,15 @@ export async function runTicket(args: {
     try {
       stashBaseline = await readStashEntries(worktreePath);
     } catch (baselineError) {
-      // `markDispatchStarted` above already told the board this attempt is dispatching
-      // (chatgpt-codex-connector, PR #284 review, "Mark ticket dispatch only when the agent
-      // starts") — a stash-read failure here means `walkTicketSteps` never runs, so `dispatchStarted`
-      // stays false and the catch below's failure audit is skipped as a pre-dispatch throw. Left
-      // un-rolled-back, the synced marker and its locked baseline would still read as "dispatch
-      // began" on a resumed attempt, which trusts that shape as post-dispatch recovery and skips
-      // refreshing it — silently crediting board writes made before the resume to a later, possibly
-      // no-op, agent. Abandoned here, before the throw, so a resume takes a genuinely fresh baseline.
-      if (boardOnly && boardBaseline) {
-        await abandonDispatchBaseline(run.repoPath, ticket);
-      }
+      // `markDispatchStarted` above already told the board this attempt is dispatching, but a
+      // stash-read failure here means `walkTicketSteps` never runs — no agent ever starts, so
+      // `dispatchStarted` (the in-memory flag `onAgentDispatchStarting` sets) stays false. The
+      // catch below now handles the rollback generically for every pre-dispatch throw, this one
+      // included (chatgpt-codex-connector, PR #284 review, "Delay ticket dispatch markers until an
+      // agent step starts") — abandoning the durable marker here too would double-abandon it.
       throw new StashBaselineUnreadableError(ticket.id, baselineError);
     }
     const stash = ticketStashRecovery(worktreePath, run.branch, stashBaseline);
-    dispatchStarted = true;
     await walkTicketSteps({
       run,
       steps: args.steps,
@@ -294,6 +292,15 @@ export async function runTicket(args: {
       boardOnly,
       boardBaseline,
       stash,
+      // Flips `dispatchStarted` true only once a step actually spawns an agent (chatgpt-codex-
+      // connector, PR #284 review, "Delay ticket dispatch markers until an agent step starts") — NOT
+      // merely because this walk was entered. A formula that orders `step:verify` before
+      // `step:implement` can fail this walk with no agent ever having run; without this, the catch
+      // below would still audit the board (or trust the durable marker as post-dispatch recovery)
+      // against a run that never touched anything.
+      onAgentDispatchStarting: () => {
+        dispatchStarted = true;
+      },
     });
     const settlement = await ticketSettlement(run, progress);
     // The deadline only stops what observes it (PR #253 review). The gate's branch reads and the
@@ -363,6 +370,22 @@ export async function runTicket(args: {
         // reach the caller and poison the run.
         await settleThisTicket().catch(() => {});
         throw auditFailure;
+      }
+    } else if (boardOnly && boardBaseline) {
+      // No agent ever ran this attempt — the two pre-dispatch `NoDeliveryError`s above, or a
+      // non-dispatching step (a formula's `step:verify` ordered before `step:implement`) failing
+      // before dispatch ever starts (chatgpt-codex-connector, PR #284 review, "Delay ticket dispatch
+      // markers until an agent step starts"). The durable marker `markDispatchStarted` wrote before
+      // this attempt began is not post-dispatch recovery state for anything: nothing this attempt did
+      // could be attributed to it, so an unrelated board write landing during this window must never
+      // be credited to it either. Retired the same way an inconclusive post-dispatch audit already
+      // retires one (`abandonDispatchBaseline`), so a resumed attempt takes a genuinely fresh baseline
+      // instead of trusting this one.
+      try {
+        await abandonDispatchBaseline(run.repoPath, ticket);
+      } catch (abandonFailure) {
+        await settleThisTicket().catch(() => {});
+        throw abandonFailure;
       }
     }
     // Always throws; returned so the signature carries the `never` and the walk's answer is typed.
@@ -580,8 +603,17 @@ async function walkTicketSteps(args: {
   boardBaseline: BoardFingerprint | null;
   /** The stash reads that tell an empty tree from a set-aside one (anton-wjfkn). */
   stash: StashRecovery;
+  /**
+   * Called the moment a step actually spawns an agent (`dispatchClaude`'s own dispatch boundary),
+   * never merely because this walk was entered (chatgpt-codex-connector, PR #284 review, "Delay
+   * ticket dispatch markers until an agent step starts") — a formula that orders a non-dispatching
+   * step (`step:verify`) before `step:implement` reaches this walk and can fail here without any
+   * agent ever having run.
+   */
+  onAgentDispatchStarting?: () => void;
 }): Promise<void> {
-  const { run, ticket, ticketCtx, session, progress, boardOnly, boardBaseline } = args;
+  const { run, ticket, ticketCtx, session, progress, boardOnly, boardBaseline, onAgentDispatchStarting } =
+    args;
   const { db } = run;
   const { sessionId, logPath } = session;
   for (const { step: cooked, definition } of args.steps) {
@@ -634,6 +666,7 @@ async function walkTicketSteps(args: {
         // `promptId`/`skillId` + digest — never both, and never the ticket's own agent for the
         // latter, which does not run it.
         setAttribution: (attribution) => Object.assign(dimensions, attribution),
+        markAgentDispatchStarting: onAgentDispatchStarting,
       },
     });
     recordStepReport(progress, result.facts);

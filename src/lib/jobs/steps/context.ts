@@ -74,6 +74,16 @@ export interface StepDeps {
     >,
   ) => void;
   /**
+   * Called by `dispatchClaude` right before it actually spawns the agent process — the true dispatch
+   * boundary, not merely "a step handler ran" (chatgpt-codex-connector, PR #284 review, "Delay
+   * ticket dispatch markers until an agent step starts"). A formula step that never reaches
+   * `dispatchClaude` at all (`step:verify`, ordered before `step:implement` by a project's own
+   * formula) must never be mistaken for a dispatch attempt: the ticket walk uses this to gate
+   * whether a failure counts as post-dispatch (audit the board for evidence) or pre-dispatch (roll
+   * the dispatch marker back, since no agent ever ran to produce any).
+   */
+  markAgentDispatchStarting?: () => void;
+  /**
    * The worktree fingerprint a read-only step guards with (`step:describe`), and the restore it puts
    * the tree back with. Production passes neither; the seam exists so a test can drive the failure
    * paths — an unreadable tree, a revert that cannot complete — which are the ones that decide

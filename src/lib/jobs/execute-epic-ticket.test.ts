@@ -469,6 +469,26 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
     } as unknown as ResolvedStep;
   }
 
+  // Marks the walk's `onAgentDispatchStarting` callback the same way `dispatchClaude`'s own real
+  // dispatch boundary does (chatgpt-codex-connector, PR #284 review, "Delay ticket dispatch markers
+  // until an agent step starts") — stands in for a real `step:implement` so a test can put a
+  // genuinely post-dispatch failure ahead of it without spinning up the real agent machinery.
+  function dispatchedImplementStep(): ResolvedStep {
+    return {
+      step: { id: "implement" },
+      definition: {
+        name: "claude",
+        class: "dispatch",
+        summary: "fake implement step — marks dispatch started and succeeds",
+        producesDiff: true,
+        handler: async (ctx: StepContext) => {
+          ctx.deps?.markAgentDispatchStarting?.();
+          return { ok: true, facts: {} };
+        },
+      },
+    } as unknown as ResolvedStep;
+  }
+
   beforeEach(() => {
     vi.resetAllMocks();
     readStashEntriesMock.mockResolvedValue([]);
@@ -486,7 +506,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
     await expect(
       runTicket({
         run: run(),
-        steps: [failingVerifyStep()],
+        steps: [dispatchedImplementStep(), failingVerifyStep()],
         ticket: boardTicket,
         runTicketIds: [boardTicket.id],
         timeoutMs: 5_000,
@@ -508,7 +528,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       await expect(
         runTicket({
           run: run(),
-          steps: [failingVerifyStep()],
+          steps: [dispatchedImplementStep(), failingVerifyStep()],
           ticket: boardTicket,
           runTicketIds: [boardTicket.id],
           timeoutMs: 5_000,
@@ -536,7 +556,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       await expect(
         runTicket({
           run: run(),
-          steps: [failingVerifyStep()],
+          steps: [dispatchedImplementStep(), failingVerifyStep()],
           ticket: boardTicket,
           runTicketIds: [boardTicket.id],
           timeoutMs: 5_000,
@@ -563,7 +583,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       await expect(
         runTicket({
           run: run(),
-          steps: [failingVerifyStep()],
+          steps: [dispatchedImplementStep(), failingVerifyStep()],
           ticket: boardTicket,
           runTicketIds: [boardTicket.id],
           timeoutMs: 5_000,
@@ -592,7 +612,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       await expect(
         runTicket({
           run: run(),
-          steps: [failingVerifyStep()],
+          steps: [dispatchedImplementStep(), failingVerifyStep()],
           ticket: boardTicket,
           runTicketIds: [boardTicket.id],
           timeoutMs: 5_000,
@@ -624,6 +644,34 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       expect(abandonDispatchBaselineMock).toHaveBeenCalledWith("/tmp/anton", boardTicket);
       // The failure audit never runs for a pre-dispatch throw (`dispatchStarted` stays false) — the
       // rollback above is what stands in for it here.
+      expect(readBoardEvidenceMock).not.toHaveBeenCalled();
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it(
+    "rolls back the dispatch marker instead of auditing the board when a non-dispatching step " +
+      "fails before any agent ever runs (chatgpt-codex-connector, PR #284 review, 'Delay ticket " +
+      "dispatch markers until an agent step starts') — a formula that orders `step:verify` before " +
+      "`step:implement` reaches `walkTicketSteps` and can fail there with no agent ever dispatched; " +
+      "trusting the pre-dispatch marker as post-dispatch recovery would let an unrelated board write " +
+      "made during this window get credited to a later, possibly no-op, agent",
+    async () => {
+      // Would be attributed as this ticket's own evidence if the (buggy) audit path ran anyway —
+      // proving the fix actually skips it, not just that nothing happened to be found.
+      readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x9"], synced: true });
+
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [failingVerifyStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow("settled as a failure");
+
+      expect(abandonDispatchBaselineMock).toHaveBeenCalledWith("/tmp/anton", boardTicket);
       expect(readBoardEvidenceMock).not.toHaveBeenCalled();
       expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
     },
