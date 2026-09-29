@@ -23,6 +23,7 @@ const ensureBoardBaselinePersistedMock = vi.fn();
 const abandonDispatchBaselineMock = vi.fn();
 const markDispatchStartedMock = vi.fn();
 const mustReadMock = vi.fn();
+const readStashEntriesMock = vi.fn();
 
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
@@ -32,8 +33,9 @@ vi.mock("../git/ops", async () => {
     describeCommit: (...args: unknown[]) => describeCommitMock(...args),
     // This suite's worktree (`/tmp/anton-wt`) is fake, and the ticket's stash baseline read (anton-wjfkn
     // round 3) now PROPAGATES a real git failure rather than swallowing it to `[]` — a change these
-    // deadline/timeout cases have nothing to do with.
-    readStashEntries: async () => [],
+    // deadline/timeout cases have nothing to do with. Defaults to `[]` below; a mock so the dispatch-
+    // marker rollback test can make it reject instead.
+    readStashEntries: (...args: unknown[]) => readStashEntriesMock(...args),
   };
 });
 
@@ -142,6 +144,7 @@ const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, 
 describe("runTicket — the deadline is honoured through the gate's branch read (PR #253 review)", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    readStashEntriesMock.mockResolvedValue([]);
     describeCommitMock.mockResolvedValue({ sha: EARLIER, subject: "anton-t1: Add the schema" });
     finishTicketMock.mockResolvedValue({ closed: true, transitioned: true });
     settleFailedTicketMock.mockImplementation(async () => {
@@ -259,6 +262,7 @@ describe("runTicket — releases the board-evidence marker only once the handoff
 
   beforeEach(() => {
     vi.resetAllMocks();
+    readStashEntriesMock.mockResolvedValue([]);
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-x1"], synced: true });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
@@ -357,6 +361,7 @@ describe("runTicket — refreshes a reopened ticket's snapshot after the reopen-
 
   beforeEach(() => {
     vi.resetAllMocks();
+    readStashEntriesMock.mockResolvedValue([]);
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-new"], synced: true });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
@@ -466,6 +471,7 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
 
   beforeEach(() => {
     vi.resetAllMocks();
+    readStashEntriesMock.mockResolvedValue([]);
     readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
     ensureBoardBaselinePersistedMock.mockResolvedValue({ beads: new Map() });
     markDispatchStartedMock.mockResolvedValue({ beads: new Map() });
@@ -596,6 +602,32 @@ describe("runTicket — audits the board on a failed post-dispatch path (PR #284
       expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
     },
   );
+
+  it(
+    "rolls back the dispatch marker when the stash baseline can't be read before the agent ever " +
+      "starts (chatgpt-codex-connector, PR #284 review, 'Mark ticket dispatch only when the agent " +
+      "starts') — otherwise the synced marker from `markDispatchStarted` above would still read as " +
+      "post-dispatch recovery on a resume, even though `walkTicketSteps` never ran this attempt",
+    async () => {
+      readStashEntriesMock.mockRejectedValue(new Error("git stash list exploded"));
+
+      await expect(
+        runTicket({
+          run: run(),
+          steps: [failingVerifyStep()],
+          ticket: boardTicket,
+          runTicketIds: [boardTicket.id],
+          timeoutMs: 5_000,
+        }),
+      ).rejects.toThrow("settled as a failure");
+
+      expect(abandonDispatchBaselineMock).toHaveBeenCalledWith("/tmp/anton", boardTicket);
+      // The failure audit never runs for a pre-dispatch throw (`dispatchStarted` stays false) — the
+      // rollback above is what stands in for it here.
+      expect(readBoardEvidenceMock).not.toHaveBeenCalled();
+      expect(settleFailedTicketMock).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 /**
@@ -646,6 +678,7 @@ describe(
     beforeEach(() => {
       vi.resetAllMocks();
       dispatchMock.mockReset();
+      readStashEntriesMock.mockResolvedValue([]);
       readBoardBaselineMock.mockResolvedValue({ beads: new Map() });
       markDispatchStartedMock.mockResolvedValue({ beads: new Map() });
       // A benign "nothing changed" default for tests below that DO reach dispatch and exercise the

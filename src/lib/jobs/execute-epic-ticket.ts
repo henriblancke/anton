@@ -269,6 +269,17 @@ export async function runTicket(args: {
     try {
       stashBaseline = await readStashEntries(worktreePath);
     } catch (baselineError) {
+      // `markDispatchStarted` above already told the board this attempt is dispatching
+      // (chatgpt-codex-connector, PR #284 review, "Mark ticket dispatch only when the agent
+      // starts") — a stash-read failure here means `walkTicketSteps` never runs, so `dispatchStarted`
+      // stays false and the catch below's failure audit is skipped as a pre-dispatch throw. Left
+      // un-rolled-back, the synced marker and its locked baseline would still read as "dispatch
+      // began" on a resumed attempt, which trusts that shape as post-dispatch recovery and skips
+      // refreshing it — silently crediting board writes made before the resume to a later, possibly
+      // no-op, agent. Abandoned here, before the throw, so a resume takes a genuinely fresh baseline.
+      if (boardOnly && boardBaseline) {
+        await abandonDispatchBaseline(run.repoPath, ticket);
+      }
       throw new StashBaselineUnreadableError(ticket.id, baselineError);
     }
     const stash = ticketStashRecovery(worktreePath, run.branch, stashBaseline);
