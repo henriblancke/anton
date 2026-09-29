@@ -14,7 +14,7 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { bundledSkillDigest, loadSkill } from "../claude/prompt";
 import { textDigest } from "../claude/skill-stamp.mjs";
 import type { ReasoningAttribution } from "../claude-invocations";
-import { ANTON_MARK, threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
+import { latestHumanComment, threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
 import { type ProjectSettings } from "../projects";
 
 /** One reported outcome for an inline review thread, parsed from claude's final message. */
@@ -252,19 +252,21 @@ function reviewerSummarySection(pr: PrReview): string[] {
 }
 
 /**
- * Top-level PR comments from a human (not anton's own ANTON_MARK-prefixed posts) — most commonly a
- * reply to a prior `needs-human` sentinel, posted the one place `classifyReview` looks for it (PR
- * #338 review, chatgpt-codex-connector). Without this, `classifyReview`'s fingerprint changes
- * enough to dispatch a fresh fix session, but the session never sees what the human actually said —
- * it can only repeat the same request.
+ * The latest top-level PR comment from a human (not anton's own ANTON_MARK-prefixed posts) — most
+ * commonly a reply to a prior `needs-human` sentinel, posted the one place `classifyReview` looks
+ * for it (PR #338 review, chatgpt-codex-connector). Limited to the SAME single comment
+ * `classifyReview`'s fingerprint reacts to (`latestHumanComment`, shared from pr.ts), not every
+ * top-level comment the PR has ever collected — a long-running PR's paginated comment fetch can
+ * return hundreds of entries, and mapping all of them into the prompt risks exhausting the model's
+ * context before it even reaches the actual review feedback (PR #338 review, chatgpt-codex-connector).
  */
 function humanCommentsSection(pr: PrReview): string[] {
-  const replies = (pr.comments ?? []).filter((c) => !c.body.startsWith(ANTON_MARK));
-  if (replies.length === 0) return [];
+  const reply = latestHumanComment(pr.comments);
+  if (!reply) return [];
   return [
     `Top-level PR comments (not inline review threads) — a reply here may answer a prior`,
     `"needs-human" request:`,
-    ...replies.map((c) => `- @${c.author}: ${c.body.trim()}`),
+    `- @${reply.author}: ${reply.body.trim()}`,
     ``,
   ];
 }

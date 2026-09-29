@@ -1940,8 +1940,8 @@ describe("notifyGateParked (anton-gvqk3)", () => {
   let prevGh: string | undefined;
 
   // Fake gh with just enough state to prove dedup: posted comment bodies persist to `storeFile`, and
-  // `pr view --json comments` reads them back — so a second `notifyGateParked` call sees exactly what
-  // the first one posted, the same way the real PR would.
+  // the paginated `api graphql` comments query (getPrTopLevelComments) reads them back — so a second
+  // `notifyGateParked` call sees exactly what the first one posted, the same way the real PR would.
   function installFakeGh(): void {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
@@ -1951,10 +1951,13 @@ const fs = require('fs');
 const a = process.argv.slice(2);
 const store = process.env.ANTON_TEST_COMMENTS_STORE;
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'view' && a.includes('comments')) {
+if (a[0] === 'api' && a[1] === 'graphql') {
   let bodies = [];
   try { bodies = JSON.parse(fs.readFileSync(store, 'utf8')); } catch {}
-  process.stdout.write(JSON.stringify({ comments: bodies.map((b) => ({ body: b })) }));
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: bodies.map((b, i) => ({ id: 'IC_' + i, author: { login: 'someone' }, body: b })),
+  } } } } }));
   process.exit(0);
 }
 if (a[0] === 'pr' && a[1] === 'comment') {

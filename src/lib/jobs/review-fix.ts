@@ -78,8 +78,8 @@ import {
   classifyReview,
   commentOnPr,
   getPrActivity,
-  getPrComments,
   getPrReview,
+  getPrTopLevelComments,
   prNumberFromRef,
   reactToReviewComment,
   reRequestReview,
@@ -1771,8 +1771,8 @@ export async function notifyGateParked(args: {
     ? " A follow-up fix round already ran against this gate; it failed again."
     : "";
   const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}${fixRoundNote}`;
-  const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
-  if (existing.includes(body)) return;
+  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => []);
+  if (existing.some((c) => c.body === body)) return;
   await safe(() => commentOnPr(repo, number, body, signal));
 }
 
@@ -2451,8 +2451,8 @@ async function publishUnpushedSentinel(args: {
   const { repo, number, sentinel, signal, logPath } = args;
   const note = sentinel.reply?.trim() || defaultReply(sentinel.outcome);
   const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}`;
-  const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
-  if (existing.includes(body)) return true;
+  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => []);
+  if (existing.some((c) => c.body === body)) return true;
   const posted = await safe(() => commentOnPr(repo, number, body, signal));
   if (posted) {
     await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);

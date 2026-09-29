@@ -101,8 +101,8 @@ export interface PrReview {
    */
   threadsComplete: boolean;
   /**
-   * Top-level PR comments (the same surface `commentOnPr`/`getPrComments` read/write — not inline
-   * review comments), oldest first. Fetched via `getPrTopLevelComments` (paginated GraphQL, not the
+   * Top-level PR comments (the same surface `commentOnPr` posts to — not inline review comments),
+   * oldest first. Fetched via `getPrTopLevelComments` (paginated GraphQL, not the
    * REST `gh pr view --json comments`, which caps at 100 with no cursor and would otherwise drop a
    * human reply past page 1 on a long-running PR). Lets `classifyReview` tell a genuine human reply
    * apart from anton's own posts (ANTON_MARK-prefixed, filtered the same way `threadsNeedingAttention`
@@ -281,7 +281,7 @@ interface PrCommentsPage {
  * everything, mirroring `getReviewThreads` — some history beats none for the (ephemeral,
  * unpersisted) fingerprint this feeds.
  */
-async function getPrTopLevelComments(
+export async function getPrTopLevelComments(
   repoPath: string,
   number: number,
   signal?: AbortSignal,
@@ -635,6 +635,19 @@ function hashReviewBody(body: string): string {
 }
 
 /**
+ * The most recent top-level PR comment that isn't one of anton's own posts (ANTON_MARK-prefixed) —
+ * a `needs-human` round's one reply channel. Shared by `classifyReview`'s fingerprint and the
+ * review-fix prompt's human-comments section (review-fix-context.ts) so both agree on which single
+ * comment answers a prior request, rather than the prompt rendering every top-level comment a
+ * long-running PR has ever collected (PR #338 review, chatgpt-codex-connector).
+ */
+export function latestHumanComment(
+  comments: Array<{ id: string; author: string; body: string }> | undefined,
+): { id: string; author: string; body: string } | undefined {
+  return [...(comments ?? [])].reverse().find((c) => !c.body.startsWith(ANTON_MARK));
+}
+
+/**
  * Pure classifier: does this PR need anton to act? Actionable when the PR is OPEN and a reviewer
  * requested changes, a CI check is failing, the branch conflicts with its base, or an unresolved
  * review thread is still waiting on anton (see threadsNeedingAttention). Pending checks /
@@ -725,14 +738,14 @@ export function classifyReview(pr: PrReview): Actionable {
     // thread) otherwise leaves the fingerprint byte-identical and the round suppressed forever (PR
     // #338 review, chatgpt-codex-connector). Omitted entirely when there is no such comment yet, to
     // leave the fingerprint of the (overwhelmingly common) comment-free PR unchanged.
-    const latestHumanComment = [...(pr.comments ?? [])].reverse().find((c) => !c.body.startsWith(ANTON_MARK));
+    const humanComment = latestHumanComment(pr.comments);
     // Hashes the body too, not just the id (PR #338 review, chatgpt-codex-connector): GitHub
     // preserves a comment's id across an edit, so a human editing their answered top-level reply —
     // the exact input meant to release the needs-human suppression — would otherwise leave this
     // fingerprint byte-identical to the stale answered row and stay suppressed forever, mirroring
     // why `changesRequested` above hashes a review's body rather than trusting its id alone.
-    if (latestHumanComment) {
-      fingerprint.push(`comment:${latestHumanComment.id}:${hashReviewBody(latestHumanComment.body)}`);
+    if (humanComment) {
+      fingerprint.push(`comment:${humanComment.id}:${hashReviewBody(humanComment.body)}`);
     }
   }
   return { actionable: reasons.length > 0, reasons, fingerprint };
@@ -746,20 +759,6 @@ export async function commentOnPr(
   signal?: AbortSignal,
 ): Promise<void> {
   await gh(repoPath, ["pr", "comment", String(number), "--body", body], signal);
-}
-
-/**
- * Existing top-level PR comments (the same surface `commentOnPr` posts to — not inline review
- * comments), oldest first. Lets a caller dedupe its own status posts before adding another.
- */
-export async function getPrComments(
-  repoPath: string,
-  number: number,
-  signal?: AbortSignal,
-): Promise<string[]> {
-  const raw = await gh(repoPath, ["pr", "view", String(number), "--json", "comments"], signal);
-  const view = JSON.parse(raw) as { comments?: Array<{ body?: string }> };
-  return (view.comments ?? []).map((c) => c.body ?? "");
 }
 
 /**
