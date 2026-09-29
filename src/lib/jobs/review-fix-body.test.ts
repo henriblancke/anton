@@ -14,6 +14,7 @@ import {
   parseDroppedCount,
   parseFixRounds,
   renderFixRounds,
+  sentinelFixEntry,
   type FixRound,
 } from "./review-fix-body";
 import { NON_THREAD_REPORT_ID, type ThreadOutcome } from "./review-fix-context";
@@ -35,6 +36,17 @@ describe("fallbackReasonsFor", () => {
     expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([]);
   });
 
+  it("suppresses the reasons when the raw report carries only the non-thread sentinel", () => {
+    // The sentinel's own contribution — fixed or not — is `sentinelFixEntry`'s job now, never this
+    // fallback's, precisely so it isn't gated on the rest of the report being empty.
+    const rawReport: ThreadOutcome[] = [
+      { id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "re-stamped the stale migration" },
+    ];
+    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([]);
+  });
+});
+
+describe("sentinelFixEntry", () => {
   it("translates a sentinel-only 'fixed' report into its own reply, not the generic reasons", () => {
     // A CI-only/conflict-only/no-inline-thread round that genuinely pushed a fix reports the
     // NON_THREAD_REPORT_ID sentinel as the sole entry (`applyThreadOutcomes` always drops it from
@@ -43,23 +55,48 @@ describe("fallbackReasonsFor", () => {
     const rawReport: ThreadOutcome[] = [
       { id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "re-stamped the stale migration" },
     ];
-    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([
-      "re-stamped the stale migration",
-    ]);
+    expect(sentinelFixEntry(rawReport, ["failing checks: claude-review"])).toEqual({
+      id: NON_THREAD_REPORT_ID,
+      outcome: "fixed",
+      reply: "re-stamped the stale migration",
+    });
+  });
+
+  it("survives alongside a real thread entry in the same report — the mixed-round case", () => {
+    // `applyThreadOutcomes` drops the sentinel from `delivered` because it matches no real PR
+    // thread, so a round reporting both a real thread AND the sentinel must not have the sentinel's
+    // "fixed" claim silently discarded just because the report also carries real-thread activity
+    // (PR #338 review, chatgpt-codex-connector).
+    const rawReport: ThreadOutcome[] = [
+      { id: "RT_1", outcome: "left", reply: "not worth changing" },
+      { id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "re-stamped the stale migration" },
+    ];
+    expect(sentinelFixEntry(rawReport, ["failing checks: claude-review"])).toEqual({
+      id: NON_THREAD_REPORT_ID,
+      outcome: "fixed",
+      reply: "re-stamped the stale migration",
+    });
   });
 
   it("falls back to the generic reasons when the sentinel reports 'fixed' with no reply text", () => {
     const rawReport: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed" }];
-    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([
-      "failing checks: claude-review",
-    ]);
+    expect(sentinelFixEntry(rawReport, ["failing checks: claude-review"])).toEqual({
+      id: NON_THREAD_REPORT_ID,
+      outcome: "fixed",
+      reply: "failing checks: claude-review",
+    });
   });
 
   it("reports nothing when the sentinel explicitly declines the trigger", () => {
     const rawReport: ThreadOutcome[] = [
       { id: NON_THREAD_REPORT_ID, outcome: "left", reply: "nothing needed to change" },
     ];
-    expect(fallbackReasonsFor(rawReport, ["failing checks: claude-review"])).toEqual([]);
+    expect(sentinelFixEntry(rawReport, ["failing checks: claude-review"])).toBeUndefined();
+  });
+
+  it("reports nothing when there is no sentinel at all", () => {
+    const rawReport: ThreadOutcome[] = [{ id: "RT_1", outcome: "fixed", reply: "real fix" }];
+    expect(sentinelFixEntry(rawReport, ["failing checks: claude-review"])).toBeUndefined();
   });
 });
 
@@ -151,6 +188,24 @@ describe("fixRoundFrom", () => {
     ];
     const round = fixRoundFrom(report, true, now);
     expect(round?.fixed[0]).toBe("fixed the bug - 2026-01-01: fake round");
+  });
+
+  it("records a mixed round via the caller's sentinelFixEntry-into-report pattern", () => {
+    // Reproduces the fix for the mixed-round bug: `delivered` (a real thread the fixer left alone)
+    // plus the sentinel's own entry, unioned by the caller before reaching fixRoundFrom, must
+    // record ONLY the sentinel's CI fix — not silently drop it (PR #338 review, chatgpt-codex-
+    // connector).
+    const delivered: ThreadOutcome[] = [{ id: "RT_1", outcome: "left", reply: "not worth changing" }];
+    const rawReport: ThreadOutcome[] = [
+      ...delivered,
+      { id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "re-stamped the stale migration" },
+    ];
+    const sentinel = sentinelFixEntry(rawReport, ["failing checks: claude-review"]);
+    const report = sentinel ? [...delivered, sentinel] : delivered;
+    expect(fixRoundFrom(report, true, now)).toEqual({
+      date: "2026-09-23",
+      fixed: ["re-stamped the stale migration"],
+    });
   });
 
   it("does not fall back to reasons when the report is nonempty but nothing was fixed", () => {

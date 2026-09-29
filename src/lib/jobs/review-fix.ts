@@ -128,7 +128,12 @@ import {
   recordReviewRound,
   unsettledPrNumbers,
 } from "../review-rounds";
-import { fallbackReasonsFor, fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
+import {
+  fallbackReasonsFor,
+  fixRoundFrom,
+  nextFixRoundsRegion,
+  sentinelFixEntry,
+} from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
@@ -1594,10 +1599,15 @@ async function runFixSession(args: {
     // `mainRoundProducedChange`, not `sessionProducedChange` or raw `pushed` — same reason as
     // `applyThreadOutcomes` above: this region renders straight from `report`'s own claims, so it
     // needs the same narrow evidence, not credit for a gate-only follow-up's unrelated edit.
+    // The sentinel is injected as its own report entry, not routed through `reasons` — it must
+    // survive alongside a real thread entry in the same round (PR #338 review, chatgpt-codex-
+    // connector), and `fallbackReasonsFor`'s generic fallback only fires when the report is
+    // otherwise completely empty.
+    const sentinelEntry = sentinelFixEntry(report, verdict.reasons);
     await refreshFixRoundsBody({
       repo,
       number,
-      report: delivered,
+      report: sentinelEntry ? [...delivered, sentinelEntry] : delivered,
       pushed: mainRoundProducedChange,
       now: new Date(clock.now()),
       logPath,

@@ -69,34 +69,45 @@ function sanitizeSummary(text: string): string {
  * or no reasons given) — the caller's signal that the region, and `gh`, stay untouched.
  */
 /**
- * The `reasons` a caller may hand `fixRoundFrom`/`refreshFixRoundsBody` as its fallback, gated on
- * the RAW model report (before `applyThreadOutcomes`'s delivery filtering) carrying no REAL thread
- * entry — never on `delivered` being empty. A nonempty report whose every reply/resolve failed to
- * reach GitHub is NOT the CI-only/conflict-only case the fallback exists for: those threads are
- * still undelivered, waiting on a retry, not resolved, so reporting `reasons` here would claim the
- * round answered findings it never actually got a word to GitHub about.
+ * The {@link NON_THREAD_REPORT_ID} sentinel's own "fixed" claim, as a synthetic {@link ThreadOutcome}
+ * the caller unions into the report it hands `fixRoundFrom` — never routed through the generic
+ * `fallbackReasons` fallback, whose entries only surface when `report` is otherwise completely
+ * empty (see {@link fallbackReasonsFor}). `triageOutcomes` matches the sentinel against no actual
+ * PR thread, so `applyThreadOutcomes` always drops it from `delivered`; a round that reports both a
+ * real thread AND the sentinel therefore hands `fixRoundFrom` a nonempty `delivered` array, and the
+ * generic fallback path never fires for it. Routing the sentinel through `fallbackReasons` instead
+ * of injecting it into the report itself meant its "fixed" claim was silently dropped whenever a
+ * real thread entry was also reported — a "thread left, CI fixed" round recorded nothing, and a
+ * "thread fixed, CI also fixed" round recorded only the thread (PR #338 review, chatgpt-codex-
+ * connector). Injecting it as its own report entry instead lets `fixRoundFrom`'s existing per-item
+ * union carry it alongside whatever `delivered` already has.
  *
- * The {@link NON_THREAD_REPORT_ID} sentinel never counts as a real thread entry — `triageOutcomes`
- * matches it against no actual PR thread, so `applyThreadOutcomes` always drops it from `delivered`
- * regardless of what it claims. Without unwrapping it here, a CI-only/conflict-only round that
- * genuinely pushed a fix and correctly reported the sentinel as `"fixed"` read as a NONEMPTY raw
- * report (the sentinel itself), so this used to fall through to `[]` — no fallback reasons — while
- * `delivered` was also `[]` (the sentinel matches no thread), leaving `refreshFixRoundsBody` with
- * neither a thread entry nor a fallback reason and recording no round at all (PR #338 review,
- * chatgpt-codex-connector). A sentinel reporting `"fixed"` is translated straight into the body
- * entry via its own reply (more specific than the generic verdict reasons); a sentinel reporting
- * `"left"`/`"needs-human"` means the fixer explicitly did nothing about the trigger, so no entry is
- * owed. Only a report with NO sentinel at all (the model skipped the reporting contract entirely)
- * still falls back to the verdict's own `reasons`.
+ * `undefined` when the sentinel isn't present or didn't claim "fixed" — nothing to inject. A
+ * missing reply text falls back to the verdict's own `reasons` (more generic, but still specific to
+ * this round's trigger) rather than the bare sentinel id.
+ */
+export function sentinelFixEntry(
+  rawReport: ThreadOutcome[],
+  reasons: string[],
+): ThreadOutcome | undefined {
+  const sentinel = rawReport.find((item) => item.id === NON_THREAD_REPORT_ID);
+  if (!sentinel || sentinel.outcome !== "fixed") return undefined;
+  const summary = sentinel.reply?.trim();
+  return { id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: summary || reasons.join("; ") };
+}
+
+/**
+ * The `reasons` a caller may hand `fixRoundFrom`/`refreshFixRoundsBody` as its fallback for a round
+ * whose RAW model report (before `applyThreadOutcomes`'s delivery filtering) is completely empty —
+ * a true CI-only/conflict-only trigger where the model emitted no reporting contract at all, not
+ * even the {@link NON_THREAD_REPORT_ID} sentinel. Any other case — a real thread entry, or a
+ * sentinel claim of any outcome — returns `[]`: a nonempty report whose every reply/resolve failed
+ * to reach GitHub is NOT this case (those threads are still undelivered, waiting on a retry, not
+ * resolved), and the sentinel's own "fixed" claim is {@link sentinelFixEntry}'s job, not this one's,
+ * precisely so it isn't gated on the rest of the report being empty.
  */
 export function fallbackReasonsFor(rawReport: ThreadOutcome[], reasons: string[]): string[] {
-  const realThreadEntries = rawReport.filter((item) => item.id !== NON_THREAD_REPORT_ID);
-  if (realThreadEntries.length > 0) return [];
-  const sentinel = rawReport.find((item) => item.id === NON_THREAD_REPORT_ID);
-  if (!sentinel) return reasons;
-  if (sentinel.outcome !== "fixed") return [];
-  const summary = sentinel.reply?.trim();
-  return summary ? [summary] : reasons;
+  return rawReport.length === 0 ? reasons : [];
 }
 
 export function fixRoundFrom(
