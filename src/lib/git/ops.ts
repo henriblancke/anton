@@ -3050,17 +3050,36 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
  * progress (markers in the tree, MERGE_HEAD set) and the conflicted paths are returned — the
  * caller has claude resolve the markers and a later `commitAll` concludes the merge. A merge that
  * fails for any other reason (e.g. untracked files in the way) is aborted and rethrown.
+ *
+ * `bypassHooks` runs the merge with this project's hooks off — for an internal premerge whose
+ * result is not yet published, mirroring `commitAll`'s own `bypassHooks` (PR #338 review,
+ * chatgpt-codex-connector, round 30): a project's `pre-merge-commit` hook that rejects the
+ * currently-failing tree would otherwise abort this merge outright — `mergeIntoCurrent` catches
+ * that as an ordinary (non-conflict) failure, so the caller never gets a chance to resolve
+ * anything or reach the real, hook-enforced commit downstream. `--no-verify` bypasses
+ * `pre-merge-commit`/`commit-msg` for the merge (git-merge(1), supported since git 2.29); routing
+ * through a `core.hooksPath` that resolves to nothing disables `prepare-commit-msg` and
+ * `post-merge` too, the same belt-and-suspenders `commitAll` already uses for its own bypassed
+ * commit. The caller is responsible for marking the resulting commit as an unverified boundary
+ * (see `markUnverifiedBoundary` in review-fix.ts) so the project's real hooks still see it before
+ * anything is pushed.
  */
 export async function mergeIntoCurrent(
   worktreePath: string,
   ref: string,
-  opts?: { ffOnly?: boolean; hooksPath?: string },
+  opts?: { ffOnly?: boolean; hooksPath?: string; bypassHooks?: boolean },
 ): Promise<{ ok: boolean; conflicts: string[] }> {
   try {
     await git(
       worktreePath,
-      ["merge", "--no-edit", ...(opts?.ffOnly ? ["--ff-only"] : []), ref],
-      opts?.hooksPath,
+      [
+        "merge",
+        "--no-edit",
+        ...(opts?.bypassHooks ? ["--no-verify"] : []),
+        ...(opts?.ffOnly ? ["--ff-only"] : []),
+        ref,
+      ],
+      opts?.bypassHooks ? disabledHooksPath() : opts?.hooksPath,
     );
     return { ok: true, conflicts: [] };
   } catch (e) {

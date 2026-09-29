@@ -1069,24 +1069,12 @@ export async function prepareFixWorktree(args: {
   // branch already carries committed work (anton-2wklm).
   const alreadyAhead = await branchAheadOfRemote(repo, branch);
 
-  // This premerge brings in a DIFFERENT ref than the sync above (`origin/${baseBranch}`, the PR's
-  // base, not `origin/${branch}`), so it needs the identical incoming-ref-aware resolution — the
-  // sync's own comment explains why resolveHooksPathOverride (answering "what does the CURRENT
-  // checkout need") is wrong for a merge that hasn't run yet. An earlier round resolved this
-  // premerge's override against the current checkout instead of `origin/${baseBranch}`, which is the
-  // same bug in a new spot: a conflicting PR's base can introduce or advance a tracked hooks
-  // directory/submodule the feature worktree doesn't have, and the stale current-checkout answer
-  // would skip a newly-introduced `post-merge` or run an old submodule checkout `git merge` never
-  // updates on its own (PR #263 review, round 30). `needsHooksPathOverrideForMerge` asks only whether
-  // the incoming ref changes something about the hooksPath directory/submodule relative to the
-  // current checkout — nothing in it assumes the resulting merge is fast-forward-only, so it applies
-  // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
-  // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
-  // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
+  // This premerge runs with the project's hooks bypassed (see `premergeBase`'s own doc) — its
+  // result is an internal, not-yet-published boundary the real gates below and the eventual
+  // hook-enforced commit in `commitAndPushFix` still verify, so there is no incoming-ref hooksPath
+  // to resolve here.
   const { conflicts, merged, failed: baseMergeFailed } = await premergeBase(
-    repo,
     worktree.path,
-    branch,
     baseBranch,
     number,
   );
@@ -1131,11 +1119,20 @@ export async function prepareFixWorktree(args: {
  * behind branch (fast-forwardable, no textual conflict) still needs this merge — without it the
  * gates judge a tree that's missing base commits and can pass against files the base already
  * superseded (#2141). Conflicts, when they happen, are what claude is asked to resolve.
+ *
+ * A clean merge runs with the project's hooks bypassed (PR #338 review, chatgpt-codex-connector,
+ * round 30): this is an internal, not-yet-published step, run before the verify gates and before
+ * claude has even looked at the tree, so a `pre-merge-commit` hook enforcing the same thing a
+ * configured gate does would otherwise reject the merge outright — `mergeIntoCurrent` treats that
+ * as an ordinary (non-conflict) failure, and the caller folds it into `refsSynced`/`failed` as if
+ * the base could never be landed at all, even though nothing about the base merge itself was
+ * actually wrong. The resulting merge commit is always marked as an unverified boundary so the
+ * project's real hooks still see its full diff via `commitAndPushFix`'s existing re-verify amend
+ * before anything is pushed — the same technique `commitFix`'s own bypassed commit already relies
+ * on, just applied to the merge commit that can land BEFORE `commitFix` ever runs.
  */
 async function premergeBase(
-  repo: string,
   worktreePath: string,
-  branch: string,
   baseBranch: string | undefined,
   number: number,
 ): Promise<{ conflicts: string[]; merged: boolean; failed: boolean }> {
@@ -1147,27 +1144,18 @@ async function premergeBase(
   // below tolerates a no-op fine on its own.
   const upToDate = await isAncestor(worktreePath, baseRef, "HEAD").catch(() => false);
   if (upToDate) return { conflicts: [], merged: false, failed: false };
-  const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
-    ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
-    : undefined;
-  // Read BEFORE the merge below can move HEAD (PR #338 review, chatgpt-codex-connector, round 5): a
-  // clean auto-merge lands its own commit via `mergeIntoCurrent`, entirely bypassing `commitFix`'s
-  // marker check. If the tip this merges on top of was itself a hook-bypassed boundary commit (a
-  // prior attempt parked one and the base has since advanced), the merge commit's tree still carries
-  // that unverified content, but the note stays attached to the OLD tip — not the new merge commit
-  // that `findUnverifiedBoundaryAncestor` actually inspects afterward. Left unpropagated, the
-  // "already ahead" fast path in `runFixSession` finds no marker on the new HEAD, skips the re-verify
-  // amend in `commitAndPushFix`, and pushes the original --no-verify commit's content straight past
-  // the project's hooks. Searches the whole unpushed range, not just literal `HEAD` (round 6): the
-  // tip this merges onto can itself be a plain commit stacked on an older, still-unpushed boundary.
+  // Read BEFORE the merge below can move HEAD (PR #338 review, chatgpt-codex-connector, round 5):
+  // the rollback path below needs a target to restore to if writing the marker fails.
   const preMergeHead = await readWorktreeState(worktreePath).then((s) => s.head, () => "");
-  const hadUnverifiedBoundary =
-    (await findUnverifiedBoundaryAncestor(worktreePath, branch)) !== undefined;
   try {
-    const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
-    if (merge.conflicts.length === 0 && hadUnverifiedBoundary) {
-      // The merge committed cleanly on top of a still-unverified tip — carry the marker forward onto
-      // the new merge commit so it isn't lost.
+    const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true });
+    if (merge.conflicts.length === 0) {
+      // Hooks were bypassed to land this commit (see this function's own doc) — mark it as an
+      // unverified boundary unconditionally, not only when carrying forward a PRE-EXISTING marker
+      // (round 5's original fix here): even a merge onto an otherwise fully-verified tip produces a
+      // commit the project's hooks never actually saw, and `findUnverifiedBoundaryAncestor` below
+      // must find this exact commit to re-verify the merge's own diff, not just whatever `commitFix`
+      // commits on top of it afterward.
       try {
         await markUnverifiedBoundary(worktreePath);
       } catch (error) {
