@@ -335,7 +335,19 @@ export async function getPrTopLevelComments(
         break;
       }
       const page = parsed.data?.repository?.pullRequest?.comments;
-      if (!page || !Array.isArray(page.nodes)) break;
+      if (!page) {
+        // Missing repository/pullRequest/comments is a malformed response, not "no comments" — flag
+        // it so a degraded read isn't mistaken for the PR's real, complete comment history (PR #338
+        // review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      if (!Array.isArray(page.nodes)) {
+        // A missing, null, or non-array `nodes` is the same malformed-response case, just missing a
+        // different field (PR #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
       allNodes.push(...page.nodes);
       if (!page.pageInfo?.hasNextPage) break;
       if (!page.pageInfo.endCursor) {

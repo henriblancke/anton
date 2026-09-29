@@ -953,53 +953,100 @@ function gitCommit(
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
+  const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+  const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
+  return runBoundedProcess("git", [...configArgs, "-C", cwd, ...args], {
+    timeoutMs,
+    signal,
+    onTimeout: (stderr) => commitTimedOut(args, timeoutMs, stderr),
+    onFailure: (code, stderr) => commitFailed(args, code, stderr),
+  });
+}
+
+/**
+ * Spawn `command` as the leader of its own process group and resolve only once it — and every
+ * child it spawned — is GONE. The same guarantee {@link gitCommit} needs for `git commit` (whose
+ * hooks run project code that can outlive a plain `execFile` timeout) applies to any other
+ * project-controlled hook anton runs synchronously in the commit path — `runIgnoreMissingHook`'s
+ * `pre-merge-commit` invocation in particular (PR #338 review, chatgpt-codex-connector): running it
+ * through the generic `git()`/`execFileAsync()` paths instead of this one would let a hung hook (or
+ * a child that survives its own termination) keep mutating the worktree after the caller has already
+ * moved on to the commit that follows, racing it. Extracted so both share the exact spawn, timeout,
+ * abort, and {@link reapCommitGroup} lifecycle rather than two copies drifting apart.
+ */
+function runBoundedProcess(
+  command: string,
+  args: string[],
+  opts: {
+    cwd?: string;
+    timeoutMs: number;
+    signal?: AbortSignal;
+    onTimeout: (stderr: string) => Error;
+    onFailure: (code: number | null, stderr: string) => Error;
+  },
+): Promise<void> {
   return new Promise((resolvePromise, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    if (opts.signal?.aborted) {
+      reject(opts.signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
       return;
     }
 
-    const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
-    // unread pipe would block the commit outright.
-    const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
+    // unread pipe would block the process outright.
+    const child = spawn(command, args, {
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
       stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
     });
     const stderr = boundedStderr(child);
-    const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
     let killing = false;
     let settled = false;
     const settle = (emit: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(budget);
-      signal?.removeEventListener("abort", abort);
+      opts.signal?.removeEventListener("abort", abort);
       emit();
     };
     const abort = () => {
       if (killing || settled) return;
       killing = true;
       void reapCommitGroup(child).then(() =>
-        settle(() => reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"))),
+        settle(() =>
+          reject(opts.signal?.reason ?? new DOMException("The operation was aborted", "AbortError")),
+        ),
       );
     };
     const budget = setTimeout(() => {
       if (killing || settled) return;
       killing = true;
-      void reapCommitGroup(child).then(() =>
-        settle(() => reject(commitTimedOut(args, timeoutMs, stderr()))),
-      );
-    }, timeoutMs);
-    signal?.addEventListener("abort", abort, { once: true });
+      void reapCommitGroup(child).then(() => settle(() => reject(opts.onTimeout(stderr()))));
+    }, opts.timeoutMs);
+    opts.signal?.addEventListener("abort", abort, { once: true });
 
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
       // A kill in flight owns the verdict: its group may still hold live writers.
       if (killing) return;
-      settle(() => (code === 0 ? resolvePromise() : reject(commitFailed(args, code, stderr()))));
+      settle(() => (code === 0 ? resolvePromise() : reject(opts.onFailure(code, stderr()))));
     });
   });
+}
+
+/** The rejection a hook killed by its own budget carries, mirroring {@link commitTimedOut}. */
+function hookTimedOut(hookName: string, timeoutMs: number, stderr: string): Error {
+  return Object.assign(
+    new Error(
+      `${hookName} hook timed out after ${formatCommitBudget(timeoutMs)} and was killed with ` +
+        `everything it spawned: ${stderr}`,
+    ),
+    { killed: true },
+  );
+}
+
+/** The rejection a hook's own non-zero exit carries, mirroring {@link commitFailed}. */
+function hookFailed(hookName: string, code: number | null, stderr: string): Error {
+  return Object.assign(new Error(`${hookName} hook failed (exit ${code}): ${stderr}`), { code });
 }
 
 /** The tree mode of a symlink. Its blob holds the TARGET PATHNAME, not the linked file's content. */
@@ -1517,7 +1564,13 @@ async function supportsGitHookRun(): Promise<boolean> {
  * executable — git itself never runs a hook lacking the executable bit, so neither does this. A
  * non-zero exit throws, propagating into the same rollback a rejected `git commit` triggers.
  */
-export async function runHookDirectly(worktreePath: string, hookName: string, hooksPath?: string): Promise<void> {
+export async function runHookDirectly(
+  worktreePath: string,
+  hookName: string,
+  hooksPath?: string,
+  requestedTimeoutMs?: number,
+  signal?: AbortSignal,
+): Promise<void> {
   const hooksDir = await git(
     worktreePath,
     ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
@@ -1526,22 +1579,46 @@ export async function runHookDirectly(worktreePath: string, hookName: string, ho
   const hookPath = resolve(hooksDir, hookName);
   if (!existsSync(hookPath)) return;
   if (process.platform !== "win32" && (statSync(hookPath).mode & 0o111) === 0) return;
-  await execFileAsync(hookPath, [], {
+  const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
+  await runBoundedProcess(hookPath, [], {
     cwd: worktreePath,
-    timeout: 120_000,
-    maxBuffer: 16 * 1024 * 1024,
+    timeoutMs,
+    signal,
+    onTimeout: (stderr) => hookTimedOut(hookName, timeoutMs, stderr),
+    onFailure: (code, stderr) => hookFailed(hookName, code, stderr),
   });
 }
 
 /**
  * Run `hookName` the way `git hook run --ignore-missing <hookName>` would — via the real
- * subcommand on git ≥2.36, or {@link runHookDirectly} on older git that doesn't have it.
+ * subcommand on git ≥2.36, or {@link runHookDirectly} on older git that doesn't have it. Both
+ * paths run through {@link runBoundedProcess} so a hook here gets the exact same process-group
+ * timeout, abort, and reap lifecycle as the commit that follows it, rather than the unbounded
+ * `git()`/`execFileAsync()` paths every other read-only git call here uses (PR #338 review,
+ * chatgpt-codex-connector).
  */
-async function runIgnoreMissingHook(worktreePath: string, hookName: string, hooksPath?: string): Promise<void> {
+async function runIgnoreMissingHook(
+  worktreePath: string,
+  hookName: string,
+  hooksPath?: string,
+  requestedTimeoutMs?: number,
+  signal?: AbortSignal,
+): Promise<void> {
   if (await supportsGitHookRun()) {
-    await git(worktreePath, ["hook", "run", "--ignore-missing", hookName], hooksPath);
+    const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+    const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
+    await runBoundedProcess(
+      "git",
+      [...configArgs, "-C", worktreePath, "hook", "run", "--ignore-missing", hookName],
+      {
+        timeoutMs,
+        signal,
+        onTimeout: (stderr) => hookTimedOut(hookName, timeoutMs, stderr),
+        onFailure: (code, stderr) => hookFailed(hookName, code, stderr),
+      },
+    );
   } else {
-    await runHookDirectly(worktreePath, hookName, hooksPath);
+    await runHookDirectly(worktreePath, hookName, hooksPath, requestedTimeoutMs, signal);
   }
 }
 
@@ -1784,7 +1861,16 @@ export async function commitAll(
       // when the project has no such hook, matching what `git merge` itself would have done.
       // `runIgnoreMissingHook` falls back to running the hook file directly on git < 2.36, which
       // predates the `hook` subcommand entirely (PR #338 review round 13, chatgpt-codex-connector).
-      await runIgnoreMissingHook(worktreePath, "pre-merge-commit", options.hooksPath);
+      // Threading this commit's own `timeoutMs`/`signal` through means a hung `pre-merge-commit` is
+      // bounded and reaped the same way the verifying commit right below it is (PR #338 review round
+      // 14, chatgpt-codex-connector).
+      await runIgnoreMissingHook(
+        worktreePath,
+        "pre-merge-commit",
+        options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+      );
     }
     await gitCommit(
       worktreePath,

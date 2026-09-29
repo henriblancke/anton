@@ -1045,9 +1045,16 @@ export async function prepareFixWorktree(args: {
   // same "local descendant of `expectedHeadSha`" shape as a genuine resume, whether the ff-only merge
   // above fast-forwarded past the new tip or failed and left the stale pre-fetch `syncedHead` in place
   // (PR #338 review, chatgpt-codex-connector, round 11).
+  //
+  // `remoteTipUnchanged` also gates the EXACT-match clause, not just the descendant one (PR #338
+  // review, chatgpt-codex-connector, round 12): a force-push to a divergent commit between
+  // `getPrReview` and this fetch updates `origin/<branch>` but makes the ff-only merge fail (swallowed
+  // by `safe`), leaving `syncedHead` at whatever HEAD already was — which can still equal
+  // `expectedHeadSha` if the worktree hadn't moved. Without this guard that reads as a clean exact
+  // match even though the branch's real tip has since diverged from `expectedHeadSha` entirely.
   const headMatches =
     expectedHeadSha === "" ||
-    syncedHead === expectedHeadSha ||
+    (remoteTipUnchanged && syncedHead === expectedHeadSha) ||
     (aheadBeforeFetch &&
       remoteTipUnchanged &&
       (await isAncestor(worktree.path, expectedHeadSha, syncedHead).catch(() => false)));
