@@ -569,11 +569,15 @@ async function fixOnePr(args: {
       baseBranch: settings.baseBranch ?? project.defaultBranch,
       all,
     });
-    // A "clean" outcome (nothing to push) can still have stamped a terminal/reopen row below
-    // (PR #335 review) — that write is this pass's only effect, so `changed` must reflect it or
-    // automation history claims a job that moved the ledger did nothing.
+    // A "clean" or "incomplete" outcome (nothing pushed, nothing resolved) can still have stamped
+    // a terminal/reopen row below (PR #335 review) — that write is this pass's only effect, so
+    // `changed` must reflect it or automation history claims a job that moved the ledger did
+    // nothing. Neither outcome is itself a change: "incomplete" means the round left the feedback
+    // unaddressed (PR #338 review, chatgpt-codex-connector), so it must not read as progress any
+    // more than "clean" does.
+    const isNoOp = outcome === "clean" || outcome === "incomplete";
     return {
-      changed: outcome !== "clean" || ledgerChanged,
+      changed: !isNoOp || ledgerChanged,
       note: `${epic.id}: ${OUTCOME_NOTE[outcome]}`,
     };
   } finally {
@@ -587,7 +591,7 @@ async function fixOnePr(args: {
 }
 
 /** What one PR's pass did — the note an operator reads off the jobs list. */
-type PrFixOutcome = "merged" | "pushed" | "answered" | "clean";
+type PrFixOutcome = "merged" | "pushed" | "answered" | "incomplete" | "clean";
 
 const OUTCOME_NOTE: Record<PrFixOutcome, string> = {
   merged: "PR merged — finalized",
@@ -595,6 +599,11 @@ const OUTCOME_NOTE: Record<PrFixOutcome, string> = {
   // Claude produced no diff, but the threads it triaged were still answered — saying "fixed" here
   // would claim a push that never happened.
   answered: "answered the review feedback; nothing to push",
+  // Nothing pushed AND the thread report was missing/partial — the feedback is still genuinely
+  // waiting on anton. Must read differently from "answered" (PR #338 review, chatgpt-codex-
+  // connector): that note claims the round finished, which automation history would otherwise
+  // treat as this PR being settled when it is not.
+  incomplete: "round left review feedback unaddressed — no report and nothing pushed",
   clean: "nothing actionable on the PR",
 };
 
@@ -808,7 +817,12 @@ async function handleEpic(args: {
         `PR #${number}: round left thread(s) unaddressed (no/incomplete report) — not recording answered`,
       );
     }
-    return pushed ? "pushed" : "answered";
+    // "answered" requires answeredAllThreads: `!pushed` alone doesn't prove the report was
+    // complete, and reporting a partial/missing round as "answered" (PR #338 review,
+    // chatgpt-codex-connector) would tell automation history the feedback was addressed when
+    // it is genuinely still waiting on anton.
+    if (pushed) return "pushed";
+    return answeredAllThreads ? "answered" : "incomplete";
   });
   return { outcome, ledgerChanged };
 }
@@ -1062,8 +1076,23 @@ async function premergeBase(
   const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
     ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
     : undefined;
+  // Read BEFORE the merge below can move HEAD (PR #338 review, chatgpt-codex-connector, round 5): a
+  // clean auto-merge lands its own commit via `mergeIntoCurrent`, entirely bypassing `commitFix`'s
+  // marker check. If the tip this merges on top of was itself a hook-bypassed boundary commit (a
+  // prior attempt parked one and the base has since advanced), the merge commit's tree still carries
+  // that unverified content, but the note stays attached to the OLD tip — not the new merge commit
+  // that `headCarriesUnverifiedBoundaryMarker` actually inspects afterward. Left unpropagated, the
+  // "already ahead" fast path in `runFixSession` finds no marker on the new HEAD, skips the re-verify
+  // amend in `commitAndPushFix`, and pushes the original --no-verify commit's content straight past
+  // the project's hooks.
+  const hadUnverifiedBoundary = await headCarriesUnverifiedBoundaryMarker(worktreePath);
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
+    if (merge.conflicts.length === 0 && hadUnverifiedBoundary) {
+      // The merge committed cleanly on top of a still-unverified tip — carry the marker forward onto
+      // the new merge commit so it isn't lost.
+      await markUnverifiedBoundary(worktreePath);
+    }
     return { conflicts: merge.conflicts, merged: true, failed: false }; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
     consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);

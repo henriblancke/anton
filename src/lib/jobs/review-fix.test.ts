@@ -94,6 +94,19 @@ vi.mock("../git/ops", async () => {
   return {
     ...actual,
     fetchOrigin: vi.fn().mockResolvedValue(undefined),
+    // `premergeBase` reads the unverified-boundary note via the real `git notes ... show HEAD`
+    // before it merges — against the plain temp dir `worktreePath` stands in for (not a real git
+    // repo), that would blow up with "not a git repository" instead of the "no note found" exit 1
+    // `headCarriesUnverifiedBoundaryMarker` actually expects for "no marker". Every other `git` call
+    // still goes to the real implementation.
+    git: (cwd: string, args: string[], hooksPath?: string) => {
+      if (args[0] === "notes") {
+        const error = new Error("no note found for object") as Error & { code: number };
+        error.code = 1;
+        return Promise.reject(error);
+      }
+      return actual.git(cwd, args, hooksPath);
+    },
     mergeIntoCurrent: (...a: unknown[]) => mergeIntoCurrentMock(...a),
     isAncestor: (...a: unknown[]) => isAncestorMock(...a),
     branchAheadOfRemote: vi.fn().mockResolvedValue(false),
