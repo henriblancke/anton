@@ -723,51 +723,39 @@ async function handleEpic(args: {
         expectedBaseRefOid: pr.baseRefOid,
       });
 
-    // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
-    // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
-    // chatgpt-codex-connector). Gated on `refsSynced` (PR #338 review, chatgpt-codex-connector,
-    // rounds 2-3): `fetchOrigin` above is best-effort for both the head branch and the base
-    // branch, and when it fails for either the worktree/`origin/<base>` stay on whatever they last
-    // resolved to locally — NOT what `pr.headSha`/`pr.baseRefOid` report. Persisting the
-    // fingerprint anyway would tell `parkedAtHead` a revision was tested when the session actually
-    // ran (and the gate failed) against stale head or base code; the next sweep sees the same
-    // unchanged GitHub head/base/fingerprint and suppresses every retry forever, even though that
-    // revision was never fetched, let alone tested. Skipping the write alone is NOT enough, though:
-    // the job's payload would still carry its enqueue-time snapshot, which for a transient fetch
-    // failure typically still matches the (unmoved) GitHub head — so the false-suppression this gate
-    // exists to prevent would happen anyway via that stale snapshot. The `else` branch below clears
-    // it instead of leaving it in place.
-    if (refsSynced) {
-      try {
-        recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
-      } catch (e) {
-        // A failed write here is worse than a skipped one: the row still carries whatever
-        // `enqueueReviewFixPrIfAbsent` snapshotted at enqueue time, which this session is about to
-        // run past without having recorded. If that stale pair still matches the (unmoved) GitHub
-        // head, a later park would wrongly suppress a revision this attempt never tested (PR #338
-        // review, chatgpt-codex-connector). Invalidate rather than merely log so the stale snapshot
-        // can't outlive this attempt; let `invalidateReviewFixAttempt`'s own failure propagate and
-        // fail this attempt outright, same as the `refsSynced` false branch below.
-        consoleLog.error("recordReviewFixAttempt failed before PR fix — invalidating stale snapshot", e);
-        invalidateReviewFixAttempt(db, ctx.jobId);
-      }
-    } else {
-      // Clear the job's own enqueue-time snapshot too, not just skip the refresh above — otherwise
-      // a stale headSha/fingerprint pair that still matches the (unmoved) GitHub head survives on
-      // this row and, if this attempt parks, wrongly suppresses every future retry at that head (PR
-      // #338 review, chatgpt-codex-connector). See `invalidateReviewFixAttempt`'s doc.
-      //
-      // Unlike `recordReviewFixAttempt` above, this write is NOT best-effort (PR #338 review,
-      // chatgpt-codex-connector, round 5): swallowing a failure here and continuing into the fix
-      // session would leave the stale enqueue-time pair on the row, and a subsequent poison-park
-      // would then suppress every future retry at a revision this attempt never actually tested.
-      // Letting it throw fails this attempt outright so the runner retries the whole job instead —
-      // a transient failure (e.g. a brief SQLite lock) clears on the next attempt, which re-tries
-      // the invalidation before it can reach the fix session at all.
+    // Refuse to run the session at all when the worktree isn't provably on what GitHub reports as
+    // the PR's current head/base (PR #338 review, chatgpt-codex-connector, round 7): a green gate
+    // run against a stale fetch is worse than no run, since `commitAndPushFix` would then push a
+    // "fix" that was only ever tested against the wrong tree. Clear the job's own enqueue-time
+    // snapshot too, not just skip recording a new one — otherwise a stale headSha/fingerprint pair
+    // that still matches the (unmoved) GitHub head survives on this row and, if a LATER attempt
+    // parks, wrongly suppresses a future retry at a revision this attempt never actually tested.
+    // NOT best-effort: swallowing a failure here and continuing into the fix session would leave
+    // that stale pair in place, so let it throw and fail this attempt outright — the runner retries
+    // the whole job, and a transient failure (e.g. a brief SQLite lock) clears on that next attempt.
+    if (!refsSynced) {
       invalidateReviewFixAttempt(db, ctx.jobId);
       consoleLog.info(
-        `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — not recording attempt fingerprint to avoid parking a suppression at an untested revision`,
+        `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — skipping this round's fix session rather than gating/pushing against a potentially stale base`,
       );
+      return "incomplete";
+    }
+
+    // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
+    // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
+    // chatgpt-codex-connector).
+    try {
+      recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
+    } catch (e) {
+      // A failed write here is worse than a skipped one: the row still carries whatever
+      // `enqueueReviewFixPrIfAbsent` snapshotted at enqueue time, which this session is about to
+      // run past without having recorded. If that stale pair still matches the (unmoved) GitHub
+      // head, a later park would wrongly suppress a revision this attempt never tested (PR #338
+      // review, chatgpt-codex-connector). Invalidate rather than merely log so the stale snapshot
+      // can't outlive this attempt; let `invalidateReviewFixAttempt`'s own failure propagate and
+      // fail this attempt outright.
+      consoleLog.error("recordReviewFixAttempt failed before PR fix — invalidating stale snapshot", e);
+      invalidateReviewFixAttempt(db, ctx.jobId);
     }
 
     const { pushed, answeredAllThreads } = await runFixSession({
@@ -787,7 +775,7 @@ async function handleEpic(args: {
       branch,
       number,
     });
-    if (!pushed && answeredAllThreads && refsSynced) {
+    if (!pushed && answeredAllThreads) {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
       // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz).
@@ -796,11 +784,8 @@ async function handleEpic(args: {
       // this round was actually asked about untouched must NOT be recorded as answered — that thread
       // is still genuinely waiting on anton, and marking the round "answered" would suppress a fresh
       // attempt at it forever (same head, same fingerprint) instead of a real reply ever reaching it.
-      // ALSO gated on `refsSynced` (PR #338 review, chatgpt-codex-connector, round 4): the earlier
-      // `invalidateReviewFixAttempt` above already cleared this job's enqueue-time identity for that
-      // exact reason — a delivered `answeredAllThreads` outcome must not write it right back with
-      // `pr.headSha`, which would let `parkedAtHead` suppress future feedback at a revision this
-      // attempt never actually saw synced.
+      // `refsSynced` is unconditionally true here — the early return above sends an unsynced round
+      // home before it ever reaches `runFixSession` (PR #338 review, chatgpt-codex-connector, round 7).
       //
       // Friction classification (ADR-0001 clause 5, anton-tuf4l): this job settles `done`, not
       // parked or cancelled, so it is NOT anton failing and NOT a human touch — nobody was asked
@@ -825,10 +810,6 @@ async function handleEpic(args: {
       } catch (e) {
         consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
       }
-    } else if (!pushed && answeredAllThreads) {
-      consoleLog.info(
-        `PR #${number}: round answered all threads but refs were not synced — not recording answered fingerprint to avoid parking a suppression at an untested revision`,
-      );
     } else if (!pushed) {
       consoleLog.info(
         `PR #${number}: round left thread(s) unaddressed (no/incomplete report) — not recording answered`,
