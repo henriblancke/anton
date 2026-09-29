@@ -1300,9 +1300,12 @@ export async function refreshAllIssuesRead(
   // separate post-hoc read would land in. `hydrateIssueSnapshot`'s guard would then see that NEWER
   // generation match and accept `hydrated` (built from THIS stale `board`), overwriting the
   // already-current cache and hiding the concurrent change from `getBoard` and other warm readers.
-  const { beads: board, generation: boardGeneration } = await refreshIssueSnapshotRead(cwd, () =>
-    loadAllIssues(cwd, opts),
-  );
+  const refreshed = await refreshIssueSnapshotRead(cwd, () => loadAllIssues(cwd, opts));
+  const board = refreshed.beads;
+  // `let`, not `const`: the gate-hydration branch below re-stamps `boardGeneration` after pushing
+  // newly-hydrated gate members onto `board` via `hydrateIssueSnapshot`, mirroring
+  // `attachCyclesBestEffort`/`ensureCycleEvidence`'s identical `generation` reassignment.
+  let boardGeneration = refreshed.generation;
   // A concurrent non-authoritative refresh may have won the snapshot loader. Enrich the exact board
   // returned here so callers that must make approval decisions never lose the requested evidence.
   // Routed through `fetchCyclesShared` (PR #274 review) rather than a direct `beads.depCycles` call:
@@ -1346,11 +1349,69 @@ export async function refreshAllIssuesRead(
         // and compare, same as `attachCyclesBestEffort`/`ensureCycleEvidence` — never attach on the
         // generation match alone.
         const boardHasBlocksEdge = beads.edgesOf(board).some((e) => e.type === "blocks");
-        const consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await freshBoardBaseline(cwd, board));
+        let consistent = !boardHasBlocksEdge || boardStillMatchesCycles(cycles, board, await freshBoardBaseline(cwd, board));
         // Re-check generation and evidence AFTER the re-list await too, same reasoning as
         // `attachCyclesBestEffort`: the inner `freshBoardBaseline` call can itself take long enough for
         // the snapshot to move or for a concurrent enrichment path to attach evidence to this same
         // `board` first.
+        if (consistent && issueSnapshotGeneration(cwd) === boardGeneration && cycleEvidenceMissingOrStale(board)) {
+          // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward —
+          // this forced-refresh board never carries them, the same gap `attachCyclesBestEffort` and
+          // `ensureCycleEvidence` both hydrate (P2 review, PR #274, issues.ts:1358). Left unhydrated,
+          // `cycleMembers` can't map either id here and reports a synthetic, unscoped "board" fault
+          // that rejects every unrelated target instead of scoping it to the cycle's own subtree.
+          const knownIds = new Set(board.map((bead) => bead.id));
+          const missingCycleIds = [...new Set(cycles.flatMap((c) => c.ids))].filter((id) => !knownIds.has(id));
+          if (missingCycleIds.length > 0) {
+            // Strict, not the degrade-to-`[]` mode `loadGateIssues` otherwise offers, mirroring
+            // `attachCyclesBestEffort`/`ensureCycleEvidence`: a swallowed failure here would leave
+            // these ids unhydrated while `consistent` stays true, attaching `cycles` evidence to a
+            // board that still can't resolve every named member.
+            const hydratedGates = await loadGateIssues(cwd, true, missingCycleIds);
+            if (issueSnapshotGeneration(cwd) === boardGeneration) {
+              // Rebuilt from `board` AFTER the hydration await, not `knownIds` captured before it: a
+              // concurrent caller sharing this same `board` array (evidence is keyed by identity) can
+              // have hydrated the same gates onto it while this listing was in flight.
+              const idsOnBoard = new Set(board.map((bead) => bead.id));
+              const stagedGates = hydratedGates.filter((gate) => !idsOnBoard.has(gate.id));
+              if (stagedGates.length > 0) {
+                // Stage onto a throwaway copy rather than pushing straight onto `board`: mutating the
+                // retained snapshot's own array before the post-hydration recheck below runs would let
+                // a concurrent reader observe, and this call permanently serialize, gate records the
+                // recheck goes on to reject. Retain them onto the real `board` only once that recheck
+                // actually passes. Mirrors `attachCyclesBestEffort`'s identical `candidateBoard` fix.
+                const candidateBoard = [...board, ...stagedGates];
+                const freshCycles = await beads.depCycles(cwd);
+                const freshWork = await loadWorkIssues(cwd);
+                const freshGates = await loadGateIssues(cwd, true, missingCycleIds);
+                consistent =
+                  sameCycles(cycles, freshCycles) &&
+                  boardStillMatchesCycles(cycles, candidateBoard, dedupeById([...freshWork, ...freshGates]));
+                if (consistent) {
+                  if (issueSnapshotGeneration(cwd) === boardGeneration) {
+                    for (const gate of stagedGates) board.push(gate);
+                    // Keep the retained snapshot's own bookkeeping in sync with `board` — pushing
+                    // gates onto it changes its content without this, same requirement as
+                    // `attachCyclesBestEffort`/`ensureCycleEvidence`.
+                    hydrateIssueSnapshot(cwd, board, boardGeneration);
+                    boardGeneration = issueSnapshotGeneration(cwd);
+                  }
+                } else if (cycleEvidenceCheckedAtFor(board) === staleCheckedAt) {
+                  // This refresh explicitly REJECTED the board/evidence pairing — leaving a stale
+                  // sidecar attached here would still read as present to `cycleEvidenceFor`. Clear it
+                  // and fail closed, mirroring `attachCyclesBestEffort`'s identical rejection branch.
+                  if (cycleEvidenceFor(board) !== undefined) {
+                    clearCycleEvidence(board);
+                    markCycleEvidenceUnavailable(cwd);
+                  }
+                }
+              }
+            }
+          }
+        }
+        // Recheck generation and evidence AFTER the gate-hydration branch too, same reasoning as the
+        // recheck above it guards against — the hydration awaits can themselves have let the snapshot
+        // move or a concurrent enrichment path attach fresher evidence to this same `board`.
         if (consistent && issueSnapshotGeneration(cwd) === boardGeneration && cycleEvidenceMissingOrStale(board)) {
           // Stamps `board` itself with the verification time (P2 review, PR #274, issues.ts:673,
           // and issues.ts:296) — otherwise this forced-refresh attach leaves `checkedAt` at its
