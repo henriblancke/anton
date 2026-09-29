@@ -349,7 +349,20 @@ export async function getPrTopLevelComments(
         break;
       }
       allNodes.push(...page.nodes);
-      if (!page.pageInfo?.hasNextPage) break;
+      if (!page.pageInfo) {
+        // No pageInfo at all is a malformed response, not "last page" — pagination could not even
+        // be checked, so the read is incomplete (PR #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      if (typeof page.pageInfo.hasNextPage !== "boolean") {
+        // hasNextPage missing or null is a malformed response, not "last page" — pagination could
+        // not be verified, so the nodes already fetched aren't confirmed as the full picture (PR
+        // #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
       if (!page.pageInfo.endCursor) {
         // hasNextPage is true but there's no cursor to continue with — can't proceed, so the nodes
         // fetched so far aren't the full picture.

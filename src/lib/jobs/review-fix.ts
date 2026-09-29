@@ -710,8 +710,14 @@ async function handleEpic(args: {
   const outcome = await withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts, alreadyAhead, preSessionHead, refsSynced } =
-      await prepareFixWorktree({
+    const {
+      worktree,
+      conflicts,
+      alreadyAhead,
+      headIsBareUnverifiedBoundary,
+      preSessionHead,
+      refsSynced,
+    } = await prepareFixWorktree({
         ctx,
         repo,
         branch,
@@ -771,6 +777,7 @@ async function handleEpic(args: {
       verdict,
       conflicts,
       alreadyAhead,
+      headIsBareUnverifiedBoundary,
       preSessionHead,
       branch,
       number,
@@ -874,6 +881,20 @@ export async function prepareFixWorktree(args: {
   worktree: Worktree;
   conflicts: string[];
   alreadyAhead: boolean;
+  /**
+   * Does `alreadyAhead` above hold ONLY because HEAD (before this attempt's own `premergeBase`
+   * runs) is itself a still-unverified premerge boundary commit — i.e. a PRIOR attempt's clean
+   * auto-merge that landed, got marked via `markUnverifiedBoundary`, and then the process errored
+   * or exited before claude ever ran on top of it (PR #338 review, chatgpt-codex-connector: keep
+   * failed premerges out of the resume fast path). `runFixSession`'s "already ahead" shortcut
+   * exists for an operator/prior session that genuinely resolved the review feedback and left
+   * unpushed commits — a bare, un-built-upon boundary commit is not that: it carries none of the
+   * fix, and taking the shortcut over it would push a base-only merge and tell reviewers their
+   * feedback was addressed when nothing addressed it. `false` whenever `alreadyAhead` is itself
+   * `false` (nothing to check); `true` when the marker lookup fails (fail closed toward the
+   * safer, slower claude dispatch rather than risk missing a genuine leftover boundary).
+   */
+  headIsBareUnverifiedBoundary: boolean;
   /**
    * Worktree HEAD once this function is done touching it — i.e. BEFORE claude or the gate
    * follow-up runs. A clean, conflict-free base premerge lands its own commit right here, inside
@@ -1082,6 +1103,16 @@ export async function prepareFixWorktree(args: {
   // operator's own commits, and the caller uses this specifically to recognize THAT: a resume whose
   // branch already carries committed work (anton-2wklm).
   const alreadyAhead = await branchAheadOfRemote(repo, branch);
+  // Does that "ahead" state consist of nothing but a still-unverified boundary commit sitting
+  // bare at the tip — i.e. a PRIOR attempt's premerge landed and got marked, then the process died
+  // before claude (or an operator) ever built anything on top of it? `syncedHead` above is read
+  // BEFORE this attempt's own `premergeBase` call below can move HEAD again, so it names exactly
+  // the commit a crashed prior attempt would have left behind. See `headIsBareUnverifiedBoundary`'s
+  // own doc on the return type for why this must keep `runFixSession`'s resume fast path from
+  // firing over it (PR #338 review, chatgpt-codex-connector).
+  const headIsBareUnverifiedBoundary = alreadyAhead
+    ? await isBareUnverifiedBoundaryCommit(worktree.path, syncedHead)
+    : false;
 
   // Gated on `refsFetched` (PR #338 review, chatgpt-codex-connector, round 11): premerging against a
   // base that hasn't been proven current would land a clean auto-merge commit on the branch's LOCAL
@@ -1129,7 +1160,14 @@ export async function prepareFixWorktree(args: {
     (s) => s.head,
     () => undefined,
   );
-  return { worktree, conflicts, alreadyAhead, preSessionHead, refsSynced };
+  return {
+    worktree,
+    conflicts,
+    alreadyAhead,
+    headIsBareUnverifiedBoundary,
+    preSessionHead,
+    refsSynced,
+  };
 }
 
 /**
@@ -1353,6 +1391,12 @@ async function runFixSession(args: {
   /** Ahead of origin before this run touched anything — see {@link prepareFixWorktree}. */
   alreadyAhead: boolean;
   /**
+   * Does `alreadyAhead` hold only because of a leftover, never-built-on premerge boundary commit
+   * — see {@link prepareFixWorktree}'s own doc on the field of the same name. Must gate the
+   * "already ahead" fast path below alongside `alreadyAhead` itself.
+   */
+  headIsBareUnverifiedBoundary: boolean;
+  /**
    * Worktree HEAD before claude/the gate follow-up ran — see {@link prepareFixWorktree}. `undefined`
    * when that read failed; every comparison against it below must treat that as "no change", never
    * as a sha that happens to differ from whatever's read later.
@@ -1374,6 +1418,7 @@ async function runFixSession(args: {
     verdict,
     conflicts,
     alreadyAhead,
+    headIsBareUnverifiedBoundary,
     preSessionHead,
     branch,
     number,
@@ -1429,7 +1474,17 @@ async function runFixSession(args: {
     // here would otherwise let the gate run against literal conflict text and, on a red result,
     // have the next worktree reap silently discard the unresolved merge while notifyGateParked
     // claims it was "resolved and committed locally".
-    if (alreadyAhead && conflicts.length === 0) {
+    //
+    // `!headIsBareUnverifiedBoundary` (PR #338 review, chatgpt-codex-connector): `alreadyAhead`
+    // alone can't tell a genuine resume apart from a PRIOR attempt's own premerge that landed,
+    // got marked unverified, and then the process errored or exited before claude ever ran on top
+    // of it — that leaves the exact same "branch ahead of origin" shape on the next attempt, with
+    // none of the review feedback actually addressed. Taking the shortcut over it would push a
+    // base-only merge and tell reviewers their feedback was resolved. Falling through instead
+    // dispatches claude normally; `premergeBase` below no-ops (the base is already merged in) and
+    // the marked boundary's ancestor is still found and re-verified by `commitFix` further down,
+    // same as any other resume.
+    if (alreadyAhead && conflicts.length === 0 && !headIsBareUnverifiedBoundary) {
       await appendSessionLog(
         logPath,
         `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
@@ -2075,6 +2130,41 @@ async function commitCarriesUnverifiedBoundaryMarker(
   } catch (error) {
     if (exitedWith(error, 1)) return false;
     throw error;
+  }
+}
+
+/**
+ * Is `commit` a still-unverified boundary that nothing has been built on top of — i.e. exactly
+ * the shape a crashed premerge leaves behind, as opposed to a genuine claude/operator fix that
+ * merely hasn't cleared re-verification yet (PR #338 review, chatgpt-codex-connector: keep failed
+ * premerges out of the resume fast path)?
+ *
+ * The marker alone can't tell those apart: `commitFix`'s own bypass commit (a real fix, pending
+ * re-verify) and `premergeBase`'s clean auto-merge (base content only, no fix at all) both call
+ * {@link markUnverifiedBoundary} unconditionally. What tells them apart is shape — `commitFix`'s
+ * bypass commit is an ordinary single-parent commit (`commitAll` never merges), while
+ * `premergeBase`'s auto-merge is a two-parent merge of the branch's prior tip and the base ref. A
+ * marked commit that is ALSO a merge is therefore never claude's own work landing directly on
+ * `commit`; it can only be the premerge's boundary sitting bare, which is exactly the case the
+ * resume fast path must not mistake for "review feedback already addressed".
+ *
+ * Fails closed toward `true` (forcing the slower claude dispatch over the resume fast path) when
+ * either git lookup itself fails — the fast path pushing straight past unaddressed feedback is
+ * the worse outcome of the two.
+ */
+async function isBareUnverifiedBoundaryCommit(
+  worktreePath: string,
+  commit: string,
+): Promise<boolean> {
+  const carriesMarker = await commitCarriesUnverifiedBoundaryMarker(worktreePath, commit).catch(
+    () => true,
+  );
+  if (!carriesMarker) return false;
+  try {
+    const parents = await commitParentShas(worktreePath, commit);
+    return parents.length >= 2;
+  } catch {
+    return true;
   }
 }
 

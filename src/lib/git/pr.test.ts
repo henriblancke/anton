@@ -458,6 +458,50 @@ process.exit(0);
     expect(fingerprint.some((f) => f.startsWith("comment:IC_2:"))).toBe(true);
   });
 
+  // PR #338 review (chatgpt-codex-connector, P2): a page with valid `nodes` but a missing/malformed
+  // `pageInfo` used to read exactly like `hasNextPage: false` (optional-chaining through to
+  // `undefined`, then `!undefined` breaking the loop) — silently marking a truncated read complete.
+  // A truncated top-level-comments read hides a newer human reply, so `classifyReview` can then
+  // fingerprint a stale "latest" comment and never release a `needs-human` round the human already
+  // answered on the omitted page.
+  it("marks top-level comments incomplete when a page is missing pageInfo entirely", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'CONFLICTING',
+    headRefName: 'anton/epic-1', headRefOid: 'sha-new', url: 'https://github.com/o/r/pull/7',
+    reviews: [], statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  if (query.includes('reviewThreads')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+    } } } } }));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+    nodes: [{ id: 'IC_1', author: { login: 'bot' }, body: 'old status update' }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.comments?.map((c) => c.id)).toEqual(["IC_1"]);
+    expect(review.commentsComplete).toBe(false);
+  });
+
   it("excludes a thread whose own comments connection is truncated, but keeps a healthy sibling", async () => {
     // RT_1 reports totalCount above what comments(first:50) actually returned — a >50-comment
     // back-and-forth. Its last *fetched* comment is not its true latest, so classifyReview/
