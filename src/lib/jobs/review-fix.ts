@@ -1074,10 +1074,8 @@ export async function prepareFixWorktree(args: {
   // already fast-forwards fine as a no-op and is recognized via `aheadBeforeFetch`'s own descendant
   // check below; resetting it here too would just force a redundant re-premerge of a boundary that
   // was never actually stuck.
-  const preSyncHead = await readWorktreeState(worktree.path).then(
-    (s) => s.head,
-    () => "",
-  );
+  const preSyncState = await readWorktreeState(worktree.path).catch(() => undefined);
+  const preSyncHead = preSyncState?.head ?? "";
   // Gated on the marker having been POSITIVELY read as bare (PR #338 review, chatgpt-codex-connector,
   // P1) — unlike `headIsBareUnverifiedBoundary` below, this branch is destructive, so it must not
   // reuse `isBareUnverifiedBoundaryCommit`'s fail-closed-to-true behavior: a note-read error there is
@@ -1087,8 +1085,17 @@ export async function prepareFixWorktree(args: {
   // reset out on `"unknown"` just lets the ff-only merge below fail its own way (swallowed by `safe`,
   // same as any other unresolved divergence), which flows into `refsSynced` and skips this round
   // rather than silently discarding anything.
+  //
+  // Also gated on the worktree being CLEAN (PR #338 review, chatgpt-codex-connector, P1): `reset
+  // --hard` discards the working tree and index along with HEAD, so a reused checkout that picked up
+  // uncommitted tracked edits on top of the bare boundary — a resumed session's in-progress work, an
+  // operator's own change — would lose them permanently. `preSyncState === undefined` (the state read
+  // itself failed) is treated the same as dirty: without a positive clean read there is no basis for
+  // discarding anything, so this falls through to the same "let the ff-only merge fail its own way"
+  // outcome as an unresolved divergence.
   if (
     preSyncHead &&
+    preSyncState?.status === "" &&
     (await classifyUnverifiedBoundaryCommit(worktree.path, preSyncHead)) === "bare" &&
     !(await isAncestor(worktree.path, syncRef, preSyncHead).catch(() => true))
   ) {
@@ -2816,10 +2823,16 @@ async function publishUnpushedSentinel(args: {
   const note = sentinel.reply?.trim() || defaultReply(sentinel.outcome);
   const marker = unpushedSentinelMarker(headSha, fingerprint);
   const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}\n${marker}`;
-  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => ({
-    comments: [],
-    commentsComplete: false,
-  }));
+  // Rethrow an abort rather than degrading to `commentsComplete: false` (PR #338 review, P2,
+  // chatgpt-codex-connector): `getPrTopLevelComments` deliberately rethrows on cancellation so
+  // callers can tell "the job was cancelled mid-read" apart from "GitHub returned an error". Folding
+  // both into the same degraded-read fallback here would return `false` as an ordinary "couldn't
+  // publish" outcome instead of propagating the cancellation, letting the runner settle a timed-out
+  // job as a normal completion.
+  const existing = await getPrTopLevelComments(repo, number, signal).catch((err) => {
+    if (signal.aborted) throw err;
+    return { comments: [], commentsComplete: false };
+  });
   if (!existing.commentsComplete) return false;
   // Dedup on the hidden marker, not full-body equality — see `unpushedSentinelMarker`.
   if (existing.comments.some((c) => c.body.includes(marker))) return true;
