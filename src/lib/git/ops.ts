@@ -621,7 +621,7 @@ export async function git(cwd: string, args: string[], hooksPath?: string): Prom
  * newline this would otherwise split on. Paths are NOT trimmed for the same reason — leading and
  * trailing whitespace are legal in a filename.
  */
-async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
+export async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
   const { stdout } = await execFileAsync("git", ["-C", cwd, "diff", "-z", ...args], {
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,

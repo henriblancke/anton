@@ -59,6 +59,7 @@ import {
   commitAll,
   commitAttemptMode,
   commitParentShas,
+  diffPaths,
   exitedWith,
   git,
   isAncestor,
@@ -1335,10 +1336,25 @@ async function premergeBase(
   // and still falls through to the unconditional reject.
   if (preMergeState && preMergeState.status !== "") {
     if (await mergeInProgress(worktreePath)) {
-      const unresolved = await unmergedPaths(worktreePath).catch(() => []);
-      return { conflicts: unresolved, merged: true, failed: false };
+      // `MERGE_HEAD` names whatever base tip THAT attempt merged from, not necessarily the
+      // `baseRef` this call just fetched (PR #338 review, chatgpt-codex-connector): if the base
+      // advanced between the attempt that left this conflict and this retry, resuming it would
+      // resolve and push a merge that silently omits every base commit landed since, while the
+      // caller's `refsSynced: true` still reports the branch caught up with the base it just
+      // read. Compare the two tips and only resume when they still agree; otherwise abort the
+      // stale merge and fall through to start a fresh one against the current tip below.
+      const [mergeHeadSha, currentBaseSha] = await Promise.all([
+        resolveCommitSha(worktreePath, "MERGE_HEAD").catch(() => undefined),
+        resolveCommitSha(worktreePath, baseRef).catch(() => undefined),
+      ]);
+      if (!mergeHeadSha || !currentBaseSha || mergeHeadSha === currentBaseSha) {
+        const unresolved = await unmergedPaths(worktreePath).catch(() => []);
+        return { conflicts: unresolved, merged: true, failed: false };
+      }
+      await git(worktreePath, ["merge", "--abort"]).catch(() => {});
+    } else {
+      return { conflicts: [], merged: false, failed: true };
     }
-    return { conflicts: [], merged: false, failed: true };
   }
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true, noFf: true });
@@ -1597,9 +1613,14 @@ export async function mainRoundChangesSurvived(
   postSessionHead: string,
 ): Promise<boolean> {
   if (preSessionHead === undefined || preGateHead === preSessionHead) return false;
-  const changedPaths = await git(worktreePath, ["diff", "--name-only", preSessionHead, preGateHead])
-    .then((out) => out.split("\n").map((line) => line.trim()).filter(Boolean))
-    .catch(() => undefined);
+  // `-z` (PR #338 review, chatgpt-codex-connector): a plain `--name-only` newline-splits a path
+  // git quotes under the default `core.quotePath` (e.g. a non-ASCII filename), so the survival
+  // check below would look up the quoted display string in `ls-tree` instead of the real path —
+  // both lookups miss, and `atGate === atFinal` (undefined === undefined) reads as "survived" even
+  // when a follow-up reverted that exact path.
+  const changedPaths = await diffPaths(worktreePath, ["--name-only", preSessionHead, preGateHead]).catch(
+    () => undefined,
+  );
   if (changedPaths === undefined || changedPaths.length === 0) return false;
   // Tree entry (mode + blob), not blob sha alone (PR #338 review, chatgpt-codex-connector): the
   // mode lives on the tree entry, not the blob object, so a follow-up that flips a path's mode
