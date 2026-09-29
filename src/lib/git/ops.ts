@@ -2134,20 +2134,29 @@ export async function commitAll(
     }
   }
   // Reaching here means the verifying commit landed (the `catch` above either rethrew or fell
-  // through past a rollback). Replay `post-merge` now, the same completion hook a real
-  // `git merge --no-edit` fires right after building this exact commit shape (PR #338 review,
-  // chatgpt-codex-connector, round 15) — `commitAll` never otherwise runs it, since this whole
-  // path commits via `git commit`, which githooks(5) documents as a `post-commit`-only command.
-  // Run against the REAL `options.hooksPath`, not `mergeCommitHooksPath` — that mirror exists only
-  // to shape what `git commit` itself invokes and is already torn down by the `finally` above;
-  // `post-merge` is invoked directly via `runIgnoreMissingHook`, same as `pre-merge-commit` above.
-  // `"0"` matches the single argument githooks(5) documents `post-merge` receiving: a squash-merge
-  // flag, always `0` here since this replay never stands in for a squash merge. Failure is logged,
-  // not thrown — githooks(5) is explicit that `post-merge` "cannot affect the outcome of git
-  // merge": the commit this hook reports on already landed and is already hook-verified, so
-  // treating a failing `post-merge` as this function's own failure would incorrectly imply the
-  // commit itself is unverified or should be retried.
-  if (shouldReplayPostMerge) {
+  // through past a rollback). Replay `post-merge` once the commit's FINAL shape is settled — not
+  // here, but right before each success `return` below, after the `extraParents`/`reduce_heads`
+  // repair (if any) has run. Git's own redundant-parent simplification can silently drop a
+  // `MERGE_HEAD` entry from the commit `gitCommit` just built, in which case the repair below
+  // splices it back in via `commit-tree` and moves HEAD again; replaying here, before that repair,
+  // would fire the hook against a commit whose parent list is about to change — or, if the repair
+  // then fails and this function rolls the branch back to `originalHead`, against a commit that
+  // never ends up on the branch at all (PR #338 review, chatgpt-codex-connector, round 16).
+  const replayPostMerge = async () => {
+    // The same completion hook a real `git merge --no-edit` fires right after building this exact
+    // commit shape (PR #338 review, chatgpt-codex-connector, round 15) — `commitAll` never
+    // otherwise runs it, since this whole path commits via `git commit`, which githooks(5)
+    // documents as a `post-commit`-only command. Run against the REAL `options.hooksPath`, not
+    // `mergeCommitHooksPath` — that mirror exists only to shape what `git commit` itself invokes
+    // and is already torn down by the `finally` above; `post-merge` is invoked directly via
+    // `runIgnoreMissingHook`, same as `pre-merge-commit` above. `"0"` matches the single argument
+    // githooks(5) documents `post-merge` receiving: a squash-merge flag, always `0` here since this
+    // replay never stands in for a squash merge. Failure is logged, not thrown — githooks(5) is
+    // explicit that `post-merge` "cannot affect the outcome of git merge": the commit this hook
+    // reports on already landed and is already hook-verified, so treating a failing `post-merge` as
+    // this function's own failure would incorrectly imply the commit itself is unverified or should
+    // be retried.
+    if (!shouldReplayPostMerge) return;
     try {
       await runIgnoreMissingHook(
         worktreePath,
@@ -2164,8 +2173,9 @@ export async function commitAll(
         error,
       );
     }
-  }
+  };
   if (extraParents.length === 0) {
+    await replayPostMerge();
     return { committed: true };
   }
   // `git commit` consumed `MERGE_HEAD` and removed it on success, building the commit from HEAD plus
@@ -2184,6 +2194,7 @@ export async function commitAll(
     actualParents.length === expectedParents.length &&
     actualParents.every((parent, index) => parent === expectedParents[index]);
   if (parentsMatch) {
+    await replayPostMerge();
     return { committed: true };
   }
   // The message is re-read from `verifiedHead` rather than reused from `originalMessage` — a
@@ -2230,6 +2241,7 @@ export async function commitAll(
     }
     throw tagCommitAttempt(error, "amend");
   }
+  await replayPostMerge();
   return { committed: true };
 }
 
