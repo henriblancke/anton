@@ -789,15 +789,16 @@ async function handleEpic(args: {
         pr.threadsComplete,
         pr.commentsComplete,
         pr.reviewsComplete,
+        pr.checksComplete,
       )
     ) {
       // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
       // actionable again — record what this round answered so a fresh triage matching BOTH the head
       // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz). See
-      // {@link shouldRecordAnswered} for why a degraded thread, comment, or reviews read
-      // (`threadsComplete === false`, `commentsComplete === false`, `reviewsComplete === false`)
-      // skips this entirely rather than recording under a reusable placeholder value (PR #338 review
-      // round 2 / round 12, chatgpt-codex-connector).
+      // {@link shouldRecordAnswered} for why a degraded thread, comment, reviews, or check-rollup read
+      // (`threadsComplete === false`, `commentsComplete === false`, `reviewsComplete === false`,
+      // `checksComplete === false`) skips this entirely rather than recording under a reusable
+      // placeholder value (PR #338 review round 2 / round 12, chatgpt-codex-connector).
       // Gated on `answeredAllThreads` (anton-091jr review, chatgpt-codex-connector): a report that
       // never arrived (a claude error text with no reporting contract) or left some of the threads
       // this round was actually asked about untouched must NOT be recorded as answered — that thread
@@ -1245,6 +1246,17 @@ export async function prepareFixWorktree(args: {
  * project's real hooks still see its full diff via `commitAndPushFix`'s existing re-verify amend
  * before anything is pushed — the same technique `commitFix`'s own bypassed commit already relies
  * on, just applied to the merge commit that can land BEFORE `commitFix` ever runs.
+ *
+ * `noFf` (PR #338 review, chatgpt-codex-connector): this function's own doc above names the
+ * MERGEABLE-but-behind branch — a strict ancestor of `baseRef`, no textual conflict — as a case
+ * that still needs a merge, and that is exactly the shape git fast-forwards by default instead of
+ * creating a commit. A bare fast-forward would land HEAD directly on `baseRef`'s own pre-existing
+ * tip commit, and the unverified-boundary marker below would then attach to that shared commit
+ * rather than to anything this call created; `commitAndPushFix`'s later re-verify soft-resets past
+ * the marked commit and recommits it with the fix, which turns the base tip itself into a sibling
+ * SHA the real `baseRef` is no longer an ancestor of, leaving the pushed PR spuriously behind its
+ * base. Forcing a real merge commit here keeps the marked commit always one this call actually
+ * made.
  */
 async function premergeBase(
   worktreePath: string,
@@ -1263,7 +1275,7 @@ async function premergeBase(
   // the rollback path below needs a target to restore to if writing the marker fails.
   const preMergeHead = await readWorktreeState(worktreePath).then((s) => s.head, () => "");
   try {
-    const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true });
+    const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true, noFf: true });
     if (merge.conflicts.length === 0) {
       // Hooks were bypassed to land this commit (see this function's own doc) — mark it as an
       // unverified boundary unconditionally, not only when carrying forward a PRE-EXISTING marker
@@ -1398,13 +1410,16 @@ export function allWaitingThreadsAnswered(
  * `thread:*` (fed to {@link allWaitingThreadsAnswered} as per-thread evidence instead), `base:*` —
  * `classifyReview` (src/lib/git/pr.ts) appends a `base:<oid>` entry to every nonempty fingerprint
  * as a pure cache-busting key, not a real reason — and `comment:*`/`comments:incomplete`/
- * `reviews:incomplete`, the top-level-comment and reviews cache-busting entries from the same
- * function. Without excluding `comments:incomplete`/`reviews:incomplete` too, a PR whose only
- * actionable reason is an unresolved inline thread, read during a degraded top-level-comment or
- * reviews page load, would read as having a non-thread reason and demand a
- * {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never existed — failing a
- * round that correctly reported only the real thread (PR #338 review, chatgpt-codex-connector and
- * claude).
+ * `reviews:incomplete`/`checks:incomplete`, the top-level-comment, reviews, and check-rollup
+ * cache-busting entries from the same function. Without excluding `comments:incomplete`/
+ * `reviews:incomplete` too, a PR whose only actionable reason is an unresolved inline thread, read
+ * during a degraded top-level-comment or reviews page load, would read as having a non-thread
+ * reason and demand a {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never
+ * existed — failing a round that correctly reported only the real thread (PR #338 review,
+ * chatgpt-codex-connector and claude). `checks:incomplete` gets the same treatment as
+ * `reviews:incomplete`, not `comments:incomplete`: both only ever appear alongside an
+ * already-genuine reason (`pr.failingChecks.length > 0` / `reviewDecision === CHANGES_REQUESTED`)
+ * whose precise identity is merely unconfirmed, rather than being pushed unconditionally.
  */
 export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): boolean {
   return fingerprint.some(
@@ -1413,29 +1428,34 @@ export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): 
       !f.startsWith("base:") &&
       !f.startsWith("comment:") &&
       f !== "comments:incomplete" &&
-      f !== "reviews:incomplete",
+      f !== "reviews:incomplete" &&
+      f !== "checks:incomplete",
   );
 }
 
 /**
  * Should this round's outcome be persisted via `recordReviewFixAnswered` (queue.ts)? Requires the
  * same delivered-evidence bar {@link allWaitingThreadsAnswered} already computed
- * (`answeredAllThreads`), AND complete thread, top-level-comment, and reviews reads
- * (`threadsComplete !== false`, `commentsComplete !== false`, `reviewsComplete !== false`).
+ * (`answeredAllThreads`), AND complete thread, top-level-comment, reviews, and check-rollup reads
+ * (`threadsComplete !== false`, `commentsComplete !== false`, `reviewsComplete !== false`,
+ * `checksComplete !== false`).
  *
  * The completeness requirements exist because `classifyReview` (src/lib/git/pr.ts) folds a degraded
- * thread, comment, or reviews read into a FIXED, deterministic fingerprint entry — the same value on
- * every degraded read, regardless of what's actually on the PR, because it can't trust that read to
- * name the true latest human reply, CHANGES_REQUESTED review, or waiting thread. Recording a round
- * under that entry would let every LATER degraded read match this stale row and stay suppressed
- * forever, even past a human reply, a new review, or a reply on a thread the very page which failed
- * to load was hiding (PR #338 review round 2, chatgpt-codex-connector; `threadsComplete` added PR
- * #338 review round 12 — a truncated thread page drops the hidden thread from both `waitingIds` and
- * the fingerprint just as readily as it would from `answeredAllThreads`, so without this gate a
- * degraded thread read persists a partial snapshot that every later degraded sweep reproduces and
- * matches, suppressing the PR even while that hidden thread is still waiting or gets a new reply).
- * Skipping the record entirely — rather than recording some other, non-reusable placeholder — means
- * the next pass, degraded or not, is never suppressed by this one.
+ * thread, comment, reviews, or check-rollup read into a FIXED, deterministic fingerprint entry — the
+ * same value on every degraded read, regardless of what's actually on the PR, because it can't trust
+ * that read to name the true latest human reply, CHANGES_REQUESTED review, waiting thread, or failing
+ * check. Recording a round under that entry would let every LATER degraded read match this stale row
+ * and stay suppressed forever, even past a human reply, a new review, a reply on a thread the very
+ * page which failed to load was hiding, or a check beyond the fetched page that newly failed or
+ * reran (PR #338 review round 2, chatgpt-codex-connector; `threadsComplete` added PR #338 review
+ * round 12 — a truncated thread page drops the hidden thread from both `waitingIds` and the
+ * fingerprint just as readily as it would from `answeredAllThreads`, so without this gate a degraded
+ * thread read persists a partial snapshot that every later degraded sweep reproduces and matches,
+ * suppressing the PR even while that hidden thread is still waiting or gets a new reply;
+ * `checksComplete` added PR #338 review, chatgpt-codex-connector, for the identical reason applied
+ * to `getPrCheckRollup`'s pagination). Skipping the record entirely — rather than recording some
+ * other, non-reusable placeholder — means the next pass, degraded or not, is never suppressed by
+ * this one.
  */
 export function shouldRecordAnswered(
   pushed: boolean,
@@ -1443,13 +1463,15 @@ export function shouldRecordAnswered(
   threadsComplete: boolean | undefined,
   commentsComplete: boolean | undefined,
   reviewsComplete: boolean | undefined,
+  checksComplete: boolean | undefined,
 ): boolean {
   return (
     !pushed &&
     answeredAllThreads &&
     threadsComplete !== false &&
     commentsComplete !== false &&
-    reviewsComplete !== false
+    reviewsComplete !== false &&
+    checksComplete !== false
   );
 }
 

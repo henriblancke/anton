@@ -1056,13 +1056,18 @@ if (a[0] === 'pr' && a[1] === 'view') {
     number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
     headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
     reviews: [],
-    statusCheckRollup: [
-      { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://ci/run/42' },
-    ],
   }));
   process.exit(0);
 }
 if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  if (query.includes('statusCheckRollup')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://ci/run/42' }],
+    } } } }] } } } } }));
+    process.exit(0);
+  }
   process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
     pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
   } } } } }));
@@ -1093,13 +1098,18 @@ if (a[0] === 'pr' && a[1] === 'view') {
     number: 7, state: 'OPEN', reviewDecision: null, mergeable: 'MERGEABLE',
     headRefName: 'anton/epic-1', url: 'https://github.com/o/r/pull/7',
     reviews: [],
-    statusCheckRollup: [
-      { __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://ci/run/42', completedAt: '2026-01-01T00:00:00Z' },
-    ],
   }));
   process.exit(0);
 }
 if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  if (query.includes('statusCheckRollup')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { commits: { nodes: [{ commit: { statusCheckRollup: { contexts: {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{ __typename: 'CheckRun', name: 'build', status: 'COMPLETED', conclusion: 'FAILURE', detailsUrl: 'https://ci/run/42', completedAt: '2026-01-01T00:00:00Z' }],
+    } } } }] } } } } }));
+    process.exit(0);
+  }
   process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
     pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
   } } } } }));

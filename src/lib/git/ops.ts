@@ -3374,11 +3374,19 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
  * commit. The caller is responsible for marking the resulting commit as an unverified boundary
  * (see `markUnverifiedBoundary` in review-fix.ts) so the project's real hooks still see it before
  * anything is pushed.
+ *
+ * `noFf` forces a real merge commit (`git merge --no-ff`) even when the checked-out branch is a
+ * strict ancestor of `ref` and git would otherwise just fast-forward HEAD onto it (PR #338 review,
+ * chatgpt-codex-connector): a caller relying on `bypassHooks` to mark the resulting commit as an
+ * unverified boundary needs that commit to always be one THIS call actually created — a bare
+ * fast-forward instead lands HEAD directly on `ref`'s own pre-existing tip commit, and marking
+ * that shared commit, then later soft-resetting past it to re-verify and recommit, produces a
+ * sibling SHA the real base tip is no longer an ancestor of.
  */
 export async function mergeIntoCurrent(
   worktreePath: string,
   ref: string,
-  opts?: { ffOnly?: boolean; hooksPath?: string; bypassHooks?: boolean },
+  opts?: { ffOnly?: boolean; hooksPath?: string; bypassHooks?: boolean; noFf?: boolean },
 ): Promise<{ ok: boolean; conflicts: string[] }> {
   try {
     await git(
@@ -3388,6 +3396,7 @@ export async function mergeIntoCurrent(
         "--no-edit",
         ...(opts?.bypassHooks ? ["--no-verify"] : []),
         ...(opts?.ffOnly ? ["--ff-only"] : []),
+        ...(opts?.noFf ? ["--no-ff"] : []),
         ref,
       ],
       opts?.bypassHooks ? disabledHooksPath() : opts?.hooksPath,

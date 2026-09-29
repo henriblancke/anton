@@ -119,7 +119,7 @@ describeBd(
         `const fs=require('fs');
 const a=process.argv.slice(2);const q=a.join(' ');
 if(a[0]==='pr'&&a[1]==='view'){
-  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'REVIEW_REQUIRED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'FAILURE'}]}));
+  console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'REVIEW_REQUIRED',mergeable:'MERGEABLE',headRefName:process.env.FAKE_BRANCH,url:'https://github.com/acme/repo/pull/7',reviews:[]}));
   process.exit(0);
 }
 if(a[0]==='pr'&&a[1]==='comment'){
@@ -130,6 +130,13 @@ if(a[0]==='pr'&&a[1]==='comment'){
 if(a[0]==='repo'&&a[1]==='view'){console.log('acme/repo');process.exit(0);}
 if(a[0]==='api'&&a[1]==='graphql'){
   if(q.includes('resolveReviewThread')){console.log('{}');process.exit(0);}
+  if(q.includes('statusCheckRollup')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{commits:{nodes:[{commit:{statusCheckRollup:{contexts:{
+      pageInfo:{hasNextPage:false,endCursor:null},
+      nodes:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'FAILURE'}],
+    }}}}]}}}}}));
+    process.exit(0);
+  }
   console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[
     {id:'RT_1',isResolved:false,isOutdated:false,path:'feature.txt',line:1,
      comments:{nodes:[{databaseId:100,author:{login:'alice'},body:'please fix this too'}]}}

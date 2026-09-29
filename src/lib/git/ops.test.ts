@@ -38,6 +38,7 @@ import {
   listFilesAtRev,
   lookupOpenPullRequest,
   markPullRequestDraft,
+  mergeIntoCurrent,
   needsHooksPathOverrideForMerge,
   openPullRequest,
   pullRequestState,
@@ -4802,6 +4803,70 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
       expect(finalMessage).toContain("Reviewed-by: hook");
     },
   );
+});
+
+// PR #338 review, chatgpt-codex-connector: `premergeBase` (review-fix.ts) relies on every commit
+// it hands to `markUnverifiedBoundary` being one THIS call actually created — a bare fast-forward
+// instead lands HEAD directly on the target ref's own pre-existing commit, which the marker then
+// wrongly attaches to.
+suite("mergeIntoCurrent (real git)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+  const head = () => execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-merge-into-current-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("fast-forwards by default when the checked-out branch is a strict ancestor of ref", async () => {
+    g(["checkout", "-q", "-b", "behind"]);
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "base.ts"), "base\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main edit"]);
+    const mainTip = head();
+    g(["checkout", "-q", "behind"]);
+
+    const result = await mergeIntoCurrent(repo, "main");
+    expect(result).toEqual({ ok: true, conflicts: [] });
+    // A bare fast-forward: HEAD now IS main's own pre-existing commit, not a new one.
+    expect(head()).toBe(mainTip);
+  });
+
+  it("noFf forces a real merge commit instead of fast-forwarding onto ref's own tip", async () => {
+    g(["checkout", "-q", "-b", "behind"]);
+    const preMergeHead = head();
+    g(["checkout", "-q", "main"]);
+    writeFileSync(join(repo, "base.ts"), "base\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main edit"]);
+    const mainTip = head();
+    g(["checkout", "-q", "behind"]);
+
+    const result = await mergeIntoCurrent(repo, "main", { noFf: true });
+    expect(result).toEqual({ ok: true, conflicts: [] });
+    // A real, new two-parent merge commit — not main's own tip.
+    const finalSha = head();
+    expect(finalSha).not.toBe(mainTip);
+    const parents = execFileSync("git", ["-C", repo, "log", "-1", "--format=%P", finalSha], {
+      encoding: "utf8",
+    }).trim().split(/\s+/);
+    expect(parents).toEqual([preMergeHead, mainTip]);
+  });
 });
 
 describe("gitVersionSupportsHookRun", () => {

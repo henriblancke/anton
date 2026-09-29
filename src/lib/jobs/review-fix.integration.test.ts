@@ -825,13 +825,24 @@ process.exit(0);`,
       binDir,
       "gh-answer",
       `const a=process.argv.slice(2);
+const q=a.join(' ');
+const checks = process.env.FAKE_ANSWER_FAILING === '1' ? [{__typename:'CheckRun',name:'golden-fence',status:'COMPLETED',conclusion:'FAILURE'}] : [];
 if(a[0]==='pr'&&a[1]==='view'){
-  const checks = process.env.FAKE_ANSWER_FAILING === '1' ? [{__typename:'CheckRun',name:'golden-fence',status:'COMPLETED',conclusion:'FAILURE'}] : [];
-  console.log(JSON.stringify({number:21,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:'${answerBranch}',headRefOid:'sha-answer',url:'u',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}],statusCheckRollup:checks}));
+  console.log(JSON.stringify({number:21,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:'${answerBranch}',headRefOid:'sha-answer',url:'u',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}]}));
   process.exit(0);
 }
 if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
-if(a[0]==='api'&&a[1]==='graphql'){console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){
+  if(q.includes('statusCheckRollup')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{commits:{nodes:[{commit:{statusCheckRollup:{contexts:{
+      pageInfo:{hasNextPage:false,endCursor:null},
+      nodes:checks,
+    }}}}]}}}}}));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:{nodes:[]}}}}}));
+  process.exit(0);
+}
 process.exit(0);`,
     );
 

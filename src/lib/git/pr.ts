@@ -91,6 +91,17 @@ export interface PrReview {
    */
   failingCheckAttempts: string[];
   pendingChecks: number;
+  /**
+   * Whether `failingChecks`/`failingCheckAttempts`/`pendingChecks` reflect the PR's WHOLE set of
+   * check contexts, or a degraded read — `gh pr view --json statusCheckRollup` issues
+   * `contexts(first:100)` with no cursor, so a PR with over 100 check contexts silently drops
+   * everything past the first page (see `getPrCheckRollup`). `false` means a genuinely new or
+   * rerun failure could be sitting on the page that failed to load: `classifyReview`'s fingerprint
+   * must not derive its `check:*` entries from a truncated list it can't tell apart from the real
+   * one. Optional, defaulting to "complete", for the same reason `reviewsComplete`/`commentsComplete`
+   * are (a caller-built fixture has no reason to populate it).
+   */
+  checksComplete?: boolean;
   /** Inline review threads (resolved ones included; filter with threadsNeedingAttention). */
   threads: ReviewThread[];
   /**
@@ -209,25 +220,26 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url",
     ],
     signal,
   );
   const view = JSON.parse(raw) as GhPrView;
 
-  const rollup = view.statusCheckRollup ?? [];
+  const [threadsResult, commentsResult, reviewsResult, checkRollupResult] = await Promise.all([
+    getReviewThreads(repoPath, number, signal),
+    getPrTopLevelComments(repoPath, number, signal),
+    getPrReviews(repoPath, number, signal),
+    getPrCheckRollup(repoPath, number, signal),
+  ]);
+
+  const rollup = checkRollupResult.rollup;
   const failing = rollup.filter(isFailing);
   const failingChecks = failing.map((c) => c.name ?? c.context ?? "check");
   const failingCheckAttempts = failing.map(
     (c) => `${c.name ?? c.context ?? "check"}@${checkAttemptId(c)}`,
   );
   const pendingChecks = rollup.filter(isPending).length;
-
-  const [threadsResult, commentsResult, reviewsResult] = await Promise.all([
-    getReviewThreads(repoPath, number, signal),
-    getPrTopLevelComments(repoPath, number, signal),
-    getPrReviews(repoPath, number, signal),
-  ]);
 
   return {
     number: view.number,
@@ -244,6 +256,7 @@ export async function getPrReview(
     failingChecks,
     failingCheckAttempts,
     pendingChecks,
+    checksComplete: checkRollupResult.rollupComplete,
     comments: commentsResult.comments,
     commentsComplete: commentsResult.commentsComplete,
     ...threadsResult,
@@ -499,6 +512,128 @@ export async function getPrReviews(
     submittedAt: r.submittedAt,
   }));
   return { reviews, reviewsComplete: complete };
+}
+
+const PR_CHECK_ROLLUP_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    commits(last:1){nodes{commit{statusCheckRollup{
+      contexts(first:100 after:$cursor){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          __typename
+          ... on CheckRun{name status conclusion detailsUrl completedAt}
+          ... on StatusContext{context state targetUrl createdAt}
+        }
+      }
+    }}}}
+  }}
+}`;
+
+type RawCheckContextNode = NonNullable<GhPrView["statusCheckRollup"]>[number];
+
+interface PrCheckRollupPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        commits?: {
+          nodes?: Array<{
+            commit?: {
+              statusCheckRollup?: {
+                contexts?: {
+                  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+                  nodes?: RawCheckContextNode[];
+                } | null;
+              } | null;
+            } | null;
+          }>;
+        };
+      };
+    };
+  };
+}
+
+/**
+ * A PR's CI check contexts via GraphQL, paginated the same way as `getReviewThreads` /
+ * `getPrTopLevelComments` / `getPrReviews` — `gh pr view --json statusCheckRollup` issues
+ * `contexts(first:100)` with no cursor (confirmed via `GH_DEBUG=api`), so a PR with over 100 check
+ * contexts (routine on a monorepo with matrix jobs across several workflows) silently drops
+ * everything past the first page. `classifyReview`'s fingerprint derives its `check:*` attempt
+ * identities from this list — a previously-answered visible check staying red while a context
+ * beyond the cap newly fails or reruns would otherwise leave the fetched fingerprint identical to
+ * the stale answered row forever (PR #338 review, chatgpt-codex-connector).
+ *
+ * Best-effort, same contract as the other paginated reads here: a later page's fetch failing keeps
+ * the pages already fetched (flagged `rollupComplete: false`) rather than discarding everything.
+ * `commit` may be entirely absent (a PR with no commits yet) or `statusCheckRollup` may be `null`
+ * (no checks configured at all) — both read as a genuinely empty, COMPLETE rollup rather than a
+ * degraded one, since there was never a first page to lose.
+ */
+async function getPrCheckRollup(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<{ rollup: RawCheckContextNode[]; rollupComplete: boolean }> {
+  const allNodes: RawCheckContextNode[] = [];
+  let complete = true;
+  try {
+    const nwo = await nameWithOwner(repoPath, signal);
+    if (!nwo) return { rollup: [], rollupComplete: false };
+    const [owner, repo] = nwo.split("/");
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: PrCheckRollupPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${PR_CHECK_ROLLUP_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as PrCheckRollupPage;
+      } catch {
+        complete = false;
+        break;
+      }
+      const commitNode = parsed.data?.repository?.pullRequest?.commits?.nodes?.[0];
+      if (!commitNode) {
+        // No commits at all on the PR yet — a real, complete (empty) rollup, not a fetch failure.
+        break;
+      }
+      const rollup = commitNode.commit?.statusCheckRollup;
+      if (rollup === null || rollup === undefined) {
+        // No checks configured for this commit — same as above, a real empty rollup.
+        break;
+      }
+      const page = rollup.contexts;
+      if (!page || !Array.isArray(page.nodes)) {
+        // statusCheckRollup present but its contexts connection is missing/malformed is a fetch
+        // problem, not "no checks" — flag it so a degraded read isn't persisted as a clean PR.
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
+      if (!page.pageInfo || typeof page.pageInfo.hasNextPage !== "boolean") {
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        complete = false;
+        break;
+      }
+      cursor = page.pageInfo.endCursor;
+    }
+  } catch {
+    return { rollup: [], rollupComplete: false };
+  }
+  return { rollup: allNodes, rollupComplete: complete };
 }
 
 /**
@@ -872,14 +1007,25 @@ export function classifyReview(pr: PrReview): Actionable {
   }
   if (pr.failingChecks.length > 0) {
     reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
-    // Keyed on the attempt identity, not the name — a check that goes green and fails again at
-    // the same PR head gets a fresh `detailsUrl`/`completedAt`, so this changes the fingerprint
-    // even though `failingChecks`' display names read identically to the prior failure. Falls back
-    // to the plain names when a caller-built fixture leaves `failingCheckAttempts` empty; sorted so
-    // ordering never depends on `gh`'s own rollup order.
-    const attempts =
-      pr.failingCheckAttempts.length > 0 ? pr.failingCheckAttempts : pr.failingChecks;
-    for (const id of [...attempts].sort()) fingerprint.push(`check:${id}`);
+    if (pr.checksComplete === false) {
+      // A degraded check-rollup read (a later GraphQL page failed — `getPrCheckRollup`) can't be
+      // trusted to carry the PR's true, complete set of check contexts: a context beyond the page
+      // that failed could be the one that newly failed or reran, in which case the `check:*`
+      // entries built from the truncated list below would compute the SAME fingerprint as before
+      // and match a stale answered row even though something genuinely changed. A fixed, distinct
+      // marker — mirroring `reviews:incomplete` above — means this checkpoint can never match an
+      // answered row recorded while the read was complete (PR #338 review, chatgpt-codex-connector).
+      fingerprint.push("checks:incomplete");
+    } else {
+      // Keyed on the attempt identity, not the name — a check that goes green and fails again at
+      // the same PR head gets a fresh `detailsUrl`/`completedAt`, so this changes the fingerprint
+      // even though `failingChecks`' display names read identically to the prior failure. Falls back
+      // to the plain names when a caller-built fixture leaves `failingCheckAttempts` empty; sorted so
+      // ordering never depends on `gh`'s own rollup order.
+      const attempts =
+        pr.failingCheckAttempts.length > 0 ? pr.failingCheckAttempts : pr.failingChecks;
+      for (const id of [...attempts].sort()) fingerprint.push(`check:${id}`);
+    }
   }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");
