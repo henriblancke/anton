@@ -1145,6 +1145,12 @@ async function premergeBase(
     }
     return { conflicts: merge.conflicts, merged: true, failed: false }; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
+    // The inner rollback above throws `PoisonError` when it can't safely undo an unmarked
+    // bypass commit (no readable pre-merge HEAD, or the `reset --hard` itself failed) — that
+    // must reach the runner so the checkout is parked, not swallowed into an ordinary "retry
+    // me" failure that leaves the unsafe checkout to be auto-retried (PR #338 review,
+    // chatgpt-codex-connector).
+    if (isPoisonError(e)) throw e;
     consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
     // `failed: true` (not just `merged: false`, which also covers the ordinary "already caught up"
     // case above) — this branch means the merge was actually attempted and blew up (transient git

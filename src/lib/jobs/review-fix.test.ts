@@ -89,6 +89,14 @@ const mergeIntoCurrentMock = vi.fn();
 // Defaults to rejecting like the real `rev-parse` would against the plain temp dir `worktreePath`
 // stands in for (not a real git repo) — tests that care about the base-ref check override this.
 const resolveCommitShaMock = vi.fn().mockRejectedValue(new Error("not a git repo"));
+// Commits (by sha) that `commitCarriesUnverifiedBoundaryMarker` should report as marked, and the
+// range `unpushedCommitsOldestFirst` should return — both default empty/none, matching "no marker
+// found" for every existing test. Only the poison-propagation test below overrides them.
+let unpushedCommitShas: string[] = [];
+let commitsWithUnverifiedBoundaryMarker = new Set<string>();
+// `markUnverifiedBoundary`'s own `notes ... add` call — resolves by default; the poison-propagation
+// test below rejects it to simulate concurrent note-ref lock contention.
+const markUnverifiedBoundaryNotesAddMock = vi.fn().mockResolvedValue("");
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
   return {
@@ -100,7 +108,12 @@ vi.mock("../git/ops", async () => {
     // `headCarriesUnverifiedBoundaryMarker` actually expects for "no marker". Every other `git` call
     // still goes to the real implementation, except `rev-list` below.
     git: (cwd: string, args: string[], hooksPath?: string) => {
-      if (args[0] === "notes") {
+      if (args[0] === "notes" && args.includes("add")) {
+        return markUnverifiedBoundaryNotesAddMock();
+      }
+      if (args[0] === "notes" && args.includes("show")) {
+        const commit = args[args.length - 1]!;
+        if (commitsWithUnverifiedBoundaryMarker.has(commit)) return Promise.resolve("marked");
         const error = new Error("no note found for object") as Error & { code: number };
         error.code = 1;
         return Promise.reject(error);
@@ -109,11 +122,10 @@ vi.mock("../git/ops", async () => {
       // propagates a git failure instead of silently narrowing to `HEAD` (PR #338 review round 9) —
       // against the plain temp dir `worktreePath` stands in for, the real `rev-list` would blow up
       // with "not a git repository" and fail these premergeBase-focused tests outright. Stand in for
-      // "no unpushed commits found" (empty range), which is what these tests already assume: none of
-      // them exercise the marker-search fallback itself (that's covered by the boundary integration
-      // tests, which run against real repos).
+      // "no unpushed commits found" (empty range) by default; the poison-propagation test below
+      // overrides `unpushedCommitShas` to exercise the marker-search fallback itself.
       if (args[0] === "rev-list" && args.includes("--first-parent") && args.includes("--reverse")) {
-        return Promise.resolve("");
+        return Promise.resolve(unpushedCommitShas.join("\n"));
       }
       return actual.git(cwd, args, hooksPath);
     },
@@ -351,6 +363,9 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     // that care about the premerge itself override this.
     isAncestorMock.mockResolvedValue(true);
     mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] });
+    unpushedCommitShas = [];
+    commitsWithUnverifiedBoundaryMarker = new Set();
+    markUnverifiedBoundaryNotesAddMock.mockReset().mockResolvedValue("");
   });
 
   afterEach(() => {
@@ -438,6 +453,24 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     // The one `mergeIntoCurrent` call is the unconditional origin/<branch> sync; premergeBase's own
     // merge is never attempted once `isAncestor` says the base is already caught up.
     expect(mergeIntoCurrentMock).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 9 (fresh evidence beyond the round-6 rollback
+  // finding): when the clean auto-merge lands on top of an already-unverified tip, writing the
+  // carried-forward marker can fail; the rollback that guards against leaving an unmarked bypass
+  // commit on HEAD then throws `PoisonError` when it has no readable pre-merge HEAD to reset back to
+  // (the worktree here is a plain temp dir, so `rev-parse HEAD` always fails, matching an unreadable
+  // `preMergeHead` in production). That `PoisonError` must reach the caller so the checkout is
+  // parked — an outer `catch` that swallowed it into an ordinary `{ failed: true }` would let a
+  // resumed "already ahead" fast path push the hook-bypassed boundary straight past re-verification.
+  it("re-throws PoisonError when the marker-write rollback has no readable pre-merge HEAD (PR #338 review, round 9)", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] }); // clean auto-merge, no conflicts
+    unpushedCommitShas = ["deadbeef"]; // one unpushed commit ahead of origin/<branch>
+    commitsWithUnverifiedBoundaryMarker = new Set(["deadbeef"]); // it already carries the marker
+    markUnverifiedBoundaryNotesAddMock.mockRejectedValue(new Error("notes ref lock contention"));
+
+    await expect(run({} as ProjectSettings)).rejects.toBeInstanceOf(PoisonError);
   });
 
   // PR #338 review, chatgpt-codex-connector, round 3: `headSynced` (now `refsSynced`) used to check
