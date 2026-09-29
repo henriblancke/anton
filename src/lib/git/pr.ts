@@ -137,13 +137,6 @@ interface GhPrView {
   baseRefOid?: string;
   headRefOid?: string;
   url: string;
-  reviews?: Array<{
-    author?: { login?: string };
-    state?: string;
-    body?: string;
-    id?: string;
-    submittedAt?: string;
-  }>;
   statusCheckRollup?: Array<{
     __typename?: string;
     name?: string;
@@ -206,7 +199,7 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url,statusCheckRollup",
     ],
     signal,
   );
@@ -220,17 +213,10 @@ export async function getPrReview(
   );
   const pendingChecks = rollup.filter(isPending).length;
 
-  const reviews = (view.reviews ?? []).map((r) => ({
-    author: r.author?.login ?? "unknown",
-    state: r.state ?? "",
-    body: r.body ?? "",
-    id: r.id,
-    submittedAt: r.submittedAt,
-  }));
-
-  const [threadsResult, commentsResult] = await Promise.all([
+  const [threadsResult, commentsResult, reviewsResult] = await Promise.all([
     getReviewThreads(repoPath, number, signal),
     getPrTopLevelComments(repoPath, number, signal),
+    getPrReviews(repoPath, number, signal),
   ]);
 
   return {
@@ -243,7 +229,7 @@ export async function getPrReview(
     baseRefOid: view.baseRefOid,
     headSha: view.headRefOid ?? "",
     url: view.url,
-    reviews,
+    reviews: reviewsResult.reviews,
     failingChecks,
     failingCheckAttempts,
     pendingChecks,
@@ -383,6 +369,125 @@ export async function getPrTopLevelComments(
       body: c.body ?? "",
     }));
   return { comments, commentsComplete: complete };
+}
+
+const PR_REVIEWS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    reviews(first:100 after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id author{login} state body submittedAt}
+    }
+  }}
+}`;
+
+interface RawPrReviewNode {
+  id?: string;
+  author?: { login?: string } | null;
+  state?: string;
+  body?: string;
+  submittedAt?: string;
+}
+
+interface PrReviewsPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviews?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: RawPrReviewNode[];
+        };
+      };
+    };
+  };
+}
+
+/**
+ * Submitted PR reviews via GraphQL, paginated the same way as `getReviewThreads` /
+ * `getPrTopLevelComments` — the installed gh's `pr view --json reviews` issues `reviews(first:100)`
+ * with no cursor, so a PR with over 100 submitted reviews (routine on a long-running epic with a bot
+ * reviewer resubmitting every round) silently drops everything past the first page.
+ * `classifyReview`'s fingerprint derives its per-review CHANGES_REQUESTED identity from this list —
+ * a truncated fetch can leave a genuinely new CHANGES_REQUESTED review off the page entirely while
+ * `reviewDecision` (computed by GitHub across ALL reviews, not just page 1) still reports
+ * CHANGES_REQUESTED, so the fingerprint keeps matching a stale answered row and the new feedback
+ * never re-triggers a fix round (PR #338 review, chatgpt-codex-connector).
+ *
+ * Best-effort, same contract as `getPrTopLevelComments`: a later page's fetch failing keeps the
+ * pages already fetched rather than discarding everything.
+ */
+export async function getPrReviews(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<{
+  reviews: Array<{ author: string; state: string; body: string; id?: string; submittedAt?: string }>;
+  reviewsComplete: boolean;
+}> {
+  const allNodes: RawPrReviewNode[] = [];
+  let complete = true;
+  try {
+    const nwo = await nameWithOwner(repoPath, signal);
+    if (!nwo) return { reviews: [], reviewsComplete: false };
+    const [owner, repo] = nwo.split("/");
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: PrReviewsPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${PR_REVIEWS_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as PrReviewsPage;
+      } catch {
+        complete = false;
+        break;
+      }
+      const page = parsed.data?.repository?.pullRequest?.reviews;
+      if (!page) {
+        complete = false;
+        break;
+      }
+      if (!Array.isArray(page.nodes)) {
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
+      if (!page.pageInfo) {
+        complete = false;
+        break;
+      }
+      if (typeof page.pageInfo.hasNextPage !== "boolean") {
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        complete = false;
+        break;
+      }
+      cursor = page.pageInfo.endCursor;
+    }
+  } catch {
+    return { reviews: [], reviewsComplete: false };
+  }
+
+  const reviews = allNodes.map((r) => ({
+    author: r.author?.login ?? "unknown",
+    state: r.state ?? "",
+    body: r.body ?? "",
+    id: r.id,
+    submittedAt: r.submittedAt,
+  }));
+  return { reviews, reviewsComplete: complete };
 }
 
 /**

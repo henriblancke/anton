@@ -458,6 +458,70 @@ process.exit(0);
     expect(fingerprint.some((f) => f.startsWith("comment:IC_2:"))).toBe(true);
   });
 
+  // PR #338 review (chatgpt-codex-connector, P2): `gh pr view --json reviews` issues
+  // `reviews(first:100)` with no cursor, so a PR with over 100 submitted reviews silently drops
+  // everything past page 1 from `pr.reviews` — including a genuinely new CHANGES_REQUESTED review
+  // that arrived after the truncation point. `reviewDecision` itself (computed by GitHub across ALL
+  // reviews) still correctly reports CHANGES_REQUESTED, so without pagination here the fingerprint
+  // would key only on the page-1 reviews and keep matching a stale answered row forever.
+  // `getPrReviews` fetches this over GraphQL instead, following `pageInfo.hasNextPage`.
+  it("paginates submitted PR reviews instead of truncating at 100", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'pr' && a[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7, state: 'OPEN', reviewDecision: 'CHANGES_REQUESTED', mergeable: 'MERGEABLE',
+    headRefName: 'anton/epic-1', headRefOid: 'sha-new', url: 'https://github.com/o/r/pull/7',
+    statusCheckRollup: [],
+  }));
+  process.exit(0);
+}
+if (a[0] === 'api' && a[1] === 'graphql') {
+  const query = a[3] || '';
+  const hasCursor = a.some((x) => x.startsWith('cursor='));
+  if (query.includes('reviewThreads')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+      pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+    } } } } }));
+    process.exit(0);
+  }
+  if (query.includes('comments(')) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+      pageInfo: { hasNextPage: false, endCursor: null }, nodes: [],
+    } } } } }));
+    process.exit(0);
+  }
+  if (!hasCursor) {
+    process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviews: {
+      pageInfo: { hasNextPage: true, endCursor: 'REVIEWS_PAGE2' },
+      nodes: [{ id: 'PRR_1', author: { login: 'alice' }, state: 'CHANGES_REQUESTED', body: 'fix this', submittedAt: '2026-01-01T00:00:00Z' }],
+    } } } } }));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { reviews: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: [{ id: 'PRR_2', author: { login: 'bob' }, state: 'CHANGES_REQUESTED', body: 'also fix this', submittedAt: '2026-01-02T00:00:00Z' }],
+  } } } } }));
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    const review = await getPrReview(sandbox, 7);
+    expect(review.reviews.map((r) => r.id)).toEqual(["PRR_1", "PRR_2"]);
+    // Bob's CHANGES_REQUESTED review lived on page 2 — proving classifyReview's fingerprint keys on
+    // it is the whole point: a truncated fetch would only ever key on alice's review and never
+    // re-trigger a fix round for bob's genuinely new feedback.
+    const fingerprint = classifyReview(review).fingerprint;
+    expect(fingerprint.some((f) => f.startsWith("review:PRR_2:bob:"))).toBe(true);
+  });
+
   // PR #338 review (chatgpt-codex-connector, P2): a page with valid `nodes` but a missing/malformed
   // `pageInfo` used to read exactly like `hasNextPage: false` (optional-chaining through to
   // `undefined`, then `!undefined` breaking the loop) — silently marking a truncated read complete.

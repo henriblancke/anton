@@ -4412,6 +4412,62 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     },
   );
 
+  // PR #338 review (chatgpt-codex-connector, P2): a real `git merge --no-edit` invokes
+  // `pre-merge-commit` with `GIT_EDITOR=:` set and, for its own successful-auto-merge path, with NO
+  // `.git/MERGE_HEAD` on disk (verified against real git 2.50 — the file only appears once conflicts
+  // need manual resolution; a clean auto-merge uses `AUTO_MERGE` instead). This replay used to write
+  // `MERGE_HEAD`/`MERGE_MSG` before running the hook and left `GIT_EDITOR` unset, so a hook branching
+  // on either signal couldn't tell this verification pass apart from an interactive merge.
+  it.runIf(process.platform !== "win32")(
+    "runs pre-merge-commit with no MERGE_HEAD on disk and GIT_EDITOR=: set",
+    async () => {
+      const seen = join(sandbox, "pre-merge-commit-seen.json");
+      const hook = join(repo, ".git", "hooks", "pre-merge-commit");
+      writeFileSync(
+        hook,
+        [
+          "#!/bin/sh",
+          `MH=no; [ -f .git/MERGE_HEAD ] && MH=yes`,
+          `printf '{"mergeHead":"%s","gitEditor":"%s"}' "$MH" "$GIT_EDITOR" > ${JSON.stringify(seen)}`,
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      chmodSync(hook, 0o755);
+
+      g(["checkout", "-q", "-b", "feature7b"]);
+      writeFileSync(join(repo, "work.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "work.ts"), "main\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+
+      g(["checkout", "-q", "feature7b"]);
+      try {
+        execFileSync("git", ["-C", repo, "merge", "--no-edit", "main"], { stdio: "ignore" });
+      } catch {
+        // Expected — `work.ts` conflicts. Resolved below, leaving MERGE_HEAD set for the boundary
+        // commit to pick up.
+      }
+      writeFileSync(join(repo, "work.ts"), "resolved\n");
+
+      const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+        bypassHooks: true,
+      });
+      expect(boundaryCommitted).toBe(true);
+
+      const { committed: amended } = await commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+      });
+      expect(amended).toBe(true);
+      expect(JSON.parse(readFileSync(seen, "utf8"))).toEqual({ mergeHead: "no", gitEditor: ":" });
+    },
+  );
+
   // Companion to the above: a `pre-merge-commit` hook that rejects must abort the verifying commit
   // and restore the worktree exactly as a rejecting `pre-commit` already does.
   it.runIf(process.platform !== "win32")(

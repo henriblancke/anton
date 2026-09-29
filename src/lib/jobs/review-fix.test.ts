@@ -1703,6 +1703,17 @@ describe("fingerprintHasNonThreadReasons", () => {
     );
   });
 
+  // PR #338 review round 2 (chatgpt-codex-connector): a degraded top-level-comment read makes
+  // `classifyReview` push the fixed `"comments:incomplete"` marker instead of `comment:<id>` — that
+  // marker starts with `comment` but not `comment:`, so the plain `startsWith("comment:")` exclusion
+  // missed it and a thread-only round read during a degraded comment page falsely demanded a
+  // `NON_THREAD_REPORT_ID` sentinel for a check/conflict/summary that never existed.
+  it("is false when the only extra entry is the comments-incomplete cache-buster", () => {
+    expect(
+      fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1", "comments:incomplete"]),
+    ).toBe(false);
+  });
+
   it("is true when a real non-thread reason (a failing check) is present", () => {
     expect(fingerprintHasNonThreadReasons(["check:build", "base:sha-1"])).toBe(true);
   });

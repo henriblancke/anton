@@ -1335,16 +1335,23 @@ export function allWaitingThreadsAnswered(
 
 /**
  * Does `verdict.fingerprint` carry an actionable reason besides an unresolved thread? Excludes
- * `thread:*` (fed to {@link allWaitingThreadsAnswered} as per-thread evidence instead) AND `base:*`
- * — `classifyReview` (src/lib/git/pr.ts) appends a `base:<oid>` entry to every nonempty fingerprint
- * as a pure cache-busting key, not a real reason. Without excluding it too, a PR whose only
- * actionable reason is an unresolved inline thread would always read as having a non-thread reason,
- * demanding a {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never existed
- * (PR #338 review, chatgpt-codex-connector and claude).
+ * `thread:*` (fed to {@link allWaitingThreadsAnswered} as per-thread evidence instead), `base:*` —
+ * `classifyReview` (src/lib/git/pr.ts) appends a `base:<oid>` entry to every nonempty fingerprint
+ * as a pure cache-busting key, not a real reason — and `comment:*`/`comments:incomplete`, the
+ * top-level-comment cache-busting entries from the same function. Without excluding
+ * `comments:incomplete` too, a PR whose only actionable reason is an unresolved inline thread, read
+ * during a degraded top-level-comment page load, would read as having a non-thread reason and
+ * demand a {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never existed —
+ * failing a round that correctly reported only the real thread (PR #338 review, chatgpt-codex-
+ * connector and claude).
  */
 export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): boolean {
   return fingerprint.some(
-    (f) => !f.startsWith("thread:") && !f.startsWith("base:") && !f.startsWith("comment:"),
+    (f) =>
+      !f.startsWith("thread:") &&
+      !f.startsWith("base:") &&
+      !f.startsWith("comment:") &&
+      f !== "comments:incomplete",
   );
 }
 

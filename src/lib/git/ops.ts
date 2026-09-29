@@ -1566,6 +1566,13 @@ async function supportsGitHookRun(): Promise<boolean> {
  * (nothing, on a clean run) instead of the repository it's actually meant to operate on — wrongly
  * accepting or rejecting a merge based on the wrong repo's state (PR #338 review round 13,
  * chatgpt-codex-connector).
+ *
+ * Also sets `GIT_EDITOR=:` — githooks(5) documents `pre-merge-commit` (the only hook this path
+ * runs) as invoked with that var set whenever the merge won't bring up an editor, which the
+ * `--no-edit`-equivalent commit that follows here never does. Verified against real git 2.50 (a
+ * `pre-merge-commit` hook dumping its env during `git merge --no-edit` on an auto-mergeable pair
+ * of branches shows `GIT_EDITOR=:`); omitting it left a hook that branches on it unable to tell
+ * this replay apart from an interactive merge (PR #338 review, chatgpt-codex-connector).
  */
 async function gitHookEnv(worktreePath: string, hooksPath?: string): Promise<NodeJS.ProcessEnv> {
   const [gitDir, workTree, indexFile] = (
@@ -1575,7 +1582,14 @@ async function gitHookEnv(worktreePath: string, hooksPath?: string): Promise<Nod
       hooksPath,
     )
   ).split("\n");
-  return { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: workTree, GIT_INDEX_FILE: indexFile, GIT_PREFIX: "" };
+  return {
+    ...process.env,
+    GIT_DIR: gitDir,
+    GIT_WORK_TREE: workTree,
+    GIT_INDEX_FILE: indexFile,
+    GIT_PREFIX: "",
+    GIT_EDITOR: ":",
+  };
 }
 
 /**
@@ -1619,6 +1633,11 @@ export async function runHookDirectly(
  * timeout, abort, and reap lifecycle as the commit that follows it, rather than the unbounded
  * `git()`/`execFileAsync()` paths every other read-only git call here uses (PR #338 review,
  * chatgpt-codex-connector).
+ *
+ * Layers `GIT_EDITOR=:` onto the inherited environment for the `git hook run` path too — unlike
+ * `runHookDirectly`, `git hook run` is real git and resolves `GIT_DIR`/`GIT_WORK_TREE`/
+ * `GIT_INDEX_FILE` itself from `-C worktreePath`, but it doesn't know this call is standing in for
+ * a `git merge` that would set `GIT_EDITOR` (see {@link gitHookEnv}'s doc for the reproduction).
  */
 async function runIgnoreMissingHook(
   worktreePath: string,
@@ -1634,6 +1653,7 @@ async function runIgnoreMissingHook(
       "git",
       [...configArgs, "-C", worktreePath, "hook", "run", "--ignore-missing", hookName],
       {
+        env: { ...process.env, GIT_EDITOR: ":" },
         timeoutMs,
         signal,
         onTimeout: (stderr) => hookTimedOut(hookName, timeoutMs, stderr),
@@ -1853,6 +1873,38 @@ export async function commitAll(
   // connector).
   try {
     if (extraParents.length > 0) {
+      // `pre-merge-commit` is invoked by `git merge` itself — githooks(5) says so explicitly, and
+      // also that finishing a merge by committing separately (exactly what this replay does even
+      // with `MERGE_HEAD` set for the commit below) skips it, running only `pre-commit`. A project
+      // that enforces its merge policy specifically in `pre-merge-commit` (as opposed to
+      // `pre-commit`) would then never see this boundary's merge shape verified at all — the very
+      // hook `premergeBase` above bypassed to land it in the first place stays unrun forever (PR
+      // #338 review, chatgpt-codex-connector). `git hook run` executes the named hook directly,
+      // honoring the same `core.hooksPath` override `gitCommit` below resolves, and propagates a
+      // non-zero exit the same way a rejected `git commit` does, into the identical rollback below.
+      // `--ignore-missing` no-ops when the project has no such hook, matching what `git merge`
+      // itself would have done. `runIgnoreMissingHook` falls back to running the hook file directly
+      // on git < 2.36, which predates the `hook` subcommand entirely (PR #338 review round 13,
+      // chatgpt-codex-connector). Threading this commit's own `timeoutMs`/`signal` through means a
+      // hung `pre-merge-commit` is bounded and reaped the same way the verifying commit right below
+      // it is (PR #338 review round 14, chatgpt-codex-connector).
+      //
+      // Run BEFORE `MERGE_HEAD`/`MERGE_MSG` are written, and with `GIT_EDITOR=:` set (handled by
+      // `runIgnoreMissingHook`/`gitHookEnv`) — a real `git merge --no-edit` invokes this hook with
+      // neither file on disk yet (its own successful-auto-merge path never writes `MERGE_HEAD` at
+      // all, using `AUTO_MERGE` instead; `MERGE_HEAD` only appears once conflicts need manual
+      // resolution) and with the editor stubbed out. Verified against real git 2.50: a
+      // `pre-merge-commit` hook run by `git merge --no-edit` on an auto-mergeable pair of branches
+      // sees no `.git/MERGE_HEAD`. Writing those files first, as this used to, left a hook that
+      // inspects merge state seeing a shape `git merge` itself never produces at this point (PR
+      // #338 review, chatgpt-codex-connector).
+      await runIgnoreMissingHook(
+        worktreePath,
+        "pre-merge-commit",
+        options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+      );
       mergeHeadPath = await git(worktreePath, [
         "rev-parse",
         "--path-format=absolute",
@@ -1872,28 +1924,6 @@ export async function commitAll(
         "MERGE_MSG",
       ]);
       await writeFile(mergeMsgPath, originalMessage);
-      // `pre-merge-commit` is invoked by `git merge` itself — githooks(5) says so explicitly, and
-      // also that finishing a merge by committing separately (exactly what this replay does, even
-      // with `MERGE_HEAD` set) skips it, running only `pre-commit`. A project that enforces its
-      // merge policy specifically in `pre-merge-commit` (as opposed to `pre-commit`) would then
-      // never see this boundary's merge shape verified at all — the very hook `premergeBase` above
-      // bypassed to land it in the first place stays unrun forever (PR #338 review,
-      // chatgpt-codex-connector). `git hook run` executes the named hook directly, honoring the same
-      // `core.hooksPath` override `gitCommit` below resolves, and propagates a non-zero exit the same
-      // way a rejected `git commit` does, into the identical rollback below. `--ignore-missing` no-ops
-      // when the project has no such hook, matching what `git merge` itself would have done.
-      // `runIgnoreMissingHook` falls back to running the hook file directly on git < 2.36, which
-      // predates the `hook` subcommand entirely (PR #338 review round 13, chatgpt-codex-connector).
-      // Threading this commit's own `timeoutMs`/`signal` through means a hung `pre-merge-commit` is
-      // bounded and reaped the same way the verifying commit right below it is (PR #338 review round
-      // 14, chatgpt-codex-connector).
-      await runIgnoreMissingHook(
-        worktreePath,
-        "pre-merge-commit",
-        options.hooksPath,
-        options.timeoutMs,
-        options.signal,
-      );
     }
     await gitCommit(
       worktreePath,
