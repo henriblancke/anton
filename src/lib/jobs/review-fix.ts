@@ -743,11 +743,15 @@ async function handleEpic(args: {
       // a stale headSha/fingerprint pair that still matches the (unmoved) GitHub head survives on
       // this row and, if this attempt parks, wrongly suppresses every future retry at that head (PR
       // #338 review, chatgpt-codex-connector). See `invalidateReviewFixAttempt`'s doc.
-      try {
-        invalidateReviewFixAttempt(db, ctx.jobId);
-      } catch (e) {
-        consoleLog.error("invalidateReviewFixAttempt failed before PR fix", e);
-      }
+      //
+      // Unlike `recordReviewFixAttempt` above, this write is NOT best-effort (PR #338 review,
+      // chatgpt-codex-connector, round 5): swallowing a failure here and continuing into the fix
+      // session would leave the stale enqueue-time pair on the row, and a subsequent poison-park
+      // would then suppress every future retry at a revision this attempt never actually tested.
+      // Letting it throw fails this attempt outright so the runner retries the whole job instead —
+      // a transient failure (e.g. a brief SQLite lock) clears on the next attempt, which re-tries
+      // the invalidation before it can reach the fix session at all.
+      invalidateReviewFixAttempt(db, ctx.jobId);
       consoleLog.info(
         `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — not recording attempt fingerprint to avoid parking a suppression at an untested revision`,
       );

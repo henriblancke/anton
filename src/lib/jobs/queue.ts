@@ -833,8 +833,13 @@ export function recordReviewFixAttempt(
  * actually tested (PR #338 review, chatgpt-codex-connector). Deleting `headSha` (not just blanking
  * `fingerprint`) is what actually breaks the match: `parkedAtHead`'s SQL `json_extract` needs an
  * equal `headSha` to find the row at all, whereas a stored `fingerprint` of `undefined` reads as
- * "match any fingerprint" and would still suppress. Best-effort like {@link recordReviewFixAttempt}:
- * a write hiccup here must not turn a legitimate (if unsynced) attempt into a job failure.
+ * "match any fingerprint" and would still suppress. UNLIKE {@link recordReviewFixAttempt}, the
+ * caller does NOT swallow a failure here (PR #338 review, chatgpt-codex-connector, round 5): a
+ * transient write failure (a brief SQLite lock) that was silently ignored would leave the stale
+ * enqueue-time pair in place, and a subsequent poison-park would then suppress retries at a
+ * revision this attempt never tested — exactly the bug this function exists to prevent. Letting
+ * the failure propagate fails the attempt instead, so the runner retries the whole job rather than
+ * continuing into the fix session with a snapshot this call was supposed to have cleared.
  */
 export function invalidateReviewFixAttempt(db: AntonDb, jobId: string): void {
   db.transaction((tx) => {
