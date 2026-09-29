@@ -270,6 +270,27 @@ describe("classifyReview", () => {
     expect(before.reasons).toEqual(after.reasons);
     expect(before.fingerprint).not.toEqual(after.fingerprint);
   });
+
+  // PR #338 review (chatgpt-codex-connector, P2): GitHub preserves a comment's id across an edit,
+  // so a human editing their latest top-level reply after an answered round — the exact input meant
+  // to release needs-human suppression — would otherwise leave this fingerprint byte-identical to
+  // the stale answered row and stay suppressed forever. Mirrors the review-body-edit case above.
+  it("changes fingerprint when the latest human comment is edited with its id unchanged", () => {
+    const before = classifyReview(
+      pr({
+        mergeable: "CONFLICTING",
+        comments: [{ id: "IC_1", author: "alice", body: "done, please retry" }],
+      }),
+    );
+    const after = classifyReview(
+      pr({
+        mergeable: "CONFLICTING",
+        comments: [{ id: "IC_1", author: "alice", body: "actually, hold off" }],
+      }),
+    );
+    expect(before.reasons).toEqual(after.reasons);
+    expect(before.fingerprint).not.toEqual(after.fingerprint);
+  });
 });
 
 describe("threadsNeedingAttention", () => {

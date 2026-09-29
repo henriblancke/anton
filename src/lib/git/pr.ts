@@ -637,7 +637,14 @@ export function classifyReview(pr: PrReview): Actionable {
     // #338 review, chatgpt-codex-connector). Omitted entirely when there is no such comment yet, to
     // leave the fingerprint of the (overwhelmingly common) comment-free PR unchanged.
     const latestHumanComment = [...(pr.comments ?? [])].reverse().find((c) => !c.body.startsWith(ANTON_MARK));
-    if (latestHumanComment) fingerprint.push(`comment:${latestHumanComment.id}`);
+    // Hashes the body too, not just the id (PR #338 review, chatgpt-codex-connector): GitHub
+    // preserves a comment's id across an edit, so a human editing their answered top-level reply —
+    // the exact input meant to release the needs-human suppression — would otherwise leave this
+    // fingerprint byte-identical to the stale answered row and stay suppressed forever, mirroring
+    // why `changesRequested` above hashes a review's body rather than trusting its id alone.
+    if (latestHumanComment) {
+      fingerprint.push(`comment:${latestHumanComment.id}:${hashReviewBody(latestHumanComment.body)}`);
+    }
   }
   return { actionable: reasons.length > 0, reasons, fingerprint };
 }

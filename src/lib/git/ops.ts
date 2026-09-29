@@ -1709,6 +1709,21 @@ export async function commitAll(
         "MERGE_MSG",
       ]);
       await writeFile(mergeMsgPath, originalMessage);
+      // `pre-merge-commit` is invoked by `git merge` itself — githooks(5) says so explicitly, and
+      // also that finishing a merge by committing separately (exactly what this replay does, even
+      // with `MERGE_HEAD` set) skips it, running only `pre-commit`. A project that enforces its
+      // merge policy specifically in `pre-merge-commit` (as opposed to `pre-commit`) would then
+      // never see this boundary's merge shape verified at all — the very hook `premergeBase` above
+      // bypassed to land it in the first place stays unrun forever (PR #338 review,
+      // chatgpt-codex-connector). `git hook run` executes the named hook directly, honoring the same
+      // `core.hooksPath` override `gitCommit` below resolves, and propagates a non-zero exit the same
+      // way a rejected `git commit` does, into the identical rollback below. `--ignore-missing` no-ops
+      // when the project has no such hook, matching what `git merge` itself would have done.
+      await git(
+        worktreePath,
+        ["hook", "run", "--ignore-missing", "pre-merge-commit"],
+        options.hooksPath,
+      );
     }
     await gitCommit(
       worktreePath,
