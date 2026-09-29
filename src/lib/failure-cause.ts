@@ -47,18 +47,22 @@ const INFRA_RE =
 
 /**
  * The claude driver's own failure shapes (driver-exit.ts `exitCodeError`/`stallError`/
- * `failureError`/`modelRefusalError`), plus `execute-epic-ticket.ts`'s `BlockedByAgentError` —
- * a deterministic non-zero exit, a stall kill, a missing result event, a refused model id, or an
- * explicit self-reported block. Each message is built in exactly one function as the ENTIRE
- * error string (never appended to other text), so its full phrasing is stable — the stall and
- * missing-result-event messages are anchored to the start like the others rather than left as
- * bare substrings, so nested diagnostic text quoting either phrase (e.g. inside a failed test's
- * captured output) can't outrank the gate/infra matcher that should actually own that failure.
- * The self-report phrase is the one exception, matched via `\b` rather than anchored, since
- * `BlockedByAgentError`'s message isn't guaranteed to start with it.
+ * `failureError`/`modelRefusalError`), plus `execute-epic-ticket.ts`'s `BlockedByAgentError`, plus
+ * every `dispatchClaude` call site's own `failure()` callback (steps/agent.ts, steps/describe.ts,
+ * review-gate.ts, review-fix.ts, product-master-steps.ts, nightly-stringer-triage.ts) for a session
+ * that exited cleanly but self-reported `is_error` — a deterministic non-zero exit, a stall kill, a
+ * missing result event, a refused model id, an explicit self-reported block, or a clean exit the
+ * model itself flagged as failed. Each message is built in exactly one function as the ENTIRE error
+ * string (never appended to other text), so its full phrasing is stable — the stall,
+ * missing-result-event, and `failure()`-callback messages are anchored to the start like the others
+ * rather than left as bare substrings, so nested diagnostic text quoting one of them (e.g. inside a
+ * failed test's captured output, or the model's own freeform report) can't outrank the gate/infra
+ * matcher that should actually own that failure. The self-report phrase is the one exception,
+ * matched via `\b` rather than anchored, since `BlockedByAgentError`'s message isn't guaranteed to
+ * start with it.
  */
 const AGENT_RE =
-  /^claude exited with code|^claude produced no output for .*killed as stalled|^claude exited without a result event|^claude refused to start: the model|\bwas self-reported blocked by the agent\b/i;
+  /^claude exited with code|^claude produced no output for .*killed as stalled|^claude exited without a result event|^claude refused to start: the model|^(?:claude|the product-master session|scan-triage|describer) reported an error\b|\bwas self-reported blocked by the agent\b/i;
 
 const PATTERNS: Array<{ cause: Exclude<FailureCause, "unknown">; pattern: Matcher }> = [
   // Freshness first: `isStaleCheckoutDeferral` is a prefix check on the one message

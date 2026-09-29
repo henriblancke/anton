@@ -186,6 +186,34 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("gate");
   });
 
+  it("classifies a step:implement dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("claude reported an error for anton-a1b2: the model gave up")).toBe("agent");
+  });
+
+  it("classifies a step:claude dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("claude reported an error for step implement: the model gave up")).toBe("agent");
+  });
+
+  it("classifies a review-fix dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("claude reported an error resolving PR #281: unknown")).toBe("agent");
+  });
+
+  it("classifies a review-gate dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("claude reported an error reviewing anton-gate1: unknown")).toBe("agent");
+  });
+
+  it("classifies a product-master dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("the product-master session reported an error: unknown")).toBe("agent");
+  });
+
+  it("classifies a scan-triage dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("scan-triage reported an error: unknown")).toBe("agent");
+  });
+
+  it("classifies a describer dispatch that self-reported is_error as agent", () => {
+    expect(classifyFailureCause("describer reported an error for anton-a1b2: unknown")).toBe("agent");
+  });
+
   it("classifies an explicit self-reported agent block as agent", () => {
     const error =
       "anton-y1u2y was self-reported blocked by the agent (blocked — dep-missing — waiting on anton-abcd) " +
