@@ -53,16 +53,30 @@ const INFRA_RE =
  * that exited cleanly but self-reported `is_error` — a deterministic non-zero exit, a stall kill, a
  * missing result event, a refused model id, an explicit self-reported block, or a clean exit the
  * model itself flagged as failed. Each message is built in exactly one function as the ENTIRE error
- * string (never appended to other text), so its full phrasing is stable — the stall,
- * missing-result-event, and `failure()`-callback messages are anchored to the start like the others
- * rather than left as bare substrings, so nested diagnostic text quoting one of them (e.g. inside a
- * failed test's captured output, or the model's own freeform report) can't outrank the gate/infra
- * matcher that should actually own that failure. The self-report phrase is the one exception,
- * matched via `\b` rather than anchored, since `BlockedByAgentError`'s message isn't guaranteed to
- * start with it.
+ * string (never appended to other text), so its full phrasing is stable and every alternative below
+ * is anchored to the start — including the self-report one: `BlockedByAgentError`'s message always
+ * opens with `${ticket.id} was self-reported blocked by the agent`, so anchoring on that ticket-id
+ * prefix (the same shape `bd`-produced ids take elsewhere, e.g. gardener/relink.ts's `ID_PATTERN`)
+ * still matches the real producer while refusing a bare, unanchored occurrence of the phrase quoted
+ * inside nested diagnostic output — e.g. a failing assertion's captured output, or a top-level gate
+ * failure whose own `BlockedByAgentError`-related test fixture happens to echo it — which would
+ * otherwise outrank the gate/infra matcher that should actually own that failure.
  */
 const AGENT_RE =
-  /^claude exited with code|^claude produced no output for .*killed as stalled|^claude exited without a result event|^claude refused to start: the model|^(?:claude|the product-master session|scan-triage|describer) reported an error\b|\bwas self-reported blocked by the agent\b/i;
+  /^claude exited with code|^claude produced no output for .*killed as stalled|^claude exited without a result event|^claude refused to start: the model|^(?:claude|the product-master session|scan-triage|describer) reported an error\b|^[a-z][a-z0-9]*-[a-z0-9]{2,12}(?:\.[a-z0-9]+)* was self-reported blocked by the agent\b/i;
+
+/**
+ * The authoritative leading envelope every gate-failure site builds as the WHOLE message's start:
+ * `${label} gate failed for ...` (steps/gates.ts, execute-epic-ticket-preserve.ts), `... gate failed
+ * after review round N for ...` (review-gate.ts), or `... gate failed after review-fix for PR #N
+ * ...` (review-fix.ts — which appends the failed gate's own captured output tail after this
+ * envelope). Anchored, and checked before the unanchored `INFRA_RE` below, because that appended
+ * tail is arbitrary test/build output that can itself contain an `INFRA_RE` phrase (e.g. a failing
+ * test in git/worktree.ts whose assertion output quotes `[worktree] ... could not be rebased`) —
+ * without this anchored check running first, that nested phrase would let `INFRA_RE` misfile the
+ * real top-level gate failure as infra.
+ */
+const GATE_ENVELOPE_RE = /^\S+ gate failed\b/i;
 
 const PATTERNS: Array<{ cause: Exclude<FailureCause, "unknown">; pattern: Matcher }> = [
   // Freshness first: `isStaleCheckoutDeferral` is a prefix check on the one message
@@ -78,15 +92,24 @@ const PATTERNS: Array<{ cause: Exclude<FailureCause, "unknown">; pattern: Matche
   // matchers means a real gate/infra failure — which never starts with this envelope — still
   // reaches its own matcher untouched.
   { cause: "agent", pattern: AGENT_RE },
-  // Infra before gate: `classifyPushFailure` records `git push failed ...`/`pre-push hook
-  // declined ...` as the authoritative top-level envelope, but a pre-push hook that runs this
-  // project's own gate check echoes that gate's "<label> gate failed for ..." phrase into the
-  // captured stderr the envelope wraps. GATE_RE is a broad, unanchored substring, so checking it
-  // first would misfile that push failure as "gate" whenever the hook's nested output happens to
-  // mention one. INFRA_RE's phrases are just as unanchored but far more specific (git/worktree
-  // plumbing text a gate failure's own message never contains), so checking it first lets the real
-  // push/worktree failure claim its envelope before the nested "gate failed" substring can.
+  // Gate envelope before infra: a gate failure's own appended output tail (review-fix.ts) can
+  // contain an INFRA_RE phrase (see GATE_ENVELOPE_RE's own doc comment). Checking the anchored
+  // envelope here means a real top-level gate failure claims its cause before that unanchored,
+  // nested phrase reaches INFRA_RE below.
+  { cause: "gate", pattern: GATE_ENVELOPE_RE },
+  // Infra before the broad gate fallback: `classifyPushFailure` records `git push failed ...`/
+  // `pre-push hook declined ...` as the authoritative top-level envelope, but a pre-push hook that
+  // runs this project's own gate check echoes that gate's "<label> gate failed for ..." phrase into
+  // the captured stderr the envelope wraps. That message never matches GATE_ENVELOPE_RE above (it
+  // doesn't open with the gate envelope), so it falls through to here: GATE_RE is a broad, unanchored
+  // substring, so checking it before INFRA_RE would misfile that push failure as "gate" whenever the
+  // hook's nested output happens to mention one. INFRA_RE's phrases are just as unanchored but far
+  // more specific (git/worktree plumbing text a gate failure's own message never contains), so
+  // checking it first lets the real push/worktree failure claim its envelope before the nested
+  // "gate failed" substring can.
   { cause: "infra", pattern: INFRA_RE },
+  // Final broad fallback: any other "gate failed" occurrence not already resolved by the anchored
+  // envelope or claimed by infra above.
   { cause: "gate", pattern: GATE_RE },
 ];
 

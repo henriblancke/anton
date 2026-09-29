@@ -222,6 +222,23 @@ describe("classifyFailureCause", () => {
     expect(classifyFailureCause(error)).toBe("agent");
   });
 
+  it("classifies a gate failure whose captured output quotes the self-report phrase as gate, not agent", () => {
+    const error =
+      "verify gate failed for anton-abcd (exit 1)\n\n> vitest run\n\nFAIL src/lib/failure-cause.test.ts\n" +
+      'AssertionError: expected "anton-y1u2y was self-reported blocked by the agent (blocked — ' +
+      'dep-missing — waiting on anton-abcd) even though it committed changes." to be classified as agent';
+    expect(classifyFailureCause(error)).toBe("gate");
+  });
+
+  it("classifies a gate failure whose captured output quotes an infra phrase as gate, not infra", () => {
+    const error =
+      "verify gate failed after review-fix for PR #281 (exit 1)\n\n> vitest run\n\n" +
+      "FAIL src/lib/git/worktree.test.ts\n" +
+      'AssertionError: expected message to contain "[worktree] anton/anton-nwnm8 could not be ' +
+      'rebased onto main"';
+    expect(classifyFailureCause(error)).toBe("gate");
+  });
+
   it("classifies the measured 'operation was aborted' reason as unknown, not agent", () => {
     expect(classifyFailureCause("The operation was aborted")).toBe("unknown");
   });
