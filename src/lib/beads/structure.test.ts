@@ -299,6 +299,22 @@ describe("validateBoardStructure", () => {
       expect(violations).toEqual([]);
     });
 
+    it("still faults a live partner in a cycle whose other member is labelled abandoned but not yet closed (P2 review, PR #274)", () => {
+      // Abandonment interrupted after the label lands but before `bd close` runs: the bead's
+      // `status` is still "open", so bd's own `blocks` rule (openBlockersOf) still reads it as an
+      // open blocker. Reading the label alone as "resolved" here would clear a cycle that still
+      // deadlocks `b`. `a` itself stays unfaulted — it is abandoned, exempt from every rule
+      // (isLive) — but `allLive` must still see the loop as live through `b`.
+      const board = [
+        task("a", undefined, { labels: ["abandoned"], dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { dependencies: [blocks("b", "a")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([["b", "blocks-cycle"]]);
+    });
+
     it("clears a cycle mixing a closed bead with a live gate — the closed member already resolved its edge (P2 review, PR #274)", () => {
       // `t1` is closed, so `g1`'s wait on it is already satisfied — the loop bd reported is really a
       // plain chain now, not a deadlock. Faulting `g1` here over a harmless historical edge is exactly

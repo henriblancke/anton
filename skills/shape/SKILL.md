@@ -1,6 +1,6 @@
 ---
 name: shape
-version: 319d19981410
+version: a9eaf00872cf
 description: >-
   The compiler. Turn a fuzzy idea into a validated feature — one PR anton's execution runtime can
   pick up — attached to its product epic, with child tickets under it. Runs forcing questions,
@@ -369,16 +369,21 @@ const orderTickets = (tickets) => {
 };
 // Mirrors the `live` filter in execute-epic-dispatch.ts: an abandoned ticket is closed but was never
 // committed, and the executor drops it from the run entirely before dispatching — but only AFTER
-// topologically ordering the full ticket set AND computing holds over it, not before. Filtering
-// abandoned tickets out ahead of orderTickets would remove them from the dependency graph, so a
-// chain like A -> abandoned B -> C could sort differently here than in the executor, which orders
-// {A, B, C} together. Filtering them out before heldIds is worse: if abandonAll added the label but
-// the batch close hasn't landed yet, B is still open and possibly still externally held itself: drop
-// B from the ticket set before computing holds and computeChildReadiness's internal-dependency
-// propagation (an internal `blocks` edge into a ticket that is itself held) never sees B, so C prints
-// dispatchable even though the real run still holds it behind B. Order first, compute holds over the
-// full set second, filter abandoned only when printing, so the printed order and held set can never
-// diverge from the real dispatch.
+// topologically ordering the full ticket set, not before. Filtering abandoned tickets out ahead of
+// orderTickets would remove them from the dependency graph, so a chain like A -> abandoned B -> C
+// could sort differently here than in the executor, which orders {A, B, C} together. Order over the
+// FULL set (abandoned included, any status) so the printed order never diverges from the executor's.
+//
+// Holds compute over a narrower set, though: only CLOSED tickets are dropped before heldIds, not
+// every abandoned one (P2 review, PR #274). This mirrors computeChildReadiness's `work` filter
+// (`deriveStage(b) !== "done"`, which is exactly `status !== "closed"` — the abandoned label plays
+// no part in it): a closed ticket is done, so its `blocks` edges can no longer propagate a hold to
+// anything depending on it, closed-abandoned included. An OPEN abandoned ticket B stays in the held
+// computation — the interrupted label-before-close case, where abandonAll added the label but the
+// batch close hasn't landed yet: B is still open and possibly itself externally held, so dropping it
+// here would hide that from a C that depends on B, and C would print dispatchable even though the
+// real run still holds it behind B. Filter abandoned (any status) only when printing, so what's
+// shown matches dispatch without needing an abandoned ticket to ever be reported as itself runnable.
 const isAbandoned = (b) => (b.labels ?? []).includes("abandoned");
 for (const feature of all.filter((b) => b.issue_type === "feature")) {
   console.log(`feature ${feature.id}:`);
@@ -388,7 +393,7 @@ for (const feature of all.filter((b) => b.issue_type === "feature")) {
   // atomic feature prints only its header with an empty dispatch order below it.
   const children = runTickets(feature.id);
   const ordered = orderTickets(children.length > 0 ? children : [feature]);
-  const held = heldIds(feature, ordered);
+  const held = heldIds(feature, ordered.filter((t) => t.status !== "closed"));
   const tickets = ordered.filter((t) => !isAbandoned(t));
   const dispatchable = tickets.filter((t) => !held.has(t.id));
   for (const [index, ticket] of dispatchable.entries())

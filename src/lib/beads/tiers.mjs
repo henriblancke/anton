@@ -415,11 +415,17 @@ function cycleMembers(byId, cycles) {
     // so member[i] blocks on member[i+1] and the last member blocks on the first" — confirming
     // this isn't an artifact of the current DFS implementation that a future bd could drop.
     const next = new Map(ids.map((id, i) => [id, ids[(i + 1) % ids.length]]));
-    // A closed (or abandoned) member has already resolved whatever waited on it, which breaks the
-    // single loop bd reports into a plain chain — nothing downstream of it can deadlock anymore
-    // (P2 review, PR #274). So the loop only still deadlocks when EVERY member remains live; one
-    // resolved link is enough to clear the whole cycle, not just the two beads next to it.
-    const allLive = mapped.length > 0 && mapped.every((id) => isLive(byId.get(id)));
+    // A closed member has already resolved whatever waited on it, which breaks the single loop bd
+    // reports into a plain chain — nothing downstream of it can deadlock anymore (P2 review, PR
+    // #274). So the loop only still deadlocks when EVERY member remains open; one resolved link is
+    // enough to clear the whole cycle, not just the two beads next to it.
+    //
+    // Deliberately `status !== "closed"`, not {@link isLive}: `bd close` itself only ever checks
+    // status (see `openBlockersOf` in jobs/execute-epic-human-gate.ts), so a bead labelled
+    // `abandoned` but not yet closed — abandonment interrupted mid-way — still blocks its
+    // dependents exactly like any other open bead. Reading it as non-live here would let a cycle
+    // that still deadlocks the board slip past `blocks-cycle` (P2 review, PR #274).
+    const allLive = mapped.length > 0 && mapped.every((id) => byId.get(id)?.status !== "closed");
     const evidence = { members, next, complete: ids.length > 0 && mapped.length === ids.length, allLive };
     for (const id of mapped) {
       const memberCycles = memberships.get(id);
