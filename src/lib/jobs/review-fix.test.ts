@@ -98,12 +98,22 @@ vi.mock("../git/ops", async () => {
     // before it merges — against the plain temp dir `worktreePath` stands in for (not a real git
     // repo), that would blow up with "not a git repository" instead of the "no note found" exit 1
     // `headCarriesUnverifiedBoundaryMarker` actually expects for "no marker". Every other `git` call
-    // still goes to the real implementation.
+    // still goes to the real implementation, except `rev-list` below.
     git: (cwd: string, args: string[], hooksPath?: string) => {
       if (args[0] === "notes") {
         const error = new Error("no note found for object") as Error & { code: number };
         error.code = 1;
         return Promise.reject(error);
+      }
+      // `findUnverifiedBoundaryAncestor`'s own range lookup (`unpushedCommitsOldestFirst`) now
+      // propagates a git failure instead of silently narrowing to `HEAD` (PR #338 review round 9) —
+      // against the plain temp dir `worktreePath` stands in for, the real `rev-list` would blow up
+      // with "not a git repository" and fail these premergeBase-focused tests outright. Stand in for
+      // "no unpushed commits found" (empty range), which is what these tests already assume: none of
+      // them exercise the marker-search fallback itself (that's covered by the boundary integration
+      // tests, which run against real repos).
+      if (args[0] === "rev-list" && args.includes("--first-parent") && args.includes("--reverse")) {
+        return Promise.resolve("");
       }
       return actual.git(cwd, args, hooksPath);
     },

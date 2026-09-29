@@ -1986,10 +1986,17 @@ async function commitCarriesUnverifiedBoundaryMarker(
  * must cover, not just literal `HEAD` (PR #338 review, chatgpt-codex-connector, round 6): an
  * operator's own plain commit landed on top of a parked, hook-bypassed boundary while resuming — the
  * explicitly supported "already ahead" resume flow — shifts `HEAD` off the marked commit without the
- * branch becoming any less unverified. Falls back to `[HEAD]` alone (this file's original search
- * surface) when the range can't be resolved — review-fix only ever runs against a branch that
- * already has an open PR, so `origin/<branch>` normally exists; this is a defensive fallback, not
- * the expected path.
+ * branch becoming any less unverified.
+ *
+ * Propagates when the range can't be resolved (PR #338 review round 9, chatgpt-codex-connector),
+ * rather than silently narrowing the search to literal `HEAD`: a prior fallback did that and missed
+ * exactly the ancestor-marker case above whenever `origin/<branch>` was momentarily unresolvable,
+ * while `branchAheadOfRemote` treats that same missing ref as "ahead" — the combination let an
+ * already-ahead resume push a hook-rejected boundary straight past re-verification. Failing loud
+ * here instead surfaces the lookup failure to `findUnverifiedBoundaryAncestor`'s own caller, which
+ * must fail closed rather than proceed as if no marker existed. review-fix only ever runs against a
+ * branch that already has an open PR, so `origin/<branch>` normally exists; an unresolvable range is
+ * not the expected path.
  *
  * `--first-parent` (PR #338 review, chatgpt-codex-connector, round 7): a premerge of the base
  * creates a merge commit whose second parent is the base tip, so a plain `origin/<branch>..HEAD`
@@ -1999,22 +2006,16 @@ async function commitCarriesUnverifiedBoundaryMarker(
  * needlessly slow. Restricting to the first-parent chain keeps this to the branch's own mainline.
  */
 async function unpushedCommitsOldestFirst(worktreePath: string, branch: string): Promise<string[]> {
-  try {
-    const out = await git(worktreePath, [
-      "rev-list",
-      "--first-parent",
-      "--reverse",
-      `origin/${branch}..HEAD`,
-    ]);
-    return out
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean);
-  } catch {
-    return resolveCommitSha(worktreePath, "HEAD")
-      .then((sha) => [sha])
-      .catch(() => []);
-  }
+  const out = await git(worktreePath, [
+    "rev-list",
+    "--first-parent",
+    "--reverse",
+    `origin/${branch}..HEAD`,
+  ]);
+  return out
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 /**
