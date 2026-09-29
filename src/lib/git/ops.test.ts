@@ -4779,6 +4779,35 @@ describe("runHookDirectly (real git)", () => {
       expect(readFileSync(ran, "utf8").trim()).toBe("ran");
     },
   );
+
+  // PR #338 review, chatgpt-codex-connector: on git < 2.36 this spawns the hook binary directly
+  // rather than through `git hook run`, so nothing sets the env vars git itself exports before
+  // invoking a hook (githooks(5)) unless this fallback does it too.
+  it.runIf(process.platform !== "win32")(
+    "exports GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE like `git hook run` would",
+    async () => {
+      const envDump = join(sandbox, "hook-env.json");
+      const hook = join(repo, ".git", "hooks", "pre-merge-commit");
+      writeFileSync(
+        hook,
+        [
+          "#!/bin/sh",
+          `printf '{"GIT_DIR":"%s","GIT_WORK_TREE":"%s","GIT_INDEX_FILE":"%s"}' "$GIT_DIR" "$GIT_WORK_TREE" "$GIT_INDEX_FILE" > ${JSON.stringify(envDump)}`,
+          "exit 0",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(hook, 0o755);
+
+      await runHookDirectly(repo, "pre-merge-commit");
+
+      const dumped = JSON.parse(readFileSync(envDump, "utf8"));
+      const realRepo = realpathSync(repo);
+      expect(dumped.GIT_DIR).toBe(join(realRepo, ".git"));
+      expect(dumped.GIT_WORK_TREE).toBe(realRepo);
+      expect(dumped.GIT_INDEX_FILE).toBe(join(realRepo, ".git", "index"));
+    },
+  );
 });
 
 // PR #338 review round 12 (chatgpt-codex-connector): `gitCommit`'s timeout races git's own hook

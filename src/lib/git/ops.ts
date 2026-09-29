@@ -979,6 +979,7 @@ function runBoundedProcess(
   args: string[],
   opts: {
     cwd?: string;
+    env?: NodeJS.ProcessEnv;
     timeoutMs: number;
     signal?: AbortSignal;
     onTimeout: (stderr: string) => Error;
@@ -995,6 +996,7 @@ function runBoundedProcess(
     // unread pipe would block the process outright.
     const child = spawn(command, args, {
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts.env ? { env: opts.env } : {}),
       stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -1557,6 +1559,26 @@ async function supportsGitHookRun(): Promise<boolean> {
 }
 
 /**
+ * The environment `git hook run` exports before invoking a hook (see the githooks docs) —
+ * `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX` — layered over this process's own.
+ * {@link runHookDirectly} spawns the hook binary itself rather than going through `git`, so
+ * without this a hook reading those vars would see whatever this process happened to inherit
+ * (nothing, on a clean run) instead of the repository it's actually meant to operate on — wrongly
+ * accepting or rejecting a merge based on the wrong repo's state (PR #338 review round 13,
+ * chatgpt-codex-connector).
+ */
+async function gitHookEnv(worktreePath: string, hooksPath?: string): Promise<NodeJS.ProcessEnv> {
+  const [gitDir, workTree, indexFile] = (
+    await git(
+      worktreePath,
+      ["rev-parse", "--path-format=absolute", "--git-dir", "--show-toplevel", "--git-path", "index"],
+      hooksPath,
+    )
+  ).split("\n");
+  return { ...process.env, GIT_DIR: gitDir, GIT_WORK_TREE: workTree, GIT_INDEX_FILE: indexFile, GIT_PREFIX: "" };
+}
+
+/**
  * Fallback for `git hook run --ignore-missing <hook>` on git < 2.36, which has no `hook`
  * subcommand at all. Resolves the same effective hooks directory `git hook run` would have looked
  * up (`rev-parse --git-path hooks`, honoring the same `core.hooksPath` override the caller
@@ -1582,6 +1604,7 @@ export async function runHookDirectly(
   const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
   await runBoundedProcess(hookPath, [], {
     cwd: worktreePath,
+    env: await gitHookEnv(worktreePath, hooksPath),
     timeoutMs,
     signal,
     onTimeout: (stderr) => hookTimedOut(hookName, timeoutMs, stderr),
