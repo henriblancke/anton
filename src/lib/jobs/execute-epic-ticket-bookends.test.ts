@@ -111,7 +111,10 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
   });
 
   it("answers closed when bd accepted the close", async () => {
-    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({ closed: true });
+    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({
+      closed: true,
+      transitioned: true,
+    });
     expect(closeMock).toHaveBeenCalledWith(REPO, ticket.id);
     expect(endSessionMock).toHaveBeenCalledWith({}, expect.anything(), "s1", "done");
   });
@@ -137,17 +140,38 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
   it("answers NOT closed when bd refused the close, and still ends the session", async () => {
     closeMock.mockRejectedValue(new Error("Command failed: bd close anton-t2\ndatabase is locked"));
 
-    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({ closed: false });
+    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({
+      closed: false,
+      // The close is the whole transition here, so bd refusing it means nothing landed — a caller
+      // holding a pending marker must not release it (PR #284 review round 7).
+      transitioned: false,
+    });
     // The record of HOW it settled was still written — it is what a reader needs to close it by hand.
     expect(noteMock).toHaveBeenCalledWith(REPO, ticket.id, expect.stringContaining("anton: satisfied by"));
     expect(endSessionMock).toHaveBeenCalledWith({}, expect.anything(), "s1", "done");
   });
 
   it("answers NOT closed for a standalone target, which moves to in-review instead", async () => {
-    await expect(finishTicket(run(), ticket, "s1", false)).resolves.toEqual({ closed: false });
+    await expect(finishTicket(run(), ticket, "s1", false)).resolves.toEqual({
+      closed: false,
+      // `closed` stays false by design for a standalone target — but the in-review tag landed, so
+      // `transitioned` says so: a caller must not read `closed: false` here as "nothing happened"
+      // (PR #284 review round 7).
+      transitioned: true,
+    });
     expect(closeMock).not.toHaveBeenCalled();
     expect(tagMock).toHaveBeenCalledWith(REPO, ticket.id, ["stage:in-review"]);
     expect(untagMock).toHaveBeenCalledWith(REPO, ticket.id, ["stage:implementing"]);
+  });
+
+  it("answers NOT transitioned for a standalone target whose in-review tag bd refused", async () => {
+    tagMock.mockRejectedValue(new Error("Command failed: bd tag anton-t2\ndatabase is locked"));
+
+    await expect(finishTicket(run(), ticket, "s1", false)).resolves.toEqual({
+      closed: false,
+      transitioned: false,
+    });
+    expect(closeMock).not.toHaveBeenCalled();
   });
 
   // PR #258 review: the close is what a NEXT attempt reads as "done", and for a satisfied ticket the
@@ -163,7 +187,10 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
       return Promise.resolve();
     });
 
-    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({ closed: true });
+    await expect(finishTicket(run(), ticket, "s1", true, satisfied)).resolves.toEqual({
+      closed: true,
+      transitioned: true,
+    });
 
     expect(order).toEqual(["marker", "close"]);
     // Written into the WORKTREE (where the branch is checked out), naming the satisfying commit in
@@ -228,7 +255,10 @@ describe("finishTicket — reports whether the close landed (PR #253 review)", (
   });
 
   it("leaves a committed ticket's branch alone — no marker, since its own commit names it", async () => {
-    await expect(finishTicket(run(), ticket, "s1", true)).resolves.toEqual({ closed: true });
+    await expect(finishTicket(run(), ticket, "s1", true)).resolves.toEqual({
+      closed: true,
+      transitioned: true,
+    });
     expect(commitMarkerMock).not.toHaveBeenCalled();
   });
 });

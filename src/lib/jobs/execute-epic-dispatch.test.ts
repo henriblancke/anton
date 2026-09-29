@@ -18,7 +18,7 @@
  * loop and the delivery verdict all RUN.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { LABELS, type Bead } from "../beads/bd";
+import { LABELS, type Bead, type BeadVersion } from "../beads/bd";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { resumeSkipped } from "../ticket-view";
 import type { EpicRun } from "./execute-epic-run";
@@ -47,6 +47,39 @@ vi.mock("../git/ops", async () => {
   };
 });
 
+const clearBoardEvidencePendingMock = vi.fn();
+// Mocked alongside `clearBoardEvidencePending` (not left to run for real) so a baseline-alone
+// resume's re-diff (anton-fc5x review, "Do not confirm baseline-only resumes as delivered") is
+// deterministic in tests — the real implementation would shell out to `bd` for the marker/baseline
+// writes a found diff triggers, which isn't wired up here.
+const readBoardEvidenceMock = vi.fn();
+const readBoardBaselineMock = vi.fn();
+vi.mock("./execute-epic-board-evidence", async () => {
+  const actual = await vi.importActual<typeof import("./execute-epic-board-evidence")>(
+    "./execute-epic-board-evidence",
+  );
+  return {
+    ...actual,
+    clearBoardEvidencePending: (...args: unknown[]) => clearBoardEvidencePendingMock(...args),
+    readBoardEvidence: (...args: unknown[]) => readBoardEvidenceMock(...args),
+    readBoardBaseline: (...args: unknown[]) => readBoardBaselineMock(...args),
+  };
+});
+
+// The durable-confirmation resume path writes the attribution commit directly rather than through
+// runTicket/the ticket's own worktree (PR #284 review, thread on line 601) — mocked so the test
+// exercises the dispatch decision, not `steps/git.ts`'s real `commitMarker` against a fake worktree.
+const recordBoardOnlyAttributionMock = vi.fn();
+vi.mock("./step-registry", () => ({
+  recordBoardOnlyAttribution: (...args: unknown[]) => recordBoardOnlyAttributionMock(...args),
+}));
+
+// The confirmed-fast-path closure fence (anton-fc5x review, "Invalidate confirmation when the
+// ticket is reopened") reads `bd history` via `readCurrentClosureVersion` — mocked so a CLOSED
+// ticket's current closure episode is deterministic in tests, not a live `bd history` call. Every
+// test that reaches the confirmed fast path with a bare-array (legacy) `boardEvidenceConfirmed`
+// value never calls this at all, since the closure gate short-circuits on an absent stored closure.
+const historyMock = vi.fn<(repo: string, id: string) => Promise<BeadVersion[]>>();
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
   return {
@@ -59,12 +92,13 @@ vi.mock("../beads/bd", async () => {
       reopen: vi.fn(async () => ""),
       show: vi.fn(async () => undefined),
       list: vi.fn(async () => []),
+      history: (repo: string, id: string) => historyMock(repo, id),
     },
   };
 });
 
 const { dispatchRunTickets } = await import("./execute-epic-dispatch");
-const { TicketRetiredError } = await import("./execute-epic-errors");
+const { TicketRetiredError, TicketTimeoutError } = await import("./execute-epic-errors");
 const { PoisonEpic } = await import("./errors");
 const { beads } = await import("../beads/bd");
 const reopenMock = vi.mocked(beads.reopen);
@@ -166,10 +200,15 @@ const abandoned = (id: string): Bead =>
 beforeEach(() => {
   board = [];
   runTicketMock.mockReset().mockResolvedValue(COMMITTED);
+  clearBoardEvidencePendingMock.mockReset();
+  readBoardEvidenceMock.mockReset().mockResolvedValue({ found: false, ids: [], synced: false });
+  readBoardBaselineMock.mockReset().mockResolvedValue({ beads: new Map() });
+  recordBoardOnlyAttributionMock.mockReset().mockResolvedValue(undefined);
   hasCommitMock.mockReset().mockResolvedValue(false);
   satisfiedByMock.mockReset().mockResolvedValue(undefined);
   branchAddedMock.mockReset().mockResolvedValue(true);
   reopenMock.mockReset().mockResolvedValue("");
+  historyMock.mockReset().mockResolvedValue([]);
   // Faithful default: a tag/untag the subsequent `show` reads back on the board bead, so the
   // post-write reread in retireFound sees the marker it just wrote (PR #238 review).
   tagMock.mockReset().mockImplementation(async (_repo: string, id: string, labels: string[]) => {
@@ -948,3 +987,797 @@ describe("the cross-machine reopen of a closed child", () => {
     expect(runTicketMock).not.toHaveBeenCalled();
   });
 });
+
+// A prior attempt's `clearBoardEvidencePending` call (execute-epic-ticket.ts) can exhaust its
+// retries and throw PoisonEpic AFTER this ticket already closed — `runTicket` is the only caller
+// of that cleanup, and a resume that finds the ticket's own commit already on the branch skips
+// `runTicket` entirely (the ordinary resumeSkipped fast path, distinct from the retirement/reopen
+// cases above). Without a retry here, the stale marker a failed cleanup left behind would never
+// clear: a later reopen of this same ticket would read it as CURRENT evidence for no new work.
+describe("a resume-skipped ticket's leftover board-evidence marker (anton-fc5x review)", () => {
+  it("retries the cleanup once this ticket's own commit is found already on the branch", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb1"])],
+    });
+    hasCommitMock.mockResolvedValue(true);
+
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      child,
+      ["anton-eb1"],
+      false,
+      false,
+    );
+    // The companion fix in the `if (delivery)` branch above records the stale-pending ids into the
+    // ledger BEFORE clearing them (`ledger.boardEvidence.set(ticket.id, stalePending)`) — asserted
+    // here too so a regression that drops that call while leaving the cleanup call intact still
+    // fails: `boardEvidenceByTicket` is what `review-context.ts`'s `boardEvidenceSection` reads to
+    // show the reviewer which beads this ticket's confirmed evidence covers.
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+  });
+
+  // chatgpt-codex-connector, PR #284 review, "Reject unstamped survivors on closed tickets": an
+  // UNSTAMPED pending marker (no `pendingBoardEvidenceClosure`) is safe to trust only when this
+  // ticket has never been reopened-and-reclosed — the test right above. Once `bd history` shows an
+  // earlier closed episode behind the current one, the same unstamped marker is exactly the shape a
+  // failed `stampPendingBoardEvidenceClosure` + failed clear can strand across a reopen, so it must
+  // NOT be passed through unconditionally the way the pre-fix `survivorTrustedForClosure` did.
+  it(
+    "does not trust an unstamped pending marker once this ticket's history shows an earlier " +
+      "reopen-and-reclose, and fails loud rather than fabricate a delivery when nothing survives " +
+      "to re-diff",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb1"])],
+      });
+      hasCommitMock.mockResolvedValue(true);
+      historyMock.mockResolvedValue([
+        { hash: "new-close-sha", at: "2026-09-21T00:00:00.000Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-09-20T12:00:00.000Z", status: "open" },
+        { hash: "old-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does nothing when the ticket carries no pending marker and no preserved baseline", async () => {
+    const child = bead("anton-a", { status: "closed", labels: [LABELS.boardOnly] });
+    hasCommitMock.mockResolvedValue(true);
+
+    await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+  });
+
+  // anton-fc5x review, "Re-diff baseline-only resumes despite an old commit": a ticket's OWN
+  // commit being on this branch (`hasCommitMock` true) is no substitute for the same re-diff the
+  // no-commit recovery path below already applies — the baseline surviving alone still just means
+  // no evidence check ever completed, whether or not this branch happens to carry a commit for it.
+  it(
+    "re-diffs a surviving preserved baseline alone instead of confirming it empty, even with this " +
+      "ticket's own commit already on the branch",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(true);
+      readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-eb1"], synced: true });
+
+      return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(readBoardBaselineMock).toHaveBeenCalledWith("/tmp/anton-repo", child);
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+          "/tmp/anton-repo",
+          child,
+          ["anton-eb1"],
+          true,
+          false,
+        );
+      });
+    },
+  );
+
+  it(
+    "halts instead of confirming a baseline-alone resume the re-diff finds no evidence for, even " +
+      "with this ticket's own commit already on the branch",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ a: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(true);
+      readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+
+      return expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      });
+    },
+  );
+
+  it(
+    "retries the confirming push alone when a prior cleanup's two writes both landed locally but " +
+      "the push never confirmed (PR #284 review, \"retain a retry obligation after cleanup push " +
+      "failure\") — neither the pending marker nor the preserved baseline survives that failure, so " +
+      "only the dedicated obligation flag can tell a same-machine resume there is still an " +
+      "unconfirmed remote write",
+    () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceCleanupUnsynced: "true" },
+      });
+      hasCommitMock.mockResolvedValue(true);
+
+      return dispatchRunTickets(makeRun([child], new AbortController().signal), prep()).then(() => {
+        expect(runTicketMock).not.toHaveBeenCalled();
+        expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith("/tmp/anton-repo", child, [], false, true);
+      });
+    },
+  );
+
+  // chatgpt-codex-connector, PR #284 review, "Fence the branch-delivery fast path by closure cycle":
+  // this `if (delivery)` fast path unions `confirmedBoardEvidenceIds` into what it (re)confirms
+  // WITHOUT the closure-cycle check `confirmedForThisCycle` applies further down — so a ticket
+  // reopened and closed again, with an OLD attribution commit still sitting on this branch from the
+  // prior delivery, took this path straight to `clearBoardEvidencePending` and rewrote the stale
+  // confirmation with the new closure, accepting the new cycle with no new board delta ever checked.
+  it(
+    "does not trust a stale confirmed-evidence id set from an earlier closure cycle even when an " +
+      "old attribution commit is still on this branch, and fails loud rather than fabricate a " +
+      "delivery when nothing survives to re-diff",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "old-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true); // the prior cycle's attribution commit is still here
+      historyMock.mockResolvedValue([
+        { hash: "new-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it(
+    "still trusts the confirmed-evidence ids in the `if (delivery)` fast path when the stored " +
+      "closure matches the ticket's current one — the ordinary resume, unaffected by the fence",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        false,
+      );
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    },
+  );
+
+  // chatgpt-codex-connector, PR #284 review, "Honor confirmation origins in the delivery resume
+  // path": a standalone board-only ticket confirmed while still OPEN in an earlier lifecycle stamps
+  // `origin` instead of `closure` (see `notedSatisfaction`'s "still trusts a confirmation written
+  // while the ticket was still open" shape). If that ticket is later reopened and delivered again in
+  // a SECOND lifecycle, `bd history` shows a reopen, so the pre-fix `!current.reopened` fallback
+  // rejected the confirmation outright — even though `origin` names exactly the closure right before
+  // the reopen, proving the confirmation belongs to this very history and not a stale one.
+  it(
+    "trusts an unstamped confirmed-evidence id set in the `if (delivery)` fast path when its " +
+      "origin matches the ticket's history, even though the ticket has since been reopened once",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], origin: "first-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true); // this branch already carries the attribution commit
+      historyMock.mockResolvedValue([
+        { hash: "second-close-sha", at: "2026-09-21T00:00:00.000Z", status: "closed" },
+        { hash: "reopen-sha", at: "2026-09-20T12:00:00.000Z", status: "open" },
+        { hash: "first-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        false,
+      );
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    },
+  );
+});
+
+// A board-only ticket closed and cleaned up on ANOTHER machine (its pending marker and preserved
+// baseline both cleared once delivery confirmed) whose branch was never pushed before this run
+// resumes on a fresh worktree here: no commit of its own, no sibling, and no note — `branchDelivery`
+// finds nothing, so the ordinary cross-machine path would regenerate it. Regenerating it is exactly
+// wrong (PR #284 review, "no record that this bead's board-only delivery ever happened"): its own
+// fresh `readBoardBaseline` already reflects the change this ticket made, so an idempotent agent can
+// only ever find a zero diff and fail with `NoDeliveryError`, undoing a delivery that already
+// happened. `beads.boardEvidenceConfirmed` is the durable trace `clearBoardEvidencePending` leaves
+// for exactly this case — it survives the marker/baseline clear precisely so this branch can tell
+// "confirmed and cleaned up" apart from "closed with nothing behind it".
+describe("a board-only ticket durably confirmed delivered with no commit on this branch (PR #284 review)", () => {
+  it("writes the attribution commit directly instead of regenerating the ticket", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly],
+      metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+    });
+    hasCommitMock.mockResolvedValue(false);
+    // A legacy bare-array confirmation carries no closure/origin of its own, so the fence falls
+    // back to reading `bd history` fresh — closed exactly once, never reopened, is unambiguous.
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
+    expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+    // The pending marker and preserved baseline that would normally carry these ids are exactly
+    // what `clearBoardEvidencePending` cleared when it set this durable flag (PR #284 review,
+    // "track which beads a durably-confirmed board-only delivery touched") — asserted here so a
+    // regression that drops the ids from the confirmed-flag payload still fails: without them the
+    // reviewer's per-ticket evidence section falls back to a generic note for a ticket whose
+    // evidence genuinely was confirmed.
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+  });
+
+  it("still reopens and regenerates a board-only ticket that was never durably confirmed", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly],
+      description: CONTRACT,
+    });
+    hasCommitMock.mockResolvedValue(false);
+    const run = makeRun([child], new AbortController().signal);
+    (run.target as Bead).description = CONTRACT;
+
+    await dispatchRunTickets(run, prep());
+
+    expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    expect(reopenMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a");
+    expect(dispatchedIds()).toEqual(["anton-a"]);
+  });
+
+  // PR #284 review (P1, "honor every confirmed board-only resume shape"): `delivery:board` is
+  // documented as a label shapers put on the run TARGET, inherited by every child — the child
+  // itself carries no label of its own. A bare `beads.isBoardOnly(ticket)` check misses this shape
+  // entirely and falls through to regeneration against a fresh baseline that already contains the
+  // child's delivered writes, where an idempotent retry is rejected as a zero diff.
+  it("writes the attribution commit for a child whose board-only label lives on the run TARGET", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      metadata: { boardEvidenceConfirmed: "true" },
+    });
+    const run = makeRun([child], new AbortController().signal);
+    (run.target as Bead).labels = [LABELS.boardOnly];
+    hasCommitMock.mockResolvedValue(false);
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
+    expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+  });
+
+  // Same finding, second missed shape: a standalone success stays OPEN at `stage:in-review` by
+  // design (its PR step is all that is left), so requiring `ticket.status === "closed"` excluded it
+  // even though `doneOnBoard` (via `resumeSkipped`) already treats it as done.
+  it("writes the attribution commit for a standalone success left OPEN at stage:in-review", async () => {
+    const target = bead(EPIC, {
+      issue_type: "task",
+      status: "open",
+      parent: undefined,
+      labels: [LABELS.boardOnly, LABELS.stage("in-review")],
+      metadata: { boardEvidenceConfirmed: "true" },
+    });
+    const run = makeStandaloneRun(target, new AbortController().signal);
+    hasCommitMock.mockResolvedValue(false);
+
+    const outcome = await dispatchRunTickets(run, prep());
+
+    expect(reopenMock).not.toHaveBeenCalled();
+    expect(runTicketMock).not.toHaveBeenCalled();
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([target]);
+    expect(outcome.delivered.map((b) => b.id)).toContain(EPIC);
+  });
+
+  // chatgpt-codex-connector, PR #284 review, "Finish surviving cleanup before accepting
+  // confirmation": `clearBoardEvidencePending` can persist the confirmed flag and still fail one of
+  // its PRECEDING clears (the marker or the baseline), and a later best-effort sync can publish that
+  // partial state on its own. A resume that only checks `boardEvidenceConfirmed` would accept this
+  // ticket as fully settled and leave the survivor behind for a future, unrelated reopen to misread.
+  it("finishes a surviving pending marker instead of trusting confirmed as fully settled", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb2"])],
+      metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+    });
+    hasCommitMock.mockResolvedValue(false);
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+    const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      child,
+      ["anton-eb1", "anton-eb2"],
+      false,
+      false,
+    );
+    expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+    expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1", "anton-eb2"]);
+  });
+
+  it("finishes a surviving preserved baseline instead of trusting confirmed as fully settled", async () => {
+    const child = bead("anton-a", {
+      status: "closed",
+      labels: [LABELS.boardOnly],
+      metadata: {
+        boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+        boardEvidenceBaseline: JSON.stringify({ x: "hash" }),
+      },
+    });
+    hasCommitMock.mockResolvedValue(false);
+    historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+    await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+    expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+      "/tmp/anton-repo",
+      child,
+      ["anton-eb1"],
+      true,
+      false,
+    );
+  });
+
+  // PR #284 review (critical, "board-only confirmed dependent wrongly skipped by an unrelated
+  // timeout"): `skipCause` used to be checked BEFORE the two board-only fast paths above. A
+  // board-only ticket already durably confirmed by an EARLIER attempt has not yet been added to
+  // `onBranch` when a sibling times out THIS attempt — that only happens once the loop actually
+  // reaches it — so `skippedDependents` could sweep it into the cascade even though its delivery
+  // has nothing to do with the timed-out ticket's rolled-back mechanism, and the old ordering would
+  // then reopen it and tag it `not-delivered`.
+  it(
+    "still recognizes a board-only confirmed dependent even when an unrelated sibling's timeout " +
+      "cascade reaches it first",
+    async () => {
+      const timedOutTicket = bead("anton-a");
+      const confirmedChild = bead("anton-b", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]) },
+        dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-a", type: "blocks" }],
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+      runTicketMock.mockImplementation(async ({ ticket }) => {
+        if (ticket.id === "anton-a") {
+          throw new TicketTimeoutError("anton-a", 60_000, false);
+        }
+        return COMMITTED;
+      });
+
+      const outcome = await dispatchRunTickets(
+        makeRun([timedOutTicket, confirmedChild], new AbortController().signal),
+        prep(),
+      );
+
+      // The confirmed board-only delivery is honored, not reopened and marked undelivered.
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(markedNotDelivered()).not.toContain("anton-b");
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([confirmedChild]);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-b");
+    },
+  );
+
+  // chatgpt-codex-connector, anton-fc5x review, "Invalidate confirmation when the ticket is
+  // reopened": a ticket reopened for rework and closed again by something other than THIS run,
+  // before this run ever redispatches it, still carries the OLD confirmation — the reopen-reset in
+  // `ensureBoardBaselinePersisted` only runs on redispatch, which this fast path is precisely what
+  // skips. The stored closure names the earlier, already-settled cycle, so it must not match the
+  // ticket's current one.
+  it(
+    "does not trust a durably confirmed delivery whose closure names an earlier, already-settled " +
+      "cycle — the ticket was reopened and closed again with no new dispatch in between",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "old-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([
+        { hash: "new-close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" },
+      ]);
+
+      await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+      expect(reopenMock).toHaveBeenCalledWith("/tmp/anton-repo", "anton-a");
+      expect(dispatchedIds()).toEqual(["anton-a"]);
+    },
+  );
+
+  it(
+    "still trusts a durably confirmed delivery whose stored closure matches the ticket's current " +
+      "one — the ordinary resume, unaffected by the closure fence",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(dispatchedIds()).toEqual([]);
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+    },
+  );
+
+  // chatgpt-codex-connector, PR #284 review, "Retry closure reads before reopening confirmed work":
+  // a durably-confirmed, closed board-only ticket resuming on a machine with no attribution commit
+  // of its own for it must retry an unreadable `bd history` before trusting it as a genuine closure
+  // mismatch. A bare read that folds "history unreadable" and "history read but mismatched" into the
+  // same `undefined` would fall through to the regeneration path below — reopening and re-dispatching
+  // a ticket whose delivered board writes are already in a fresh baseline, so an idempotent agent
+  // finds nothing to do and the real delivery fails as undelivered.
+  it(
+    "halts instead of reopening a confirmed board-only delivery when its closure history is " +
+      "unreadable after retries, rather than treating that as a closure mismatch",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], closure: "close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  // chatgpt-codex-connector, PR #284 review, "Validate closure reads before matching confirmation
+  // origins": the same retry-before-reopening guarantee as above, but for a confirmation written
+  // while the ticket was still open (stamped `origin`, not `closure`) — `originMatchesPriorClosure`
+  // used to fold an unreadable history into a plain mismatch, silently reopening and regenerating an
+  // already-delivered ticket against a baseline that already contains its writes.
+  it(
+    "halts instead of reopening a confirmed board-only delivery whose confirmation carries only " +
+      "`origin` when its closure history is unreadable after retries",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"], origin: "first-close-sha" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockRejectedValue(new Error("dolt: connection refused"));
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
+
+  // Same fence, the other degenerate read: `bd history` resolves without throwing but comes back
+  // empty for a ticket this run already knows is CLOSED — `read.closure` is `undefined` even though
+  // the ticket's own status proves a closure exists. A confirmation written before the origin fence
+  // existed carries no `origin` either, so the old comparison (`undefined === undefined`) trusted this
+  // exactly like a legitimate "never closed before" origin, waving through a read that told us nothing
+  // about the ticket's actual closure history.
+  it(
+    "halts instead of trusting a confirmed board-only delivery with no stamped origin when its " +
+      "closure history reads back empty for a ticket that is closed",
+    async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify({ ids: ["anton-eb1"] }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([]);
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    },
+  );
+});
+
+// PR #284 review ("Recover cleanup-only resumes before regeneration"): a prior attempt can clear
+// the pending marker and preserved baseline locally but exhaust its retries on
+// `setBoardEvidenceConfirmed` itself — leaving `boardEvidenceCleanupUnsynced` as the only trace,
+// carrying the ids still owed confirmation. That obligation is board state, so it can reach a
+// machine with no attribution commit of its own for this ticket at all (a fresh cross-machine
+// worktree). Without retrying it here, independently of `delivery`, this ticket would fall through
+// the confirmed-evidence fast path (never confirmed) into full regeneration against a fresh
+// baseline that already contains its delivered writes.
+describe(
+  "a board-only ticket with an unsynced cleanup obligation and no commit on this branch " +
+    "(PR #284 review, \"Recover cleanup-only resumes before regeneration\")",
+  () => {
+    it("finishes confirming the recovered ids instead of reopening and regenerating", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceCleanupUnsynced: JSON.stringify(["anton-eb1"]) },
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      const outcome = await dispatchRunTickets(
+        makeRun([child], new AbortController().signal),
+        prep(),
+      );
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        true,
+      );
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(recordBoardOnlyAttributionMock.mock.calls[0][0].tickets).toEqual([child]);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+
+    it("unions the obligation's ids with a surviving pending marker and preserved baseline", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceCleanupUnsynced: JSON.stringify(["anton-eb1"]),
+          boardEvidenceBaseline: JSON.stringify({ x: "hash" }),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        true,
+        true,
+      );
+    });
+
+    // PR #284 review (chatgpt-codex-connector, "Clear obligations on confirmed cross-machine
+    // resumes"): a failed cleanup push can write BOTH `boardEvidenceConfirmed` and the obligation
+    // locally, and a later best-effort sync can publish both together — so a fresh machine can see
+    // this exact combination. The confirmed fast path used to leave the stale obligation behind
+    // uncleared; it now finishes that cleanup too, so the obligation cannot survive indefinitely
+    // and later get unioned into a REOPENED delivery's evidence ids.
+    it("clears a stale cleanup obligation left behind on an already-confirmed ticket", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+          boardEvidenceCleanupUnsynced: JSON.stringify(["anton-eb1"]),
+        },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      historyMock.mockResolvedValue([{ hash: "close-sha", at: "2026-09-20T00:00:00.000Z", status: "closed" }]);
+
+      const outcome = await dispatchRunTickets(
+        makeRun([child], new AbortController().signal),
+        prep(),
+      );
+
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        true,
+      );
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+  },
+);
+
+// chatgpt-codex-connector, PR #284 review, "Reconfirm pending evidence before regenerating the
+// ticket": a process dying AFTER `finishTicket` closes/transitions the ticket but BEFORE
+// `clearBoardEvidencePending` ever runs leaves the pending marker/baseline `readBoardEvidence`
+// already confirmed synced sitting on the board with NO cleanup obligation — that flag is only
+// ever written BY `clearBoardEvidencePending`, which in this scenario never started. A fresh
+// machine with no commit for this ticket must still finish confirming that surviving evidence
+// instead of falling through to full regeneration.
+describe(
+  "a board-only ticket with surviving pending evidence but no cleanup obligation and no commit " +
+    "on this branch (PR #284 review, \"Reconfirm pending evidence before regenerating the ticket\")",
+  () => {
+    it("finishes confirming a surviving pending marker instead of reopening and regenerating", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly, LABELS.boardEvidencePending(["anton-eb1"])],
+      });
+      hasCommitMock.mockResolvedValue(false);
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        false,
+      );
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.delivered.map((b) => b.id)).toContain("anton-a");
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+
+    // chatgpt-codex-connector, PR #284 review, "Do not confirm baseline-only resumes as
+    // delivered": the preserved baseline alone is not evidence — `lockDispatchBaseline` writes it
+    // BEFORE every board-only dispatch, whether or not the agent (or `readBoardEvidence`) ever
+    // ran. A resume that finds only this survivor must re-diff it against the board rather than
+    // accept an empty id set as a settled (if empty) confirmation.
+    it("re-diffs a surviving preserved baseline alone instead of confirming it empty", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ x: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      readBoardEvidenceMock.mockResolvedValue({ found: true, ids: ["anton-eb1"], synced: true });
+
+      const outcome = await dispatchRunTickets(makeRun([child], new AbortController().signal), prep());
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(readBoardBaselineMock).toHaveBeenCalledWith("/tmp/anton-repo", child);
+      expect(readBoardEvidenceMock).toHaveBeenCalledWith("/tmp/anton-repo", { beads: new Map() }, child);
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        true,
+        false,
+      );
+      expect(recordBoardOnlyAttributionMock).toHaveBeenCalledTimes(1);
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+
+    it("halts instead of confirming a baseline-alone resume the re-diff finds no evidence for", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: { boardEvidenceBaseline: JSON.stringify({ x: "hash" }) },
+      });
+      hasCommitMock.mockResolvedValue(false);
+      readBoardEvidenceMock.mockResolvedValue({ found: false, ids: [], synced: false });
+
+      await expect(
+        dispatchRunTickets(makeRun([child], new AbortController().signal), prep()),
+      ).rejects.toThrow(PoisonEpic);
+
+      expect(reopenMock).not.toHaveBeenCalled();
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).not.toHaveBeenCalled();
+      expect(recordBoardOnlyAttributionMock).not.toHaveBeenCalled();
+    });
+  },
+);
+
+// PR #284 review ("Preserve confirmed evidence IDs during cleanup retries"): a same-machine resume
+// whose commit IS on this branch retries any leftover cleanup obligation through the `if (delivery)`
+// path. `setBoardEvidenceConfirmed` is not idempotent on its `ids` argument — passing the bare
+// (already-cleared) pending marker would overwrite real confirmed evidence with an empty array.
+describe(
+  "a resume-skipped ticket's cleanup retry preserves already-known evidence ids (PR #284 review, " +
+    "\"Preserve confirmed evidence IDs during cleanup retries\")",
+  () => {
+    it("unions already-confirmed ids into the retry instead of passing the empty stale-pending set", async () => {
+      const child = bead("anton-a", {
+        status: "closed",
+        labels: [LABELS.boardOnly],
+        metadata: {
+          boardEvidenceConfirmed: JSON.stringify(["anton-eb1"]),
+          boardEvidenceCleanupUnsynced: JSON.stringify([]),
+        },
+      });
+      hasCommitMock.mockResolvedValue(true);
+
+      const outcome = await dispatchRunTickets(
+        makeRun([child], new AbortController().signal),
+        prep(),
+      );
+
+      expect(runTicketMock).not.toHaveBeenCalled();
+      expect(clearBoardEvidencePendingMock).toHaveBeenCalledWith(
+        "/tmp/anton-repo",
+        child,
+        ["anton-eb1"],
+        false,
+        true,
+      );
+      expect(outcome.boardEvidenceByTicket.get("anton-a")).toEqual(["anton-eb1"]);
+    });
+  },
+);

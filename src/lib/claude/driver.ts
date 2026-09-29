@@ -41,6 +41,14 @@ export interface RunClaudeOptions extends ClaudeCliOptions {
    * applied over `process.env` at spawn time by `spawnClaude`.
    */
   routing: ClaudeRouting;
+  /**
+   * A caller-scoped delta applied over `process.env` before `routingEnvDelta` (anton-72hj's routing
+   * still wins outright). An explicit `undefined` removes the variable rather than leaving whatever
+   * anton was launched with — see {@link import("../beads/bd-env").scrubBdServerEnv}, which the
+   * review gate's reviewer session uses to guarantee it can reach no Dolt server regardless of what
+   * `.beads/metadata.json` says.
+   */
+  envOverrides?: Record<string, string | undefined>;
   /** The composed system prompt — written to a temp file and passed via --append-system-prompt-file. */
   appendSystemPrompt?: string;
   /** Abort the child (lease lost / run cancelled). */

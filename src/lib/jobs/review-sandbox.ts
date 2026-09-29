@@ -81,9 +81,39 @@ export function assertReviewSandboxSupported(platform: NodeJS.Platform = process
  * read-only guard's own `readWorktreeState` reads some other repository, so the "the reviewer wrote
  * nothing" verdict is fabricated rather than earned. Denying it costs nothing legitimate — git's
  * writes go to the admin dir under the common dir, which is denied anyway.
+ *
+ * `repoPath` — the LIVE board's checkout ({@link import("./steps/context").StepContext.repoPath}) —
+ * has its `.beads` (the local Dolt checkout `bd` reads/writes) denied too when a board-only run
+ * hands one over (PR #284 review, "protect the live board from review-session writes"):
+ * `boardEvidenceSection` (review-context.ts) teaches the reviewer the exact `bd -C <repoPath> show
+ * <id>` syntax and path so it can check confirmed board evidence, and the reviewer keeps general
+ * Bash (only `Bash(git:*)` is a denied TOOL) — a stray `bd -C <repoPath> update ...` in place of
+ * `show` would mutate the canonical board directly, invisible to `enforceReadOnly`, which only
+ * snapshots THIS worktree's git state, never `repoPath`. Denying only `.beads` rather than the whole
+ * `repoPath` matters when `ANTON_WORKTREES_ROOT` is configured inside the project repo (a supported
+ * override existing integration fixtures use): there `repoPath` is an ancestor of `worktreePath`,
+ * and denying the whole ancestor would make the entire review worktree read-only, breaking the
+ * project checks' own caches/coverage writes under the sandbox's normal cwd allowance. `.beads`
+ * itself is never an ancestor of a worktree, so it stays denied without that collateral blast
+ * radius. This closes only the filesystem-backed case (a local or file-based Dolt checkout); a
+ * shared-server Dolt board writes over a connection string rather than local files, so this sandbox
+ * rule cannot reach that case. That case is closed a different way instead (PR #284 review, "Block
+ * server-backed board writes during review", hardened round 18 "Deny Bash instead of only the bd
+ * command prefix"): `reviewDeniedTools` (review-gate.ts) denies `Bash` OUTRIGHT when
+ * `readBoardMode(repoPath).mode === "server"` — a tool-name prefix rule like `Bash(bd:*)` matches only
+ * a command string that itself starts with `bd`, and a shell can invoke the same binary in unboundedly
+ * many shapes that don't (`cd` first, a wrapper script, an alias) — so a server-backed board never
+ * hands this session a shell capable of reaching it at all, rather than relying on a filesystem rule
+ * that cannot reach it or a command-prefix rule a shell can route around.
  */
-export function reviewSandboxDenyWrite(worktreePath: string, gitCommonDir: string): string[] {
-  return [...new Set([gitCommonDir, join(worktreePath, ".git")])];
+export function reviewSandboxDenyWrite(
+  worktreePath: string,
+  gitCommonDir: string,
+  repoPath?: string,
+): string[] {
+  return [
+    ...new Set([gitCommonDir, join(worktreePath, ".git"), ...(repoPath ? [join(repoPath, ".beads")] : [])]),
+  ];
 }
 
 /** The review session's `sandbox` block — what the driver hands Claude Code on `--settings`. */
@@ -148,13 +178,20 @@ function assertAbsoluteCommonDir(commonDir: string): string {
  * `readGitCommonDir` is injected so the gate's unit tests can drive the resolution without a
  * repository; production passes `gitCommonDir` from git/ops. A failure to read it PROPAGATES: a
  * sandbox scoped to a common dir anton could not resolve is a guard with a hole in it.
+ *
+ * `repoPath` — the live board's checkout the run hands `boardEvidenceSection` — is optional
+ * because most reviews carry no board-only ticket at all; passed straight to
+ * {@link reviewSandboxDenyWrite}, see there for why it is denied.
  */
 export async function resolveReviewSandbox(args: {
   worktreePath: string;
   readGitCommonDir: (worktreePath: string) => Promise<string>;
+  repoPath?: string;
   platform?: NodeJS.Platform;
 }): Promise<ReviewSandboxSettings> {
   assertReviewSandboxSupported(args.platform);
   const commonDir = assertAbsoluteCommonDir(await args.readGitCommonDir(args.worktreePath));
-  return reviewSandboxSettings(await withRealPaths(reviewSandboxDenyWrite(args.worktreePath, commonDir)));
+  return reviewSandboxSettings(
+    await withRealPaths(reviewSandboxDenyWrite(args.worktreePath, commonDir, args.repoPath)),
+  );
 }

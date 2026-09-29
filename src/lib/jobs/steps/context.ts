@@ -74,6 +74,16 @@ export interface StepDeps {
     >,
   ) => void;
   /**
+   * Called by `dispatchClaude` right before it actually spawns the agent process — the true dispatch
+   * boundary, not merely "a step handler ran" (chatgpt-codex-connector, PR #284 review, "Delay
+   * ticket dispatch markers until an agent step starts"). A formula step that never reaches
+   * `dispatchClaude` at all (`step:verify`, ordered before `step:implement` by a project's own
+   * formula) must never be mistaken for a dispatch attempt: the ticket walk uses this to gate
+   * whether a failure counts as post-dispatch (audit the board for evidence) or pre-dispatch (roll
+   * the dispatch marker back, since no agent ever ran to produce any).
+   */
+  markAgentDispatchStarting?: () => void;
+  /**
    * The worktree fingerprint a read-only step guards with (`step:describe`), and the restore it puts
    * the tree back with. Production passes neither; the seam exists so a test can drive the failure
    * paths — an unreadable tree, a revert that cannot complete — which are the ones that decide
@@ -150,6 +160,13 @@ export interface StepContext {
    * directly, which reads as "every ticket committed its own work".
    */
   satisfied?: ReadonlyMap<string, SatisfiedSettlement>;
+  /**
+   * The bead ids a board-only ticket's CONFIRMED evidence covered, by ticket id (PR #284 review round
+   * 11) — set once by dispatch and read by `step:review` so the reviewer is told WHICH beads a
+   * board-only ticket actually changed, instead of only that some board write happened somewhere.
+   * Absent on a ticket-phase context, and for a caller invoking a handler directly.
+   */
+  boardEvidenceByTicket?: ReadonlyMap<string, string[]>;
   settings: ProjectSettings;
   /** The formula step being executed. Absent for a caller invoking a handler directly. */
   step?: CookedStep;
@@ -181,6 +198,17 @@ export interface StepContext {
    * falls back to the index alone, which is exactly the behaviour that predates this field.
    */
   ticketStartHead?: string;
+  /**
+   * Whether THIS ticket's delivery is board-only ({@link
+   * import("../execute-epic-board-evidence").isBoardOnlyRun}), decided once by {@link
+   * import("../execute-epic-ticket").runTicket} and carried through so a dispatching step (`step:
+   * implement`, `step:claude`) can tell the agent its outcome-reporting rule is different for this
+   * ticket (anton-fc5x PR #284 review) — see {@link
+   * import("../../claude/system-prompt").SystemPromptLayers.boardOnly}. Absent (not just false) for
+   * a caller invoking a handler directly, or a run-phase context spanning more than one ticket,
+   * where "board-only" is not one ticket's fact to carry.
+   */
+  boardOnly?: boolean;
   /** Re-assert the cross-machine run-lease; throws when it has lapsed (anton-jz1). */
   assertLeaseHeld?: () => void;
   /**

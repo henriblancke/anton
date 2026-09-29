@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { BeadVersion } from "./bd";
-import { currentClosureVersion } from "./closure-cycle";
+import { currentClosureVersion, reopenedBeforeCurrentClosure } from "./closure-cycle";
 
 const version = (hash: string, status: string): BeadVersion => ({
   hash,
@@ -37,5 +37,32 @@ describe("currentClosureVersion", () => {
         version("old-close", "closed"),
       ]),
     ).toBe("new-close");
+  });
+});
+
+describe("reopenedBeforeCurrentClosure", () => {
+  it("is false for an empty or live history — nothing closed yet to have been reopened from", () => {
+    expect(reopenedBeforeCurrentClosure([])).toBe(false);
+    expect(reopenedBeforeCurrentClosure([version("live", "in_progress")])).toBe(false);
+  });
+
+  it("is false for a bead closed exactly once — the current closure is its only episode", () => {
+    expect(
+      reopenedBeforeCurrentClosure([
+        version("note-write", "closed"),
+        version("close", "closed"),
+        version("before-close", "in_progress"),
+      ]),
+    ).toBe(false);
+  });
+
+  it("is true once an earlier closed version sits behind the current closed streak", () => {
+    expect(
+      reopenedBeforeCurrentClosure([
+        version("new-close", "closed"),
+        version("reopen", "open"),
+        version("old-close", "closed"),
+      ]),
+    ).toBe(true);
   });
 });

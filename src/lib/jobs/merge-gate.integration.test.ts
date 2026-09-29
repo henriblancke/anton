@@ -132,7 +132,11 @@ describeBd("PR-merge gate e2e (real handlers · real bd/git · fake gh)", () => 
   }
 
   beforeAll(async () => {
-    bdRepo = makeBdRepo({ initialCommit: true });
+    // A wired remote (anton-fc5x): `closeFinalized`'s untag only sticks once the confirming push
+    // reports `synced`/`shared-server` — on a not-wired board (no remote) it never can, and the
+    // label is restored forever. `bare: true` gives it a real remote to confirm against, exactly
+    // like the sibling review-fix-merge.integration.test.ts.
+    bdRepo = makeBdRepo({ bare: true, initialCommit: true });
     repo = bdRepo.repo;
     const binDir = join(bdRepo.dir, "bin");
     mkdirSync(binDir, { recursive: true });

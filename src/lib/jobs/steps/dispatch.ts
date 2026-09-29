@@ -127,6 +127,11 @@ export async function dispatchClaude(
   ctx.ctx.report({ sessionId: session.sessionId, cwd: ctx.worktreePath });
 
   try {
+    // The true dispatch boundary (chatgpt-codex-connector, PR #284 review, "Delay ticket dispatch
+    // markers until an agent step starts") — everything above this point (session bookkeeping,
+    // metering setup) can run for a step that never actually spawns an agent; this is the last line
+    // before it commits to doing so.
+    ctx.deps?.markAgentDispatchStarting?.();
     const routing = claudeRouting(ctx.settings);
     await ctx.ctx.claudeReached(quotaMeterKey(ctx.settings));
     const result = await claude({
