@@ -1568,6 +1568,15 @@ export async function commitAll(
     timeoutMs?: number;
     signal?: AbortSignal;
     amendToVerifyHooks?: boolean;
+    /**
+     * The still-unverified commit to reset PAST, when it sits BEHIND `HEAD` rather than being `HEAD`
+     * itself — e.g. an operator's own plain commit landed on top of a parked, hook-bypassed boundary
+     * while resuming (PR #338 review, chatgpt-codex-connector, round 6). The reset below then targets
+     * THIS commit's own parent(s) instead of `HEAD`'s, so the hook sees the combined diff from before
+     * the unverified content through `HEAD`, not just what a descendant commit added on top of it.
+     * Defaults to `HEAD` itself when unset, matching the original single-commit behavior.
+     */
+    verifyFrom?: string;
   } = {},
 ): Promise<{ committed: boolean }> {
   await stageAll(worktreePath, options.hooksPath);
@@ -1613,8 +1622,12 @@ export async function commitAll(
   // combined diff. What follows is an ordinary, hook-verified commit of that tree.
   const originalHead = await resolveCommitSha(worktreePath, "HEAD");
   const originalMessage = await git(worktreePath, ["log", "-1", "--format=%B", "HEAD"]);
-  const originalParents = await commitParentShas(worktreePath, originalHead);
-  await git(worktreePath, ["reset", "--soft", originalParents[0] ?? `${originalHead}^`]);
+  // Whose parents to reset back to: `HEAD`'s own by default, or an ancestor further back when the
+  // caller says the unverified content sits there instead (see `verifyFrom` above) — a descendant
+  // commit on top of it stays in `HEAD`'s tree either way, since `--soft` leaves the index untouched.
+  const boundaryHead = options.verifyFrom ?? originalHead;
+  const boundaryParents = await commitParentShas(worktreePath, boundaryHead);
+  await git(worktreePath, ["reset", "--soft", boundaryParents[0] ?? `${boundaryHead}^`]);
   try {
     await gitCommit(
       worktreePath,
@@ -1654,7 +1667,7 @@ export async function commitAll(
   // even under `commit.gpgSign`, so re-signing is opt-in via `-S`, applied only when the verified
   // commit itself carries a signature (`%G?` reports anything but `N`), to match it rather than
   // unconditionally sign or unconditionally drop the signature.
-  const extraParents = originalParents.slice(1);
+  const extraParents = boundaryParents.slice(1);
   if (extraParents.length > 0) {
     const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
     const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
@@ -1664,7 +1677,7 @@ export async function commitAll(
       "commit-tree",
       tree,
       "-p",
-      originalParents[0] ?? verifiedHead,
+      boundaryParents[0] ?? verifiedHead,
       ...extraParents.flatMap((parent) => ["-p", parent]),
       ...(signatureStatus !== "N" ? ["-S"] : []),
       "-m",

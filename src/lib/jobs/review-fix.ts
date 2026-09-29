@@ -1018,6 +1018,7 @@ export async function prepareFixWorktree(args: {
   const { conflicts, merged, failed: baseMergeFailed } = await premergeBase(
     repo,
     worktree.path,
+    branch,
     baseBranch,
     number,
   );
@@ -1062,6 +1063,7 @@ export async function prepareFixWorktree(args: {
 async function premergeBase(
   repo: string,
   worktreePath: string,
+  branch: string,
   baseBranch: string | undefined,
   number: number,
 ): Promise<{ conflicts: string[]; merged: boolean; failed: boolean }> {
@@ -1081,17 +1083,57 @@ async function premergeBase(
   // marker check. If the tip this merges on top of was itself a hook-bypassed boundary commit (a
   // prior attempt parked one and the base has since advanced), the merge commit's tree still carries
   // that unverified content, but the note stays attached to the OLD tip — not the new merge commit
-  // that `headCarriesUnverifiedBoundaryMarker` actually inspects afterward. Left unpropagated, the
+  // that `findUnverifiedBoundaryAncestor` actually inspects afterward. Left unpropagated, the
   // "already ahead" fast path in `runFixSession` finds no marker on the new HEAD, skips the re-verify
   // amend in `commitAndPushFix`, and pushes the original --no-verify commit's content straight past
-  // the project's hooks.
-  const hadUnverifiedBoundary = await headCarriesUnverifiedBoundaryMarker(worktreePath);
+  // the project's hooks. Searches the whole unpushed range, not just literal `HEAD` (round 6): the
+  // tip this merges onto can itself be a plain commit stacked on an older, still-unpushed boundary.
+  const preMergeHead = await readWorktreeState(worktreePath).then((s) => s.head, () => "");
+  const hadUnverifiedBoundary =
+    (await findUnverifiedBoundaryAncestor(worktreePath, branch)) !== undefined;
   try {
     const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
     if (merge.conflicts.length === 0 && hadUnverifiedBoundary) {
       // The merge committed cleanly on top of a still-unverified tip — carry the marker forward onto
       // the new merge commit so it isn't lost.
-      await markUnverifiedBoundary(worktreePath);
+      try {
+        await markUnverifiedBoundary(worktreePath);
+      } catch (error) {
+        // The merge landed cleanly even though writing its marker failed (concurrent note-ref lock
+        // contention, say) — left in place, `HEAD` would carry the still-unverified content with no
+        // note attached, and a resumed "already ahead" fast path would treat it as re-verified and
+        // push it straight past the project's hooks (PR #338 review, chatgpt-codex-connector, round
+        // 6; `commitFix` rolls back for the identical reason when IT hits this same failure while
+        // creating the marker). `reset --hard` (not `--soft`, unlike `commitFix`'s rollback) because
+        // there is no follow-up work staged on top to preserve — only the merge itself, which a
+        // retry redoes from scratch. No rollback target (the best-effort read above failed) is
+        // itself poison — silently leaving the merge on HEAD unmarked is exactly what this rollback
+        // exists to prevent.
+        if (!preMergeHead) {
+          throw new PoisonError(
+            `PR #${number}: auto-merge of ${baseRef} committed but its unverified-boundary marker ` +
+              `failed to write, and the pre-merge HEAD needed to roll it back was never read — the ` +
+              `worktree may be left with an unmarked bypass commit`,
+            { cause: error },
+          );
+        }
+        try {
+          await git(worktreePath, ["reset", "--hard", preMergeHead]);
+        } catch (restoreError) {
+          throw new PoisonError(
+            `PR #${number}: auto-merge of ${baseRef} committed but its unverified-boundary ` +
+              `marker failed to write, and restoring HEAD to ${preMergeHead} afterward also ` +
+              `failed — the worktree may be left with an unmarked bypass commit: ` +
+              `${(restoreError as Error).message}`,
+            { cause: error },
+          );
+        }
+        consoleLog.error(
+          `PR #${number}: marking auto-merge of ${baseRef} as an unverified boundary failed`,
+          error,
+        );
+        return { conflicts: [], merged: false, failed: true };
+      }
     }
     return { conflicts: merge.conflicts, merged: true, failed: false }; // clean auto-merge → a merge commit is pushed below
   } catch (e) {
@@ -1886,14 +1928,59 @@ async function markUnverifiedBoundary(worktreePath: string): Promise<void> {
   ]);
 }
 
-async function headCarriesUnverifiedBoundaryMarker(worktreePath: string): Promise<boolean> {
+async function commitCarriesUnverifiedBoundaryMarker(
+  worktreePath: string,
+  commit: string,
+): Promise<boolean> {
   try {
-    await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "show", "HEAD"]);
+    await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "show", commit]);
     return true;
   } catch (error) {
     if (exitedWith(error, 1)) return false;
     throw error;
   }
+}
+
+/**
+ * Every commit on `branch` not yet on `origin/<branch>`, oldest first — the range a marker search
+ * must cover, not just literal `HEAD` (PR #338 review, chatgpt-codex-connector, round 6): an
+ * operator's own plain commit landed on top of a parked, hook-bypassed boundary while resuming — the
+ * explicitly supported "already ahead" resume flow — shifts `HEAD` off the marked commit without the
+ * branch becoming any less unverified. Falls back to `[HEAD]` alone (this file's original search
+ * surface) when the range can't be resolved — review-fix only ever runs against a branch that
+ * already has an open PR, so `origin/<branch>` normally exists; this is a defensive fallback, not
+ * the expected path.
+ */
+async function unpushedCommitsOldestFirst(worktreePath: string, branch: string): Promise<string[]> {
+  try {
+    const out = await git(worktreePath, ["rev-list", "--reverse", `origin/${branch}..HEAD`]);
+    return out
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return resolveCommitSha(worktreePath, "HEAD")
+      .then((sha) => [sha])
+      .catch(() => []);
+  }
+}
+
+/**
+ * The oldest unpushed commit still carrying an unverified-boundary marker, if any — what
+ * `commitFix`'s re-verify amend must reset PAST so the project's hooks see that commit's FULL
+ * bypassed diff, not just what a commit stacked on top of it later changed. Searching only `HEAD`
+ * (this file's original check) missed exactly the scenario an operator's own resume commit creates:
+ * the note stays on the parent while `HEAD` moves off it (PR #338 review, chatgpt-codex-connector,
+ * round 6).
+ */
+async function findUnverifiedBoundaryAncestor(
+  worktreePath: string,
+  branch: string,
+): Promise<string | undefined> {
+  for (const commit of await unpushedCommitsOldestFirst(worktreePath, branch)) {
+    if (await commitCarriesUnverifiedBoundaryMarker(worktreePath, commit)) return commit;
+  }
+  return undefined;
 }
 
 /**
@@ -1937,7 +2024,7 @@ async function clearUnverifiedBoundaryMarker(worktreePath: string): Promise<void
  * to stage, there is nothing left for `commitAndPushFix`'s call to actually commit, so the
  * hook-bypassed boundary commit would otherwise reach the remote having never had the project's real
  * hooks run over it. The caller need not pass this explicitly for that case — whenever
- * `bypassHooks` is unset, this function checks {@link headCarriesUnverifiedBoundaryMarker} itself
+ * `bypassHooks` is unset, this function checks {@link findUnverifiedBoundaryAncestor} itself
  * and forces it on, so a fresh process picks up exactly where an in-memory flag would have (round 3
  * of the same review).
  */
@@ -1966,10 +2053,14 @@ async function commitFix(
   const before = await readWorktreeState(worktreePath);
   // See this function's own doc comment: a bypass call never needs this (it's about to BECOME the
   // unverified boundary, not verify one), but every other call must ask the worktree itself, not
-  // trust whatever this round happens to remember.
-  const amendToVerifyHooks =
-    options.amendToVerifyHooks ||
-    (!options.bypassHooks && (await headCarriesUnverifiedBoundaryMarker(worktreePath)));
+  // trust whatever this round happens to remember. Searches the whole unpushed range, not just
+  // literal HEAD (PR #338 review, chatgpt-codex-connector, round 6) — an operator's own plain commit
+  // stacked on a parked boundary while resuming leaves HEAD unmarked without making the branch any
+  // less unverified.
+  const boundaryAncestor = options.bypassHooks
+    ? undefined
+    : await findUnverifiedBoundaryAncestor(worktreePath, branch);
+  const amendToVerifyHooks = options.amendToVerifyHooks || boundaryAncestor !== undefined;
   let committed: boolean;
   try {
     ({ committed } = await commitAll(
@@ -1979,6 +2070,11 @@ async function commitFix(
         hooksPath,
         bypassHooks: options.bypassHooks,
         amendToVerifyHooks,
+        // Reset PAST the marked ancestor itself, not just HEAD's own parent, so the hook sees its
+        // FULL diff even when it sits behind commits `commitFix` never made itself (round 6). `undefined`
+        // when the caller asked for `amendToVerifyHooks` explicitly without an ancestor found —
+        // `commitAll` then falls back to treating HEAD itself as the boundary, matching prior behavior.
+        verifyFrom: boundaryAncestor,
         timeoutMs: resolveCommitTimeoutMs(settings),
         signal,
       },
@@ -2008,9 +2104,11 @@ async function commitFix(
       // An amend REPLACES the tip rather than adding on top of it, so `before.head` is never an
       // ancestor of `after.head` even when it landed cleanly — `isAncestor` below would wrongly
       // poison every timed-out-but-actually-landed amend. Confirm instead that only the tip itself
-      // changed: the new tip's parent(s) must be exactly what the old tip's were.
+      // changed: the new tip's parent(s) must be exactly what the boundary's were — `boundaryAncestor`
+      // when the amend reset past a marked commit BEHIND HEAD (round 6), else `before.head` itself,
+      // matching what `commitAll` actually reset against in either case.
       const [beforeParents, afterParents] = await Promise.all([
-        commitParentShas(worktreePath, before.head),
+        commitParentShas(worktreePath, boundaryAncestor ?? before.head),
         commitParentShas(worktreePath, after.head),
       ]);
       const sameParents =
@@ -2069,7 +2167,7 @@ async function commitFix(
  *
  * Re-verification of a hook-bypassed boundary commit (PR #338 review, chatgpt-codex-connector,
  * rounds 2-3) is entirely `commitFix`'s own concern now — see
- * {@link headCarriesUnverifiedBoundaryMarker} — so this function no longer needs a
+ * {@link findUnverifiedBoundaryAncestor} — so this function no longer needs a
  * `boundaryCommitted` flag threaded in from the caller's own call graph; that flag only ever
  * reflected THIS round's memory, not the worktree, and so missed the case of a retry that never
  * re-ran `runFixSession`'s pre-gate `commitFix` call at all (the "already ahead" fast path).
