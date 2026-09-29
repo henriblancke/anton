@@ -1940,11 +1940,28 @@ export async function commitAll(
     // nothing landed: unconditionally resetting here would silently discard an already-verified
     // commit and poison a retry into re-running hooks whose side effects may not be idempotent
     // (PR #338 review, chatgpt-codex-connector, round 12).
-    const headAfterError = await resolveCommitSha(worktreePath, "HEAD").catch(() => undefined);
-    const landed =
-      headAfterError !== undefined &&
-      headAfterError !== resetHead &&
-      (await isAncestor(worktreePath, resetHead, headAfterError).catch(() => false));
+    let landed: boolean;
+    try {
+      const headAfterError = await resolveCommitSha(worktreePath, "HEAD");
+      landed =
+        headAfterError !== resetHead && (await isAncestor(worktreePath, resetHead, headAfterError));
+    } catch (landedCheckError) {
+      // A failure HERE — not "HEAD didn't move" but the check itself erroring (lock contention,
+      // disk pressure right after the hook timeout's SIGKILL reap) — must not collapse to
+      // `landed = false`: that's exactly the destructive reset the comment above exists to avoid,
+      // just reached through this check's own error path instead of the happy path (round 12 fixed
+      // the happy path; this is its mirror). Surface it instead of guessing either way.
+      throw tagCommitAttempt(
+        new Error(
+          `git commit failed while verifying hooks over the boundary commit, and checking ` +
+            `whether it landed also failed (${(landedCheckError as Error).message}) — the ` +
+            `worktree may be left with the boundary's changes committed or staged, and was NOT ` +
+            `reset to avoid discarding an already-landed commit: ${(error as Error).message}`,
+          { cause: error },
+        ),
+        "amend",
+      );
+    }
     if (!landed) {
       // Hooks rejected it, or the commit timed out before one was created: put the branch back
       // exactly where it started rather than leaving HEAD at the boundary's parent with the

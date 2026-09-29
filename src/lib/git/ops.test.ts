@@ -4955,6 +4955,124 @@ suite("commitAll (real git · amendToVerifyHooks with a slow post-commit)", () =
   );
 });
 
+/**
+ * A git shim reproducing "the commit landed but `gitCommit`'s own process reports failure"
+ * (round 12's scenario — a `post-commit` merely outlasting the timeout) WITHOUT depending on real
+ * signal/timing races: `commit` is let through to the real git for real, but if that real commit
+ * succeeds, the shim itself still exits non-zero — the exact shape `gitCommit` sees when the ref
+ * already moved before its own process reported rejection. Combined with failing the Nth
+ * `rev-parse --verify HEAD^{commit}` (the exact call `resolveCommitSha` makes, used by the
+ * landed-check inside the catch) with an operational error unrelated to whether the revision
+ * exists, so the check that decides "did it land" fails transiently instead of answering.
+ */
+function shimGitLandingCommitButFailingProcessAndNthVerify(sandboxDir: string, n: number): string {
+  const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+  const binDir = join(sandboxDir, "landed-check-shim-bin");
+  const counterFile = join(sandboxDir, "revparse-verify-count");
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(
+    join(binDir, "git"),
+    `#!/usr/bin/env node
+const {spawnSync}=require('node:child_process');
+const fs=require('node:fs');
+const a=process.argv.slice(2);
+const counterFile=${JSON.stringify(counterFile)};
+// Every call here goes through the shared \`git()\`/\`gitCommit()\` helpers, which always shape argv
+// as [...configArgs, '-C', cwd, <subcommand>, ...] — so the subcommand sits right after '-C <cwd>',
+// never at a[0].
+const cIdx=a.indexOf('-C');
+const subcommand=cIdx>=0?a[cIdx+2]:a[0];
+if(subcommand==='rev-parse'&&a.includes('--verify')&&a.includes('HEAD^{commit}')){
+  let c=0;
+  try{c=parseInt(fs.readFileSync(counterFile,'utf8'),10)||0;}catch{}
+  c+=1;
+  fs.writeFileSync(counterFile,String(c));
+  if(c===${n}){
+    process.stderr.write("fatal: unable to read tree (simulated lock contention)\\n");
+    process.exit(128);
+  }
+  const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+  process.exit(r.status ?? 1);
+}
+if(subcommand==='commit'){
+  const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+  if(r.status===0){
+    process.stderr.write("simulated: commit landed but the wrapping process reports failure (e.g. a post-commit outlasting a timeout)\\n");
+    process.exit(1);
+  }
+  process.exit(r.status ?? 1);
+}
+const r=spawnSync(${JSON.stringify(realGit)},a,{stdio:'inherit'});
+process.exit(r.status ?? 1);
+`,
+  );
+  chmodSync(join(binDir, "git"), 0o755);
+  return binDir;
+}
+
+// PR #338 review (chatgpt-codex-connector): the round-12 fix above only re-checks "did it land" on
+// a rejected `gitCommit` — but that check itself (`resolveCommitSha`/`isAncestor`) used to collapse
+// ANY failure, including a transient operational one, to "didn't land", triggering the exact
+// destructive `reset --soft` the round-12 comment says must not happen to an already-verified
+// commit. This exercises that error path directly: the commit genuinely lands (the shim lets the
+// real `git commit` run), `gitCommit` still rejects (the shim reports failure anyway, mirroring the
+// post-commit-outlasts-timeout race without needing to reproduce the real timing), and the
+// landed-check's own `rev-parse` then fails transiently instead of answering.
+suite("commitAll (real git · landed-check itself fails after the commit lands)", () => {
+  let sandbox: string;
+  let repo: string;
+
+  const g = (args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "ignore" });
+
+  beforeEach(() => {
+    sandbox = mkdtempSync(join(tmpdir(), "anton-commit-landedcheck-fail-"));
+    repo = join(sandbox, "repo");
+    mkdirSync(repo);
+    execFileSync("git", ["init", "-q", "-b", "main", repo], { stdio: "ignore" });
+    g(["config", "user.email", "t@example.com"]);
+    g(["config", "user.name", "anton-test"]);
+    writeFileSync(join(repo, "README.md"), "# sandbox\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "init"]);
+  });
+
+  afterEach(() => {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 20, retryDelay: 150 });
+  });
+
+  it("surfaces the landed-check failure instead of guessing 'not landed' and resetting the verified commit away", async () => {
+    writeFileSync(join(repo, "work.ts"), "export const work = 1;\n");
+    const { committed: boundaryCommitted } = await commitAll(repo, "boundary", {
+      bypassHooks: true,
+    });
+    expect(boundaryCommitted).toBe(true);
+
+    writeFileSync(join(repo, "follow-up.ts"), "export const followUp = 1;\n");
+
+    // Calls 1 and 2 are the plain `originalHead`/`resetHead` reads before `gitCommit` runs; call 3
+    // is the landed-check inside the catch — the one under test.
+    const binDir = shimGitLandingCommitButFailingProcessAndNthVerify(sandbox, 3);
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${prevPath}`;
+    try {
+      await expect(commitAll(repo, "boundary", { amendToVerifyHooks: true })).rejects.toThrow(
+        /checking whether it landed also failed/,
+      );
+    } finally {
+      process.env.PATH = prevPath;
+    }
+
+    // The commit the shim let land must still be HEAD — proof the failed landed-check did NOT fall
+    // through to the destructive `reset --soft originalHead` path.
+    const committedFiles = execFileSync(
+      "git",
+      ["-C", repo, "ls-tree", "-r", "--name-only", "HEAD"],
+      { encoding: "utf8" },
+    );
+    expect(committedFiles).toContain("follow-up.ts");
+  });
+});
+
 // PR #338 review round 3 (chatgpt-codex-connector): a hook that inspects the STAGED diff (like
 // lint-staged) diffs the index against the commit it's being compared to. Once the gate follow-up
 // stages a file of its OWN, `commitAll` used to take the ordinary commit path and never re-check the

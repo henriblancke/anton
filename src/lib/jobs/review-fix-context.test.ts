@@ -278,9 +278,13 @@ describe("reviewFixContext", () => {
 
   // PR #338 review (@claude): a gate-failure follow-up is the one bounded round the gate gets, not
   // a re-diagnosis of the review feedback — it must not carry the reviewer summaries, thread
-  // listings, cluster callout, or a thread-report ask, even when the (pre-fix) `pr` snapshot still
-  // has them. Nothing reads this dispatch's result text, so the reporting ask is pure noise here.
-  it("trims the prompt to header + gate output when a gate just failed, even with threads/reviews present", () => {
+  // listings, cluster callout, merge-conflict list, or a thread-report ask, even when the (pre-fix)
+  // `pr`/`conflicts` snapshot still has them. Nothing reads this dispatch's result text, so the
+  // reporting ask is pure noise here. `conflicts` is non-empty here specifically so this test would
+  // fail if `conflictsSection` were ever ungated again: today the only caller of a gate-only round
+  // (`runGateFixFollowUp`) always passes `conflicts: []`, but that's an invariant this function
+  // itself must enforce, not one a caller happens to uphold (PR #338 review round 2, @claude).
+  it("trims the prompt to header + gate output when a gate just failed, even with threads/reviews/conflicts present", () => {
     const threads: ReviewThread[] = Array.from({ length: CLUSTERED_FINDINGS_THRESHOLD }, (_, i) =>
       threadOn("src/broken.ts", `RT_${i}`),
     );
@@ -292,7 +296,7 @@ describe("reviewFixContext", () => {
         reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "rename foo to bar" }],
       }),
       ["the tests gate failed after the fix (exit 3)"],
-      [],
+      ["src/a.ts"],
       { label: "tests", output: "boom-output" },
     );
     expect(out).toContain("## Gate failure (one follow-up round)");
@@ -301,6 +305,7 @@ describe("reviewFixContext", () => {
     expect(out).not.toContain("[thread RT_0]");
     expect(out).not.toContain("## Clustered findings");
     expect(out).not.toContain("Failing CI checks:");
+    expect(out).not.toContain("Merge conflicts:");
     expect(out).not.toContain("## Reporting format (required)");
   });
 

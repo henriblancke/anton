@@ -192,7 +192,7 @@ export function reviewFixContext(
     ...(gateOnly ? [] : threadsSection(threads)),
     ...(gateOnly ? [] : clusterSection(threads)),
     ...(gateOnly ? [] : failingChecksSection(pr)),
-    ...conflictsSection(conflicts),
+    ...(gateOnly ? [] : conflictsSection(conflicts)),
     ...gateFailureSection(gateFailure),
     ...(gateOnly ? [] : reportingFormatSection(threads, reasons, hasNonThreadReasons)),
   ]
