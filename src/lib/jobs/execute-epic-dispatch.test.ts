@@ -1000,4 +1000,34 @@ describe("the cross-machine reopen of a closed child", () => {
     );
     expect(reopenMock).not.toHaveBeenCalled();
   });
+
+  // Fresh evidence beyond PR #274's first two rounds: a cycle of THREE tickets closes through a
+  // third member (`anton-a → anton-b → anton-c → anton-a`), not a direct `anton-b → anton-a`
+  // reverse edge — that edge never exists here. The closed member still comes first in source
+  // order, so `onBranch` is empty exactly as in the round-2 case above, and only a path walk
+  // through `anton-c` (not a single-hop back-edge test) can see that regenerating `anton-a` now
+  // would run it ahead of `anton-b`, the prerequisite its own edge names.
+  it("fails loud over a three-ticket cycle even when no direct reverse edge names the closed child", async () => {
+    const child = closedChild("anton-a") as Bead;
+    (child as unknown as { dependencies: unknown[] }).dependencies = [
+      { issue_id: "anton-a", depends_on_id: "anton-b", type: "blocks" },
+    ];
+    const depB = bead("anton-b", {
+      dependencies: [{ issue_id: "anton-b", depends_on_id: "anton-c", type: "blocks" }],
+    } as Partial<Bead>);
+    const depC = bead("anton-c", {
+      dependencies: [{ issue_id: "anton-c", depends_on_id: "anton-a", type: "blocks" }],
+    } as Partial<Bead>);
+    showMock.mockResolvedValue(child);
+
+    // Source order — the cycle's fallback — puts the closed child FIRST, ahead of both tickets it
+    // shares the loop with.
+    const run = makeRun([child, depB, depC], new AbortController().signal);
+
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(PoisonEpic);
+    await expect(dispatchRunTickets(run, prep())).rejects.toThrow(
+      /anton-a must be regenerated.*regenerating it now would run it ahead of anton-b, its own `blocks` prerequisite/,
+    );
+    expect(reopenMock).not.toHaveBeenCalled();
+  });
 });

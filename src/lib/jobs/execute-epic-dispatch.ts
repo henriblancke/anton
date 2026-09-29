@@ -1088,10 +1088,13 @@ export async function branchDelivery(
  * caught — a dependent that already ran ahead of `ticket`. The second catches `ticket` itself
  * about to run ahead of its own prerequisite, which `onBranch` alone can't see when the closed
  * member simply comes first in source order: at that point `onBranch` is empty, so it reads as
- * "nothing has happened yet" rather than "the order is already broken". Requiring a mutual edge
- * back to `ticket` on the second check is what keeps it scoped to the internal cycle — an
- * ordinary blocker outside this run's own ticket set would never land in `onBranch` either, but
- * it isn't cyclic and `orderTickets` never promised anything about it here.
+ * "nothing has happened yet" rather than "the order is already broken".
+ *
+ * The second check needs a PATH back to `ticket`, not a direct reverse edge (P2 review, PR #274
+ * round 3): a cycle of three or more tickets (`A → B → C → A`) closes through `C`, not through a
+ * `B → A` edge that never exists. Walking the whole `blocks` graph from the prerequisite is what
+ * keeps this scoped to the internal cycle — an ordinary blocker outside this run's own ticket set
+ * would never land in `onBranch` either, but it isn't cyclic and has no path back to `ticket`.
  */
 function cyclicOrderViolation(
   ticket: Bead,
@@ -1103,15 +1106,32 @@ function cyclicOrderViolation(
     if (e.to === ticket.id && onBranch.has(e.from)) return { other: e.from, ranAhead: true };
   }
   for (const e of edges) {
-    if (
-      e.from === ticket.id &&
-      !onBranch.has(e.to) &&
-      edges.some((back) => back.from === e.to && back.to === ticket.id)
-    ) {
+    if (e.from === ticket.id && !onBranch.has(e.to) && pathExists(e.to, ticket.id, edges)) {
       return { other: e.to, ranAhead: false };
     }
   }
   return undefined;
+}
+
+/** Whether `to` is reachable from `from` by following `blocks` edges (`e.from` depends on
+ * `e.to`) — a cycle of any length back to `to`, not just a direct mutual edge. */
+function pathExists(
+  from: string,
+  to: string,
+  edges: ReadonlyArray<{ from: string; to: string }>,
+): boolean {
+  const stack = [from];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === to) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    for (const e of edges) {
+      if (e.from === cur) stack.push(e.to);
+    }
+  }
+  return false;
 }
 
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
