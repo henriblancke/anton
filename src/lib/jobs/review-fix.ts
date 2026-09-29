@@ -879,8 +879,14 @@ export async function prepareFixWorktree(args: {
    * (PR #338 review, chatgpt-codex-connector: a clean base-only premerge otherwise makes
    * `commitAndPushFix` return `pushed: true` for a round where claude changed nothing, which
    * `fabricatedFix` then can't tell apart from a genuine fix).
+   *
+   * `undefined` when the best-effort read below fails — never a fallback sha, and never compared
+   * as equal OR unequal to anything: a caller must treat "unknown" as "no change" (fail closed),
+   * or a transient git hiccup here would make every later diff against it read as "changed" and
+   * validate a "fixed" claim the round never actually earned (PR #338 review, chatgpt-codex-
+   * connector, round 8).
    */
-  preSessionHead: string;
+  preSessionHead: string | undefined;
   /**
    * Did the fetch above actually land the worktree's HEAD on `expectedHeadSha` AND
    * `origin/<baseBranch>` on `expectedBaseRefOid`? Both git steps are best-effort (a repo with no
@@ -1042,12 +1048,16 @@ export async function prepareFixWorktree(args: {
   // Read AFTER the premerge above, not before — a clean auto-merge already landed its own commit by
   // this point (see the field's own doc on the return type), and that commit must count as part of
   // the pre-session baseline, not as evidence of a session-produced change. Best-effort like every
-  // other git read on this path: a failed read falls back to "" (never a real sha, so the later
-  // diff reads as "changed") rather than aborting a fix over a HEAD read anton doesn't strictly need
-  // yet — the same tolerance `branchAheadOfRemote` above already applies to a git hiccup here.
+  // other git read on this path: a failed read falls back to `undefined` (never a sha, so it can
+  // never equal OR differ from a later-read sha) rather than aborting a fix over a HEAD read anton
+  // doesn't strictly need yet — the same tolerance `branchAheadOfRemote` above already applies to a
+  // git hiccup here. `undefined`, not `""` (PR #338 review, chatgpt-codex-connector, round 8): `""`
+  // reads as unequal to any real sha, silently turning an unreadable baseline into fabricated
+  // "changed" evidence; every comparison against this field below must instead treat `undefined` as
+  // "no change" explicitly.
   const preSessionHead = await readWorktreeState(worktree.path).then(
     (s) => s.head,
-    () => "",
+    () => undefined,
   );
   return { worktree, conflicts, alreadyAhead, preSessionHead, refsSynced };
 }
@@ -1240,8 +1250,12 @@ async function runFixSession(args: {
   conflicts: string[];
   /** Ahead of origin before this run touched anything — see {@link prepareFixWorktree}. */
   alreadyAhead: boolean;
-  /** Worktree HEAD before claude/the gate follow-up ran — see {@link prepareFixWorktree}. */
-  preSessionHead: string;
+  /**
+   * Worktree HEAD before claude/the gate follow-up ran — see {@link prepareFixWorktree}. `undefined`
+   * when that read failed; every comparison against it below must treat that as "no change", never
+   * as a sha that happens to differ from whatever's read later.
+   */
+  preSessionHead: string | undefined;
   branch: string;
   number: number;
 }): Promise<RunFixSessionResult> {
@@ -1501,7 +1515,11 @@ async function runFixSession(args: {
     // good enough for `notifyReReview` below (a follow-up-only push still deserves a re-review ping)
     // but NOT for `report`'s own claims (next).
     const { head: postSessionHead } = await readWorktreeState(worktree.path);
-    const sessionProducedChange = postSessionHead !== preSessionHead;
+    // `preSessionHead !== undefined` guards both comparisons below: an unreadable baseline (PR #338
+    // review, chatgpt-codex-connector, round 8) must read as "no change", never as a sha that
+    // trivially differs from whatever got read afterward — the fail-closed half of the fix, so a
+    // transient git hiccup can never itself manufacture push evidence for a claim claude never earned.
+    const sessionProducedChange = preSessionHead !== undefined && postSessionHead !== preSessionHead;
     // `report` is parsed from `result.text` — the main round's OWN final message, produced before
     // gates (and any gate-fix follow-up) ever ran. Whether a "fixed" claim in it is real must be
     // checked against what THAT round committed, not what the whole session ended up pushing: the
@@ -1509,7 +1527,7 @@ async function runFixSession(args: {
     // edits are evidence the *gate* got fixed, never evidence for any claim in this report. Using
     // `sessionProducedChange` here let a gate-only follow-up validate a fabricated "fixed" claim on
     // an inline thread the follow-up never looked at (PR #338 review, chatgpt-codex-connector).
-    const mainRoundProducedChange = preGateHead !== preSessionHead;
+    const mainRoundProducedChange = preSessionHead !== undefined && preGateHead !== preSessionHead;
 
     const report = parseThreadReport(result.text);
     // `delivered` is the subset of `report` whose reply actually posted (PR #335 review) — what

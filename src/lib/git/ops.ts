@@ -1627,6 +1627,27 @@ export async function commitAll(
   // commit on top of it stays in `HEAD`'s tree either way, since `--soft` leaves the index untouched.
   const boundaryHead = options.verifyFrom ?? originalHead;
   const boundaryParents = await commitParentShas(worktreePath, boundaryHead);
+  // The selected boundary is the OLDEST unpushed commit carrying the marker (see
+  // `findUnverifiedBoundaryAncestor`) — a later commit between it and `HEAD` can itself be a merge
+  // (e.g. a clean base premerge landing on top of an already-parked boundary, PR #338 review, round
+  // 7) whose non-mainline parent the reconstruction below would otherwise silently drop, since only
+  // the SELECTED boundary's own parents get restored. Walk every commit in that range and collect any
+  // parent that isn't itself part of the range, so a base tip merged in partway through survives.
+  const replayedDescendants =
+    boundaryHead === originalHead
+      ? []
+      : (await git(worktreePath, ["rev-list", `${boundaryHead}..${originalHead}`]))
+          .split("\n")
+          .filter(Boolean);
+  const replayedRange = new Set([boundaryHead, ...replayedDescendants]);
+  const descendantMergeParents: string[] = [];
+  for (const commit of replayedDescendants) {
+    for (const parent of await commitParentShas(worktreePath, commit)) {
+      if (!replayedRange.has(parent) && !descendantMergeParents.includes(parent)) {
+        descendantMergeParents.push(parent);
+      }
+    }
+  }
   await git(worktreePath, ["reset", "--soft", boundaryParents[0] ?? `${boundaryHead}^`]);
   try {
     await gitCommit(
@@ -1655,9 +1676,10 @@ export async function commitAll(
     }
     throw tagCommitAttempt(error, "amend");
   }
-  // The commit just made only ever carries the ONE parent the reset above pointed at — a boundary
-  // commit with further parents (the two-parent merge case above) needs them restored now. Pure
-  // metadata rewrite of the commit that just passed hook verification, never a second hook run
+  // The commit just made only ever carries the ONE parent the reset above pointed at — the selected
+  // boundary's own further parents AND any merge parents a later commit in the replayed range
+  // introduced (`descendantMergeParents` above) need restoring now. Pure metadata rewrite of the
+  // commit that just passed hook verification, never a second hook run
   // (`commit-tree` invokes none, and neither does `reset`): same tree, only the parent list changes
   // back to what the original boundary commit actually had. The message is re-read from
   // `verifiedHead` rather than reused from `originalMessage` — a `prepare-commit-msg`/`commit-msg`
@@ -1667,7 +1689,9 @@ export async function commitAll(
   // even under `commit.gpgSign`, so re-signing is opt-in via `-S`, applied only when the verified
   // commit itself carries a signature (`%G?` reports anything but `N`), to match it rather than
   // unconditionally sign or unconditionally drop the signature.
-  const extraParents = boundaryParents.slice(1);
+  const extraParents = [...boundaryParents.slice(1), ...descendantMergeParents].filter(
+    (parent, index, all) => parent !== boundaryParents[0] && all.indexOf(parent) === index,
+  );
   if (extraParents.length > 0) {
     const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
     const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
