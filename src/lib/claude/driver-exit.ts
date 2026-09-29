@@ -98,8 +98,13 @@ const TRANSIENT_RESULT_RE =
  * envelope's `detail` can be the model's own freeform result text, and a deterministic failure that
  * merely narrates or quotes "API Error: 503" mid-sentence (e.g. describing a test fixture) must not
  * be misread as Claude Code's own diagnostic (review finding on PR #339).
+ *
+ * Restricted to the same recoverable statuses `TRANSIENT_STDERR_RE` treats as transient (429 and
+ * the 5xx family) — not any three-digit code: a deterministic refusal like `API Error: 400`/`401`/
+ * `403`/`404` must fall through to the ordinary Error path instead of this legacy fallback claiming
+ * it as recoverable ahead of the generic Claude-exit classifier (review finding on PR #339).
  */
-const TRANSIENT_STDERR_ENVELOPE_RE = /^API Error:\s*\d{3}\b/i;
+const TRANSIENT_STDERR_ENVELOPE_RE = /^API Error:\s*(?:429|500|502|503|504|529)\b/i;
 
 /**
  * Coarsely categorize a transient failure so the runner can refuse to resume twice on the SAME
@@ -162,7 +167,16 @@ function signatureOf(raw: string): string {
  *     trust — but only when it opens the surfaced `detail`, never a quoted occurrence deeper in
  *     the agent's own prose (review finding on PR #339): checked against `detail` alone, not the
  *     merged message, so an anchored `^` actually means "starts the detail."
+ *
+ * The `(transient: ...)` suffix isn't always the true end of the stored string either:
+ * `settleRunRow` (execute-epic-settle.ts) writes `${message}${orphanNotice}`, appending
+ * `orphanClause`'s prose (always opening with a space, then `WARNING:` or `A PR `) onto whatever
+ * `exitCodeError`/`failureError` built — so a failed run with an orphan PR to report pushes the
+ * tag away from the literal end of `message` (review finding on PR #339). `TRANSIENT_TAG_RE` below
+ * accepts that known suffix rather than requiring the tag to be the very last characters.
  */
+const TRANSIENT_TAG_RE = /\(transient: [^)]+\)(?: (?:WARNING:|A PR )[\s\S]*)?$/;
+
 export function isRecoverableClaudeText(message: string): boolean {
   if (/^claude exited without a result event\b/.test(message)) return true;
   if (/^claude produced no output for .*killed as stalled\b/i.test(message)) return true;
@@ -171,7 +185,7 @@ export function isRecoverableClaudeText(message: string): boolean {
   if (!prefixMatch) return false;
   const detail = message.slice(prefixMatch[0].length);
   return (
-    /\(transient: [^)]+\)$/.test(message) ||
+    TRANSIENT_TAG_RE.test(message) ||
     TRANSIENT_RESULT_RE.test(message) ||
     TRANSIENT_STDERR_ENVELOPE_RE.test(detail)
   );

@@ -300,6 +300,38 @@ describe("exitError", () => {
     expect(isRecoverableClaudeError(err)).toBe(true);
     expect(isRecoverableClaudeText(err!.message)).toBe(true);
   });
+
+  it("still recognizes the transient tag when an orphan-PR notice is appended after it (review finding on PR #339)", () => {
+    // settleRunRow (execute-epic-settle.ts) writes `${message}${orphanNotice}` — orphanClause's
+    // prose lands AFTER whatever exitCodeError built, so the `(transient: ...)` tag is no longer the
+    // literal end of the stored string. Both of orphanClause's non-empty shapes must still resolve.
+    const draftNotice =
+      "claude exited with code 1: three tests fail (transient: 503) A PR an earlier attempt had " +
+      "already opened (https://github.com/x/y/pull/1) was converted to a DRAFT so this un-reviewed " +
+      "work can't be merged; it returns to ready when the gate passes.";
+    const lookupFailedNotice =
+      "claude exited with code 1: three tests fail (transient: 503) WARNING: anton could NOT check " +
+      "whether an earlier attempt left a PR open on this branch (the `gh` lookup failed) — if one is " +
+      "open it is still mergeable with this un-reviewed work. Check the branch by hand.";
+
+    expect(isRecoverableClaudeText(draftNotice)).toBe(true);
+    expect(isRecoverableClaudeText(lookupFailedNotice)).toBe(true);
+  });
+
+  it("does not treat a deterministic 400/401/403/404 API-error envelope as recoverable (review finding on PR #339)", () => {
+    // TRANSIENT_STDERR_ENVELOPE_RE used to accept any three-digit status after "API Error:", so a
+    // deterministic client-error response (auth/permission/not-found) fell into the transient
+    // fallback ahead of the generic Claude-exit AGENT_RE classifier in failure-cause.ts.
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 400 Bad Request")).toBe(false);
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 401 Unauthorized")).toBe(false);
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 403 Forbidden")).toBe(false);
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 404 Not Found")).toBe(false);
+    // The recoverable statuses in the same family must still be recognized.
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 429 Too Many Requests")).toBe(
+      true,
+    );
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 529 Overloaded")).toBe(true);
+  });
 });
 
 describe("transientSignature", () => {
