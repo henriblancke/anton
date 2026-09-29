@@ -1493,6 +1493,29 @@ describe("ensureCycleEvidence (codex review, PR #274)", () => {
     expect(issueSnapshotVersion(REPO)).toBe(before);
   });
 
+  it("fails closed on a retired board even when its own evidence still looks fresh by time (P2 badge review, PR #274, thread on issues.ts:1013)", async () => {
+    // The round-24 test above doesn't cover this gap: there, `board` never carried evidence at all,
+    // so `cycleEvidenceMissingOrStale` already routed the call through the generation-checking
+    // refresh path on its own. Here `board` carries evidence attached moments ago — still well
+    // within its trust window — so a time/presence-only guard would treat it as already handled and
+    // return without ever comparing `generation` against the retained snapshot. Attaching evidence
+    // never bumps the snapshot generation, so a sidecar's time-freshness says nothing about whether
+    // the array it's attached to is still the one the retained snapshot points at.
+    const board = [{ ...target, dependencies: [] }];
+    attachCycleEvidence(board, [{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const staleGeneration = issueSnapshotGeneration(REPO);
+    invalidateIssueSnapshot(REPO); // a concurrent refresh moves the retained snapshot on
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board, staleGeneration);
+
+    // No wasted `bd dep cycles` call either: every attach branch further down is itself gated on the
+    // generation match, so a mismatch caught up front never needs the fetch at all.
+    expect(cyclesMock).not.toHaveBeenCalled();
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
   it("hydrates gate-only cycle members into the board before attaching evidence (P2 review, PR #274, issues.ts:599)", async () => {
     // Two gates blocking each other with no ordinary bead's edge dangling toward either: `board`
     // carries no `blocks` edge of its own, but the outer consistency re-list still runs and agrees

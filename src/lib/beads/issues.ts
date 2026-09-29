@@ -1005,6 +1005,29 @@ export async function ensureCycleEvidence(
   board: Bead[],
   generation: number,
 ): Promise<Bead[]> {
+  // A background refresh can replace the retained snapshot in the gap between the caller capturing
+  // `(board, generation)` and reaching this call (the approve route does real work in between:
+  // resolving an operator, parsing the request body) — exactly the race this function's own
+  // `generation` parameter exists to catch (see the doc above). But time-freshness and generation
+  // are independent: `board`'s sidecar can still be within its trust window even though `board` is
+  // already a retired array, because attaching evidence never bumps the snapshot generation. Left
+  // unchecked here, the `cycleEvidenceMissingOrStale` guard below would treat that sidecar as
+  // trustworthy and skip every generation check that follows, handing the caller evidence computed
+  // for a graph state the retained snapshot may have already moved past (P2 review, PR #274,
+  // issues.ts:1013). Fail closed instead, mirroring this function's own rejection branches further
+  // down: clear it so the caller sees the same "missing" verdict a cold board would produce, rather
+  // than a stale-but-unexpired one.
+  // Returned immediately, rather than falling into the refresh below: every attach branch past this
+  // point is itself gated on `issueSnapshotGeneration(cwd) === generation`, so a mismatch here would
+  // still pay for a `bd dep cycles` fetch and a consistency re-list only to attach nothing — this
+  // call's `generation` argument cannot change mid-call to make that fetch land.
+  if (issueSnapshotGeneration(cwd) !== generation) {
+    if (cycleEvidenceFor(board) !== undefined) {
+      clearCycleEvidence(board);
+      markCycleEvidenceUnavailable(cwd);
+    }
+    return board;
+  }
   // `cycleEvidenceMissingOrStale`, not a plain presence check (P2 review, PR #274,
   // issues.ts:884): a retained board whose evidence is merely expired — not absent — would
   // otherwise skip straight past this whole refresh, leaving `board` paired with a verdict from
