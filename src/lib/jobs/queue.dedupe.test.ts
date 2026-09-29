@@ -549,6 +549,40 @@ describe("enqueueReviewFixPrIfAbsent", () => {
       expect(activeRows()).toHaveLength(2);
     });
 
+    // PR #338 review, chatgpt-codex-connector: two attempts for the same head but different
+    // fingerprints can park within the same second — `updatedAt` is second-truncated, so ordering on
+    // it alone can hand back the older, mismatched park instead of the newer one matching the current
+    // fingerprint. `parkedAtHead` must fall back to insert order (JOB_INSERT_ORDER), same as
+    // `answeredUnchanged`, to break the tie correctly.
+    it("breaks a same-second updatedAt tie between two parked attempts by insert order", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1"],
+      })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+      const aUpdatedAt = t.db
+        .select({ updatedAt: schema.jobs.updatedAt })
+        .from(schema.jobs)
+        .where(eq(schema.jobs.id, a))
+        .all()[0].updatedAt;
+
+      // A newer park at the same head, but a different fingerprint (e.g. a base advance) — tie its
+      // `updatedAt` to `a`'s so only insert order can tell them apart.
+      const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c2"],
+      })!;
+      t.db
+        .update(schema.jobs)
+        .set({ status: "parked", updatedAt: aUpdatedAt })
+        .where(eq(schema.jobs.id, b))
+        .run();
+
+      // `b` is the later insert, so it must win the match despite the tied timestamp.
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c2"])).toBe(true);
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1"])).toBe(false);
+    });
+
     /**
      * PR #338 review, chatgpt-codex-connector: an attempt that ran against unsynced local refs must
      * not leave its enqueue-time `headSha`/`fingerprint` snapshot in place. For a transient fetch

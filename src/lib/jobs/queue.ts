@@ -614,6 +614,12 @@ export function enqueueReviewFixPrIfAbsent(
  * branch itself was pushed to (PR #338 review, chatgpt-codex-connector). `fingerprint === undefined`
  * (a caller with nothing finer to check, or a legacy parked row from before this field existed) falls
  * back to the old headSha-only match — there is no base-change evidence to admit a retry with.
+ *
+ * Ordered on `updatedAt` DESC with {@link JOB_INSERT_ORDER} as the tie-break, same as
+ * {@link answeredUnchanged} — `updatedAt` is second-truncated, so two attempts for the same head but
+ * different fingerprints parking within the same second would otherwise sort arbitrarily, and SQLite
+ * could hand back the older mismatched row instead of the newer one matching the current fingerprint
+ * (PR #338 review, chatgpt-codex-connector).
  */
 function parkedAtHead(
   tx: Pick<AntonDb, "select">,
@@ -634,7 +640,7 @@ function parkedAtHead(
         eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
       ),
     )
-    .orderBy(desc(schema.jobs.updatedAt))
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
     .limit(1)
     .all()[0];
   if (!row) return undefined;
