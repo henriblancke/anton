@@ -789,8 +789,10 @@ export function recordReviewFixAnswered(
  * not the stale enqueue-time snapshot — otherwise a base that advanced between enqueue and park
  * never lifts the suppression (it still compares to the old base), and a base that later cycles
  * back to the enqueue-time value wrongly suppresses a park that in fact ran against a different one
- * (PR #338 review, chatgpt-codex-connector). Best-effort like {@link recordReviewFixAnswered}: a
- * write hiccup here must not turn a legitimate fix attempt into a job failure.
+ * (PR #338 review, chatgpt-codex-connector). A write hiccup here does not fail the attempt outright
+ * — the caller catches it and calls {@link invalidateReviewFixAttempt} instead, so a failed refresh
+ * can't leave the stale enqueue-time snapshot in place to wrongly suppress a later park (PR #338
+ * review, chatgpt-codex-connector, round 6).
  */
 export function recordReviewFixAttempt(
   db: AntonDb,

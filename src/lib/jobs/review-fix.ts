@@ -741,7 +741,15 @@ async function handleEpic(args: {
       try {
         recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
       } catch (e) {
-        consoleLog.error("recordReviewFixAttempt failed before PR fix", e);
+        // A failed write here is worse than a skipped one: the row still carries whatever
+        // `enqueueReviewFixPrIfAbsent` snapshotted at enqueue time, which this session is about to
+        // run past without having recorded. If that stale pair still matches the (unmoved) GitHub
+        // head, a later park would wrongly suppress a revision this attempt never tested (PR #338
+        // review, chatgpt-codex-connector). Invalidate rather than merely log so the stale snapshot
+        // can't outlive this attempt; let `invalidateReviewFixAttempt`'s own failure propagate and
+        // fail this attempt outright, same as the `refsSynced` false branch below.
+        consoleLog.error("recordReviewFixAttempt failed before PR fix — invalidating stale snapshot", e);
+        invalidateReviewFixAttempt(db, ctx.jobId);
       }
     } else {
       // Clear the job's own enqueue-time snapshot too, not just skip the refresh above — otherwise
@@ -1982,10 +1990,22 @@ async function commitCarriesUnverifiedBoundaryMarker(
  * surface) when the range can't be resolved — review-fix only ever runs against a branch that
  * already has an open PR, so `origin/<branch>` normally exists; this is a defensive fallback, not
  * the expected path.
+ *
+ * `--first-parent` (PR #338 review, chatgpt-codex-connector, round 7): a premerge of the base
+ * creates a merge commit whose second parent is the base tip, so a plain `origin/<branch>..HEAD`
+ * range also enumerates every commit reachable only through that side — the branch's own unpushed
+ * commits AND the base's entire intervening history. Each would then get its own `git notes show`
+ * call below, so a long-lived PR merging a base with hundreds of commits makes every marker check
+ * needlessly slow. Restricting to the first-parent chain keeps this to the branch's own mainline.
  */
 async function unpushedCommitsOldestFirst(worktreePath: string, branch: string): Promise<string[]> {
   try {
-    const out = await git(worktreePath, ["rev-list", "--reverse", `origin/${branch}..HEAD`]);
+    const out = await git(worktreePath, [
+      "rev-list",
+      "--first-parent",
+      "--reverse",
+      `origin/${branch}..HEAD`,
+    ]);
     return out
       .split("\n")
       .map((line) => line.trim())
