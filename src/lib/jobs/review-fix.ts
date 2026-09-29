@@ -1835,9 +1835,13 @@ async function runGateFixFollowUp(args: {
  * a hook rejecting the re-verify commit restores HEAD to that same unverified boundary commit, and
  * the next dispatch — finding the branch already ahead of origin — took the fast path and pushed it
  * exactly as rejected). A note survives because it lives on the commit object itself, in a ref this
- * file never pushes; a commit that gets genuinely re-verified always lands under a NEW sha (an
- * ordinary `git commit`, or `commitAll`'s own reset + recommit), so the marker simply doesn't carry
- * forward onto it — no explicit removal needed.
+ * file never pushes. A commit that gets genuinely re-verified USUALLY lands under a new sha (an
+ * ordinary `git commit`, or `commitAll`'s own reset + recommit) that the marker simply doesn't carry
+ * forward onto — but `commitAll`'s amend path can reproduce the exact same tree, parents, message, and
+ * author, and within the same one-second git timestamp resolution that reproduces the IDENTICAL sha
+ * too (PR #338 review round 4, chatgpt-codex-connector). `commitFix` therefore explicitly removes the
+ * marker via {@link clearUnverifiedBoundaryMarker} once a re-verify commit lands, rather than relying
+ * on the sha having changed.
  */
 const UNVERIFIED_BOUNDARY_NOTES_REF = "refs/notes/anton-review-fix-boundary";
 
@@ -1859,6 +1863,27 @@ async function headCarriesUnverifiedBoundaryMarker(worktreePath: string): Promis
     return true;
   } catch (error) {
     if (exitedWith(error, 1)) return false;
+    throw error;
+  }
+}
+
+/**
+ * Remove the marker from HEAD once its commit has actually been re-verified by the project's real
+ * hooks (PR #338 review round 4, chatgpt-codex-connector). The doc comment on
+ * {@link UNVERIFIED_BOUNDARY_NOTES_REF} used to assume a re-verified commit always lands under a new
+ * sha, so the marker would simply not carry forward — but `commitAll`'s amend path resets to the
+ * boundary's own parent and recommits the SAME tree, message, and author; within the same one-second
+ * git timestamp resolution that reproduces the IDENTICAL sha, leaving the note still attached to a
+ * commit that has since been pushed as verified. A later round would then find `HEAD` still "marked",
+ * force a fresh (and now diverging) boundary commit on top of it, and fail to push as a non-fast-
+ * forward against what's already on the remote. Exit 1 (no note on this object) is the expected case
+ * when the sha DID change and is silently fine; anything else is a real failure to surface.
+ */
+async function clearUnverifiedBoundaryMarker(worktreePath: string): Promise<void> {
+  try {
+    await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "remove", "HEAD"]);
+  } catch (error) {
+    if (exitedWith(error, 1)) return;
     throw error;
   }
 }
@@ -1977,7 +2002,31 @@ async function commitFix(
     committed = true;
   }
   if (committed && options.bypassHooks) {
-    await markUnverifiedBoundary(worktreePath);
+    try {
+      await markUnverifiedBoundary(worktreePath);
+    } catch (error) {
+      // The commit above already landed even though writing its marker failed (PR #338 review round
+      // 4, chatgpt-codex-connector: e.g. concurrent note-ref lock contention). Left in place, HEAD
+      // would carry a hook-bypassed commit indistinguishable from a genuinely re-verified one, and the
+      // next attempt's "already ahead" fast path would push it straight past this project's hooks.
+      // `reset --soft` back to `before.head` undoes only that commit, keeping the index/tree intact so
+      // nothing claude produced is lost — the caller's retry restages and recommits from scratch,
+      // trying the note write again.
+      try {
+        await git(worktreePath, ["reset", "--soft", before.head]);
+      } catch (restoreError) {
+        throw new PoisonError(
+          `review fix for PR #${number} committed a hook-bypassed boundary commit but failed to ` +
+            `mark it unverified, and restoring HEAD to ${before.head} afterward also failed — the ` +
+            `worktree may be left with an unmarked bypass commit: ${(restoreError as Error).message}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+  if (committed && amendToVerifyHooks) {
+    await clearUnverifiedBoundaryMarker(worktreePath);
   }
   return { committed, hooksPath };
 }
