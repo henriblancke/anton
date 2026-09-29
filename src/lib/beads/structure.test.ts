@@ -315,6 +315,25 @@ describe("validateBoardStructure", () => {
       expect(violations.map((v) => [v.id, v.rule])).toEqual([["b", "blocks-cycle"]]);
     });
 
+    it("faults every member of a cycle abandonAll left labelled but still open on every side (P2 review, PR #274)", () => {
+      // `abandonAll` labels every cycle member before its atomic close; interrupted between the
+      // labels and the close, both `a` and `b` sit open with `abandoned`. The mixed-cycle test
+      // above relies on `b` staying plain live to carry the fault — here NOTHING is, so the
+      // per-bead loop's `isLive` gate would skip both and report a clean board while bd's own
+      // close order (status-only) still treats the loop as an open deadlock.
+      const board = [
+        task("a", undefined, { labels: ["abandoned"], dependencies: [blocks("a", "b")] }),
+        task("b", undefined, { labels: ["abandoned"], dependencies: [blocks("b", "a")] }),
+      ];
+      const violations = validateBoardStructure(board, {
+        cycles: [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }],
+      });
+      expect(violations.map((v) => [v.id, v.rule])).toEqual([
+        ["a", "blocks-cycle"],
+        ["b", "blocks-cycle"],
+      ]);
+    });
+
     it("clears a cycle mixing a closed bead with a live gate — the closed member already resolved its edge (P2 review, PR #274)", () => {
       // `t1` is closed, so `g1`'s wait on it is already satisfied — the loop bd reported is really a
       // plain chain now, not a deadlock. Faulting `g1` here over a harmless historical edge is exactly

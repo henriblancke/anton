@@ -105,6 +105,31 @@ function isJudged(bead) {
 }
 
 /**
+ * Emits `bead`'s `blocks-cycle` fault, naming the edge bd's own reported path actually walks
+ * (`next`) over any other `blocks` edge into the cycle's member set — a bead can hold a chord into
+ * the same cycle (e.g. `a -> c` on top of the real loop `a -> b -> c -> a`), and picking that chord
+ * names a `bd dep remove` that leaves the reported loop fully intact. Falls back to the old
+ * any-member search only when the path edge isn't found on this bead (bd's report and the board
+ * disagreeing). Shared by the per-bead loop and the all-abandoned fallback below it, so both name
+ * the same edge for the same cycle.
+ */
+function faultCycleMember(bead, cycle, fault) {
+  const edges = (bead.dependencies ?? []).filter((dep) => dep?.type === "blocks");
+  const onPath = edges.find((dep) => dep.depends_on_id === cycle.next.get(bead.id));
+  const partner = (onPath ?? edges.find((dep) => cycle.members.has(dep.depends_on_id)))?.depends_on_id;
+  fault(
+    bead.id,
+    "blocks-cycle",
+    "blocking",
+    `sits in a blocks cycle${partner ? ` with ${partner}` : ""} — each bead on the loop waits ` +
+      `(directly or transitively) on the next, so none of them can ever become ready and the ` +
+      `run deadlocks. Break the loop by dropping one edge on it ` +
+      `(\`bd dep remove ${bead.id} ${partner ?? "<blocker-id>"}\`), then re-add whichever order ` +
+      `is actually correct (\`bd dep add <blocked> <blocker>\`).`,
+  );
+}
+
+/**
  * Every way this board departs from `epic → feature → ticket`, in board order. Each violation is
  * `{ id, rule, severity, message }`, the message naming the fault and the `bd` command that fixes it.
  *
@@ -211,25 +236,7 @@ export function validateBoardStructure(board, { cycles } = {}) {
       // #274). This also makes the old "cycle with no judged member" fallback redundant: every live
       // member of a fully-live loop is faulted right here now, gate/molecule or not.
       if (!cycle.allLive) continue;
-      // Prefer the edge bd's own reported path actually walks (`next`), not just any `blocks` edge
-      // into the cycle's member set: a bead can hold a chord into the same cycle (e.g. `a -> c` on
-      // top of the real loop `a -> b -> c -> a`), and picking that chord names a `bd dep remove`
-      // that leaves the reported loop fully intact. Falls back to the old any-member search only
-      // when the path edge isn't found on this bead (bd's report and the board disagreeing).
-      const edges = (bead.dependencies ?? []).filter((dep) => dep?.type === "blocks");
-      const onPath = edges.find((dep) => dep.depends_on_id === cycle.next.get(bead.id));
-      const partner = (onPath ?? edges.find((dep) => cycle.members.has(dep.depends_on_id)))
-        ?.depends_on_id;
-      fault(
-        bead.id,
-        "blocks-cycle",
-        "blocking",
-        `sits in a blocks cycle${partner ? ` with ${partner}` : ""} — each bead on the loop waits ` +
-          `(directly or transitively) on the next, so none of them can ever become ready and the ` +
-          `run deadlocks. Break the loop by dropping one edge on it ` +
-          `(\`bd dep remove ${bead.id} ${partner ?? "<blocker-id>"}\`), then re-add whichever order ` +
-          `is actually correct (\`bd dep add <blocked> <blocker>\`).`,
-      );
+      faultCycleMember(bead, cycle, fault);
     }
 
     // Everything past this point is tier judgement, not graph integrity — dangling-parent and the
@@ -337,6 +344,33 @@ export function validateBoardStructure(board, { cycles } = {}) {
         `${tickets} tickets (budget ${FEATURE_TICKET_BUDGET}) — one feature is one reviewable PR, ` +
           "and this is likely two. Split it into features under the same epic.",
       );
+    }
+  }
+
+  // `abandonAll` labels every cycle member `abandoned` before its atomic close; interrupted between
+  // the labels and the close, every member sits open with the label. The per-bead loop above gates
+  // on `isLive`, which excludes ALL of them — so when a cycle has no member left outside that gate,
+  // the loop never visits a single one and the cycle's `allLive` (status-only, per `cycleMembers`)
+  // never gets checked at all. bd's own close order reads status alone too (`openBlockersOf`), so
+  // that cycle still deadlocks in bd while `board-check` reports a healthy board (P2 review, PR
+  // #274 — "graph-integrity checks need to process every non-closed bead and reserve the abandoned
+  // exclusion for tier-specific checks"). Faults every mapped member directly off `cycleMembers`'
+  // own evidence, bypassing `isLive` entirely, but ONLY when no member of the cycle is `isLive` —
+  // a cycle with at least one live member is already fully handled by the loop above (a live
+  // member there already carries the same fault; the abandoned side of a mixed cycle deliberately
+  // stays unfaulted, since fixing it means finishing its abandon, not editing an edge).
+  const reportedCycles = new Set();
+  for (const evidences of cycleMemberships.values()) {
+    for (const cycle of evidences) {
+      if (reportedCycles.has(cycle)) continue;
+      reportedCycles.add(cycle);
+      if (!cycle.allLive) continue;
+      const hasLiveMember = [...cycle.members].some((id) => isLive(byId.get(id)));
+      if (hasLiveMember) continue;
+      for (const id of cycle.members) {
+        const member = byId.get(id);
+        if (member) faultCycleMember(member, cycle, fault);
+      }
     }
   }
 
