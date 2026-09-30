@@ -2403,6 +2403,98 @@ describe("mainRoundChangesSurvived", () => {
     ).toBe(false);
   });
 
+  // PR #338 review, chatgpt-codex-connector, P1 (this round): a newly added path must not be
+  // credited as "survived" when the final tree no longer carries it. `atFinal === atPreSession`
+  // already catches this — a brand-new path has `atPreSession === undefined`, and a follow-up that
+  // deletes it (while editing something unrelated) leaves `atFinal === undefined` too, so the two
+  // sides compare equal and the path is correctly reported as not survived.
+  it("returns false when a follow-up deletes a file the main round added, while editing something else", async () => {
+    writeFileSync(join(dir, "other.txt"), "base\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "newfile.ts"), "export const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: add newfile.ts"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    execFileSync("git", ["-C", dir, "rm", "-q", "newfile.ts"]);
+    writeFileSync(join(dir, "other.txt"), "changed\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: delete newfile.ts, edit other.txt"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // Same case at the rename-destination shape the review comment called out specifically: the
+  // destination path is "new" from `preSessionHead`'s point of view, so reversing the rename hits
+  // the identical `atFinal === atPreSession` (both undefined) branch as a plain add-then-delete.
+  it("returns false when a follow-up reverses a rename the main round made", async () => {
+    writeFileSync(join(dir, "old.ts"), "export const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    g(["mv", "old.ts", "new.ts"]);
+    g(["commit", "-q", "-m", "main round: rename old.ts to new.ts"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    g(["mv", "new.ts", "old.ts"]);
+    g(["commit", "-q", "-m", "follow-up: reverse the rename"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, P1 (this round): a hunk's added/removed line that
+  // itself starts with `+`/`-` (e.g. source text `++sentinel`) is emitted by `git diff` as
+  // `+++sentinel` / `---sentinel` — indistinguishable by prefix alone from the pre-hunk `+++ b/file`
+  // / `--- a/file` file-header lines. The old check matched that prefix unconditionally, so it
+  // discarded this real hunk content as if it were a header, leaving `hunk.added` empty for a
+  // pure-addition hunk. That made the "nothing to anchor" fallback (`addedBlock.length === 0`)
+  // fire unconditionally and report "survived" even though the follow-up reverted the line and
+  // separately made an unrelated edit — exactly the case this hunk-level fallback exists to catch.
+  it("returns false when a follow-up reverts a pure-addition hunk whose content itself starts with `+`, while editing the file elsewhere", async () => {
+    // Unindented so the added/removed line's own text sits flush against the diff's `+`/`-`
+    // marker — indentation would put a space between them and mask the bug this guards against.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\nreturn 1;\n}\nfunction b() {\nreturn 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Pure addition whose own text starts with `+`, so the diff line reads `+++sentinel`.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\nreturn 1;\n}\nfunction b() {\n++sentinel\nreturn 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: add ++sentinel"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // Follow-up reverts the addition but also edits function a, so the final tree differs from
+    // both `preSessionHead` and `preGateHead` and this path falls into the hunk-level fallback.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n// unrelated\nreturn 1;\n}\nfunction b() {\nreturn 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert ++sentinel, edit function a"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
   // PR #338 review, chatgpt-codex-connector, round 5 P1: a follow-up that removes the main round's
   // hunk from its OWN location but separately types the identical text somewhere else in the file —
   // a NEW occurrence, not a pre-existing one the round-4 test already covers — must not be credited

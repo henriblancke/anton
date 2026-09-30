@@ -1825,7 +1825,14 @@ async function mainRoundHunkSurvived(
       continue;
     }
     const hunk = hunks[hunks.length - 1];
-    if (!hunk || line.startsWith("---") || line.startsWith("+++")) continue;
+    // Only the pre-hunk `--- a/file` / `+++ b/file` file-header lines are skipped here, and `!hunk`
+    // alone already identifies them (they appear once, before the first `@@`, per single-path diff).
+    // Matching `---`/`+++` by prefix INSIDE a hunk (PR #338 review, chatgpt-codex-connector, P1) is
+    // wrong: git prefixes each hunk line with exactly one leading `+`/`-`, so an added source line
+    // that itself starts with `+` (e.g. `++sentinel`) is emitted as `+++sentinel`, and a removed line
+    // starting with `-` becomes `---...` — both would be discarded as fake headers instead of being
+    // recorded as real hunk content.
+    if (!hunk) continue;
     if (line.startsWith("-")) hunk.removed.push(line.slice(1));
     else if (line.startsWith("+")) hunk.added.push(line.slice(1));
   }
