@@ -399,6 +399,11 @@ export async function getPrTopLevelComments(
     return { comments: [], commentsComplete: false };
   }
 
+  // A malformed node missing `id` is dropped from `comments` below, but that must also mark the
+  // read incomplete (PR #338 review, chatgpt-codex-connector) — otherwise the newest human reply
+  // to a needs-human request can be the dropped node, `commentsComplete` stays true, and
+  // `classifyReview` fingerprints the older (already-answered) history instead, suppressing the PR.
+  if (allNodes.some((c) => typeof c.id !== "string")) complete = false;
   const comments = allNodes
     .filter((c): c is RawPrCommentNode & { id: string } => typeof c.id === "string")
     .map((c) => ({

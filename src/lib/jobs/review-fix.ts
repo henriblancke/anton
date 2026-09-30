@@ -1358,7 +1358,14 @@ async function premergeBase(
         return { conflicts: [], merged: false, failed: true };
       }
       if (mergeHeadSha === currentBaseSha) {
-        const unresolved = await unmergedPaths(worktreePath).catch(() => []);
+        // A failed read must NOT collapse to "zero unresolved paths" (PR #338 review,
+        // chatgpt-codex-connector): that would report this resumed merge as cleanly synced with no
+        // conflicts, so the model gets no conflict-file context while `commitFix`'s later `git add -A`
+        // can stage the still-conflicted paths — including literal conflict markers — as resolved.
+        const unresolved = await unmergedPaths(worktreePath).catch(() => undefined);
+        if (unresolved === undefined) {
+          return { conflicts: [], merged: false, failed: true };
+        }
         return { conflicts: unresolved, merged: true, failed: false };
       }
       await git(worktreePath, ["merge", "--abort"]).catch(() => {});
@@ -1638,19 +1645,26 @@ export async function mainRoundChangesSurvived(
   // resolves to the SAME blob sha at both commits — `rev-parse <commit>:<path>` can't see the
   // difference, and this would credit the main round's fix as having survived a pushed tree that
   // no longer carries it.
-  const treeEntryAt = (commit: string, path: string): Promise<string | undefined> =>
+  // A failed `ls-tree` read must be distinguishable from a genuinely absent path (PR #338 review,
+  // chatgpt-codex-connector): collapsing both to `undefined` makes `atGate === atFinal` true
+  // whenever BOTH reads fail, reporting survival for a path this check could never actually verify —
+  // including the case where a gate follow-up reverted the change and the failure is masking exactly
+  // that. `READ_FAILED` is a sentinel distinct from both a real `mode:blob` entry and "path absent".
+  const READ_FAILED = Symbol("ls-tree read failed");
+  const treeEntryAt = (commit: string, path: string): Promise<string | undefined | typeof READ_FAILED> =>
     git(worktreePath, ["ls-tree", commit, "--", path])
       .then((out) => {
         const [mode, , blob] = (out.split("\n").find(Boolean) ?? "").split(/\s+/);
         return mode && blob ? `${mode}:${blob}` : undefined;
       })
-      .catch(() => undefined);
+      .catch(() => READ_FAILED);
   const survived = await Promise.all(
     changedPaths.map(async (path) => {
       const [atGate, atFinal] = await Promise.all([
         treeEntryAt(preGateHead, path),
         treeEntryAt(postSessionHead, path),
       ]);
+      if (atGate === READ_FAILED || atFinal === READ_FAILED) return false;
       return atGate === atFinal;
     }),
   );
