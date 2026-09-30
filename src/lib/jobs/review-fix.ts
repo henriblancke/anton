@@ -1379,6 +1379,19 @@ async function premergeBase(
         return { conflicts: unresolved, merged: true, failed: false };
       }
       await git(worktreePath, ["merge", "--abort"]).catch(() => {});
+      // `merge --abort` restores the tree to its pre-merge state for paths the merge itself
+      // touched, but it is not a general-purpose cleanliness guarantee — it can still leave (or
+      // uncover) unrelated tracked edits the cleanliness guard above only ever checked ONCE, before
+      // this abort ran (PR #338 review, chatgpt-codex-connector, P1). Falling through to the fresh
+      // merge below without re-checking would let it start on a dirty tree exactly like the guard
+      // above exists to prevent — `commitFix` could then stage those edits into the push, or the
+      // marker-failure `reset --hard` further down could destroy them. Re-read and fold a non-clean
+      // (or unreadable) result into the same `failed: true` the guard above already returns for
+      // generic dirt.
+      const postAbortState = await readWorktreeState(worktreePath).then((s) => s, () => undefined);
+      if (postAbortState === undefined || postAbortState.status !== "") {
+        return { conflicts: [], merged: false, failed: true };
+      }
     } else {
       return { conflicts: [], merged: false, failed: true };
     }
@@ -1739,6 +1752,13 @@ function fileContentAt(worktreePath: string, commit: string, path: string): Prom
   );
 }
 
+/** A path's tree-entry file mode at `commit` (e.g. `100644`, `100755`), or `undefined` on any read failure or absence. */
+function fileModeAt(worktreePath: string, commit: string, path: string): Promise<string | undefined> {
+  return git(worktreePath, ["ls-tree", commit, "--", path])
+    .then((out) => (out.split("\n").find(Boolean) ?? "").split(/\s+/)[0] || undefined)
+    .catch(() => undefined);
+}
+
 /**
  * Hunk-level fallback for {@link mainRoundChangesSurvived}: called only once a path's final tree
  * entry differs from BOTH its pre-session and pre-gate content, so a whole-file compare can no
@@ -1787,9 +1807,24 @@ async function mainRoundHunkSurvived(
     if (line.startsWith("-")) hunk.removed.push(line.slice(1));
     else if (line.startsWith("+")) hunk.added.push(line.slice(1));
   }
-  // No parsed hunks (e.g. a binary diff) — nothing to check hunk-by-hunk. The caller only reaches
-  // here when `atFinal` already differs from `atPreSession`, so fall back to that same verdict.
-  if (hunks.length === 0) return true;
+  // No parsed hunks (e.g. a binary diff, or a mode-only change whose content is untouched — a
+  // `git diff -U0` between two modes of the same blob emits `old mode`/`new mode` lines but no
+  // `@@` hunk) — falling back to "survived" unconditionally credited a reverted mode-only fix
+  // whenever a follow-up also edited the file's content, since that still lands here with zero
+  // parsed hunks (PR #338 review, chatgpt-codex-connector, P2). When the main round's own change
+  // to this path was mode-only, require the final mode to still carry it rather than assuming
+  // survival.
+  if (hunks.length === 0) {
+    const [preSessionMode, preGateMode, finalMode] = await Promise.all([
+      fileModeAt(worktreePath, preSessionHead, path),
+      fileModeAt(worktreePath, preGateHead, path),
+      fileModeAt(worktreePath, postSessionHead, path),
+    ]);
+    if (preGateMode !== undefined && preGateMode !== preSessionMode) {
+      return finalMode === preGateMode;
+    }
+    return true;
+  }
   return hunks.every(({ removed, added }) => {
     const addedBlock = added.join("\n");
     if (addedBlock.length > 0 && countOccurrences(finalContent, addedBlock) > countOccurrences(preSessionContent, addedBlock)) {

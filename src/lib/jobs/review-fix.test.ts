@@ -2166,6 +2166,33 @@ describe("mainRoundChangesSurvived", () => {
     ).toBe(false);
   });
 
+  // PR #338 review, chatgpt-codex-connector, P2: a mode-only main-round diff followed by a
+  // follow-up that reverts the mode AND edits the content lands in the hunk-level fallback with
+  // zero parsed `@@` hunks either way (the mode-only diff has none, and the fallback only compares
+  // the main round's own hunks) — the mode revert must still be caught rather than defaulting to
+  // "survived".
+  it("returns false when a follow-up reverts a mode-only fix while also editing the file's content", async () => {
+    writeFileSync(join(dir, "script.sh"), "echo hi\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o755);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: make script.sh executable"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o644);
+    writeFileSync(join(dir, "script.sh"), "echo hi\necho unrelated\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert mode, edit content"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
   it("returns true when the follow-up leaves the main round's content and mode untouched", async () => {
     writeFileSync(join(dir, "script.sh"), "echo hi\n");
     g(["add", "-A"]);
