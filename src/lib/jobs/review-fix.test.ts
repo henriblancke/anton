@@ -2402,6 +2402,75 @@ describe("mainRoundChangesSurvived", () => {
       await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
     ).toBe(false);
   });
+
+  // PR #338 review, chatgpt-codex-connector, round 5 P1: a follow-up that removes the main round's
+  // hunk from its OWN location but separately types the identical text somewhere else in the file —
+  // a NEW occurrence, not a pre-existing one the round-4 test already covers — must not be credited
+  // via a file-wide occurrence count that can't tell the two locations apart.
+  it("returns false when a follow-up reverts a hunk at its own location but adds a brand-new duplicate of its text elsewhere", async () => {
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round's fix is a pure addition inside function b. "  return true;" appears nowhere else
+    // in the pre-session file.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return 1;\n}\nfunction b() {\n  return true;\n  return 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix function b"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up drops the fix from function b (reverting it) but separately adds a new
+    // line to function a that happens to read the exact same text. A file-wide count sees one
+    // occurrence in the final file against zero in the pre-session file and wrongly calls that
+    // "grew" — even though the actual reviewed hunk, at its own location in function b, is gone.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return 1;\n  return true;\n}\nfunction b() {\n  return 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert fix in b, add unrelated duplicate text in a"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 5 P2: a binary content change has no text to
+  // parse into hunks at all (`git diff -U0` reports "Binary files ... differ", no `@@` lines), and
+  // the mode is untouched, so there is no signal to distinguish a survived fix from a follow-up that
+  // reverted it while separately re-editing the same binary file. This must fail closed rather than
+  // default to "survived".
+  it("returns false (fails closed) when a gate follow-up further edits a binary file the main round changed, with no parsed hunks", async () => {
+    writeFileSync(join(dir, "asset.bin"), Buffer.from([0x00, 0x01, 0x02, 0x03]));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round replaces the binary content; mode stays the same.
+    writeFileSync(join(dir, "asset.bin"), Buffer.from([0x10, 0x11, 0x12, 0x13]));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: replace binary asset"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up edits the SAME binary file to a THIRD blob — byte-for-byte
+    // indistinguishable from "reverted the main round's fix, then made an unrelated tweak".
+    writeFileSync(join(dir, "asset.bin"), Buffer.from([0x20, 0x21, 0x22, 0x23]));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: further edit binary asset"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
 });
 
 // anton-gvqk3: a gate parking the fix session must say so on the PR itself — the run-log entry

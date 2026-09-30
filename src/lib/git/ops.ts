@@ -2165,7 +2165,13 @@ export async function commitAll(
     // explicit that `post-merge` "cannot affect the outcome of git merge": the commit this hook
     // reports on already landed and is already hook-verified, so treating a failing `post-merge` as
     // this function's own failure would incorrectly imply the commit itself is unverified or should
-    // be retried.
+    // be retried. Cancellation is the one outcome this must NOT swallow (PR #338 review,
+    // chatgpt-codex-connector, P2): `commitFix` clears the unverified-boundary marker as soon as
+    // this resolves, so if the signal fires mid-replay and we merely warn, the marker is cleared
+    // before the already-aborted push fails, and a retry's "already ahead" fast path then pushes
+    // the branch having never actually replayed the hook. Rethrowing here instead surfaces to
+    // `commitFix`'s own `if (signal.aborted) throw error` handling, which leaves the marker in
+    // place for the retry.
     if (!shouldReplayPostMerge) return;
     try {
       await runIgnoreMissingHook(
@@ -2177,6 +2183,7 @@ export async function commitAll(
         ["0"],
       );
     } catch (error) {
+      if (options.signal?.aborted) throw error;
       console.warn(
         `[git] post-merge hook failed after replaying a bare-merge boundary commit in ${worktreePath} — ` +
           `the commit already landed and was not rolled back`,

@@ -4397,6 +4397,82 @@ suite("commitAll (real git · amendToVerifyHooks)", () => {
     },
   );
 
+  // PR #338 review, chatgpt-codex-connector, round 17 P2: a job signal aborting WHILE the replayed
+  // `post-merge` hook is running used to be caught and merely logged, same as an ordinary hook
+  // failure — so `commitAll` still resolved `{ committed: true }` and `commitFix` cleared the
+  // unverified-boundary marker before the (already-aborted) push failed. A retry then found the
+  // branch ahead but unmarked, and its "already ahead" fast path pushed straight past a hook that
+  // never actually ran. Cancellation must instead propagate out of `commitAll` so the marker survives.
+  it.runIf(process.platform !== "win32")(
+    "propagates cancellation from the post-merge replay instead of swallowing it as an ordinary hook failure",
+    async () => {
+      g(["checkout", "-q", "-b", "feature-cancel"]);
+      writeFileSync(join(repo, "feature.ts"), "feature\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "feature edit"]);
+
+      g(["checkout", "-q", "main"]);
+      writeFileSync(join(repo, "base.ts"), "base\n");
+      g(["add", "-A"]);
+      g(["commit", "-q", "--no-verify", "-m", "main edit"]);
+      const mainTip = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      g(["checkout", "-q", "feature-cancel"]);
+      execFileSync("git", ["-C", repo, "merge", "--no-verify", "--no-edit", "main"], {
+        stdio: "ignore",
+      });
+      const boundarySha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      // Signals it has started, then blocks well past when the abort below lands — proof the
+      // cancellation interrupts a hook actually in flight, not one that already finished.
+      const postMergeStarted = join(sandbox, "post-merge-started");
+      const postMergeHook = join(repo, ".git", "hooks", "post-merge");
+      writeFileSync(
+        postMergeHook,
+        ["#!/bin/sh", `touch ${JSON.stringify(postMergeStarted)}`, "sleep 30", "exit 0", ""].join(
+          "\n",
+        ),
+        "utf8",
+      );
+      chmodSync(postMergeHook, 0o755);
+
+      const controller = new AbortController();
+      const reason = new Error("job made no progress");
+      const pending = commitAll(repo, "boundary", {
+        amendToVerifyHooks: true,
+        verifyFrom: boundarySha,
+        verifiedBoundaryIsBareMerge: true,
+        signal: controller.signal,
+      });
+
+      await vi.waitFor(() => expect(existsSync(postMergeStarted)).toBe(true));
+      controller.abort(reason);
+
+      await expect(pending).rejects.toBe(reason);
+
+      // The verify commit itself already landed before the hook ran — cancelling the REPLAY must
+      // not roll it back (a retry needs a marked commit to reset past and re-replay the hook), only
+      // stop `commitAll` from reporting success while the hook never actually completed. Checking
+      // the landed commit's own parents (rather than its sha, which the amend can legitimately
+      // reproduce identically here) proves it's a genuine, intact two-parent merge, not something a
+      // rollback flattened or discarded.
+      const finalSha = execFileSync("git", ["-C", repo, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      const finalParents = execFileSync(
+        "git",
+        ["-C", repo, "log", "-1", "--format=%P", finalSha],
+        { encoding: "utf8" },
+      ).trim().split(" ");
+      expect(finalParents).toHaveLength(2);
+      expect(finalParents[1]).toBe(mainTip);
+    },
+  );
+
   // PR #338 review round 10 (chatgpt-codex-connector): passing `-m` reports its source as `message`
   // to `prepare-commit-msg`, even with `MERGE_HEAD` present and the resulting commit carrying two
   // parents — a hook branching on that source argument would take the non-merge path on a commit

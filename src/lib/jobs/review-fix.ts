@@ -1726,19 +1726,6 @@ export async function mainRoundChangesSurvived(
   return survived.every(Boolean);
 }
 
-/** Non-overlapping occurrence count of `needle` in `haystack`; 0 for an empty needle. */
-function countOccurrences(haystack: string, needle: string): number {
-  if (needle.length === 0) return 0;
-  let count = 0;
-  let idx = 0;
-  for (;;) {
-    idx = haystack.indexOf(needle, idx);
-    if (idx === -1) return count;
-    count++;
-    idx += needle.length;
-  }
-}
-
 /**
  * A path's content at `commit`, distinguishing "genuinely absent at this commit" (`""`, e.g. a
  * file the main round itself created) from a real read failure (`undefined`) — collapsing both to
@@ -1759,25 +1746,29 @@ function fileModeAt(worktreePath: string, commit: string, path: string): Promise
     .catch(() => undefined);
 }
 
+/** Number of unchanged lines pulled from the pre-gate file on each side of an added block to anchor it to its original location — see {@link mainRoundHunkSurvived}. */
+const HUNK_ANCHOR_CONTEXT_LINES = 3;
+
 /**
  * Hunk-level fallback for {@link mainRoundChangesSurvived}: called only once a path's final tree
  * entry differs from BOTH its pre-session and pre-gate content, so a whole-file compare can no
  * longer tell a reverted hunk apart from an unrelated edit made elsewhere in the same file. Walks
  * the main round's own hunks for this path and checks each against the FINAL file content.
  *
- * A hunk survives when the count of its added text in the FINAL file exceeds the count in the
- * PRE-SESSION file — i.e. an occurrence beyond whatever already existed is still there. Comparing
- * counts rather than a plain `includes` (PR #338 review, chatgpt-codex-connector, round 4) matters
- * because a global `includes` ignores location: when the added text happens to duplicate text
- * already present elsewhere in the file (e.g. another `return true;`), that pre-existing
- * occurrence alone satisfies a plain `includes` even after the follow-up strips out the hunk's own
- * occurrence and edits something unrelated in the same file. Otherwise the hunk is reverted when
- * the exact text it replaced has reappeared, or (for a pure-addition hunk, with nothing removed to
- * reappear) the added-text count simply didn't grow — a PR #338 P1 fix: with `removed` empty, the
- * old check's `removedBlock.length > 0` guard was always false, so a pure-addition hunk's absence
- * was silently credited as "survived". Any other outcome — a replacement hunk edited into
- * something else entirely — is treated the same as the file-level "reformatted, not reverted"
- * case, i.e. survived.
+ * A hunk with added text survives when that text is still found in the FINAL file anchored to its
+ * ORIGINAL location — bracketed by the few unchanged lines that sat immediately before/after it in
+ * the pre-gate file. A plain file-wide `includes`/count comparison (PR #338 review round 4, then
+ * round 5's own fix) ignores location: when a gate follow-up reverts the hunk at its own spot but
+ * separately adds identical text elsewhere in the same file — not merely text that pre-existed
+ * there — the file-wide occurrence count still comes out ahead of the pre-session baseline, so it
+ * credits the reverted hunk as surviving (PR #338 review, chatgpt-codex-connector, round 5 P1).
+ * Anchoring to the surrounding, unrelated-edit-immune context rules that out. Otherwise the hunk is
+ * reverted when the exact text it replaced has reappeared, or (for a pure-addition hunk, with
+ * nothing removed to reappear) the anchored block simply isn't there — a PR #338 P1 fix: with
+ * `removed` empty, the old check's `removedBlock.length > 0` guard was always false, so a
+ * pure-addition hunk's absence was silently credited as "survived". Any other outcome — a
+ * replacement hunk edited into something else entirely — is treated the same as the file-level
+ * "reformatted, not reverted" case, i.e. survived.
  *
  * Fails closed (not survived) on a read error, matching the caller's own convention.
  */
@@ -1788,18 +1779,25 @@ async function mainRoundHunkSurvived(
   postSessionHead: string,
   path: string,
 ): Promise<boolean> {
-  const [mainDiff, preSessionContent, finalContent] = await Promise.all([
+  const [mainDiff, preGateContent, finalContent] = await Promise.all([
     git(worktreePath, ["diff", "-U0", "--no-color", preSessionHead, preGateHead, "--", path]).catch(
       () => undefined,
     ),
-    fileContentAt(worktreePath, preSessionHead, path),
+    fileContentAt(worktreePath, preGateHead, path),
     fileContentAt(worktreePath, postSessionHead, path),
   ]);
-  if (mainDiff === undefined || preSessionContent === undefined || finalContent === undefined) return false;
-  const hunks: { removed: string[]; added: string[] }[] = [];
+  if (mainDiff === undefined || preGateContent === undefined || finalContent === undefined) return false;
+  const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+  const hunks: { newStart: number; newLen: number; removed: string[]; added: string[] }[] = [];
   for (const line of mainDiff.split("\n")) {
-    if (line.startsWith("@@")) {
-      hunks.push({ removed: [], added: [] });
+    const header = HUNK_HEADER.exec(line);
+    if (header) {
+      hunks.push({
+        newStart: Number(header[1]),
+        newLen: header[2] === undefined ? 1 : Number(header[2]),
+        removed: [],
+        added: [],
+      });
       continue;
     }
     const hunk = hunks[hunks.length - 1];
@@ -1807,13 +1805,15 @@ async function mainRoundHunkSurvived(
     if (line.startsWith("-")) hunk.removed.push(line.slice(1));
     else if (line.startsWith("+")) hunk.added.push(line.slice(1));
   }
-  // No parsed hunks (e.g. a binary diff, or a mode-only change whose content is untouched — a
-  // `git diff -U0` between two modes of the same blob emits `old mode`/`new mode` lines but no
-  // `@@` hunk) — falling back to "survived" unconditionally credited a reverted mode-only fix
-  // whenever a follow-up also edited the file's content, since that still lands here with zero
-  // parsed hunks (PR #338 review, chatgpt-codex-connector, P2). When the main round's own change
-  // to this path was mode-only, require the final mode to still carry it rather than assuming
-  // survival.
+  // No parsed hunks — a binary diff (`git diff -U0` prints "Binary files ... differ", no `@@`
+  // lines), or a mode-only change whose content is untouched. A mode-only main-round change is
+  // handled below by checking the mode itself. A BINARY content change has no text to anchor at
+  // all, so — unlike the old unconditional "survived" here — this must fail closed (PR #338
+  // review, chatgpt-codex-connector, round 5 P2): the caller only reaches this function when the
+  // final blob already differs from both the pre-session AND pre-gate blobs, so a gate follow-up
+  // that reverted the main round's binary fix while separately re-editing the same binary file
+  // (same mode, still zero parsed hunks) has no textual signal to distinguish it from a survived
+  // fix — crediting it as "survived" unconditionally let that revert slip through unnoticed.
   if (hunks.length === 0) {
     const [preSessionMode, preGateMode, finalMode] = await Promise.all([
       fileModeAt(worktreePath, preSessionHead, path),
@@ -1823,17 +1823,26 @@ async function mainRoundHunkSurvived(
     if (preGateMode !== undefined && preGateMode !== preSessionMode) {
       return finalMode === preGateMode;
     }
-    return true;
+    return false;
   }
-  return hunks.every(({ removed, added }) => {
+  const preGateLines = preGateContent.split("\n");
+  return hunks.every(({ newStart, newLen, removed, added }) => {
     const addedBlock = added.join("\n");
-    if (addedBlock.length > 0 && countOccurrences(finalContent, addedBlock) > countOccurrences(preSessionContent, addedBlock)) {
-      return true;
+    if (addedBlock.length > 0) {
+      const startIdx = newStart - 1;
+      const endIdx = startIdx + newLen;
+      const contextBefore = preGateLines.slice(Math.max(0, startIdx - HUNK_ANCHOR_CONTEXT_LINES), startIdx);
+      const contextAfter = preGateLines.slice(
+        endIdx,
+        Math.min(preGateLines.length, endIdx + HUNK_ANCHOR_CONTEXT_LINES),
+      );
+      const anchoredAddedBlock = [...contextBefore, ...added, ...contextAfter].join("\n");
+      if (finalContent.includes(anchoredAddedBlock)) return true;
     }
     const removedBlock = removed.join("\n");
     if (removedBlock.length > 0) return !finalContent.includes(removedBlock);
     // Pure-addition hunk (nothing removed): there's no prior text whose reappearance would
-    // prove a revert, so the added-text count not growing above IS the revert signal.
+    // prove a revert, so the anchored block's absence IS the revert signal.
     return addedBlock.length === 0;
   });
 }
