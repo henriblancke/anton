@@ -528,6 +528,19 @@ async function needsFix(
     return { needsFix: true, headSha, state: pr.state, prNumber: number };
   }
   const verdict = classifyReview(pr);
+  if (isUnreadableChecksRollup(pr, verdict)) {
+    // The check-rollup GraphQL read failed without ever observing a failing context — the ONLY
+    // actionable reason is `classifyReview`'s "check rollup read incomplete" marker, e.g. from a
+    // persistent API/permission error. Dispatching `review-fix-pr` here hands claude a prompt with
+    // no concrete failing check to address, and `shouldRecordAnswered` can never suppress the
+    // outcome afterward (`checksComplete` stays `false` on every retry too), so an unreadable PR
+    // would get a brand new session every scheduled sweep forever (PR #338 review, chatgpt-codex-
+    // connector). Throwing routes this target through the same "one unreadable PR retries, the rest
+    // still dispatch" path the loop below already applies to a `getPrReview` failure itself.
+    throw new Error(
+      `PR #${number}: check rollup read incomplete with no other actionable signal — retrying triage instead of dispatching a fix`,
+    );
+  }
   return {
     needsFix: verdict.actionable,
     headSha,
@@ -535,6 +548,17 @@ async function needsFix(
     state: pr.state,
     prNumber: number,
   };
+}
+
+/**
+ * True when `classifyReview`'s ONLY actionable reason is a degraded check-rollup read
+ * (`checksComplete: false`) — no failing check was actually observed, and nothing else about the PR
+ * is actionable either. `checksComplete` unconditionally adds its own reason whenever it is `false`
+ * (see `classifyReview`), so a `reasons` array of length 1 on a `checksComplete: false` PR can only
+ * be that one entry.
+ */
+function isUnreadableChecksRollup(pr: PrReview, verdict: Actionable): boolean {
+  return verdict.actionable && pr.checksComplete === false && verdict.reasons.length === 1;
 }
 
 /**
@@ -2819,6 +2843,43 @@ async function clearUnverifiedBoundaryMarker(worktreePath: string): Promise<void
 }
 
 /**
+ * `commitAll`'s `post-merge` replay is the one step that still throws on a cancellation AFTER its
+ * verifying commit has already landed (see the cancellation branch of `commitAll`'s own
+ * `replayPostMerge`) — so by the time `commitFix`'s catch below sees `signal.aborted`, HEAD may
+ * already be a commit that REPLACED `boundaryAncestor` under a brand new sha. `findUnverifiedBoundaryAncestor`
+ * only walks commits reachable from `HEAD` (`origin/<branch>..HEAD`), so a note left behind on the
+ * old, now-unreachable sha is invisible to the next attempt: `boundaryAncestor` reads as unmarked,
+ * `amendToVerifyHooks` never turns on, and the "already ahead" resume fast path pushes the new
+ * commit straight past the `post-merge` hook that never got to finish (PR #338 review, chatgpt-
+ * codex-connector, P2 round 2). Move the marker onto whatever is actually HEAD now, preserving its
+ * exact text (the bare-premerge tag included, if it carried one) — best-effort throughout, since a
+ * failure to relocate it must not shadow the cancellation itself.
+ */
+async function preserveUnverifiedBoundaryOnCancel(
+  worktreePath: string,
+  boundaryAncestor: string | undefined,
+): Promise<void> {
+  if (boundaryAncestor === undefined) return;
+  try {
+    const head = await resolveCommitSha(worktreePath, "HEAD");
+    if (head === boundaryAncestor) return; // Nothing replaced it — the existing note already covers HEAD.
+    const note = await unverifiedBoundaryNote(worktreePath, boundaryAncestor);
+    if (note === undefined) return; // No marker existed to carry forward.
+    await git(worktreePath, [
+      "notes",
+      `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`,
+      "add",
+      "-f",
+      "-m",
+      note,
+      head,
+    ]);
+  } catch {
+    // Best-effort — see doc comment above.
+  }
+}
+
+/**
  * Stage whatever is in the worktree and commit it, with the recovery a commit timeout needs. Split
  * out of `commitAndPushFix` (anton-vtex7) so `runFixSession` can land a resolved base merge BEFORE
  * the verify gates run, while the push itself still waits behind them. Returns whether a commit
@@ -2916,8 +2977,15 @@ async function commitFix(
     ));
   } catch (error) {
     // An operator cancellation stops the entire review-fix lifecycle: do not push, resolve threads,
-    // or mark its session done merely because Git had already advanced HEAD.
-    if (signal.aborted) throw error;
+    // or mark its session done merely because Git had already advanced HEAD. Still relocate the
+    // unverified-boundary marker first, though (see `preserveUnverifiedBoundaryOnCancel`'s own doc):
+    // `commitAll`'s `post-merge` replay can cancel AFTER its verifying commit already replaced
+    // `boundaryAncestor`, and leaving the note on that now-unreachable sha would let a retry's
+    // "already ahead" fast path push straight past the `post-merge` hook that never finished.
+    if (signal.aborted) {
+      await preserveUnverifiedBoundaryOnCancel(worktreePath, boundaryAncestor);
+      throw error;
+    }
     const after = await readWorktreeState(worktreePath);
     if (after.head === before.head) throw error;
     if (after.ref !== `refs/heads/${branch}`) {
