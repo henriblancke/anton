@@ -3091,15 +3091,19 @@ async function notifyReReview(args: {
   signal: AbortSignal;
 }): Promise<void> {
   const { repo, number, pr, reasons, signal } = args;
-  await safe(() =>
-    commentOnPr(
-      repo,
-      number,
-      `${ANTON_MARK} anton pushed a fix for the review feedback (${reasons.join("; ")}). Please re-review.`,
-      signal,
-    ),
-  );
-  await safe(() =>
-    reRequestReview(repo, number, reviewersRequestingChanges(pr), signal),
-  );
+  // Rethrow an abort rather than swallowing it as an ordinary best-effort failure (PR #338 review,
+  // chatgpt-codex-connector): this is the last signal-aware operation before the round returns
+  // success, so a `safe()`-style catch-all here would let a job timeout that fires mid-notify
+  // complete as a normal success with the comment or re-request never actually sent.
+  await commentOnPr(
+    repo,
+    number,
+    `${ANTON_MARK} anton pushed a fix for the review feedback (${reasons.join("; ")}). Please re-review.`,
+    signal,
+  ).catch((err) => {
+    if (signal.aborted) throw err;
+  });
+  await reRequestReview(repo, number, reviewersRequestingChanges(pr), signal).catch((err) => {
+    if (signal.aborted) throw err;
+  });
 }

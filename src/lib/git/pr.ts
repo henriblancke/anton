@@ -525,6 +525,13 @@ export async function getPrReviews(
     return { reviews: [], reviewsComplete: false };
   }
 
+  // A malformed node missing `state` is mapped to `""` below, same as the `comments` read above
+  // treats a missing `id` — but that must also mark the read incomplete (PR #338 review,
+  // chatgpt-codex-connector). Otherwise a newly submitted CHANGES_REQUESTED review that happens to
+  // be the malformed node fingerprints as `""`, `classifyReview` ignores it as a non-requesting
+  // review, and `reviewsComplete` staying true lets `answeredUnchanged` reproduce the old
+  // fingerprint and suppress the new feedback forever.
+  if (allNodes.some((r) => typeof r.state !== "string")) complete = false;
   const reviews = allNodes.map((r) => ({
     author: r.author?.login ?? "unknown",
     state: r.state ?? "",
@@ -1221,7 +1228,12 @@ export async function reRequestReview(
   for (const r of reviewers) args.push("-f", `reviewers[]=${r}`);
   try {
     await gh(repoPath, args, signal);
-  } catch {
+  } catch (err) {
+    // A cancellation must propagate (PR #338 review, chatgpt-codex-connector) so a caller racing
+    // this against a job timeout can tell "cancelled mid-request" apart from "GitHub refused the
+    // reviewer" — swallowing it here would let a timed-out job complete as if the re-request had
+    // been attempted normally.
+    rethrowIfAborted(err, signal);
     // reviewer can't be re-requested (e.g. is the PR author / a team) — ignore.
   }
 }
