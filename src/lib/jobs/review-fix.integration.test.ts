@@ -67,6 +67,23 @@ function writeBin(dir: string, name: string, body: string): string {
   return p;
 }
 
+// `getPrReview` (src/lib/git/pr.ts) no longer reads reviews/checks/comments off `pr view`'s own
+// JSON — each is now its own paginated `gh api graphql` call, and a query this fake `gh` doesn't
+// recognize returns no stdout at all, which `getPrReviews`/`getPrCheckRollup`/`getPrTopLevelComments`
+// treat as a degraded read (`reviewsComplete`/`checksComplete`/`commentsComplete: false`).
+// `classifyReview` then treats that incompleteness itself as an actionable reason, so a fixture
+// that wants a genuinely clean/green PR must answer every one of these queries with a real,
+// complete-but-empty page — not fall through to a silent `process.exit(0)`. Dispatched by a
+// substring unique to each query's body (`_QUERY` constants in pr.ts).
+const GRAPHQL_EMPTY_COMPLETE_PAGES = `if(a[0]==='api'&&a[1]==='graphql'){
+  const gq=a.join(' ');
+  const empty=(shape)=>{console.log(JSON.stringify({data:{repository:{pullRequest:shape}}}));process.exit(0);};
+  if(gq.includes('reviewThreads(')) empty({reviewThreads:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}});
+  if(gq.includes('reviews(first')) empty({reviews:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}});
+  if(gq.includes('statusCheckRollup')) empty({commits:{nodes:[{commit:{statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}}]}});
+  empty({comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}});
+}`;
+
 describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
   let bdRepo: BdRepo;
   let sandbox: string;
@@ -508,6 +525,7 @@ process.exit(0);`,
       `const a=process.argv.slice(2);
 if(a[0]==='pr'&&a[1]==='view'){console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'APPROVED',headRefName:process.env.FAKE_BRANCH,url:'u',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'SUCCESS'}]}));process.exit(0);}
 if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+${GRAPHQL_EMPTY_COMPLETE_PAGES}
 process.exit(0);`,
     );
     const prev = process.env.ANTON_GH_BIN;
@@ -546,6 +564,7 @@ if(a[0]==='pr'&&a[1]==='view'){
   console.log(JSON.stringify({number:n,state:'OPEN',reviewDecision:'APPROVED',headRefName:process.env.FAKE_BRANCH,url:'u',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'SUCCESS'}]}));process.exit(0);
 }
 if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+${GRAPHQL_EMPTY_COMPLETE_PAGES}
 process.exit(0);`,
     );
 
