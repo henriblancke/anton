@@ -104,10 +104,32 @@ let commitsWithUnverifiedBoundaryMarker = new Set<string>();
 // `markUnverifiedBoundary`'s own `notes ... add` call — resolves by default; the poison-propagation
 // test below rejects it to simulate concurrent note-ref lock contention.
 const markUnverifiedBoundaryNotesAddMock = vi.fn().mockResolvedValue("");
+// Forces `git reset --hard` to fail — stands in for a corrupted/locked worktree that can't even be
+// rolled back to its own pre-merge HEAD. `undefined` by default (the real `reset --hard` against the
+// tests' real-but-minimal git repo succeeds); only the round-9 PoisonError test below sets this.
+let resetHardRejection: Error | undefined;
+// `readWorktreeState` calls its own module-local `git` helper directly, not the exported binding
+// above — so overriding this module's `git` export (as done for reset/notes/rev-list) has no effect
+// on it. Wired separately below so a single test can force it to reject outright, standing in for
+// `readWorktreeState` failing on a reused checkout it can't read (PR #338 review, chatgpt-codex-
+// connector, P1). Defaults to the real implementation against the tests' real-but-minimal git repo.
+// A `vi.hoisted` ref object, not a plain outer `let` (PR #338 review, chatgpt-codex-connector): `vi.mock`
+// factories are hoisted above ALL other top-level statements in this file, so a plain `let` assigned
+// inside the factory would still be in the temporal dead zone if some other import in the module graph
+// pulls in "../git/ops" before this file's own declarations run — `vi.hoisted` is vitest's documented
+// escape hatch for exactly this.
+const realReadWorktreeStateRef = vi.hoisted<{ current?: typeof import("../git/ops").readWorktreeState }>(
+  () => ({}),
+);
+const readWorktreeStateMock = vi.fn(
+  (...a: Parameters<typeof import("../git/ops").readWorktreeState>) => realReadWorktreeStateRef.current!(...a),
+);
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  realReadWorktreeStateRef.current = actual.readWorktreeState;
   return {
     ...actual,
+    readWorktreeState: (...a: Parameters<typeof actual.readWorktreeState>) => readWorktreeStateMock(...a),
     fetchOrigin: vi.fn().mockResolvedValue(undefined),
     // `premergeBase` reads the unverified-boundary note via the real `git notes ... show HEAD`
     // before it merges — against the plain temp dir `worktreePath` stands in for (not a real git
@@ -133,6 +155,9 @@ vi.mock("../git/ops", async () => {
       // overrides `unpushedCommitShas` to exercise the marker-search fallback itself.
       if (args[0] === "rev-list" && args.includes("--first-parent") && args.includes("--reverse")) {
         return Promise.resolve(unpushedCommitShas.join("\n"));
+      }
+      if (args[0] === "reset" && args.includes("--hard") && resetHardRejection) {
+        return Promise.reject(resetHardRejection);
       }
       return actual.git(cwd, args, hooksPath);
     },
@@ -358,6 +383,17 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     worktreePath = mkdtempSync(join(tmpdir(), "anton-review-fix-warm-"));
+    // A real, clean, one-commit repo — not just a bare temp dir — so `readWorktreeState` (real; only
+    // specific `git/ops` functions are stubbed above) resolves cleanly by default, matching a real
+    // reused review-fix worktree in production. `premergeBase`'s own dirty-checkout guard (PR #338
+    // review, chatgpt-codex-connector, P1) requires a POSITIVELY clean read before it will merge —
+    // a bare, non-repo temp dir would make every read fail and the guard refuse to merge at all,
+    // which is correct in production but would make premergeBase-exercising tests below unable to
+    // reach the merge they're testing.
+    execFileSync("git", ["-C", worktreePath, "init", "-q", "-b", "main"]);
+    execFileSync("git", ["-C", worktreePath, "config", "user.email", "a@b.c"]);
+    execFileSync("git", ["-C", worktreePath, "config", "user.name", "test"]);
+    execFileSync("git", ["-C", worktreePath, "commit", "-q", "--allow-empty", "-m", "base"]);
     createWorktreeMock.mockResolvedValue({
       path: worktreePath,
       branch: "anton/fix-7",
@@ -373,6 +409,8 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     unpushedCommitShas = [];
     commitsWithUnverifiedBoundaryMarker = new Set();
     markUnverifiedBoundaryNotesAddMock.mockReset().mockResolvedValue("");
+    resetHardRejection = undefined;
+    readWorktreeStateMock.mockReset().mockImplementation((...a) => realReadWorktreeStateRef.current!(...a));
   });
 
   afterEach(() => {
@@ -450,6 +488,45 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
   });
 
+  // PR #338 review, chatgpt-codex-connector, P1: a reused review-fix worktree can carry uncommitted
+  // tracked edits (an operator's own change, a resumed session's in-progress work). Merging on top of
+  // them risks a later `reset --hard` (if the boundary-marker write fails) discarding those edits for
+  // good, so the premerge must refuse to run at all rather than gamble on a rollback.
+  it("does NOT merge (and preserves uncommitted edits) when the checkout is genuinely dirty", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase would otherwise merge
+    writeFileSync(join(worktreePath, "wip.txt"), "operator's in-progress edit\n");
+
+    const result = await run({} as ProjectSettings);
+
+    // The unconditional origin/<branch> ff-only sync still runs — only premergeBase's OWN
+    // bypassed-hooks merge (`noFf: true`) must be skipped.
+    expect(mergeIntoCurrentMock).not.toHaveBeenCalledWith(
+      worktreePath,
+      expect.anything(),
+      expect.objectContaining({ noFf: true }),
+    );
+    expect(result.refsSynced).toBe(false);
+    expect(readFileSync(join(worktreePath, "wip.txt"), "utf8")).toBe("operator's in-progress edit\n");
+  });
+
+  // The dirty-checkout guard above must fail CLOSED, not open, when it can't even tell whether the
+  // checkout is dirty: a `readWorktreeState` rejection must never be read as "clean" (PR #338 review,
+  // chatgpt-codex-connector, P1) — that would let this same destructive path run against a reused
+  // worktree whose actual dirty state the read simply failed to report.
+  it("does NOT merge when readWorktreeState fails to confirm the checkout is clean", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase would otherwise merge
+    readWorktreeStateMock.mockRejectedValue(new Error("worktree state unreadable"));
+
+    const result = await run({} as ProjectSettings);
+
+    expect(mergeIntoCurrentMock).not.toHaveBeenCalledWith(
+      worktreePath,
+      expect.anything(),
+      expect.objectContaining({ noFf: true }),
+    );
+    expect(result.refsSynced).toBe(false);
+  });
+
   it("does NOT re-warm when the branch is already caught up with the base (no merge to do)", async () => {
     isAncestorMock.mockResolvedValue(true);
     const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
@@ -465,17 +542,18 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
   // PR #338 review, chatgpt-codex-connector, round 9 (fresh evidence beyond the round-6 rollback
   // finding): when the clean auto-merge lands on top of an already-unverified tip, writing the
   // carried-forward marker can fail; the rollback that guards against leaving an unmarked bypass
-  // commit on HEAD then throws `PoisonError` when it has no readable pre-merge HEAD to reset back to
-  // (the worktree here is a plain temp dir, so `rev-parse HEAD` always fails, matching an unreadable
-  // `preMergeHead` in production). That `PoisonError` must reach the caller so the checkout is
-  // parked — an outer `catch` that swallowed it into an ordinary `{ failed: true }` would let a
-  // resumed "already ahead" fast path push the hook-bypassed boundary straight past re-verification.
-  it("re-throws PoisonError when the marker-write rollback has no readable pre-merge HEAD (PR #338 review, round 9)", async () => {
+  // commit on HEAD must throw `PoisonError` when it can't actually restore HEAD to its pre-merge
+  // position (here: the `git reset --hard` itself fails — a locked/corrupted worktree). That
+  // `PoisonError` must reach the caller so the checkout is parked — an outer `catch` that swallowed
+  // it into an ordinary `{ failed: true }` would let a resumed "already ahead" fast path push the
+  // hook-bypassed boundary straight past re-verification.
+  it("re-throws PoisonError when the marker-write rollback's own reset fails (PR #338 review, round 9)", async () => {
     isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
     mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] }); // clean auto-merge, no conflicts
     unpushedCommitShas = ["deadbeef"]; // one unpushed commit ahead of origin/<branch>
     commitsWithUnverifiedBoundaryMarker = new Set(["deadbeef"]); // it already carries the marker
     markUnverifiedBoundaryNotesAddMock.mockRejectedValue(new Error("notes ref lock contention"));
+    resetHardRejection = new Error("worktree locked");
 
     await expect(run({} as ProjectSettings)).rejects.toBeInstanceOf(PoisonError);
   });
@@ -558,10 +636,11 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
   // matched by a later sweep.
   describe("refsSynced treats a descendant checkout as synced, not just an exact match", () => {
     // `readWorktreeState` is real (only `git/ops` functions named in the mock above are stubbed) and
-    // `worktreePath` is a plain temp dir, not a real git repo, so it always resolves to "" here —
-    // `isAncestorMock` is what stands in for "is the checkout ahead of `expectedHeadSha`". The
-    // descendant allowance only applies when the branch was already ahead of origin BEFORE the fetch
-    // (see the race-condition describe block below), so these tests — about the ancestry check
+    // `worktreePath` is the outer `beforeEach`'s real one-commit repo, so it resolves to that commit's
+    // actual sha here — `isAncestorMock` is what stands in for "is the checkout ahead of
+    // `expectedHeadSha`". The descendant allowance only applies when the branch was already ahead of
+    // origin BEFORE the fetch (see the race-condition describe block below), so these tests — about
+    // the ancestry check
     // itself, not the guard in front of it — set that precondition true: the pre-fetch tracking sha
     // resolves to exactly `expectedHeadSha` (proving real, current knowledge of origin), same as
     // `branchAheadOfRemote` reporting real local-only commits on top of it.
@@ -585,11 +664,14 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
 
     it("is true when the checkout is a descendant of expectedHeadSha (not equal to it)", async () => {
       isAncestorMock.mockResolvedValue(true); // stands in for both premergeBase's own check and this one
+      const actualHead = execFileSync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
 
       const result = await runWithHead("expected-head-sha");
 
       expect(result.refsSynced).toBe(true);
-      expect(isAncestorMock).toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+      expect(isAncestorMock).toHaveBeenCalledWith(worktreePath, "expected-head-sha", actualHead);
     });
 
     it("is false when the checkout is neither equal to nor a descendant of expectedHeadSha", async () => {
@@ -2103,6 +2185,51 @@ describe("mainRoundChangesSurvived", () => {
     expect(
       await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
     ).toBe(true);
+  });
+
+  it("returns true when a gate follow-up further edits the same file without reverting the fix", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix the bug"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up reformats the same file (e.g. a lint/format fix) — its tree entry no
+    // longer matches `preGateHead` byte-for-byte, but the main round's fix is still in substance
+    // on the branch, since the content never reverts back to `preSessionHead`'s original.
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\nconst y = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: gate formatting fix"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(true);
+  });
+
+  it("returns false when a gate follow-up reverts the file all the way back to its pre-session content", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix the bug"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert the fix"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
   });
 });
 

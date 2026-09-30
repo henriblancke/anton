@@ -1320,9 +1320,11 @@ async function premergeBase(
   // round 33): the base still hasn't landed in the tree, and the caller folds `failed` into
   // `refsSynced` — reporting `false` here would tell `prepareFixWorktree`'s caller the checkout is
   // synced with the PR's advertised base when it demonstrably isn't, letting the session and gates
-  // run against a stale tree and `commitFix` stage the pre-existing dirty edits into the push. Only
-  // gated on a POSITIVE dirty read (`preMergeState` resolved and its status is non-empty) — a failed
-  // read falls through to the existing behavior below, unchanged.
+  // run against a stale tree and `commitFix` stage the pre-existing dirty edits into the push. Gated
+  // on the ABSENCE of a positively-clean read (`preMergeState` unresolved, or resolved with a
+  // non-empty status) — a failed read must never be treated as "clean" (PR #338 review,
+  // chatgpt-codex-connector, round 35): that would let this same destructive path run against a
+  // reused worktree whose actual dirty state the read simply failed to tell us about.
   //
   // EXCEPT when the dirt is a merge THIS function itself left conflicted (`MERGE_HEAD` set) on an
   // earlier attempt whose dispatched session crashed or was killed before `commitFix` could conclude
@@ -1332,9 +1334,9 @@ async function premergeBase(
   // incomplete without ever exposing the unresolved conflicts to a session that could fix them (PR
   // #338 review, chatgpt-codex-connector). Hand the still-unmerged paths back exactly as a fresh
   // conflict would be — nothing here touches the tree, so a prior session's own partial resolution
-  // (staged, not yet committed) survives untouched. Any OTHER dirty checkout carries no `MERGE_HEAD`
-  // and still falls through to the unconditional reject.
-  if (preMergeState && preMergeState.status !== "") {
+  // (staged, not yet committed) survives untouched. Any OTHER dirty (or unreadable) checkout carries
+  // no `MERGE_HEAD` and still falls through to the unconditional reject.
+  if (preMergeState === undefined || preMergeState.status !== "") {
     if (await mergeInProgress(worktreePath)) {
       // `MERGE_HEAD` names whatever base tip THAT attempt merged from, not necessarily the
       // `baseRef` this call just fetched (PR #338 review, chatgpt-codex-connector): if the base
@@ -1616,8 +1618,13 @@ export function shouldRecordAnswered(
  * path the main round changed, while making the gate pass some other way, still leaves that
  * comparison reading "changed" even though the fix itself never reaches the push (PR #338 review,
  * chatgpt-codex-connector: validate `fixed` claims against the final post-follow-up tree, not merely
- * the intermediate main-round commit). This walks every path the main round touched and requires the
- * follow-up left each one exactly as the main round committed it.
+ * the intermediate main-round commit). This walks every path the main round touched and requires
+ * each one still differs from its OWN pre-session content — not that it matches `preGateHead`
+ * byte-for-byte (PR #338 review, chatgpt-codex-connector, round 2): a follow-up that formats or
+ * otherwise augments a path the main round already fixed leaves that path's final tree entry
+ * different from `preGateHead` too, and requiring an exact match would discard a fix that is, in
+ * substance, still on the branch. Only a follow-up that reverts a path all the way back to its
+ * pre-session state counts as "did not survive" for that path.
  *
  * Fails closed throughout: a missing `preSessionHead`, no commit from the main round, or any git
  * read that errors reads as "did not survive" rather than risk crediting a claim the round never
@@ -1646,7 +1653,7 @@ export async function mainRoundChangesSurvived(
   // difference, and this would credit the main round's fix as having survived a pushed tree that
   // no longer carries it.
   // A failed `ls-tree` read must be distinguishable from a genuinely absent path (PR #338 review,
-  // chatgpt-codex-connector): collapsing both to `undefined` makes `atGate === atFinal` true
+  // chatgpt-codex-connector): collapsing both to `undefined` makes `atPreSession === atFinal` true
   // whenever BOTH reads fail, reporting survival for a path this check could never actually verify —
   // including the case where a gate follow-up reverted the change and the failure is masking exactly
   // that. `READ_FAILED` is a sentinel distinct from both a real `mode:blob` entry and "path absent".
@@ -1660,12 +1667,18 @@ export async function mainRoundChangesSurvived(
       .catch(() => READ_FAILED);
   const survived = await Promise.all(
     changedPaths.map(async (path) => {
-      const [atGate, atFinal] = await Promise.all([
-        treeEntryAt(preGateHead, path),
+      // Against `preSessionHead` (this path's ORIGINAL content), not `preGateHead` (PR #338
+      // review, chatgpt-codex-connector, round 2): a gate follow-up that further edits a path the
+      // main round already fixed — reformatting it, say — makes the final tree entry differ from
+      // `preGateHead` too, and that difference is not a reversion. Only a final entry that matches
+      // back up with what the path looked like BEFORE the main round touched it means the
+      // follow-up undid the fix.
+      const [atPreSession, atFinal] = await Promise.all([
+        treeEntryAt(preSessionHead, path),
         treeEntryAt(postSessionHead, path),
       ]);
-      if (atGate === READ_FAILED || atFinal === READ_FAILED) return false;
-      return atGate === atFinal;
+      if (atPreSession === READ_FAILED || atFinal === READ_FAILED) return false;
+      return atPreSession !== atFinal;
     }),
   );
   return survived.every(Boolean);
