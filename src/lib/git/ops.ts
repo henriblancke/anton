@@ -1998,6 +1998,14 @@ export async function commitAll(
       // hung `pre-merge-commit` is bounded and reaped the same way the verifying commit right below
       // it is (PR #338 review round 14, chatgpt-codex-connector).
       //
+      // Gated on `verifiedBoundaryIsBareMerge`, mirroring `shouldReplayPostMerge` above: a real,
+      // conflict-free `git merge` is the ONLY path that ever invokes `pre-merge-commit` at all
+      // (githooks(5); verified against git 2.43/2.50) — a conflicted merge resolved by hand and
+      // concluded via an ordinary `git commit` fires `pre-commit` instead, never this hook. Running
+      // it unconditionally here would subject that manual-resolution replay to a check the real
+      // workflow it stands in for never applies, and can park a merge the project's own hooks
+      // otherwise accept (PR #338 review round 30, chatgpt-codex-connector, P2).
+      //
       // Run BEFORE `MERGE_HEAD`/`MERGE_MSG` are written, and with `GIT_EDITOR=:` set (handled by
       // `runIgnoreMissingHook`/`gitHookEnv`) — a real `git merge --no-edit` invokes this hook with
       // neither file on disk yet (its own successful-auto-merge path never writes `MERGE_HEAD` at
@@ -2007,13 +2015,15 @@ export async function commitAll(
       // sees no `.git/MERGE_HEAD`. Writing those files first, as this used to, left a hook that
       // inspects merge state seeing a shape `git merge` itself never produces at this point (PR
       // #338 review, chatgpt-codex-connector).
-      await runIgnoreMissingHook(
-        worktreePath,
-        "pre-merge-commit",
-        options.hooksPath,
-        options.timeoutMs,
-        options.signal,
-      );
+      if (options.verifiedBoundaryIsBareMerge) {
+        await runIgnoreMissingHook(
+          worktreePath,
+          "pre-merge-commit",
+          options.hooksPath,
+          options.timeoutMs,
+          options.signal,
+        );
+      }
       mergeHeadPath = await git(worktreePath, [
         "rev-parse",
         "--path-format=absolute",
