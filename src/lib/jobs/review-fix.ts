@@ -1341,13 +1341,23 @@ async function premergeBase(
       // advanced between the attempt that left this conflict and this retry, resuming it would
       // resolve and push a merge that silently omits every base commit landed since, while the
       // caller's `refsSynced: true` still reports the branch caught up with the base it just
-      // read. Compare the two tips and only resume when they still agree; otherwise abort the
-      // stale merge and fall through to start a fresh one against the current tip below.
+      // read. Compare the two tips and only resume when BOTH were read and PROVEN equal;
+      // otherwise abort the stale merge and fall through to start a fresh one against the
+      // current tip below.
       const [mergeHeadSha, currentBaseSha] = await Promise.all([
         resolveCommitSha(worktreePath, "MERGE_HEAD").catch(() => undefined),
         resolveCommitSha(worktreePath, baseRef).catch(() => undefined),
       ]);
-      if (!mergeHeadSha || !currentBaseSha || mergeHeadSha === currentBaseSha) {
+      if (!mergeHeadSha || !currentBaseSha) {
+        // A transient failure here must NOT read as permission to resume (PR #338 review,
+        // chatgpt-codex-connector, round 34): unlike the read at the top of this function, this
+        // one guards resuming a merge whose omitted-commits risk is exactly what the comment
+        // above describes. An unresolved comparison can't prove the conflicted merge still
+        // targets `baseRef`'s current tip, so fail the premerge rather than accept it — folding
+        // into `refsSynced: false` instead of silently reporting the checkout as caught up.
+        return { conflicts: [], merged: false, failed: true };
+      }
+      if (mergeHeadSha === currentBaseSha) {
         const unresolved = await unmergedPaths(worktreePath).catch(() => []);
         return { conflicts: unresolved, merged: true, failed: false };
       }
