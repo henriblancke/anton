@@ -2232,6 +2232,31 @@ describe("mainRoundChangesSurvived", () => {
     ).toBe(false);
   });
 
+  it("returns false when a gate follow-up reverts the main round's hunk but adds an unrelated change to the same file", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix the bug"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up reverts the review fix back to the buggy line, but also tacks on an
+    // unrelated change to the SAME file. The file's final tree entry still differs from both
+    // `preSessionHead` and `preGateHead`, so a whole-blob compare alone can't tell this apart from
+    // a legitimate reformat of the fix — it must catch that the reviewed hunk itself came back.
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\nconst z = unrelated();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert fix, add unrelated line"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
   it("returns false when a gate follow-up recreates a file the main round deleted, with different content", async () => {
     writeFileSync(join(dir, "secret.txt"), "leaked-token\n");
     g(["add", "-A"]);

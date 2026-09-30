@@ -745,6 +745,14 @@ async function handleEpic(args: {
     // the whole job, and a transient failure (e.g. a brief SQLite lock) clears on that next attempt.
     if (!refsSynced) {
       invalidateReviewFixAttempt(db, ctx.jobId);
+      // The fetch/sync above is best-effort and swallows its own errors into `refsSynced: false` —
+      // including a signal that aborted mid-fetch (a no-progress timeout, a lost lease). Returning
+      // "incomplete" normally in that case would complete this handler as if the round genuinely
+      // found nothing to sync, letting the runner settle a timed-out/lease-lost attempt as done
+      // instead of retrying it (PR #338 review, chatgpt-codex-connector).
+      if (ctx.signal.aborted) {
+        throw ctx.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+      }
       consoleLog.info(
         `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — skipping this round's fix session rather than gating/pushing against a potentially stale base`,
       );
@@ -1623,8 +1631,12 @@ export function shouldRecordAnswered(
  * byte-for-byte (PR #338 review, chatgpt-codex-connector, round 2): a follow-up that formats or
  * otherwise augments a path the main round already fixed leaves that path's final tree entry
  * different from `preGateHead` too, and requiring an exact match would discard a fix that is, in
- * substance, still on the branch. Only a follow-up that reverts a path all the way back to its
- * pre-session state counts as "did not survive" for that path.
+ * substance, still on the branch. A follow-up that reverts a path all the way back to its
+ * pre-session state counts as "did not survive" for that path — and so does one that reverts the
+ * main round's specific hunk while leaving or adding an unrelated change elsewhere in the SAME
+ * file (PR #338 review, chatgpt-codex-connector, P1): that also leaves the final tree entry
+ * different from `preSessionHead`, so a whole-file compare alone can't tell the two apart. See
+ * {@link mainRoundHunkSurvived} for the hunk-level check this falls back to in that case.
  *
  * Fails closed throughout: a missing `preSessionHead`, no commit from the main round, or any git
  * read that errors reads as "did not survive" rather than risk crediting a claim the round never
@@ -1685,10 +1697,68 @@ export async function mainRoundChangesSurvived(
       // different content, `atPreSession !== atFinal` is still true even though the deletion was
       // undone — the recreated blob just happens to differ from the original one.
       if (atPreGate === undefined) return atFinal === undefined;
-      return atPreSession !== atFinal;
+      if (atFinal === atPreSession) return false;
+      if (atFinal === undefined || atFinal === atPreGate) return true;
+      // Beyond this point `atFinal` differs from BOTH ends (PR #338 review, chatgpt-codex-connector,
+      // P1): the follow-up touched this path further after the main round's own fix. A whole-blob
+      // compare can't tell "the follow-up reverted the main round's hunk but also made an unrelated
+      // edit elsewhere in the file" apart from a genuine reformat — the unrelated edit alone is
+      // enough to make `atFinal` differ from `atPreSession`, and the old `atPreSession !== atFinal`
+      // check credited that as "survived" even with the reviewed hunk reverted underneath it. Check
+      // hunk-by-hunk instead, applying the SAME "back to what it looked like before the main round
+      // touched it" test this function already uses at file granularity.
+      return mainRoundHunkSurvived(worktreePath, preSessionHead, preGateHead, postSessionHead, path);
     }),
   );
   return survived.every(Boolean);
+}
+
+/**
+ * Hunk-level fallback for {@link mainRoundChangesSurvived}: called only once a path's final tree
+ * entry differs from BOTH its pre-session and pre-gate content, so a whole-file compare can no
+ * longer tell a reverted hunk apart from an unrelated edit made elsewhere in the same file. Walks
+ * the main round's own hunks for this path and checks each against the FINAL file content: a hunk
+ * survives when the text it added is still present; it is reverted only when that added text is
+ * gone AND the exact text it replaced has reappeared. Any other outcome — the region was edited
+ * into something else entirely — is treated the same as the file-level "reformatted, not reverted"
+ * case, i.e. survived.
+ *
+ * Fails closed (not survived) on a read error, matching the caller's own convention.
+ */
+async function mainRoundHunkSurvived(
+  worktreePath: string,
+  preSessionHead: string,
+  preGateHead: string,
+  postSessionHead: string,
+  path: string,
+): Promise<boolean> {
+  const [mainDiff, finalContent] = await Promise.all([
+    git(worktreePath, ["diff", "-U0", "--no-color", preSessionHead, preGateHead, "--", path]).catch(
+      () => undefined,
+    ),
+    git(worktreePath, ["show", `${postSessionHead}:${path}`]).catch(() => undefined),
+  ]);
+  if (mainDiff === undefined || finalContent === undefined) return false;
+  const hunks: { removed: string[]; added: string[] }[] = [];
+  for (const line of mainDiff.split("\n")) {
+    if (line.startsWith("@@")) {
+      hunks.push({ removed: [], added: [] });
+      continue;
+    }
+    const hunk = hunks[hunks.length - 1];
+    if (!hunk || line.startsWith("---") || line.startsWith("+++")) continue;
+    if (line.startsWith("-")) hunk.removed.push(line.slice(1));
+    else if (line.startsWith("+")) hunk.added.push(line.slice(1));
+  }
+  // No parsed hunks (e.g. a binary diff) — nothing to check hunk-by-hunk. The caller only reaches
+  // here when `atFinal` already differs from `atPreSession`, so fall back to that same verdict.
+  if (hunks.length === 0) return true;
+  return hunks.every(({ removed, added }) => {
+    const addedBlock = added.join("\n");
+    if (addedBlock.length > 0 && finalContent.includes(addedBlock)) return true;
+    const removedBlock = removed.join("\n");
+    return !(removedBlock.length > 0 && finalContent.includes(removedBlock));
+  });
 }
 
 /**
