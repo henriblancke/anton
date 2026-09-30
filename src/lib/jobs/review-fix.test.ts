@@ -2283,6 +2283,75 @@ describe("mainRoundChangesSurvived", () => {
     ).toBe(false);
   });
 
+  it("returns false when a follow-up reverts a pure-addition hunk whose text duplicates a pre-existing line elsewhere in the file (PR #338 review, round 4)", async () => {
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round's fix is a pure addition whose added line ("  return true;") happens to
+    // duplicate a line that already exists elsewhere in the file (in function a).
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return true;\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix function b"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up drops the added line (reverting the fix, back to the original 1
+    // occurrence of "  return true;") but also tacks on an unrelated function elsewhere in the
+    // same file, so the final tree entry differs from BOTH preSessionHead and preGateHead. A
+    // location-blind `finalContent.includes(addedBlock)` would still find the pre-existing
+    // occurrence in function a and wrongly credit this as "survived".
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return false;\n}\nfunction c() {\n  return 42;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert fix, add unrelated function"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns true when a follow-up keeps a pure-addition hunk whose text duplicates a pre-existing line elsewhere, while editing the file further", async () => {
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return true;\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix function b"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up keeps the main round's added line in function b intact (now two
+    // occurrences of "  return true;" on the branch) and just tacks on an unrelated function.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return true;\n  return false;\n}\nfunction c() {\n  return 42;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: add unrelated function"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(true);
+  });
+
   it("returns false when a gate follow-up recreates a file the main round deleted, with different content", async () => {
     writeFileSync(join(dir, "secret.txt"), "leaked-token\n");
     g(["add", "-A"]);

@@ -1713,17 +1713,51 @@ export async function mainRoundChangesSurvived(
   return survived.every(Boolean);
 }
 
+/** Non-overlapping occurrence count of `needle` in `haystack`; 0 for an empty needle. */
+function countOccurrences(haystack: string, needle: string): number {
+  if (needle.length === 0) return 0;
+  let count = 0;
+  let idx = 0;
+  for (;;) {
+    idx = haystack.indexOf(needle, idx);
+    if (idx === -1) return count;
+    count++;
+    idx += needle.length;
+  }
+}
+
+/**
+ * A path's content at `commit`, distinguishing "genuinely absent at this commit" (`""`, e.g. a
+ * file the main round itself created) from a real read failure (`undefined`) — collapsing both to
+ * the same value would let a failed read masquerade as an empty, newly-created file.
+ */
+function fileContentAt(worktreePath: string, commit: string, path: string): Promise<string | undefined> {
+  return git(worktreePath, ["show", `${commit}:${path}`]).catch(() =>
+    git(worktreePath, ["ls-tree", commit, "--", path])
+      .then((out) => (out.trim() === "" ? "" : undefined))
+      .catch(() => undefined),
+  );
+}
+
 /**
  * Hunk-level fallback for {@link mainRoundChangesSurvived}: called only once a path's final tree
  * entry differs from BOTH its pre-session and pre-gate content, so a whole-file compare can no
  * longer tell a reverted hunk apart from an unrelated edit made elsewhere in the same file. Walks
- * the main round's own hunks for this path and checks each against the FINAL file content: a hunk
- * survives when the text it added is still present. Otherwise it's reverted when either the exact
- * text it replaced has reappeared, or (for a pure-addition hunk, with nothing removed to reappear)
- * the added text is simply gone — a PR #338 P1 fix: with `removed` empty, the old check's
- * `removedBlock.length > 0` guard was always false, so a pure-addition hunk's absence was silently
- * credited as "survived". Any other outcome — a replacement hunk edited into something else
- * entirely — is treated the same as the file-level "reformatted, not reverted" case, i.e. survived.
+ * the main round's own hunks for this path and checks each against the FINAL file content.
+ *
+ * A hunk survives when the count of its added text in the FINAL file exceeds the count in the
+ * PRE-SESSION file — i.e. an occurrence beyond whatever already existed is still there. Comparing
+ * counts rather than a plain `includes` (PR #338 review, chatgpt-codex-connector, round 4) matters
+ * because a global `includes` ignores location: when the added text happens to duplicate text
+ * already present elsewhere in the file (e.g. another `return true;`), that pre-existing
+ * occurrence alone satisfies a plain `includes` even after the follow-up strips out the hunk's own
+ * occurrence and edits something unrelated in the same file. Otherwise the hunk is reverted when
+ * the exact text it replaced has reappeared, or (for a pure-addition hunk, with nothing removed to
+ * reappear) the added-text count simply didn't grow — a PR #338 P1 fix: with `removed` empty, the
+ * old check's `removedBlock.length > 0` guard was always false, so a pure-addition hunk's absence
+ * was silently credited as "survived". Any other outcome — a replacement hunk edited into
+ * something else entirely — is treated the same as the file-level "reformatted, not reverted"
+ * case, i.e. survived.
  *
  * Fails closed (not survived) on a read error, matching the caller's own convention.
  */
@@ -1734,13 +1768,14 @@ async function mainRoundHunkSurvived(
   postSessionHead: string,
   path: string,
 ): Promise<boolean> {
-  const [mainDiff, finalContent] = await Promise.all([
+  const [mainDiff, preSessionContent, finalContent] = await Promise.all([
     git(worktreePath, ["diff", "-U0", "--no-color", preSessionHead, preGateHead, "--", path]).catch(
       () => undefined,
     ),
-    git(worktreePath, ["show", `${postSessionHead}:${path}`]).catch(() => undefined),
+    fileContentAt(worktreePath, preSessionHead, path),
+    fileContentAt(worktreePath, postSessionHead, path),
   ]);
-  if (mainDiff === undefined || finalContent === undefined) return false;
+  if (mainDiff === undefined || preSessionContent === undefined || finalContent === undefined) return false;
   const hunks: { removed: string[]; added: string[] }[] = [];
   for (const line of mainDiff.split("\n")) {
     if (line.startsWith("@@")) {
@@ -1757,11 +1792,13 @@ async function mainRoundHunkSurvived(
   if (hunks.length === 0) return true;
   return hunks.every(({ removed, added }) => {
     const addedBlock = added.join("\n");
-    if (addedBlock.length > 0 && finalContent.includes(addedBlock)) return true;
+    if (addedBlock.length > 0 && countOccurrences(finalContent, addedBlock) > countOccurrences(preSessionContent, addedBlock)) {
+      return true;
+    }
     const removedBlock = removed.join("\n");
     if (removedBlock.length > 0) return !finalContent.includes(removedBlock);
     // Pure-addition hunk (nothing removed): there's no prior text whose reappearance would
-    // prove a revert, so the absence of the added text above IS the revert signal.
+    // prove a revert, so the added-text count not growing above IS the revert signal.
     return addedBlock.length === 0;
   });
 }
