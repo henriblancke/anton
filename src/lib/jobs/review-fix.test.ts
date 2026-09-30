@@ -2231,6 +2231,30 @@ describe("mainRoundChangesSurvived", () => {
       await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
     ).toBe(false);
   });
+
+  it("returns false when a gate follow-up recreates a file the main round deleted, with different content", async () => {
+    writeFileSync(join(dir, "secret.txt"), "leaked-token\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round deletes the file entirely.
+    g(["rm", "-q", "secret.txt"]);
+    g(["commit", "-q", "-m", "main round: delete secret.txt"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // Gate follow-up recreates the path with different content. The blob differs from the
+    // original, so a plain `atPreSession !== atFinal` reads this as "survived" — but the
+    // deletion itself was undone.
+    writeFileSync(join(dir, "secret.txt"), "different-content\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: recreate secret.txt"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
 });
 
 // anton-gvqk3: a gate parking the fix session must say so on the PR itself — the run-log entry

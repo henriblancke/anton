@@ -1673,11 +1673,18 @@ export async function mainRoundChangesSurvived(
       // `preGateHead` too, and that difference is not a reversion. Only a final entry that matches
       // back up with what the path looked like BEFORE the main round touched it means the
       // follow-up undid the fix.
-      const [atPreSession, atFinal] = await Promise.all([
+      const [atPreSession, atPreGate, atFinal] = await Promise.all([
         treeEntryAt(preSessionHead, path),
+        treeEntryAt(preGateHead, path),
         treeEntryAt(postSessionHead, path),
       ]);
-      if (atPreSession === READ_FAILED || atFinal === READ_FAILED) return false;
+      if (atPreSession === READ_FAILED || atPreGate === READ_FAILED || atFinal === READ_FAILED) return false;
+      // A deletion needs the final tree to still be ABSENT, not merely different from the
+      // pre-session entry (PR #338 review, chatgpt-codex-connector, round 3): if the main round
+      // deleted this path (`atPreGate === undefined`) and a gate follow-up recreates it with
+      // different content, `atPreSession !== atFinal` is still true even though the deletion was
+      // undone — the recreated blob just happens to differ from the original one.
+      if (atPreGate === undefined) return atFinal === undefined;
       return atPreSession !== atFinal;
     }),
   );
