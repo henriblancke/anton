@@ -2257,6 +2257,32 @@ describe("mainRoundChangesSurvived", () => {
     ).toBe(false);
   });
 
+  it("returns false when a gate follow-up reverts a pure-addition hunk but edits the same file elsewhere (PR #338 P1)", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round's fix is a pure addition — no line is removed, only a new one added.
+    writeFileSync(join(dir, "app.ts"), "const x = 1;\nconst y = validate();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: add validation"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up drops the added line (reverting the fix) but also tacks on an unrelated
+    // line to the same file, so the final tree entry differs from BOTH preSessionHead and
+    // preGateHead — a pure-addition hunk has no removed text whose reappearance the old check
+    // could key off, so it credited this as "survived".
+    writeFileSync(join(dir, "app.ts"), "const x = 1;\nconst z = unrelated();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: drop validation, add unrelated line"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
   it("returns false when a gate follow-up recreates a file the main round deleted, with different content", async () => {
     writeFileSync(join(dir, "secret.txt"), "leaked-token\n");
     g(["add", "-A"]);

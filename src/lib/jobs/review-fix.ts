@@ -1718,10 +1718,12 @@ export async function mainRoundChangesSurvived(
  * entry differs from BOTH its pre-session and pre-gate content, so a whole-file compare can no
  * longer tell a reverted hunk apart from an unrelated edit made elsewhere in the same file. Walks
  * the main round's own hunks for this path and checks each against the FINAL file content: a hunk
- * survives when the text it added is still present; it is reverted only when that added text is
- * gone AND the exact text it replaced has reappeared. Any other outcome — the region was edited
- * into something else entirely — is treated the same as the file-level "reformatted, not reverted"
- * case, i.e. survived.
+ * survives when the text it added is still present. Otherwise it's reverted when either the exact
+ * text it replaced has reappeared, or (for a pure-addition hunk, with nothing removed to reappear)
+ * the added text is simply gone — a PR #338 P1 fix: with `removed` empty, the old check's
+ * `removedBlock.length > 0` guard was always false, so a pure-addition hunk's absence was silently
+ * credited as "survived". Any other outcome — a replacement hunk edited into something else
+ * entirely — is treated the same as the file-level "reformatted, not reverted" case, i.e. survived.
  *
  * Fails closed (not survived) on a read error, matching the caller's own convention.
  */
@@ -1757,7 +1759,10 @@ async function mainRoundHunkSurvived(
     const addedBlock = added.join("\n");
     if (addedBlock.length > 0 && finalContent.includes(addedBlock)) return true;
     const removedBlock = removed.join("\n");
-    return !(removedBlock.length > 0 && finalContent.includes(removedBlock));
+    if (removedBlock.length > 0) return !finalContent.includes(removedBlock);
+    // Pure-addition hunk (nothing removed): there's no prior text whose reappearance would
+    // prove a revert, so the absence of the added text above IS the revert signal.
+    return addedBlock.length === 0;
   });
 }
 
