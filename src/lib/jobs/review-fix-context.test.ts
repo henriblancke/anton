@@ -8,6 +8,7 @@ import {
   buildReviewFixPrompt,
   CLUSTERED_FINDINGS_THRESHOLD,
   labelValue,
+  NON_THREAD_REPORT_ID,
   parseThreadReport,
   reviewFixContext,
   triageOutcomes,
@@ -26,6 +27,7 @@ function makePr(overrides: Partial<PrReview> = {}): PrReview {
     reviewDecision: "CHANGES_REQUESTED",
     mergeable: "MERGEABLE",
     headRefName: "anton/anton-x1",
+    baseRefName: "main",
     headSha: "sha1",
     url: "https://github.com/acme/repo/pull/7",
     reviews: [],
@@ -77,6 +79,23 @@ describe("buildReviewFixPrompt — reasoning attribution", () => {
       projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
     });
     expect(other.promptBodyDigest).not.toBe(attribution.promptBodyDigest);
+  });
+
+  // anton-pwekp: the follow-up round's prompt must actually carry the gate output, not just the
+  // reasoning contract — this is what the agent sees when deciding what to fix.
+  it("carries the gate label + output in the prompt when a gate just failed", async () => {
+    const { prompt } = await buildReviewFixPrompt({
+      epic,
+      pr,
+      reasons: ["the tests gate failed after the fix (exit 3)"],
+      conflicts: [],
+      gateFailure: { label: "tests", output: "boom-output" },
+      settings,
+      projectDir: "/tmp/anton-review-fix-context-test-nonexistent",
+    });
+    expect(prompt).toContain("## Gate failure (one follow-up round)");
+    expect(prompt).toContain("tests gate failed after the fix above");
+    expect(prompt).toContain("boom-output");
   });
 });
 
@@ -141,10 +160,97 @@ describe("reviewFixContext", () => {
     expect(out).toContain('{"threads":[{"id":"<thread id>"');
   });
 
-  it("omits the reporting format when there are no threads", () => {
+  // anton-091jr review round 2 (chatgpt-codex-connector): a round with no inline threads is still
+  // actionable (CI-only, conflict-only, or a reviewer summary with no inline comments) and must
+  // still ask for a report — the sentinel entry is what proves claude actually addressed the
+  // reason, rather than a successful-but-silent run being mistaken for one that did.
+  it("asks for a sentinel-keyed report when there are no threads but the round is still actionable", () => {
     const out = reviewFixContext(epic, makePr({ failingChecks: ["build"] }), ["failing checks: build"]);
     expect(out).toContain("Failing CI checks: build.");
+    expect(out).toContain("## Reporting format (required)");
+    expect(out).toContain(NON_THREAD_REPORT_ID);
+  });
+
+  it("omits the reporting format entirely when there are no threads and no reasons", () => {
+    const out = reviewFixContext(epic, makePr({ failingChecks: [] }), []);
     expect(out).not.toContain("## Reporting format (required)");
+  });
+
+  // PR #338 review (chatgpt-codex-connector): the sentinel schema must permit "needs-human" too —
+  // otherwise a non-thread reason that genuinely needs a product decision has no outcome claude can
+  // report, and the needs-human flow (classifyReview folding in a human's top-level reply) never
+  // activates.
+  it("permits needs-human alongside fixed/left in the sentinel-only reporting format", () => {
+    const out = reviewFixContext(epic, makePr({ failingChecks: ["build"] }), ["failing checks: build"]);
+    expect(out).toContain('"outcome":"fixed" | "left" | "needs-human"');
+  });
+
+  it("permits needs-human for the sentinel entry in the mixed (threads + non-thread) format too", () => {
+    const threads: ReviewThread[] = [threadOn("src/a.ts", "RT_1")];
+    const out = reviewFixContext(
+      epic,
+      makePr({ threads, failingChecks: ["build"] }),
+      ["failing checks: build", "1 unresolved review thread(s)"],
+      [],
+      undefined,
+      true,
+    );
+    expect(out).toContain('with outcome "fixed", "left", or');
+    expect(out).toContain('"needs-human"');
+  });
+
+  // PR #338 review (chatgpt-codex-connector): a round with BOTH inline threads and a non-thread
+  // reason (a failing check here) must ask for the sentinel too, not just the per-thread report —
+  // otherwise claude never has a chance to acknowledge the non-thread reason and
+  // allWaitingThreadsAnswered can never see the positive evidence it requires for one.
+  it("also asks for the sentinel-keyed entry when threads AND a non-thread reason are both present", () => {
+    const threads: ReviewThread[] = [threadOn("src/a.ts", "RT_1")];
+    const out = reviewFixContext(
+      epic,
+      makePr({ threads, failingChecks: ["build"] }),
+      ["failing checks: build", "1 unresolved review thread(s)"],
+      [],
+      undefined,
+      true,
+    );
+    expect(out).toContain('{"threads":[{"id":"<thread id>"');
+    expect(out).toContain(NON_THREAD_REPORT_ID);
+  });
+
+  it("does not mention the sentinel when threads are present but nothing else is actionable", () => {
+    const threads: ReviewThread[] = [threadOn("src/a.ts", "RT_1")];
+    const out = reviewFixContext(epic, makePr({ threads }), ["1 unresolved review thread(s)"]);
+    expect(out).toContain('{"threads":[{"id":"<thread id>"');
+    expect(out).not.toContain(NON_THREAD_REPORT_ID);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): when a human answers a prior needs-human sentinel with
+  // a top-level PR comment, the fixer must see the reply — classifyReview already changes the
+  // fingerprint on it, so without this the session dispatched off that change can't see what was
+  // said and may just repeat the same request.
+  it("surfaces top-level human PR comments, excluding anton's own posts", () => {
+    const out = reviewFixContext(
+      epic,
+      makePr({
+        comments: [
+          { id: "1", author: "anton", body: `${ANTON_MARK} anton did not push a fix — needs a call` },
+          { id: "2", author: "alice", body: "go with option B" },
+        ],
+      }),
+      ["needs a product decision"],
+    );
+    expect(out).toContain("Top-level PR comments");
+    expect(out).toContain("- @alice: go with option B");
+    expect(out).not.toContain("needs a call");
+  });
+
+  it("omits the human-comments section when there are none besides anton's own", () => {
+    const out = reviewFixContext(
+      epic,
+      makePr({ comments: [{ id: "1", author: "anton", body: `${ANTON_MARK} left as-is` }] }),
+      ["failing checks: build"],
+    );
+    expect(out).not.toContain("Top-level PR comments");
   });
 
   it("lists merge conflicts when present", () => {
@@ -152,6 +258,55 @@ describe("reviewFixContext", () => {
     expect(out).toContain("Merge conflicts:");
     expect(out).toContain("- src/a.ts");
     expect(out).toContain("- src/b.ts");
+  });
+
+  // anton-pwekp: the bounded follow-up round's own context, beside conflictsSection.
+  it("includes the gate failure section when a gate just failed", () => {
+    const out = reviewFixContext(epic, makePr(), ["gate failed"], [], {
+      label: "tests",
+      output: "boom-output",
+    });
+    expect(out).toContain("## Gate failure (one follow-up round)");
+    expect(out).toContain("The tests gate failed after the fix above.");
+    expect(out).toContain("boom-output");
+  });
+
+  it("omits the gate failure section when no gate failed", () => {
+    const out = reviewFixContext(epic, makePr(), ["conflicts"], ["src/a.ts"]);
+    expect(out).not.toContain("## Gate failure");
+  });
+
+  // PR #338 review (@claude): a gate-failure follow-up is the one bounded round the gate gets, not
+  // a re-diagnosis of the review feedback — it must not carry the reviewer summaries, thread
+  // listings, cluster callout, merge-conflict list, or a thread-report ask, even when the (pre-fix)
+  // `pr`/`conflicts` snapshot still has them. Nothing reads this dispatch's result text, so the
+  // reporting ask is pure noise here. `conflicts` is non-empty here specifically so this test would
+  // fail if `conflictsSection` were ever ungated again: today the only caller of a gate-only round
+  // (`runGateFixFollowUp`) always passes `conflicts: []`, but that's an invariant this function
+  // itself must enforce, not one a caller happens to uphold (PR #338 review round 2, @claude).
+  it("trims the prompt to header + gate output when a gate just failed, even with threads/reviews/conflicts present", () => {
+    const threads: ReviewThread[] = Array.from({ length: CLUSTERED_FINDINGS_THRESHOLD }, (_, i) =>
+      threadOn("src/broken.ts", `RT_${i}`),
+    );
+    const out = reviewFixContext(
+      epic,
+      makePr({
+        threads,
+        failingChecks: ["build"],
+        reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "rename foo to bar" }],
+      }),
+      ["the tests gate failed after the fix (exit 3)"],
+      ["src/a.ts"],
+      { label: "tests", output: "boom-output" },
+    );
+    expect(out).toContain("## Gate failure (one follow-up round)");
+    expect(out).toContain("boom-output");
+    expect(out).not.toContain("Reviewer summaries requesting changes:");
+    expect(out).not.toContain("[thread RT_0]");
+    expect(out).not.toContain("## Clustered findings");
+    expect(out).not.toContain("Failing CI checks:");
+    expect(out).not.toContain("Merge conflicts:");
+    expect(out).not.toContain("## Reporting format (required)");
   });
 
   function threadOn(path: string, id: string): ReviewThread {

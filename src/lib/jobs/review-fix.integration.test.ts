@@ -15,6 +15,7 @@ import { driveJob, makeJobRunner } from "@/lib/testing/jobs";
 import { beads, LABELS } from "../beads/bd";
 import { selfBuildVersion } from "../build/drift";
 import * as schema from "../db/schema";
+import { classifyReview } from "../git/pr";
 import { getJob, type Clock } from "./queue";
 
 // Records every `pushBranch` call's args while delegating to the real implementation — so a test
@@ -28,6 +29,20 @@ vi.mock("../git/ops", async () => {
     pushBranch: (...args: Parameters<typeof actual.pushBranch>) => {
       pushBranchCalls.push(args);
       return actual.pushBranch(...args);
+    },
+  };
+});
+
+// Flips on for one test to prove `recordReviewFixAnswered` is best-effort (anton-091jr review
+// round 2): every other test delegates straight to the real implementation.
+let recordAnsweredThrows = false;
+vi.mock("./queue", async () => {
+  const actual = await vi.importActual<typeof import("./queue")>("./queue");
+  return {
+    ...actual,
+    recordReviewFixAnswered: (...args: Parameters<typeof actual.recordReviewFixAnswered>) => {
+      if (recordAnsweredThrows) throw new Error("simulated jobs table write failure");
+      return actual.recordReviewFixAnswered(...args);
     },
   };
 });
@@ -51,6 +66,23 @@ function writeBin(dir: string, name: string, body: string): string {
   chmodSync(p, 0o755);
   return p;
 }
+
+// `getPrReview` (src/lib/git/pr.ts) no longer reads reviews/checks/comments off `pr view`'s own
+// JSON — each is now its own paginated `gh api graphql` call, and a query this fake `gh` doesn't
+// recognize returns no stdout at all, which `getPrReviews`/`getPrCheckRollup`/`getPrTopLevelComments`
+// treat as a degraded read (`reviewsComplete`/`checksComplete`/`commentsComplete: false`).
+// `classifyReview` then treats that incompleteness itself as an actionable reason, so a fixture
+// that wants a genuinely clean/green PR must answer every one of these queries with a real,
+// complete-but-empty page — not fall through to a silent `process.exit(0)`. Dispatched by a
+// substring unique to each query's body (`_QUERY` constants in pr.ts).
+const GRAPHQL_EMPTY_COMPLETE_PAGES = `if(a[0]==='api'&&a[1]==='graphql'){
+  const gq=a.join(' ');
+  const empty=(shape)=>{console.log(JSON.stringify({data:{repository:{pullRequest:shape}}}));process.exit(0);};
+  if(gq.includes('reviewThreads(')) empty({reviewThreads:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}});
+  if(gq.includes('reviews(first')) empty({reviews:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}});
+  if(gq.includes('statusCheckRollup')) empty({commits:{nodes:[{commit:{statusCheckRollup:{contexts:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}}]}});
+  empty({comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}});
+}`;
 
 describeBd("review-fix e2e (real handler · real bd/git · fake claude/gh)", () => {
   let bdRepo: BdRepo;
@@ -435,6 +467,32 @@ process.exit(0);`,
     }
   });
 
+  it("settles an 'answered, nothing to push' round `done` even when recordReviewFixAnswered throws (anton-091jr)", async () => {
+    // No prior unpushed commit and a no-op claude — the branch is already in sync with origin from
+    // the previous test, so this round genuinely has nothing to commit or push, landing on the
+    // `answered` outcome that calls `recordReviewFixAnswered`.
+    const noopClaude = writeBin(
+      binDir,
+      "claude-noop-answered",
+      `const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+e({type:'result',subtype:'success',result:'nothing to change',is_error:false});
+process.exit(0);`,
+    );
+    const prev = process.env.ANTON_CLAUDE_BIN;
+    process.env.ANTON_CLAUDE_BIN = noopClaude;
+    recordAnsweredThrows = true;
+    try {
+      const fixes = await runSweep();
+      expect(fixes).toHaveLength(1);
+      // A best-effort bookkeeping write throwing must not turn a legitimately successful round into
+      // a job failure/retry (anton-tuf4l's "recording never fails the work").
+      expect((await getJob(tdb.db, fixes[0]))?.status).toBe("done");
+    } finally {
+      process.env.ANTON_CLAUDE_BIN = prev;
+      recordAnsweredThrows = false;
+    }
+  });
+
   /**
    * anton-z5e3g's never-fail rule, end-to-end: the round record is a meter, and a meter must not cost
    * a delivery. The table is dropped out from under a live fix — the sharpest form of a write that
@@ -467,6 +525,7 @@ process.exit(0);`,
       `const a=process.argv.slice(2);
 if(a[0]==='pr'&&a[1]==='view'){console.log(JSON.stringify({number:7,state:'OPEN',reviewDecision:'APPROVED',headRefName:process.env.FAKE_BRANCH,url:'u',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'SUCCESS'}]}));process.exit(0);}
 if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+${GRAPHQL_EMPTY_COMPLETE_PAGES}
 process.exit(0);`,
     );
     const prev = process.env.ANTON_GH_BIN;
@@ -505,6 +564,7 @@ if(a[0]==='pr'&&a[1]==='view'){
   console.log(JSON.stringify({number:n,state:'OPEN',reviewDecision:'APPROVED',headRefName:process.env.FAKE_BRANCH,url:'u',reviews:[],statusCheckRollup:[{__typename:'CheckRun',name:'build',status:'COMPLETED',conclusion:'SUCCESS'}]}));process.exit(0);
 }
 if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+${GRAPHQL_EMPTY_COMPLETE_PAGES}
 process.exit(0);`,
     );
 
@@ -753,6 +813,149 @@ process.exit(0);`,
       process.env.FAKE_PARK_HEAD = "sha-new";
       await runDispatch(parkEpic);
       jobs = jobsForParkEpic();
+      expect(jobs).toHaveLength(2);
+      expect(jobs.some((j) => j.status === "queued")).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("does not re-dispatch a target that answered at the current PR head with unchanged reasons; admits one once a reason changes", async () => {
+    const answerEpic = await beads.create(repo, {
+      title: "Feature stuck on an unfixable check",
+      type: "epic",
+      description: "## Goal\nUnfixable check.",
+    });
+    const answerBranch = `anton/${answerEpic}`;
+    const g = (args: string[], cwd = repo) => execFileSync("git", args, { cwd, stdio: "ignore" });
+    g(["checkout", "-q", "-b", answerBranch]);
+    writeFileSync(join(repo, "answer.txt"), "v1\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "answer work"]);
+    g(["push", "-q", "-u", "origin", answerBranch]);
+    g(["checkout", "-q", "main"]);
+    await beads.tag(repo, answerEpic, [LABELS.stage("in-review")]);
+    await beads.setPrRef(repo, answerEpic, "gh-21");
+
+    // Always actionable (CHANGES_REQUESTED) at a fixed head; FAKE_ANSWER_FAILING toggles a second
+    // reason (a failing check) so the test can change classifyReview's reasons without a new commit
+    // — exactly the "PR-body waiver / stuck CI check" case anton-dfuvz targets.
+    const answerGh = writeBin(
+      binDir,
+      "gh-answer",
+      `const a=process.argv.slice(2);
+const q=a.join(' ');
+const checks = process.env.FAKE_ANSWER_FAILING === '1' ? [{__typename:'CheckRun',name:'golden-fence',status:'COMPLETED',conclusion:'FAILURE'}] : [];
+if(a[0]==='pr'&&a[1]==='view'){
+  console.log(JSON.stringify({number:21,state:'OPEN',reviewDecision:'CHANGES_REQUESTED',mergeable:'MERGEABLE',headRefName:'${answerBranch}',headRefOid:'sha-answer',url:'u',reviews:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}]}));
+  process.exit(0);
+}
+if(a[0]==='repo'){console.log('acme/repo');process.exit(0);}
+if(a[0]==='api'&&a[1]==='graphql'){
+  if(q.includes('statusCheckRollup')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{commits:{nodes:[{commit:{statusCheckRollup:{contexts:{
+      pageInfo:{hasNextPage:false,endCursor:null},
+      nodes:checks,
+    }}}}]}}}}}));
+    process.exit(0);
+  }
+  const empty={pageInfo:{hasNextPage:false,endCursor:null},nodes:[]};
+  if(q.includes('comments(first:100')){
+    console.log(JSON.stringify({data:{repository:{pullRequest:{comments:empty}}}}));
+    process.exit(0);
+  }
+  if(q.includes('reviews(first:100')){
+    // No id/submittedAt fields — matches the synthetic PrReview the test builds its expected
+    // fingerprint from below (author/state/body only), so both fall back to the same "?"
+    // identity in classifyReview's review fingerprint key.
+    console.log(JSON.stringify({data:{repository:{pullRequest:{reviews:{
+      pageInfo:{hasNextPage:false,endCursor:null},
+      nodes:[{author:{login:'alice'},state:'CHANGES_REQUESTED',body:'fix it'}],
+    }}}}}));
+    process.exit(0);
+  }
+  console.log(JSON.stringify({data:{repository:{pullRequest:{reviewThreads:empty}}}}));
+  process.exit(0);
+}
+process.exit(0);`,
+    );
+
+    const restore = saveEnv(["ANTON_GH_BIN", "FAKE_ANSWER_FAILING"]);
+    process.env.ANTON_GH_BIN = answerGh;
+    process.env.FAKE_ANSWER_FAILING = "0";
+    const jobsForAnswerEpic = () =>
+      tdb.db
+        .select()
+        .from(schema.jobs)
+        .where(eq(schema.jobs.type, "review-fix-pr"))
+        .all()
+        .filter((j) => JSON.parse(j.payloadJson).epicBeadId === answerEpic);
+
+    try {
+      // The prior test leaves its own `queued` review-fix-pr row behind (the whole point of its
+      // last assertion) — sweep it aside so this test's single-tick `driveJob` calls lease THIS
+      // target's job rather than that unrelated leftover one.
+      tdb.db
+        .update(schema.jobs)
+        .set({ status: "cancelled" })
+        .where(and(eq(schema.jobs.type, "review-fix-pr"), eq(schema.jobs.status, "queued")))
+        .run();
+
+      // Pass 1: nothing covers the target yet — one job is dispatched.
+      await runDispatch(answerEpic);
+      let jobs = jobsForAnswerEpic();
+      expect(jobs).toHaveLength(1);
+      const answeredId = jobs[0].id;
+
+      // The round answers the review feedback but pushes no commit — simulated directly (what
+      // actually decides push-vs-answer, `runFixSession`, is exercised by the push-path e2e test
+      // above; only the dispatcher's read of the settled state is under test here). Built through
+      // `classifyReview` itself (anton-091jr review round 6, chatgpt-codex-connector) rather than
+      // hand-written, so it always matches the real fingerprint shape — including the body-hash
+      // suffix on the `review:*` entry and the trailing `base:*` entry appended for every actionable
+      // reason — instead of drifting out of sync with `classifyReview`'s own encoding.
+      const answeredFingerprint = classifyReview({
+        number: 21,
+        state: "OPEN",
+        reviewDecision: "CHANGES_REQUESTED",
+        mergeable: "MERGEABLE",
+        headRefName: answerBranch,
+        headSha: "sha-answer",
+        url: "u",
+        reviews: [{ author: "alice", state: "CHANGES_REQUESTED", body: "fix it" }],
+        failingChecks: [],
+        failingCheckAttempts: [],
+        pendingChecks: 0,
+        threads: [],
+        threadsComplete: true,
+      }).fingerprint;
+      tdb.db
+        .update(schema.jobs)
+        .set({
+          status: "done",
+          payloadJson: JSON.stringify({
+            projectId,
+            epicBeadId: answerEpic,
+            headSha: "sha-answer",
+            answeredFingerprint,
+          }),
+        })
+        .where(eq(schema.jobs.id, answeredId))
+        .run();
+
+      // Pass 2: same head, same reasons — the answered round suppresses a fresh enqueue.
+      const job2 = await getJob(tdb.db, await runDispatch(answerEpic));
+      jobs = jobsForAnswerEpic();
+      expect(jobs).toHaveLength(1);
+      expect(job2?.outcomeNote).toBe(
+        "examined 1 PR(s) in review, dispatched 0, suppressed 1 (answered, unchanged)",
+      );
+
+      // A newly failing check changes the actionable reasons without moving the head — pass 3 must
+      // admit the retry that could now actually act on it.
+      process.env.FAKE_ANSWER_FAILING = "1";
+      await runDispatch(answerEpic);
+      jobs = jobsForAnswerEpic();
       expect(jobs).toHaveLength(2);
       expect(jobs.some((j) => j.status === "queued")).toBe(true);
     } finally {

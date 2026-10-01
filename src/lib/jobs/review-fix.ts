@@ -47,6 +47,7 @@
  * and finalizing a merge clears `stage:in-review` so a later pass no longer treats the epic as
  * in-review (never finalized twice).
  */
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { beads, labelValueOf, type Bead } from "../beads/bd";
 import { metered } from "../claude-invocations";
@@ -56,13 +57,21 @@ import { resolveModel } from "./model-routing";
 import {
   branchAheadOfRemote,
   commitAll,
+  commitAttemptMode,
+  commitParentShas,
+  diffPaths,
+  exitedWith,
+  git,
   isAncestor,
   readWorktreeState,
   fetchOrigin,
+  mergeInProgress,
   mergeIntoCurrent,
+  unmergedPaths,
   needsHooksPathOverrideForMerge,
   pushBranch,
   readPullRequestBody,
+  resolveCommitSha,
   resolveHooksPathOverride,
   resolveHooksPathOverrideForMerge,
   stageAll,
@@ -73,14 +82,15 @@ import {
   classifyReview,
   commentOnPr,
   getPrActivity,
-  getPrComments,
   getPrReview,
+  getPrTopLevelComments,
   prNumberFromRef,
   reactToReviewComment,
   reRequestReview,
   replyToReviewComment,
   resolveReviewThread,
   reviewersRequestingChanges,
+  threadsNeedingAttention,
   type Actionable,
   type PrReactionContent,
   type PrReview,
@@ -102,13 +112,16 @@ import {
   resolveWarmConfig,
   type ProjectSettings,
 } from "../projects";
-import { captureVerifyGates } from "./shell";
+import { captureVerifyGates, type VerifyGateOutcome } from "./shell";
 import { tailLines } from "./review-context";
-import { findOpenRunForEpic } from "../runs";
+import { findOpenRunForEpic, type RunRow } from "../runs";
 import { runTickets } from "../ticket-view";
 import { appendSessionLog, endSession, startJobSession } from "../sessions";
+import type { ClaudeEvent } from "../claude/driver";
 import {
   buildReviewFixPrompt,
+  fabricatedFix,
+  NON_THREAD_REPORT_ID,
   parseThreadReport,
   triageOutcomes,
   type ThreadOutcome,
@@ -119,14 +132,26 @@ import {
   recordReviewRound,
   unsettledPrNumbers,
 } from "../review-rounds";
-import { fallbackReasonsFor, fixRoundFrom, nextFixRoundsRegion } from "./review-fix-body";
+import {
+  fallbackReasonsFor,
+  fixRoundFrom,
+  nextFixRoundsRegion,
+  sentinelFixEntry,
+} from "./review-fix-body";
 import { upsertBodyRegion } from "./steps/prompts";
 import { IN_REVIEW } from "./review-fix-board";
 import { safe } from "./safe";
 import { finalizeMergedEpic } from "./review-fix-finalize";
 import { isPoisonError, PoisonError } from "./errors";
 import type { AntonDb, Clock } from "./queue";
-import { reviewFixPrParkedAtHead, systemClock } from "./queue";
+import {
+  invalidateReviewFixAttempt,
+  recordReviewFixAnswered,
+  recordReviewFixAttempt,
+  reviewFixPrAnsweredUnchanged,
+  reviewFixPrParkedAtHead,
+  systemClock,
+} from "./queue";
 import type { JobContext, JobEffect, JobHandler, RunnerLogger } from "./runner";
 
 // The per-thread report parser is a review-fix protocol concern; re-export so existing importers
@@ -280,7 +305,14 @@ async function dispatchInReview(args: {
   // `parked` row for it already sits at this exact PR head, so a fresh attempt would just fail
   // identically — counted apart from `dispatched` so an operator reading the pass's note can tell
   // this suppressed target from a merely-idle one (a clean PR never reaches this loop's insides).
-  let suppressed = 0;
+  let suppressedParked = 0;
+  // A target whose last round ANSWERED the review feedback (replied to threads, maybe re-requested
+  // review) but pushed no commit, at the SAME head and the SAME actionable reasons as right now
+  // (anton-dfuvz) — some reasons no code change can satisfy (a PR-body waiver line, a CI check stuck
+  // re-evaluating the same commit), so re-dispatching every pass would burn a full session on the
+  // same answer forever. Counted apart from both `dispatched` and `suppressedParked` for the same
+  // reason those are counted apart from each other.
+  let suppressedAnswered = 0;
   // A row `recordPrReopened` actually unsettled — a reopened, still-clean PR whose only effect this
   // pass is that write (anton PR #335 follow-up review): without counting it, `changed` below would
   // report `false` even though a row moved, contradicting `JobEffect.changed`'s contract.
@@ -321,15 +353,29 @@ async function dispatchInReview(args: {
       // Through the runner, not the queue helper: the `gh` read above yields, and a project delete
       // landing inside it must refuse this insert or teardown fails over the row (PR #250 review).
       // The head SHA lets the runner's dedupe suppress a doomed retry — see `enqueueReviewFixPrIfAbsent`.
-      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha);
+      // `fingerprint` is only ever set for the classifyReview (non-merged) branch, so a merged
+      // target's dispatch is never caught by the answered check either.
+      const jobId = ctx.enqueueReviewFixPr(projectId, target.id, triage.headSha, triage.fingerprint);
       if (jobId) {
         dispatched += 1;
         continue;
       }
-      if (triage.headSha && reviewFixPrParkedAtHead(db, projectId, target.id, triage.headSha)) {
-        suppressed += 1;
+      if (
+        triage.headSha &&
+        reviewFixPrParkedAtHead(db, projectId, target.id, triage.headSha, triage.fingerprint)
+      ) {
+        suppressedParked += 1;
         consoleLog.info(
           `epic ${target.id}: suppressed — parked review-fix-pr at unchanged head ${triage.headSha}`,
+        );
+      } else if (
+        triage.headSha &&
+        triage.fingerprint &&
+        reviewFixPrAnsweredUnchanged(db, projectId, target.id, triage.headSha, triage.fingerprint)
+      ) {
+        suppressedAnswered += 1;
+        consoleLog.info(
+          `epic ${target.id}: suppressed — answered at unchanged head ${triage.headSha} with the same actionable reasons`,
         );
       }
     } catch (e) {
@@ -430,7 +476,10 @@ async function dispatchInReview(args: {
 
   // The dispatch is the effect: an examined PR with nothing to do is a poll that correctly did
   // nothing, and the counts together are what an operator checks the poll against.
-  const suppressedNote = suppressed > 0 ? `, suppressed ${suppressed} (parked, unchanged head)` : "";
+  const suppressedParts: string[] = [];
+  if (suppressedParked > 0) suppressedParts.push(`suppressed ${suppressedParked} (parked, unchanged head)`);
+  if (suppressedAnswered > 0) suppressedParts.push(`suppressed ${suppressedAnswered} (answered, unchanged)`);
+  const suppressedNote = suppressedParts.length > 0 ? `, ${suppressedParts.join(", ")}` : "";
   const reconciledNote = reconciled > 0 ? `, reconciled ${reconciled} orphaned PR(s)` : "";
   const reopenedNote = reopened > 0 ? `, reopened ${reopened} PR(s)` : "";
   const closedNote = closedStamped > 0 ? `, closed ${closedStamped} PR(s)` : "";
@@ -445,6 +494,13 @@ interface FixTriage {
   needsFix: boolean;
   /** The PR head's commit SHA — undefined only if the PR could not be identified. */
   headSha?: string;
+  /**
+   * `classifyReview`'s fingerprint for the current PR state (anton-dfuvz) — what
+   * `enqueueReviewFixPrIfAbsent` keys its answered suppression on, alongside `headSha`. Only ever
+   * set on the classifyReview (non-merged) branch: a merged target's finalization must never be
+   * suppressed by a stale answered round from before it merged.
+   */
+  fingerprint?: string[];
   /** OPEN | MERGED | CLOSED as the triage read it; undefined when there is no PR to read. */
   state?: string;
   /** The PR this triage read, undefined when the target names none. */
@@ -456,7 +512,8 @@ interface FixTriage {
  * anything else is a clean PR that costs nothing to leave alone. One `gh` read per target, the same
  * read `handleEpic` repeats when the dispatched job actually runs: PR state can change in between,
  * and the fix re-decides against what it finds rather than trusting this triage. The head SHA rides
- * along on the same read — it is what `enqueueReviewFixPrIfAbsent` keys its park suppression on.
+ * along on the same read — it is what `enqueueReviewFixPrIfAbsent` keys its park and answered
+ * suppressions on.
  */
 async function needsFix(
   repo: string,
@@ -466,12 +523,42 @@ async function needsFix(
   const number = prNumberFromRef(beads.getPrRef(target));
   if (number === undefined) return { needsFix: false };
   const pr = await getPrReview(repo, number, signal);
+  const headSha = pr.headSha || undefined;
+  if (pr.state === "MERGED") {
+    return { needsFix: true, headSha, state: pr.state, prNumber: number };
+  }
+  const verdict = classifyReview(pr);
+  if (isUnreadableChecksRollup(pr, verdict)) {
+    // The check-rollup GraphQL read failed without ever observing a failing context — the ONLY
+    // actionable reason is `classifyReview`'s "check rollup read incomplete" marker, e.g. from a
+    // persistent API/permission error. Dispatching `review-fix-pr` here hands claude a prompt with
+    // no concrete failing check to address, and `shouldRecordAnswered` can never suppress the
+    // outcome afterward (`checksComplete` stays `false` on every retry too), so an unreadable PR
+    // would get a brand new session every scheduled sweep forever (PR #338 review, chatgpt-codex-
+    // connector). Throwing routes this target through the same "one unreadable PR retries, the rest
+    // still dispatch" path the loop below already applies to a `getPrReview` failure itself.
+    throw new Error(
+      `PR #${number}: check rollup read incomplete with no other actionable signal — retrying triage instead of dispatching a fix`,
+    );
+  }
   return {
-    needsFix: pr.state === "MERGED" || classifyReview(pr).actionable,
-    headSha: pr.headSha || undefined,
+    needsFix: verdict.actionable,
+    headSha,
+    fingerprint: verdict.fingerprint,
     state: pr.state,
     prNumber: number,
   };
+}
+
+/**
+ * True when `classifyReview`'s ONLY actionable reason is a degraded check-rollup read
+ * (`checksComplete: false`) — no failing check was actually observed, and nothing else about the PR
+ * is actionable either. `checksComplete` unconditionally adds its own reason whenever it is `false`
+ * (see `classifyReview`), so a `reasons` array of length 1 on a `checksComplete: false` PR can only
+ * be that one entry.
+ */
+function isUnreadableChecksRollup(pr: PrReview, verdict: Actionable): boolean {
+  return verdict.actionable && pr.checksComplete === false && verdict.reasons.length === 1;
 }
 
 /**
@@ -515,11 +602,15 @@ async function fixOnePr(args: {
       baseBranch: settings.baseBranch ?? project.defaultBranch,
       all,
     });
-    // A "clean" outcome (nothing to push) can still have stamped a terminal/reopen row below
-    // (PR #335 review) — that write is this pass's only effect, so `changed` must reflect it or
-    // automation history claims a job that moved the ledger did nothing.
+    // A "clean" or "incomplete" outcome (nothing pushed, nothing resolved) can still have stamped
+    // a terminal/reopen row below (PR #335 review) — that write is this pass's only effect, so
+    // `changed` must reflect it or automation history claims a job that moved the ledger did
+    // nothing. Neither outcome is itself a change: "incomplete" means the round left the feedback
+    // unaddressed (PR #338 review, chatgpt-codex-connector), so it must not read as progress any
+    // more than "clean" does.
+    const isNoOp = outcome === "clean" || outcome === "incomplete";
     return {
-      changed: outcome !== "clean" || ledgerChanged,
+      changed: !isNoOp || ledgerChanged,
       note: `${epic.id}: ${OUTCOME_NOTE[outcome]}`,
     };
   } finally {
@@ -533,7 +624,7 @@ async function fixOnePr(args: {
 }
 
 /** What one PR's pass did — the note an operator reads off the jobs list. */
-type PrFixOutcome = "merged" | "pushed" | "answered" | "clean";
+type PrFixOutcome = "merged" | "pushed" | "answered" | "incomplete" | "clean";
 
 const OUTCOME_NOTE: Record<PrFixOutcome, string> = {
   merged: "PR merged — finalized",
@@ -541,6 +632,11 @@ const OUTCOME_NOTE: Record<PrFixOutcome, string> = {
   // Claude produced no diff, but the threads it triaged were still answered — saying "fixed" here
   // would claim a push that never happened.
   answered: "answered the review feedback; nothing to push",
+  // Nothing pushed AND the thread report was missing/partial — the feedback is still genuinely
+  // waiting on anton. Must read differently from "answered" (PR #338 review, chatgpt-codex-
+  // connector): that note claims the round finished, which automation history would otherwise
+  // treat as this PR being settled when it is not.
+  incomplete: "round left review feedback unaddressed — no report and nothing pushed",
   clean: "nothing actionable on the PR",
 };
 
@@ -553,7 +649,11 @@ async function handleEpic(args: {
   epic: Bead;
   settings: ProjectSettings;
   branchPrefix: string;
-  /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
+  /**
+   * Fallback base branch for conflict pre-merges (project setting, else the repo's default
+   * branch) — used only when the PR's own `baseRefName` is unavailable; the PR's actual base
+   * always wins once `pr` is fetched (see `prBaseBranch` below).
+   */
   baseBranch: string | undefined;
   all: Bead[];
 }): Promise<{ outcome: PrFixOutcome; ledgerChanged: boolean }> {
@@ -574,6 +674,12 @@ async function handleEpic(args: {
 
   const pr = await getPrReview(repo, number, ctx.signal);
   const branch = pr.headRefName || `${branchPrefix}/${epic.id}`;
+  // The PR's OWN base on GitHub, not the project's configured/default branch — a retargeted PR or a
+  // project whose default branch setting changed after the PR opened leaves those two diverging,
+  // and premerging the project's setting would merge the wrong branch into the PR (anton-091jr
+  // review, chatgpt-codex-connector). Falls back to the project setting only when `gh` didn't report
+  // one (a synthetic PrReview in tests).
+  const prBaseBranch = pr.baseRefName || baseBranch;
 
   // A merged PR is terminal — finalize the epic (done + cleanup) rather than fixing feedback. A PR
   // merely CLOSED (not merged) falls through to classifyReview, which treats any non-OPEN state as
@@ -632,18 +738,91 @@ async function handleEpic(args: {
   const outcome = await withWorktreeClaim(repo, branch, claimOwner, async () => {
     // Re-materialize the worktree from the PR branch (execute-epic removes it after opening the
     // PR), sync it with origin, and pre-merge the base if GitHub reports a conflict.
-    const { worktree, conflicts, alreadyAhead } = await prepareFixWorktree({
-      ctx,
-      repo,
-      branch,
-      settings,
-      baseBranch,
-      pr,
-      number,
-      claimOwner,
-    });
+    const {
+      worktree,
+      conflicts,
+      alreadyAhead,
+      headIsBareUnverifiedBoundary,
+      preSessionHead,
+      refsSynced,
+    } = await prepareFixWorktree({
+        ctx,
+        repo,
+        branch,
+        settings,
+        baseBranch: prBaseBranch,
+        number,
+        claimOwner,
+        expectedHeadSha: pr.headSha,
+        expectedBaseRefOid: pr.baseRefOid,
+      });
 
-    const pushed = await runFixSession({
+    // Refuse to run the session at all when the worktree isn't provably on what GitHub reports as
+    // the PR's current head/base (PR #338 review, chatgpt-codex-connector, round 7): a green gate
+    // run against a stale fetch is worse than no run, since `commitAndPushFix` would then push a
+    // "fix" that was only ever tested against the wrong tree. Clear the job's own enqueue-time
+    // snapshot too, not just skip recording a new one — otherwise a stale headSha/fingerprint pair
+    // that still matches the (unmoved) GitHub head survives on this row and, if a LATER attempt
+    // parks, wrongly suppresses a future retry at a revision this attempt never actually tested.
+    // NOT best-effort: swallowing a failure here and continuing into the fix session would leave
+    // that stale pair in place, so let it throw and fail this attempt outright — the runner retries
+    // the whole job, and a transient failure (e.g. a brief SQLite lock) clears on that next attempt.
+    if (!refsSynced) {
+      invalidateReviewFixAttempt(db, ctx.jobId);
+      // The fetch/sync above is best-effort and swallows its own errors into `refsSynced: false` —
+      // including a signal that aborted mid-fetch (a no-progress timeout, a lost lease). Returning
+      // "incomplete" normally in that case would complete this handler as if the round genuinely
+      // found nothing to sync, letting the runner settle a timed-out/lease-lost attempt as done
+      // instead of retrying it (PR #338 review, chatgpt-codex-connector).
+      if (ctx.signal.aborted) {
+        throw ctx.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
+      }
+      consoleLog.info(
+        `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — skipping this round's fix session rather than gating/pushing against a potentially stale base`,
+      );
+      return "incomplete";
+    }
+
+    // Refresh the job's own payload to what THIS attempt actually saw before it can hit a
+    // `PoisonError` and park — see `recordReviewFixAttempt`'s doc (PR #338 review,
+    // chatgpt-codex-connector). Skipped when any of the underlying reads came back degraded
+    // (PR #338 review, chatgpt-codex-connector, round 8): a fingerprint built from a truncated
+    // page carries `reviews:incomplete`/`comments:incomplete`/`checks:incomplete`/a partial thread
+    // list, and if THIS attempt then parks, that degraded fingerprint becomes `parkedAtHead`'s
+    // match target. A transient read failure tends to reproduce the SAME degraded shape on the
+    // next pass too, so the park would keep matching and suppress every future dispatch at this
+    // head even once a human's feedback lands on the very page that failed to load — exactly the
+    // silent-suppression bug the `:incomplete` markers exist to prevent, just one write earlier.
+    // Invalidating instead (clearing headSha too, not just skipping the write) means a later park
+    // can never match this row on `headSha`, so the next pass retries rather than staying
+    // suppressed on unverified state.
+    if (
+      pr.threadsComplete === false ||
+      pr.commentsComplete === false ||
+      pr.reviewsComplete === false ||
+      pr.checksComplete === false
+    ) {
+      invalidateReviewFixAttempt(db, ctx.jobId);
+      consoleLog.info(
+        `PR #${number}: review read was incomplete — not recording this attempt's fingerprint as a park identity`,
+      );
+    } else {
+      try {
+        recordReviewFixAttempt(db, ctx.jobId, pr.headSha, verdict.fingerprint);
+      } catch (e) {
+        // A failed write here is worse than a skipped one: the row still carries whatever
+        // `enqueueReviewFixPrIfAbsent` snapshotted at enqueue time, which this session is about to
+        // run past without having recorded. If that stale pair still matches the (unmoved) GitHub
+        // head, a later park would wrongly suppress a revision this attempt never tested (PR #338
+        // review, chatgpt-codex-connector). Invalidate rather than merely log so the stale snapshot
+        // can't outlive this attempt; let `invalidateReviewFixAttempt`'s own failure propagate and
+        // fail this attempt outright.
+        consoleLog.error("recordReviewFixAttempt failed before PR fix — invalidating stale snapshot", e);
+        invalidateReviewFixAttempt(db, ctx.jobId);
+      }
+    }
+
+    const { pushed, answeredAllThreads } = await runFixSession({
       db,
       clock,
       ctx,
@@ -656,19 +835,88 @@ async function handleEpic(args: {
       verdict,
       conflicts,
       alreadyAhead,
+      headIsBareUnverifiedBoundary,
+      preSessionHead,
       branch,
       number,
     });
-    return pushed ? "pushed" : "answered";
+    if (
+      shouldRecordAnswered(
+        pushed,
+        answeredAllThreads,
+        pr.threadsComplete,
+        pr.commentsComplete,
+        pr.reviewsComplete,
+        pr.checksComplete,
+      )
+    ) {
+      // No commit landed, so the next dispatcher pass would re-triage this exact PR state as
+      // actionable again — record what this round answered so a fresh triage matching BOTH the head
+      // and this fingerprint is suppressed instead of handed a brand new session (anton-dfuvz). See
+      // {@link shouldRecordAnswered} for why a degraded thread, comment, reviews, or check-rollup read
+      // (`threadsComplete === false`, `commentsComplete === false`, `reviewsComplete === false`,
+      // `checksComplete === false`) skips this entirely rather than recording under a reusable
+      // placeholder value (PR #338 review round 2 / round 12, chatgpt-codex-connector).
+      // Gated on `answeredAllThreads` (anton-091jr review, chatgpt-codex-connector): a report that
+      // never arrived (a claude error text with no reporting contract) or left some of the threads
+      // this round was actually asked about untouched must NOT be recorded as answered — that thread
+      // is still genuinely waiting on anton, and marking the round "answered" would suppress a fresh
+      // attempt at it forever (same head, same fingerprint) instead of a real reply ever reaching it.
+      // `refsSynced` is unconditionally true here — the early return above sends an unsynced round
+      // home before it ever reaches `runFixSession` (PR #338 review, chatgpt-codex-connector, round 7).
+      //
+      // Friction classification (ADR-0001 clause 5, anton-tuf4l): this job settles `done`, not
+      // parked or cancelled, so it is NOT anton failing and NOT a human touch — nobody was asked
+      // anything and nothing is waiting on a person. It still counts toward `prFixRounds` (this PR
+      // really did need a round of attention), but contributes zero to every anton-failing/
+      // human-touch counter. The later suppression this enables (declining to re-dispatch at the
+      // same head + fingerprint) creates no job row of its own, so it needs no counter beyond this
+      // one. Best-effort like the beads sync above: a write hiccup here must not turn a legitimately
+      // successful "answered, nothing to push" round into a job failure (anton-tuf4l).
+      //
+      // Stored WITHOUT `thread:` entries (anton-091jr review, chatgpt-codex-connector): `verdict`
+      // was classified BEFORE this round replied, so its fingerprint still names every thread that
+      // was waiting then. `answeredAllThreads` just proved every one of those got a real, delivered
+      // reply — anton is now each thread's last commenter, so `threadsNeedingAttention` drops all of
+      // them on the very next sweep and a fresh `classifyReview` fingerprint would never include
+      // them either. Storing the pre-reply fingerprint verbatim would compare against a shape the
+      // next sweep can never reproduce, so the suppression check would always miss and hand this PR
+      // a brand new fix session despite nothing about it having changed.
+      const postReplyFingerprint = stripThreadFingerprint(verdict.fingerprint);
+      try {
+        recordReviewFixAnswered(db, ctx.jobId, pr.headSha, postReplyFingerprint);
+      } catch (e) {
+        consoleLog.error("recordReviewFixAnswered failed after PR fix", e);
+      }
+    } else if (!pushed && pr.threadsComplete === false) {
+      consoleLog.info(
+        `PR #${number}: review thread read was incomplete — not recording answered`,
+      );
+    } else if (!pushed && pr.commentsComplete === false) {
+      consoleLog.info(
+        `PR #${number}: comment history read was incomplete — not recording answered`,
+      );
+    } else if (!pushed) {
+      consoleLog.info(
+        `PR #${number}: round left thread(s) unaddressed (no/incomplete report) — not recording answered`,
+      );
+    }
+    // "answered" requires answeredAllThreads: `!pushed` alone doesn't prove the report was
+    // complete, and reporting a partial/missing round as "answered" (PR #338 review,
+    // chatgpt-codex-connector) would tell automation history the feedback was addressed when
+    // it is genuinely still waiting on anton.
+    if (pushed) return "pushed";
+    return answeredAllThreads ? "answered" : "incomplete";
   });
   return { outcome, ledgerChanged };
 }
 
 /**
  * Materialize the PR branch into a fresh worktree and get it ready for claude: fetch origin (a
- * reviewer may have pushed), fast-forward to the remote branch, and — when GitHub reports the PR
- * CONFLICTING — pre-merge the base so claude only has conflict markers to resolve. Every git step
- * is best-effort: a repo with no reachable origin still gets the review-comment flow.
+ * reviewer may have pushed), fast-forward to the remote branch, and — whenever the branch is
+ * behind its base — pre-merge the base so the verify gates below run against the same tree GitHub
+ * would merge, and claude has only conflict markers (if any) left to resolve. Every git step is
+ * best-effort: a repo with no reachable origin still gets the review-comment flow.
  */
 export async function prepareFixWorktree(args: {
   ctx: JobContext;
@@ -677,13 +925,94 @@ export async function prepareFixWorktree(args: {
   settings: ProjectSettings;
   /** Base branch for conflict pre-merges (project setting, else the repo's default branch). */
   baseBranch: string | undefined;
-  pr: PrReview;
   number: number;
   /** This job's claim on the branch — createWorktree hands the checkout to nobody else. */
   claimOwner: string;
-}): Promise<{ worktree: Worktree; conflicts: string[]; alreadyAhead: boolean }> {
-  const { ctx, repo, branch, settings, baseBranch, pr, number, claimOwner } =
-    args;
+  /**
+   * `pr.headSha` the caller classified its fix attempt against — compared against what the sync
+   * below actually lands on, so a best-effort `fetchOrigin` failure can be told apart from a real
+   * sync (see `refsSynced` below). Empty when the caller has no head to verify against (e.g. a
+   * synthetic `PrReview` in tests) — `refsSynced` is unconditionally true for this half of the
+   * check in that case, since there is nothing to compare.
+   */
+  expectedHeadSha: string;
+  /**
+   * `pr.baseRefOid` the caller classified its fix attempt against — compared against what
+   * `origin/<baseBranch>` actually resolves to after the fetch below, for the same reason
+   * `expectedHeadSha` is checked against the synced head: `fetchOrigin` below fetches the base
+   * branch too, and is just as best-effort. A silent failure there leaves `origin/<baseBranch>`
+   * stale, so `premergeBase` merges an old base commit and the gates run against a tree that
+   * doesn't match what GitHub reports as the PR's current base — even though the head fetch
+   * succeeded and `syncedHead === expectedHeadSha` (PR #338 review, chatgpt-codex-connector,
+   * round 3). Undefined/empty when the caller has no base to verify against (e.g. a synthetic
+   * `PrReview` in tests, or no `baseBranch` at all) — that half of the check is then
+   * unconditionally true, matching `expectedHeadSha`'s own fallback.
+   */
+  expectedBaseRefOid: string | undefined;
+}): Promise<{
+  worktree: Worktree;
+  conflicts: string[];
+  alreadyAhead: boolean;
+  /**
+   * Does `alreadyAhead` above hold ONLY because HEAD (before this attempt's own `premergeBase`
+   * runs) is itself a still-unverified premerge boundary commit — i.e. a PRIOR attempt's clean
+   * auto-merge that landed, got marked via `markUnverifiedBoundary`, and then the process errored
+   * or exited before claude ever ran on top of it (PR #338 review, chatgpt-codex-connector: keep
+   * failed premerges out of the resume fast path). `runFixSession`'s "already ahead" shortcut
+   * exists for an operator/prior session that genuinely resolved the review feedback and left
+   * unpushed commits — a bare, un-built-upon boundary commit is not that: it carries none of the
+   * fix, and taking the shortcut over it would push a base-only merge and tell reviewers their
+   * feedback was addressed when nothing addressed it. `false` whenever `alreadyAhead` is itself
+   * `false` (nothing to check); `true` when the marker lookup fails (fail closed toward the
+   * safer, slower claude dispatch rather than risk missing a genuine leftover boundary).
+   */
+  headIsBareUnverifiedBoundary: boolean;
+  /**
+   * Worktree HEAD once this function is done touching it — i.e. BEFORE claude or the gate
+   * follow-up runs. A clean, conflict-free base premerge lands its own commit right here, inside
+   * this function, well before any review-fix work happens (see `premergeBase`'s "clean
+   * auto-merge" comment) — so this is the boundary `runFixSession` diffs against to tell "this
+   * round's session/gate follow-up actually changed something" apart from "the branch merely sits
+   * ahead of origin because of a base sync that has nothing to do with the review feedback"
+   * (PR #338 review, chatgpt-codex-connector: a clean base-only premerge otherwise makes
+   * `commitAndPushFix` return `pushed: true` for a round where claude changed nothing, which
+   * `fabricatedFix` then can't tell apart from a genuine fix).
+   *
+   * `undefined` when the best-effort read below fails — never a fallback sha, and never compared
+   * as equal OR unequal to anything: a caller must treat "unknown" as "no change" (fail closed),
+   * or a transient git hiccup here would make every later diff against it read as "changed" and
+   * validate a "fixed" claim the round never actually earned (PR #338 review, chatgpt-codex-
+   * connector, round 8).
+   */
+  preSessionHead: string | undefined;
+  /**
+   * Did the fetch above actually land the worktree's HEAD on `expectedHeadSha` AND
+   * `origin/<baseBranch>` on `expectedBaseRefOid`? Both git steps are best-effort (a repo with no
+   * reachable origin still gets the review-comment flow) — when `fetchOrigin` fails silently for
+   * either ref, that ref just resolves to whatever it last was locally, which can be stale. `false`
+   * here tells the caller the session below (if any) ran, and any gate it hit failed, against code
+   * that was NOT what GitHub reports as the PR's current head or base — so persisting an attempt
+   * fingerprint keyed on `expectedHeadSha`/`expectedBaseRefOid` would misrepresent that revision as
+   * tested (PR #338 review, chatgpt-codex-connector, rounds 2-3). Also `false` when the fetched refs
+   * DO match but `premergeBase` below fails outright partway through the merge (round 4 of the same
+   * review) — the advertised base tree never actually landed in the worktree the gates ran against,
+   * so that's just as untested as a stale fetch. A checkout that sits AHEAD of `expectedHeadSha`
+   * (contains it as an ancestor, e.g. unpushed operator/prior-attempt commits on a resumed branch)
+   * still counts as synced, not stale.
+   */
+  refsSynced: boolean;
+}> {
+  const {
+    ctx,
+    repo,
+    branch,
+    settings,
+    baseBranch,
+    number,
+    claimOwner,
+    expectedHeadSha,
+    expectedBaseRefOid,
+  } = args;
 
   const worktree = await createWorktree({
     repoPath: repo,
@@ -710,9 +1039,107 @@ export async function prepareFixWorktree(args: {
   await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
   await ctx.heartbeat();
 
+  // Snapshot "local branch already ahead of origin" BEFORE the fetch/sync below can move
+  // `origin/<branch>` — the only way to tell "this worktree already carried commits past
+  // `expectedHeadSha` before we asked origin for anything" (the supported resume path, see
+  // `alreadyAhead` below) apart from "origin answered with a tip newer than what `getPrReview`
+  // reported, and the ff-only merge below just fast-forwarded local onto it" (a race between that
+  // read and this fetch). Both leave `syncedHead` strictly ahead of `expectedHeadSha`; only the
+  // resume case is safe to trust as "synced", since in the race case the checks/reviews/fingerprint
+  // the caller classified are for a commit that is no longer the branch's real tip (PR #338 review,
+  // chatgpt-codex-connector, round 9) — a plain ff-only merge otherwise has no local-only commits to
+  // land it ahead of a freshly-fetched `origin/<branch>`, so seeing it ahead only *after* the fetch
+  // can't distinguish the two.
+  //
+  // `branchAheadOfRemote` alone isn't enough evidence: it deliberately returns `true` when
+  // `origin/<branch>` is absent locally or its `rev-list` fails (fail-open, so a repo with no
+  // reachable origin doesn't block the review-comment flow elsewhere) — that "unknown" case reads
+  // identically to a genuine resume, so it can't tell apart from the race above either. Requiring the
+  // pre-fetch tracking ref to have actually resolved, AND to already equal `expectedHeadSha` — the
+  // head `getPrReview` reported — proves the local repo's knowledge of origin was both real and
+  // current at that moment, so any extra local commits on top of it are trustworthy resume work, not
+  // a raced fetch dressed up by the fallback (PR #338 review, chatgpt-codex-connector, round 10).
+  // Skipped entirely when `expectedHeadSha === ""` (a synthetic `PrReview` in tests) — `headMatches`
+  // below trusts the sync unconditionally in that case, so `aheadBeforeFetch`'s value can't affect it.
+  const preFetchTrackingSha =
+    expectedHeadSha === ""
+      ? undefined
+      : await resolveCommitSha(repo, `origin/${branch}`).catch(() => undefined);
+  const aheadBeforeFetch =
+    expectedHeadSha !== "" &&
+    preFetchTrackingSha === expectedHeadSha &&
+    (await branchAheadOfRemote(repo, branch));
+
   await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
+
+  // Recheck the remote tip immediately after fetching — `aheadBeforeFetch` only proves the
+  // PRE-fetch tracking ref matched `expectedHeadSha`; it says nothing about whether the branch
+  // advanced remotely DURING the fetch. If it did, the ff-only merge below either fast-forwards
+  // onto commits beyond what `expectedHeadSha` names (so `syncedHead` is a descendant of the NEW
+  // tip, not evidence about the old one) or fails outright on a diverged tip (swallowed by `safe`,
+  // leaving `syncedHead` at its old pre-fetch value) — either way, treating the resulting
+  // `syncedHead` as a descendant of `expectedHeadSha` worth trusting is exactly the race this
+  // function's other comments describe, just not caught by them (PR #338 review,
+  // chatgpt-codex-connector, round 11). Requiring the POST-fetch tracking ref to still equal
+  // `expectedHeadSha` closes it: a remote-advance during the fetch fails this and forces
+  // `headMatches` down to the exact-match branch only, which a stale `syncedHead` can't satisfy.
+  const remoteTipUnchanged =
+    expectedHeadSha === "" ||
+    (await resolveCommitSha(repo, `origin/${branch}`).catch(() => undefined)) === expectedHeadSha;
+
+  const syncRef = `origin/${branch}`;
+
+  // Reconcile a leftover BARE premerge boundary against the freshly-fetched remote tip (PR #338
+  // review, chatgpt-codex-connector, P1) — a prior attempt's `premergeBase` can land a clean,
+  // hook-bypassed base-only merge and then crash before claude (or an operator) ever builds on top
+  // of it, leaving HEAD on a commit with no real fix underneath. If the PR's head has since advanced
+  // on GitHub (another push, a force-push, an operator's own commit), that bare commit and the new
+  // remote tip diverge — neither is an ancestor of the other, since the bare commit's own content
+  // merged in the OLD tip plus the base, not whatever landed on the new tip. The ff-only merge below
+  // then fails against that exact divergent state on EVERY sweep (swallowed by `safe`, so
+  // `headMatches` never becomes true), locking this checkout out of ever reaching the new head
+  // without a human resetting it by hand. Reset the bare boundary away — back to its own first
+  // parent, the tip it premerged ON TOP OF — before attempting the sync, so the ff-only merge has a
+  // genuine ancestor of the new tip to fast-forward from.
+  //
+  // Gated on the FETCHED `syncRef` not already being an ancestor of this commit (not the reverse):
+  // the "remote unchanged" resume path — a crashed premerge with nothing else touching the branch —
+  // already fast-forwards fine as a no-op and is recognized via `aheadBeforeFetch`'s own descendant
+  // check below; resetting it here too would just force a redundant re-premerge of a boundary that
+  // was never actually stuck.
+  const preSyncState = await readWorktreeState(worktree.path).catch(() => undefined);
+  const preSyncHead = preSyncState?.head ?? "";
+  // Gated on the marker having been POSITIVELY read as bare (PR #338 review, chatgpt-codex-connector,
+  // P1) — unlike `headIsBareUnverifiedBoundary` below, this branch is destructive, so it must not
+  // reuse `isBareUnverifiedBoundaryCommit`'s fail-closed-to-true behavior: a note-read error there is
+  // deliberately treated as "be cautious, take the slower path", but here it would instead hard-reset
+  // a commit whose provenance was never actually confirmed — discarding a legitimate diverged local
+  // commit (an operator's own work, say) exactly as readily as a genuine crashed premerge. Leaving the
+  // reset out on `"unknown"` just lets the ff-only merge below fail its own way (swallowed by `safe`,
+  // same as any other unresolved divergence), which flows into `refsSynced` and skips this round
+  // rather than silently discarding anything.
+  //
+  // Also gated on the worktree being CLEAN (PR #338 review, chatgpt-codex-connector, P1): `reset
+  // --hard` discards the working tree and index along with HEAD, so a reused checkout that picked up
+  // uncommitted tracked edits on top of the bare boundary — a resumed session's in-progress work, an
+  // operator's own change — would lose them permanently. `preSyncState === undefined` (the state read
+  // itself failed) is treated the same as dirty: without a positive clean read there is no basis for
+  // discarding anything, so this falls through to the same "let the ff-only merge fail its own way"
+  // outcome as an unresolved divergence.
+  if (
+    preSyncHead &&
+    preSyncState?.status === "" &&
+    (await classifyUnverifiedBoundaryCommit(worktree.path, preSyncHead)) === "bare" &&
+    !(await isAncestor(worktree.path, syncRef, preSyncHead).catch(() => true))
+  ) {
+    const staleBoundaryParents = await commitParentShas(worktree.path, preSyncHead).catch(() => []);
+    const priorTip = staleBoundaryParents[0];
+    if (priorTip) {
+      await safe(() => git(worktree.path, ["reset", "--hard", priorTip]));
+    }
+  }
 
   // Override `core.hooksPath` for the fast-forward below ONLY when the incoming ref itself doesn't
   // carry it (see needsHooksPathOverrideForMerge) — a value resolved before this merge is either
@@ -724,7 +1151,6 @@ export async function prepareFixWorktree(args: {
   // can pass for a submodule-backed hooksPath that is self-consistent right now but about to go stale
   // the instant this merge changes the gitlink — resolveHooksPathOverrideForMerge validates any
   // submodule substitute against the INCOMING ref specifically (PR #263 review, round 21).
-  const syncRef = `origin/${branch}`;
   const syncHooksPath = (await needsHooksPathOverrideForMerge(repo, worktree.path, syncRef))
     ? await resolveHooksPathOverrideForMerge(repo, worktree.path, syncRef)
     : undefined;
@@ -732,52 +1158,724 @@ export async function prepareFixWorktree(args: {
     mergeIntoCurrent(worktree.path, syncRef, { ffOnly: true, hooksPath: syncHooksPath }),
   );
 
+  // Read RIGHT after the sync above, before the premerge can land its own commit and move HEAD
+  // again — this is the one point where the worktree's actual position can be checked against what
+  // `fetchOrigin`/the ff-only merge were SUPPOSED to reach. `expectedHeadSha === ""` (no head to
+  // verify against, e.g. a synthetic `PrReview` in tests) trusts the sync unconditionally, matching
+  // this function's pre-existing behavior before this check existed.
+  const syncedHead = await readWorktreeState(worktree.path).then(
+    (s) => s.head,
+    () => "",
+  );
+  // A checkout that is a DESCENDANT of `expectedHeadSha` — not just equal to it — also counts as
+  // synced: the supported resume path leaves unpushed operator or prior-attempt commits on the
+  // local branch, so the ff-only merge above is a no-op against `origin/<branch>` and `syncedHead`
+  // legitimately sits ahead of what GitHub reports (PR #338 review, chatgpt-codex-connector, round
+  // 4). Treating that as unsynced deleted the job's attempt identity every single pass, so a parked
+  // gate could never be matched by a later sweep and kept re-dispatching against the same commits.
+  //
+  // But that descendant allowance only holds when the LOCAL branch was already ahead of origin
+  // BEFORE this function fetched anything (`aheadBeforeFetch` above) — i.e. the extra commits are
+  // known to be the resume path's own unpushed work, not something the fetch just pulled in. Without
+  // that guard, a PR branch that advances remotely between the caller's `getPrReview` and the fetch
+  // above produces the exact same shape: a freshly fetched `origin/<branch>` that is a descendant of
+  // `expectedHeadSha`, fast-forwarded onto local by the ff-only merge — and accepting it as synced
+  // would run the checks/reviews/fingerprint the caller classified against a commit that is no
+  // longer the branch's real tip (PR #338 review, chatgpt-codex-connector, round 9). When
+  // `aheadBeforeFetch` is false, only an exact match counts as synced — anything else forces a fresh
+  // PR read on the next pass instead. Also requires `remoteTipUnchanged` (above): `aheadBeforeFetch`
+  // alone only proves the race hadn't happened BEFORE this fetch, not that this fetch itself didn't
+  // just cause it — without the post-fetch recheck, a remote advance during the fetch reads as the
+  // same "local descendant of `expectedHeadSha`" shape as a genuine resume, whether the ff-only merge
+  // above fast-forwarded past the new tip or failed and left the stale pre-fetch `syncedHead` in place
+  // (PR #338 review, chatgpt-codex-connector, round 11).
+  //
+  // `remoteTipUnchanged` also gates the EXACT-match clause, not just the descendant one (PR #338
+  // review, chatgpt-codex-connector, round 12): a force-push to a divergent commit between
+  // `getPrReview` and this fetch updates `origin/<branch>` but makes the ff-only merge fail (swallowed
+  // by `safe`), leaving `syncedHead` at whatever HEAD already was — which can still equal
+  // `expectedHeadSha` if the worktree hadn't moved. Without this guard that reads as a clean exact
+  // match even though the branch's real tip has since diverged from `expectedHeadSha` entirely.
+  const headMatches =
+    expectedHeadSha === "" ||
+    (remoteTipUnchanged && syncedHead === expectedHeadSha) ||
+    (aheadBeforeFetch &&
+      remoteTipUnchanged &&
+      (await isAncestor(worktree.path, expectedHeadSha, syncedHead).catch(() => false)));
+
+  // Same check for the base ref `fetchOrigin` above also fetched (best-effort, just like the head
+  // fetch above) — resolved directly via `rev-parse` rather than `readWorktreeState` since the
+  // worktree's own HEAD hasn't merged it in yet (that's `premergeBase`, below). No `baseBranch`
+  // (nothing gets premerged, so a stale base ref can't feed the gates) or no `expectedBaseRefOid`
+  // (a synthetic `PrReview` in tests) trusts the sync unconditionally, matching `expectedHeadSha`'s
+  // own fallback.
+  const baseMatches =
+    !baseBranch ||
+    !expectedBaseRefOid ||
+    (await resolveCommitSha(worktree.path, `origin/${baseBranch}`).catch(() => "")) ===
+      expectedBaseRefOid;
+
+  // Refs matching GitHub is necessary but not sufficient — `premergeBase` below still has to
+  // actually land that base content in the tree the gates run against. Final `refsSynced` folds in
+  // its outcome too (see below).
+  const refsFetched = headMatches && baseMatches;
+
   // Snapshot "ahead of origin" right after the fast-forward sync above and BEFORE the premerge
   // below — the premerge's own auto-merge commit (see its "clean auto-merge" comment) would
   // otherwise put the branch ahead for a reason that has nothing to do with a prior session's or
   // operator's own commits, and the caller uses this specifically to recognize THAT: a resume whose
   // branch already carries committed work (anton-2wklm).
   const alreadyAhead = await branchAheadOfRemote(repo, branch);
+  // Does that "ahead" state consist of nothing but a still-unverified boundary commit sitting
+  // bare at the tip — i.e. a PRIOR attempt's premerge landed and got marked, then the process died
+  // before claude (or an operator) ever built anything on top of it? `syncedHead` above is read
+  // BEFORE this attempt's own `premergeBase` call below can move HEAD again, so it names exactly
+  // the commit a crashed prior attempt would have left behind. See `headIsBareUnverifiedBoundary`'s
+  // own doc on the return type for why this must keep `runFixSession`'s resume fast path from
+  // firing over it (PR #338 review, chatgpt-codex-connector).
+  const headIsBareUnverifiedBoundary = alreadyAhead
+    ? await isBareUnverifiedBoundaryCommit(worktree.path, syncedHead)
+    : false;
 
-  // This premerge brings in a DIFFERENT ref than the sync above (`origin/${baseBranch}`, the PR's
-  // base, not `origin/${branch}`), so it needs the identical incoming-ref-aware resolution — the
-  // sync's own comment explains why resolveHooksPathOverride (answering "what does the CURRENT
-  // checkout need") is wrong for a merge that hasn't run yet. An earlier round resolved this
-  // premerge's override against the current checkout instead of `origin/${baseBranch}`, which is the
-  // same bug in a new spot: a conflicting PR's base can introduce or advance a tracked hooks
-  // directory/submodule the feature worktree doesn't have, and the stale current-checkout answer
-  // would skip a newly-introduced `post-merge` or run an old submodule checkout `git merge` never
-  // updates on its own (PR #263 review, round 30). `needsHooksPathOverrideForMerge` asks only whether
-  // the incoming ref changes something about the hooksPath directory/submodule relative to the
-  // current checkout — nothing in it assumes the resulting merge is fast-forward-only, so it applies
-  // equally to this non-`ffOnly` premerge. Resolution is done inside `premergeBase` itself, after its
-  // own `baseBranch` guard, rather than unconditionally here — there is no `origin/${baseBranch}` ref
-  // to resolve against (nor any point doing the work) when there is no conflict to premerge at all.
-  const conflicts = await premergeBase(repo, worktree.path, pr, baseBranch, number);
+  // Gated on `refsFetched` (PR #338 review, chatgpt-codex-connector, round 11): premerging against a
+  // base that hasn't been proven current would land a clean auto-merge commit on the branch's LOCAL
+  // history before the caller ever sees `refsSynced === false` and skips the session — that commit
+  // then persists (this checkout is reused across passes, not discarded on skip), so the very next
+  // pass reads the branch as `alreadyAhead` of origin and takes the fast path that pushes it straight
+  // through without ever addressing the review feedback. Skipping the premerge entirely when the refs
+  // themselves are unsynchronized leaves nothing for that next pass to find "ahead" of a legitimate
+  // resume, and the fresh fetch it performs re-attempts the premerge against a base actually proven
+  // current. This premerge runs with the project's hooks bypassed (see `premergeBase`'s own doc) —
+  // its result is an internal, not-yet-published boundary the real gates below and the eventual
+  // hook-enforced commit in `commitAndPushFix` still verify, so there is no incoming-ref hooksPath to
+  // resolve here.
+  const { conflicts, merged, failed: baseMergeFailed } = refsFetched
+    ? await premergeBase(worktree.path, baseBranch, number)
+    : { conflicts: [], merged: false, failed: false };
   await ctx.heartbeat();
-  return { worktree, conflicts, alreadyAhead };
+  // Folded in here, after `premergeBase` returns, rather than into `refsFetched` above: a fetched
+  // head/base that match GitHub exactly are still not "synced" if the merge landing that base
+  // content then fails outright (a transient git error, a hook failure) — without this, `refsSynced`
+  // stayed true and the caller recorded an attempt fingerprint for a tree that never actually got the
+  // base merged in, so a red gate parked a suppression that looked identical to a real, tested
+  // failure (PR #338 review, chatgpt-codex-connector, round 4).
+  const refsSynced = refsFetched && !baseMergeFailed;
+  // A clean (conflict-free) base merge can change dependency metadata (lockfile, package.json)
+  // without updating `node_modules`, which was warmed above BEFORE this merge landed — the verify
+  // gates below would then fail solely because the install reflects the pre-merge tree (anton-091jr
+  // review round 2, chatgpt-codex-connector). Skipped when conflicts remain: claude resolves those
+  // first, and warming against unresolved conflict markers would install nonsense.
+  if (merged && conflicts.length === 0) {
+    await safe(() => warmWorktreeBestEffort(worktree, ctx.signal, resolveWarmConfig(settings)));
+    await ctx.heartbeat();
+  }
+  // Read AFTER the premerge above, not before — a clean auto-merge already landed its own commit by
+  // this point (see the field's own doc on the return type), and that commit must count as part of
+  // the pre-session baseline, not as evidence of a session-produced change. Best-effort like every
+  // other git read on this path: a failed read falls back to `undefined` (never a sha, so it can
+  // never equal OR differ from a later-read sha) rather than aborting a fix over a HEAD read anton
+  // doesn't strictly need yet — the same tolerance `branchAheadOfRemote` above already applies to a
+  // git hiccup here. `undefined`, not `""` (PR #338 review, chatgpt-codex-connector, round 8): `""`
+  // reads as unequal to any real sha, silently turning an unreadable baseline into fabricated
+  // "changed" evidence; every comparison against this field below must instead treat `undefined` as
+  // "no change" explicitly.
+  const preSessionHead = await readWorktreeState(worktree.path).then(
+    (s) => s.head,
+    () => undefined,
+  );
+  return {
+    worktree,
+    conflicts,
+    alreadyAhead,
+    headIsBareUnverifiedBoundary,
+    preSessionHead,
+    refsSynced,
+  };
 }
 
-/** The base merge GitHub says this PR needs — its conflicts are what claude is asked to resolve. */
+/**
+ * The base merge the verify gates need underneath them — brought in whenever the branch doesn't
+ * already carry the base's tip, regardless of what GitHub's own `mergeable` field says. The gates
+ * below (e.g. check-migration-ordering) diff against `origin/<base>` directly, so a MERGEABLE-but-
+ * behind branch (fast-forwardable, no textual conflict) still needs this merge — without it the
+ * gates judge a tree that's missing base commits and can pass against files the base already
+ * superseded (#2141). Conflicts, when they happen, are what claude is asked to resolve.
+ *
+ * A clean merge runs with the project's hooks bypassed (PR #338 review, chatgpt-codex-connector,
+ * round 30): this is an internal, not-yet-published step, run before the verify gates and before
+ * claude has even looked at the tree, so a `pre-merge-commit` hook enforcing the same thing a
+ * configured gate does would otherwise reject the merge outright — `mergeIntoCurrent` treats that
+ * as an ordinary (non-conflict) failure, and the caller folds it into `refsSynced`/`failed` as if
+ * the base could never be landed at all, even though nothing about the base merge itself was
+ * actually wrong. The resulting merge commit is always marked as an unverified boundary so the
+ * project's real hooks still see its full diff via `commitAndPushFix`'s existing re-verify amend
+ * before anything is pushed — the same technique `commitFix`'s own bypassed commit already relies
+ * on, just applied to the merge commit that can land BEFORE `commitFix` ever runs.
+ *
+ * `noFf` (PR #338 review, chatgpt-codex-connector): this function's own doc above names the
+ * MERGEABLE-but-behind branch — a strict ancestor of `baseRef`, no textual conflict — as a case
+ * that still needs a merge, and that is exactly the shape git fast-forwards by default instead of
+ * creating a commit. A bare fast-forward would land HEAD directly on `baseRef`'s own pre-existing
+ * tip commit, and the unverified-boundary marker below would then attach to that shared commit
+ * rather than to anything this call created; `commitAndPushFix`'s later re-verify soft-resets past
+ * the marked commit and recommits it with the fix, which turns the base tip itself into a sibling
+ * SHA the real `baseRef` is no longer an ancestor of, leaving the pushed PR spuriously behind its
+ * base. Forcing a real merge commit here keeps the marked commit always one this call actually
+ * made.
+ */
 async function premergeBase(
-  repo: string,
   worktreePath: string,
-  pr: PrReview,
   baseBranch: string | undefined,
   number: number,
-): Promise<string[]> {
-  if (pr.mergeable !== "CONFLICTING" || !baseBranch) return [];
+): Promise<{ conflicts: string[]; merged: boolean; failed: boolean }> {
+  if (!baseBranch) return { conflicts: [], merged: false, failed: false };
   const baseRef = `origin/${baseBranch}`;
-  const hooksPath = (await needsHooksPathOverrideForMerge(repo, worktreePath, baseRef))
-    ? await resolveHooksPathOverrideForMerge(repo, worktreePath, baseRef)
-    : undefined;
-  try {
-    const merge = await mergeIntoCurrent(worktreePath, baseRef, { hooksPath });
-    return merge.conflicts; // clean auto-merge → a merge commit is pushed below
-  } catch (e) {
-    consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
-    return [];
+  // Already caught up → no merge to do. Best-effort like every other git read on this path (see
+  // prepareFixWorktree's doc): a failed read (origin/<base> didn't resolve, a transient git error)
+  // reads as "can't confirm we're caught up" rather than aborting the premerge — the merge attempt
+  // below tolerates a no-op fine on its own.
+  const upToDate = await isAncestor(worktreePath, baseRef, "HEAD").catch(() => false);
+  if (upToDate) return { conflicts: [], merged: false, failed: false };
+  // Read BEFORE the merge below can move HEAD (PR #338 review, chatgpt-codex-connector, round 5):
+  // the rollback path below needs a target to restore to if writing the marker fails.
+  const preMergeState = await readWorktreeState(worktreePath).then((s) => s, () => undefined);
+  const preMergeHead = preMergeState?.head ?? "";
+  // A dirty checkout (a reused review-fix worktree can carry uncommitted tracked edits — an
+  // operator's own change, a resumed session's in-progress work) must never enter the merge below:
+  // a non-overlapping merge can land cleanly while retaining those edits, and if the
+  // unverified-boundary marker write then fails, the rollback a few lines down is an unconditional
+  // `reset --hard` that would discard the merge AND those retained edits together (PR #338 review,
+  // chatgpt-codex-connector, round 32). There is no rollback that can both undo a bypassed merge
+  // commit and keep arbitrary pre-existing dirty state, so the only safe move is to never start:
+  // skip the premerge here and let a later pass retry once the checkout is clean. Unlike the
+  // genuine up-to-date no-op above, this is `failed: true` (PR #338 review, chatgpt-codex-connector,
+  // round 33): the base still hasn't landed in the tree, and the caller folds `failed` into
+  // `refsSynced` — reporting `false` here would tell `prepareFixWorktree`'s caller the checkout is
+  // synced with the PR's advertised base when it demonstrably isn't, letting the session and gates
+  // run against a stale tree and `commitFix` stage the pre-existing dirty edits into the push. Gated
+  // on the ABSENCE of a positively-clean read (`preMergeState` unresolved, or resolved with a
+  // non-empty status) — a failed read must never be treated as "clean" (PR #338 review,
+  // chatgpt-codex-connector, round 35): that would let this same destructive path run against a
+  // reused worktree whose actual dirty state the read simply failed to tell us about.
+  //
+  // EXCEPT when the dirt is a merge THIS function itself left conflicted (`MERGE_HEAD` set) on an
+  // earlier attempt whose dispatched session crashed or was killed before `commitFix` could conclude
+  // it. That state is always resumable — the merge is exactly what this call would produce anyway —
+  // so blindly rejecting it as generic dirt instead reports `failed: true` forever: every retry finds
+  // the same still-conflicted checkout, `refsSynced` stays false, and the run parks each attempt as
+  // incomplete without ever exposing the unresolved conflicts to a session that could fix them (PR
+  // #338 review, chatgpt-codex-connector). Hand the still-unmerged paths back exactly as a fresh
+  // conflict would be — nothing here touches the tree, so a prior session's own partial resolution
+  // (staged, not yet committed) survives untouched. Any OTHER dirty (or unreadable) checkout carries
+  // no `MERGE_HEAD` and still falls through to the unconditional reject.
+  if (preMergeState === undefined || preMergeState.status !== "") {
+    if (await mergeInProgress(worktreePath)) {
+      // `MERGE_HEAD` names whatever base tip THAT attempt merged from, not necessarily the
+      // `baseRef` this call just fetched (PR #338 review, chatgpt-codex-connector): if the base
+      // advanced between the attempt that left this conflict and this retry, resuming it would
+      // resolve and push a merge that silently omits every base commit landed since, while the
+      // caller's `refsSynced: true` still reports the branch caught up with the base it just
+      // read. Compare the two tips and only resume when BOTH were read and PROVEN equal;
+      // otherwise abort the stale merge and fall through to start a fresh one against the
+      // current tip below.
+      const [mergeHeadSha, currentBaseSha] = await Promise.all([
+        resolveCommitSha(worktreePath, "MERGE_HEAD").catch(() => undefined),
+        resolveCommitSha(worktreePath, baseRef).catch(() => undefined),
+      ]);
+      if (!mergeHeadSha || !currentBaseSha) {
+        // A transient failure here must NOT read as permission to resume (PR #338 review,
+        // chatgpt-codex-connector, round 34): unlike the read at the top of this function, this
+        // one guards resuming a merge whose omitted-commits risk is exactly what the comment
+        // above describes. An unresolved comparison can't prove the conflicted merge still
+        // targets `baseRef`'s current tip, so fail the premerge rather than accept it — folding
+        // into `refsSynced: false` instead of silently reporting the checkout as caught up.
+        return { conflicts: [], merged: false, failed: true };
+      }
+      if (mergeHeadSha === currentBaseSha) {
+        // A failed read must NOT collapse to "zero unresolved paths" (PR #338 review,
+        // chatgpt-codex-connector): that would report this resumed merge as cleanly synced with no
+        // conflicts, so the model gets no conflict-file context while `commitFix`'s later `git add -A`
+        // can stage the still-conflicted paths — including literal conflict markers — as resolved.
+        const unresolved = await unmergedPaths(worktreePath).catch(() => undefined);
+        if (unresolved === undefined) {
+          return { conflicts: [], merged: false, failed: true };
+        }
+        return { conflicts: unresolved, merged: true, failed: false };
+      }
+      await git(worktreePath, ["merge", "--abort"]).catch(() => {});
+      // `merge --abort` restores the tree to its pre-merge state for paths the merge itself
+      // touched, but it is not a general-purpose cleanliness guarantee — it can still leave (or
+      // uncover) unrelated tracked edits the cleanliness guard above only ever checked ONCE, before
+      // this abort ran (PR #338 review, chatgpt-codex-connector, P1). Falling through to the fresh
+      // merge below without re-checking would let it start on a dirty tree exactly like the guard
+      // above exists to prevent — `commitFix` could then stage those edits into the push, or the
+      // marker-failure `reset --hard` further down could destroy them. Re-read and fold a non-clean
+      // (or unreadable) result into the same `failed: true` the guard above already returns for
+      // generic dirt.
+      const postAbortState = await readWorktreeState(worktreePath).then((s) => s, () => undefined);
+      if (postAbortState === undefined || postAbortState.status !== "") {
+        return { conflicts: [], merged: false, failed: true };
+      }
+    } else {
+      return { conflicts: [], merged: false, failed: true };
+    }
   }
+  try {
+    const merge = await mergeIntoCurrent(worktreePath, baseRef, { bypassHooks: true, noFf: true });
+    if (merge.conflicts.length === 0) {
+      // Confirm the merge actually landed a commit before marking HEAD as an unverified boundary
+      // (PR #338 review, chatgpt-codex-connector): the `isAncestor` check above is best-effort and a
+      // transient failure reads as "not caught up" (see its own comment), so this can still reach
+      // `git merge --no-ff` when `baseRef` is ALREADY an ancestor of HEAD — which git resolves as
+      // "Already up to date." and creates no commit at all. Without this, the pre-existing HEAD
+      // (some earlier, already-pushed PR commit) would get marked `bare: true` even though it isn't
+      // the merge and carries real fix content, and the later replay could soft-reset past it and
+      // recommit it from its parent, producing a non-fast-forward push that retries indefinitely.
+      // Only checked when `preMergeHead` was actually read — an unreadable baseline leaves this
+      // exactly as unable to tell the two cases apart as before.
+      if (preMergeHead) {
+        const postMergeHead = await resolveCommitSha(worktreePath, "HEAD").catch(() => "");
+        if (postMergeHead === preMergeHead) {
+          return { conflicts: [], merged: false, failed: false };
+        }
+      }
+      // Hooks were bypassed to land this commit (see this function's own doc) — mark it as an
+      // unverified boundary unconditionally, not only when carrying forward a PRE-EXISTING marker
+      // (round 5's original fix here): even a merge onto an otherwise fully-verified tip produces a
+      // commit the project's hooks never actually saw, and `findUnverifiedBoundaryAncestor` below
+      // must find this exact commit to re-verify the merge's own diff, not just whatever `commitFix`
+      // commits on top of it afterward.
+      try {
+        // `bare: true` — this merge landed with no claude session involved at all, so unlike
+        // `commitFix`'s own bypass commit, there is no fix content underneath it (PR #338 review,
+        // chatgpt-codex-connector: see `isBareUnverifiedBoundaryCommit`'s doc).
+        await markUnverifiedBoundary(worktreePath, { bare: true });
+      } catch (error) {
+        // The merge landed cleanly even though writing its marker failed (concurrent note-ref lock
+        // contention, say) — left in place, `HEAD` would carry the still-unverified content with no
+        // note attached, and a resumed "already ahead" fast path would treat it as re-verified and
+        // push it straight past the project's hooks (PR #338 review, chatgpt-codex-connector, round
+        // 6; `commitFix` rolls back for the identical reason when IT hits this same failure while
+        // creating the marker). `reset --hard` (not `--soft`, unlike `commitFix`'s rollback) because
+        // there is no follow-up work staged on top to preserve — only the merge itself, which a
+        // retry redoes from scratch. No rollback target (the best-effort read above failed) is
+        // itself poison — silently leaving the merge on HEAD unmarked is exactly what this rollback
+        // exists to prevent.
+        if (!preMergeHead) {
+          throw new PoisonError(
+            `PR #${number}: auto-merge of ${baseRef} committed but its unverified-boundary marker ` +
+              `failed to write, and the pre-merge HEAD needed to roll it back was never read — the ` +
+              `worktree may be left with an unmarked bypass commit`,
+            { cause: error },
+          );
+        }
+        try {
+          await git(worktreePath, ["reset", "--hard", preMergeHead]);
+        } catch (restoreError) {
+          throw new PoisonError(
+            `PR #${number}: auto-merge of ${baseRef} committed but its unverified-boundary ` +
+              `marker failed to write, and restoring HEAD to ${preMergeHead} afterward also ` +
+              `failed — the worktree may be left with an unmarked bypass commit: ` +
+              `${(restoreError as Error).message}`,
+            { cause: error },
+          );
+        }
+        consoleLog.error(
+          `PR #${number}: marking auto-merge of ${baseRef} as an unverified boundary failed`,
+          error,
+        );
+        return { conflicts: [], merged: false, failed: true };
+      }
+    }
+    return { conflicts: merge.conflicts, merged: true, failed: false }; // clean auto-merge → a merge commit is pushed below
+  } catch (e) {
+    // The inner rollback above throws `PoisonError` when it can't safely undo an unmarked
+    // bypass commit (no readable pre-merge HEAD, or the `reset --hard` itself failed) — that
+    // must reach the runner so the checkout is parked, not swallowed into an ordinary "retry
+    // me" failure that leaves the unsafe checkout to be auto-retried (PR #338 review,
+    // chatgpt-codex-connector).
+    if (isPoisonError(e)) throw e;
+    consoleLog.error(`PR #${number}: merging ${baseRef} failed`, e);
+    // `failed: true` (not just `merged: false`, which also covers the ordinary "already caught up"
+    // case above) — this branch means the merge was actually attempted and blew up (transient git
+    // error, hook failure), so the base content the gates need never landed even though the refs
+    // fetched cleanly. The caller folds this into `refsSynced` so that failure can't be recorded as
+    // a tested attempt (PR #338 review, chatgpt-codex-connector, round 4).
+    return { conflicts: [], merged: false, failed: true };
+  }
+}
+
+/** What one fix session decided (see {@link runFixSession}). */
+interface RunFixSessionResult {
+  /** Did this round push a commit to the remote? */
+  pushed: boolean;
+  /**
+   * Did every thread that was waiting on anton BEFORE this session started end up with a real
+   * (non-fabricated) outcome? Only meaningful when `!pushed` — {@link handleEpic} gates
+   * `recordReviewFixAnswered` on it so a malformed/partial thread report, or a fast path that never
+   * looked at threads at all, is never mistaken for an actually-answered round (anton-091jr review,
+   * chatgpt-codex-connector).
+   */
+  answeredAllThreads: boolean;
+}
+
+/**
+ * Do EVERY thread `waitingIds` named (the PR's own unresolved-and-not-yet-replied-to set, read
+ * BEFORE this round touched anything) now have a real, DELIVERED outcome — i.e. is there nothing
+ * left that this round was asked about but never actually answered? `answeredIds` is
+ * `applyThreadOutcomes`'s own return value: the ids whose GitHub reply actually landed. A
+ * `fabricatedFix` "fixed" claim never reaches that set (same rule `applyThreadOutcomes` uses to
+ * skip replying to it), and neither does a thread whose reply call failed — a report entry alone
+ * isn't enough, since `replyToReviewComment` failing is swallowed by `safe()` and must not read as
+ * "answered" (anton-091jr review, chatgpt-codex-connector).
+ *
+ * `hasNonThreadReasons` names whether `verdict.fingerprint` carries any entry besides `thread:*` —
+ * a failing check, a merge conflict, or a reviewer summary. Whenever it's true (whether or not
+ * threads were ALSO waiting — a mixed round), a claude run that finished without error is not
+ * evidence it actually handled that reason: treating it as such would let `recordReviewFixAnswered`
+ * suppress a genuinely still-broken PR at this head+fingerprint forever (anton-091jr review round 2
+ * and PR #338 review, chatgpt-codex-connector — the latter caught this check only firing when
+ * `waitingIds` was empty, so a mixed round with both threads and a non-thread reason could report
+ * every thread and never once be asked about the failing check/summary). Positive evidence is
+ * `report` naming the {@link NON_THREAD_REPORT_ID} sentinel with a non-fabricated outcome:
+ * - same `fabricatedFix` rule `applyThreadOutcomes` applies to a real thread reply, so a claude run
+ *   can't claim "fixed" on the sentinel when nothing was actually pushed (PR #338 review,
+ *   chatgpt-codex-connector).
+ * - a `needs-human` sentinel counts the same as `left`: the sentinel id matches no real GitHub
+ *   thread, so `applyThreadOutcomes` never posts it — but the unpushed caller in `runFixSession`
+ *   publishes it as a top-level PR comment via `publishUnpushedSentinel` and ANDs that publish's
+ *   own success into its `answeredAllThreads` result. This function only ever sees the sentinel
+ *   after it was already asked for, so treating its mere presence as real evidence relies on that
+ *   caller-side gate, not a second one here (PR #338 review, chatgpt-codex-connector: publication
+ *   succeeding while this function still hard-rejected `needs-human` meant the request was visible
+ *   on the PR yet every sweep kept dispatching a fresh session against it anyway).
+ */
+export function allWaitingThreadsAnswered(
+  waitingIds: ReadonlySet<string>,
+  answeredIds: ReadonlySet<string>,
+  report: ThreadOutcome[],
+  hasNonThreadReasons: boolean,
+  pushed: boolean,
+): boolean {
+  if (hasNonThreadReasons) {
+    const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
+    if (!sentinel || fabricatedFix(sentinel, pushed)) return false;
+  }
+  for (const id of waitingIds) {
+    if (!answeredIds.has(id)) return false;
+  }
+  return true;
+}
+
+/**
+ * Does `verdict.fingerprint` carry an actionable reason besides an unresolved thread? Excludes
+ * `thread:*` (fed to {@link allWaitingThreadsAnswered} as per-thread evidence instead), `base:*` —
+ * `classifyReview` (src/lib/git/pr.ts) appends a `base:<oid>` entry to every nonempty fingerprint
+ * as a pure cache-busting key, not a real reason — and `comment:*`/`comments:incomplete`/
+ * `reviews:incomplete`/`checks:incomplete`, the top-level-comment, reviews, and check-rollup
+ * cache-busting entries from the same function. Without excluding `comments:incomplete`/
+ * `reviews:incomplete` too, a PR whose only actionable reason is an unresolved inline thread, read
+ * during a degraded top-level-comment or reviews page load, would read as having a non-thread
+ * reason and demand a {@link NON_THREAD_REPORT_ID} sentinel for a check/conflict/summary that never
+ * existed — failing a round that correctly reported only the real thread (PR #338 review,
+ * chatgpt-codex-connector and claude). `checks:incomplete` gets the same treatment as
+ * `reviews:incomplete`, not `comments:incomplete`: both only ever appear alongside an
+ * already-genuine reason (`pr.failingChecks.length > 0` / `reviewDecision === CHANGES_REQUESTED`)
+ * whose precise identity is merely unconfirmed, rather than being pushed unconditionally.
+ */
+export function fingerprintHasNonThreadReasons(fingerprint: readonly string[]): boolean {
+  return fingerprint.some(
+    (f) =>
+      !f.startsWith("thread:") &&
+      !f.startsWith("base:") &&
+      !f.startsWith("comment:") &&
+      f !== "comments:incomplete" &&
+      f !== "reviews:incomplete" &&
+      f !== "checks:incomplete",
+  );
+}
+
+/**
+ * Strip `thread:*` entries from a `classifyReview` fingerprint — the same normalization
+ * `postReplyFingerprint` applies before {@link recordReviewFixAnswered} (PR #338 review,
+ * chatgpt-codex-connector). Any site that derives a stable identity from a fingerprint that might
+ * be read again AFTER this round's thread replies have already posted must go through this first:
+ * once posted, those threads are no longer waiting, so a fresh `classifyReview` fingerprint (a
+ * retry after a crash, a later sweep) never reproduces them — comparing against the raw, un-thread-
+ * stripped fingerprint this round classified against would then never match again.
+ */
+function stripThreadFingerprint(fingerprint: readonly string[]): string[] {
+  return fingerprint.filter((f) => !f.startsWith("thread:"));
+}
+
+/**
+ * Should this round's outcome be persisted via `recordReviewFixAnswered` (queue.ts)? Requires the
+ * same delivered-evidence bar {@link allWaitingThreadsAnswered} already computed
+ * (`answeredAllThreads`), AND complete thread, top-level-comment, reviews, and check-rollup reads
+ * (`threadsComplete !== false`, `commentsComplete !== false`, `reviewsComplete !== false`,
+ * `checksComplete !== false`).
+ *
+ * The completeness requirements exist because `classifyReview` (src/lib/git/pr.ts) folds a degraded
+ * thread, comment, reviews, or check-rollup read into a FIXED, deterministic fingerprint entry — the
+ * same value on every degraded read, regardless of what's actually on the PR, because it can't trust
+ * that read to name the true latest human reply, CHANGES_REQUESTED review, waiting thread, or failing
+ * check. Recording a round under that entry would let every LATER degraded read match this stale row
+ * and stay suppressed forever, even past a human reply, a new review, a reply on a thread the very
+ * page which failed to load was hiding, or a check beyond the fetched page that newly failed or
+ * reran (PR #338 review round 2, chatgpt-codex-connector; `threadsComplete` added PR #338 review
+ * round 12 — a truncated thread page drops the hidden thread from both `waitingIds` and the
+ * fingerprint just as readily as it would from `answeredAllThreads`, so without this gate a degraded
+ * thread read persists a partial snapshot that every later degraded sweep reproduces and matches,
+ * suppressing the PR even while that hidden thread is still waiting or gets a new reply;
+ * `checksComplete` added PR #338 review, chatgpt-codex-connector, for the identical reason applied
+ * to `getPrCheckRollup`'s pagination). Skipping the record entirely — rather than recording some
+ * other, non-reusable placeholder — means the next pass, degraded or not, is never suppressed by
+ * this one.
+ */
+export function shouldRecordAnswered(
+  pushed: boolean,
+  answeredAllThreads: boolean,
+  threadsComplete: boolean | undefined,
+  commentsComplete: boolean | undefined,
+  reviewsComplete: boolean | undefined,
+  checksComplete: boolean | undefined,
+): boolean {
+  return (
+    !pushed &&
+    answeredAllThreads &&
+    threadsComplete !== false &&
+    commentsComplete !== false &&
+    reviewsComplete !== false &&
+    checksComplete !== false
+  );
+}
+
+/**
+ * Did the main round's own commit survive, unaltered, all the way to what actually gets pushed?
+ * `preGateHead` is the boundary commit the main round itself produced (see `runFixSession`'s own
+ * snapshot, taken right after `commitFix` and before gates or the gate-fix follow-up touch
+ * anything); `postSessionHead` is the tip after gates and the one bounded follow-up round have run.
+ *
+ * A gate-fix follow-up's prompt carries only the gate's failure output, never review feedback — so
+ * whatever it edits is not evidence for any "fixed" claim in the main round's own report. Comparing
+ * `preGateHead` to `preSessionHead` alone (raw commit identity) proves the main round committed
+ * SOMETHING, but not that the same content is still what's on the branch: a follow-up that reverts a
+ * path the main round changed, while making the gate pass some other way, still leaves that
+ * comparison reading "changed" even though the fix itself never reaches the push (PR #338 review,
+ * chatgpt-codex-connector: validate `fixed` claims against the final post-follow-up tree, not merely
+ * the intermediate main-round commit). This walks every path the main round touched and requires
+ * each one still differs from its OWN pre-session content — not that it matches `preGateHead`
+ * byte-for-byte (PR #338 review, chatgpt-codex-connector, round 2): a follow-up that formats or
+ * otherwise augments a path the main round already fixed leaves that path's final tree entry
+ * different from `preGateHead` too, and requiring an exact match would discard a fix that is, in
+ * substance, still on the branch. A follow-up that reverts a path all the way back to its
+ * pre-session state counts as "did not survive" for that path — and so does one that reverts the
+ * main round's specific hunk while leaving or adding an unrelated change elsewhere in the SAME
+ * file (PR #338 review, chatgpt-codex-connector, P1): that also leaves the final tree entry
+ * different from `preSessionHead`, so a whole-file compare alone can't tell the two apart. See
+ * {@link mainRoundHunkSurvived} for the hunk-level check this falls back to in that case.
+ *
+ * Fails closed throughout: a missing `preSessionHead`, no commit from the main round, or any git
+ * read that errors reads as "did not survive" rather than risk crediting a claim the round never
+ * actually delivered.
+ */
+export async function mainRoundChangesSurvived(
+  worktreePath: string,
+  preSessionHead: string | undefined,
+  preGateHead: string,
+  postSessionHead: string,
+): Promise<boolean> {
+  if (preSessionHead === undefined || preGateHead === preSessionHead) return false;
+  // `-z` (PR #338 review, chatgpt-codex-connector): a plain `--name-only` newline-splits a path
+  // git quotes under the default `core.quotePath` (e.g. a non-ASCII filename), so the survival
+  // check below would look up the quoted display string in `ls-tree` instead of the real path —
+  // both lookups miss, and `atGate === atFinal` (undefined === undefined) reads as "survived" even
+  // when a follow-up reverted that exact path.
+  const changedPaths = await diffPaths(worktreePath, ["--name-only", preSessionHead, preGateHead]).catch(
+    () => undefined,
+  );
+  if (changedPaths === undefined || changedPaths.length === 0) return false;
+  // Tree entry (mode + blob), not blob sha alone (PR #338 review, chatgpt-codex-connector): the
+  // mode lives on the tree entry, not the blob object, so a follow-up that flips a path's mode
+  // (e.g. reverts an executable bit the main round set) while leaving its content untouched
+  // resolves to the SAME blob sha at both commits — `rev-parse <commit>:<path>` can't see the
+  // difference, and this would credit the main round's fix as having survived a pushed tree that
+  // no longer carries it.
+  // A failed `ls-tree` read must be distinguishable from a genuinely absent path (PR #338 review,
+  // chatgpt-codex-connector): collapsing both to `undefined` makes `atPreSession === atFinal` true
+  // whenever BOTH reads fail, reporting survival for a path this check could never actually verify —
+  // including the case where a gate follow-up reverted the change and the failure is masking exactly
+  // that. `READ_FAILED` is a sentinel distinct from both a real `mode:blob` entry and "path absent".
+  const READ_FAILED = Symbol("ls-tree read failed");
+  const treeEntryAt = (commit: string, path: string): Promise<string | undefined | typeof READ_FAILED> =>
+    git(worktreePath, ["ls-tree", commit, "--", path])
+      .then((out) => {
+        const [mode, , blob] = (out.split("\n").find(Boolean) ?? "").split(/\s+/);
+        return mode && blob ? `${mode}:${blob}` : undefined;
+      })
+      .catch(() => READ_FAILED);
+  const survived = await Promise.all(
+    changedPaths.map(async (path) => {
+      // Against `preSessionHead` (this path's ORIGINAL content), not `preGateHead` (PR #338
+      // review, chatgpt-codex-connector, round 2): a gate follow-up that further edits a path the
+      // main round already fixed — reformatting it, say — makes the final tree entry differ from
+      // `preGateHead` too, and that difference is not a reversion. Only a final entry that matches
+      // back up with what the path looked like BEFORE the main round touched it means the
+      // follow-up undid the fix.
+      const [atPreSession, atPreGate, atFinal] = await Promise.all([
+        treeEntryAt(preSessionHead, path),
+        treeEntryAt(preGateHead, path),
+        treeEntryAt(postSessionHead, path),
+      ]);
+      if (atPreSession === READ_FAILED || atPreGate === READ_FAILED || atFinal === READ_FAILED) return false;
+      // A deletion needs the final tree to still be ABSENT, not merely different from the
+      // pre-session entry (PR #338 review, chatgpt-codex-connector, round 3): if the main round
+      // deleted this path (`atPreGate === undefined`) and a gate follow-up recreates it with
+      // different content, `atPreSession !== atFinal` is still true even though the deletion was
+      // undone — the recreated blob just happens to differ from the original one.
+      if (atPreGate === undefined) return atFinal === undefined;
+      if (atFinal === atPreSession) return false;
+      if (atFinal === undefined || atFinal === atPreGate) return true;
+      // Beyond this point `atFinal` differs from BOTH ends (PR #338 review, chatgpt-codex-connector,
+      // P1): the follow-up touched this path further after the main round's own fix. A whole-blob
+      // compare can't tell "the follow-up reverted the main round's hunk but also made an unrelated
+      // edit elsewhere in the file" apart from a genuine reformat — the unrelated edit alone is
+      // enough to make `atFinal` differ from `atPreSession`, and the old `atPreSession !== atFinal`
+      // check credited that as "survived" even with the reviewed hunk reverted underneath it. Check
+      // hunk-by-hunk instead, applying the SAME "back to what it looked like before the main round
+      // touched it" test this function already uses at file granularity.
+      return mainRoundHunkSurvived(worktreePath, preSessionHead, preGateHead, postSessionHead, path);
+    }),
+  );
+  return survived.every(Boolean);
+}
+
+/**
+ * A path's content at `commit`, distinguishing "genuinely absent at this commit" (`""`, e.g. a
+ * file the main round itself created) from a real read failure (`undefined`) — collapsing both to
+ * the same value would let a failed read masquerade as an empty, newly-created file.
+ */
+function fileContentAt(worktreePath: string, commit: string, path: string): Promise<string | undefined> {
+  return git(worktreePath, ["show", `${commit}:${path}`]).catch(() =>
+    git(worktreePath, ["ls-tree", commit, "--", path])
+      .then((out) => (out.trim() === "" ? "" : undefined))
+      .catch(() => undefined),
+  );
+}
+
+/** A path's tree-entry file mode at `commit` (e.g. `100644`, `100755`), or `undefined` on any read failure or absence. */
+function fileModeAt(worktreePath: string, commit: string, path: string): Promise<string | undefined> {
+  return git(worktreePath, ["ls-tree", commit, "--", path])
+    .then((out) => (out.split("\n").find(Boolean) ?? "").split(/\s+/)[0] || undefined)
+    .catch(() => undefined);
+}
+
+/** Number of unchanged lines pulled from the pre-gate file on each side of an added block to anchor it to its original location — see {@link mainRoundHunkSurvived}. */
+const HUNK_ANCHOR_CONTEXT_LINES = 3;
+
+/**
+ * Hunk-level fallback for {@link mainRoundChangesSurvived}: called only once a path's final tree
+ * entry differs from BOTH its pre-session and pre-gate content, so a whole-file compare can no
+ * longer tell a reverted hunk apart from an unrelated edit made elsewhere in the same file. Walks
+ * the main round's own hunks for this path and checks each against the FINAL file content.
+ *
+ * A hunk with added text survives when that text is still found in the FINAL file anchored to its
+ * ORIGINAL location — bracketed by the few unchanged lines that sat immediately before/after it in
+ * the pre-gate file. A plain file-wide `includes`/count comparison (PR #338 review round 4, then
+ * round 5's own fix) ignores location: when a gate follow-up reverts the hunk at its own spot but
+ * separately adds identical text elsewhere in the same file — not merely text that pre-existed
+ * there — the file-wide occurrence count still comes out ahead of the pre-session baseline, so it
+ * credits the reverted hunk as surviving (PR #338 review, chatgpt-codex-connector, round 5 P1).
+ * Anchoring to the surrounding, unrelated-edit-immune context rules that out. Otherwise the hunk is
+ * reverted when the exact text it replaced has reappeared, or (for a pure-addition hunk, with
+ * nothing removed to reappear) the anchored block simply isn't there — a PR #338 P1 fix: with
+ * `removed` empty, the old check's `removedBlock.length > 0` guard was always false, so a
+ * pure-addition hunk's absence was silently credited as "survived". Any other outcome — a
+ * replacement hunk edited into something else entirely — is treated the same as the file-level
+ * "reformatted, not reverted" case, i.e. survived.
+ *
+ * Fails closed (not survived) on a read error, matching the caller's own convention.
+ */
+async function mainRoundHunkSurvived(
+  worktreePath: string,
+  preSessionHead: string,
+  preGateHead: string,
+  postSessionHead: string,
+  path: string,
+): Promise<boolean> {
+  const [mainDiff, preGateContent, finalContent] = await Promise.all([
+    git(worktreePath, ["diff", "-U0", "--no-color", preSessionHead, preGateHead, "--", path]).catch(
+      () => undefined,
+    ),
+    fileContentAt(worktreePath, preGateHead, path),
+    fileContentAt(worktreePath, postSessionHead, path),
+  ]);
+  if (mainDiff === undefined || preGateContent === undefined || finalContent === undefined) return false;
+  const HUNK_HEADER = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+  const hunks: { newStart: number; newLen: number; removed: string[]; added: string[] }[] = [];
+  for (const line of mainDiff.split("\n")) {
+    const header = HUNK_HEADER.exec(line);
+    if (header) {
+      hunks.push({
+        newStart: Number(header[1]),
+        newLen: header[2] === undefined ? 1 : Number(header[2]),
+        removed: [],
+        added: [],
+      });
+      continue;
+    }
+    const hunk = hunks[hunks.length - 1];
+    // Only the pre-hunk `--- a/file` / `+++ b/file` file-header lines are skipped here, and `!hunk`
+    // alone already identifies them (they appear once, before the first `@@`, per single-path diff).
+    // Matching `---`/`+++` by prefix INSIDE a hunk (PR #338 review, chatgpt-codex-connector, P1) is
+    // wrong: git prefixes each hunk line with exactly one leading `+`/`-`, so an added source line
+    // that itself starts with `+` (e.g. `++sentinel`) is emitted as `+++sentinel`, and a removed line
+    // starting with `-` becomes `---...` — both would be discarded as fake headers instead of being
+    // recorded as real hunk content.
+    if (!hunk) continue;
+    if (line.startsWith("-")) hunk.removed.push(line.slice(1));
+    else if (line.startsWith("+")) hunk.added.push(line.slice(1));
+  }
+  // No parsed hunks — a binary diff (`git diff -U0` prints "Binary files ... differ", no `@@`
+  // lines), or a mode-only change whose content is untouched. A mode-only main-round change is
+  // handled below by checking the mode itself. A BINARY content change has no text to anchor at
+  // all, so — unlike the old unconditional "survived" here — this must fail closed (PR #338
+  // review, chatgpt-codex-connector, round 5 P2): the caller only reaches this function when the
+  // final blob already differs from both the pre-session AND pre-gate blobs, so a gate follow-up
+  // that reverted the main round's binary fix while separately re-editing the same binary file
+  // (same mode, still zero parsed hunks) has no textual signal to distinguish it from a survived
+  // fix — crediting it as "survived" unconditionally let that revert slip through unnoticed.
+  if (hunks.length === 0) {
+    const [preSessionMode, preGateMode, finalMode] = await Promise.all([
+      fileModeAt(worktreePath, preSessionHead, path),
+      fileModeAt(worktreePath, preGateHead, path),
+      fileModeAt(worktreePath, postSessionHead, path),
+    ]);
+    if (preGateMode !== undefined && preGateMode !== preSessionMode) {
+      return finalMode === preGateMode;
+    }
+    return false;
+  }
+  const preGateLines = preGateContent.split("\n");
+  return hunks.every(({ newStart, newLen, removed, added }) => {
+    const addedBlock = added.join("\n");
+    if (addedBlock.length > 0) {
+      const startIdx = newStart - 1;
+      const endIdx = startIdx + newLen;
+      const contextBefore = preGateLines.slice(Math.max(0, startIdx - HUNK_ANCHOR_CONTEXT_LINES), startIdx);
+      const contextAfter = preGateLines.slice(
+        endIdx,
+        Math.min(preGateLines.length, endIdx + HUNK_ANCHOR_CONTEXT_LINES),
+      );
+      const anchoredAddedBlock = [...contextBefore, ...added, ...contextAfter].join("\n");
+      if (finalContent.includes(anchoredAddedBlock)) return true;
+    }
+    const removedBlock = removed.join("\n");
+    if (removedBlock.length > 0) return !finalContent.includes(removedBlock);
+    // Pure-addition hunk (nothing removed): there's no prior text whose reappearance would
+    // prove a revert, so the anchored block's absence IS the revert signal.
+    return addedBlock.length === 0;
+  });
 }
 
 /**
@@ -800,9 +1898,21 @@ async function runFixSession(args: {
   conflicts: string[];
   /** Ahead of origin before this run touched anything — see {@link prepareFixWorktree}. */
   alreadyAhead: boolean;
+  /**
+   * Does `alreadyAhead` hold only because of a leftover, never-built-on premerge boundary commit
+   * — see {@link prepareFixWorktree}'s own doc on the field of the same name. Must gate the
+   * "already ahead" fast path below alongside `alreadyAhead` itself.
+   */
+  headIsBareUnverifiedBoundary: boolean;
+  /**
+   * Worktree HEAD before claude/the gate follow-up ran — see {@link prepareFixWorktree}. `undefined`
+   * when that read failed; every comparison against it below must treat that as "no change", never
+   * as a sha that happens to differ from whatever's read later.
+   */
+  preSessionHead: string | undefined;
   branch: string;
   number: number;
-}): Promise<boolean> {
+}): Promise<RunFixSessionResult> {
   const {
     db,
     clock,
@@ -816,9 +1926,21 @@ async function runFixSession(args: {
     verdict,
     conflicts,
     alreadyAhead,
+    headIsBareUnverifiedBoundary,
+    preSessionHead,
     branch,
     number,
   } = args;
+
+  // Snapshot BEFORE this round touches anything — what `answeredAllThreads` (in every return below)
+  // checks a thread report against. `pr` is the same read `verdict` was classified from, so this
+  // matches exactly what made the round actionable in the first place.
+  const waitingIds = new Set(threadsNeedingAttention(pr).map((t) => t.id));
+  // Does this round need answering for something besides those threads — a failing check, a merge
+  // conflict, or a reviewer summary? Drives both the prompt (ask for the sentinel even in a mixed
+  // round) and `allWaitingThreadsAnswered` (require it), so the two can never drift apart (PR #338
+  // review, chatgpt-codex-connector).
+  const hasNonThreadReasons = fingerprintHasNonThreadReasons(verdict.fingerprint);
 
   // Resume the epic's open run if present (for UI linkage); review-fix doesn't create runs itself.
   const run = await findOpenRunForEpic(db, projectId, epic.id);
@@ -838,6 +1960,9 @@ async function runFixSession(args: {
   // re-review notification) throws — that would erase delivery evidence for a push that already
   // reached the remote (PR #320 review).
   let sessionSettled = false;
+  // Set the instant the one bounded follow-up round is dispatched (anton-pwekp), so a PoisonError
+  // that reaches the catch below can tell the PR whether a fix round was already attempted.
+  let gateFollowUpAttempted = false;
 
   try {
     // A resume can land here with the fix already committed on the branch — an operator resolving
@@ -857,12 +1982,38 @@ async function runFixSession(args: {
     // here would otherwise let the gate run against literal conflict text and, on a red result,
     // have the next worktree reap silently discard the unresolved merge while notifyGateParked
     // claims it was "resolved and committed locally".
-    if (alreadyAhead && conflicts.length === 0) {
+    //
+    // `!headIsBareUnverifiedBoundary` (PR #338 review, chatgpt-codex-connector): `alreadyAhead`
+    // alone can't tell a genuine resume apart from a PRIOR attempt's own premerge that landed,
+    // got marked unverified, and then the process errored or exited before claude ever ran on top
+    // of it — that leaves the exact same "branch ahead of origin" shape on the next attempt, with
+    // none of the review feedback actually addressed. Taking the shortcut over it would push a
+    // base-only merge and tell reviewers their feedback was resolved. Falling through instead
+    // dispatches claude normally; `premergeBase` below no-ops (the base is already merged in) and
+    // the marked boundary's ancestor is still found and re-verified by `commitFix` further down,
+    // same as any other resume.
+    if (alreadyAhead && conflicts.length === 0 && !headIsBareUnverifiedBoundary) {
       await appendSessionLog(
         logPath,
         `[review-fix] PR #${number}: branch already ahead of origin; running gates and pushing without claude\n`,
       );
-      await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+      await runGatesWithFollowUp({
+        db,
+        clock,
+        ctx,
+        projectId,
+        epic,
+        settings,
+        worktree,
+        pr,
+        run,
+        number,
+        logPath,
+        onEvent,
+        onFollowUpAttempted: () => {
+          gateFollowUpAttempted = true;
+        },
+      });
       const pushed = await commitAndPushFix(
         repo,
         worktree.path,
@@ -889,7 +2040,18 @@ async function runFixSession(args: {
         reasons: verdict.reasons,
       });
       await notifyReReview({ repo, number, pr, reasons: verdict.reasons, signal: ctx.signal });
-      return pushed;
+      // This path never dispatches claude, so nothing here ever looked at (let alone replied to)
+      // any thread, nor reported the non-thread sentinel. Route the unpushed case through the same
+      // `allWaitingThreadsAnswered` the main path uses (with an empty report/answered set, since
+      // nothing was ever asked) rather than a hand-rolled `waitingIds.size === 0` check — that check
+      // alone ignored `hasNonThreadReasons` and could credit this fast path as "fully answered" for a
+      // failing check or reviewer summary nothing ever verified, if `pushed` ever came back false
+      // despite the branch being ahead (PR #338 review, @claude).
+      return {
+        pushed,
+        answeredAllThreads:
+          pushed || allWaitingThreadsAnswered(waitingIds, new Set(), [], hasNonThreadReasons, pushed),
+      };
     }
 
     await appendSessionLog(
@@ -902,6 +2064,7 @@ async function runFixSession(args: {
       pr,
       reasons: verdict.reasons,
       conflicts,
+      hasNonThreadReasons,
       settings,
       projectDir: worktree.path,
     });
@@ -941,17 +2104,56 @@ async function runFixSession(args: {
       );
     }
 
-    // premergeBase left any base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for
-    // this same session to resolve alongside the review feedback. Commit that resolution NOW, before
-    // the gates run: a red gate below still throws and parks the branch, but the merge itself is
-    // already landed rather than sitting as an uncommitted resolution the next re-run's fresh
-    // worktree would simply discard (anton-vtex7). Nothing is pushed here — publication stays behind
-    // the gates. No conflicts to resolve → nothing to commit yet → this run is unchanged.
-    if (conflicts.length > 0) {
-      await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal);
-    }
+    // Commit the main round's own work NOW, before gates (and the possible gate-fix follow-up)
+    // touch the tree. This used to be gated on `conflicts.length > 0` — premergeBase leaves any
+    // base-merge conflicts uncommitted (conflict markers, MERGE_HEAD set) for this same session to
+    // resolve, and that resolution needed landing before a red gate below could throw and park the
+    // branch (anton-vtex7) — but `commitFix` stages everything and only actually commits when the
+    // tree is dirty, so calling it unconditionally still no-ops for a conflict-free, nothing-to-fix
+    // round while ALSO covering the conflict case. Doing it unconditionally is what makes
+    // `preGateHead` below a real boundary: without it, a conflict-free round's own edits would sit
+    // uncommitted straight through the gate run, and the follow-up's commit (if any) would be
+    // indistinguishable from this round's. Nothing is pushed here — publication stays behind the
+    // gates.
+    //
+    // `bypassHooks: true` (PR #338 review, chatgpt-codex-connector): this is an internal boundary
+    // marker, not publication — the tree still gets a real hook-enforced commit below, in
+    // `commitAndPushFix`, once it is actually about to be pushed. A project whose pre-commit hook
+    // runs the SAME lint/typecheck/test command as a configured verify gate would otherwise have
+    // this commit rejected by the hook before `runGatesWithFollowUp` ever runs — exiting via the
+    // plain (retryable) error `commitFix` throws when nothing landed, which skips straight past the
+    // bounded gate-fix follow-up round below and re-dispatches a whole new review session against
+    // the exact same failure instead.
+    //
+    // This commit is marked as an unverified boundary (see `markUnverifiedBoundary`), so
+    // `commitAndPushFix` below re-verifies it via `commitFix`'s own marker check even when the
+    // follow-up round makes no further changes — a clean index would otherwise mean `commitAll`
+    // never invokes git at all, letting this hook-bypassed commit reach the remote unverified.
+    await commitFix(repo, worktree.path, epic.id, branch, number, settings, ctx.signal, {
+      bypassHooks: true,
+    });
+    // Snapshot the boundary BEFORE gates/the follow-up round can touch anything — see
+    // `mainRoundProducedChange` below for why this, not `postSessionHead`, is what `report`'s own
+    // claims get checked against.
+    const { head: preGateHead } = await readWorktreeState(worktree.path);
 
-    await runTestGate(settings, worktree.path, ctx.signal, logPath, number);
+    await runGatesWithFollowUp({
+      db,
+      clock,
+      ctx,
+      projectId,
+      epic,
+      settings,
+      worktree,
+      pr,
+      run,
+      number,
+      logPath,
+      onEvent,
+      onFollowUpAttempted: () => {
+        gateFollowUpAttempted = true;
+      },
+    });
 
     const pushed = await commitAndPushFix(
       repo,
@@ -970,25 +2172,80 @@ async function runFixSession(args: {
     await endSession(db, clock, sessionId, "done", pushed);
     sessionSettled = true;
 
+    // `pushed` alone is not proof this round's claude/gate-follow-up work produced anything: a clean
+    // base premerge (see `prepareFixWorktree`'s `preSessionHead` doc) can already have HEAD ahead of
+    // origin before claude ever ran, so `commitAndPushFix` returns `pushed: true` for that merge
+    // alone even when claude changed nothing. `sessionProducedChange` names whether ANYTHING beyond
+    // that ambient base sync went out this round (claude's own edits OR the gate-fix follow-up's) —
+    // good enough for `notifyReReview` below (a follow-up-only push still deserves a re-review ping)
+    // but NOT for `report`'s own claims (next).
+    const { head: postSessionHead } = await readWorktreeState(worktree.path);
+    // Compared by TREE, not raw commit identity (PR #338 review, chatgpt-codex-connector, P2):
+    // `commitAndPushFix`'s own re-verify amend (`commitFix` → `commitAll`'s `amendToVerifyHooks`
+    // path) unconditionally rewrites a still-unverified boundary — e.g. `premergeBase`'s clean
+    // base-only merge, still unpushed — to run the project's real hooks, even when nothing new was
+    // ever staged on top of it. That rewrite always lands under a NEW commit sha (a fresh commit
+    // timestamp alone is enough), while the TREE it commits is byte-identical to what was there
+    // before. A main claude round and gate follow-up that both changed nothing would otherwise still
+    // read as `sessionProducedChange` purely from that hook-only rewrite, and the branch below wrongly
+    // posts "pushed a fix" / re-requests reviewers for a base-sync-only push it meant to skip.
+    // `undefined` on either side (an unreadable head, or a git error resolving its tree) reads as "no
+    // change" — the same fail-closed convention `preSessionHead` itself already uses, so a transient
+    // git hiccup can never manufacture push evidence for a claim claude never earned.
+    const treeOfCommit = (sha: string | undefined): Promise<string | undefined> =>
+      sha === undefined
+        ? Promise.resolve(undefined)
+        : git(worktree.path, ["rev-parse", `${sha}^{tree}`]).catch(() => undefined);
+    const [preSessionTree, postSessionTree] = await Promise.all([
+      treeOfCommit(preSessionHead),
+      treeOfCommit(postSessionHead),
+    ]);
+    const sessionProducedChange =
+      preSessionTree !== undefined &&
+      postSessionTree !== undefined &&
+      postSessionTree !== preSessionTree;
+    // `report` is parsed from `result.text` — the main round's OWN final message, produced before
+    // gates (and any gate-fix follow-up) ever ran. Whether a "fixed" claim in it is real must be
+    // checked against what THAT round committed AND what actually survived to the final pushed tree,
+    // not merely that the main round committed something: the follow-up's prompt carries the gate's
+    // failure output and nothing about review feedback, so its edits are evidence the *gate* got
+    // fixed, never evidence for any claim in this report — and if the follow-up happens to revert a
+    // path the main round changed while making the gate pass some other way, the claim behind it must
+    // not be credited (PR #338 review, chatgpt-codex-connector: validate `fixed` claims against the
+    // final post-follow-up tree, not merely the intermediate main-round commit). Using
+    // `sessionProducedChange` here let a gate-only follow-up validate a fabricated "fixed" claim on
+    // an inline thread the follow-up never looked at (PR #338 review, chatgpt-codex-connector).
+    const mainRoundProducedChange = await mainRoundChangesSurvived(
+      worktree.path,
+      preSessionHead,
+      preGateHead,
+      postSessionHead,
+    );
+
     const report = parseThreadReport(result.text);
     // `delivered` is the subset of `report` whose reply actually posted (PR #335 review) — what
     // both the round record and the PR body below must count, not the raw model report, since a
     // GitHub failure mid-reply leaves that thread still waiting on anton regardless of what claude
-    // claimed.
+    // claimed. Gated on `mainRoundProducedChange`, not raw `pushed` (PR #338 review,
+    // chatgpt-codex-connector): a gate-only follow-up push must not validate a "fixed" claim this
+    // report made about review feedback the follow-up never looked at.
     const delivered = await applyThreadOutcomes({
       repo,
       number,
       pr,
       report,
-      pushed,
+      pushed: mainRoundProducedChange,
       signal: ctx.signal,
       logPath,
     });
+    const answeredIds = new Set(delivered.map((d) => d.id));
     // The round's own record (anton-z5e3g): what GitHub's reviewers handed this round and how anton
     // answered it, from the values already in hand. AFTER the outcomes are applied, and only on this
     // path — a session that threw replied to no thread, so its findings are still waiting on anton
     // and the retry's row carries them; recording both would count the same review twice. The write
-    // never throws (see `recordReviewRound`), so the fix above cannot be lost to a meter.
+    // never throws (see `recordReviewRound`), so the fix above cannot be lost to a meter. `pushed`
+    // here matches `applyThreadOutcomes`'s own — `recordReviewRound`'s internal re-triage must agree
+    // with what actually got a delivered reply, for the same reason given above.
     await recordReviewRound(db, clock, {
       projectId,
       beadId: epic.id,
@@ -996,7 +2253,7 @@ async function runFixSession(args: {
       prNumber: number,
       pr,
       report: delivered,
-      pushed,
+      pushed: mainRoundProducedChange,
     });
     // Recheck the terminal state right after the insert above, against a FRESH read rather than the
     // `pr` snapshot fetched before this session's claude dispatch (PR #335 review). On a shared board,
@@ -1022,13 +2279,20 @@ async function runFixSession(args: {
     }
     // AFTER the push (`pushed` is already settled above) — anton-te6nr — so the body never claims a
     // fix that isn't on the remote yet. `verdict.reasons` backs the fallback entry for a round with
-    // no thread report (CI-only/conflict-only/no-inline-threads trigger); `fallbackReasonsFor` gates
-    // that on the RAW `report`, not `delivered` (PR #335 review).
+    // no thread report (CI-only/conflict-only/no-inline-threads trigger). Gated on
+    // `mainRoundProducedChange`, not `sessionProducedChange` or raw `pushed` — same reason as
+    // `applyThreadOutcomes` above: this region renders straight from `report`'s own claims, so it
+    // needs the same narrow evidence, not credit for a gate-only follow-up's unrelated edit.
+    // The sentinel is injected as its own report entry, not routed through `reasons` — it must
+    // survive alongside a real thread entry in the same round (PR #338 review, chatgpt-codex-
+    // connector), and `fallbackReasonsFor`'s generic fallback only fires when the report is
+    // otherwise completely empty.
+    const sentinelEntry = sentinelFixEntry(report, verdict.reasons);
     await refreshFixRoundsBody({
       repo,
       number,
-      report: delivered,
-      pushed,
+      report: sentinelEntry ? [...delivered, sentinelEntry] : delivered,
+      pushed: mainRoundProducedChange,
       now: new Date(clock.now()),
       logPath,
       reasons: fallbackReasonsFor(report, verdict.reasons),
@@ -1039,24 +2303,79 @@ async function runFixSession(args: {
         logPath,
         `[review-fix] no changes produced; leaving PR #${number} as-is\n`,
       );
-      return false;
+      // `refreshFixRoundsBody` above returned immediately for an unpushed round — its explanation
+      // never reached the PR body. Without publishing it here, a "left" or "needs-human" sentinel
+      // that `allWaitingThreadsAnswered` is about to accept as answered (below) would suppress this
+      // fingerprint+headSha forever while the reviewer never learns why nothing changed (PR #338
+      // review, @chatgpt-codex-connector) — and for "needs-human" specifically, treat a successful
+      // publish as the round's answer rather than forcing a retry every sweep even though the human
+      // request is already visible on the PR (PR #338 review, chatgpt-codex-connector).
+      const sentinel = report.find((r) => r.id === NON_THREAD_REPORT_ID);
+      // Defaults to true: when there's no sentinel to publish (or it's fabricated),
+      // `allWaitingThreadsAnswered` below already rejects it on its own — this flag only needs to
+      // veto the case where a real sentinel existed but the comment never reached GitHub.
+      let sentinelPublished = true;
+      if (sentinel && !fabricatedFix(sentinel, pushed)) {
+        sentinelPublished = await publishUnpushedSentinel({
+          repo,
+          number,
+          sentinel,
+          headSha: pr.headSha,
+          // Stripped of `thread:*` entries (see `stripThreadFingerprint`'s doc): the inline threads
+          // in this same report were just replied to above via `applyThreadOutcomes`, so a retry
+          // that crashes before `recordReviewFixAnswered` recomputes a fresh `classifyReview`
+          // fingerprint that already lacks those now-answered threads — comparing against the raw
+          // fingerprint here would never match it, and the marker below would never dedup.
+          fingerprint: stripThreadFingerprint(verdict.fingerprint),
+          signal: ctx.signal,
+          logPath,
+        });
+      }
+      return {
+        pushed: false,
+        answeredAllThreads:
+          sentinelPublished &&
+          allWaitingThreadsAnswered(waitingIds, answeredIds, report, hasNonThreadReasons, pushed),
+      };
     }
 
-    await notifyReReview({
-      repo,
-      number,
-      pr,
-      reasons: verdict.reasons,
-      signal: ctx.signal,
-    });
-    return true;
+    // Gated on `sessionProducedChange`, not raw `pushed` — same reason as `applyThreadOutcomes` and
+    // `refreshFixRoundsBody` above: a base-sync-only push must not tell reviewers anton "pushed a
+    // fix" when the session itself left every reported thread unanswered (PR #338 review,
+    // @chatgpt-codex-connector).
+    if (sessionProducedChange) {
+      await notifyReReview({
+        repo,
+        number,
+        pr,
+        reasons: verdict.reasons,
+        signal: ctx.signal,
+      });
+    } else {
+      await appendSessionLog(
+        logPath,
+        `[review-fix] PR #${number}: push was a base-branch sync only; skipping re-review notification\n`,
+      );
+    }
+    return { pushed: true, answeredAllThreads: true };
   } catch (e) {
     if (!sessionSettled) await endSession(db, clock, sessionId, "failed");
     // Poison means this attempt is parked for a human — the PR's own CONFLICTING/CI badges say
     // nothing about THAT (they don't know a gate ever ran), so without this comment the reader sees
     // only a stale badge, not why anton stopped (anton-gvqk3).
     if (isPoisonError(e)) {
-      await notifyGateParked({ repo, number, error: e, conflicts, signal: ctx.signal });
+      await notifyGateParked({
+        repo,
+        number,
+        error: e,
+        conflicts,
+        // Scoped to the gate-failure poison itself (not just "a follow-up round ran at some point
+        // this attempt"): a follow-up that fixed the gate can still be followed by an unrelated
+        // commit/marker poison from `commitFix`/`commitAndPushFix` below, and that poison did not
+        // fail a second time — it never touched the gate at all (PR #338 review, @claude).
+        fixRoundAttempted: gateFollowUpAttempted && isGateFailurePoison(e),
+        signal: ctx.signal,
+      });
     }
     throw e; // propagate so the runner applies quota backoff / retry / park
   }
@@ -1065,26 +2384,45 @@ async function runFixSession(args: {
 /**
  * Tell the PR why anton stopped: the gate/blocker a poison park named, plus whether a base-branch
  * merge is already resolved and committed locally (unpushed) so the reader isn't left guessing what
- * state the branch is in. Carries {@link ANTON_MARK} like every other anton comment, so the review
- * sweep's own `threadsNeedingAttention` never mistakes it for a human's. Idempotent against the PR's
- * comment history rather than any local state — a resumed job parking on the SAME gate is a fresh
- * process with nothing of its own to remember, but the PR remembers what was already said on it.
+ * state the branch is in, and whether a bounded follow-up round already tried to fix the gate
+ * (anton-pwekp) — so the reader isn't left assuming a retry would help. Carries {@link ANTON_MARK}
+ * like every other anton comment, so the review sweep's own `threadsNeedingAttention` never mistakes
+ * it for a human's. Idempotent against the PR's comment history rather than any local state — a
+ * resumed job parking on the SAME gate is a fresh process with nothing of its own to remember, but
+ * the PR remembers what was already said on it.
+ *
+ * Posts best-effort even when the comment history is a degraded read (`commentsComplete: false`,
+ * including the fetch-failure fallback below) rather than skipping — unlike `publishUnpushedSentinel`,
+ * this is the ONLY call site: it fires from the catch block of a poison park, and a parked job is not
+ * retried by the normal sweep at the same head (see `suppressed — parked review-fix-pr at unchanged
+ * head` above), so nothing calls this again until a human runs `resumeJob` or the head changes. A
+ * degraded read here would therefore not just "delay" the notification, it would drop it until one of
+ * those happens — worse than the small chance of a duplicate comment from deduping against a partial
+ * comment list (PR #338 review round 3, @claude).
  */
 export async function notifyGateParked(args: {
   repo: string;
   number: number;
   error: Error;
   conflicts: string[];
+  /** Did the one bounded follow-up round already run against this gate before it parked? */
+  fixRoundAttempted?: boolean;
   signal: AbortSignal;
 }): Promise<void> {
-  const { repo, number, error, conflicts, signal } = args;
+  const { repo, number, error, conflicts, fixRoundAttempted, signal } = args;
   const mergeNote =
     conflicts.length > 0
       ? " The base branch merge was resolved and committed locally (not yet pushed)."
       : "";
-  const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}`;
-  const existing = await getPrComments(repo, number, signal).catch((): string[] => []);
-  if (existing.includes(body)) return;
+  const fixRoundNote = fixRoundAttempted
+    ? " A follow-up fix round already ran against this gate; it failed again."
+    : "";
+  const body = `${ANTON_MARK} anton stopped fixing PR #${number} — ${error.message}${mergeNote}${fixRoundNote}`;
+  const existing = await getPrTopLevelComments(repo, number, signal).catch(() => ({
+    comments: [],
+    commentsComplete: false,
+  }));
+  if (existing.comments.some((c) => c.body === body)) return;
   await safe(() => commentOnPr(repo, number, body, signal));
 }
 
@@ -1111,6 +2449,52 @@ const GATE_FAILURE_OUTPUT_CHARS = 3000;
  * below: `captureVerifyGates` REJECTS for those (it never returns a red outcome for them), so they
  * propagate as an ordinary error the runner still retries.
  */
+async function captureRedGate(
+  settings: ProjectSettings,
+  cwd: string,
+  signal: AbortSignal,
+  logPath: string,
+): Promise<VerifyGateOutcome | undefined> {
+  const outcomes = await captureVerifyGates(resolveVerifyGates(settings), cwd, signal, logPath);
+  return outcomes.find((o) => !o.ok);
+}
+
+const GATE_FAILURE_POISON = Symbol("gateFailurePoison");
+
+/**
+ * Whether `error` is specifically the poison {@link gateFailurePoison} throws — not just any
+ * `PoisonError` reaching the same catch block. `gateFollowUpAttempted` (set the instant the
+ * follow-up round is dispatched, never reset once it succeeds) says nothing on its own about
+ * WHICH poison a later throw is: `commitFix`/`commitAndPushFix` raise their own `PoisonError`s
+ * for unrelated commit/marker failures, and those can still fire after a follow-up round already
+ * fixed the gate. Tagged the same way `commitAttemptMode` tags a commit error (git/ops.ts) —
+ * on the original object, not a wrapper, so identity and message survive for every other reader.
+ *
+ * Exported for tests only — every real caller is inside this module.
+ */
+export function isGateFailurePoison(error: unknown): boolean {
+  return Boolean(error && typeof error === "object" && GATE_FAILURE_POISON in error);
+}
+
+/**
+ * Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
+ *
+ * Friction classification (ADR-0001 clause 5, anton-tuf4l): this poison parks the job through the
+ * runner's ordinary non-quota path, so it counts toward `failureParkCount` — anton failing, a human
+ * has to clear it — same as any other poison park. No new counter: a gate still red after the one
+ * bounded follow-up round (anton-pwekp) is exactly the "job parked (non-quota)" row in the gap-3
+ * taxonomy, not a new kind of stop.
+ */
+function gateFailurePoison(red: VerifyGateOutcome, number: number): PoisonError {
+  return Object.assign(
+    new PoisonError(
+      `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
+        tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
+    ),
+    { [GATE_FAILURE_POISON]: true },
+  );
+}
+
 export async function runTestGate(
   settings: ProjectSettings,
   cwd: string,
@@ -1118,14 +2502,388 @@ export async function runTestGate(
   logPath: string,
   number: number,
 ): Promise<void> {
-  const outcomes = await captureVerifyGates(resolveVerifyGates(settings), cwd, signal, logPath);
-  const red = outcomes.find((o) => !o.ok);
+  const red = await captureRedGate(settings, cwd, signal, logPath);
+  if (red) throw gateFailurePoison(red, number);
+}
+
+/**
+ * Run the verify gates; on red, give the fix ONE bounded follow-up claude round — in the same
+ * worktree, with the gate's own label + tailed output in its prompt — and re-run the gates before
+ * giving up (anton-pwekp). A deterministic gate failure the agent could fix (a migration
+ * re-stamp, a lint error) reaches it exactly once: green after the follow-up returns normally so
+ * the caller pushes as usual; still red parks with the SECOND run's output, exactly as a first-try
+ * red would have without this round. Called from both the normal dispatch path and the
+ * already-ahead fast path in `runFixSession`, each call site gets at most one follow-up — there is
+ * no loop here to bound.
+ *
+ * Transient failures (an aborted signal, a killed process) never reach the follow-up at all:
+ * `captureRedGate` (via `captureVerifyGates`) REJECTS for those rather than returning a red
+ * outcome, so they propagate as an ordinary retryable error out of this function without spending
+ * the round.
+ */
+async function runGatesWithFollowUp(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+  projectId: string;
+  epic: Bead;
+  settings: ProjectSettings;
+  worktree: Worktree;
+  pr: PrReview;
+  run: RunRow | undefined;
+  number: number;
+  logPath: string;
+  onEvent: (event: ClaudeEvent) => void;
+  /** Called once the follow-up round is actually dispatched, so the caller can note it for the park comment. */
+  onFollowUpAttempted: () => void;
+}): Promise<void> {
+  const {
+    db,
+    clock,
+    ctx,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    run,
+    number,
+    logPath,
+    onEvent,
+    onFollowUpAttempted,
+  } = args;
+
+  const red = await captureRedGate(settings, worktree.path, ctx.signal, logPath);
   if (!red) return;
-  // Opening sentence unchanged (existing readers parse it) — the gate output tail is appended.
-  throw new PoisonError(
-    `${red.label} gate failed after review-fix for PR #${number} (exit ${red.code})\n\n` +
-      tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS),
+
+  await appendSessionLog(
+    logPath,
+    `[review-fix] PR #${number}: ${red.label} gate failed (exit ${red.code}); running one follow-up fix round before parking\n`,
   );
+  onFollowUpAttempted();
+  // The main round plus the first gate can already have burned most of a bounded
+  // `jobTimeoutMinutes` — reset the no-progress clock before spending it on the follow-up round and
+  // the gate re-run below, since `ctx.claudeReached()` is a no-op after the first spawn and can't do
+  // it for us (PR #338 review, chatgpt-codex-connector).
+  await ctx.heartbeat();
+  await runGateFixFollowUp({
+    db,
+    clock,
+    ctx,
+    projectId,
+    epic,
+    settings,
+    worktree,
+    pr,
+    run,
+    number,
+    onEvent,
+    red,
+  });
+  await ctx.heartbeat();
+
+  const red2 = await captureRedGate(settings, worktree.path, ctx.signal, logPath);
+  if (red2) throw gateFailurePoison(red2, number);
+}
+
+/**
+ * The bounded follow-up round itself: one claude dispatch over the gate's own label + tailed
+ * output, via the same `reviewFixContext` protocol as the main fix (so the gate-failure section
+ * sits beside conflicts/threads rather than needing a parallel prompt). Mirrors the main dispatch
+ * in `runFixSession` (routing, model, metering, permission mode) so this round is billed and
+ * routed identically; an unsuccessful claude result throws a plain (retryable) error, same as the
+ * main dispatch — only the SECOND gate run decides whether this attempt parks.
+ */
+async function runGateFixFollowUp(args: {
+  db: AntonDb;
+  clock: Clock;
+  ctx: JobContext;
+  projectId: string;
+  epic: Bead;
+  settings: ProjectSettings;
+  worktree: Worktree;
+  pr: PrReview;
+  run: RunRow | undefined;
+  number: number;
+  onEvent: (event: ClaudeEvent) => void;
+  red: VerifyGateOutcome;
+}): Promise<void> {
+  const { db, clock, ctx, projectId, epic, settings, worktree, pr, run, number, onEvent, red } = args;
+
+  const { prompt, appendSystemPrompt, attribution } = await buildReviewFixPrompt({
+    epic,
+    pr,
+    reasons: [`the ${red.label} gate failed after the fix (exit ${red.code})`],
+    conflicts: [],
+    gateFailure: { label: red.label, output: tailLines(red.output, GATE_FAILURE_OUTPUT_CHARS) },
+    settings,
+    projectDir: worktree.path,
+  });
+
+  const routing = claudeRouting(settings);
+  await ctx.claudeReached(quotaMeterKey(settings));
+  const result = await metered(
+    db,
+    clock,
+    {
+      projectId,
+      jobType: ctx.type,
+      jobId: ctx.jobId,
+      step: "review-fix-gate",
+      stepHandler: "review-fix",
+      runId: run?.id,
+      beadId: epic.id,
+      modelRequested: settings.model,
+      agentTag: labelValueOf(epic.labels, "agent"),
+      ...attribution,
+    },
+    runClaude,
+  )({
+    cwd: worktree.path,
+    prompt,
+    appendSystemPrompt,
+    model: resolveReviewFixModel(settings, epic),
+    routing,
+    permissionMode: settings.permissionMode ?? "bypassPermissions",
+    signal: ctx.signal,
+    onEvent,
+  });
+  if (!result.ok) {
+    throw new Error(
+      `claude reported an error fixing the ${red.label} gate for PR #${number}: ${result.text ?? "unknown"}`,
+    );
+  }
+}
+
+/**
+ * A git note — never pushed, see `pushBranch`'s own `git push` args below, which name only `branch`
+ * — marking the commit it's attached to as a hook-bypassed boundary commit `commitFix` hasn't yet
+ * re-verified. Written by `commitFix` itself right after it makes one (see below) and read back by
+ * `commitFix` on every OTHER call, so a boundary commit's unverified status survives past the
+ * runFixSession call graph that created it — a job retry, or a resumed "already ahead" fast path,
+ * is a brand-new process with none of this round's in-memory state, and used to trust an
+ * `amendToVerifyHooks`/`boundaryCommitted` flag that only ever reflected what THIS call happened to
+ * know, not what the worktree's actual HEAD carries (PR #338 review round 3, chatgpt-codex-connector:
+ * a hook rejecting the re-verify commit restores HEAD to that same unverified boundary commit, and
+ * the next dispatch — finding the branch already ahead of origin — took the fast path and pushed it
+ * exactly as rejected). A note survives because it lives on the commit object itself, in a ref this
+ * file never pushes. A commit that gets genuinely re-verified USUALLY lands under a new sha (an
+ * ordinary `git commit`, or `commitAll`'s own reset + recommit) that the marker simply doesn't carry
+ * forward onto — but `commitAll`'s amend path can reproduce the exact same tree, parents, message, and
+ * author, and within the same one-second git timestamp resolution that reproduces the IDENTICAL sha
+ * too (PR #338 review round 4, chatgpt-codex-connector). `commitFix` therefore explicitly removes the
+ * marker via {@link clearUnverifiedBoundaryMarker} once a re-verify commit lands, rather than relying
+ * on the sha having changed.
+ */
+const UNVERIFIED_BOUNDARY_NOTES_REF = "refs/notes/anton-review-fix-boundary";
+
+/**
+ * Tag written into the boundary note by `premergeBase`'s OWN clean-merge mark only — never by
+ * `commitFix` — recording provenance explicitly rather than leaving `isBareUnverifiedBoundaryCommit`
+ * to infer it from merge topology (PR #338 review, chatgpt-codex-connector). A bypassed `commitFix`
+ * call that concludes a premerge's leftover `MERGE_HEAD` (claude resolved the base-merge conflicts
+ * as part of addressing review feedback) produces a commit with the exact same two-parent shape as a
+ * bare, fix-free premerge — the two are only distinguishable by who actually wrote the note.
+ */
+const BARE_PREMERGE_NOTE_TAG = "bare-base-premerge";
+
+async function markUnverifiedBoundary(
+  worktreePath: string,
+  options: { bare?: boolean } = {},
+): Promise<void> {
+  const note = options.bare
+    ? `hooks bypassed for this commit; not yet re-verified [${BARE_PREMERGE_NOTE_TAG}]`
+    : "hooks bypassed for this commit; not yet re-verified";
+  await git(worktreePath, [
+    "notes",
+    `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`,
+    "add",
+    "-f",
+    "-m",
+    note,
+    "HEAD",
+  ]);
+}
+
+/** The boundary note's own text, or `undefined` when `commit` carries no marker at all. */
+async function unverifiedBoundaryNote(
+  worktreePath: string,
+  commit: string,
+): Promise<string | undefined> {
+  try {
+    return await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "show", commit]);
+  } catch (error) {
+    if (exitedWith(error, 1)) return undefined;
+    throw error;
+  }
+}
+
+async function commitCarriesUnverifiedBoundaryMarker(
+  worktreePath: string,
+  commit: string,
+): Promise<boolean> {
+  return (await unverifiedBoundaryNote(worktreePath, commit)) !== undefined;
+}
+
+/**
+ * Provenance of a commit with respect to the unverified-boundary marker: `"bare"` when the note was
+ * read and positively carries {@link BARE_PREMERGE_NOTE_TAG} (a crashed, fix-free `premergeBase`),
+ * `"marked-not-bare"` when a note was read but doesn't carry the tag (a genuine claude/operator fix
+ * boundary), `"unmarked"` when the note lookup succeeded and found nothing, and `"unknown"` when the
+ * lookup itself failed and provenance couldn't be determined at all.
+ *
+ * Answered from the marker's own provenance tag, not merge topology — a bare, fix-free
+ * `premergeBase` auto-merge and a bypassed `commitFix` call that concludes a premerge's leftover
+ * conflicted merge (claude resolved the base-merge conflicts while addressing the actual review
+ * feedback) are BOTH two-parent commits, so a parent-count check can't tell a real fix from an empty
+ * premerge; only `markUnverifiedBoundary`'s caller knows which one it is (PR #338 review,
+ * chatgpt-codex-connector).
+ */
+async function classifyUnverifiedBoundaryCommit(
+  worktreePath: string,
+  commit: string,
+): Promise<"bare" | "marked-not-bare" | "unmarked" | "unknown"> {
+  let note: string | undefined;
+  try {
+    note = await unverifiedBoundaryNote(worktreePath, commit);
+  } catch {
+    return "unknown";
+  }
+  if (note === undefined) return "unmarked";
+  return note.includes(BARE_PREMERGE_NOTE_TAG) ? "bare" : "marked-not-bare";
+}
+
+/**
+ * Is `commit` a still-unverified boundary that nothing has been built on top of — i.e. exactly
+ * the shape a crashed premerge leaves behind, as opposed to a genuine claude/operator fix that
+ * merely hasn't cleared re-verification yet (PR #338 review, chatgpt-codex-connector: keep failed
+ * premerges out of the resume fast path)?
+ *
+ * Fails closed toward `true` (forcing the slower claude dispatch over the resume fast path) when the
+ * note lookup itself fails — the fast path pushing straight past unaddressed feedback is the worse
+ * outcome of the two. Only safe for callers that treat `true` as "be more cautious", never as license
+ * for a destructive action — see `classifyUnverifiedBoundaryCommit` for a caller (the stale-boundary
+ * reset in `prepareFixWorktree`) that must tell "positively bare" apart from "couldn't tell".
+ */
+async function isBareUnverifiedBoundaryCommit(
+  worktreePath: string,
+  commit: string,
+): Promise<boolean> {
+  const provenance = await classifyUnverifiedBoundaryCommit(worktreePath, commit);
+  return provenance !== "marked-not-bare" && provenance !== "unmarked";
+}
+
+/**
+ * Every commit on `branch` not yet on `origin/<branch>`, oldest first — the range a marker search
+ * must cover, not just literal `HEAD` (PR #338 review, chatgpt-codex-connector, round 6): an
+ * operator's own plain commit landed on top of a parked, hook-bypassed boundary while resuming — the
+ * explicitly supported "already ahead" resume flow — shifts `HEAD` off the marked commit without the
+ * branch becoming any less unverified.
+ *
+ * Propagates when the range can't be resolved (PR #338 review round 9, chatgpt-codex-connector),
+ * rather than silently narrowing the search to literal `HEAD`: a prior fallback did that and missed
+ * exactly the ancestor-marker case above whenever `origin/<branch>` was momentarily unresolvable,
+ * while `branchAheadOfRemote` treats that same missing ref as "ahead" — the combination let an
+ * already-ahead resume push a hook-rejected boundary straight past re-verification. Failing loud
+ * here instead surfaces the lookup failure to `findUnverifiedBoundaryAncestor`'s own caller, which
+ * must fail closed rather than proceed as if no marker existed. review-fix only ever runs against a
+ * branch that already has an open PR, so `origin/<branch>` normally exists; an unresolvable range is
+ * not the expected path.
+ *
+ * `--first-parent` (PR #338 review, chatgpt-codex-connector, round 7): a premerge of the base
+ * creates a merge commit whose second parent is the base tip, so a plain `origin/<branch>..HEAD`
+ * range also enumerates every commit reachable only through that side — the branch's own unpushed
+ * commits AND the base's entire intervening history. Each would then get its own `git notes show`
+ * call below, so a long-lived PR merging a base with hundreds of commits makes every marker check
+ * needlessly slow. Restricting to the first-parent chain keeps this to the branch's own mainline.
+ */
+async function unpushedCommitsOldestFirst(worktreePath: string, branch: string): Promise<string[]> {
+  const out = await git(worktreePath, [
+    "rev-list",
+    "--first-parent",
+    "--reverse",
+    `origin/${branch}..HEAD`,
+  ]);
+  return out
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The oldest unpushed commit still carrying an unverified-boundary marker, if any — what
+ * `commitFix`'s re-verify amend must reset PAST so the project's hooks see that commit's FULL
+ * bypassed diff, not just what a commit stacked on top of it later changed. Searching only `HEAD`
+ * (this file's original check) missed exactly the scenario an operator's own resume commit creates:
+ * the note stays on the parent while `HEAD` moves off it (PR #338 review, chatgpt-codex-connector,
+ * round 6).
+ */
+async function findUnverifiedBoundaryAncestor(
+  worktreePath: string,
+  branch: string,
+): Promise<string | undefined> {
+  for (const commit of await unpushedCommitsOldestFirst(worktreePath, branch)) {
+    if (await commitCarriesUnverifiedBoundaryMarker(worktreePath, commit)) return commit;
+  }
+  return undefined;
+}
+
+/**
+ * Remove the marker from HEAD once its commit has actually been re-verified by the project's real
+ * hooks (PR #338 review round 4, chatgpt-codex-connector). The doc comment on
+ * {@link UNVERIFIED_BOUNDARY_NOTES_REF} used to assume a re-verified commit always lands under a new
+ * sha, so the marker would simply not carry forward — but `commitAll`'s amend path resets to the
+ * boundary's own parent and recommits the SAME tree, message, and author; within the same one-second
+ * git timestamp resolution that reproduces the IDENTICAL sha, leaving the note still attached to a
+ * commit that has since been pushed as verified. A later round would then find `HEAD` still "marked",
+ * force a fresh (and now diverging) boundary commit on top of it, and fail to push as a non-fast-
+ * forward against what's already on the remote. Exit 1 (no note on this object) is the expected case
+ * when the sha DID change and is silently fine; anything else is a real failure to surface.
+ */
+async function clearUnverifiedBoundaryMarker(worktreePath: string): Promise<void> {
+  try {
+    await git(worktreePath, ["notes", `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`, "remove", "HEAD"]);
+  } catch (error) {
+    if (exitedWith(error, 1)) return;
+    throw error;
+  }
+}
+
+/**
+ * `commitAll`'s `post-merge` replay is the one step that still throws on a cancellation AFTER its
+ * verifying commit has already landed (see the cancellation branch of `commitAll`'s own
+ * `replayPostMerge`) — so by the time `commitFix`'s catch below sees `signal.aborted`, HEAD may
+ * already be a commit that REPLACED `boundaryAncestor` under a brand new sha. `findUnverifiedBoundaryAncestor`
+ * only walks commits reachable from `HEAD` (`origin/<branch>..HEAD`), so a note left behind on the
+ * old, now-unreachable sha is invisible to the next attempt: `boundaryAncestor` reads as unmarked,
+ * `amendToVerifyHooks` never turns on, and the "already ahead" resume fast path pushes the new
+ * commit straight past the `post-merge` hook that never got to finish (PR #338 review, chatgpt-
+ * codex-connector, P2 round 2). Move the marker onto whatever is actually HEAD now, preserving its
+ * exact text (the bare-premerge tag included, if it carried one) — best-effort throughout, since a
+ * failure to relocate it must not shadow the cancellation itself.
+ */
+async function preserveUnverifiedBoundaryOnCancel(
+  worktreePath: string,
+  boundaryAncestor: string | undefined,
+): Promise<void> {
+  if (boundaryAncestor === undefined) return;
+  try {
+    const head = await resolveCommitSha(worktreePath, "HEAD");
+    if (head === boundaryAncestor) return; // Nothing replaced it — the existing note already covers HEAD.
+    const note = await unverifiedBoundaryNote(worktreePath, boundaryAncestor);
+    if (note === undefined) return; // No marker existed to carry forward.
+    await git(worktreePath, [
+      "notes",
+      `--ref=${UNVERIFIED_BOUNDARY_NOTES_REF}`,
+      "add",
+      "-f",
+      "-m",
+      note,
+      head,
+    ]);
+  } catch {
+    // Best-effort — see doc comment above.
+  }
 }
 
 /**
@@ -1134,6 +2892,23 @@ export async function runTestGate(
  * the verify gates run, while the push itself still waits behind them. Returns whether a commit
  * exists to push (this call made one, or the tree had nothing new to add) and the hooksPath
  * resolved for it, which `commitAndPushFix` reuses for the push.
+ *
+ * `bypassHooks` (PR #338 review, chatgpt-codex-connector): only `runFixSession`'s pre-gate boundary
+ * commit passes this — it exists to snapshot "what the main round changed" before gates run, not to
+ * publish anything, and a project's own pre-commit hook enforcing the same check a verify gate does
+ * would otherwise reject it before the gate (and its bounded follow-up round) ever gets a chance.
+ * `commitAndPushFix`'s own call never bypasses. A commit made this way is marked with
+ * {@link markUnverifiedBoundary} so every later call — this round's own, or a future retry's —
+ * knows to re-verify it.
+ *
+ * `amendToVerifyHooks` covers the case that boundary commit's doc comment used to promise but didn't
+ * keep (PR #338 review, chatgpt-codex-connector, round 2): when the follow-up round adds nothing new
+ * to stage, there is nothing left for `commitAndPushFix`'s call to actually commit, so the
+ * hook-bypassed boundary commit would otherwise reach the remote having never had the project's real
+ * hooks run over it. The caller need not pass this explicitly for that case — whenever
+ * `bypassHooks` is unset, this function checks {@link findUnverifiedBoundaryAncestor} itself
+ * and forces it on, so a fresh process picks up exactly where an in-memory flag would have (round 3
+ * of the same review).
  */
 async function commitFix(
   repo: string,
@@ -1143,6 +2918,7 @@ async function commitFix(
   number: number,
   settings: ProjectSettings,
   signal: AbortSignal,
+  options: { bypassHooks?: boolean; amendToVerifyHooks?: boolean } = {},
 ): Promise<{ committed: boolean; hooksPath: string | undefined }> {
   // Staged BEFORE `resolveHooksPathOverride` is asked anything (PR #263 review, round 37) — the
   // same fix `commitStep` applies for the same reason: its submodule-staleness check reads the
@@ -1157,17 +2933,66 @@ async function commitFix(
   // `post-commit` runs after HEAD advances. A timeout can therefore reject `commitAll` after the
   // fix landed; recognize only a forward move on this run's branch, never an unrelated rewrite.
   const before = await readWorktreeState(worktreePath);
+  // See this function's own doc comment: a bypass call never needs this (it's about to BECOME the
+  // unverified boundary, not verify one), but every other call must ask the worktree itself, not
+  // trust whatever this round happens to remember. Searches the whole unpushed range, not just
+  // literal HEAD (PR #338 review, chatgpt-codex-connector, round 6) — an operator's own plain commit
+  // stacked on a parked boundary while resuming leaves HEAD unmarked without making the branch any
+  // less unverified.
+  const boundaryAncestor = options.bypassHooks
+    ? undefined
+    : await findUnverifiedBoundaryAncestor(worktreePath, branch);
+  const amendToVerifyHooks = options.amendToVerifyHooks || boundaryAncestor !== undefined;
+  // Tells `commitAll` whether the boundary it's about to re-verify is a BARE, fix-free auto-merge
+  // (`premergeBase`'s clean base sync, marked via `BARE_PREMERGE_NOTE_TAG`) rather than a genuine
+  // multi-parent commit that concluded a manually-resolved conflict — only `commitAll`'s own
+  // `verifiedBoundaryIsBareMerge` doc explains why that distinction matters for which hooks the
+  // verify commit runs. `false` (never bare) when no marked ancestor was found at all — there is no
+  // positive marker to read, so this must default to the pre-existing, fully-hook-verified behavior
+  // rather than guess (PR #338 review, chatgpt-codex-connector, P2).
+  //
+  // `boundaryAncestor === before.head` (PR #338 review, chatgpt-codex-connector, round 15): the tag
+  // alone only says the OLDEST unpushed boundary started out bare — it says nothing about whether
+  // this very function's own earlier bypass call (or an operator) has since stacked a real,
+  // non-bare commit on top while resuming. Classifying from the tag alone kept treating that whole
+  // stack as bare, so `commitAll` picked the merge-replay hooks mirror (skips `pre-commit`) for a
+  // commit that also carries that later, genuinely-new content — exactly what a real `git merge`'s
+  // auto path never has to verify. Requiring the boundary to still BE `HEAD` restricts the bare
+  // lifecycle to the one case it actually models: nothing built above it yet.
+  const boundaryIsBareMerge =
+    boundaryAncestor !== undefined &&
+    boundaryAncestor === before.head &&
+    (await classifyUnverifiedBoundaryCommit(worktreePath, boundaryAncestor)) === "bare";
   let committed: boolean;
   try {
     ({ committed } = await commitAll(
       worktreePath,
       `${epicId}: address review feedback (PR #${number})`,
-      { hooksPath, timeoutMs: resolveCommitTimeoutMs(settings), signal },
+      {
+        hooksPath,
+        verifiedBoundaryIsBareMerge: boundaryIsBareMerge,
+        bypassHooks: options.bypassHooks,
+        amendToVerifyHooks,
+        // Reset PAST the marked ancestor itself, not just HEAD's own parent, so the hook sees its
+        // FULL diff even when it sits behind commits `commitFix` never made itself (round 6). `undefined`
+        // when the caller asked for `amendToVerifyHooks` explicitly without an ancestor found —
+        // `commitAll` then falls back to treating HEAD itself as the boundary, matching prior behavior.
+        verifyFrom: boundaryAncestor,
+        timeoutMs: resolveCommitTimeoutMs(settings),
+        signal,
+      },
     ));
   } catch (error) {
     // An operator cancellation stops the entire review-fix lifecycle: do not push, resolve threads,
-    // or mark its session done merely because Git had already advanced HEAD.
-    if (signal.aborted) throw error;
+    // or mark its session done merely because Git had already advanced HEAD. Still relocate the
+    // unverified-boundary marker first, though (see `preserveUnverifiedBoundaryOnCancel`'s own doc):
+    // `commitAll`'s `post-merge` replay can cancel AFTER its verifying commit already replaced
+    // `boundaryAncestor`, and leaving the note on that now-unreachable sha would let a retry's
+    // "already ahead" fast path push straight past the `post-merge` hook that never finished.
+    if (signal.aborted) {
+      await preserveUnverifiedBoundaryOnCancel(worktreePath, boundaryAncestor);
+      throw error;
+    }
     const after = await readWorktreeState(worktreePath);
     if (after.head === before.head) throw error;
     if (after.ref !== `refs/heads/${branch}`) {
@@ -1177,13 +3002,68 @@ async function commitFix(
         { cause: error },
       );
     }
-    if (!(await isAncestor(worktreePath, before.head, after.head))) {
+    // `amendToVerifyHooks` above is what this call ASKED FOR, not necessarily what `commitAll`
+    // actually ran: it only takes the amend path when nothing new was staged, so a gate follow-up
+    // that DID stage new changes on top of a prior boundary commit gets an ordinary commit even when
+    // this was passed (PR #338 review round 2, chatgpt-codex-connector). Trust the mode `commitAll`
+    // tagged the error with over the request; only the request survives a non-commit failure (e.g.
+    // `stageAll` itself throwing, which never reaches either `gitCommit` call inside `commitAll`).
+    const requestedMode = amendToVerifyHooks ? "amend" : "commit";
+    const attemptedAmend = (commitAttemptMode(error) ?? requestedMode) === "amend";
+    if (attemptedAmend) {
+      // An amend REPLACES the tip rather than adding on top of it, so `before.head` is never an
+      // ancestor of `after.head` even when it landed cleanly — `isAncestor` below would wrongly
+      // poison every timed-out-but-actually-landed amend. Confirm instead that only the tip itself
+      // changed: the new tip's parent(s) must be exactly what the boundary's were — `boundaryAncestor`
+      // when the amend reset past a marked commit BEHIND HEAD (round 6), else `before.head` itself,
+      // matching what `commitAll` actually reset against in either case.
+      const [beforeParents, afterParents] = await Promise.all([
+        commitParentShas(worktreePath, boundaryAncestor ?? before.head),
+        commitParentShas(worktreePath, after.head),
+      ]);
+      const sameParents =
+        beforeParents.length === afterParents.length &&
+        beforeParents.every((p, i) => p === afterParents[i]);
+      if (!sameParents) {
+        throw new PoisonError(
+          `review fix for PR #${number} rewrote ${branch} instead of amending its boundary commit`,
+          { cause: error },
+        );
+      }
+    } else if (!(await isAncestor(worktreePath, before.head, after.head))) {
       throw new PoisonError(
         `review fix for PR #${number} rewrote ${branch} instead of adding its commit`,
         { cause: error },
       );
     }
     committed = true;
+  }
+  if (committed && options.bypassHooks) {
+    try {
+      await markUnverifiedBoundary(worktreePath);
+    } catch (error) {
+      // The commit above already landed even though writing its marker failed (PR #338 review round
+      // 4, chatgpt-codex-connector: e.g. concurrent note-ref lock contention). Left in place, HEAD
+      // would carry a hook-bypassed commit indistinguishable from a genuinely re-verified one, and the
+      // next attempt's "already ahead" fast path would push it straight past this project's hooks.
+      // `reset --soft` back to `before.head` undoes only that commit, keeping the index/tree intact so
+      // nothing claude produced is lost — the caller's retry restages and recommits from scratch,
+      // trying the note write again.
+      try {
+        await git(worktreePath, ["reset", "--soft", before.head]);
+      } catch (restoreError) {
+        throw new PoisonError(
+          `review fix for PR #${number} committed a hook-bypassed boundary commit but failed to ` +
+            `mark it unverified, and restoring HEAD to ${before.head} afterward also failed — the ` +
+            `worktree may be left with an unmarked bypass commit: ${(restoreError as Error).message}`,
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+  if (committed && amendToVerifyHooks) {
+    await clearUnverifiedBoundaryMarker(worktreePath);
   }
   return { committed, hooksPath };
 }
@@ -1194,6 +3074,13 @@ async function commitFix(
  * unpushed (e.g. a push failed after committing, then the retry's claude produced no new diff).
  * Otherwise there is genuinely nothing to send — a clean no-op, not a silent skip of pending work.
  * Returns whether anything was pushed.
+ *
+ * Re-verification of a hook-bypassed boundary commit (PR #338 review, chatgpt-codex-connector,
+ * rounds 2-3) is entirely `commitFix`'s own concern now — see
+ * {@link findUnverifiedBoundaryAncestor} — so this function no longer needs a
+ * `boundaryCommitted` flag threaded in from the caller's own call graph; that flag only ever
+ * reflected THIS round's memory, not the worktree, and so missed the case of a retry that never
+ * re-ran `runFixSession`'s pre-gate `commitFix` call at all (the "already ahead" fast path).
  */
 async function commitAndPushFix(
   repo: string,
@@ -1347,6 +3234,93 @@ export async function refreshFixRoundsBody(args: {
 const defaultReply = (outcome: ThreadOutcome["outcome"]): string =>
   outcome === "fixed" ? "addressed in the latest push" : "left as-is";
 
+/**
+ * Stable identity for an unpushed-round notice — headSha + actionable fingerprint, the same pair
+ * `recordReviewFixAnswered`/`reviewFixPrAnsweredUnchanged` already key a round's identity on
+ * (anton-dfuvz). NOT the model-authored `reply` text: a worker crash between posting this comment
+ * and settling the job (before `recordReviewFixAnswered` or job settlement) re-runs the model on
+ * retry, which can reword `reply` for what is semantically the same round. Comparing full comment
+ * bodies would then treat that reword as a brand-new notice and repost on every crash-retry (PR
+ * #338 review, chatgpt-codex-connector).
+ *
+ * `fingerprint` must already be run through {@link stripThreadFingerprint} — same as
+ * `postReplyFingerprint` before `recordReviewFixAnswered` (PR #338 review, chatgpt-codex-connector,
+ * round 33). A mixed round replies to its inline threads (`applyThreadOutcomes`) before it ever
+ * reaches this call, so those threads are no longer waiting by the time a crash-retry recomputes a
+ * fresh `classifyReview` fingerprint — an un-stripped fingerprint here would never match that
+ * retry's, and the dedup check below would never recognize its own already-posted notice.
+ */
+function unpushedSentinelMarker(headSha: string, fingerprint: readonly string[]): string {
+  // `JSON.stringify`, not a `,`-joined string (PR #338 review round 3, @chatgpt-codex-connector): a
+  // fingerprint entry can itself carry a comma (a check name, an attempt URL), so a plain join lets
+  // two DIFFERENT arrays — e.g. `["check:a,check:b", "base:x"]` and `["check:a", "check:b",
+  // "base:x"]` — hash to the same marker. `JSON.stringify` delimits each element unambiguously.
+  const hash = createHash("sha1")
+    .update(`${headSha}|${JSON.stringify(fingerprint)}`)
+    .digest("hex")
+    .slice(0, 12);
+  return `<!-- anton:unpushed-round:${hash} -->`;
+}
+
+/**
+ * Publish the {@link NON_THREAD_REPORT_ID} sentinel's explanation as a normal PR comment for an
+ * unpushed round — the only case where `refreshFixRoundsBody` never runs (it returns immediately
+ * when nothing pushed), so the sentinel's reply would otherwise never reach anywhere a reviewer can
+ * see it, even though `allWaitingThreadsAnswered` is about to treat it as a real answer and
+ * suppress this fingerprint+headSha for good. Idempotent against the PR's comment history, same as
+ * `notifyGateParked` — a resumed job re-parsing the same report has nothing local to remember.
+ *
+ * Returns whether the explanation actually reached GitHub (already posted, or posted just now) —
+ * the caller must not let `allWaitingThreadsAnswered` credit this round when a transient
+ * `gh pr comment` failure meant nobody ever saw why nothing changed (PR #338 review,
+ * @chatgpt-codex-connector), or when the comment history read back is a degraded one
+ * (`commentsComplete: false`) that can't rule out the sentinel already being present on a missing
+ * page (PR #338 review round 2, @chatgpt-codex-connector) — posting anyway risks a duplicate, and
+ * crediting the round risks suppressing a genuinely-unanswered one forever.
+ */
+async function publishUnpushedSentinel(args: {
+  repo: string;
+  number: number;
+  sentinel: ThreadOutcome;
+  headSha: string;
+  fingerprint: readonly string[];
+  signal: AbortSignal;
+  logPath: string;
+}): Promise<boolean> {
+  const { repo, number, sentinel, headSha, fingerprint, signal, logPath } = args;
+  const note = sentinel.reply?.trim() || defaultReply(sentinel.outcome);
+  const marker = unpushedSentinelMarker(headSha, fingerprint);
+  const body = `${ANTON_MARK} anton did not push a fix for PR #${number} (${sentinel.outcome}) — ${note}\n${marker}`;
+  // Rethrow an abort rather than degrading to `commentsComplete: false` (PR #338 review, P2,
+  // chatgpt-codex-connector): `getPrTopLevelComments` deliberately rethrows on cancellation so
+  // callers can tell "the job was cancelled mid-read" apart from "GitHub returned an error". Folding
+  // both into the same degraded-read fallback here would return `false` as an ordinary "couldn't
+  // publish" outcome instead of propagating the cancellation, letting the runner settle a timed-out
+  // job as a normal completion.
+  const existing = await getPrTopLevelComments(repo, number, signal).catch((err) => {
+    if (signal.aborted) throw err;
+    return { comments: [], commentsComplete: false };
+  });
+  if (!existing.commentsComplete) return false;
+  // Dedup on the hidden marker, not full-body equality — see `unpushedSentinelMarker`.
+  if (existing.comments.some((c) => c.body.includes(marker))) return true;
+  // Same rethrow-on-abort guard as the history read above (PR #338 review, P2,
+  // chatgpt-codex-connector, round 2): `safe()` swallows every error including a cancellation that
+  // fires mid-post, which would return `false` as an ordinary "couldn't publish" outcome and let the
+  // caller settle a timed-out job as a normal `incomplete` completion instead of retrying it.
+  const posted = await commentOnPr(repo, number, body, signal).then(
+    () => true,
+    (err) => {
+      if (signal.aborted) throw err;
+      return false;
+    },
+  );
+  if (posted) {
+    await appendSessionLog(logPath, `[review-fix] PR #${number}: published unpushed-round outcome — ${note}\n`);
+  }
+  return posted;
+}
+
 /** The reaction that turns a triaged outcome into the reviewer's free calibration signal. */
 const reactionForOutcome = (outcome: ThreadOutcome["outcome"]): PrReactionContent => {
   switch (outcome) {
@@ -1368,15 +3342,19 @@ async function notifyReReview(args: {
   signal: AbortSignal;
 }): Promise<void> {
   const { repo, number, pr, reasons, signal } = args;
-  await safe(() =>
-    commentOnPr(
-      repo,
-      number,
-      `${ANTON_MARK} anton pushed a fix for the review feedback (${reasons.join("; ")}). Please re-review.`,
-      signal,
-    ),
-  );
-  await safe(() =>
-    reRequestReview(repo, number, reviewersRequestingChanges(pr), signal),
-  );
+  // Rethrow an abort rather than swallowing it as an ordinary best-effort failure (PR #338 review,
+  // chatgpt-codex-connector): this is the last signal-aware operation before the round returns
+  // success, so a `safe()`-style catch-all here would let a job timeout that fires mid-notify
+  // complete as a normal success with the comment or re-request never actually sent.
+  await commentOnPr(
+    repo,
+    number,
+    `${ANTON_MARK} anton pushed a fix for the review feedback (${reasons.join("; ")}). Please re-review.`,
+    signal,
+  ).catch((err) => {
+    if (signal.aborted) throw err;
+  });
+  await reRequestReview(repo, number, reviewersRequestingChanges(pr), signal).catch((err) => {
+    if (signal.aborted) throw err;
+  });
 }

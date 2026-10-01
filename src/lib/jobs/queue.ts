@@ -505,6 +505,19 @@ export function enqueueExecuteEpicIfAbsent(
  * parked job is never re-suppressed by this check. Omitted (the merge-finalize dispatch has no PR
  * commit of its own to key on), the suppression is simply skipped — unchanged prior behavior.
  *
+ * `fingerprint` (anton-dfuvz), when passed alongside `headSha`, adds a THIRD suppression targeting a
+ * different dead end than a red gate: a `done` row for the same target whose payload carries the
+ * SAME head SHA *and* the same `classifyReview` fingerprint (a fixer session that answered the
+ * review feedback — replied to threads, maybe re-requested review — but pushed no commit) is also
+ * treated as covering it. Some actionable state no code change can satisfy — a PR-body waiver line,
+ * a stuck CI check re-evaluating the same commit — so without this, the dispatcher hands the same
+ * unresolved-but-unfixable PR to a fresh session every scheduled pass forever. Keyed on state, not
+ * a status a human must clear: ANY of a new head, a newly/no-longer-unresolved thread, a NEW REPLY on
+ * an already-counted thread, a new failing check, or a changed review decision changes `fingerprint`
+ * or `headSha`, and the very next pass's fresh triage no longer matches what's stored — the
+ * suppression lifts itself. The merge-finalize dispatch passes no `fingerprint` (its target isn't
+ * open, so `classifyReview` never ran for it), so a merged PR is never caught by this check either.
+ *
  * Synchronous transaction with no awaits inside, like the execute-epic helpers above: better-sqlite3
  * runs one connection, so the read→write pair cannot interleave and two overlapping passes yield
  * exactly one job — don't make this async. `jobs_active_epic_unique` keys on
@@ -525,7 +538,12 @@ export function enqueueReviewFixPrIfAbsent(
   clock: Clock,
   projectId: string,
   epicBeadId: string,
-  opts?: { refuseProject?: (projectId: string) => boolean; headSha?: string },
+  opts?: {
+    refuseProject?: (projectId: string) => boolean;
+    headSha?: string;
+    /** classifyReview's fingerprint for the CURRENT triage — see this function's doc, anton-dfuvz. */
+    fingerprint?: string[];
+  },
 ): string | undefined {
   const nowMs = clock.now();
   try {
@@ -543,7 +561,20 @@ export function enqueueReviewFixPrIfAbsent(
       );
       if (existing) return undefined;
 
-      if (opts?.headSha && parkedAtHead(tx, projectId, epicBeadId, opts.headSha)) return undefined;
+      if (
+        opts?.headSha &&
+        parkedAtHead(tx, projectId, epicBeadId, opts.headSha, opts.fingerprint)
+      ) {
+        return undefined;
+      }
+
+      if (
+        opts?.headSha &&
+        opts.fingerprint &&
+        answeredUnchanged(tx, projectId, epicBeadId, opts.headSha, opts.fingerprint)
+      ) {
+        return undefined;
+      }
 
       const id = randomUUID();
       tx.insert(schema.jobs)
@@ -552,7 +583,9 @@ export function enqueueReviewFixPrIfAbsent(
           type: "review-fix-pr",
           projectId,
           payloadJson: JSON.stringify(
-            opts?.headSha ? { projectId, epicBeadId, headSha: opts.headSha } : { projectId, epicBeadId },
+            opts?.headSha
+              ? { projectId, epicBeadId, headSha: opts.headSha, fingerprint: opts.fingerprint }
+              : { projectId, epicBeadId },
           ),
           status: "queued",
           runAt: secDate(nowMs),
@@ -569,40 +602,310 @@ export function enqueueReviewFixPrIfAbsent(
   }
 }
 
-/** Id of a `parked` `review-fix-pr` job for this target whose payload's `headSha` matches. */
+/**
+ * Id of a `parked` `review-fix-pr` job for this target whose payload's `headSha` matches AND whose
+ * stored `fingerprint` (the `classifyReview` fingerprint this attempt was dispatched against, saved
+ * into the payload at enqueue time above) is unchanged from `fingerprint` — mirroring
+ * {@link answeredUnchanged}'s same two-part identity for a `done` row. A red gate parked at head X
+ * used to stay suppressed at head X forever, even once the PR's BASE advanced enough to fix the gate
+ * or change the premerged tree — `classifyReview` (src/lib/git/pr.ts) folds the base tip into every
+ * actionable fingerprint for exactly this reason, but this suppression ignored it and matched on the
+ * (unchanged) PR head alone, parking the target indefinitely until a human resumed the job or the PR
+ * branch itself was pushed to (PR #338 review, chatgpt-codex-connector). `fingerprint === undefined`
+ * (a caller with nothing finer to check, or a legacy parked row from before this field existed) falls
+ * back to the old headSha-only match — there is no base-change evidence to admit a retry with.
+ *
+ * Filtered on `status` in JS against the target's single most recent SETTLED row at this head (any
+ * status outside {@link ACTIVE_STATUSES}, not `parked` alone) — same reasoning as
+ * {@link answeredUnchanged}'s own comment on why it can't filter `status = "done"` in SQL: a target
+ * that parks at fingerprint A, later settles an answered/no-push attempt at fingerprint B on the same
+ * head, and then cycles back to A needs the newer B row to win the ordering, not be skipped by a SQL
+ * `status = "parked"` filter that can only ever see the older A park — otherwise the stale A row is
+ * resurrected and the PR stays suppressed indefinitely even though the target has since moved past it
+ * (PR #338 review, chatgpt-codex-connector).
+ *
+ * Ordered on `updatedAt` DESC with {@link JOB_INSERT_ORDER} as the tie-break, same as
+ * {@link answeredUnchanged} — `updatedAt` is second-truncated, so two attempts for the same head but
+ * different fingerprints parking within the same second would otherwise sort arbitrarily, and SQLite
+ * could hand back the older mismatched row instead of the newer one matching the current fingerprint
+ * (PR #338 review, chatgpt-codex-connector).
+ *
+ * NOT filtered on `headSha` in SQL — the single most recent settled row is selected across EVERY
+ * head first, and only THEN checked against `headSha`, same as {@link answeredUnchanged}. A
+ * force-push cycle from head A to B and back to A used to resurrect an old `parked`-at-A row while
+ * ignoring a newer, more relevant settled attempt at B: filtering by `headSha` before ordering makes
+ * that older A row the "most recent…at head A" match even though a B attempt intervened, so a target
+ * whose fingerprint also happened to return to its A value stayed parked despite the newer attempt
+ * having moved the state on (PR #338 review, chatgpt-codex-connector, round 12).
+ */
 function parkedAtHead(
   tx: Pick<AntonDb, "select">,
   projectId: string,
   epicBeadId: string,
   headSha: string,
+  fingerprint?: string[],
 ): string | undefined {
-  return firstJobId(
-    tx,
-    and(
-      eq(schema.jobs.type, "review-fix-pr"),
-      eq(schema.jobs.projectId, projectId),
-      eq(schema.jobs.status, "parked"),
-      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
-      eq(sql`json_extract(${schema.jobs.payloadJson}, '$.headSha')`, headSha),
-    ),
-  );
+  const row = tx
+    .select({ id: schema.jobs.id, status: schema.jobs.status, payloadJson: schema.jobs.payloadJson })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "review-fix-pr"),
+        eq(schema.jobs.projectId, projectId),
+        notInArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
+    .limit(1)
+    .all()[0];
+  if (!row || row.status !== "parked") return undefined;
+  let payload: { headSha?: string; fingerprint?: string[] };
+  try {
+    payload = JSON.parse(row.payloadJson);
+  } catch {
+    return undefined;
+  }
+  if (payload.headSha !== headSha) return undefined;
+  if (fingerprint === undefined) return row.id;
+  return payload.fingerprint === undefined ||
+    JSON.stringify(payload.fingerprint) === JSON.stringify(fingerprint)
+    ? row.id
+    : undefined;
 }
 
 /**
- * Is a target's most recent `review-fix-pr` attempt parked at the SAME head as `headSha` — i.e. is
- * a fresh enqueue for it currently suppressed by {@link enqueueReviewFixPrIfAbsent}'s head check?
- * Exported so a caller that already knows a target needs a fix, but got no job id back, can tell an
- * operator WHY: suppressed (a red gate parked on this exact commit, nothing to retry yet) versus
- * merely covered by a job already in flight. Read-only and outside any transaction — a harmless race
- * with the enqueue's own check, at worst a beat-stale log line.
+ * Is a target's most recent `review-fix-pr` attempt parked at the SAME head as `headSha` AND the
+ * SAME `classifyReview` fingerprint — i.e. is a fresh enqueue for it currently suppressed by
+ * {@link enqueueReviewFixPrIfAbsent}'s park check? Exported so a caller that already knows a target
+ * needs a fix, but got no job id back, can tell an operator WHY: suppressed (a red gate parked on
+ * this exact commit and fingerprint, nothing to retry yet) versus merely covered by a job already in
+ * flight. Read-only and outside any transaction — a harmless race with the enqueue's own check, at
+ * worst a beat-stale log line.
  */
 export function reviewFixPrParkedAtHead(
   db: AntonDb,
   projectId: string,
   epicBeadId: string,
   headSha: string,
+  fingerprint?: string[],
 ): boolean {
-  return parkedAtHead(db, projectId, epicBeadId, headSha) !== undefined;
+  return parkedAtHead(db, projectId, epicBeadId, headSha, fingerprint) !== undefined;
+}
+
+/**
+ * Id of a `done` `review-fix-pr` job for this target that answered its round (see
+ * {@link recordReviewFixAnswered}) at the SAME head SHA and the SAME `classifyReview` fingerprint —
+ * anton-dfuvz. `answeredFingerprint` is a JSON array, so its equality is checked in JS after parsing
+ * rather than trying to express array equality in the query. Compared against ONLY the target's
+ * single most recent settled row OVERALL (any status outside {@link ACTIVE_STATUSES} — `done`,
+ * `parked`, `failed`, or `cancelled` — counts as settled, not `done` alone) — never a search over
+ * history for any matching row — so a fingerprint that cycled A→B→A admits the fresh A round instead
+ * of being resuppressed by a stale row: if the newest settled row is a `parked` B (a red gate that
+ * parked the intervening round), it simply isn't `done`, so it doesn't match, regardless of what an
+ * older `done` row once answered. Filtering on `status = "done"` directly, as an earlier revision
+ * did, let that older row win the ordering instead of the newer `parked` one, permanently
+ * resuppressing a round the PR had already moved past (PR #338 review, chatgpt-codex-connector).
+ *
+ * NOT filtered on `headSha` in SQL — deliberately: the row is selected as the single most recent
+ * settled attempt ACROSS EVERY head, and only THEN checked against `headSha`. Filtering by `headSha`
+ * up front (an earlier revision did this) selects the most recent settled row AT THAT HEAD, which is
+ * a different — and wrong — question: a force-push cycle from head A to B and back to A resurrects
+ * the old answered-A row while ignoring a newer, more relevant B attempt that intervened, and if the
+ * fingerprint also happens to return to its A value, a fresh enqueue for the reverted target is
+ * wrongly suppressed even though a newer attempt (at B) has since moved the state on (PR #338
+ * review, chatgpt-codex-connector, round 12).
+ *
+ * Ordered on `updatedAt` DESC with {@link JOB_INSERT_ORDER} as the tie-break, same as
+ * {@link latestExecuteEpicJob} — `updatedAt` is second-truncated, so an answered A attempt and a
+ * newer parked B attempt settling inside the same second would otherwise sort arbitrarily, and
+ * SQLite could hand back the older `done` A row instead of the newer `parked` B, reintroducing the
+ * exact resuppression bug above.
+ */
+function answeredUnchanged(
+  tx: Pick<AntonDb, "select">,
+  projectId: string,
+  epicBeadId: string,
+  headSha: string,
+  fingerprint: string[],
+): string | undefined {
+  const row = tx
+    .select({ id: schema.jobs.id, status: schema.jobs.status, payloadJson: schema.jobs.payloadJson })
+    .from(schema.jobs)
+    .where(
+      and(
+        eq(schema.jobs.type, "review-fix-pr"),
+        eq(schema.jobs.projectId, projectId),
+        notInArray(schema.jobs.status, [...ACTIVE_STATUSES]),
+        eq(sql`json_extract(${schema.jobs.payloadJson}, '$.epicBeadId')`, epicBeadId),
+      ),
+    )
+    .orderBy(desc(schema.jobs.updatedAt), desc(JOB_INSERT_ORDER))
+    .limit(1)
+    .all()[0];
+  if (!row || row.status !== "done") return undefined;
+  let payload: { headSha?: string; answeredFingerprint?: string[] };
+  try {
+    payload = JSON.parse(row.payloadJson);
+  } catch {
+    return undefined;
+  }
+  if (payload.headSha !== headSha) return undefined;
+  return payload.answeredFingerprint !== undefined &&
+    JSON.stringify(payload.answeredFingerprint) === JSON.stringify(fingerprint)
+    ? row.id
+    : undefined;
+}
+
+/**
+ * Is a target's last settled `review-fix-pr` attempt an ANSWERED round (replied to threads, maybe
+ * re-requested review, but pushed no commit) at the same head and the same actionable fingerprint as
+ * right now — i.e. is a fresh enqueue for it currently suppressed by
+ * {@link enqueueReviewFixPrIfAbsent}'s check? Exported for the dispatcher's own reporting,
+ * mirroring {@link reviewFixPrParkedAtHead}: a caller that already knows a target needs a fix but got
+ * no job id back can tell this suppression apart from a parked red gate or a job already in flight.
+ */
+export function reviewFixPrAnsweredUnchanged(
+  db: AntonDb,
+  projectId: string,
+  epicBeadId: string,
+  headSha: string,
+  fingerprint: string[],
+): boolean {
+  return answeredUnchanged(db, projectId, epicBeadId, headSha, fingerprint) !== undefined;
+}
+
+/**
+ * Record that THIS `review-fix-pr` job's round answered its target's review feedback without
+ * pushing a commit — the head SHA and `classifyReview` fingerprint it acted on, folded into the
+ * job's own payload (anton-dfuvz). The next dispatcher pass compares a fresh triage against this
+ * (via {@link reviewFixPrAnsweredUnchanged}/the enqueue's own check) so a target that answered at an
+ * UNCHANGED head with the SAME actionable fingerprint is not handed to a brand new fix session every
+ * scheduled pass for a fix no code change can supply — a PR-body waiver line, a CI check stuck
+ * re-evaluating the same commit. A merged, pushed, or newly-actionable round never calls this, so
+ * the suppression only ever describes the exact state an answered round left behind. `fingerprint`
+ * (unlike display `reasons`) names each unresolved thread by id + last comment id, so a reviewer's
+ * new reply on an already-counted thread is never mistaken for the state this round actually
+ * answered (anton-091jr review, chatgpt-codex-connector). Read-modify-write wrapped in ONE
+ * transaction (anton-091jr review, @claude, re-raised) — nothing else writes this job's payload
+ * concurrently today, but the pair is cheap to make atomic and closes the gap for good rather than
+ * leaving it to keep resurfacing as a "still open" note on every future touch of this function.
+ */
+export function recordReviewFixAnswered(
+  db: AntonDb,
+  jobId: string,
+  headSha: string,
+  fingerprint: string[],
+): void {
+  db.transaction((tx) => {
+    const row = tx
+      .select({ payloadJson: schema.jobs.payloadJson })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, jobId))
+      .limit(1)
+      .all()[0];
+    if (!row) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payloadJson);
+    } catch {
+      payload = {};
+    }
+    payload.headSha = headSha;
+    payload.answeredFingerprint = fingerprint;
+    tx.update(schema.jobs)
+      .set({ payloadJson: JSON.stringify(payload) })
+      .where(eq(schema.jobs.id, jobId))
+      .run();
+  });
+}
+
+/**
+ * Refresh THIS `review-fix-pr` job's stored `headSha`/`fingerprint` to the fresh `classifyReview`
+ * verdict `handleEpic` just computed, before it attempts the fix. The payload written at enqueue
+ * time ({@link enqueueReviewFixPrIfAbsent}) is only a snapshot of whatever the dispatcher saw when
+ * it queued the job; by the time the worker actually runs, `handleEpic` re-fetches the PR and may
+ * see a different base tip or a newer reviewer reply. If this attempt then hits a `PoisonError` and
+ * parks, {@link parkedAtHead}'s next-pass match must compare against what was ACTUALLY attempted,
+ * not the stale enqueue-time snapshot — otherwise a base that advanced between enqueue and park
+ * never lifts the suppression (it still compares to the old base), and a base that later cycles
+ * back to the enqueue-time value wrongly suppresses a park that in fact ran against a different one
+ * (PR #338 review, chatgpt-codex-connector). A write hiccup here does not fail the attempt outright
+ * — the caller catches it and calls {@link invalidateReviewFixAttempt} instead, so a failed refresh
+ * can't leave the stale enqueue-time snapshot in place to wrongly suppress a later park (PR #338
+ * review, chatgpt-codex-connector, round 6).
+ */
+export function recordReviewFixAttempt(
+  db: AntonDb,
+  jobId: string,
+  headSha: string,
+  fingerprint: string[],
+): void {
+  db.transaction((tx) => {
+    const row = tx
+      .select({ payloadJson: schema.jobs.payloadJson })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, jobId))
+      .limit(1)
+      .all()[0];
+    if (!row) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payloadJson);
+    } catch {
+      payload = {};
+    }
+    payload.headSha = headSha;
+    payload.fingerprint = fingerprint;
+    tx.update(schema.jobs)
+      .set({ payloadJson: JSON.stringify(payload) })
+      .where(eq(schema.jobs.id, jobId))
+      .run();
+  });
+}
+
+/**
+ * Clear THIS `review-fix-pr` job's stored `headSha`/`fingerprint` when the attempt ran against
+ * unsynced local refs ({@link handleEpic}'s `refsSynced` guard skips {@link recordReviewFixAttempt}
+ * in that case). Leaving the write skipped is not enough on its own: the payload then still carries
+ * whatever {@link enqueueReviewFixPrIfAbsent} snapshotted at enqueue time, and for a transient fetch
+ * failure — the common case — GitHub's head hasn't actually moved since, so that stale snapshot
+ * still matches the CURRENT head. If this attempt then hits a `PoisonError` and parks,
+ * {@link parkedAtHead}'s next-pass lookup filters in SQL on that exact `headSha`, finds this row, and
+ * suppresses every future retry at that head — even though the revision it parked on was never
+ * actually tested (PR #338 review, chatgpt-codex-connector). Deleting `headSha` (not just blanking
+ * `fingerprint`) is what actually breaks the match: `parkedAtHead`'s SQL `json_extract` needs an
+ * equal `headSha` to find the row at all, whereas a stored `fingerprint` of `undefined` reads as
+ * "match any fingerprint" and would still suppress. UNLIKE {@link recordReviewFixAttempt}, the
+ * caller does NOT swallow a failure here (PR #338 review, chatgpt-codex-connector, round 5): a
+ * transient write failure (a brief SQLite lock) that was silently ignored would leave the stale
+ * enqueue-time pair in place, and a subsequent poison-park would then suppress retries at a
+ * revision this attempt never tested — exactly the bug this function exists to prevent. Letting
+ * the failure propagate fails the attempt instead, so the runner retries the whole job rather than
+ * continuing into the fix session with a snapshot this call was supposed to have cleared.
+ */
+export function invalidateReviewFixAttempt(db: AntonDb, jobId: string): void {
+  db.transaction((tx) => {
+    const row = tx
+      .select({ payloadJson: schema.jobs.payloadJson })
+      .from(schema.jobs)
+      .where(eq(schema.jobs.id, jobId))
+      .limit(1)
+      .all()[0];
+    if (!row) return;
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(row.payloadJson);
+    } catch {
+      payload = {};
+    }
+    delete payload.headSha;
+    delete payload.fingerprint;
+    tx.update(schema.jobs)
+      .set({ payloadJson: JSON.stringify(payload) })
+      .where(eq(schema.jobs.id, jobId))
+      .run();
+  });
 }
 
 /**

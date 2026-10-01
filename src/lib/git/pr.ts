@@ -5,6 +5,7 @@
  * (ANTON_GH_BIN, shared with git/ops.ts) so tests point it at a fake. See DESIGN §4.
  */
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promisify } from "node:util";
 import { GH_BIN_ENV } from "./ops";
 
@@ -22,6 +23,18 @@ async function gh(repoPath: string, args: string[], signal?: AbortSignal): Promi
     signal,
   });
   return stdout;
+}
+
+/**
+ * A paginated-read catch must tell a caller's own cancellation apart from GitHub actually failing —
+ * a caller-aborted `signal` (job timeout, lease loss) is not a degraded read to fall back on, it's
+ * the caller no longer wanting an answer. Swallowing it into `{ complete: false }` lets the
+ * dispatcher act on a stale/partial `PrReview` after the run that requested it already gave up,
+ * instead of the abort propagating so the runner retries the whole read (PR #338 review,
+ * chatgpt-codex-connector).
+ */
+function rethrowIfAborted(err: unknown, signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw err;
 }
 
 /** Parse the PR number from a beads external-ref (`gh-123`) or a PR url. Returns undefined if none. */
@@ -56,14 +69,51 @@ export interface PrReview {
   mergeable: string | null;
   /** The PR's head branch — the branch anton pushes fixes to. */
   headRefName: string;
+  /**
+   * The PR's actual base branch on GitHub — NOT necessarily the project's configured/default
+   * branch. A retargeted PR, or a project whose default branch setting changed after the PR opened,
+   * leaves those two diverging; premerging the wrong one pushes an unrelated branch's history into
+   * the PR (anton-091jr review, chatgpt-codex-connector). Optional only because `gh` always reports
+   * it in practice — a caller building a synthetic `PrReview` (tests) may still omit it, in which
+   * case callers fall back to the project's configured base branch.
+   */
+  baseRefName?: string;
+  /**
+   * The base branch's current tip commit SHA. Folded into the merge-conflict fingerprint (anton-091jr
+   * review round 4, chatgpt-codex-connector): the conflict reason string is otherwise a constant, so
+   * if the base branch advances while the PR head is unchanged and the conflict persists (or
+   * reappears), a stale answered-fingerprint row at the same head SHA keeps matching and the new
+   * conflict against the new base never re-triggers a fix round. Optional for the same reason as
+   * `baseRefName` — a caller-built fixture may omit it.
+   */
+  baseRefOid?: string;
   /** The PR head's commit SHA — what distinguishes "same doomed input" from new commits (anton-bzm7s). */
   headSha: string;
   url: string;
   /** Submitted reviews (latest state per reviewer as gh reports them). */
-  reviews: Array<{ author: string; state: string; body: string }>;
-  /** Failing checks, by name. */
+  reviews: Array<{ author: string; state: string; body: string; id?: string; submittedAt?: string }>;
+  /** Failing checks, by name (display text — a name alone repeats across reruns, see `failingCheckAttempts`). */
   failingChecks: string[];
+  /**
+   * One entry per failing check in `failingChecks`, `name@attemptIdentity` — where attemptIdentity is
+   * the check's own details URL / timestamp, which changes on a rerun even when the name and
+   * conclusion don't (anton-091jr review, chatgpt-codex-connector). The answered-suppression
+   * fingerprint keys on this instead of `failingChecks` so a check that goes green and fails again at
+   * the same head is treated as a NEW failure rather than matched against a stale "answered" row.
+   */
+  failingCheckAttempts: string[];
   pendingChecks: number;
+  /**
+   * Whether `failingChecks`/`failingCheckAttempts`/`pendingChecks` reflect the PR's WHOLE set of
+   * check contexts, or a degraded read — `gh pr view --json statusCheckRollup` issues
+   * `contexts(first:100)` with no cursor, so a PR with over 100 check contexts silently drops
+   * everything past the first page (see `getPrCheckRollup`). `false` means a genuinely new or
+   * rerun failure could be sitting on the page that failed to load: `classifyReview`'s fingerprint
+   * must not derive its `check:*` entries from a truncated list it can't tell apart from the real
+   * one. Optional, defaulting to "complete", for the same reason `reviewsComplete`/`commentsComplete`
+   * are (a caller-built fixture has no reason to populate it).
+   */
+  checksComplete?: boolean;
   /** Inline review threads (resolved ones included; filter with threadsNeedingAttention). */
   threads: ReviewThread[];
   /**
@@ -73,6 +123,41 @@ export interface PrReview {
    * checking this would report zero or understated counts indistinguishable from a clean PR.
    */
   threadsComplete: boolean;
+  /**
+   * Top-level PR comments (the same surface `commentOnPr` posts to — not inline review comments),
+   * oldest first. Fetched via `getPrTopLevelComments` (paginated GraphQL, not the
+   * REST `gh pr view --json comments`, which caps at 100 with no cursor and would otherwise drop a
+   * human reply past page 1 on a long-running PR). Lets `classifyReview` tell a genuine human reply
+   * apart from anton's own posts (ANTON_MARK-prefixed, filtered the same way `threadsNeedingAttention`
+   * ignores its own inline replies): a `needs-human` round is otherwise unactionable on every other
+   * axis, so without this a human answering anton's request the one place it was actually posted — a
+   * plain top-level reply — left the fingerprint byte-identical and the round suppressed forever (PR
+   * #338 review, chatgpt-codex-connector). Optional because a caller-built fixture (tests) has no
+   * reason to populate it.
+   */
+  comments?: Array<{ id: string; author: string; body: string }>;
+  /**
+   * Whether `comments` is the PR's WHOLE top-level comment history, or a degraded read — a page
+   * fetch failed or returned a malformed response (see `getPrTopLevelComments`). `false` makes a
+   * short or stale `comments` distinguishable from a genuinely complete one: `classifyReview` must
+   * not derive its answered-suppression checkpoint from a `comments` list that might be missing the
+   * very reply that would release it, and the PR #338-comment dedup checks in review-fix.ts
+   * (`notifyGateParked`, `publishUnpushedSentinel`) must not read an absent match in a degraded list
+   * as "definitely not posted yet" (PR #338 review round 2, chatgpt-codex-connector). Optional,
+   * defaulting to "complete", for the same reason `comments` itself is optional — a caller-built
+   * fixture (tests) has no reason to populate it.
+   */
+  commentsComplete?: boolean;
+  /**
+   * Whether `reviews` is the PR's WHOLE submitted-review history, or a degraded read — a later
+   * GraphQL page failed or returned a malformed response (see `getPrReviews`). `false` means a
+   * genuinely new CHANGES_REQUESTED review, or an edit to one, could be sitting on the page that
+   * failed to load: `classifyReview`'s per-review fingerprint would then keep matching a stale
+   * answered row against the truncated list it DID get, silently suppressing the hidden review
+   * forever. Mirrors `commentsComplete` — optional, defaulting to "complete", for the same reason
+   * (a caller-built fixture has no reason to populate it).
+   */
+  reviewsComplete?: boolean;
 }
 
 interface GhPrView {
@@ -81,9 +166,10 @@ interface GhPrView {
   reviewDecision: string | null;
   mergeable?: string | null;
   headRefName: string;
+  baseRefName?: string;
+  baseRefOid?: string;
   headRefOid?: string;
   url: string;
-  reviews?: Array<{ author?: { login?: string }; state?: string; body?: string }>;
   statusCheckRollup?: Array<{
     __typename?: string;
     name?: string;
@@ -91,6 +177,10 @@ interface GhPrView {
     conclusion?: string; // SUCCESS | FAILURE | ... (checkRun)
     state?: string; // SUCCESS | FAILURE | PENDING (statusContext)
     context?: string; // statusContext name
+    detailsUrl?: string; // checkRun — points at the actual run/job, changes on rerun
+    targetUrl?: string; // statusContext equivalent of detailsUrl
+    completedAt?: string; // checkRun — changes on rerun even when detailsUrl is absent
+    createdAt?: string; // statusContext equivalent of completedAt
   }>;
 }
 
@@ -110,6 +200,23 @@ function isPending(c: NonNullable<GhPrView["statusCheckRollup"]>[number]): boole
 }
 
 /**
+ * Stable identity of THIS check's attempt, not just its name — a rerun of the same check keeps the
+ * same name but gets a fresh `detailsUrl`/`completedAt`, which is exactly what distinguishes "the
+ * failure a prior round already answered" from "a fresh failure at the same head" (anton-091jr
+ * review, chatgpt-codex-connector). Composes every available signal rather than picking the first
+ * truthy one (anton-091jr review round 2, chatgpt-codex-connector): a provider that reuses the same
+ * `targetUrl`/`detailsUrl` across reruns still changes `completedAt`/`createdAt`, and selecting only
+ * the URL would discard that and let a check that goes green then fails again at the same head match
+ * a stale answered row. Falls back to "unknown" only when `gh` reports none of the four.
+ */
+function checkAttemptId(c: NonNullable<GhPrView["statusCheckRollup"]>[number]): string {
+  const parts = [c.detailsUrl, c.targetUrl, c.completedAt, c.createdAt].filter(
+    (p): p is string => Boolean(p),
+  );
+  return parts.length > 0 ? parts.join("|") : "unknown";
+}
+
+/**
  * Fetch a PR's review decision, submitted reviews, CI rollup, and inline review comments.
  * `owner/repo` is resolved once via `gh repo view` so inline comments can be pulled from the API.
  */
@@ -125,24 +232,26 @@ export async function getPrReview(
       "view",
       String(number),
       "--json",
-      "number,state,reviewDecision,mergeable,headRefName,headRefOid,url,reviews,statusCheckRollup",
+      "number,state,reviewDecision,mergeable,headRefName,baseRefName,baseRefOid,headRefOid,url",
     ],
     signal,
   );
   const view = JSON.parse(raw) as GhPrView;
 
-  const rollup = view.statusCheckRollup ?? [];
-  const failingChecks = rollup
-    .filter(isFailing)
-    .map((c) => c.name ?? c.context ?? "check")
-    .filter(Boolean);
-  const pendingChecks = rollup.filter(isPending).length;
+  const [threadsResult, commentsResult, reviewsResult, checkRollupResult] = await Promise.all([
+    getReviewThreads(repoPath, number, signal),
+    getPrTopLevelComments(repoPath, number, signal),
+    getPrReviews(repoPath, number, signal),
+    getPrCheckRollup(repoPath, number, signal),
+  ]);
 
-  const reviews = (view.reviews ?? []).map((r) => ({
-    author: r.author?.login ?? "unknown",
-    state: r.state ?? "",
-    body: r.body ?? "",
-  }));
+  const rollup = checkRollupResult.rollup;
+  const failing = rollup.filter(isFailing);
+  const failingChecks = failing.map((c) => c.name ?? c.context ?? "check");
+  const failingCheckAttempts = failing.map(
+    (c) => `${c.name ?? c.context ?? "check"}@${checkAttemptId(c)}`,
+  );
+  const pendingChecks = rollup.filter(isPending).length;
 
   return {
     number: view.number,
@@ -150,13 +259,429 @@ export async function getPrReview(
     reviewDecision: view.reviewDecision ?? null,
     mergeable: view.mergeable ?? null,
     headRefName: view.headRefName,
+    baseRefName: view.baseRefName,
+    baseRefOid: view.baseRefOid,
     headSha: view.headRefOid ?? "",
     url: view.url,
-    reviews,
+    reviews: reviewsResult.reviews,
+    reviewsComplete: reviewsResult.reviewsComplete,
     failingChecks,
+    failingCheckAttempts,
     pendingChecks,
-    ...(await getReviewThreads(repoPath, number, signal)),
+    checksComplete: checkRollupResult.rollupComplete,
+    comments: commentsResult.comments,
+    commentsComplete: commentsResult.commentsComplete,
+    ...threadsResult,
   };
+}
+
+const PR_COMMENTS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    comments(first:100 after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id author{login} body}
+    }
+  }}
+}`;
+
+interface RawPrCommentNode {
+  id?: string;
+  author?: { login?: string } | null;
+  body?: string;
+}
+
+interface PrCommentsPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        comments?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: RawPrCommentNode[];
+        };
+      };
+    };
+  };
+}
+
+/**
+ * Top-level PR comments via GraphQL, paginated the same way as `getReviewThreads` — `gh pr view
+ * --json comments` issues `comments(first:100)` with no cursor, so a PR that has collected over 100
+ * top-level comments silently drops everything past the first page, including whichever comment was
+ * a human's actual reply. `classifyReview`'s `latestHumanComment` reads the LAST entry as the most
+ * recent one, so a truncated fetch doesn't just miss a comment — it keeps returning a stale "latest"
+ * and a `needs-human` round it already answered stays suppressed forever (PR #338 review,
+ * chatgpt-codex-connector).
+ *
+ * Best-effort: a later page's fetch failing keeps the pages already fetched rather than discarding
+ * everything, mirroring `getReviewThreads` — some history beats none for the dedup checks
+ * (`notifyGateParked`, `publishUnpushedSentinel`) this feeds. But "some beats none" is only safe
+ * when the caller can tell it apart from "all": a missing page can hide the very comment a caller is
+ * checking for, so `commentsComplete: false` flags exactly that degraded case, and every caller of
+ * this list (`classifyReview`'s fingerprint, the two dedup checks above) must treat a degraded read
+ * as "unknown", never as "confirmed absent" (PR #338 review round 2, chatgpt-codex-connector).
+ */
+export async function getPrTopLevelComments(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<{ comments: Array<{ id: string; author: string; body: string }>; commentsComplete: boolean }> {
+  const allNodes: RawPrCommentNode[] = [];
+  let complete = true;
+  try {
+    const nwo = await nameWithOwner(repoPath, signal);
+    if (!nwo) return { comments: [], commentsComplete: false };
+    const [owner, repo] = nwo.split("/");
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: PrCommentsPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${PR_COMMENTS_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as PrCommentsPage;
+      } catch (err) {
+        rethrowIfAborted(err, signal);
+        // Keep the pages already fetched, but flag the read as incomplete — a failed page (the exact
+        // bug this fixes) still degrades to a short list rather than one silently mistaken for the
+        // PR's whole comment history.
+        complete = false;
+        break;
+      }
+      const page = parsed.data?.repository?.pullRequest?.comments;
+      if (!page) {
+        // Missing repository/pullRequest/comments is a malformed response, not "no comments" — flag
+        // it so a degraded read isn't mistaken for the PR's real, complete comment history (PR #338
+        // review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      if (!Array.isArray(page.nodes)) {
+        // A missing, null, or non-array `nodes` is the same malformed-response case, just missing a
+        // different field (PR #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
+      if (!page.pageInfo) {
+        // No pageInfo at all is a malformed response, not "last page" — pagination could not even
+        // be checked, so the read is incomplete (PR #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      if (typeof page.pageInfo.hasNextPage !== "boolean") {
+        // hasNextPage missing or null is a malformed response, not "last page" — pagination could
+        // not be verified, so the nodes already fetched aren't confirmed as the full picture (PR
+        // #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        // hasNextPage is true but there's no cursor to continue with — can't proceed, so the nodes
+        // fetched so far aren't the full picture.
+        complete = false;
+        break;
+      }
+      cursor = page.pageInfo.endCursor;
+    }
+  } catch (err) {
+    rethrowIfAborted(err, signal);
+    return { comments: [], commentsComplete: false };
+  }
+
+  // A malformed node missing `id` is dropped from `comments` below, but that must also mark the
+  // read incomplete (PR #338 review, chatgpt-codex-connector) — otherwise the newest human reply
+  // to a needs-human request can be the dropped node, `commentsComplete` stays true, and
+  // `classifyReview` fingerprints the older (already-answered) history instead, suppressing the PR.
+  if (allNodes.some((c) => typeof c.id !== "string")) complete = false;
+  const comments = allNodes
+    .filter((c): c is RawPrCommentNode & { id: string } => typeof c.id === "string")
+    .map((c) => ({
+      id: c.id,
+      author: c.author?.login ?? "unknown",
+      body: c.body ?? "",
+    }));
+  return { comments, commentsComplete: complete };
+}
+
+const PR_REVIEWS_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    reviews(first:100 after:$cursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{id author{login} state body submittedAt}
+    }
+  }}
+}`;
+
+interface RawPrReviewNode {
+  id?: string;
+  author?: { login?: string } | null;
+  state?: string;
+  body?: string;
+  submittedAt?: string;
+}
+
+interface PrReviewsPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviews?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: RawPrReviewNode[];
+        };
+      };
+    };
+  };
+}
+
+/**
+ * Submitted PR reviews via GraphQL, paginated the same way as `getReviewThreads` /
+ * `getPrTopLevelComments` — the installed gh's `pr view --json reviews` issues `reviews(first:100)`
+ * with no cursor, so a PR with over 100 submitted reviews (routine on a long-running epic with a bot
+ * reviewer resubmitting every round) silently drops everything past the first page.
+ * `classifyReview`'s fingerprint derives its per-review CHANGES_REQUESTED identity from this list —
+ * a truncated fetch can leave a genuinely new CHANGES_REQUESTED review off the page entirely while
+ * `reviewDecision` (computed by GitHub across ALL reviews, not just page 1) still reports
+ * CHANGES_REQUESTED, so the fingerprint keeps matching a stale answered row and the new feedback
+ * never re-triggers a fix round (PR #338 review, chatgpt-codex-connector).
+ *
+ * Best-effort, same contract as `getPrTopLevelComments`: a later page's fetch failing keeps the
+ * pages already fetched rather than discarding everything.
+ */
+export async function getPrReviews(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<{
+  reviews: Array<{ author: string; state: string; body: string; id?: string; submittedAt?: string }>;
+  reviewsComplete: boolean;
+}> {
+  const allNodes: RawPrReviewNode[] = [];
+  let complete = true;
+  try {
+    const nwo = await nameWithOwner(repoPath, signal);
+    if (!nwo) return { reviews: [], reviewsComplete: false };
+    const [owner, repo] = nwo.split("/");
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: PrReviewsPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${PR_REVIEWS_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as PrReviewsPage;
+      } catch (err) {
+        rethrowIfAborted(err, signal);
+        complete = false;
+        break;
+      }
+      const page = parsed.data?.repository?.pullRequest?.reviews;
+      if (!page) {
+        complete = false;
+        break;
+      }
+      if (!Array.isArray(page.nodes)) {
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
+      if (!page.pageInfo) {
+        complete = false;
+        break;
+      }
+      if (typeof page.pageInfo.hasNextPage !== "boolean") {
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        complete = false;
+        break;
+      }
+      cursor = page.pageInfo.endCursor;
+    }
+  } catch (err) {
+    rethrowIfAborted(err, signal);
+    return { reviews: [], reviewsComplete: false };
+  }
+
+  // A malformed node missing `state` is mapped to `""` below, same as the `comments` read above
+  // treats a missing `id` — but that must also mark the read incomplete (PR #338 review,
+  // chatgpt-codex-connector). Otherwise a newly submitted CHANGES_REQUESTED review that happens to
+  // be the malformed node fingerprints as `""`, `classifyReview` ignores it as a non-requesting
+  // review, and `reviewsComplete` staying true lets `answeredUnchanged` reproduce the old
+  // fingerprint and suppress the new feedback forever.
+  if (allNodes.some((r) => typeof r.state !== "string")) complete = false;
+  const reviews = allNodes.map((r) => ({
+    author: r.author?.login ?? "unknown",
+    state: r.state ?? "",
+    body: r.body ?? "",
+    id: r.id,
+    submittedAt: r.submittedAt,
+  }));
+  return { reviews, reviewsComplete: complete };
+}
+
+const PR_CHECK_ROLLUP_QUERY = `query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+  repository(owner:$owner,name:$repo){pullRequest(number:$number){
+    commits(last:1){nodes{commit{statusCheckRollup{
+      contexts(first:100 after:$cursor){
+        pageInfo{hasNextPage endCursor}
+        nodes{
+          __typename
+          ... on CheckRun{name status conclusion detailsUrl completedAt}
+          ... on StatusContext{context state targetUrl createdAt}
+        }
+      }
+    }}}}
+  }}
+}`;
+
+type RawCheckContextNode = NonNullable<GhPrView["statusCheckRollup"]>[number];
+
+interface PrCheckRollupPage {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        commits?: {
+          nodes?: Array<{
+            commit?: {
+              statusCheckRollup?: {
+                contexts?: {
+                  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+                  nodes?: RawCheckContextNode[];
+                } | null;
+              } | null;
+            } | null;
+          }>;
+        };
+      };
+    };
+  };
+}
+
+/**
+ * A PR's CI check contexts via GraphQL, paginated the same way as `getReviewThreads` /
+ * `getPrTopLevelComments` / `getPrReviews` — `gh pr view --json statusCheckRollup` issues
+ * `contexts(first:100)` with no cursor (confirmed via `GH_DEBUG=api`), so a PR with over 100 check
+ * contexts (routine on a monorepo with matrix jobs across several workflows) silently drops
+ * everything past the first page. `classifyReview`'s fingerprint derives its `check:*` attempt
+ * identities from this list — a previously-answered visible check staying red while a context
+ * beyond the cap newly fails or reruns would otherwise leave the fetched fingerprint identical to
+ * the stale answered row forever (PR #338 review, chatgpt-codex-connector).
+ *
+ * Best-effort, same contract as the other paginated reads here: a later page's fetch failing keeps
+ * the pages already fetched (flagged `rollupComplete: false`) rather than discarding everything.
+ * `commit` may be entirely absent (a PR with no commits yet) or `statusCheckRollup` may be `null`
+ * (no checks configured at all) — both read as a genuinely empty, COMPLETE rollup rather than a
+ * degraded one, since there was never a first page to lose.
+ */
+async function getPrCheckRollup(
+  repoPath: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<{ rollup: RawCheckContextNode[]; rollupComplete: boolean }> {
+  const allNodes: RawCheckContextNode[] = [];
+  let complete = true;
+  try {
+    const nwo = await nameWithOwner(repoPath, signal);
+    if (!nwo) return { rollup: [], rollupComplete: false };
+    const [owner, repo] = nwo.split("/");
+
+    let cursor: string | undefined;
+    for (;;) {
+      let parsed: PrCheckRollupPage;
+      try {
+        const raw = await gh(
+          repoPath,
+          [
+            "api", "graphql",
+            "-f", `query=${PR_CHECK_ROLLUP_QUERY}`,
+            "-f", `owner=${owner}`,
+            "-f", `repo=${repo}`,
+            "-F", `number=${number}`,
+            ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+          ],
+          signal,
+        );
+        parsed = JSON.parse(raw) as PrCheckRollupPage;
+      } catch (err) {
+        rethrowIfAborted(err, signal);
+        complete = false;
+        break;
+      }
+      const commitsNodes = parsed.data?.repository?.pullRequest?.commits?.nodes;
+      if (!Array.isArray(commitsNodes)) {
+        // `commits`/`nodes` themselves missing is a malformed/partial payload — distinct from a
+        // valid empty array, which is the genuine "no commits yet" case below (PR #338 review,
+        // chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      const commitNode = commitsNodes[0];
+      if (!commitNode) {
+        // No commits at all on the PR yet — a real, complete (empty) rollup, not a fetch failure.
+        break;
+      }
+      if (!commitNode.commit) {
+        // `commit` is non-null in GitHub's schema whenever a commit node is returned at all — a
+        // present `commitNode` with an absent `commit` is a malformed/partial payload, not "no
+        // checks configured". The optional chain below would otherwise read straight through to
+        // `undefined` and this fell out of the loop as a genuine empty rollup with
+        // `rollupComplete: true`, letting a check-only actionable PR classify as clean off a read
+        // that never actually inspected its checks (PR #338 review, chatgpt-codex-connector).
+        complete = false;
+        break;
+      }
+      const rollup = commitNode.commit.statusCheckRollup;
+      if (rollup === null || rollup === undefined) {
+        // No checks configured for this commit — same as above, a real empty rollup.
+        break;
+      }
+      const page = rollup.contexts;
+      if (!page || !Array.isArray(page.nodes)) {
+        // statusCheckRollup present but its contexts connection is missing/malformed is a fetch
+        // problem, not "no checks" — flag it so a degraded read isn't persisted as a clean PR.
+        complete = false;
+        break;
+      }
+      allNodes.push(...page.nodes);
+      if (!page.pageInfo || typeof page.pageInfo.hasNextPage !== "boolean") {
+        complete = false;
+        break;
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor) {
+        complete = false;
+        break;
+      }
+      cursor = page.pageInfo.endCursor;
+    }
+  } catch (err) {
+    rethrowIfAborted(err, signal);
+    return { rollup: [], rollupComplete: false };
+  }
+  return { rollup: allNodes, rollupComplete: complete };
 }
 
 /**
@@ -301,7 +826,8 @@ async function getReviewThreads(
           signal,
         );
         parsed = JSON.parse(raw) as ReviewThreadsPage;
-      } catch {
+      } catch (err) {
+        rethrowIfAborted(err, signal);
         // Keep the pages already fetched, but flag the read as incomplete — a failed first page
         // still degrades to an empty, incomplete list.
         complete = false;
@@ -406,7 +932,8 @@ async function getReviewThreads(
       }
       cursor = page.pageInfo.endCursor;
     }
-  } catch {
+  } catch (err) {
+    rethrowIfAborted(err, signal);
     return { threads: [], threadsComplete: false };
   }
 
@@ -445,6 +972,34 @@ export function threadsNeedingAttention(pr: PrReview): ReviewThread[] {
 export interface Actionable {
   actionable: boolean;
   reasons: string[];
+  /**
+   * Stable identity of the CURRENT actionable state, for the answered-suppression fingerprint
+   * (anton-091jr review, chatgpt-codex-connector). `reasons` is display text and stays coarse on
+   * purpose (a count, a check-name list) — it does not change when a reviewer replies again on a
+   * thread already counted, so comparing `reasons` alone lets that new reply get silently
+   * suppressed by a stale "answered" row at the same head. `fingerprint` names each unresolved
+   * thread by id + its last comment id, so a new reply always changes it even when the coarse count
+   * doesn't. Never shown to a human — comparison-only.
+   */
+  fingerprint: string[];
+}
+
+/** Short, edit-sensitive stand-in for a review body in the fingerprint — full text is unbounded. */
+function hashReviewBody(body: string): string {
+  return createHash("sha1").update(body).digest("hex").slice(0, 12);
+}
+
+/**
+ * The most recent top-level PR comment that isn't one of anton's own posts (ANTON_MARK-prefixed) —
+ * a `needs-human` round's one reply channel. Shared by `classifyReview`'s fingerprint and the
+ * review-fix prompt's human-comments section (review-fix-context.ts) so both agree on which single
+ * comment answers a prior request, rather than the prompt rendering every top-level comment a
+ * long-running PR has ever collected (PR #338 review, chatgpt-codex-connector).
+ */
+export function latestHumanComment(
+  comments: Array<{ id: string; author: string; body: string }> | undefined,
+): { id: string; author: string; body: string } | undefined {
+  return [...(comments ?? [])].reverse().find((c) => !c.body.startsWith(ANTON_MARK));
 }
 
 /**
@@ -456,22 +1011,133 @@ export interface Actionable {
  */
 export function classifyReview(pr: PrReview): Actionable {
   const reasons: string[] = [];
-  if (pr.state !== "OPEN") return { actionable: false, reasons: ["pr not open"] };
+  const fingerprint: string[] = [];
+  if (pr.state !== "OPEN") return { actionable: false, reasons: ["pr not open"], fingerprint: [] };
 
   if (pr.reviewDecision === "CHANGES_REQUESTED") {
-    reasons.push("changes requested by a reviewer");
+    // Fold in the count of CHANGES_REQUESTED review events (not just the decision, which stays
+    // CHANGES_REQUESTED across a second/repeat review from the same reviewer) so a genuinely new
+    // review bumps `reasons` even when its body adds no inline comments — otherwise
+    // enqueueReviewFixPrIfAbsent's answered-unchanged suppression (anton-dfuvz) would keep treating
+    // a repeat review as already-answered. Omitted when zero (fixtures that set reviewDecision
+    // without a matching reviews entry) to keep the plain form for those.
+    const changesRequested = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED");
+    const reason =
+      changesRequested.length > 0
+        ? `changes requested by a reviewer (${changesRequested.length} review(s))`
+        : "changes requested by a reviewer";
+    reasons.push(reason);
+    // Keyed on each requesting review's own identity, not the count (anton-091jr review round 2,
+    // chatgpt-codex-connector): if an answered review is dismissed and a DIFFERENT reviewer then
+    // requests changes at the same head, the count alone can return to the same value and match a
+    // stale answered row even though the actual requester changed. `id` is gh's stable review node
+    // id; `submittedAt` is the fallback for a caller-built fixture that omits it. Also folds in a
+    // hash of the review body (anton-091jr review round 3, chatgpt-codex-connector): a reviewer can
+    // edit an already-submitted CHANGES_REQUESTED review's body without touching its id, author,
+    // submittedAt, or the PR head, so without this the amended feedback would match a stale
+    // answered row and get suppressed forever.
+    if (pr.reviewsComplete === false) {
+      // A degraded reviews read (a later GraphQL page failed — `getPrReviews`) can't be trusted to
+      // carry the true, complete set of CHANGES_REQUESTED reviews: the very review that would
+      // change this identity might be sitting on the page that failed, in which case the
+      // `review:*` entries built from the truncated list below would compute the SAME fingerprint
+      // as before and match a stale answered row even though something genuinely changed. A fixed,
+      // distinct marker — mirroring `comments:incomplete` above — means this checkpoint can never
+      // match an answered row recorded while the read was complete (PR #338 review, chatgpt-codex-
+      // connector).
+      fingerprint.push("reviews:incomplete");
+    } else if (changesRequested.length > 0) {
+      const ids = changesRequested
+        .map((r) => `${r.id ?? r.submittedAt ?? "?"}:${r.author}:${hashReviewBody(r.body)}`)
+        .sort();
+      for (const id of ids) fingerprint.push(`review:${id}`);
+    } else {
+      fingerprint.push(reason);
+    }
   }
   if (pr.failingChecks.length > 0) {
     reasons.push(`failing checks: ${pr.failingChecks.join(", ")}`);
   }
+  if (pr.checksComplete === false) {
+    // Unconditional on `failingChecks.length`, unlike the `reviewsComplete` handling above
+    // (anton-091jr PR #338 review, @claude): `pr.reviewDecision` is a separate, non-paginated `gh
+    // pr view` field, so a degraded reviews page never hides that changes were requested — only
+    // which reviewer. Checks have no such independent signal — `failingChecks` is itself derived
+    // from the same potentially-truncated `getPrCheckRollup` read this branch exists to distrust.
+    // A page-2 fetch failure with an all-green page 1 sets `checksComplete: false` and leaves
+    // `failingChecks` at `[]`, so gating this on `failingChecks.length > 0` would skip both the
+    // reason and the `checks:incomplete` marker and let a PR with a real failing check on the
+    // unfetched page look clean forever.
+    reasons.push("check rollup read incomplete (a failing check may be on an unfetched page)");
+    fingerprint.push("checks:incomplete");
+  } else if (pr.failingChecks.length > 0) {
+    // Keyed on the attempt identity, not the name — a check that goes green and fails again at
+    // the same PR head gets a fresh `detailsUrl`/`completedAt`, so this changes the fingerprint
+    // even though `failingChecks`' display names read identically to the prior failure. Falls back
+    // to the plain names when a caller-built fixture leaves `failingCheckAttempts` empty; sorted so
+    // ordering never depends on `gh`'s own rollup order.
+    const attempts = pr.failingCheckAttempts.length > 0 ? pr.failingCheckAttempts : pr.failingChecks;
+    for (const id of [...attempts].sort()) fingerprint.push(`check:${id}`);
+  }
   if (pr.mergeable === "CONFLICTING") {
     reasons.push("merge conflicts with the base branch");
+    // Non-`base:*`/`thread:*` entry (anton-091jr review, chatgpt-codex-connector): without one,
+    // `fingerprintHasNonThreadReasons` (review-fix.ts) sees only the `base:*` cache-busting entry
+    // appended below for every actionable reason and treats a conflict-only round as having NO
+    // non-thread reason. `allWaitingThreadsAnswered` then never demands the conflict sentinel, so a
+    // premerge that fails (or otherwise leaves no commit) lets `report` cover only threads and the
+    // round is recorded as fully answered — suppressing the unresolved conflict on every later sweep
+    // at the same head/base. Keyed on `headSha` so a new push always changes it too.
+    fingerprint.push(`conflict:${pr.headSha}`);
   }
   const waiting = threadsNeedingAttention(pr);
   if (waiting.length > 0) {
     reasons.push(`${waiting.length} unresolved review thread(s)`);
+    // One entry per thread (sorted for a stable fingerprint regardless of GraphQL ordering), keyed
+    // on its last comment so a fresh reply on an already-counted thread still changes this.
+    for (const t of [...waiting].sort((a, b) => a.id.localeCompare(b.id))) {
+      const last = t.comments[t.comments.length - 1];
+      fingerprint.push(`thread:${t.id}:${last?.id ?? "none"}`);
+    }
   }
-  return { actionable: reasons.length > 0, reasons };
+  if (reasons.length > 0) {
+    // Keyed on the base branch's current tip for EVERY actionable reason, not just CONFLICTING
+    // (anton-091jr review round 5, chatgpt-codex-connector): the review-fix worker unconditionally
+    // premerges the base before running gates, so a base that advances while the head and the
+    // actionable reasons stay put is still a changed execution input. Without this, a mergeable PR
+    // with an answered/no-push round would keep matching the stale answered row forever even though
+    // the next run would premerge a different base. Falls back to the plain reason when a
+    // caller-built fixture omits `baseRefOid`.
+    fingerprint.push(`base:${pr.baseRefOid ?? "unknown"}`);
+    // Folds in the latest top-level PR comment that ISN'T one of anton's own posts (ANTON_MARK
+    // prefix, same filter `threadsNeedingAttention` applies to inline replies) — a `needs-human`
+    // round is deliberately unactionable on every other axis, so a human answering anton's request
+    // the one place it was actually posted (a plain top-level reply, not a review or an inline
+    // thread) otherwise leaves the fingerprint byte-identical and the round suppressed forever (PR
+    // #338 review, chatgpt-codex-connector). Omitted entirely when there is no such comment yet, to
+    // leave the fingerprint of the (overwhelmingly common) comment-free PR unchanged.
+    if (pr.commentsComplete === false) {
+      // A degraded top-level-comment read (a later GraphQL page failed — `getPrTopLevelComments`)
+      // can't be trusted to name the true latest human reply: the very reply that would release a
+      // needs-human suppression might be sitting on the page that failed, in which case the stale
+      // fallback below would compute the SAME fingerprint entry as before and match a stale answered
+      // row even though something genuinely changed. A fixed, distinct marker instead of a
+      // `comment:*` entry means this checkpoint can never match an answered row recorded while the
+      // read was complete (PR #338 review round 2, chatgpt-codex-connector).
+      fingerprint.push("comments:incomplete");
+    } else {
+      const humanComment = latestHumanComment(pr.comments);
+      // Hashes the body too, not just the id (PR #338 review, chatgpt-codex-connector): GitHub
+      // preserves a comment's id across an edit, so a human editing their answered top-level reply —
+      // the exact input meant to release the needs-human suppression — would otherwise leave this
+      // fingerprint byte-identical to the stale answered row and stay suppressed forever, mirroring
+      // why `changesRequested` above hashes a review's body rather than trusting its id alone.
+      if (humanComment) {
+        fingerprint.push(`comment:${humanComment.id}:${hashReviewBody(humanComment.body)}`);
+      }
+    }
+  }
+  return { actionable: reasons.length > 0, reasons, fingerprint };
 }
 
 /** Post a comment on the PR (used to note that anton pushed fixes). Best-effort. */
@@ -482,20 +1148,6 @@ export async function commentOnPr(
   signal?: AbortSignal,
 ): Promise<void> {
   await gh(repoPath, ["pr", "comment", String(number), "--body", body], signal);
-}
-
-/**
- * Existing top-level PR comments (the same surface `commentOnPr` posts to — not inline review
- * comments), oldest first. Lets a caller dedupe its own status posts before adding another.
- */
-export async function getPrComments(
-  repoPath: string,
-  number: number,
-  signal?: AbortSignal,
-): Promise<string[]> {
-  const raw = await gh(repoPath, ["pr", "view", String(number), "--json", "comments"], signal);
-  const view = JSON.parse(raw) as { comments?: Array<{ body?: string }> };
-  return (view.comments ?? []).map((c) => c.body ?? "");
 }
 
 /**
@@ -576,7 +1228,12 @@ export async function reRequestReview(
   for (const r of reviewers) args.push("-f", `reviewers[]=${r}`);
   try {
     await gh(repoPath, args, signal);
-  } catch {
+  } catch (err) {
+    // A cancellation must propagate (PR #338 review, chatgpt-codex-connector) so a caller racing
+    // this against a job timeout can tell "cancelled mid-request" apart from "GitHub refused the
+    // reviewer" — swallowing it here would let a timed-out job complete as if the re-request had
+    // been attempted normally.
+    rethrowIfAborted(err, signal);
     // reviewer can't be re-requested (e.g. is the PR author / a team) — ignore.
   }
 }

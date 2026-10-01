@@ -7,6 +7,7 @@ import type { ChildProcess } from "node:child_process";
 import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
+import { mkdir, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { dirname as posixDirname, normalize as posixNormalizeRaw } from "node:path/posix";
@@ -620,7 +621,7 @@ export async function git(cwd: string, args: string[], hooksPath?: string): Prom
  * newline this would otherwise split on. Paths are NOT trimmed for the same reason — leading and
  * trailing whitespace are legal in a filename.
  */
-async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
+export async function diffPaths(cwd: string, args: string[]): Promise<string[]> {
   const { stdout } = await execFileAsync("git", ["-C", cwd, "diff", "-z", ...args], {
     timeout: 120_000,
     maxBuffer: 16 * 1024 * 1024,
@@ -952,53 +953,102 @@ function gitCommit(
   requestedTimeoutMs?: number,
   signal?: AbortSignal,
 ): Promise<void> {
+  const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+  const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
+  return runBoundedProcess("git", [...configArgs, "-C", cwd, ...args], {
+    timeoutMs,
+    signal,
+    onTimeout: (stderr) => commitTimedOut(args, timeoutMs, stderr),
+    onFailure: (code, stderr) => commitFailed(args, code, stderr),
+  });
+}
+
+/**
+ * Spawn `command` as the leader of its own process group and resolve only once it — and every
+ * child it spawned — is GONE. The same guarantee {@link gitCommit} needs for `git commit` (whose
+ * hooks run project code that can outlive a plain `execFile` timeout) applies to any other
+ * project-controlled hook anton runs synchronously in the commit path — `runIgnoreMissingHook`'s
+ * `pre-merge-commit` invocation in particular (PR #338 review, chatgpt-codex-connector): running it
+ * through the generic `git()`/`execFileAsync()` paths instead of this one would let a hung hook (or
+ * a child that survives its own termination) keep mutating the worktree after the caller has already
+ * moved on to the commit that follows, racing it. Extracted so both share the exact spawn, timeout,
+ * abort, and {@link reapCommitGroup} lifecycle rather than two copies drifting apart.
+ */
+function runBoundedProcess(
+  command: string,
+  args: string[],
+  opts: {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    signal?: AbortSignal;
+    onTimeout: (stderr: string) => Error;
+    onFailure: (code: number | null, stderr: string) => Error;
+  },
+): Promise<void> {
   return new Promise((resolvePromise, reject) => {
-    if (signal?.aborted) {
-      reject(signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
+    if (opts.signal?.aborted) {
+      reject(opts.signal.reason ?? new DOMException("The operation was aborted", "AbortError"));
       return;
     }
 
-    const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
     // stdout is dropped rather than piped: nothing here reads it, and a chatty hook filling an
-    // unread pipe would block the commit outright.
-    const child = spawn("git", [...configArgs, "-C", cwd, ...args], {
+    // unread pipe would block the process outright.
+    const child = spawn(command, args, {
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts.env ? { env: opts.env } : {}),
       stdio: ["ignore", "ignore", "pipe"],
       detached: process.platform !== "win32",
     });
     const stderr = boundedStderr(child);
-    const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
     let killing = false;
     let settled = false;
     const settle = (emit: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(budget);
-      signal?.removeEventListener("abort", abort);
+      opts.signal?.removeEventListener("abort", abort);
       emit();
     };
     const abort = () => {
       if (killing || settled) return;
       killing = true;
       void reapCommitGroup(child).then(() =>
-        settle(() => reject(signal?.reason ?? new DOMException("The operation was aborted", "AbortError"))),
+        settle(() =>
+          reject(opts.signal?.reason ?? new DOMException("The operation was aborted", "AbortError")),
+        ),
       );
     };
     const budget = setTimeout(() => {
       if (killing || settled) return;
       killing = true;
-      void reapCommitGroup(child).then(() =>
-        settle(() => reject(commitTimedOut(args, timeoutMs, stderr()))),
-      );
-    }, timeoutMs);
-    signal?.addEventListener("abort", abort, { once: true });
+      void reapCommitGroup(child).then(() => settle(() => reject(opts.onTimeout(stderr()))));
+    }, opts.timeoutMs);
+    opts.signal?.addEventListener("abort", abort, { once: true });
 
     child.on("error", (err) => settle(() => reject(err)));
     child.on("close", (code) => {
       // A kill in flight owns the verdict: its group may still hold live writers.
       if (killing) return;
-      settle(() => (code === 0 ? resolvePromise() : reject(commitFailed(args, code, stderr()))));
+      settle(() => (code === 0 ? resolvePromise() : reject(opts.onFailure(code, stderr()))));
     });
   });
+}
+
+/** The rejection a hook killed by its own budget carries, mirroring {@link commitTimedOut}. */
+function hookTimedOut(hookName: string, timeoutMs: number, stderr: string): Error {
+  return Object.assign(
+    new Error(
+      `${hookName} hook timed out after ${formatCommitBudget(timeoutMs)} and was killed with ` +
+        `everything it spawned: ${stderr}`,
+    ),
+    { killed: true },
+  );
+}
+
+/** The rejection a hook's own non-zero exit carries, mirroring {@link commitFailed}. */
+function hookFailed(hookName: string, code: number | null, stderr: string): Error {
+  return Object.assign(new Error(`${hookName} hook failed (exit ${code}): ${stderr}`), { code });
 }
 
 /** The tree mode of a symlink. Its blob holds the TARGET PATHNAME, not the linked file's content. */
@@ -1482,6 +1532,218 @@ export function exitedWith(error: unknown, code: number): boolean {
 }
 
 /**
+ * Parses `git --version`'s stdout and reports whether that git has a `hook` subcommand at all —
+ * `git hook run` was added in the 2.36.0 release (see its RelNotes), and this project's README
+ * places no minimum git version, so a 2.35-or-older git must not be assumed. A version string that
+ * doesn't parse assumes support rather than silently downgrading every caller to the direct
+ * fallback (PR #338 review round 13, chatgpt-codex-connector).
+ */
+export function gitVersionSupportsHookRun(versionOutput: string): boolean {
+  const match = /git version (\d+)\.(\d+)/.exec(versionOutput);
+  if (!match) return true;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 2 || (major === 2 && minor >= 36);
+}
+
+let gitHookRunSupport: Promise<boolean> | undefined;
+
+/** Cached, memoized wrapper around {@link gitVersionSupportsHookRun} — the installed git binary can't change mid-run. */
+async function supportsGitHookRun(): Promise<boolean> {
+  if (!gitHookRunSupport) {
+    gitHookRunSupport = execFileAsync("git", ["--version"], { timeout: 5_000 })
+      .then(({ stdout }) => gitVersionSupportsHookRun(stdout))
+      .catch(() => true);
+  }
+  return gitHookRunSupport;
+}
+
+/**
+ * The environment `git hook run` exports before invoking a hook (see the githooks docs) —
+ * `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_PREFIX` — layered over this process's own.
+ * {@link runHookDirectly} spawns the hook binary itself rather than going through `git`, so
+ * without this a hook reading those vars would see whatever this process happened to inherit
+ * (nothing, on a clean run) instead of the repository it's actually meant to operate on — wrongly
+ * accepting or rejecting a merge based on the wrong repo's state (PR #338 review round 13,
+ * chatgpt-codex-connector).
+ *
+ * Also sets `GIT_EDITOR=:` — githooks(5) documents `pre-merge-commit` (the only hook this path
+ * runs) as invoked with that var set whenever the merge won't bring up an editor, which the
+ * `--no-edit`-equivalent commit that follows here never does. Verified against real git 2.50 (a
+ * `pre-merge-commit` hook dumping its env during `git merge --no-edit` on an auto-mergeable pair
+ * of branches shows `GIT_EDITOR=:`); omitting it left a hook that branches on it unable to tell
+ * this replay apart from an interactive merge (PR #338 review, chatgpt-codex-connector).
+ */
+async function gitHookEnv(worktreePath: string, hooksPath?: string): Promise<NodeJS.ProcessEnv> {
+  const [gitDir, workTree, indexFile] = (
+    await git(
+      worktreePath,
+      ["rev-parse", "--path-format=absolute", "--git-dir", "--show-toplevel", "--git-path", "index"],
+      hooksPath,
+    )
+  ).split("\n");
+  return {
+    ...process.env,
+    GIT_DIR: gitDir,
+    GIT_WORK_TREE: workTree,
+    GIT_INDEX_FILE: indexFile,
+    GIT_PREFIX: "",
+    GIT_EDITOR: ":",
+  };
+}
+
+/**
+ * Fallback for `git hook run --ignore-missing <hook>` on git < 2.36, which has no `hook`
+ * subcommand at all. Resolves the same effective hooks directory `git hook run` would have looked
+ * up (`rev-parse --git-path hooks`, honoring the same `core.hooksPath` override the caller
+ * resolved) and, mirroring `--ignore-missing`, no-ops when the hook isn't there or isn't marked
+ * executable — git itself never runs a hook lacking the executable bit, so neither does this. A
+ * non-zero exit throws, propagating into the same rollback a rejected `git commit` triggers.
+ */
+export async function runHookDirectly(
+  worktreePath: string,
+  hookName: string,
+  hooksPath?: string,
+  requestedTimeoutMs?: number,
+  signal?: AbortSignal,
+  hookArgs: string[] = [],
+): Promise<void> {
+  const hooksDir = await git(
+    worktreePath,
+    ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+    hooksPath,
+  );
+  const hookPath = resolve(hooksDir, hookName);
+  if (!existsSync(hookPath)) return;
+  if (process.platform !== "win32" && (statSync(hookPath).mode & 0o111) === 0) return;
+  const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
+  await runBoundedProcess(hookPath, hookArgs, {
+    cwd: worktreePath,
+    env: await gitHookEnv(worktreePath, hooksPath),
+    timeoutMs,
+    signal,
+    onTimeout: (stderr) => hookTimedOut(hookName, timeoutMs, stderr),
+    onFailure: (code, stderr) => hookFailed(hookName, code, stderr),
+  });
+}
+
+/**
+ * Run `hookName` the way `git hook run --ignore-missing <hookName>` would — via the real
+ * subcommand on git ≥2.36, or {@link runHookDirectly} on older git that doesn't have it. Both
+ * paths run through {@link runBoundedProcess} so a hook here gets the exact same process-group
+ * timeout, abort, and reap lifecycle as the commit that follows it, rather than the unbounded
+ * `git()`/`execFileAsync()` paths every other read-only git call here uses (PR #338 review,
+ * chatgpt-codex-connector).
+ *
+ * Layers `GIT_EDITOR=:` onto the inherited environment for the `git hook run` path too — unlike
+ * `runHookDirectly`, `git hook run` is real git and resolves `GIT_DIR`/`GIT_WORK_TREE`/
+ * `GIT_INDEX_FILE` itself from `-C worktreePath`, but it doesn't know this call is standing in for
+ * a `git merge` that would set `GIT_EDITOR` (see {@link gitHookEnv}'s doc for the reproduction).
+ */
+async function runIgnoreMissingHook(
+  worktreePath: string,
+  hookName: string,
+  hooksPath?: string,
+  requestedTimeoutMs?: number,
+  signal?: AbortSignal,
+  hookArgs: string[] = [],
+): Promise<void> {
+  if (await supportsGitHookRun()) {
+    const configArgs = hooksPath ? ["-c", `core.hooksPath=${hooksPath}`] : [];
+    const timeoutMs = commitTimeoutMs(requestedTimeoutMs);
+    await runBoundedProcess(
+      "git",
+      [
+        ...configArgs,
+        "-C",
+        worktreePath,
+        "hook",
+        "run",
+        "--ignore-missing",
+        hookName,
+        ...(hookArgs.length > 0 ? ["--", ...hookArgs] : []),
+      ],
+      {
+        env: { ...process.env, GIT_EDITOR: ":" },
+        timeoutMs,
+        signal,
+        onTimeout: (stderr) => hookTimedOut(hookName, timeoutMs, stderr),
+        onFailure: (code, stderr) => hookFailed(hookName, code, stderr),
+      },
+    );
+  } else {
+    await runHookDirectly(worktreePath, hookName, hooksPath, requestedTimeoutMs, signal, hookArgs);
+  }
+}
+
+/**
+ * A `core.hooksPath` mirroring the worktree's real hooks directory via symlinks, minus
+ * `pre-commit` AND `post-commit` — passed to the verifying `git commit` call `commitAll`'s
+ * merge-replay path makes, so that call runs every OTHER configured hook (crucially `commit-msg`,
+ * which a real `git merge` also invokes for the merge commit message) without also invoking
+ * either of the two hooks that are specific to a plain `git commit` rather than a `git merge`.
+ *
+ * A real `git merge` never runs `pre-commit` directly — githooks(5) documents that only the STOCK
+ * `pre-merge-commit` sample hook happens to chain into `pre-commit` itself; a project's own custom
+ * `pre-merge-commit` (already run explicitly above via `runIgnoreMissingHook`) is under no
+ * obligation to, and most don't. A generic `git commit`, by contrast, ALWAYS fires `pre-commit`
+ * regardless of merge context — so committing this replay's merge shape via a plain `git commit`
+ * call re-runs a hook the real merge workflow it stands in for would only have run if that
+ * project's own `pre-merge-commit` chose to chain it, and can reject/repeatedly park a merge the
+ * project's actual workflow accepts (PR #338 review, chatgpt-codex-connector, P2).
+ *
+ * `post-commit` is excluded for the mirror image of the same reason (PR #338 review,
+ * chatgpt-codex-connector, round 15): githooks(5) documents `post-commit` as a `git commit`-only
+ * hook and `post-merge` as `git merge`'s own completion hook — verified against real git 2.43, a
+ * `git merge --no-edit` runs `post-merge` and never `post-commit`, while a plain `git commit` runs
+ * the reverse. Replaying this boundary via `git commit` would otherwise fire `post-commit` (which
+ * the real merge workflow never runs and may not expect) while never firing `post-merge` (whose
+ * side effects — e.g. a lockfile regeneration or submodule sync a project's own `post-merge` does
+ * — the project's actual `git merge` step depends on). The caller runs `post-merge` explicitly via
+ * {@link runIgnoreMissingHook} once the commit lands, mirroring how `pre-merge-commit` is already
+ * run explicitly above; excluding `post-commit` here stops it firing a second, unwanted time.
+ *
+ * `undefined` when the real hooks directory doesn't exist at all (nothing configured, so nothing
+ * to skip) or the mirror can't be built — falls back to the caller's own `hooksPath`, matching this
+ * function's behavior before this mirror existed, rather than failing the whole commit over a
+ * best-effort hygiene step. That fallback is a deliberate fail-CLOSED choice (PR #338 review,
+ * chatgpt-codex-connector, P1): a single failed `symlink()` — e.g. a platform/filesystem that
+ * restricts symlink creation — used to be swallowed per-entry, silently omitting just that one
+ * hook from the mirror while still returning it, so the verifying commit could run with a
+ * PARTIAL mirror and skip a required `commit-msg`/`prepare-commit-msg`/other hook while still
+ * being treated as fully verified. Any failed link now aborts the whole mirror build instead, and
+ * the caller runs with the real `hooksPath` — re-running `pre-commit` unnecessarily for this one
+ * commit is the safe direction to fail in, unlike silently dropping an arbitrary other hook.
+ */
+async function hooksPathForMergeReplay(
+  worktreePath: string,
+  hooksPath: string | undefined,
+): Promise<string | undefined> {
+  let mirror: string | undefined;
+  try {
+    const realHooksDir = await git(
+      worktreePath,
+      ["rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+      hooksPath,
+    );
+    if (!existsSync(realHooksDir)) return undefined;
+    mirror = resolve(tmpdir(), `anton-merge-hooks-${randomUUID()}`);
+    await mkdir(mirror, { recursive: true });
+    for (const entry of await readdir(realHooksDir)) {
+      if (entry === "pre-commit" || entry === "post-commit") continue;
+      await symlink(resolve(realHooksDir, entry), resolve(mirror, entry));
+    }
+    return mirror;
+  } catch {
+    // A failure partway through leaves some links already made — clean those up rather than
+    // leaking a half-built mirror into tmpdir, since the caller falls back to `options.hooksPath`
+    // and never receives this path to remove itself.
+    if (mirror) await rm(mirror, { recursive: true, force: true }).catch(() => {});
+    return undefined;
+  }
+}
+
+/**
  * Stage everything in the worktree — `git add -A`, extracted so a caller can stage BEFORE asking
  * {@link resolveHooksPathOverride} anything (PR #263 review, round 37; see {@link commitAll}'s own
  * doc comment for why that order matters). Idempotent: calling it again right after — as
@@ -1490,6 +1752,33 @@ export function exitedWith(error: unknown, code: number): boolean {
  */
 export async function stageAll(worktreePath: string, hooksPath?: string): Promise<void> {
   await git(worktreePath, ["add", "-A"], hooksPath);
+}
+
+const COMMIT_ATTEMPT_MODE = Symbol("gitCommitAttemptMode");
+
+/**
+ * Which git operation `commitAll` was attempting when the error it threw was raised — `"commit"`
+ * for the ordinary staged-changes path, `"amend"` for the `amendToVerifyHooks` path. A caller
+ * recovering from a timeout or hook rejection needs this: which path the CALLER requested via
+ * `amendToVerifyHooks` is not always which path RAN, since `commitAll` only takes the amend path
+ * when nothing new was staged — a caller can ask for it and still get an ordinary commit if the fix
+ * session added changes on top of a prior boundary commit (PR #338 review round 2,
+ * chatgpt-codex-connector). Tagged on the ORIGINAL error object (not wrapped) so identity
+ * (`rejects.toBe`) and message (a timeout's `killed: true` / budget text, git's own exit-code
+ * message) survive unchanged for every other caller that doesn't care about the mode.
+ */
+export function commitAttemptMode(error: unknown): "commit" | "amend" | undefined {
+  if (error && typeof error === "object" && COMMIT_ATTEMPT_MODE in error) {
+    return (error as Record<typeof COMMIT_ATTEMPT_MODE, "commit" | "amend">)[COMMIT_ATTEMPT_MODE];
+  }
+  return undefined;
+}
+
+function tagCommitAttempt<E>(error: E, mode: "commit" | "amend"): E {
+  if (error && typeof error === "object") {
+    Object.assign(error, { [COMMIT_ATTEMPT_MODE]: mode });
+  }
+  return error;
 }
 
 /**
@@ -1502,12 +1791,19 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
  *
  * `bypassHooks` runs the commit with this project's hooks off, and a run's ordinary commits never
  * ask for it: hooks are the project's own gate on content, and anton has no standing to skip them.
- * Its one caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a hook refused
+ * One caller is the ticket-timeout preserve RETRYING a `WIP <id>:` commit that a hook refused
  * before anything landed (PR #228 review) — a tree the project's own verify gates have already
  * passed, on its way to a commit that is explicitly incomplete and in no pull request. That caller
  * proves the tree is still the verified one first, via {@link stageAllAndHashTree}: a hook that
  * EDITS before it rejects leaves a different tree, and `--no-verify` would commit those post-gate
  * edits under a proof that never covered them.
+ *
+ * The other caller is review-fix's pre-gate boundary commit (PR #338 review, chatgpt-codex-connector):
+ * an internal snapshot of what the main round changed, taken BEFORE the verify gates run and never
+ * pushed on its own. A project's pre-commit hook that happens to enforce the same check a configured
+ * verify gate does would otherwise reject this commit outright, before the gate — and its one bounded
+ * follow-up round — ever gets a chance; the project's hooks still run on the real, hook-enforced
+ * commit `commitAndPushFix` makes once the gates are green and the fix is actually being published.
  *
  * `hooksPath`, when the caller passes one, MUST have been resolved AFTER whatever staging already
  * happened in the worktree — never before (PR #263 review, round 37). `resolveHooksPathOverride`'s
@@ -1528,24 +1824,442 @@ export async function stageAll(worktreePath: string, hooksPath?: string): Promis
 export async function commitAll(
   worktreePath: string,
   message: string,
-  options: { bypassHooks?: boolean; hooksPath?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+  options: {
+    bypassHooks?: boolean;
+    hooksPath?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    amendToVerifyHooks?: boolean;
+    /**
+     * The still-unverified commit to reset PAST, when it sits BEHIND `HEAD` rather than being `HEAD`
+     * itself — e.g. an operator's own plain commit landed on top of a parked, hook-bypassed boundary
+     * while resuming (PR #338 review, chatgpt-codex-connector, round 6). The reset below then targets
+     * THIS commit's own parent(s) instead of `HEAD`'s, so the hook sees the combined diff from before
+     * the unverified content through `HEAD`, not just what a descendant commit added on top of it.
+     * Defaults to `HEAD` itself when unset, matching the original single-commit behavior.
+     */
+    verifyFrom?: string;
+    /**
+     * The boundary being re-verified is a BARE, fix-free auto-merge (`premergeBase`'s clean base
+     * sync landed with hooks bypassed, nothing built on top) — as opposed to a genuine multi-parent
+     * commit that concluded a manually-resolved conflict (claude resolving base-merge conflicts
+     * while addressing the actual review feedback, still a real `git commit` in git's own hook
+     * lifecycle). Only the caller knows which one it is (see `BARE_PREMERGE_NOTE_TAG`'s own doc in
+     * review-fix.ts) — `commitAll` has no notion of that provenance on its own.
+     *
+     * When `true` AND the verify commit turns out to carry more than one parent, the verifying
+     * commit below skips `pre-commit` (still running every other configured hook, `commit-msg`
+     * included): a real `git merge`'s own automatic, conflict-free path never invokes `pre-commit`
+     * directly — only `pre-merge-commit`, already run explicitly above — so committing this bare
+     * merge's replay via a plain `git commit` would otherwise fire a hook the real merge workflow
+     * this stands in for might never have run, and can reject (or repeatedly park) a merge the
+     * project's actual workflow accepts (PR #338 review, chatgpt-codex-connector, P2). A genuine
+     * conflict-resolution merge is concluded via an ORDINARY `git commit` in real git too, which
+     * always fires `pre-commit` — so this must stay `false`/unset for that case, matching prior
+     * behavior.
+     */
+    verifiedBoundaryIsBareMerge?: boolean;
+  } = {},
 ): Promise<{ committed: boolean }> {
   await stageAll(worktreePath, options.hooksPath);
   const bypass = options.bypassHooks ? ["--no-verify"] : [];
+  let nothingStaged: boolean;
   try {
     // Exits non-zero when there ARE staged changes → there is something to commit.
     await git(worktreePath, ["diff", "--cached", "--quiet"]);
-    return { committed: false };
+    nothingStaged = true;
   } catch {
+    nothingStaged = false;
+  }
+  if (!nothingStaged && !options.amendToVerifyHooks) {
+    try {
+      await gitCommit(
+        worktreePath,
+        ["commit", ...bypass, "-m", message],
+        // `--no-verify` alone bypasses only `pre-commit` and `commit-msg` (git-commit(1)) —
+        // `prepare-commit-msg` still fires and could reject or mutate this internal boundary commit
+        // before the project's real hooks ever see it on the verified commit below (PR #338 review,
+        // chatgpt-codex-connector, round 11). Routing a bypass through a `core.hooksPath` that
+        // resolves to nothing disables every hook for this invocation, the same technique
+        // {@link resolveHooksPathOverride}'s submodule case already uses.
+        options.bypassHooks ? disabledHooksPath() : options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+      );
+    } catch (error) {
+      throw tagCommitAttempt(error, "commit");
+    }
+    return { committed: true };
+  }
+  if (!options.amendToVerifyHooks) {
+    return { committed: false };
+  }
+  // HEAD is a prior hook-bypassed boundary commit that still needs the project's real hooks to see
+  // its FULL diff before it publishes (PR #338 review, chatgpt-codex-connector) — regardless of
+  // whether anything new got staged above. A hook that inspects the STAGED diff (lint-staged and
+  // friends) diffs the index against the commit it's being compared to; leaving the boundary's own
+  // tree already committed underneath a follow-up's own staged edits hides the boundary's changes
+  // from that diff just as completely as an empty index does — so branching on `nothingStaged` here
+  // (a bare amend, or an ordinary commit stacked on the untouched boundary) validates only whatever
+  // the follow-up itself staged and never re-checks the boundary's own files (PR #338 review round
+  // 3, chatgpt-codex-connector). `reset --soft` back to the boundary's own parent — EVERY parent it
+  // had, not just the first, so a boundary commit that itself resolved a conflicted base premerge (a
+  // genuine two-parent merge) doesn't get flattened to one when this replays it — moves the branch
+  // pointer back while leaving the index untouched, so the index (the boundary's tree, plus
+  // whatever the follow-up staged) now reads as staged against that parent and the hook sees the
+  // combined diff. What follows is an ordinary, hook-verified commit of that tree.
+  const originalHead = await resolveCommitSha(worktreePath, "HEAD");
+  const originalMessage = await git(worktreePath, ["log", "-1", "--format=%B", "HEAD"]);
+  // Whose parents to reset back to: `HEAD`'s own by default, or an ancestor further back when the
+  // caller says the unverified content sits there instead (see `verifyFrom` above) — a descendant
+  // commit on top of it stays in `HEAD`'s tree either way, since `--soft` leaves the index untouched.
+  const boundaryHead = options.verifyFrom ?? originalHead;
+  const boundaryParents = await commitParentShas(worktreePath, boundaryHead);
+  // The selected boundary is the OLDEST unpushed commit carrying the marker (see
+  // `findUnverifiedBoundaryAncestor`) — a later commit between it and `HEAD` can itself be a merge
+  // (e.g. a clean base premerge landing on top of an already-parked boundary, PR #338 review, round
+  // 7) whose non-mainline parent the reconstruction below would otherwise silently drop, since only
+  // the SELECTED boundary's own parents get restored. Walk every commit in that range and collect any
+  // parent that isn't itself part of the range, so a base tip merged in partway through survives.
+  // `--first-parent` is required here (PR #338 review, round 8, chatgpt-codex-connector): a plain
+  // `boundary..HEAD` range also enumerates commits reachable ONLY through a merge's second parent —
+  // e.g. the base tip a clean base merge pulled in — so that base tip lands in `replayedRange` as if
+  // it were itself a walked descendant, and the loop below then sees it as "already in range" and
+  // drops it from `descendantMergeParents` instead of preserving it. Restricting the walk to the
+  // first-parent chain keeps `replayedRange` to the actual mainline descendants, so a merge's other
+  // parents are always detected as outside that range.
+  const replayedDescendants =
+    boundaryHead === originalHead
+      ? []
+      : (
+          await git(worktreePath, ["rev-list", "--first-parent", `${boundaryHead}..${originalHead}`])
+        )
+          .split("\n")
+          .filter(Boolean);
+  const replayedRange = new Set([boundaryHead, ...replayedDescendants]);
+  const descendantMergeParents: string[] = [];
+  for (const commit of replayedDescendants) {
+    for (const parent of await commitParentShas(worktreePath, commit)) {
+      if (!replayedRange.has(parent) && !descendantMergeParents.includes(parent)) {
+        descendantMergeParents.push(parent);
+      }
+    }
+  }
+  // The selected boundary's own further parents, plus any merge parents a later commit in the
+  // replayed range introduced (`descendantMergeParents` above), need to land on the verifying
+  // commit below — computed before that commit so they can be fed to it directly, rather than
+  // spliced in afterward (see the `MERGE_HEAD` comment below for why afterward doesn't work).
+  const extraParents = [...boundaryParents.slice(1), ...descendantMergeParents].filter(
+    (parent, index, all) => parent !== boundaryParents[0] && all.indexOf(parent) === index,
+  );
+  await git(worktreePath, ["reset", "--soft", boundaryParents[0] ?? `${boundaryHead}^`]);
+  const resetHead = await resolveCommitSha(worktreePath, "HEAD");
+  // When the boundary had more than one parent, write those extras to `MERGE_HEAD` before
+  // committing so `git commit` builds a genuine merge commit — HEAD (the reset target) plus every
+  // `MERGE_HEAD` entry, in file order — in the SAME shot the hooks run over. A hook that branches on
+  // merge context (checking `MERGE_HEAD`, the parent count, or `prepare-commit-msg`'s "merge"
+  // source) then sees the real topology the final pushed commit will have; committing single-parent
+  // first and splicing the extra parents in afterward via `commit-tree` — as this used to do — lets
+  // such a hook pass a flattened stand-in while the actual merge shape goes unverified (PR #338
+  // review, chatgpt-codex-connector, round 9).
+  let mergeHeadPath: string | undefined;
+  let mergeMsgPath: string | undefined;
+  // Symlink mirror of the real hooks dir, minus `pre-commit`/`post-commit` — built only when
+  // `options.verifiedBoundaryIsBareMerge` says the verify commit stands in for a real `git merge`'s
+  // own automatic path rather than a conflict resolution concluded via an ordinary `git commit` (see
+  // that option's own doc, and {@link hooksPathForMergeReplay}). Removed in `finally` below
+  // regardless of how the commit turns out.
+  let mergeCommitHooksPath: string | undefined;
+  // Real git only runs `post-merge` for the same auto-merge path this option stands in for
+  // (githooks(5); verified against git 2.43) — a manually conflict-resolved merge concluded via an
+  // ordinary `git commit`, in real git too, never fires it. Captured before the commit so the flag
+  // survives into the success path below regardless of which branch built `mergeCommitHooksPath`.
+  const shouldReplayPostMerge = extraParents.length > 0 && Boolean(options.verifiedBoundaryIsBareMerge);
+  // Setup (resolving/writing MERGE_HEAD and MERGE_MSG) lives inside this same try — HEAD already
+  // moved to `resetHead` above, so a failure here (e.g. an unwritable git dir) needs the identical
+  // restoration the commit failure path below already performs, not an uncaught throw that leaves
+  // the branch rewound with the boundary's changes merely staged (PR #338 review, chatgpt-codex-
+  // connector).
+  try {
+    if (extraParents.length > 0) {
+      // `pre-merge-commit` is invoked by `git merge` itself — githooks(5) says so explicitly, and
+      // also that finishing a merge by committing separately (exactly what this replay does even
+      // with `MERGE_HEAD` set for the commit below) skips it, running only `pre-commit`. A project
+      // that enforces its merge policy specifically in `pre-merge-commit` (as opposed to
+      // `pre-commit`) would then never see this boundary's merge shape verified at all — the very
+      // hook `premergeBase` above bypassed to land it in the first place stays unrun forever (PR
+      // #338 review, chatgpt-codex-connector). `git hook run` executes the named hook directly,
+      // honoring the same `core.hooksPath` override `gitCommit` below resolves, and propagates a
+      // non-zero exit the same way a rejected `git commit` does, into the identical rollback below.
+      // `--ignore-missing` no-ops when the project has no such hook, matching what `git merge`
+      // itself would have done. `runIgnoreMissingHook` falls back to running the hook file directly
+      // on git < 2.36, which predates the `hook` subcommand entirely (PR #338 review round 13,
+      // chatgpt-codex-connector). Threading this commit's own `timeoutMs`/`signal` through means a
+      // hung `pre-merge-commit` is bounded and reaped the same way the verifying commit right below
+      // it is (PR #338 review round 14, chatgpt-codex-connector).
+      //
+      // Gated on `verifiedBoundaryIsBareMerge`, mirroring `shouldReplayPostMerge` above: a real,
+      // conflict-free `git merge` is the ONLY path that ever invokes `pre-merge-commit` at all
+      // (githooks(5); verified against git 2.43/2.50) — a conflicted merge resolved by hand and
+      // concluded via an ordinary `git commit` fires `pre-commit` instead, never this hook. Running
+      // it unconditionally here would subject that manual-resolution replay to a check the real
+      // workflow it stands in for never applies, and can park a merge the project's own hooks
+      // otherwise accept (PR #338 review round 30, chatgpt-codex-connector, P2).
+      //
+      // Run BEFORE `MERGE_HEAD`/`MERGE_MSG` are written, and with `GIT_EDITOR=:` set (handled by
+      // `runIgnoreMissingHook`/`gitHookEnv`) — a real `git merge --no-edit` invokes this hook with
+      // neither file on disk yet (its own successful-auto-merge path never writes `MERGE_HEAD` at
+      // all, using `AUTO_MERGE` instead; `MERGE_HEAD` only appears once conflicts need manual
+      // resolution) and with the editor stubbed out. Verified against real git 2.50: a
+      // `pre-merge-commit` hook run by `git merge --no-edit` on an auto-mergeable pair of branches
+      // sees no `.git/MERGE_HEAD`. Writing those files first, as this used to, left a hook that
+      // inspects merge state seeing a shape `git merge` itself never produces at this point (PR
+      // #338 review, chatgpt-codex-connector).
+      if (options.verifiedBoundaryIsBareMerge) {
+        await runIgnoreMissingHook(
+          worktreePath,
+          "pre-merge-commit",
+          options.hooksPath,
+          options.timeoutMs,
+          options.signal,
+        );
+      }
+      mergeHeadPath = await git(worktreePath, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "MERGE_HEAD",
+      ]);
+      await writeFile(mergeHeadPath, extraParents.map((parent) => `${parent}\n`).join(""));
+      // `-m` reports its source as `message` to `prepare-commit-msg`, even with `MERGE_HEAD` present
+      // and the resulting commit carrying multiple parents — a hook branching on that source argument
+      // would see the wrong one. Writing the message to `MERGE_MSG` and committing with `--no-edit`
+      // instead runs the same path `git merge` itself uses, so the hook sees source `merge` (PR #338
+      // review, chatgpt-codex-connector, round 10).
+      mergeMsgPath = await git(worktreePath, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "MERGE_MSG",
+      ]);
+      await writeFile(mergeMsgPath, originalMessage);
+      if (options.verifiedBoundaryIsBareMerge) {
+        mergeCommitHooksPath = await hooksPathForMergeReplay(worktreePath, options.hooksPath);
+      }
+    }
     await gitCommit(
       worktreePath,
-      ["commit", ...bypass, "-m", message],
-      options.hooksPath,
+      extraParents.length > 0 ? ["commit", "--no-edit"] : ["commit", "-m", originalMessage],
+      mergeCommitHooksPath ?? options.hooksPath,
       options.timeoutMs,
       options.signal,
     );
+  } catch (error) {
+    // `gitCommit`'s timeout races git's own hook sequencing (githooks(5)): the commit object and
+    // ref update land BEFORE `post-commit` runs, so a `post-commit` that merely runs long — not
+    // one that rejects the commit — can cross the timeout budget and have `gitCommit` reject
+    // *after* HEAD already moved to the fully hook-verified commit. Check that before assuming
+    // nothing landed: unconditionally resetting here would silently discard an already-verified
+    // commit and poison a retry into re-running hooks whose side effects may not be idempotent
+    // (PR #338 review, chatgpt-codex-connector, round 12).
+    let landed: boolean;
+    try {
+      const headAfterError = await resolveCommitSha(worktreePath, "HEAD");
+      landed =
+        headAfterError !== resetHead && (await isAncestor(worktreePath, resetHead, headAfterError));
+    } catch (landedCheckError) {
+      // A failure HERE — not "HEAD didn't move" but the check itself erroring (lock contention,
+      // disk pressure right after the hook timeout's SIGKILL reap) — must not collapse to
+      // `landed = false`: that's exactly the destructive reset the comment above exists to avoid,
+      // just reached through this check's own error path instead of the happy path (round 12 fixed
+      // the happy path; this is its mirror). Surface it instead of guessing either way.
+      throw tagCommitAttempt(
+        new Error(
+          `git commit failed while verifying hooks over the boundary commit, and checking ` +
+            `whether it landed also failed (${(landedCheckError as Error).message}) — the ` +
+            `worktree may be left with the boundary's changes committed or staged, and was NOT ` +
+            `reset to avoid discarding an already-landed commit: ${(error as Error).message}`,
+          { cause: error },
+        ),
+        "amend",
+      );
+    }
+    if (!landed) {
+      // Hooks rejected it, or the commit timed out before one was created: put the branch back
+      // exactly where it started rather than leaving HEAD at the boundary's parent with the
+      // boundary's own changes sitting staged but uncommitted — and, when one was written, a stray
+      // `MERGE_HEAD`/`MERGE_MSG` claiming a merge that never landed. `MERGE_HEAD` must be removed
+      // BEFORE the reset: git refuses a `reset --soft` while it is present ("Cannot do a soft reset
+      // in the middle of a merge"), which would otherwise leave HEAD at the boundary's parent with
+      // the boundary's changes staged, poisoning a later retry instead of restoring the marked
+      // boundary for one (PR #338 review, chatgpt-codex-connector, round 10). Both cleanup steps run
+      // even if one of them fails, so a failure in either is still reported rather than swallowed.
+      const cleanupErrors: string[] = [];
+      if (mergeHeadPath) {
+        try {
+          await rm(mergeHeadPath, { force: true });
+        } catch (rmError) {
+          cleanupErrors.push(`removing MERGE_HEAD failed (${(rmError as Error).message})`);
+        }
+      }
+      if (mergeMsgPath) {
+        try {
+          await rm(mergeMsgPath, { force: true });
+        } catch (rmError) {
+          cleanupErrors.push(`removing MERGE_MSG failed (${(rmError as Error).message})`);
+        }
+      }
+      try {
+        await git(worktreePath, ["reset", "--soft", originalHead]);
+      } catch (resetError) {
+        cleanupErrors.push(
+          `resetting HEAD to ${originalHead} failed (${(resetError as Error).message})`,
+        );
+      }
+      if (cleanupErrors.length > 0) {
+        throw tagCommitAttempt(
+          new Error(
+            `git commit failed while verifying hooks over the boundary commit, and restoring ` +
+              `HEAD to ${originalHead} afterward also failed (${cleanupErrors.join("; ")}) — the ` +
+              `worktree may be left with the boundary's changes staged but uncommitted: ` +
+              `${(error as Error).message}`,
+            { cause: error },
+          ),
+          "amend",
+        );
+      }
+      throw tagCommitAttempt(error, "amend");
+    }
+    // Fell through: the commit actually landed despite `gitCommit` reporting failure (the
+    // `post-commit` race above). Leave HEAD exactly where it is — no reset — and continue past
+    // this `catch` into the same post-commit verification the success path runs below (the
+    // `extraParents`/`reduce_heads` repair), rather than rethrowing a stale error for a commit
+    // that already made it through the project's real hooks.
+  } finally {
+    // Best-effort — the mirror is a scratch temp dir, never referenced again once the commit above
+    // has settled one way or the other, so a failed cleanup here must not turn a landed (or safely
+    // rolled back) commit into a reported failure.
+    if (mergeCommitHooksPath) {
+      await rm(mergeCommitHooksPath, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+  // Reaching here means the verifying commit landed (the `catch` above either rethrew or fell
+  // through past a rollback). Replay `post-merge` once the commit's FINAL shape is settled — not
+  // here, but right before each success `return` below, after the `extraParents`/`reduce_heads`
+  // repair (if any) has run. Git's own redundant-parent simplification can silently drop a
+  // `MERGE_HEAD` entry from the commit `gitCommit` just built, in which case the repair below
+  // splices it back in via `commit-tree` and moves HEAD again; replaying here, before that repair,
+  // would fire the hook against a commit whose parent list is about to change — or, if the repair
+  // then fails and this function rolls the branch back to `originalHead`, against a commit that
+  // never ends up on the branch at all (PR #338 review, chatgpt-codex-connector, round 16).
+  const replayPostMerge = async () => {
+    // The same completion hook a real `git merge --no-edit` fires right after building this exact
+    // commit shape (PR #338 review, chatgpt-codex-connector, round 15) — `commitAll` never
+    // otherwise runs it, since this whole path commits via `git commit`, which githooks(5)
+    // documents as a `post-commit`-only command. Run against the REAL `options.hooksPath`, not
+    // `mergeCommitHooksPath` — that mirror exists only to shape what `git commit` itself invokes
+    // and is already torn down by the `finally` above; `post-merge` is invoked directly via
+    // `runIgnoreMissingHook`, same as `pre-merge-commit` above. `"0"` matches the single argument
+    // githooks(5) documents `post-merge` receiving: a squash-merge flag, always `0` here since this
+    // replay never stands in for a squash merge. Failure is logged, not thrown — githooks(5) is
+    // explicit that `post-merge` "cannot affect the outcome of git merge": the commit this hook
+    // reports on already landed and is already hook-verified, so treating a failing `post-merge` as
+    // this function's own failure would incorrectly imply the commit itself is unverified or should
+    // be retried. Cancellation is the one outcome this must NOT swallow (PR #338 review,
+    // chatgpt-codex-connector, P2): `commitFix` clears the unverified-boundary marker as soon as
+    // this resolves, so if the signal fires mid-replay and we merely warn, the marker is cleared
+    // before the already-aborted push fails, and a retry's "already ahead" fast path then pushes
+    // the branch having never actually replayed the hook. Rethrowing here instead surfaces to
+    // `commitFix`'s own `if (signal.aborted) throw error` handling, which leaves the marker in
+    // place for the retry.
+    if (!shouldReplayPostMerge) return;
+    try {
+      await runIgnoreMissingHook(
+        worktreePath,
+        "post-merge",
+        options.hooksPath,
+        options.timeoutMs,
+        options.signal,
+        ["0"],
+      );
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      console.warn(
+        `[git] post-merge hook failed after replaying a bare-merge boundary commit in ${worktreePath} — ` +
+          `the commit already landed and was not rolled back`,
+        error,
+      );
+    }
+  };
+  if (extraParents.length === 0) {
+    await replayPostMerge();
     return { committed: true };
   }
+  // `git commit` consumed `MERGE_HEAD` and removed it on success, building the commit from HEAD plus
+  // every listed parent — usually exactly `resetHead` followed by `extraParents`, matching the
+  // original boundary's topology already, with hooks having seen that real shape. The one case it
+  // does NOT preserve: git's own redundant-parent simplification (`reduce_heads` in
+  // `builtin/commit.c`, shared with `git merge`) silently drops any `MERGE_HEAD` entry that is
+  // already an ancestor of another listed parent — e.g. `verifyFrom` targeting a boundary whose own
+  // parent is an ancestor of a later merge's non-mainline parent. Detect that here and repair it with
+  // the same metadata-only `commit-tree` splice this function used before `MERGE_HEAD` existed —
+  // never a second hook run, just the parent list corrected on the commit hooks already verified.
+  const verifiedHead = await resolveCommitSha(worktreePath, "HEAD");
+  const expectedParents = [resetHead, ...extraParents];
+  const actualParents = await commitParentShas(worktreePath, verifiedHead);
+  const parentsMatch =
+    actualParents.length === expectedParents.length &&
+    actualParents.every((parent, index) => parent === expectedParents[index]);
+  if (parentsMatch) {
+    await replayPostMerge();
+    return { committed: true };
+  }
+  // The message is re-read from `verifiedHead` rather than reused from `originalMessage` — a
+  // `prepare-commit-msg`/`commit-msg` hook that edited the message (e.g. appending a required
+  // trailer) left that edit on the commit hooks just verified, and `originalMessage` was captured
+  // before hooks ran (PR #338 review, chatgpt-codex-connector). Likewise `commit-tree` — unlike `git
+  // commit` — never signs on its own even under `commit.gpgSign`, so re-signing is opt-in via `-S`,
+  // applied only when the verified commit itself carries a signature (`%G?` reports anything but
+  // `N`), to match it rather than unconditionally sign or unconditionally drop the signature.
+  const tree = await git(worktreePath, ["rev-parse", `${verifiedHead}^{tree}`]);
+  const verifiedMessage = await git(worktreePath, ["log", "-1", "--format=%B", verifiedHead]);
+  const signatureStatus = await git(worktreePath, ["log", "-1", "--format=%G?", verifiedHead]);
+  try {
+    const reparented = await git(worktreePath, [
+      "commit-tree",
+      tree,
+      "-p",
+      resetHead,
+      ...extraParents.flatMap((parent) => ["-p", parent]),
+      ...(signatureStatus !== "N" ? ["-S"] : []),
+      "-m",
+      verifiedMessage,
+    ]);
+    await git(worktreePath, ["reset", "--soft", reparented]);
+  } catch (error) {
+    // HEAD is already the (git-simplified) commit from the hook-verified commit above — a retry
+    // that only looks at HEAD would find that commit, not the original marked boundary, and could
+    // push it having silently dropped `extraParents`. Put the branch back exactly where it started
+    // (the untouched boundary) so a retry has the same marked commit this function itself started
+    // from, matching the recovery this function already does when the verify commit itself fails.
+    try {
+      await git(worktreePath, ["reset", "--soft", originalHead]);
+    } catch (restoreError) {
+      throw tagCommitAttempt(
+        new Error(
+          `git commit-tree/reset failed while restoring the boundary commit's extra parents, and ` +
+            `restoring HEAD to ${originalHead} afterward also failed — the worktree may be left ` +
+            `at a commit missing parent(s) ${extraParents.join(", ")}: ` +
+            `${(restoreError as Error).message}`,
+          { cause: error },
+        ),
+        "amend",
+      );
+    }
+    throw tagCommitAttempt(error, "amend");
+  }
+  await replayPostMerge();
+  return { committed: true };
 }
 
 /**
@@ -2748,26 +3462,82 @@ export async function resolveFreshBase(repoPath: string, base: string): Promise<
  * progress (markers in the tree, MERGE_HEAD set) and the conflicted paths are returned — the
  * caller has claude resolve the markers and a later `commitAll` concludes the merge. A merge that
  * fails for any other reason (e.g. untracked files in the way) is aborted and rethrown.
+ *
+ * `bypassHooks` runs the merge with this project's hooks off — for an internal premerge whose
+ * result is not yet published, mirroring `commitAll`'s own `bypassHooks` (PR #338 review,
+ * chatgpt-codex-connector, round 30): a project's `pre-merge-commit` hook that rejects the
+ * currently-failing tree would otherwise abort this merge outright — `mergeIntoCurrent` catches
+ * that as an ordinary (non-conflict) failure, so the caller never gets a chance to resolve
+ * anything or reach the real, hook-enforced commit downstream. `--no-verify` bypasses
+ * `pre-merge-commit`/`commit-msg` for the merge (git-merge(1), supported since git 2.29); routing
+ * through a `core.hooksPath` that resolves to nothing disables `prepare-commit-msg` and
+ * `post-merge` too, the same belt-and-suspenders `commitAll` already uses for its own bypassed
+ * commit. The caller is responsible for marking the resulting commit as an unverified boundary
+ * (see `markUnverifiedBoundary` in review-fix.ts) so the project's real hooks still see it before
+ * anything is pushed.
+ *
+ * `noFf` forces a real merge commit (`git merge --no-ff`) even when the checked-out branch is a
+ * strict ancestor of `ref` and git would otherwise just fast-forward HEAD onto it (PR #338 review,
+ * chatgpt-codex-connector): a caller relying on `bypassHooks` to mark the resulting commit as an
+ * unverified boundary needs that commit to always be one THIS call actually created — a bare
+ * fast-forward instead lands HEAD directly on `ref`'s own pre-existing tip commit, and marking
+ * that shared commit, then later soft-resetting past it to re-verify and recommit, produces a
+ * sibling SHA the real base tip is no longer an ancestor of.
  */
 export async function mergeIntoCurrent(
   worktreePath: string,
   ref: string,
-  opts?: { ffOnly?: boolean; hooksPath?: string },
+  opts?: { ffOnly?: boolean; hooksPath?: string; bypassHooks?: boolean; noFf?: boolean },
 ): Promise<{ ok: boolean; conflicts: string[] }> {
   try {
     await git(
       worktreePath,
-      ["merge", "--no-edit", ...(opts?.ffOnly ? ["--ff-only"] : []), ref],
-      opts?.hooksPath,
+      [
+        "merge",
+        "--no-edit",
+        ...(opts?.bypassHooks ? ["--no-verify"] : []),
+        ...(opts?.ffOnly ? ["--ff-only"] : []),
+        ...(opts?.noFf ? ["--no-ff"] : []),
+        ref,
+      ],
+      opts?.bypassHooks ? disabledHooksPath() : opts?.hooksPath,
     );
     return { ok: true, conflicts: [] };
   } catch (e) {
-    const conflicts = await diffPaths(worktreePath, ["--name-only", "--diff-filter=U"]).catch(() => []);
+    const conflicts = await unmergedPaths(worktreePath).catch(() => []);
     if (conflicts.length === 0) {
       await git(worktreePath, ["merge", "--abort"]).catch(() => {});
       throw e;
     }
     return { ok: false, conflicts };
+  }
+}
+
+/**
+ * Paths still carrying unresolved conflict markers (`git diff --diff-filter=U`) — the same query
+ * {@link mergeIntoCurrent} uses to decide a conflicted merge from any other failure, exported so a
+ * caller resuming a merge left in progress across process retries (review-fix's `premergeBase`) can
+ * ask the identical question a session later.
+ */
+export async function unmergedPaths(worktreePath: string): Promise<string[]> {
+  return diffPaths(worktreePath, ["--name-only", "--diff-filter=U"]);
+}
+
+/**
+ * Whether `worktreePath` has a merge in progress — `MERGE_HEAD` set, meaning some earlier `git
+ * merge` conflicted and was never concluded (by a commit or an abort). `mergeIntoCurrent` always
+ * leaves this behind on a conflicted merge and only ever clears it via a caller's later commit or
+ * its own `merge --abort` on a non-conflict failure — so its presence on a REUSED worktree, checked
+ * before this attempt has run any git command of its own, can only mean a previous attempt's own
+ * conflicted merge is still sitting there unresolved, not some unrelated dirty state (PR #338
+ * review, chatgpt-codex-connector).
+ */
+export async function mergeInProgress(worktreePath: string): Promise<boolean> {
+  try {
+    await git(worktreePath, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]);
+    return true;
+  } catch {
+    return false;
   }
 }
 

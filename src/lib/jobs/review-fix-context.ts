@@ -14,7 +14,7 @@ import { buildExecutionSystemPrompt } from "../claude/system-prompt";
 import { bundledSkillDigest, loadSkill } from "../claude/prompt";
 import { textDigest } from "../claude/skill-stamp.mjs";
 import type { ReasoningAttribution } from "../claude-invocations";
-import { threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
+import { latestHumanComment, threadsNeedingAttention, type PrReview, type ReviewThread } from "../git/pr";
 import { type ProjectSettings } from "../projects";
 
 /** One reported outcome for an inline review thread, parsed from claude's final message. */
@@ -23,6 +23,16 @@ export interface ThreadOutcome {
   outcome: "fixed" | "left" | "needs-human";
   reply?: string;
 }
+
+/**
+ * Sentinel `ThreadOutcome.id` for a round with NO inline threads but still actionable (a failing
+ * check, a merge conflict, or a reviewer summary with no inline comments) — reuses the same
+ * `{"threads":[...]}` report shape so `parseThreadReport` needs no new parsing path. Its presence in
+ * the parsed report is the positive evidence review-fix.ts requires before treating such a round as
+ * "answered": a successful claude run that never mentions it must NOT be mistaken for one that
+ * actually handled the reason (anton-091jr review round 2, chatgpt-codex-connector).
+ */
+export const NON_THREAD_REPORT_ID = "non-thread-reasons";
 
 /**
  * A "fixed" claim with nothing pushed behind it — a fabrication whether it's about to answer a
@@ -98,11 +108,24 @@ export async function buildReviewFixPrompt(args: {
   pr: PrReview;
   reasons: string[];
   conflicts: string[];
+  /** A gate that just failed after a prior fix session — the bounded follow-up round's own context. */
+  gateFailure?: GateFailure;
+  /**
+   * Does `reasons` include something besides the unresolved-thread count — a failing check, a
+   * merge conflict, or a reviewer summary? When true, `reportingFormatSection` asks for the
+   * {@link NON_THREAD_REPORT_ID} sentinel ALONGSIDE the per-thread report, not just when there are
+   * zero threads — a mixed round (both inline threads and a non-thread reason) must still be asked
+   * about the non-thread reason, or `allWaitingThreadsAnswered` can never see the positive evidence
+   * it now requires for one (PR #338 review, chatgpt-codex-connector). Defaults to `false` for the
+   * gate follow-up round, whose own report is never read back into that check.
+   */
+  hasNonThreadReasons?: boolean;
   settings: ProjectSettings;
   /** The worktree the fix runs in (for resolving a project-local agent prompt). */
   projectDir: string;
 }): Promise<{ prompt: string; appendSystemPrompt: string; attribution: ReasoningAttribution }> {
-  const { epic, pr, reasons, conflicts, settings, projectDir } = args;
+  const { epic, pr, reasons, conflicts, gateFailure, hasNonThreadReasons = false, settings, projectDir } =
+    args;
 
   // Compose the same layered system prompt used for execution (base + agent + seed). Use the
   // epic's agent tag if it has one.
@@ -119,9 +142,21 @@ export async function buildReviewFixPrompt(args: {
   const attribution: ReasoningAttribution = override
     ? { promptBodyDigest: textDigest(override) }
     : { skillId: "review-fix", skillDigest: bundledSkillDigest("review-fix"), skillIsDefault: true };
-  const prompt = [reasoning, "", "---", "", reviewFixContext(epic, pr, reasons, conflicts)].join("\n");
+  const prompt = [
+    reasoning,
+    "",
+    "---",
+    "",
+    reviewFixContext(epic, pr, reasons, conflicts, gateFailure, hasNonThreadReasons),
+  ].join("\n");
 
   return { prompt, appendSystemPrompt, attribution };
+}
+
+/** A verify gate that failed after a fix session — label + tailed output, for the follow-up round's prompt. */
+export interface GateFailure {
+  label: string;
+  output: string;
 }
 
 /**
@@ -133,16 +168,33 @@ export async function buildReviewFixPrompt(args: {
  * Assembled from independent section builders (each returns its own lines, empty when it does not
  * apply) so the shape stays flat and every section is testable in isolation.
  */
-export function reviewFixContext(epic: Bead, pr: PrReview, reasons: string[], conflicts: string[] = []): string {
+export function reviewFixContext(
+  epic: Bead,
+  pr: PrReview,
+  reasons: string[],
+  conflicts: string[] = [],
+  gateFailure?: GateFailure,
+  hasNonThreadReasons = false,
+): string {
+  // A gate-failure follow-up is the one bounded round the gate gets, not a re-diagnosis of the
+  // review feedback — so it gets ONLY the header + the gate output, never the reviewer summaries,
+  // thread listings, cluster callout, or a thread report ask. `pr` here is the same pre-fix read
+  // the main round classified from; rendering those sections would show threads the main round may
+  // already have resolved as still "unresolved", and the reporting ask would pull the round's one
+  // shot into re-litigating review feedback instead of the gate (PR #338 review, @claude). Nothing
+  // reads `result.text` from this dispatch, so the report ask is also pure noise here.
+  const gateOnly = gateFailure !== undefined;
   const threads = threadsNeedingAttention(pr);
   return [
     ...headerSection(epic, pr, reasons),
-    ...reviewerSummarySection(pr),
-    ...threadsSection(threads),
-    ...clusterSection(threads),
-    ...failingChecksSection(pr),
-    ...conflictsSection(conflicts),
-    ...reportingFormatSection(threads),
+    ...(gateOnly ? [] : reviewerSummarySection(pr)),
+    ...(gateOnly ? [] : humanCommentsSection(pr)),
+    ...(gateOnly ? [] : threadsSection(threads)),
+    ...(gateOnly ? [] : clusterSection(threads)),
+    ...(gateOnly ? [] : failingChecksSection(pr)),
+    ...(gateOnly ? [] : conflictsSection(conflicts)),
+    ...gateFailureSection(gateFailure),
+    ...(gateOnly ? [] : reportingFormatSection(threads, reasons, hasNonThreadReasons)),
   ]
     .join("\n")
     .trimEnd();
@@ -189,12 +241,60 @@ function headerSection(epic: Bead, pr: PrReview, reasons: string[]): string[] {
   ];
 }
 
+/**
+ * Cap on how many CHANGES_REQUESTED review bodies this section renders directly into the prompt —
+ * prompt-budget only, never fingerprinting: `classifyReview` (pr.ts) still folds EVERY submitted
+ * review into its fingerprint regardless of this cap, so nothing here weakens dedup/suppression.
+ * A long-running PR with a bot reviewer resubmitting every round can rack up 100+ CHANGES_REQUESTED
+ * reviews with a body; passing all of them unbounded risked exhausting the model's context before
+ * it ever reached the actual current feedback (PR #338 review, chatgpt-codex-connector). Keeps the
+ * MOST RECENT entries — pr.reviews returns oldest-first, so this section is the tail — since those
+ * are what a fix round is actually meant to respond to, mirroring {@link humanCommentsSection}'s
+ * same "latest, not everything" bound for top-level comments.
+ */
+const MAX_REVIEWER_SUMMARIES = 20;
+
+/** Cap on one review body's own contribution — an unbounded single body could alone blow the budget the count cap above is meant to protect. */
+const MAX_REVIEWER_SUMMARY_CHARS = 2000;
+
 function reviewerSummarySection(pr: PrReview): string[] {
   const changeReviews = pr.reviews.filter((r) => r.state === "CHANGES_REQUESTED" && r.body.trim());
   if (changeReviews.length === 0) return [];
+  const bounded = changeReviews.slice(-MAX_REVIEWER_SUMMARIES);
+  const omitted = changeReviews.length - bounded.length;
   return [
     `Reviewer summaries requesting changes:`,
-    ...changeReviews.map((r) => `- @${r.author}: ${r.body.trim()}`),
+    ...(omitted > 0
+      ? [`(${omitted} older review summar${omitted === 1 ? "y" : "ies"} omitted for length)`]
+      : []),
+    ...bounded.map((r) => {
+      const body = r.body.trim();
+      const truncated =
+        body.length > MAX_REVIEWER_SUMMARY_CHARS
+          ? `${body.slice(0, MAX_REVIEWER_SUMMARY_CHARS)}… (truncated)`
+          : body;
+      return `- @${r.author}: ${truncated}`;
+    }),
+    ``,
+  ];
+}
+
+/**
+ * The latest top-level PR comment from a human (not anton's own ANTON_MARK-prefixed posts) — most
+ * commonly a reply to a prior `needs-human` sentinel, posted the one place `classifyReview` looks
+ * for it (PR #338 review, chatgpt-codex-connector). Limited to the SAME single comment
+ * `classifyReview`'s fingerprint reacts to (`latestHumanComment`, shared from pr.ts), not every
+ * top-level comment the PR has ever collected — a long-running PR's paginated comment fetch can
+ * return hundreds of entries, and mapping all of them into the prompt risks exhausting the model's
+ * context before it even reaches the actual review feedback (PR #338 review, chatgpt-codex-connector).
+ */
+function humanCommentsSection(pr: PrReview): string[] {
+  const reply = latestHumanComment(pr.comments);
+  if (!reply) return [];
+  return [
+    `Top-level PR comments (not inline review threads) — a reply here may answer a prior`,
+    `"needs-human" request:`,
+    `- @${reply.author}: ${reply.body.trim()}`,
     ``,
   ];
 }
@@ -227,8 +327,61 @@ function conflictsSection(conflicts: string[]): string[] {
   ];
 }
 
-function reportingFormatSection(threads: ReviewThread[]): string[] {
-  if (threads.length === 0) return [];
+/**
+ * The bounded follow-up round's own context (anton-pwekp): the fixer just ran, its verify gates
+ * came back red, and this is the ONE extra round the gate gets before the job parks. Tailed output
+ * already trimmed by the caller — this section renders whatever it's handed verbatim.
+ */
+function gateFailureSection(gateFailure: GateFailure | undefined): string[] {
+  if (!gateFailure) return [];
+  return [
+    `## Gate failure (one follow-up round)`,
+    ``,
+    `The ${gateFailure.label} gate failed after the fix above. This is the only extra round the`,
+    `gate gets — if it fails again, the PR is parked for a human. Resolve what it's complaining`,
+    `about (a deterministic gate failure like a migration re-stamp or a lint error is usually a`,
+    `small, targeted fix, not a re-diagnosis of the review feedback):`,
+    ``,
+    "```",
+    gateFailure.output,
+    "```",
+    ``,
+  ];
+}
+
+/**
+ * `hasNonThreadReasons` names whether this round is ALSO actionable via something besides the
+ * threads above (a failing check, a merge conflict, or a reviewer summary with no inline
+ * comments — see "Why this needs action" above). A mixed round (both inline threads and a
+ * non-thread reason) must still ask for the {@link NON_THREAD_REPORT_ID} sentinel — restricting
+ * that ask to the `threads.length === 0` case let a mixed round report every thread and never
+ * once be asked about the non-thread reason, so `allWaitingThreadsAnswered` had no way to tell a
+ * genuinely-handled round from one that silently ignored it (PR #338 review,
+ * chatgpt-codex-connector).
+ */
+function reportingFormatSection(
+  threads: ReviewThread[],
+  reasons: string[],
+  hasNonThreadReasons: boolean,
+): string[] {
+  if (threads.length === 0) {
+    // No inline threads, but the round is still actionable. Without an explicit report, a claude
+    // run that touches nothing looks identical to one that genuinely resolved the reason — and
+    // would get recorded as "answered" on nothing but that resemblance (anton-091jr review round
+    // 2, chatgpt-codex-connector). Reuses the thread-report shape (one entry keyed on the sentinel
+    // id) so parseThreadReport needs no separate parsing path.
+    if (reasons.length === 0) return [];
+    return [
+      `## Reporting format (required)`,
+      ``,
+      `There are no inline review threads here, but this round is still actionable. End your final`,
+      `message with a fenced json block naming what you did about it:`,
+      ``,
+      "```json",
+      `{"threads":[{"id":"${NON_THREAD_REPORT_ID}","outcome":"fixed" | "left" | "needs-human","reply":"one-line summary of what you changed, why nothing needed to change, or what decision is needed"}]}`,
+      "```",
+    ];
+  }
   return [
     `## Reporting format (required)`,
     ``,
@@ -241,6 +394,17 @@ function reportingFormatSection(threads: ReviewThread[]): string[] {
     `Use "fixed" only for threads you actually changed code for, "left" for findings you`,
     `deliberately did not act on, "needs-human" when a decision is required. The reply is posted`,
     `on the thread verbatim.`,
+    ...(hasNonThreadReasons
+      ? [
+          ``,
+          `This round is ALSO actionable for a reason with no inline thread (a failing check, a`,
+          `merge conflict, or a reviewer summary with no inline comments — see "Why this needs`,
+          `action" above). Report that too: add one more entry to the same "threads" array, keyed`,
+          `on the sentinel id "${NON_THREAD_REPORT_ID}", with outcome "fixed", "left", or`,
+          `"needs-human", and a one-line reply summarizing what you did about it (or what decision`,
+          `is needed).`,
+        ]
+      : []),
   ];
 }
 

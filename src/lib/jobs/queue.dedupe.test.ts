@@ -17,6 +17,7 @@ import {
   enqueueReviewFixPrIfAbsent,
   enqueueScheduledTypeIfAbsent,
   getJob,
+  invalidateReviewFixAttempt,
   resumeBudgetDeferredJobs,
   resumeJob,
   reviewFixPrParkedAtHead,
@@ -520,6 +521,96 @@ describe("enqueueReviewFixPrIfAbsent", () => {
       t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
 
       expect(enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1")).toBeDefined();
+    });
+
+    it("lifts the suppression once the fingerprint changes at the same head (a base advance)", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1", "base:oid1"],
+      })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      // Same head, but the base tip moved — classifyReview folds that into the fingerprint even
+      // though nothing was pushed to the PR branch itself, and a fresh premerge could fix the gate
+      // or change the tree the gate ran against (PR #338 review, chatgpt-codex-connector).
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1", "base:oid1"])).toBe(
+        true,
+      );
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1", "base:oid2"])).toBe(
+        false,
+      );
+
+      const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1", "base:oid2"],
+      });
+      expect(b).toBeDefined();
+      expect(b).not.toBe(a);
+      expect(activeRows()).toHaveLength(2);
+    });
+
+    // PR #338 review, chatgpt-codex-connector: two attempts for the same head but different
+    // fingerprints can park within the same second — `updatedAt` is second-truncated, so ordering on
+    // it alone can hand back the older, mismatched park instead of the newer one matching the current
+    // fingerprint. `parkedAtHead` must fall back to insert order (JOB_INSERT_ORDER), same as
+    // `answeredUnchanged`, to break the tie correctly.
+    it("breaks a same-second updatedAt tie between two parked attempts by insert order", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1"],
+      })!;
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+      const aUpdatedAt = t.db
+        .select({ updatedAt: schema.jobs.updatedAt })
+        .from(schema.jobs)
+        .where(eq(schema.jobs.id, a))
+        .all()[0].updatedAt;
+
+      // A newer park at the same head, but a different fingerprint (e.g. a base advance) — tie its
+      // `updatedAt` to `a`'s so only insert order can tell them apart.
+      const b = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c2"],
+      })!;
+      t.db
+        .update(schema.jobs)
+        .set({ status: "parked", updatedAt: aUpdatedAt })
+        .where(eq(schema.jobs.id, b))
+        .run();
+
+      // `b` is the later insert, so it must win the match despite the tied timestamp.
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c2"])).toBe(true);
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1"])).toBe(false);
+    });
+
+    /**
+     * PR #338 review, chatgpt-codex-connector: an attempt that ran against unsynced local refs must
+     * not leave its enqueue-time `headSha`/`fingerprint` snapshot in place. For a transient fetch
+     * failure the GitHub head typically hasn't moved, so that stale snapshot still matches the
+     * current head — if the attempt then parks, a fresh sweep at the SAME (unmoved) head would find
+     * it and suppress every retry forever, even though the parked attempt never actually tested that
+     * revision. `invalidateReviewFixAttempt` clears the snapshot so the parked row no longer matches.
+     */
+    it("invalidateReviewFixAttempt clears the snapshot so an unsynced attempt's park does not suppress the unchanged head", () => {
+      const a = enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+        headSha: "sha1",
+        fingerprint: ["thread:1:c1"],
+      })!;
+
+      // The worker picks up job `a`, but refs never sync — invalidate instead of refreshing.
+      invalidateReviewFixAttempt(t.db, a);
+      t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, a)).run();
+
+      // GitHub's head never moved (the fetch failure was transient) — a naive skip-the-write would
+      // still match here and wrongly suppress.
+      expect(reviewFixPrParkedAtHead(t.db, "p1", "epic-1", "sha1", ["thread:1:c1"])).toBe(false);
+      expect(
+        enqueueReviewFixPrIfAbsent(t.db, systemClock, "p1", "epic-1", {
+          headSha: "sha1",
+          fingerprint: ["thread:1:c1"],
+        }),
+      ).toBeDefined();
+      expect(activeRows()).toHaveLength(2);
     });
 
     it("a resumed (un-parked) job re-enqueues normally and is not re-suppressed", async () => {

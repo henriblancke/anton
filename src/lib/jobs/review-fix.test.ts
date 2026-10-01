@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,9 +19,13 @@ import { GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrActivity, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
 import {
+  allWaitingThreadsAnswered,
   applyThreadOutcomes,
   claimOwnerFor,
+  fingerprintHasNonThreadReasons,
   inReviewEpics,
+  isGateFailurePoison,
+  mainRoundChangesSurvived,
   makeReviewFixHandler,
   makeReviewFixPrHandler,
   notifyGateParked,
@@ -29,8 +34,10 @@ import {
   refreshFixRoundsBody,
   resolveReviewFixModel,
   runTestGate,
+  shouldRecordAnswered,
   type ThreadOutcome,
 } from "./review-fix";
+import { NON_THREAD_REPORT_ID } from "./review-fix-context";
 import { LABELS, type Bead } from "../beads/bd";
 import { PoisonError } from "./errors";
 import type { ProjectSettings } from "../projects";
@@ -77,15 +84,89 @@ vi.mock("../claude/driver", () => ({ runClaude: (...a: unknown[]) => runClaudeMo
 
 // prepareFixWorktree's own git steps (sync + premerge) — none of them under test here, so they're
 // no-ops rather than hitting a real repo the mocked `createWorktree` above never actually made.
+// `isAncestor` defaults to true (already caught up with the base) so premergeBase is a no-op by
+// default — the mocked `worktreePath` below is a plain temp dir, not a real git repo, so the REAL
+// `isAncestor` would otherwise reject and premergeBase's own `.catch(() => false)` would read that
+// as "behind" and merge on every test regardless of what's actually under test.
+const isAncestorMock = vi.fn();
+// Stands in for "was the LOCAL branch already ahead of origin/<branch> BEFORE prepareFixWorktree
+// fetched anything" — defaults to false (no pre-existing local commits), matching a fresh checkout.
+const branchAheadOfRemoteMock = vi.fn().mockResolvedValue(false);
+const mergeIntoCurrentMock = vi.fn();
+// Defaults to rejecting like the real `rev-parse` would against the plain temp dir `worktreePath`
+// stands in for (not a real git repo) — tests that care about the base-ref check override this.
+const resolveCommitShaMock = vi.fn().mockRejectedValue(new Error("not a git repo"));
+// Commits (by sha) that `commitCarriesUnverifiedBoundaryMarker` should report as marked, and the
+// range `unpushedCommitsOldestFirst` should return — both default empty/none, matching "no marker
+// found" for every existing test. Only the poison-propagation test below overrides them.
+let unpushedCommitShas: string[] = [];
+let commitsWithUnverifiedBoundaryMarker = new Set<string>();
+// `markUnverifiedBoundary`'s own `notes ... add` call — resolves by default; the poison-propagation
+// test below rejects it to simulate concurrent note-ref lock contention.
+const markUnverifiedBoundaryNotesAddMock = vi.fn().mockResolvedValue("");
+// Forces `git reset --hard` to fail — stands in for a corrupted/locked worktree that can't even be
+// rolled back to its own pre-merge HEAD. `undefined` by default (the real `reset --hard` against the
+// tests' real-but-minimal git repo succeeds); only the round-9 PoisonError test below sets this.
+let resetHardRejection: Error | undefined;
+// `readWorktreeState` calls its own module-local `git` helper directly, not the exported binding
+// above — so overriding this module's `git` export (as done for reset/notes/rev-list) has no effect
+// on it. Wired separately below so a single test can force it to reject outright, standing in for
+// `readWorktreeState` failing on a reused checkout it can't read (PR #338 review, chatgpt-codex-
+// connector, P1). Defaults to the real implementation against the tests' real-but-minimal git repo.
+// A `vi.hoisted` ref object, not a plain outer `let` (PR #338 review, chatgpt-codex-connector): `vi.mock`
+// factories are hoisted above ALL other top-level statements in this file, so a plain `let` assigned
+// inside the factory would still be in the temporal dead zone if some other import in the module graph
+// pulls in "../git/ops" before this file's own declarations run — `vi.hoisted` is vitest's documented
+// escape hatch for exactly this.
+const realReadWorktreeStateRef = vi.hoisted<{ current?: typeof import("../git/ops").readWorktreeState }>(
+  () => ({}),
+);
+const readWorktreeStateMock = vi.fn(
+  (...a: Parameters<typeof import("../git/ops").readWorktreeState>) => realReadWorktreeStateRef.current!(...a),
+);
 vi.mock("../git/ops", async () => {
   const actual = await vi.importActual<typeof import("../git/ops")>("../git/ops");
+  realReadWorktreeStateRef.current = actual.readWorktreeState;
   return {
     ...actual,
+    readWorktreeState: (...a: Parameters<typeof actual.readWorktreeState>) => readWorktreeStateMock(...a),
     fetchOrigin: vi.fn().mockResolvedValue(undefined),
-    mergeIntoCurrent: vi.fn().mockResolvedValue({ conflicts: [] }),
-    branchAheadOfRemote: vi.fn().mockResolvedValue(false),
+    // `premergeBase` reads the unverified-boundary note via the real `git notes ... show HEAD`
+    // before it merges — against the plain temp dir `worktreePath` stands in for (not a real git
+    // repo), that would blow up with "not a git repository" instead of the "no note found" exit 1
+    // `headCarriesUnverifiedBoundaryMarker` actually expects for "no marker". Every other `git` call
+    // still goes to the real implementation, except `rev-list` below.
+    git: (cwd: string, args: string[], hooksPath?: string) => {
+      if (args[0] === "notes" && args.includes("add")) {
+        return markUnverifiedBoundaryNotesAddMock();
+      }
+      if (args[0] === "notes" && args.includes("show")) {
+        const commit = args[args.length - 1]!;
+        if (commitsWithUnverifiedBoundaryMarker.has(commit)) return Promise.resolve("marked");
+        const error = new Error("no note found for object") as Error & { code: number };
+        error.code = 1;
+        return Promise.reject(error);
+      }
+      // `findUnverifiedBoundaryAncestor`'s own range lookup (`unpushedCommitsOldestFirst`) now
+      // propagates a git failure instead of silently narrowing to `HEAD` (PR #338 review round 9) —
+      // against the plain temp dir `worktreePath` stands in for, the real `rev-list` would blow up
+      // with "not a git repository" and fail these premergeBase-focused tests outright. Stand in for
+      // "no unpushed commits found" (empty range) by default; the poison-propagation test below
+      // overrides `unpushedCommitShas` to exercise the marker-search fallback itself.
+      if (args[0] === "rev-list" && args.includes("--first-parent") && args.includes("--reverse")) {
+        return Promise.resolve(unpushedCommitShas.join("\n"));
+      }
+      if (args[0] === "reset" && args.includes("--hard") && resetHardRejection) {
+        return Promise.reject(resetHardRejection);
+      }
+      return actual.git(cwd, args, hooksPath);
+    },
+    mergeIntoCurrent: (...a: unknown[]) => mergeIntoCurrentMock(...a),
+    isAncestor: (...a: unknown[]) => isAncestorMock(...a),
+    branchAheadOfRemote: (...a: unknown[]) => branchAheadOfRemoteMock(...a),
     needsHooksPathOverrideForMerge: vi.fn().mockResolvedValue(false),
     resolveHooksPathOverrideForMerge: vi.fn().mockResolvedValue(undefined),
+    resolveCommitSha: (...a: unknown[]) => resolveCommitShaMock(...a),
   };
 });
 
@@ -287,21 +368,6 @@ describe("claimOwnerFor", () => {
  * run path (execute-epic-claim.ts) does.
  */
 describe("prepareFixWorktree (anton-u02rt)", () => {
-  const pr: PrReview = {
-    number: 7,
-    state: "OPEN",
-    reviewDecision: "CHANGES_REQUESTED",
-    mergeable: "MERGEABLE",
-    headRefName: "anton/fix-7",
-    headSha: "sha-7",
-    url: "https://example.test/pull/7",
-    reviews: [],
-    failingChecks: [],
-    pendingChecks: 0,
-    threads: [],
-    threadsComplete: true,
-  };
-
   const fakeCtx = (): JobContext =>
     ({
       jobId: "job-test",
@@ -317,6 +383,17 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     worktreePath = mkdtempSync(join(tmpdir(), "anton-review-fix-warm-"));
+    // A real, clean, one-commit repo — not just a bare temp dir — so `readWorktreeState` (real; only
+    // specific `git/ops` functions are stubbed above) resolves cleanly by default, matching a real
+    // reused review-fix worktree in production. `premergeBase`'s own dirty-checkout guard (PR #338
+    // review, chatgpt-codex-connector, P1) requires a POSITIVELY clean read before it will merge —
+    // a bare, non-repo temp dir would make every read fail and the guard refuse to merge at all,
+    // which is correct in production but would make premergeBase-exercising tests below unable to
+    // reach the merge they're testing.
+    execFileSync("git", ["-C", worktreePath, "init", "-q", "-b", "main"]);
+    execFileSync("git", ["-C", worktreePath, "config", "user.email", "a@b.c"]);
+    execFileSync("git", ["-C", worktreePath, "config", "user.name", "test"]);
+    execFileSync("git", ["-C", worktreePath, "commit", "-q", "--allow-empty", "-m", "base"]);
     createWorktreeMock.mockResolvedValue({
       path: worktreePath,
       branch: "anton/fix-7",
@@ -325,6 +402,15 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       repoPath: "/repo",
     } satisfies Worktree);
     warmWorktreeBestEffortMock.mockResolvedValue(undefined);
+    // Already caught up with the base by default — see the mock's own doc comment. Individual tests
+    // that care about the premerge itself override this.
+    isAncestorMock.mockResolvedValue(true);
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] });
+    unpushedCommitShas = [];
+    commitsWithUnverifiedBoundaryMarker = new Set();
+    markUnverifiedBoundaryNotesAddMock.mockReset().mockResolvedValue("");
+    resetHardRejection = undefined;
+    readWorktreeStateMock.mockReset().mockImplementation((...a) => realReadWorktreeStateRef.current!(...a));
   });
 
   afterEach(() => {
@@ -338,9 +424,10 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       branch: "anton/fix-7",
       settings,
       baseBranch: "main",
-      pr,
       number: 7,
       claimOwner: "review-fix:job-test",
+      expectedHeadSha: "",
+      expectedBaseRefOid: undefined,
     });
 
   it("a review-fix gate failing on a module the lockfile declares", async () => {
@@ -372,6 +459,377 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
     const [, , warmConfig] = warmWorktreeBestEffortMock.mock.calls[0]!;
     expect(warmConfig).toEqual({ command: undefined, enabled: false });
   });
+
+  // anton-091jr review round 2 (chatgpt-codex-connector): a MERGEABLE-but-behind base commit can
+  // change dependency metadata without `node_modules` reflecting it, because warming ran BEFORE the
+  // base premerge landed. Re-warming after a clean (conflict-free) premerge closes that gap.
+  it("re-warms after a clean base premerge lands, so the gates see the merged tree's dependencies", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] }); // clean auto-merge, no conflicts
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(2);
+    for (const call of warmWorktreeBestEffortMock.mock.calls) {
+      expect(call[0]).toMatchObject({ path: worktreePath });
+      expect(call[2]).toEqual({ command: "pnpm install --frozen-lockfile", enabled: true });
+    }
+  });
+
+  it("does NOT re-warm when the base premerge lands conflicts still needing resolution", async () => {
+    isAncestorMock.mockResolvedValue(false);
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: ["src/a.ts"] });
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    const result = await run(settings);
+
+    expect(result.conflicts).toEqual(["src/a.ts"]);
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, P1: a reused review-fix worktree can carry uncommitted
+  // tracked edits (an operator's own change, a resumed session's in-progress work). Merging on top of
+  // them risks a later `reset --hard` (if the boundary-marker write fails) discarding those edits for
+  // good, so the premerge must refuse to run at all rather than gamble on a rollback.
+  it("does NOT merge (and preserves uncommitted edits) when the checkout is genuinely dirty", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase would otherwise merge
+    writeFileSync(join(worktreePath, "wip.txt"), "operator's in-progress edit\n");
+
+    const result = await run({} as ProjectSettings);
+
+    // The unconditional origin/<branch> ff-only sync still runs — only premergeBase's OWN
+    // bypassed-hooks merge (`noFf: true`) must be skipped.
+    expect(mergeIntoCurrentMock).not.toHaveBeenCalledWith(
+      worktreePath,
+      expect.anything(),
+      expect.objectContaining({ noFf: true }),
+    );
+    expect(result.refsSynced).toBe(false);
+    expect(readFileSync(join(worktreePath, "wip.txt"), "utf8")).toBe("operator's in-progress edit\n");
+  });
+
+  // The dirty-checkout guard above must fail CLOSED, not open, when it can't even tell whether the
+  // checkout is dirty: a `readWorktreeState` rejection must never be read as "clean" (PR #338 review,
+  // chatgpt-codex-connector, P1) — that would let this same destructive path run against a reused
+  // worktree whose actual dirty state the read simply failed to report.
+  it("does NOT merge when readWorktreeState fails to confirm the checkout is clean", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase would otherwise merge
+    readWorktreeStateMock.mockRejectedValue(new Error("worktree state unreadable"));
+
+    const result = await run({} as ProjectSettings);
+
+    expect(mergeIntoCurrentMock).not.toHaveBeenCalledWith(
+      worktreePath,
+      expect.anything(),
+      expect.objectContaining({ noFf: true }),
+    );
+    expect(result.refsSynced).toBe(false);
+  });
+
+  it("does NOT re-warm when the branch is already caught up with the base (no merge to do)", async () => {
+    isAncestorMock.mockResolvedValue(true);
+    const settings = { warmCommand: "pnpm install --frozen-lockfile" } as ProjectSettings;
+
+    await run(settings);
+
+    expect(warmWorktreeBestEffortMock).toHaveBeenCalledTimes(1);
+    // The one `mergeIntoCurrent` call is the unconditional origin/<branch> sync; premergeBase's own
+    // merge is never attempted once `isAncestor` says the base is already caught up.
+    expect(mergeIntoCurrentMock).toHaveBeenCalledTimes(1);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 9 (fresh evidence beyond the round-6 rollback
+  // finding): when the clean auto-merge lands on top of an already-unverified tip, writing the
+  // carried-forward marker can fail; the rollback that guards against leaving an unmarked bypass
+  // commit on HEAD must throw `PoisonError` when it can't actually restore HEAD to its pre-merge
+  // position (here: the `git reset --hard` itself fails — a locked/corrupted worktree). That
+  // `PoisonError` must reach the caller so the checkout is parked — an outer `catch` that swallowed
+  // it into an ordinary `{ failed: true }` would let a resumed "already ahead" fast path push the
+  // hook-bypassed boundary straight past re-verification.
+  it("re-throws PoisonError when the marker-write rollback's own reset fails (PR #338 review, round 9)", async () => {
+    isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
+    mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] }); // clean auto-merge, no conflicts
+    unpushedCommitShas = ["deadbeef"]; // one unpushed commit ahead of origin/<branch>
+    commitsWithUnverifiedBoundaryMarker = new Set(["deadbeef"]); // it already carries the marker
+    markUnverifiedBoundaryNotesAddMock.mockRejectedValue(new Error("notes ref lock contention"));
+    resetHardRejection = new Error("worktree locked");
+
+    await expect(run({} as ProjectSettings)).rejects.toBeInstanceOf(PoisonError);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 3: `headSynced` (now `refsSynced`) used to check
+  // only the worktree's own head, so a `fetchOrigin` that fetched the head branch fine but silently
+  // failed for the base branch still reported "synced" — the premerge then ran against a STALE
+  // `origin/<baseBranch>`, yet the fingerprint got persisted as if the PR's advertised base had
+  // actually been tested.
+  describe("refsSynced also verifies the fetched base ref against pr.baseRefOid", () => {
+    const runWithBase = (expectedBaseRefOid: string | undefined) =>
+      prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "", // isolate the assertion to the base-ref half of the check
+        expectedBaseRefOid,
+      });
+
+    it("is true when the fetched origin/<base> resolves to the PR's reported baseRefOid", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-current");
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(true);
+    });
+
+    it("is false when origin/<base> resolves to a STALE sha (fetchOrigin silently failed for it)", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-stale");
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("is false when resolving origin/<base> fails outright", async () => {
+      resolveCommitShaMock.mockRejectedValue(new Error("unknown revision"));
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("trusts the sync unconditionally when the caller has no baseRefOid to verify against", async () => {
+      resolveCommitShaMock.mockResolvedValue("whatever-it-resolves-to");
+
+      const result = await runWithBase(undefined);
+
+      expect(result.refsSynced).toBe(true);
+    });
+
+    it("trusts the sync unconditionally when there is no baseBranch at all (nothing gets premerged)", async () => {
+      resolveCommitShaMock.mockResolvedValue("irrelevant");
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: undefined,
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "",
+        expectedBaseRefOid: "base-sha-current",
+      });
+
+      expect(result.refsSynced).toBe(true);
+      expect(resolveCommitShaMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 4: the resume path (anton-2wklm) leaves unpushed
+  // operator/prior-attempt commits on the local branch, so the ff-only sync above is a no-op and
+  // `syncedHead` legitimately sits ahead of `expectedHeadSha` rather than equal to it. Treating that
+  // as unsynced deleted the job's attempt identity every pass, so a parked gate could never be
+  // matched by a later sweep.
+  describe("refsSynced treats a descendant checkout as synced, not just an exact match", () => {
+    // `readWorktreeState` is real (only `git/ops` functions named in the mock above are stubbed) and
+    // `worktreePath` is the outer `beforeEach`'s real one-commit repo, so it resolves to that commit's
+    // actual sha here — `isAncestorMock` is what stands in for "is the checkout ahead of
+    // `expectedHeadSha`". The descendant allowance only applies when the branch was already ahead of
+    // origin BEFORE the fetch (see the race-condition describe block below), so these tests — about
+    // the ancestry check
+    // itself, not the guard in front of it — set that precondition true: the pre-fetch tracking sha
+    // resolves to exactly `expectedHeadSha` (proving real, current knowledge of origin), same as
+    // `branchAheadOfRemote` reporting real local-only commits on top of it.
+    beforeEach(() => {
+      resolveCommitShaMock.mockResolvedValue("expected-head-sha");
+      branchAheadOfRemoteMock.mockResolvedValue(true);
+    });
+
+    const runWithHead = (expectedHeadSha: string) =>
+      prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha,
+        expectedBaseRefOid: undefined, // isolate the assertion to the head half of the check
+      });
+
+    it("is true when the checkout is a descendant of expectedHeadSha (not equal to it)", async () => {
+      isAncestorMock.mockResolvedValue(true); // stands in for both premergeBase's own check and this one
+      const actualHead = execFileSync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+
+      const result = await runWithHead("expected-head-sha");
+
+      expect(result.refsSynced).toBe(true);
+      expect(isAncestorMock).toHaveBeenCalledWith(worktreePath, "expected-head-sha", actualHead);
+    });
+
+    it("is false when the checkout is neither equal to nor a descendant of expectedHeadSha", async () => {
+      isAncestorMock.mockResolvedValue(false);
+
+      const result = await runWithHead("expected-head-sha");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("is false when the ancestry check itself fails outright", async () => {
+      isAncestorMock.mockRejectedValue(new Error("not a git repo"));
+
+      const result = await runWithHead("expected-head-sha");
+
+      expect(result.refsSynced).toBe(false);
+    });
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 9: if the PR branch advances remotely between the
+  // caller's `getPrReview` and `prepareFixWorktree`'s own fetch, the freshly fetched `origin/<branch>`
+  // is a descendant of `expectedHeadSha` too — indistinguishable, by ancestry alone, from the resume
+  // path's pre-existing local commits. Only a branch that was ALREADY ahead of origin before the
+  // fetch (i.e. not just a fresh checkout the fetch itself advanced) may use the descendant
+  // allowance; otherwise a descendant checkout must still force a fresh PR read rather than run the
+  // gates against a commit GitHub no longer reports as the head.
+  describe("refsSynced does not trust a descendant checkout the fetch itself just produced", () => {
+    it("is false when the branch was NOT already ahead before the fetch, even if the synced checkout is a descendant of expectedHeadSha", async () => {
+      resolveCommitShaMock.mockResolvedValue("expected-head-sha"); // known, current pre-fetch tracking sha
+      branchAheadOfRemoteMock.mockResolvedValue(false); // nothing local pre-dates this fetch
+      isAncestorMock.mockResolvedValue(true); // the freshly-fetched tip descends from expectedHeadSha
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha",
+        expectedBaseRefOid: undefined,
+      });
+
+      expect(result.refsSynced).toBe(false);
+      // The guard short-circuits before even asking — a descendant fetched just now proves nothing.
+      expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+    });
+
+    // PR #338 review, chatgpt-codex-connector, round 10: `branchAheadOfRemote` itself fails OPEN
+    // (returns `true`) when `origin/<branch>` is unresolvable locally — indistinguishable, by that
+    // return value alone, from a genuine pre-existing local-only commit. A pre-fetch tracking sha
+    // that never resolved is exactly the "unknown" case, so it must not be trusted as evidence of a
+    // real resume, even though `branchAheadOfRemote` itself reports "ahead".
+    it("is false when the pre-fetch tracking sha never resolves, even though branchAheadOfRemote fails open to true", async () => {
+      resolveCommitShaMock.mockRejectedValue(new Error("unknown revision: origin/anton/fix-7"));
+      branchAheadOfRemoteMock.mockResolvedValue(true); // the fail-open fallback, not real evidence
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha",
+        expectedBaseRefOid: undefined,
+      });
+
+      expect(result.refsSynced).toBe(false);
+      expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+    });
+
+    // Same "unknown" case, but the pre-fetch tracking sha DOES resolve — just to something other
+    // than `expectedHeadSha`, meaning the local repo's knowledge of origin was stale rather than
+    // current at snapshot time. Still not trustworthy evidence of a real resume.
+    it("is false when the pre-fetch tracking sha resolves to something other than expectedHeadSha", async () => {
+      resolveCommitShaMock.mockResolvedValue("some-other-stale-sha");
+      branchAheadOfRemoteMock.mockResolvedValue(true);
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha",
+        expectedBaseRefOid: undefined,
+      });
+
+      expect(result.refsSynced).toBe(false);
+      expect(isAncestorMock).not.toHaveBeenCalledWith(worktreePath, "expected-head-sha", "");
+    });
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 4: a fetched head/base that both match GitHub
+  // exactly are still not "synced" if `premergeBase` then fails outright (a transient git error, a
+  // hook failure) — the advertised base tree never actually landed in the tree the gates ran
+  // against, so persisting an attempt fingerprint would misrepresent that revision as tested.
+  describe("refsSynced folds in a failed (not just conflicting) base premerge", () => {
+    it("is false when the base merge fails outright, even though the fetched refs matched", async () => {
+      isAncestorMock.mockResolvedValue(false); // behind the base → premergeBase actually merges
+      mergeIntoCurrentMock.mockRejectedValue(new Error("hook failed"));
+
+      const result = await run({} as ProjectSettings); // expectedHeadSha/BaseRefOid unset → trivially matched
+
+      expect(result.refsSynced).toBe(false);
+      expect(result.conflicts).toEqual([]);
+    });
+
+    it("stays true when the base merge succeeds cleanly", async () => {
+      isAncestorMock.mockResolvedValue(false);
+      mergeIntoCurrentMock.mockResolvedValue({ conflicts: [] });
+
+      const result = await run({} as ProjectSettings);
+
+      expect(result.refsSynced).toBe(true);
+    });
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 11: premerging BEFORE the refs are proven
+  // synchronized used to land a clean auto-merge commit on the branch's local history even though
+  // `refsSynced` came back false — the caller skips the session on that signal but never undoes the
+  // commit, so the next pass reads the branch as `alreadyAhead` of origin and takes the fast path
+  // that pushes it straight through without ever addressing the review feedback. The premerge must
+  // not run at all when the refs themselves are unsynchronized.
+  describe("premergeBase does not run at all when the refs are unsynchronized", () => {
+    it("skips the base merge when the head is neither equal to nor a descendant of expectedHeadSha", async () => {
+      // Not up to date with the base, so premergeBase WOULD attempt a real merge if it ran at all —
+      // proves the skip is what stops the second `mergeIntoCurrent` call, not a coincidental no-op.
+      isAncestorMock.mockResolvedValue(false);
+      resolveCommitShaMock.mockRejectedValue(new Error("not a git repo")); // aheadBeforeFetch stays false
+      branchAheadOfRemoteMock.mockResolvedValue(false); // no pre-existing local-only commits either
+
+      const result = await prepareFixWorktree({
+        ctx: fakeCtx(),
+        repo: "/repo",
+        branch: "anton/fix-7",
+        settings: {} as ProjectSettings,
+        baseBranch: "main",
+        number: 7,
+        claimOwner: "review-fix:job-test",
+        expectedHeadSha: "expected-head-sha", // mismatched against the ("") readWorktreeState fallback
+        expectedBaseRefOid: undefined, // isolate the assertion to the head half of the check
+      });
+
+      expect(result.refsSynced).toBe(false);
+      expect(result.conflicts).toEqual([]);
+      // Only the unconditional origin/<branch> sync — premergeBase's own merge attempt never runs.
+      expect(mergeIntoCurrentMock).toHaveBeenCalledTimes(1);
+      expect(markUnverifiedBoundaryNotesAddMock).not.toHaveBeenCalled();
+    });
+  });
 });
 
 /**
@@ -396,10 +854,12 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     reviewDecision: "APPROVED",
     mergeable: "MERGEABLE",
     headRefName: `anton/pr-${number}`,
+    baseRefName: "main",
     headSha: `sha-${number}`,
     url: `https://example.test/pull/${number}`,
     reviews: [],
     failingChecks: [],
+    failingCheckAttempts: [],
     pendingChecks: 0,
     threads: [],
     threadsComplete: true,
@@ -545,6 +1005,214 @@ describe("makeReviewFixHandler (the dispatcher)", () => {
     const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
     expect(rows).toHaveLength(2);
     expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  /** A `done` row simulating an answered round (anton-dfuvz) — what actually settles it is out of this suite's scope. */
+  const markAnswered = (epicBeadId: string, headSha: string, answeredFingerprint: string[]) =>
+    t.db
+      .update(schema.jobs)
+      .set({
+        status: "done",
+        payloadJson: JSON.stringify({ projectId: t.projectId, epicBeadId, headSha, answeredFingerprint }),
+      })
+      .where(eq(schema.jobs.type, "review-fix-pr"))
+      .run();
+
+  // anton-dfuvz: checks no code change can satisfy (a PR-body waiver line, a CI check stuck
+  // re-evaluating the same commit) keep classifyReview actionable forever — a fixer session that
+  // answered the feedback without pushing must not be handed a fresh one every scheduled pass.
+  it("suppresses a target that answered at the current PR head with unchanged reasons, and says so distinctly", async () => {
+    listMock.mockResolvedValue([target("e-1", 1), target("e-2", 2)]);
+    getPrReviewMock.mockImplementation(async (_repo: string, number: number) =>
+      number === 1 ? openPr(1, { reviewDecision: "CHANGES_REQUESTED" }) : openPr(2), // e-2 stays clean
+    );
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer", "base:unknown"]);
+
+    const job = await getJob(t.db, await dispatch());
+    expect(dispatchedTargets()).toEqual(["e-1"]); // still the one row from the first pass
+    expect(job?.outcomeNote).toBe(
+      "examined 2 PR(s) in review, dispatched 0, suppressed 1 (answered, unchanged)",
+    );
+  });
+
+  it("admits a fresh job once the PR head moves past an answered attempt, even with unchanged reasons", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, { reviewDecision: "CHANGES_REQUESTED", headSha: "sha-new" }),
+    );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  it("admits a fresh job once a new unresolved review thread appears, even at the unchanged head", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, {
+        reviewDecision: "CHANGES_REQUESTED",
+        threads: [
+          {
+            id: "RT_new",
+            isResolved: false,
+            isOutdated: false,
+            comments: [{ id: 1, author: "alice", body: "one more thing" }],
+          },
+        ],
+      }),
+    );
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  // anton-091jr review (chatgpt-codex-connector): a reviewer's new reply on the SAME thread anton
+  // already answered must not be swallowed by a stale answered row just because the coarse thread
+  // COUNT is unchanged — the fingerprint has to key on the thread's actual comment identity.
+  it("admits a fresh job when a reviewer replies again on an already-answered thread, even with the same thread count and head", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    const threadWithComment = (commentId: number) => ({
+      id: "RT_1",
+      isResolved: false,
+      isOutdated: false,
+      comments: [{ id: commentId, author: "alice", body: "please fix" }],
+    });
+    getPrReviewMock.mockResolvedValue(openPr(1, { threads: [threadWithComment(1)] }));
+
+    await dispatch();
+    // What classifyReview's fingerprint actually stores for one thread whose last comment is #1.
+    markAnswered("e-1", "sha-1", ["thread:RT_1:1"]);
+
+    // Same head, same thread, but the reviewer posted a NEW comment on it — still 1 unresolved
+    // thread by count, but a different fingerprint.
+    getPrReviewMock.mockResolvedValue(openPr(1, { threads: [threadWithComment(2)] }));
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): an actionable fingerprint can cycle A→B→A at the same
+  // head (e.g. a reviewer's comment edited back). The intervening B round is admitted fresh here,
+  // then PARKS (a red test gate) instead of answering — the target's most recent SETTLED attempt is
+  // that parked B row, not the older `done` A row, so round A returning must be admitted fresh too,
+  // not resuppressed by the stale answered row.
+  it("admits a fresh job when a fingerprint cycles A→B→A and the intervening B round parked", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    // Round A: dispatched, then answered without a push.
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    // Round B: a new thread appears at the same head — a different fingerprint, so it's admitted
+    // fresh — then it parks (e.g. a red gate) rather than answering.
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, {
+        reviewDecision: "CHANGES_REQUESTED",
+        threads: [
+          {
+            id: "RT_new",
+            isResolved: false,
+            isOutdated: false,
+            comments: [{ id: 1, author: "alice", body: "one more thing" }],
+          },
+        ],
+      }),
+    );
+    await dispatch();
+    const afterRoundB = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(afterRoundB).toHaveLength(2);
+    const roundBId = afterRoundB.find((r) => r.status === "queued")!.id;
+    // Bumped later than round A's `updatedAt` (the fixed test clock never advances on its own) so
+    // "most recent settled row" is unambiguous, matching what a real park() call would do.
+    t.db
+      .update(schema.jobs)
+      .set({ status: "parked", updatedAt: new Date(clock.now() + 1000) })
+      .where(eq(schema.jobs.id, roundBId))
+      .run();
+
+    // Round A returns — same head, same fingerprint as the answered row. The stale `done` A row
+    // must not win over the newer `parked` B row when deciding whether this round was ever answered.
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(3);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): same A→B→A cycle as above, but round B settles at the
+  // SAME second as round A (the fixed test clock never advances on its own) instead of a bumped
+  // `updatedAt`. `updatedAt` alone can't order same-second rows, so `answeredUnchanged` must fall
+  // back to insert order (JOB_INSERT_ORDER) to see round B's `parked` row as newer than round A's
+  // stale `done` row — otherwise SQLite could hand back either row and resuppress round A arbitrarily.
+  it("admits a fresh job when a fingerprint cycles A→B→A and the intervening B round parks within the same second", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    // Round A: dispatched, then answered without a push.
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    // Round B: a new thread appears at the same head — a different fingerprint, so it's admitted
+    // fresh — then it parks (e.g. a red gate) rather than answering, without ever bumping the clock.
+    getPrReviewMock.mockResolvedValue(
+      openPr(1, {
+        reviewDecision: "CHANGES_REQUESTED",
+        threads: [
+          {
+            id: "RT_new",
+            isResolved: false,
+            isOutdated: false,
+            comments: [{ id: 1, author: "alice", body: "one more thing" }],
+          },
+        ],
+      }),
+    );
+    await dispatch();
+    const afterRoundB = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(afterRoundB).toHaveLength(2);
+    const roundBId = afterRoundB.find((r) => r.status === "queued")!.id;
+    // Same `updatedAt` as round A's `done` row — only insert order tells them apart.
+    t.db.update(schema.jobs).set({ status: "parked" }).where(eq(schema.jobs.id, roundBId)).run();
+
+    // Round A returns — same head, same fingerprint as the answered row. The newer `parked` B row
+    // (later insert order, tied `updatedAt`) must win over the stale `done` A row.
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+    await dispatch();
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(3);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+  });
+
+  it("admits a fresh job for a MERGED target even though a prior answered attempt matches its head", async () => {
+    listMock.mockResolvedValue([target("e-1", 1)]);
+    getPrReviewMock.mockResolvedValue(openPr(1, { reviewDecision: "CHANGES_REQUESTED" }));
+
+    await dispatch();
+    markAnswered("e-1", "sha-1", ["changes requested by a reviewer"]);
+
+    // Merged, same head as the stale answered round — classifyReview never runs for it, so it
+    // carries no `reasons` and the answered check (which requires both) never applies.
+    getPrReviewMock.mockResolvedValue(openPr(1, { state: "MERGED" }));
+    const job = await getJob(t.db, await dispatch());
+    const rows = t.db.select().from(schema.jobs).where(eq(schema.jobs.type, "review-fix-pr")).all();
+    expect(rows).toHaveLength(2);
+    expect(rows.some((r) => r.status === "queued")).toBe(true);
+    expect(job?.outcomeNote).toBe("examined 1 PR(s) in review, dispatched 1");
   });
 
   // One unreadable PR must not cost the others their dispatch — but the failure still surfaces, so
@@ -896,10 +1564,12 @@ process.exit(0);
       reviewDecision: "CHANGES_REQUESTED",
       mergeable: "MERGEABLE",
       headRefName: "anton/epic-1",
+      baseRefName: "main",
       headSha: "sha1",
       url: "https://github.com/o/r/pull/7",
       reviews: [],
       failingChecks: [],
+      failingCheckAttempts: [],
       pendingChecks: 0,
       threads,
       threadsComplete: true,
@@ -1042,6 +1712,167 @@ process.exit(0);
 
     expect(delivered).toEqual([item]);
     expect(ghCalls().some((c) => c.some((x) => x.includes("mutation")))).toBe(true);
+  });
+});
+
+/**
+ * `allWaitingThreadsAnswered` gates `recordReviewFixAnswered` in both the main dispatch path and the
+ * already-ahead fast path (PR #338 review, chatgpt-codex-connector + @claude): a round must not be
+ * recorded "answered" on anything less than real, delivered evidence for every reason it was
+ * actionable for, thread or not.
+ */
+describe("allWaitingThreadsAnswered", () => {
+  it("requires the non-thread sentinel when hasNonThreadReasons is true, even with no waiting threads", () => {
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), [], true, false)).toBe(false);
+  });
+
+  it("accepts a 'left' sentinel as real evidence for a non-thread reason", () => {
+    const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "left", reply: "flaky infra" }];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, false)).toBe(true);
+  });
+
+  it("rejects a 'fixed' sentinel when nothing was pushed — a fabricated claim", () => {
+    const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "fixed the build" }];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, false)).toBe(false);
+  });
+
+  it("accepts a 'needs-human' sentinel as real evidence for a non-thread reason", () => {
+    // Publication (`publishUnpushedSentinel`) is the caller's own gate, ANDed into
+    // `answeredAllThreads` alongside this function's result (PR #338 review, chatgpt-codex-
+    // connector) — from this function's own perspective, a real (non-fabricated) sentinel counts
+    // the same regardless of outcome, same as "left" above.
+    const report: ThreadOutcome[] = [
+      { id: NON_THREAD_REPORT_ID, outcome: "needs-human", reply: "needs a product call" },
+    ];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(true);
+    expect(allWaitingThreadsAnswered(new Set(["RT_1"]), new Set(["RT_1"]), report, true, true)).toBe(
+      true,
+    );
+  });
+
+  it("a real thread's own delivered needs-human reply still counts — only the sentinel is rejected", () => {
+    // No non-thread reason here: `hasNonThreadReasons` is false, so only the per-thread evidence
+    // matters, and a delivered reply (whatever its outcome) satisfies it.
+    expect(allWaitingThreadsAnswered(new Set(["RT_1"]), new Set(["RT_1"]), [], false, false)).toBe(true);
+  });
+
+  it("ignores hasNonThreadReasons once something was pushed (caller only consults this when !pushed)", () => {
+    // The fast path in runFixSession only calls this to decide the unpushed case; it short-circuits
+    // on `pushed` itself before ever reaching here. This spec pins that this function alone does not
+    // — `pushed` here only feeds `fabricatedFix`'s own check on the sentinel.
+    const report: ThreadOutcome[] = [{ id: NON_THREAD_REPORT_ID, outcome: "fixed", reply: "fixed it" }];
+    expect(allWaitingThreadsAnswered(new Set(), new Set(), report, true, true)).toBe(true);
+  });
+});
+
+/**
+ * `fingerprintHasNonThreadReasons` feeds `allWaitingThreadsAnswered` as `hasNonThreadReasons` (PR
+ * #338 review, chatgpt-codex-connector + @claude): `classifyReview` (src/lib/git/pr.ts) appends a
+ * `base:<oid>` entry to every nonempty fingerprint as a pure cache-buster, not a real reason — a
+ * thread-only round's fingerprint is `["thread:...", "base:..."]`, and treating that `base:` entry
+ * as a non-thread reason would demand a `NON_THREAD_REPORT_ID` sentinel that never has anything real
+ * to report, silently defeating the answered-unchanged suppression for the most common actionable
+ * shape: a PR whose only feedback is inline review comments.
+ */
+describe("fingerprintHasNonThreadReasons", () => {
+  it("is false for a thread-only fingerprint, even with the base cache-buster appended", () => {
+    expect(fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1"])).toBe(false);
+  });
+
+  it("is false when the only extra entry is the comment cache-buster (PR #338 round)", () => {
+    // `classifyReview` appends `comment:<id>` under the same unconditional `reasons.length > 0`
+    // guard as `base:<oid>` — a pure cache-buster for a plain top-level human reply, not a real
+    // non-thread reason. Same exclusion as `base:*` for the same reason.
+    expect(fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1", "comment:IC_1"])).toBe(
+      false,
+    );
+  });
+
+  // PR #338 review round 2 (chatgpt-codex-connector): a degraded top-level-comment read makes
+  // `classifyReview` push the fixed `"comments:incomplete"` marker instead of `comment:<id>` — that
+  // marker starts with `comment` but not `comment:`, so the plain `startsWith("comment:")` exclusion
+  // missed it and a thread-only round read during a degraded comment page falsely demanded a
+  // `NON_THREAD_REPORT_ID` sentinel for a check/conflict/summary that never existed.
+  it("is false when the only extra entry is the comments-incomplete cache-buster", () => {
+    expect(
+      fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1", "comments:incomplete"]),
+    ).toBe(false);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): `classifyReview` pushes this same-shaped, exact
+  // sibling constant for a degraded REVIEWS read — `"comments:incomplete"`'s
+  // `startsWith("comment:")` exclusion doesn't match it (different word, no colon after "comment"),
+  // so it needs its own exact-match exclusion.
+  it("is false when the only extra entry is the reviews-incomplete cache-buster", () => {
+    expect(
+      fingerprintHasNonThreadReasons(["thread:RT_1:C_1", "base:sha-1", "reviews:incomplete"]),
+    ).toBe(false);
+  });
+
+  it("is true when a real non-thread reason (a failing check) is present", () => {
+    expect(fingerprintHasNonThreadReasons(["check:build", "base:sha-1"])).toBe(true);
+  });
+
+  it("is true for a bare merge-conflict reason with no thread/check entries", () => {
+    expect(fingerprintHasNonThreadReasons(["merge conflicts with the base branch", "base:sha-1"])).toBe(
+      true,
+    );
+  });
+
+  it("is false for an empty fingerprint", () => {
+    expect(fingerprintHasNonThreadReasons([])).toBe(false);
+  });
+});
+
+/**
+ * `shouldRecordAnswered` gates `recordReviewFixAnswered` on a complete thread, comment-history, and
+ * reviews read, on top of the existing `!pushed && answeredAllThreads` bar (PR #338 review round 2 /
+ * round 12, chatgpt-codex-connector): `classifyReview` (src/lib/git/pr.ts) folds a degraded read into
+ * a fixed, deterministic fingerprint entry, so persisting a round recorded under that value would let
+ * every later degraded read match it and stay suppressed forever — even past a human reply, or a new
+ * reply on a thread, the failed page was hiding.
+ */
+describe("shouldRecordAnswered", () => {
+  it("records when nothing pushed, every thread answered, and the thread/comment/review/check reads were complete", () => {
+    expect(shouldRecordAnswered(false, true, true, true, true, true)).toBe(true);
+  });
+
+  it("records when commentsComplete/reviewsComplete/checksComplete are undefined (a caller-built fixture that never set them)", () => {
+    expect(shouldRecordAnswered(false, true, true, undefined, undefined, undefined)).toBe(true);
+  });
+
+  // PR #338 review round 12 (chatgpt-codex-connector): a truncated thread page drops the hidden
+  // thread from both `waitingIds` and the fingerprint, so recording this round as answered would let
+  // a later, still-degraded read match this stale row and suppress a still-waiting thread forever.
+  it("does not record when the thread read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, false, true, true, true)).toBe(false);
+  });
+
+  it("does not record when the comment read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, true, false, true, true)).toBe(false);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): mirrors the comment-completeness gate above — a
+  // degraded REVIEWS read can hide a new CHANGES_REQUESTED review, so recording this round as
+  // answered would let a later, still-degraded read match this stale row and suppress it forever.
+  it("does not record when the reviews read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, true, true, false, true)).toBe(false);
+  });
+
+  // PR #338 review (chatgpt-codex-connector): mirrors the reviews-completeness gate above — a
+  // degraded check-rollup read can hide a check beyond the fetched page that newly failed or
+  // reran, so recording this round as answered would let a later, still-degraded read match this
+  // stale row and suppress it forever.
+  it("does not record when the check-rollup read was degraded, even though everything else answered", () => {
+    expect(shouldRecordAnswered(false, true, true, true, true, false)).toBe(false);
+  });
+
+  it("does not record when something was pushed", () => {
+    expect(shouldRecordAnswered(true, true, true, true, true, true)).toBe(false);
+  });
+
+  it("does not record when a thread was left unanswered", () => {
+    expect(shouldRecordAnswered(false, false, true, true, true, true)).toBe(false);
   });
 });
 
@@ -1257,6 +2088,483 @@ describe("runTestGate (anton-h0hwc)", () => {
   });
 });
 
+// PR #338 review, @claude: `notifyGateParked`'s "a follow-up round already ran against this gate;
+// it failed again" note must only ever describe THIS poison — not any PoisonError that happens to
+// reach the same catch block after a follow-up round was dispatched (e.g. an unrelated commit/marker
+// poison from `commitFix`/`commitAndPushFix`, raised even after the follow-up's own gate re-run came
+// back green).
+describe("isGateFailurePoison (PR #338 review, @claude)", () => {
+  it("is true for the poison runTestGate raises on a red gate", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "anton-gate-poison-test-"));
+    try {
+      const err = await runTestGate(
+        { testCommand: "echo boom && exit 1" },
+        dir,
+        new AbortController().signal,
+        join(dir, "session.log"),
+        7,
+      ).catch((e) => e);
+      expect(isGateFailurePoison(err)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is false for an unrelated PoisonError — e.g. commitFix's own commit/marker failures", () => {
+    expect(
+      isGateFailurePoison(
+        new PoisonError("review fix for PR #7 rewrote branch instead of adding its commit"),
+      ),
+    ).toBe(false);
+  });
+
+  it("is false for a plain (non-poison) error", () => {
+    expect(isGateFailurePoison(new Error("boom"))).toBe(false);
+  });
+});
+
+// PR #338 review round 3 (chatgpt-codex-connector): the mode lives on the tree entry, not the blob
+// object, so comparing `rev-parse <commit>:<path>` blob shas alone can't see a mode-only change —
+// a follow-up round that reverts a path's executable bit while leaving its content untouched must
+// still read as "did not survive".
+describe("mainRoundChangesSurvived", () => {
+  let dir: string;
+
+  function g(args: string[]): string {
+    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "anton-survived-"));
+    g(["init", "-q", "-b", "main"]);
+    g(["config", "user.email", "a@b.c"]);
+    g(["config", "user.name", "test"]);
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("returns false when a follow-up flips a path's mode even though its content is unchanged", async () => {
+    writeFileSync(join(dir, "script.sh"), "echo hi\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o755);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: make script.sh executable"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o644);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert the mode"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, P2: a mode-only main-round diff followed by a
+  // follow-up that reverts the mode AND edits the content lands in the hunk-level fallback with
+  // zero parsed `@@` hunks either way (the mode-only diff has none, and the fallback only compares
+  // the main round's own hunks) — the mode revert must still be caught rather than defaulting to
+  // "survived".
+  it("returns false when a follow-up reverts a mode-only fix while also editing the file's content", async () => {
+    writeFileSync(join(dir, "script.sh"), "echo hi\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o755);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: make script.sh executable"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o644);
+    writeFileSync(join(dir, "script.sh"), "echo hi\necho unrelated\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert mode, edit content"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns true when the follow-up leaves the main round's content and mode untouched", async () => {
+    writeFileSync(join(dir, "script.sh"), "echo hi\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    chmodSync(join(dir, "script.sh"), 0o755);
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: make script.sh executable"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "unrelated.txt"), "x\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: unrelated change"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(true);
+  });
+
+  it("returns true when a gate follow-up further edits the same file without reverting the fix", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix the bug"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up reformats the same file (e.g. a lint/format fix) — its tree entry no
+    // longer matches `preGateHead` byte-for-byte, but the main round's fix is still in substance
+    // on the branch, since the content never reverts back to `preSessionHead`'s original.
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\nconst y = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: gate formatting fix"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(true);
+  });
+
+  it("returns false when a gate follow-up reverts the file all the way back to its pre-session content", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix the bug"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert the fix"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns false when a gate follow-up reverts the main round's hunk but adds an unrelated change to the same file", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "app.ts"), "const x = fixed();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix the bug"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up reverts the review fix back to the buggy line, but also tacks on an
+    // unrelated change to the SAME file. The file's final tree entry still differs from both
+    // `preSessionHead` and `preGateHead`, so a whole-blob compare alone can't tell this apart from
+    // a legitimate reformat of the fix — it must catch that the reviewed hunk itself came back.
+    writeFileSync(join(dir, "app.ts"), "const x = buggy();\nconst z = unrelated();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert fix, add unrelated line"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns false when a gate follow-up reverts a pure-addition hunk but edits the same file elsewhere (PR #338 P1)", async () => {
+    writeFileSync(join(dir, "app.ts"), "const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round's fix is a pure addition — no line is removed, only a new one added.
+    writeFileSync(join(dir, "app.ts"), "const x = 1;\nconst y = validate();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: add validation"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up drops the added line (reverting the fix) but also tacks on an unrelated
+    // line to the same file, so the final tree entry differs from BOTH preSessionHead and
+    // preGateHead — a pure-addition hunk has no removed text whose reappearance the old check
+    // could key off, so it credited this as "survived".
+    writeFileSync(join(dir, "app.ts"), "const x = 1;\nconst z = unrelated();\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: drop validation, add unrelated line"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns false when a follow-up reverts a pure-addition hunk whose text duplicates a pre-existing line elsewhere in the file (PR #338 review, round 4)", async () => {
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round's fix is a pure addition whose added line ("  return true;") happens to
+    // duplicate a line that already exists elsewhere in the file (in function a).
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return true;\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix function b"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up drops the added line (reverting the fix, back to the original 1
+    // occurrence of "  return true;") but also tacks on an unrelated function elsewhere in the
+    // same file, so the final tree entry differs from BOTH preSessionHead and preGateHead. A
+    // location-blind `finalContent.includes(addedBlock)` would still find the pre-existing
+    // occurrence in function a and wrongly credit this as "survived".
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return false;\n}\nfunction c() {\n  return 42;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert fix, add unrelated function"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  it("returns true when a follow-up keeps a pure-addition hunk whose text duplicates a pre-existing line elsewhere, while editing the file further", async () => {
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return true;\n  return false;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix function b"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up keeps the main round's added line in function b intact (now two
+    // occurrences of "  return true;" on the branch) and just tacks on an unrelated function.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return true;\n}\nfunction b() {\n  return true;\n  return false;\n}\nfunction c() {\n  return 42;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: add unrelated function"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(true);
+  });
+
+  it("returns false when a gate follow-up recreates a file the main round deleted, with different content", async () => {
+    writeFileSync(join(dir, "secret.txt"), "leaked-token\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round deletes the file entirely.
+    g(["rm", "-q", "secret.txt"]);
+    g(["commit", "-q", "-m", "main round: delete secret.txt"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // Gate follow-up recreates the path with different content. The blob differs from the
+    // original, so a plain `atPreSession !== atFinal` reads this as "survived" — but the
+    // deletion itself was undone.
+    writeFileSync(join(dir, "secret.txt"), "different-content\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: recreate secret.txt"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, P1 (this round): a newly added path must not be
+  // credited as "survived" when the final tree no longer carries it. `atFinal === atPreSession`
+  // already catches this — a brand-new path has `atPreSession === undefined`, and a follow-up that
+  // deletes it (while editing something unrelated) leaves `atFinal === undefined` too, so the two
+  // sides compare equal and the path is correctly reported as not survived.
+  it("returns false when a follow-up deletes a file the main round added, while editing something else", async () => {
+    writeFileSync(join(dir, "other.txt"), "base\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    writeFileSync(join(dir, "newfile.ts"), "export const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: add newfile.ts"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    execFileSync("git", ["-C", dir, "rm", "-q", "newfile.ts"]);
+    writeFileSync(join(dir, "other.txt"), "changed\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: delete newfile.ts, edit other.txt"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // Same case at the rename-destination shape the review comment called out specifically: the
+  // destination path is "new" from `preSessionHead`'s point of view, so reversing the rename hits
+  // the identical `atFinal === atPreSession` (both undefined) branch as a plain add-then-delete.
+  it("returns false when a follow-up reverses a rename the main round made", async () => {
+    writeFileSync(join(dir, "old.ts"), "export const x = 1;\n");
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    g(["mv", "old.ts", "new.ts"]);
+    g(["commit", "-q", "-m", "main round: rename old.ts to new.ts"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    g(["mv", "new.ts", "old.ts"]);
+    g(["commit", "-q", "-m", "follow-up: reverse the rename"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, P1 (this round): a hunk's added/removed line that
+  // itself starts with `+`/`-` (e.g. source text `++sentinel`) is emitted by `git diff` as
+  // `+++sentinel` / `---sentinel` — indistinguishable by prefix alone from the pre-hunk `+++ b/file`
+  // / `--- a/file` file-header lines. The old check matched that prefix unconditionally, so it
+  // discarded this real hunk content as if it were a header, leaving `hunk.added` empty for a
+  // pure-addition hunk. That made the "nothing to anchor" fallback (`addedBlock.length === 0`)
+  // fire unconditionally and report "survived" even though the follow-up reverted the line and
+  // separately made an unrelated edit — exactly the case this hunk-level fallback exists to catch.
+  it("returns false when a follow-up reverts a pure-addition hunk whose content itself starts with `+`, while editing the file elsewhere", async () => {
+    // Unindented so the added/removed line's own text sits flush against the diff's `+`/`-`
+    // marker — indentation would put a space between them and mask the bug this guards against.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\nreturn 1;\n}\nfunction b() {\nreturn 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Pure addition whose own text starts with `+`, so the diff line reads `+++sentinel`.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\nreturn 1;\n}\nfunction b() {\n++sentinel\nreturn 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: add ++sentinel"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // Follow-up reverts the addition but also edits function a, so the final tree differs from
+    // both `preSessionHead` and `preGateHead` and this path falls into the hunk-level fallback.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n// unrelated\nreturn 1;\n}\nfunction b() {\nreturn 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert ++sentinel, edit function a"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 5 P1: a follow-up that removes the main round's
+  // hunk from its OWN location but separately types the identical text somewhere else in the file —
+  // a NEW occurrence, not a pre-existing one the round-4 test already covers — must not be credited
+  // via a file-wide occurrence count that can't tell the two locations apart.
+  it("returns false when a follow-up reverts a hunk at its own location but adds a brand-new duplicate of its text elsewhere", async () => {
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round's fix is a pure addition inside function b. "  return true;" appears nowhere else
+    // in the pre-session file.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return 1;\n}\nfunction b() {\n  return true;\n  return 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: fix function b"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up drops the fix from function b (reverting it) but separately adds a new
+    // line to function a that happens to read the exact same text. A file-wide count sees one
+    // occurrence in the final file against zero in the pre-session file and wrongly calls that
+    // "grew" — even though the actual reviewed hunk, at its own location in function b, is gone.
+    writeFileSync(
+      join(dir, "app.ts"),
+      "function a() {\n  return 1;\n  return true;\n}\nfunction b() {\n  return 2;\n}\n",
+    );
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: revert fix in b, add unrelated duplicate text in a"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+
+  // PR #338 review, chatgpt-codex-connector, round 5 P2: a binary content change has no text to
+  // parse into hunks at all (`git diff -U0` reports "Binary files ... differ", no `@@` lines), and
+  // the mode is untouched, so there is no signal to distinguish a survived fix from a follow-up that
+  // reverted it while separately re-editing the same binary file. This must fail closed rather than
+  // default to "survived".
+  it("returns false (fails closed) when a gate follow-up further edits a binary file the main round changed, with no parsed hunks", async () => {
+    writeFileSync(join(dir, "asset.bin"), Buffer.from([0x00, 0x01, 0x02, 0x03]));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "base"]);
+    const preSessionHead = g(["rev-parse", "HEAD"]);
+
+    // Main round replaces the binary content; mode stays the same.
+    writeFileSync(join(dir, "asset.bin"), Buffer.from([0x10, 0x11, 0x12, 0x13]));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "main round: replace binary asset"]);
+    const preGateHead = g(["rev-parse", "HEAD"]);
+
+    // The gate follow-up edits the SAME binary file to a THIRD blob — byte-for-byte
+    // indistinguishable from "reverted the main round's fix, then made an unrelated tweak".
+    writeFileSync(join(dir, "asset.bin"), Buffer.from([0x20, 0x21, 0x22, 0x23]));
+    g(["add", "-A"]);
+    g(["commit", "-q", "-m", "follow-up: further edit binary asset"]);
+    const postSessionHead = g(["rev-parse", "HEAD"]);
+
+    expect(
+      await mainRoundChangesSurvived(dir, preSessionHead, preGateHead, postSessionHead),
+    ).toBe(false);
+  });
+});
+
 // anton-gvqk3: a gate parking the fix session must say so on the PR itself — the run-log entry
 // runTestGate already produces is invisible to a human reading only the PR, who otherwise sees a
 // stale CONFLICTING/CI badge and nothing about why anton stopped.
@@ -1268,8 +2576,8 @@ describe("notifyGateParked (anton-gvqk3)", () => {
   let prevGh: string | undefined;
 
   // Fake gh with just enough state to prove dedup: posted comment bodies persist to `storeFile`, and
-  // `pr view --json comments` reads them back — so a second `notifyGateParked` call sees exactly what
-  // the first one posted, the same way the real PR would.
+  // the paginated `api graphql` comments query (getPrTopLevelComments) reads them back — so a second
+  // `notifyGateParked` call sees exactly what the first one posted, the same way the real PR would.
   function installFakeGh(): void {
     const fakeGh = join(binDir, "gh");
     writeFileSync(
@@ -1279,10 +2587,13 @@ const fs = require('fs');
 const a = process.argv.slice(2);
 const store = process.env.ANTON_TEST_COMMENTS_STORE;
 if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
-if (a[0] === 'pr' && a[1] === 'view' && a.includes('comments')) {
+if (a[0] === 'api' && a[1] === 'graphql') {
   let bodies = [];
   try { bodies = JSON.parse(fs.readFileSync(store, 'utf8')); } catch {}
-  process.stdout.write(JSON.stringify({ comments: bodies.map((b) => ({ body: b })) }));
+  process.stdout.write(JSON.stringify({ data: { repository: { pullRequest: { comments: {
+    pageInfo: { hasNextPage: false, endCursor: null },
+    nodes: bodies.map((b, i) => ({ id: 'IC_' + i, author: { login: 'someone' }, body: b })),
+  } } } } }));
   process.exit(0);
 }
 if (a[0] === 'pr' && a[1] === 'comment') {
@@ -1401,5 +2712,40 @@ process.exit(0);
     });
 
     expect(postedComments()).toHaveLength(2);
+  });
+
+  // PR #338 review round 3 (@claude): this is the only call site, firing from a poison park's catch
+  // block — a parked job isn't retried by the normal sweep at the same head, so nothing calls this
+  // again until a human resumes it or the head changes. Skipping on a degraded read (the round-2 fix
+  // below) would therefore drop the notification rather than merely delay it, so it now posts
+  // best-effort — deduping against whatever partial history it could read — and accepts the small
+  // risk of an occasional duplicate over silently parking with no PR-facing explanation.
+  it("still posts when the comment history read is incomplete, favoring a possible duplicate over silence", async () => {
+    const fakeGh = join(binDir, "gh");
+    writeFileSync(
+      fakeGh,
+      `#!/usr/bin/env node
+const fs = require('fs');
+const a = process.argv.slice(2);
+if (a[0] === 'repo' && a[1] === 'view') { process.stdout.write('o/r\\n'); process.exit(0); }
+if (a[0] === 'api' && a[1] === 'graphql') { process.exit(1); }
+if (a[0] === 'pr' && a[1] === 'comment') {
+  fs.appendFileSync(process.env.ANTON_TEST_GH_LOG, JSON.stringify(a) + '\\n');
+  process.exit(0);
+}
+process.exit(0);
+`,
+    );
+    chmodSync(fakeGh, 0o755);
+
+    await notifyGateParked({
+      repo: sandbox,
+      number: 7,
+      error: new PoisonError("tests gate failed after review-fix for PR #7 (exit 3)\n\nboom"),
+      conflicts: [],
+      signal: new AbortController().signal,
+    });
+
+    expect(postedComments()).toHaveLength(1);
   });
 });
