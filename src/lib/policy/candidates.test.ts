@@ -8,8 +8,9 @@
  * disagreed with it would claim available work where the picker has none.
  */
 import { describe, expect, it } from "vitest";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import type { Bead } from "../beads/types";
-import { policyCandidates } from "./candidates";
+import { policyCandidates as projectPolicyCandidates } from "./candidates";
 
 /** A dated, contract-shaped bead — nothing for the approve gate to fault. */
 const bead = (o: Partial<Bead> & { id: string }): Bead => ({
@@ -22,6 +23,11 @@ const bead = (o: Partial<Bead> & { id: string }): Bead => ({
   ...o,
 });
 
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+const policyCandidates = (board: Bead[], now?: Date) =>
+  projectPolicyCandidates(authoritative(board), now);
 const ids = (board: Bead[], now?: Date) => policyCandidates(board, now).candidates.map((c) => c.id);
 
 describe("policyCandidates", () => {
@@ -112,6 +118,24 @@ describe("policyCandidates", () => {
       bead({ id: "gate", status: "open" }),
     ];
     expect(ids(board)).toContain("feature");
+  });
+
+  it("fails closed when it cannot establish that a board is cycle-free", () => {
+    const board = [bead({ id: "feature", issue_type: "feature" })];
+
+    expect(projectPolicyCandidates(board)).toEqual({ candidates: [], notStartable: 1 });
+  });
+
+  it("withholds a feature when authoritative cycle evidence names its ready children", () => {
+    const board = attachCycleEvidence([
+      bead({ id: "feature", issue_type: "feature" }),
+      bead({ id: "free", parent: "feature" }),
+      bead({ id: "a", parent: "feature", dependencies: [{ issue_id: "a", depends_on_id: "b", type: "blocks" }] }),
+      bead({ id: "b", parent: "feature", dependencies: [{ issue_id: "b", depends_on_id: "a", type: "blocks" }] }),
+    ], [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }]);
+
+    expect(ids(board)).toEqual([]);
+    expect(policyCandidates(board).notStartable).toBe(1);
   });
 
   it("counts parent hops, so a policy can say `parentless work only` (anton-hmyo)", () => {

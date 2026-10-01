@@ -17,6 +17,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { proposalFingerprint } from "../gardener/detections";
 import type { ProjectSettings } from "../projects";
 import { quotaMeterKey } from "../quota-meter";
@@ -272,5 +273,45 @@ describe("beginEpicRun — the run-row model", () => {
     await start([bead("t1", { labels: [LABELS.approved, "risk:high"] })], "t1");
 
     expect(createRunMock.mock.calls[0][2]).toMatchObject({ model: "fallback" });
+  });
+});
+
+describe("beginEpicRun — the structure/cycle re-check (PR #274 review)", () => {
+  // Approval only guarantees a run's own tickets were cycle-free AT APPROVAL TIME. A cross-machine
+  // Dolt merge can land an internal `blocks` cycle among this run's own tickets after that check
+  // passed but before the job dispatches — `runReadiness` treats an internal edge as ordering, not a
+  // blocker, so it never sees the cycle, and `orderTickets` (execute-epic-board.ts) falls back to
+  // input order rather than refusing. This gate is what refuses the run instead of dispatching a
+  // ticket ahead of a prerequisite the edges say it must follow.
+  it("poisons a run whose own tickets sit in a blocks cycle bd reports", async () => {
+    const target = bead("e1", { issue_type: "epic" });
+    const t1 = bead("t1", { parent: "e1", dependencies: [{ type: "blocks", issue_id: "t1", depends_on_id: "t2" }] });
+    const t2 = bead("t2", { parent: "e1", dependencies: [{ type: "blocks", issue_id: "t2", depends_on_id: "t1" }] });
+    const board = [target, t1, t2];
+    attachCycleEvidence(board, [{ ids: ["t1", "t2"], raw: {} }]);
+
+    const refusal = await start(board, "e1");
+
+    expect(refusal).toBeInstanceOf(PoisonEpic);
+    const message = (refusal as Error).message;
+    expect(message).toContain("e1");
+    expect(message).toContain("breaks the tier structure");
+    expect(message).toContain("sits in a blocks cycle");
+    expect(message).toContain("t1");
+    expect(message).toContain("t2");
+    // Nothing held: the run never reaches a worktree or a claim over a graph it cannot dispatch.
+    expect(createRunMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves a cycle-free target alone — bd's own evidence says the graph is safe to dispatch", async () => {
+    const target = bead("e2", { issue_type: "epic" });
+    const t1 = bead("t1", { parent: "e2" });
+    const t2 = bead("t2", { parent: "e2", dependencies: [{ type: "blocks", issue_id: "t2", depends_on_id: "t1" }] });
+    const board = [target, t1, t2];
+    attachCycleEvidence(board, []);
+
+    await start(board, "e2");
+
+    expect(createRunMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -100,7 +100,7 @@ export function isUnit(b: Bead): boolean {
  * ITSELF — resolved (closed) ⇒ no longer blocking — which is exactly what the standalone-blocker
  * helpers below do with an unattributable blocker.
  */
-function runTargetResolver(all: Bead[]): (id: string) => string | undefined {
+export function runTargetResolver(all: Bead[]): (id: string) => string | undefined {
   const byId = new Map(all.map((b) => [b.id, b]));
   return (id: string) => {
     const seen = new Set<string>();

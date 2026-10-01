@@ -8,9 +8,13 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { LABELS, type Bead, type BeadDep } from "../beads/bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import type { PickerExclusionReason } from "../board-picker-plan";
 import { proposalFingerprint } from "../gardener/detections";
-import { eligibleTargets, ineligibility } from "./picker-targets";
+import {
+  eligibleTargets as projectEligibleTargets,
+  ineligibility as projectIneligibility,
+} from "./picker-targets";
 
 // Nothing in the decision may shell out: it is a pure function of a snapshot, and a `bd` spawn on
 // the picker's tick is the cost the whole mechanical-picker design exists to avoid (D3).
@@ -28,6 +32,13 @@ vi.mock("node:child_process", async (importOriginal) => ({
 function bead(id: string, o: Partial<Bead> = {}): Bead {
   return { id, title: id, status: "open", issue_type: "task", ...o };
 }
+
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+const eligibleTargets = (board: Bead[]) => projectEligibleTargets(authoritative(board));
+const ineligibility = (target: Bead, board: Bead[]) =>
+  projectIneligibility(target, authoritative(board));
 
 /** A `blocks` edge as bd inlines it: from = the dependent, to = the blocker. */
 const blockedBy = (dependent: string, blocker: string): BeadDep => ({
@@ -239,6 +250,20 @@ describe("eligibleTargets", () => {
     const board = [bead("t3"), bead("t1"), bead("t2")];
 
     expect(eligibleTargets(board).eligible.map((b) => b.id)).toEqual(["t3", "t1", "t2"]);
+  });
+
+  it("excludes a target from picker apply when its snapshot carries a reported cycle", () => {
+    const board = attachCycleEvidence([
+      authored("a", { dependencies: [blockedBy("a", "b")] }),
+      authored("b", { dependencies: [blockedBy("b", "a")] }),
+    ], [{ ids: ["a", "b"], raw: { cycle: ["a", "b"] } }]);
+
+    const { eligible, exclusions } = eligibleTargets(board);
+    expect(eligible).toEqual([]);
+    expect(exclusions).toEqual([
+      expect.objectContaining({ beadId: "a", reason: "approval-gap", detail: expect.stringContaining("blocks cycle") }),
+      expect.objectContaining({ beadId: "b", reason: "approval-gap", detail: expect.stringContaining("blocks cycle") }),
+    ]);
   });
 });
 

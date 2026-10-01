@@ -1075,6 +1075,65 @@ export async function branchDelivery(
   return { how: "sibling", by, inherited: !(await reads.branchAdded(by.sha)) };
 }
 
+/**
+ * The other half of a `blocks` cycle with `ticket` whose ordering a regeneration right now would
+ * violate, and which way it breaks — evidence that this run's dispatch order either ran a
+ * dependent ahead of `ticket`, or is about to run `ticket` ahead of a prerequisite it names
+ * itself. Neither a valid topological order ({@link orderTickets}) ever produces. The only way
+ * either happens is the cycle fallback: `blocks` edges among the run's own tickets that
+ * `orderTickets` could not place, so it dispatched in source order instead.
+ *
+ * Both directions have to be checked (P2 review, PR #274 round 2): source order can land the
+ * closed member on EITHER side of its cycle partner. The first check is the one PR #274 already
+ * caught — a dependent that already ran ahead of `ticket`. The second catches `ticket` itself
+ * about to run ahead of its own prerequisite, which `onBranch` alone can't see when the closed
+ * member simply comes first in source order: at that point `onBranch` is empty, so it reads as
+ * "nothing has happened yet" rather than "the order is already broken".
+ *
+ * The second check needs a PATH back to `ticket`, not a direct reverse edge (P2 review, PR #274
+ * round 3): a cycle of three or more tickets (`A → B → C → A`) closes through `C`, not through a
+ * `B → A` edge that never exists. Walking the whole `blocks` graph from the prerequisite is what
+ * keeps this scoped to the internal cycle — an ordinary blocker outside this run's own ticket set
+ * would never land in `onBranch` either, but it isn't cyclic and has no path back to `ticket`.
+ */
+function cyclicOrderViolation(
+  ticket: Bead,
+  all: Bead[],
+  onBranch: ReadonlySet<string>,
+): { other: string; ranAhead: boolean } | undefined {
+  const edges = beads.edgesOf(all).filter((e) => e.type === "blocks");
+  for (const e of edges) {
+    if (e.to === ticket.id && onBranch.has(e.from)) return { other: e.from, ranAhead: true };
+  }
+  for (const e of edges) {
+    if (e.from === ticket.id && !onBranch.has(e.to) && pathExists(e.to, ticket.id, edges)) {
+      return { other: e.to, ranAhead: false };
+    }
+  }
+  return undefined;
+}
+
+/** Whether `to` is reachable from `from` by following `blocks` edges (`e.from` depends on
+ * `e.to`) — a cycle of any length back to `to`, not just a direct mutual edge. */
+function pathExists(
+  from: string,
+  to: string,
+  edges: ReadonlyArray<{ from: string; to: string }>,
+): boolean {
+  const stack = [from];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === to) return true;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    for (const e of edges) {
+      if (e.from === cur) stack.push(e.to);
+    }
+  }
+  return false;
+}
+
 /** One ticket's turn: skip what is already here, hold what lost its mechanism, run the rest. */
 async function dispatchTicket(
   run: EpicRun,
@@ -1191,6 +1250,32 @@ async function dispatchTicket(
   // work must be regenerated here. Reopen a closed child first so runTicket's claim + close
   // operate on a live bead (a standalone target is never closed, so it needs no reopen).
   if (doneOnBoard && ticket.status === "closed") {
+    // A closed member is what let the board's cycle gate wave this ticket's `blocks` loop through
+    // as resolved (tiers.mjs `cycleMembers`'s `allLive` — one closed member breaks a live
+    // deadlock). That is only true when the close carried real, landed work; a cross-machine
+    // resume finding no commit for it here means it did not, so the loop is live again the moment
+    // this reopen runs. Only possible because `orderTickets` (execute-epic-board.ts) fell back to
+    // source order over that same cycle — either the ticket that blocks-depends on it already
+    // dispatched, or (P2 review, PR #274 round 2) source order put the closed member first and
+    // it is about to run ahead of its OWN prerequisite. Either way the run has executed, or is
+    // about to execute, one side of the loop ahead of the prerequisite the other side encoded.
+    // Fail loud instead of reopening into an order the graph itself says is impossible.
+    const violation = cyclicOrderViolation(ticket, all, onBranch);
+    if (violation) {
+      const { other, ranAhead } = violation;
+      throw new PoisonEpic(
+        `${ticket.id} must be regenerated — it is closed on the board but its commit is missing ` +
+          `from this branch — but ${
+            ranAhead
+              ? `${other} already ran ahead of it in this run's dispatch order`
+              : `regenerating it now would run it ahead of ${other}, its own \`blocks\` prerequisite`
+          }. That order came from a \`blocks\` cycle between them that the board's structure ` +
+          `gate treats as resolved once one member closes; ${ticket.id} closing without its work ` +
+          `landing here means the loop never actually resolved. Break the cycle ` +
+          `(\`bd dep remove ${other} ${ticket.id}\` or the reverse, whichever edge is stale) ` +
+          `and re-run.`,
+      );
+    }
     await reopenForRegeneration(repo, ticket);
   }
   try {

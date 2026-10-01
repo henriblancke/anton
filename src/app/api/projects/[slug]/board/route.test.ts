@@ -20,8 +20,9 @@ const getBoardVersion = vi.fn(async () => "2:sync");
 vi.mock("@/lib/board", () => ({ getBoard, getBoardVersion }));
 
 const probeAllIssues = vi.fn();
+const probeCycleEvidence = vi.fn();
 const refreshAllIssues = vi.fn(async (): Promise<[]> => []);
-vi.mock("@/lib/beads/issues", () => ({ probeAllIssues, refreshAllIssues }));
+vi.mock("@/lib/beads/issues", () => ({ probeAllIssues, probeCycleEvidence, refreshAllIssues }));
 
 const { GET } = await import("./route");
 

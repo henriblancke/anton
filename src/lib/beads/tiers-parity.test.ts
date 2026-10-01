@@ -12,6 +12,8 @@
 import { describe, expect, it } from "vitest";
 import { beads } from "./bd";
 import { isPipelineArtifact } from "./contract";
+import { parseDepCycles as parseDepCyclesForCli } from "./cycles.mjs";
+import { parseDepCycles } from "./hygiene";
 import { isContainer, parentOf, validateBoardStructure } from "./structure";
 import type { Bead } from "./types";
 
@@ -65,5 +67,62 @@ describe("tiers.mjs agrees with the app's TypeScript predicates", () => {
     expect(beads.isAbandoned(dropped)).toBe(true);
     const board = [bead("e", "epic"), bead("f", "feature", { parent: "e" }), dropped];
     expect(validateBoardStructure(board).some((v) => v.id === "stray")).toBe(false);
+  });
+
+  it("reads a `blocks` edge in the same direction beads.edgesOf does — issue_id is the DEPENDENT", () => {
+    // bd stores `blocks` as (issue_id = dependent, depends_on_id = blocker). A copy that read the
+    // pair backwards would fault the blocker for waiting on its own dependent instead of the other
+    // way round, so pin the direction against the app's own edge reader.
+    const blocker = bead("blocker", "task");
+    const dependent = bead(
+      "dependent",
+      "task",
+      { dependencies: [{ issue_id: "dependent", depends_on_id: "blocker", type: "blocks" }] },
+    );
+    const board = [blocker, dependent];
+    const [edge] = beads.edgesOf(board);
+    expect(edge).toEqual({ from: "dependent", to: "blocker", type: "blocks" });
+    expect(validateBoardStructure(board).some((v) => v.id === edge.from)).toBe(false);
+  });
+
+  it("does not fire blocks-edge-dangling on a `blocks` edge whose target is a `gate` bead", () => {
+    // 121 of this project's own live edges are exactly this shape — a ticket waiting on an ad-hoc
+    // merge gate. A gate found in the board is FOUND, never treated as though it were missing.
+    const gate = bead("gate1", "gate");
+    const waiter = bead("waiter", "task", {
+      dependencies: [{ issue_id: "waiter", depends_on_id: "gate1", type: "blocks" }],
+    });
+    const board = [gate, waiter];
+    expect(validateBoardStructure(board).some((v) => v.rule === "blocks-edge-dangling")).toBe(false);
+  });
+
+  it("shares cycle parsing between the release CLI and typed facade", () => {
+    const raw = JSON.stringify([
+      { cycle: ["a", { id: "b" }] },
+      { path: [{ issue_id: "c" }, "d"] },
+      { ids: ["e"] },
+    ]);
+
+    expect(parseDepCycles(raw)).toEqual(parseDepCyclesForCli(raw));
+  });
+
+  it("keeps malformed cycle evidence unreadable at both seams", () => {
+    expect(parseDepCyclesForCli("not json")).toBeNull();
+    expect(parseDepCyclesForCli(JSON.stringify({ cycle: ["a", "b"] }))).toBeNull();
+    expect(() => parseDepCycles("not json")).toThrow(/refusing to report unreadable cycle evidence/);
+    expect(() => parseDepCycles(JSON.stringify({ cycle: ["a", "b"] }))).toThrow(/could not read its --json output/);
+  });
+
+  it("forwards parsed bd cycle evidence through the typed facade", () => {
+    const board = [
+      bead("a", "task", { dependencies: [{ issue_id: "a", depends_on_id: "b", type: "blocks" }] }),
+      bead("b", "task", { dependencies: [{ issue_id: "b", depends_on_id: "a", type: "blocks" }] }),
+    ];
+    const cycles = parseDepCycles(JSON.stringify([{ cycle: ["a", "b"] }]));
+
+    expect(validateBoardStructure(board, { cycles }).map((v) => [v.id, v.rule])).toEqual([
+      ["a", "blocks-cycle"],
+      ["b", "blocks-cycle"],
+    ]);
   });
 });

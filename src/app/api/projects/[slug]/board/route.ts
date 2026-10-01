@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getBoard, getBoardVersion } from "@/lib/board";
-import { probeAllIssues, refreshAllIssues } from "@/lib/beads/issues";
+import { probeAllIssues, probeCycleEvidence, refreshAllIssues } from "@/lib/beads/issues";
 import { resolveProject } from "../resolve-project";
 
 export const dynamic = "force-dynamic";
@@ -21,6 +21,7 @@ export async function GET(
     // A stale TTL or completed sync starts one background comparison. Unchanged data keeps the
     // same version and therefore never causes a full board download.
     probeAllIssues(project.repoPath);
+    probeCycleEvidence(project.repoPath);
     const currentVersion = await getBoardVersion(project);
     if (knownVersion === currentVersion) {
       return new NextResponse(null, { status: 304 });

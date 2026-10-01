@@ -4,6 +4,7 @@
  * everything here is pure over bd's stdout.
  */
 import { num, pick, str, strings } from "./bd-json";
+import { parseDepCycles as parseDepCyclesForCli } from "./cycles.mjs";
 import type { Bead } from "./types";
 
 // ── board hygiene verbs (anton-6qbc) ──
@@ -119,10 +120,13 @@ export interface OrphanBead {
  * `raw` is carried deliberately. bd REFUSES to create a blocking cycle at every write path there is
  * — `dep add` (with and without `--no-cycle-check`), `link`, `batch`, and `import` (which skips the
  * offending edge) all reject it, measured on 1.1.0 and 1.1.2 — so a populated cycle list can only
- * come from a merge or a corrupted graph, and the EMPTY shape (`[]`) is the only one obtainable to
- * pin a parse against. Rather than guess, {@link parseDepCycles} extracts ids from the encodings bd
- * plausibly uses and hands the untouched element through as `raw`, so a report can always render
- * something truthful even if `ids` comes back empty.
+ * come from a merge or a corrupted graph, and the EMPTY shape (`[]`) is the only one obtainable
+ * from a live `bd` to pin a parse against. The populated shape is confirmed instead against bd's own
+ * source (`issueops.Cycle{Members []CycleMember \`json:"members"\`, Partial bool}`, output bare via
+ * `outputJSON(report.Cycles)`) rather than guessed — {@link parseDepCycles} reads the `members` key
+ * alongside the other encodings bd's CLI help and older exports have used, and hands the untouched
+ * element through as `raw`, so a report can always render something truthful even if `ids` comes
+ * back empty for a shape bd changes to next.
  */
 export interface DepCycle {
   /** The bead ids on the cycle, best-effort — may be empty if bd's element shape is unrecognised. */
@@ -287,19 +291,14 @@ export function parseOrphans(raw: string): OrphanBead[] {
  * is the finding, and swallowing it would hide the one condition this verb exists to surface.
  */
 export function parseDepCycles(raw: string): DepCycle[] {
-  const parsed = parseHygieneJson(raw, "dep cycles");
-  if (!Array.isArray(parsed)) return [];
-  const idsOf = (node: unknown): string[] => {
-    if (typeof node === "string") return [node];
-    if (Array.isArray(node)) return node.flatMap(idsOf);
-    const o = node as Record<string, unknown> | null;
-    if (!o || typeof o !== "object") return [];
-    const named = o.cycle ?? o.path ?? o.ids ?? o.issue_ids ?? o.issues ?? o.nodes;
-    if (named !== undefined) return idsOf(named);
-    const id = str(o.id) ?? str(o.issue_id);
-    return id ? [id] : [];
-  };
-  return parsed.map((entry) => ({ ids: idsOf(entry), raw: entry }));
+  const cycles = parseDepCyclesForCli(raw);
+  if (cycles === null) {
+    throw new Error(
+      `bd dep cycles: could not read its --json output (bd output format changed?) — ` +
+        `refusing to report unreadable cycle evidence as a cycle-free board. Output: ${raw.slice(0, 200)}`,
+    );
+  }
+  return cycles;
 }
 
 /**

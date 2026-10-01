@@ -18,6 +18,7 @@ import {
   type DetectionInput,
 } from "@/lib/gardener/detections";
 import { LABELS } from "@/lib/beads/bd";
+import { attachCycleEvidence } from "@/lib/beads/cycle-evidence";
 import type { Policy } from "@/lib/policy/types";
 
 /** A dated, contract-shaped bead — nothing for the picker's own eligibility gate to fault. */
@@ -70,7 +71,11 @@ describe("the picker's mark", () => {
     const target = bead({ id: "anton-1", issue_type: "bug", labels: ["severity:critical"] });
     const policy: Policy = { types: ["bug"], labels: [{ namespace: "severity", values: ["critical"] }] };
 
-    const marks = boardProvenance({ board: [target], plan: plan(), policy }).get("anton-1");
+    const marks = boardProvenance({
+      board: attachCycleEvidence([target], []),
+      plan: plan(),
+      policy,
+    }).get("anton-1");
 
     expect(marks).toEqual([
       // The discovered namespace is the narrowest lever, so it is the one `admittingCriterion` picks.

@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { LABELS, type Bead } from "../beads/bd";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { indexBoard } from "../gardener/board-index";
 import { bead, NOW } from "./board.fixture";
 import type { PmClaimStart } from "./report";
@@ -14,20 +15,25 @@ import { startRefusal, START_GUARDS } from "./start-guards";
 
 const RUBRIC = "- [ ] it ships";
 
-const BOARD = [
-  /** A parentless task with a rubric: a run target the picker would offer, missing only the gate. */
-  bead("anton-ready", { acceptance_criteria: RUBRIC }),
-  bead("anton-granted", { acceptance_criteria: RUBRIC, labels: [LABELS.approved] }),
-  bead("anton-taken", { acceptance_criteria: RUBRIC, assignee: "runner-7" }),
-  bead("anton-card", { issue_type: "feature", acceptance_criteria: RUBRIC }),
-  bead("anton-ticket", { parent: "anton-card", acceptance_criteria: RUBRIC }),
-  // Both bars describe this one: it carries the gate AND nothing would dispatch it.
-  bead("anton-granted-ticket", {
-    parent: "anton-card",
-    acceptance_criteria: RUBRIC,
-    labels: [LABELS.approved],
-  }),
-];
+// Nominal cycle evidence: a completed `bd dep cycles` read with no cycles — the approve gate this
+// suite exercises now refuses to answer without it.
+const BOARD = attachCycleEvidence(
+  [
+    /** A parentless task with a rubric: a run target the picker would offer, missing only the gate. */
+    bead("anton-ready", { acceptance_criteria: RUBRIC }),
+    bead("anton-granted", { acceptance_criteria: RUBRIC, labels: [LABELS.approved] }),
+    bead("anton-taken", { acceptance_criteria: RUBRIC, assignee: "runner-7" }),
+    bead("anton-card", { issue_type: "feature", acceptance_criteria: RUBRIC }),
+    bead("anton-ticket", { parent: "anton-card", acceptance_criteria: RUBRIC }),
+    // Both bars describe this one: it carries the gate AND nothing would dispatch it.
+    bead("anton-granted-ticket", {
+      parent: "anton-card",
+      acceptance_criteria: RUBRIC,
+      labels: [LABELS.approved],
+    }),
+  ],
+  [],
+);
 
 const index = indexBoard(BOARD);
 

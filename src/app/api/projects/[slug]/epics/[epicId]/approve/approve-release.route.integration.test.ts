@@ -54,7 +54,7 @@ async function projectId(): Promise<string> {
  * digest would make every plan here stale, which is precisely the case a release must not record.
  */
 async function liveStamp(): Promise<BoardStamp> {
-  const board = await loadAllIssues(repo);
+  const board = await loadAllIssues(repo, { withCycles: true });
   return stampBoard(board, Date.now());
 }
 
@@ -71,7 +71,7 @@ async function liveStamp(): Promise<BoardStamp> {
  * rule, and neither is a literal a test may assume.
  */
 async function livePlan(): Promise<BoardPickerPlan> {
-  const board = await loadAllIssues(repo);
+  const board = await loadAllIssues(repo, { withCycles: true });
   const project = await projectId();
   const now = Date.now();
   await saveBoardPickerPlan(getDb(), { now: () => now }, {

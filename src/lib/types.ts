@@ -381,12 +381,17 @@ export interface UpNextEntry {
  *     rather than about the operator's board, and it is still named: a lane that ranked everything
  *     structurally eligible would present targets the configured policy rejects as what anton would
  *     start next.
+ *   • `cycles-unavailable` — `bd dep cycles` timed out or returned unreadable output, so every
+ *     target's approval gate fails closed on the missing evidence (`missingCycleEvidenceGap`). Named
+ *     rather than left to read as `no-claimable-work`: that would tell the operator the board is
+ *     genuinely empty when the real cause is an auxiliary query that the next read retries.
  */
 export type UpNextAbsence =
   | "disarmed"
   | "proposes-only"
   | "no-claimable-work"
-  | "policy-unreadable";
+  | "policy-unreadable"
+  | "cycles-unavailable";
 
 /** Per-project beads↔Dolt sync health, read from the sync-status registry (bd.ts). Mirrors
  * SyncStatus there — kept as a separate declaration so client components import types without the

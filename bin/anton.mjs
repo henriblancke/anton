@@ -65,6 +65,7 @@ import {
 } from "../src/lib/beads/config.mjs";
 import { configureServerMode } from "../src/lib/beads/server-mode.mjs";
 import { buildStructureReport, formatStructureReport } from "../src/lib/beads/tiers.mjs";
+import { parseDepCycles } from "../src/lib/beads/cycles.mjs";
 import { listFiles, skillState } from "../src/lib/claude/skill-stamp.mjs";
 import {
   buildDrift,
@@ -1500,12 +1501,119 @@ function bdList(repo, extra) {
   return exec("bd", ["-C", repo, "list", ...extra, "--json", "--limit", "0"], budgetMs("network"));
 }
 
-/** bd's listing as an array, or null when this build's output can't be parsed. */
+/** The authoritative cycle query, through the same project-scoped runner as the board listing. */
+function bdDepCycles(repo) {
+  const exec = scopedBdRunner(repo, readDoltMetadata(repo));
+  return exec("bd", ["-C", repo, "dep", "cycles", "--json"], budgetMs("network"));
+}
+
+/**
+ * Whether every id `cycles` names carries the same live/abandoned status AND the same parent in both
+ * board snapshots. `sameBlocksEdges` alone only proves the `blocks` EDGES held steady — another writer
+ * can reopen a closed cycle member, or toggle its `abandoned` label, without touching any edge at all
+ * (P2 review, PR #274). `validateBoardStructure` reads a cycle's blocking-ness off its members'
+ * live/abandoned status, not off the edges, so that drift would pair fresh cycle evidence with stale
+ * liveness and could pass a cycle that just went live, or fault one that just went dead. A reparent is
+ * the same kind of gap for `buildStructureReport`'s subtree-scoped fault attribution: moving a cycle
+ * member to a different parent between the two reads leaves edges and live/abandoned status alone
+ * while the fault's rightful owner moves (P2 review, PR #274, issues.ts:419). Mirrors
+ * `src/lib/beads/issues.ts`'s `sameCycleMemberLiveness`, which this plain-Node launcher can't import
+ * (that file is TS).
+ */
+function sameCycleMemberLiveness(cycles, a, b) {
+  const memberIds = new Set(cycles.flatMap((cycle) => cycle.ids));
+  if (memberIds.size === 0) return true;
+  const liveKey = (board) => {
+    const byId = new Map(board.map((bead) => [bead.id, bead]));
+    return (id) => {
+      const bead = byId.get(id);
+      if (!bead) return undefined;
+      const parent = bead.parent ?? bead.parent_id ?? "";
+      return `${bead.status}:${(bead.labels ?? []).includes("abandoned")}:${parent}`;
+    };
+  };
+  const [keyA, keyB] = [liveKey(a), liveKey(b)];
+  return [...memberIds].every((id) => keyA(id) === keyB(id));
+}
+
+/**
+ * Whether two board reads agree on every `blocks` edge — the only edge type `bd dep cycles` walks.
+ * Mirrors `src/lib/beads/issues.ts`'s `sameBlocksEdges`, which this plain-Node launcher can't import
+ * (that file is TS).
+ */
+function sameBlocksEdges(a, b) {
+  const toSet = (board) => {
+    const keys = new Set();
+    for (const bead of board) {
+      for (const dep of bead.dependencies ?? []) {
+        if (dep?.type === "blocks") keys.add(`${bead.id}>${dep.depends_on_id}`);
+      }
+    }
+    return keys;
+  };
+  const [setA, setB] = [toSet(a), toSet(b)];
+  return setA.size === setB.size && [...setA].every((k) => setB.has(k));
+}
+
+/**
+ * Whether two FULL board reads agree on membership and every structural fact
+ * `validateBoardStructure` reads off a bead — status, parent, issue_type, and label set — for
+ * EVERY id either board carries, not just those a `blocks` edge or a reported cycle touches.
+ * `sameBlocksEdges` and `sameCycleMemberLiveness` only ever look at the graph `bd dep cycles`
+ * walks; a plain reparent that adds a board's first feature under a legacy epic touches neither —
+ * no `blocks` edge moves and no cycle member changes — so both existing checks pass while
+ * `cmdBoardCheck` would otherwise keep the STALE `read.board` that `buildStructureReport` runs
+ * against, silently missing the epic's newly-stranded pre-existing tickets (P2 review, PR #274,
+ * bin/anton.mjs:1769). Mirrors `src/lib/beads/issues.ts`'s `sameTargetEligibilityState`, which this
+ * plain-Node launcher can't import (that file is TS), generalized to every id on the board rather
+ * than one candidate.
+ */
+function sameBoardStructure(a, b) {
+  const key = (board) => {
+    const byId = new Map(board.map((bead) => [bead.id, bead]));
+    return (id) => {
+      const bead = byId.get(id);
+      if (!bead) return undefined;
+      const parent = bead.parent ?? bead.parent_id ?? "";
+      return `${bead.status}:${bead.issue_type}:${parent}:${[...(bead.labels ?? [])].sort().join(",")}`;
+    };
+  };
+  const [idsA, idsB] = [new Set(a.map((bead) => bead.id)), new Set(b.map((bead) => bead.id))];
+  if (idsA.size !== idsB.size) return false;
+  const [keyA, keyB] = [key(a), key(b)];
+  return [...idsA].every((id) => idsB.has(id) && keyA(id) === keyB(id));
+}
+
+/**
+ * Whether two `bd dep cycles` results name the same set of cycles (by member id set). Mirrors
+ * `src/lib/beads/issues.ts`'s `sameCycles`, which this plain-Node launcher can't import (that file
+ * is TS).
+ */
+function sameCycles(a, b) {
+  const key = (cycle) => [...cycle.ids].sort().join(",");
+  const toSet = (list) => new Set(list.map(key));
+  const [setA, setB] = [toSet(a), toSet(b)];
+  return setA.size === setB.size && [...setA].every((k) => setB.has(k));
+}
+
+/** Bound on `cmdBoardCheck`'s re-list-and-compare retry — mirrors `issues.ts`'s
+ * `MAX_CYCLE_CONSISTENCY_RETRIES`, so a board under sustained shaping fails closed instead of
+ * spawning `bd list`/`bd dep cycles` forever. */
+const MAX_BOARD_CHECK_CYCLE_RETRIES = 3;
+
+/**
+ * bd's listing as an array, or null when this build's output can't be parsed. bd --json returns
+ * either a top-level array or a `{ <key>: [...] }` envelope — mirrors src/lib/beads/bd-json.ts's
+ * `asArray`, which this CLI bundle can't import (that file is TS; this is a plain-Node launcher).
+ */
 function parseBoard(stdout) {
   try {
     const parsed = JSON.parse(stdout || "[]");
+    if (Array.isArray(parsed)) return parsed;
+    if (Array.isArray(parsed?.issues)) return parsed.issues;
+    if (Array.isArray(parsed?.results)) return parsed.results;
     // bd omits the key entirely on an empty board rather than emitting [].
-    return Array.isArray(parsed) ? parsed : [];
+    return [];
   } catch {
     return null;
   }
@@ -1535,22 +1643,68 @@ function readBoard(repo) {
           : all.error.message,
     };
   }
+
+  let work;
   if (all.status === 0) {
-    const board = parseBoard(all.stdout);
-    return board ? { board } : { error: "bd returned output this build can't parse." };
+    work = parseBoard(all.stdout);
+    if (!work) return { error: "bd returned output this build can't parse." };
+  } else {
+    const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
+    const failed = [open, closed].some((r) => r.error || r.status !== 0);
+    // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
+    // the useful message is why `--status all` was refused, not why the second guess was.
+    if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+
+    const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+    if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
+    const byId = new Map();
+    for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+    work = [...byId.values()];
   }
 
-  const [open, closed] = [bdList(repo, []), bdList(repo, ["--status", "closed"])];
-  const failed = [open, closed].some((r) => r.error || r.status !== 0);
-  // Report the ORIGINAL failure: the fallback is a guess about which bd this is, and if it fails too
-  // the useful message is why `--status all` was refused, not why the second guess was.
-  if (failed) return { error: (all.stderr ?? "").trim() || `bd list exited ${all.status}` };
+  // bd omits pipeline gates from ordinary listings while retaining blocks edges that point to them.
+  // The structural rule needs the target record to distinguish a real gate from a dangling blocker.
+  const known = new Set(work.map((bead) => bead.id));
+  const needsGates = work.some((bead) =>
+    (bead.dependencies ?? []).some((dep) => dep?.type === "blocks" && !known.has(dep.depends_on_id)),
+  );
+  if (!needsGates) return { board: work };
 
-  const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
-  if (listings.some((l) => l === null)) return { error: "bd returned output this build can't parse." };
-  const byId = new Map();
-  for (const bead of listings.flat()) if (!byId.has(bead.id)) byId.set(bead.id, bead);
+  const fetched = fetchGates(repo);
+  if (fetched.error) return { error: fetched.error };
+  const byId = new Map(work.map((bead) => [bead.id, bead]));
+  for (const gate of fetched.gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
   return { board: [...byId.values()] };
+}
+
+/**
+ * Every pipeline gate in `repo`, `--status all` first and falling back to the same open+closed
+ * merge the rest of this file uses for bd builds that reject that flag. Shared by `readBoard`'s
+ * dangling-blocker hydration and `cmdBoardCheck`'s cycle-only-gates hydration below it — both need
+ * the WHOLE gate listing, since neither knows in advance which gate ids a dangling edge or a cycle
+ * will name.
+ */
+function fetchGates(repo) {
+  const gates = bdList(repo, ["--status", "all", "--type", "gate"]);
+  if (gates.error) return { error: gates.error.message };
+  if (gates.status === 0) {
+    const parsed = parseBoard(gates.stdout);
+    return parsed ? { gates: parsed } : { error: "bd returned output this build can't parse." };
+  }
+  // Gates are omitted from the regular list, so they need the same status compatibility fallback.
+  // Otherwise `/shape` supports the work listing but hard-fails when its graph has a gate edge.
+  const [open, closed] = [
+    bdList(repo, ["--type", "gate"]),
+    bdList(repo, ["--status", "closed", "--type", "gate"]),
+  ];
+  if ([open, closed].some((result) => result.error || result.status !== 0)) {
+    return { error: (gates.stderr ?? "").trim() || `bd list --type gate exited ${gates.status}` };
+  }
+  const listings = [parseBoard(open.stdout), parseBoard(closed.stdout)];
+  if (listings.some((listing) => listing === null)) return { error: "bd returned output this build can't parse." };
+  const byId = new Map();
+  for (const gate of listings.flat()) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+  return { gates: [...byId.values()] };
 }
 
 /**
@@ -1569,6 +1723,26 @@ function readBoard(repo) {
  *
  * Read-only: it never writes a bead. Repair is authoring work — the report names the bead in the
  * wrong place and the command that moves it, never what the right shape of the work is.
+ *
+ * `bd list` and `bd dep cycles` are independent live reads with no shared transaction: on a
+ * shared-server board another machine can repair (or introduce) a cycle in the gap between them,
+ * leaving `cycles` describe a graph the listed `board`'s own `blocks` edges no longer match —
+ * `buildStructureReport` never independently re-traverses those edges for cycles, so this mandatory
+ * gate could exit clean against an inconsistent snapshot. Re-lists and compares both `blocks` edges
+ * AND every reported cycle member's live/abandoned status (a status can flip without moving an
+ * edge) after the cycle query before trusting the pairing, the same `sameBlocksEdges` +
+ * `sameCycleMemberLiveness` retry `src/lib/beads/issues.ts`'s `loadAllIssues` runs, bounded by
+ * `MAX_BOARD_CHECK_CYCLE_RETRIES` and failing closed on a graph that keeps moving faster than it
+ * can be read consistently.
+ *
+ * The gate hydration below (for a cycle made entirely of gates no ordinary bead's `blocks` edge
+ * dangles toward) is its OWN live `bd list`, made after the checks above already passed — so it can
+ * itself land after another writer repairs the cycle `cycles` named and opens a DIFFERENT gate-only
+ * cycle under a different pair of gates (P2 review, PR #274). Left unrevalidated, `board` would
+ * carry the newer gate records while `cycles` still names only the repaired one, and the mandatory
+ * gate could exit clean despite the live cycle. Re-fetches `bd dep cycles` and re-reads the board
+ * after hydrating and retries the whole attempt on drift, the same `recheckCycleConsistency` +
+ * `recheckHydratedBlocksConsistency` pairing `loadAllIssues` runs post-hydration.
  */
 function cmdBoardCheck(args) {
   const paths = args.filter((a) => !a.startsWith("-"));
@@ -1580,13 +1754,140 @@ function cmdBoardCheck(args) {
       console.error(c.red(`No .beads/ at ${repo}`) + c.dim(" — run `anton init` there, or pass a repo path."));
       return 1;
     }
-    const { board, error } = readBoard(repo);
-    if (error) {
-      console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${error}`));
-      return 1;
+
+    let board, cycles;
+    attempts: for (let attempt = 0; ; attempt++) {
+      const giveUp = () => {
+        console.error(
+          c.red(`bd dep cycles failed in ${repo}`) +
+            c.dim(
+              `\ndependency graph kept moving across ${MAX_BOARD_CHECK_CYCLE_RETRIES + 1} reads of ` +
+                "bd list/bd dep cycles — giving up rather than pairing cycle evidence with a board it may not describe",
+            ),
+        );
+        return 1;
+      };
+
+      const read = readBoard(repo);
+      if (read.error) {
+        console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${read.error}`));
+        return 1;
+      }
+      const cycleResult = bdDepCycles(repo);
+      if (cycleResult.error || cycleResult.status !== 0) {
+        const detail = cycleResult.error?.code === "ENOENT"
+          ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+          : cycleResult.error?.message || (cycleResult.stderr ?? "").trim() || `bd dep cycles exited ${cycleResult.status}`;
+        console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
+        return 1;
+      }
+      const parsedCycles = parseDepCycles(cycleResult.stdout);
+      if (parsedCycles === null) {
+        console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
+        return 1;
+      }
+
+      const recheck = readBoard(repo);
+      if (recheck.error) {
+        console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${recheck.error}`));
+        return 1;
+      }
+      if (
+        !sameBlocksEdges(read.board, recheck.board) ||
+        !sameCycleMemberLiveness(parsedCycles, read.board, recheck.board) ||
+        !sameBoardStructure(read.board, recheck.board)
+      ) {
+        if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
+        continue attempts;
+      }
+
+      // `recheck.board`, not `read.board`: the checks above only prove the two reads AGREE, not
+      // which is current, and `recheck.board` is the later of the two — evaluate the report against
+      // the newer board now that graph compatibility is established.
+      let hydratedBoard = recheck.board;
+      const hydratedCycles = parsedCycles;
+
+      // A cycle can be made entirely of gates no ordinary bead's `blocks` edge dangles toward (two
+      // gates blocking each other, nothing else pointing at either) — `readBoard`'s own dangling-edge
+      // check never fires, so `board` never carries them. Left alone, `cycleMembers` can't map any of
+      // those ids and reports the cycle as unreadable — a synthetic, unscoped "board" fault that blocks
+      // every target even when `validateBoardStructure` would otherwise ignore a cycle with no live
+      // member (P2 review, PR #274). Hydrate whatever the evidence names that `board` is still missing
+      // before building the report, the same as `src/lib/beads/issues.ts`'s `loadAllIssues`.
+      const knownIds = new Set(hydratedBoard.map((bead) => bead.id));
+      const missingCycleIds = [...new Set(hydratedCycles.flatMap((cycle) => cycle.ids))].filter(
+        (id) => !knownIds.has(id),
+      );
+      if (missingCycleIds.length > 0) {
+        const fetched = fetchGates(repo);
+        if (fetched.error) {
+          console.error(c.red(`bd list --type gate failed in ${repo}`) + c.dim(`\n${fetched.error}`));
+          return 1;
+        }
+        const byId = new Map(hydratedBoard.map((bead) => [bead.id, bead]));
+        for (const gate of fetched.gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+        hydratedBoard = [...byId.values()];
+
+        // Revalidate rather than trust the pairing: this hydration is its own `bd list`, made after
+        // the checks above already passed, so it can itself land after another writer repairs the
+        // cycle `hydratedCycles` named and opens a different gate-only cycle under a different pair
+        // of gates. Re-fetch `bd dep cycles` and require it still names the same cycles.
+        const cycleRecheckResult = bdDepCycles(repo);
+        if (cycleRecheckResult.error || cycleRecheckResult.status !== 0) {
+          const detail = cycleRecheckResult.error?.code === "ENOENT"
+            ? "bd not found on PATH — install it with `brew install gastownhall/tap/bd`"
+            : cycleRecheckResult.error?.message || (cycleRecheckResult.stderr ?? "").trim() ||
+              `bd dep cycles exited ${cycleRecheckResult.status}`;
+          console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim(`\n${detail}`));
+          return 1;
+        }
+        const freshCycles = parseDepCycles(cycleRecheckResult.stdout);
+        if (freshCycles === null) {
+          console.error(c.red(`bd dep cycles failed in ${repo}`) + c.dim("\nbd returned cycle output this build can't parse."));
+          return 1;
+        }
+        if (!sameCycles(hydratedCycles, freshCycles)) {
+          if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
+          continue attempts;
+        }
+
+        // Matching cycle sets only proves the CYCLIC pairs held steady — this hydration is a live
+        // `bd list` in its own right, and an ordinary ACYCLIC `blocks` edge can land or vanish during
+        // that gap without moving `bd dep cycles` at all. Rebuild the comparison the same way
+        // `hydratedBoard` itself was just built (a fresh board read plus a fresh full gate listing)
+        // and compare both edges and cycle-member liveness against it before trusting the pairing.
+        const freshRead = readBoard(repo);
+        if (freshRead.error) {
+          console.error(c.red(`bd list failed in ${repo}`) + c.dim(`\n${freshRead.error}`));
+          return 1;
+        }
+        const freshGates = fetchGates(repo);
+        if (freshGates.error) {
+          console.error(c.red(`bd list --type gate failed in ${repo}`) + c.dim(`\n${freshGates.error}`));
+          return 1;
+        }
+        const freshById = new Map(freshRead.board.map((bead) => [bead.id, bead]));
+        for (const gate of freshGates.gates) if (!freshById.has(gate.id)) freshById.set(gate.id, gate);
+        const freshBoard = [...freshById.values()];
+        if (
+          !sameBlocksEdges(hydratedBoard, freshBoard) ||
+          !sameCycleMemberLiveness(hydratedCycles, hydratedBoard, freshBoard) ||
+          !sameBoardStructure(hydratedBoard, freshBoard)
+        ) {
+          if (attempt >= MAX_BOARD_CHECK_CYCLE_RETRIES) return giveUp();
+          continue attempts;
+        }
+        // Same reasoning as the outer pairing above: the checks just proved agreement, not
+        // currency — carry forward `freshBoard`, the later of the two reads.
+        hydratedBoard = freshBoard;
+      }
+
+      board = hydratedBoard;
+      cycles = hydratedCycles;
+      break attempts;
     }
 
-    const report = buildStructureReport(board);
+    const report = buildStructureReport(board, { cycles });
     blocking += report.blocking;
     console.log(formatStructureReport(report, repos.length > 1 ? repo : ""));
     console.log("");

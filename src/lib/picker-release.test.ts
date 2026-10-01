@@ -11,6 +11,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import { makeTestDb, type TestDb } from "./db/testing";
 import * as schema from "./db/schema";
 import type { Bead } from "./beads/bd";
+import { attachCycleEvidence } from "./beads/cycle-evidence";
 import {
   getBoardPickerPlan,
   saveBoardPickerPlan,
@@ -43,7 +44,10 @@ function bead(id: string, o: Partial<Bead> = {}): Bead {
 
 /** A board the picker ranks `urgent` ahead of `target` on — so a rank read off the FRESH generation
  *  is distinguishable from the `rank: 1` every recorded plan below hands out. */
-const BOARD = [bead("urgent", { priority: 0 }), bead("target", { priority: 2 })];
+const BOARD = attachCycleEvidence(
+  [bead("urgent", { priority: 0 }), bead("target", { priority: 2 })],
+  [],
+);
 
 /** Record one generation and answer with its id — what a release names as the decision it answers. */
 async function record(entries: PickerPlanEntry[], board = BOARD): Promise<string> {

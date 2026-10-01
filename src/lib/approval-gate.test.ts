@@ -17,6 +17,7 @@ import {
   notRunnableWhy,
 } from "./approval-gate";
 import type { Bead } from "./beads/bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "./beads/cycle-evidence";
 import { contractGatedBeads, runTickets } from "./ticket-view";
 
 /** Any bd stamp: without one a bead never came from a bd read, and the contract never judges it. */
@@ -53,7 +54,10 @@ const waitsOn = (id: string, ...blockers: string[]): Partial<Bead> => ({
   dependencies: blockers.map((depends_on_id) => ({ issue_id: id, depends_on_id, type: "blocks" })),
 });
 
-const of = (target: Bead, board: Bead[]) => approvalGaps(target, board);
+/** A test fixture models a complete bd read plus its authoritative empty cycle report. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+const of = (target: Bead, board: Bead[]) => approvalGaps(target, authoritative(board));
 const rulesOf = (gaps: { rule: string }[]) => gaps.map((g) => g.rule);
 
 /**
@@ -62,7 +66,7 @@ const rulesOf = (gaps: { rule: string }[]) => gaps.map((g) => g.rule);
  * beads that are not run targets at all.
  */
 function fixtureBoard(): Bead[] {
-  return [
+  return authoritative([
     epic("anton-e"),
     feature("anton-clean", "anton-e"),
     ticket("anton-t1", "anton-clean"),
@@ -70,7 +74,7 @@ function fixtureBoard(): Bead[] {
     feature("anton-gappy", "anton-e"),
     ticket("anton-t3", "anton-gappy", { acceptance_criteria: undefined }),
     ticket("anton-t4", "anton-gappy"),
-  ];
+  ]);
 }
 
 const find = (board: Bead[], id: string): Bead => {
@@ -225,6 +229,36 @@ describe("the `structure` rule — the tier shape under the target", () => {
     ];
 
     expect(of(find(board, "anton-f"), board)).toEqual([]);
+  });
+});
+
+describe("authoritative cycle evidence", () => {
+  it("fails closed when the board has no authoritative cycle report", () => {
+    const board = [feature("anton-f"), ticket("anton-t1", "anton-f")];
+
+    expect(approvalGaps(find(board, "anton-f"), board)).toEqual([
+      {
+        rule: "structure",
+        message:
+          "board → authoritative `bd dep cycles` evidence is unavailable — cannot confirm this run is cycle-free, so it cannot be approved or started",
+        evidenceMissing: true,
+      },
+    ]);
+  });
+
+  it("refuses a target whose same-run tickets form a reported dependency cycle", () => {
+    const board = attachCycleEvidence([
+      feature("anton-f"),
+      ticket("anton-a", "anton-f", waitsOn("anton-a", "anton-b")),
+      ticket("anton-b", "anton-f", waitsOn("anton-b", "anton-a")),
+    ], [{ ids: ["anton-a", "anton-b"], raw: { cycle: ["anton-a", "anton-b"] } }]);
+
+    const gaps = of(find(board, "anton-f"), board);
+    expect(rulesOf(gaps)).toEqual(["structure", "structure"]);
+    expect(gaps.map((gap) => gap.message)).toEqual([
+      expect.stringContaining("anton-a → sits in a blocks cycle with anton-b"),
+      expect.stringContaining("anton-b → sits in a blocks cycle with anton-a"),
+    ]);
   });
 });
 

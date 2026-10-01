@@ -163,11 +163,15 @@ describe("parseDepCycles", () => {
       ["a-1", "a-2"],
       { cycle: ["b-1", "b-2"] },
       { path: [{ id: "c-1" }, { id: "c-2" }] },
+      // bd's actual `Cycle{Members, Partial}` shape (confirmed against issueops/cycledetector.go on
+      // 1.1.2): `members` wasn't in the fallback chain, so this real shape parsed to `ids: []`.
+      { members: [{ id: "d-1" }, { id: "d-2", issue: { id: "d-2", title: "D2" } }], partial: true },
     ];
     expect(parseDepCycles(JSON.stringify(raws))).toEqual([
       { ids: ["a-1", "a-2"], raw: raws[0] },
       { ids: ["b-1", "b-2"], raw: raws[1] },
       { ids: ["c-1", "c-2"], raw: raws[2] },
+      { ids: ["d-1", "d-2"], raw: raws[3] },
     ]);
   });
 
@@ -175,8 +179,10 @@ describe("parseDepCycles", () => {
     expect(parseDepCycles(JSON.stringify([{ weird: 1 }]))).toEqual([{ ids: [], raw: { weird: 1 } }]);
   });
 
-  it("treats a non-array top level as no cycles rather than throwing", () => {
-    expect(parseDepCycles('{"not": "an array"}')).toEqual([]);
+  it("throws on a non-array top level rather than treating it as cycle-free", () => {
+    expect(() => parseDepCycles('{"not": "an array"}')).toThrow(
+      /could not read its --json output/,
+    );
   });
 });
 

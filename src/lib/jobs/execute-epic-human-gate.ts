@@ -277,6 +277,14 @@ export interface HumanTicketPreflight {
   answeredButBlocked: Map<string, string[]>;
   /** False when the run has no human work at all — nothing was written, nothing to adopt. */
   armed: boolean;
+  /**
+   * Ticket ids this preflight actually armed a wait for, or closed as answered (PR #274 review) —
+   * `state.handled`, the one set the pass loop itself uses to avoid re-arming. Distinct from
+   * `gated`: a ticket held by an ordinary cross-run blocker lands in `gated` too, but never
+   * reaches here unless {@link isUnarmedHumanWork} judged it — the caller uses this narrower set
+   * to tell "already given a human wait" apart from "merely blocked by something else".
+   */
+  handled: ReadonlySet<string>;
 }
 
 /**
@@ -604,6 +612,7 @@ export async function preflightHumanTickets(args: {
     tickets: ticketsOf(),
     answeredButBlocked: state.answeredButBlocked,
     armed,
+    handled: state.handled,
   };
 }
 
