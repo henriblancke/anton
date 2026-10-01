@@ -89,6 +89,24 @@ const TRANSIENT_RESULT_RE =
   /(connection (?:closed|reset|aborted)|closed mid-?response|econnreset|epipe|etimedout|socket hang ?up|premature close|stream (?:closed|error|interrupted|truncat)|unexpected end of)/i;
 
 /**
+ * Claude Code's own `API Error: <status> ...` diagnostic prefix (driver-limits.ts observes it
+ * verbatim for both the gateway-billing and rate-limit envelopes) — a shape a model narrating its
+ * own failure would not organically type, unlike the generic prose `TRANSIENT_STDERR_RE` also
+ * matches ("internal server error", a bare "500", "overloaded", …). `isRecoverableClaudeText`'s
+ * legacy fallback trusts only this narrower shape, and only when it OPENS the surfaced detail
+ * (never a quoted occurrence deeper in the string): the merged `claude exited with code N: <detail>`
+ * envelope's `detail` can be the model's own freeform result text, and a deterministic failure that
+ * merely narrates or quotes "API Error: 503" mid-sentence (e.g. describing a test fixture) must not
+ * be misread as Claude Code's own diagnostic (review finding on PR #339).
+ *
+ * Restricted to the same recoverable statuses `TRANSIENT_STDERR_RE` treats as transient (429 and
+ * the 5xx family) — not any three-digit code: a deterministic refusal like `API Error: 400`/`401`/
+ * `403`/`404` must fall through to the ordinary Error path instead of this legacy fallback claiming
+ * it as recoverable ahead of the generic Claude-exit classifier (review finding on PR #339).
+ */
+const TRANSIENT_STDERR_ENVELOPE_RE = /^API Error:\s*(?:429|500|502|503|504|529)\b/i;
+
+/**
  * Coarsely categorize a transient failure so the runner can refuse to resume twice on the SAME
  * signature (a resume that dies the same way escalates to a fresh restart). stderr (Claude Code's own
  * channel) is scanned broadly; the model-authored result text only against socket/stream-level
@@ -111,6 +129,66 @@ export function transientSignature(
 
 function signatureOf(raw: string): string {
   return raw.toLowerCase().replace(/\s+/g, "-");
+}
+
+/**
+ * True when `message` is text this file constructs for a `RecoverableClaudeError` — a transient
+ * driver-level death (a truncated stream, a stalled session, or a network/upstream drop), never a
+ * deterministic agent-authored failure. `failure-cause.ts` needs this: once an in-session resume
+ * exhausts (or never gets attempted), `settleRunRow` stores the error's `.message` as plain text, so
+ * classifying a settled run's cause has nothing but that string to go on — and a deterministic
+ * `claude exited with code N: <the agent's own report>` shares the exact same envelope as the
+ * transient `exitCodeError` case above.
+ *
+ * `code` is nullable (a signal kill leaves `null`, per `ClaudeExit.code` and `driver.ts`'s `close`
+ * handler), so the exit-code envelope this matches is `claude exited with code (?:\d+|null): ` —
+ * a digit-only guard would silently reject every signal-kill message, including ones carrying the
+ * anchored transient tag below (anton-r0tb follow-up).
+ *
+ * The exit-code envelope's surfaced detail prefers the agent's own result summary over stderr
+ * (`exitCodeError`), so a signature matched solely in stderr (e.g. a 503) can leave the rendered
+ * message with no transient wording in `detail` at all. Both `exitCodeError` and `failureError`'s
+ * `is_error`+transient branch append a stable `(transient: <signature>)` tag whenever they actually
+ * build a `RecoverableClaudeError`, precisely so this function never has to reconstruct that fact
+ * from prose that may not carry it — that anchored suffix is the PRIMARY signal this checks for the
+ * exit-code envelope.
+ *
+ * The one exception is a `runs.error` row written before that tag existed, which carries no suffix
+ * at all — for those this falls back to the two narrower signals below, never the broad
+ * `TRANSIENT_STDERR_RE`: `detail` can be the agent's own freeform report (see `TRANSIENT_RESULT_RE`'s
+ * doc on why that channel is scanned narrowly), so a bare status code or generic server-error phrase
+ * the agent merely typed in prose (e.g. "the local endpoint returned 500") would otherwise match the
+ * broad regex and misclassify a genuine deterministic failure as transient — exactly the collision
+ * `transientSignature` was already narrowed to avoid.
+ *   - `TRANSIENT_RESULT_RE` — the same socket/stream-level wording already vetted safe against
+ *     model-authored text, since `detail` may in fact be the model's own result summary.
+ *   - `TRANSIENT_STDERR_ENVELOPE_RE` — Claude Code's own `API Error: <status>` diagnostic prefix,
+ *     not wording a model would organically type while narrating a failure, so it stays safe to
+ *     trust — but only when it opens the surfaced `detail`, never a quoted occurrence deeper in
+ *     the agent's own prose (review finding on PR #339): checked against `detail` alone, not the
+ *     merged message, so an anchored `^` actually means "starts the detail."
+ *
+ * The `(transient: ...)` suffix isn't always the true end of the stored string either:
+ * `settleRunRow` (execute-epic-settle.ts) writes `${message}${orphanNotice}`, appending
+ * `orphanClause`'s prose (always opening with a space, then `WARNING:` or `A PR `) onto whatever
+ * `exitCodeError`/`failureError` built — so a failed run with an orphan PR to report pushes the
+ * tag away from the literal end of `message` (review finding on PR #339). `TRANSIENT_TAG_RE` below
+ * accepts that known suffix rather than requiring the tag to be the very last characters.
+ */
+const TRANSIENT_TAG_RE = /\(transient: [^)]+\)(?: (?:WARNING:|A PR )[\s\S]*)?$/;
+
+export function isRecoverableClaudeText(message: string): boolean {
+  if (/^claude exited without a result event\b/.test(message)) return true;
+  if (/^claude produced no output for .*killed as stalled\b/i.test(message)) return true;
+  if (/^claude reported a transient error result\b/i.test(message)) return true;
+  const prefixMatch = message.match(/^claude exited with code (?:\d+|null): /);
+  if (!prefixMatch) return false;
+  const detail = message.slice(prefixMatch[0].length);
+  return (
+    TRANSIENT_TAG_RE.test(message) ||
+    TRANSIENT_RESULT_RE.test(message) ||
+    TRANSIENT_STDERR_ENVELOPE_RE.test(detail)
+  );
 }
 
 /** The final result text, or "" when the run emitted no result event (or a non-string one). */
@@ -220,8 +298,11 @@ function exitCodeError(exit: ClaudeExit, sessionId: string | undefined): Error {
   if (modelRefusal) return modelRefusal;
   const message = `claude exited with code ${exit.code}: ${detail.slice(-2000)}`;
   const signature = transientSignature(resultText, exit.stderr, exit.stream.resultRaw !== undefined);
+  // The surfaced `detail` above can omit the transient wording entirely (it preferred a resultText
+  // that doesn't carry it, while the signature was matched in stderr) — append a stable tag so
+  // `isRecoverableClaudeText` can still recognize this as recoverable from the stored string alone.
   return signature
-    ? new RecoverableClaudeError(message, { sessionId, signature })
+    ? new RecoverableClaudeError(`${message} (transient: ${signature})`, { sessionId, signature })
     : new Error(message);
 }
 
@@ -246,11 +327,14 @@ function failureError(exit: ClaudeExit): Error | null {
 
   const resultText = resultTextOf(exit);
   const signature = transientSignature(resultText, exit.stderr, true);
+  // Stable-prefixed rather than bare `resultText`: the model-authored text can say anything (or
+  // nothing), so it alone can never be recognized as recoverable once stored as plain `runs.error`
+  // text — `isRecoverableClaudeText` anchors on this exact envelope.
   return signature
-    ? new RecoverableClaudeError(resultText || "claude reported a transient error result", {
-        sessionId,
-        signature,
-      })
+    ? new RecoverableClaudeError(
+        `claude reported a transient error result (${signature})${resultText ? `: ${resultText}` : ""}`,
+        { sessionId, signature },
+      )
     : null;
 }
 

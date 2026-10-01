@@ -11,7 +11,13 @@ import {
   type RecoverableClaudeError,
 } from "../jobs/errors";
 import { createStreamState, type StreamState } from "./driver-events";
-import { exitError, toClaudeResult, transientSignature, type ClaudeExit } from "./driver-exit";
+import {
+  exitError,
+  isRecoverableClaudeText,
+  toClaudeResult,
+  transientSignature,
+  type ClaudeExit,
+} from "./driver-exit";
 
 function stream(overrides: Partial<StreamState> = {}): StreamState {
   return { ...createStreamState(), ...overrides };
@@ -214,6 +220,117 @@ describe("exitError", () => {
       exit({ stream: stream({ resultRaw: { type: "result", is_error: true, result: "the local endpoint returned 500" } }) }),
     );
     expect(real).toBeNull();
+  });
+
+  it("stably tags a clean-exit is_error transient result so its stored message stays recognizable as recoverable (PR #339 review)", () => {
+    // failureError's is_error+transient branch used to surface bare `resultText` with no stable
+    // envelope at all, so once `settleRunRow` stored `.message` as plain text there was nothing left
+    // for `isRecoverableClaudeText` to anchor on — a genuine upstream drop classified as "unknown".
+    const err = exitError(
+      exit({
+        stream: stream({
+          resultRaw: { type: "result", is_error: true, result: "Connection closed mid-response (ECONNRESET)" },
+        }),
+      }),
+    );
+
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(err?.message.startsWith("claude reported a transient error result")).toBe(true);
+    expect(isRecoverableClaudeText(err!.message)).toBe(true);
+  });
+
+  it("keeps a transient nonzero exit recognizable even when the surfaced detail prefers the agent's own report over the stderr signature (PR #339 review)", () => {
+    // exitCodeError prefers the agent's own result summary for the surfaced `detail`, so when the
+    // transient signature was matched only in stderr the rendered message can end up with no
+    // transient wording anywhere in it — `isRecoverableClaudeText` used to reconstruct recoverability
+    // by re-scanning that text and missed exactly this case, misclassifying a real upstream drop as
+    // a deterministic agent failure.
+    const err = exitError(
+      exit({
+        code: 1,
+        stderr: "Connection closed mid-response",
+        stream: stream({ resultRaw: { type: "result", is_error: true, result: "three tests fail" } }),
+      }),
+    );
+
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(recoverable(err).signature).toBe("connection-closed");
+    expect(err?.message).not.toMatch(/connection closed/i);
+    expect(isRecoverableClaudeText(err!.message)).toBe(true);
+  });
+
+  it("never re-derives recoverability by re-scanning an untagged agent report for a bare status code (review finding)", () => {
+    // The agent's own result text merely mentions a status code while reporting a real, deterministic
+    // failure. `transientSignature` correctly finds no signal (narrow result-text regex), so
+    // `exitCodeError` builds a plain `Error` with no `(transient: ...)` tag — `isRecoverableClaudeText`
+    // must not reconstruct one by re-scanning the stored message with the broad stderr regex.
+    const message = "claude exited with code 1: the local endpoint still returns a 503 in the test.";
+    expect(isRecoverableClaudeText(message)).toBe(false);
+  });
+
+  it("still recognizes a legacy untagged message whose detail is Claude Code's own API-error envelope", () => {
+    // A `runs.error` row written before the `(transient: ...)` suffix existed carries no tag, but
+    // Claude Code's own `API Error: <status>` prefix is a machine-authored shape a model wouldn't
+    // organically type, so it stays a safe fallback signal.
+    const message = "claude exited with code 1: API Error: 503 Service Unavailable";
+    expect(isRecoverableClaudeText(message)).toBe(true);
+  });
+
+  it("does not treat an unanchored quote of the API-error envelope in agent prose as recoverable (review finding)", () => {
+    // The agent's own result text merely quotes Claude Code's `API Error: <status>` envelope while
+    // narrating a real, deterministic failure (e.g. describing a test fixture) — it must OPEN the
+    // surfaced detail to count as Claude Code's own diagnostic, not just appear somewhere in it.
+    const message = "claude exited with code 1: the API Error: 503 fixture still fails";
+    expect(isRecoverableClaudeText(message)).toBe(false);
+  });
+
+  it("recognizes a tagged signal-exit message even though its code is null, not a digit (anton-r0tb follow-up)", () => {
+    // A signal kill leaves `exit.code` null (ClaudeExit.code is nullable, driver.ts passes the
+    // nullable `close` code straight through), so `exitCodeError` can build
+    // `claude exited with code null: ... (transient: <signature>)` — a digit-only envelope guard
+    // would reject this before ever checking the anchored suffix.
+    const err = exitError(
+      exit({
+        code: null,
+        stderr: "socket hang up",
+        stream: stream({ resultRaw: { type: "result", is_error: true, result: "unrelated report" } }),
+      }),
+    );
+
+    expect(isRecoverableClaudeError(err)).toBe(true);
+    expect(isRecoverableClaudeText(err!.message)).toBe(true);
+  });
+
+  it("still recognizes the transient tag when an orphan-PR notice is appended after it (review finding on PR #339)", () => {
+    // settleRunRow (execute-epic-settle.ts) writes `${message}${orphanNotice}` — orphanClause's
+    // prose lands AFTER whatever exitCodeError built, so the `(transient: ...)` tag is no longer the
+    // literal end of the stored string. Both of orphanClause's non-empty shapes must still resolve.
+    const draftNotice =
+      "claude exited with code 1: three tests fail (transient: 503) A PR an earlier attempt had " +
+      "already opened (https://github.com/x/y/pull/1) was converted to a DRAFT so this un-reviewed " +
+      "work can't be merged; it returns to ready when the gate passes.";
+    const lookupFailedNotice =
+      "claude exited with code 1: three tests fail (transient: 503) WARNING: anton could NOT check " +
+      "whether an earlier attempt left a PR open on this branch (the `gh` lookup failed) — if one is " +
+      "open it is still mergeable with this un-reviewed work. Check the branch by hand.";
+
+    expect(isRecoverableClaudeText(draftNotice)).toBe(true);
+    expect(isRecoverableClaudeText(lookupFailedNotice)).toBe(true);
+  });
+
+  it("does not treat a deterministic 400/401/403/404 API-error envelope as recoverable (review finding on PR #339)", () => {
+    // TRANSIENT_STDERR_ENVELOPE_RE used to accept any three-digit status after "API Error:", so a
+    // deterministic client-error response (auth/permission/not-found) fell into the transient
+    // fallback ahead of the generic Claude-exit AGENT_RE classifier in failure-cause.ts.
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 400 Bad Request")).toBe(false);
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 401 Unauthorized")).toBe(false);
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 403 Forbidden")).toBe(false);
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 404 Not Found")).toBe(false);
+    // The recoverable statuses in the same family must still be recognized.
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 429 Too Many Requests")).toBe(
+      true,
+    );
+    expect(isRecoverableClaudeText("claude exited with code 1: API Error: 529 Overloaded")).toBe(true);
   });
 });
 
