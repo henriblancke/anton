@@ -1073,7 +1073,10 @@ export async function prepareFixWorktree(args: {
     preFetchTrackingSha === expectedHeadSha &&
     (await branchAheadOfRemote(repo, branch));
 
-  await safe(() =>
+  // Kept, not discarded: `baseMatches` below only trusts a base that sits AHEAD of what GitHub
+  // reports when THIS fetch actually landed — otherwise `origin/<base>` is whatever an earlier fetch
+  // left, possibly an intermediate descendant already overtaken by the real tip.
+  const fetched = await safe(() =>
     fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
   );
 
@@ -1220,7 +1223,11 @@ export async function prepareFixWorktree(args: {
   // never be fixed (coach #9/#10/#12: `baseRefOid` pinned 26 commits behind `origin/main`, 576
   // skipped rounds). The fetch is only stale when it sits BEHIND or BESIDE what GitHub reports;
   // ahead of it, the premerge below lands a strictly newer base, which still contains everything
-  // the caller classified against.
+  // the caller classified against. Only when THIS round's fetch succeeded, though (PR #342 review,
+  // chatgpt-codex-connector + claude): after a swallowed fetch failure, a descendant left by an
+  // earlier fetch proves nothing about the base's current tip, and premerging it would test and
+  // push against a stale base under `refsSynced: true`. The exact match needs no such proof — it
+  // already equals what GitHub reports.
   const fetchedBase =
     baseBranch && expectedBaseRefOid
       ? await resolveCommitSha(worktree.path, `origin/${baseBranch}`).catch(() => "")
@@ -1229,7 +1236,8 @@ export async function prepareFixWorktree(args: {
     !baseBranch ||
     !expectedBaseRefOid ||
     fetchedBase === expectedBaseRefOid ||
-    (fetchedBase !== "" &&
+    (fetched &&
+      fetchedBase !== "" &&
       (await isAncestor(worktree.path, expectedBaseRefOid, fetchedBase).catch(() => false)));
 
   // Refs matching GitHub is necessary but not sufficient — `premergeBase` below still has to

@@ -15,7 +15,7 @@ import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
 import type { JobContext } from "./runner";
-import { GH_BIN_ENV } from "../git/ops";
+import { fetchOrigin, GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrActivity, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
 import {
@@ -615,6 +615,29 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
         "base-sha-lagging",
         "base-sha-newer",
       );
+    });
+
+    // PR #342 review (chatgpt-codex-connector + claude): after a swallowed fetch failure,
+    // `origin/<base>` is whatever an EARLIER fetch left — a descendant of the lagging `baseRefOid`
+    // that the real tip may already have overtaken. Ancestry alone can't tell that apart from a
+    // fresh fetch, so the descendant path needs this round's own fetch to have landed.
+    it("is false when the fetch failed and origin/<base> is only a cached descendant", async () => {
+      vi.mocked(fetchOrigin).mockRejectedValueOnce(new Error("network blip"));
+      resolveCommitShaMock.mockResolvedValue("base-sha-cached-descendant");
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await runWithBase("base-sha-lagging");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    it("still accepts an exact match when the fetch failed (the ref already equals GitHub's base)", async () => {
+      vi.mocked(fetchOrigin).mockRejectedValueOnce(new Error("network blip"));
+      resolveCommitShaMock.mockResolvedValue("base-sha-current");
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(true);
     });
 
     it("is false when resolving origin/<base> fails outright", async () => {
