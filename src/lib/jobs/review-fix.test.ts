@@ -631,6 +631,20 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
       expect(result.refsSynced).toBe(false);
     });
 
+    // PR #342 review (chatgpt-codex-connector): a bare `git fetch origin <base>` can succeed while
+    // only writing FETCH_HEAD under a custom/missing fetch refspec, so a successful fetch would vouch
+    // for a tracking ref it never touched. Explicit destinations force `origin/<ref>` to be written.
+    it("fetches base and head into their remote-tracking refs explicitly", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-current");
+
+      await runWithBase("base-sha-current");
+
+      expect(vi.mocked(fetchOrigin)).toHaveBeenCalledWith(expect.any(String), [
+        "+refs/heads/main:refs/remotes/origin/main",
+        "+refs/heads/anton/fix-7:refs/remotes/origin/anton/fix-7",
+      ]);
+    });
+
     it("still accepts an exact match when the fetch failed (the ref already equals GitHub's base)", async () => {
       vi.mocked(fetchOrigin).mockRejectedValueOnce(new Error("network blip"));
       resolveCommitShaMock.mockResolvedValue("base-sha-current");

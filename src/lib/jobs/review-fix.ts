@@ -1076,8 +1076,17 @@ export async function prepareFixWorktree(args: {
   // Kept, not discarded: `baseMatches` below only trusts a base that sits AHEAD of what GitHub
   // reports when THIS fetch actually landed — otherwise `origin/<base>` is whatever an earlier fetch
   // left, possibly an intermediate descendant already overtaken by the real tip.
+  //
+  // Explicit destination refspecs, as `resolveFreshBase` uses: a bare `git fetch origin <ref>`
+  // honours origin's configured fetch refspec, so with a custom or missing one it can succeed while
+  // only writing FETCH_HEAD — `fetched` would then vouch for an `origin/<base>` this fetch never
+  // touched (PR #342 review, chatgpt-codex-connector). `+` allows a non-fast-forward update.
+  const trackingRefspec = (ref: string) => `+refs/heads/${ref}:refs/remotes/origin/${ref}`;
   const fetched = await safe(() =>
-    fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
+    fetchOrigin(
+      worktree.path,
+      (baseBranch ? [baseBranch, branch] : [branch]).map(trackingRefspec),
+    ),
   );
 
   // Recheck the remote tip immediately after fetching — `aheadBeforeFetch` only proves the
