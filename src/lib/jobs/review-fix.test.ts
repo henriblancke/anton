@@ -587,10 +587,34 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
 
     it("is false when origin/<base> resolves to a STALE sha (fetchOrigin silently failed for it)", async () => {
       resolveCommitShaMock.mockResolvedValue("base-sha-stale");
+      // Stale means behind (or beside) what GitHub reports — the reported base is not its ancestor.
+      isAncestorMock.mockResolvedValue(false);
 
       const result = await runWithBase("base-sha-current");
 
       expect(result.refsSynced).toBe(false);
+      expect(isAncestorMock).toHaveBeenCalledWith(
+        expect.any(String),
+        "base-sha-current",
+        "base-sha-stale",
+      );
+    });
+
+    // GitHub stops refreshing a CONFLICTING PR's `baseRefOid` until its head moves, so the fetched
+    // base can legitimately sit AHEAD of it. Reading that as stale skipped every fix round before
+    // claude ran — and only a fix round's push could ever refresh it (coach #9/#10/#12).
+    it("is true when origin/<base> is AHEAD of a lagging baseRefOid (conflicting PR)", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-newer");
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await runWithBase("base-sha-lagging");
+
+      expect(result.refsSynced).toBe(true);
+      expect(isAncestorMock).toHaveBeenCalledWith(
+        expect.any(String),
+        "base-sha-lagging",
+        "base-sha-newer",
+      );
     });
 
     it("is false when resolving origin/<base> fails outright", async () => {

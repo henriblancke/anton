@@ -308,5 +308,45 @@ process.exit(0);`,
         delete process.env.FAKE_BASE_REF_OID;
       }
     });
+
+    it("DOES run the round when GitHub's baseRefOid lags behind the fetched base (conflicting PR)", async () => {
+      // GitHub stops refreshing a CONFLICTING PR's `baseRefOid` until its head moves, so it reports
+      // an ancestor of the real base tip — and the head only moves once a fix round pushes. An
+      // exact-match sync check skipped every such round before claude ran, leaving the PR stuck
+      // forever (coach #9/#10/#12: 576 skipped rounds). A fetched base AHEAD of what GitHub reports
+      // is not stale, so the round must reach claude and record its answer.
+      const staleBase = execFileSync("git", ["-C", repo, "rev-parse", "main"], {
+        encoding: "utf8",
+      }).trim();
+      writeFileSync(join(repo, "base-advance.txt"), "landed on main after the PR stalled\n");
+      g(repo, ["add", "-A"]);
+      g(repo, ["commit", "-q", "-m", "main moves on"]);
+      g(repo, ["push", "-q", "origin", "main"]);
+
+      const ackingClaude = writeBin(
+        binDir,
+        "claude-acking-lagging-base",
+        `const e=o=>process.stdout.write(JSON.stringify(o)+'\\n');
+const report=JSON.stringify({threads:[{id:${JSON.stringify(NON_THREAD_REPORT_ID)},outcome:'left',reply:'rollout plan already covered in the description; no change needed'}]});
+e({type:'result',subtype:'success',result:'looked at the rollout plan\\n\\n\`\`\`json\\n'+report+'\\n\`\`\`',is_error:false});
+process.exit(0);`,
+      );
+      const prevClaude = process.env.ANTON_CLAUDE_BIN;
+      process.env.ANTON_CLAUDE_BIN = ackingClaude;
+      process.env.FAKE_BASE_REF_OID = staleBase;
+      try {
+        const fixes = await runSweep();
+        expect(fixes).toHaveLength(1);
+        const job = await getJob(tdb.db, fixes[0]);
+        expect(job?.status).toBe("done");
+        // The skipped round settled `noop` with "no report and nothing pushed"; a round that synced
+        // premerges the newer base and pushes it — the very push that unsticks a conflicting PR.
+        expect(job?.outcome).toBe("ok");
+        expect(job?.outcomeNote).toContain("pushed a fix");
+      } finally {
+        process.env.ANTON_CLAUDE_BIN = prevClaude;
+        delete process.env.FAKE_BASE_REF_OID;
+      }
+    });
   },
 );
