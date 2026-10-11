@@ -15,7 +15,7 @@ import { makeProjectDb, type TestProjectDb } from "@/lib/testing/project";
 import { driveJob } from "@/lib/testing/jobs";
 import { getJob, type Clock } from "./queue";
 import type { JobContext } from "./runner";
-import { GH_BIN_ENV } from "../git/ops";
+import { fetchOrigin, GH_BIN_ENV } from "../git/ops";
 import { ANTON_MARK, type PrActivity, type PrReview, type ReviewThread } from "../git/pr";
 import type { Worktree } from "../git/worktree";
 import {
@@ -587,10 +587,71 @@ describe("prepareFixWorktree (anton-u02rt)", () => {
 
     it("is false when origin/<base> resolves to a STALE sha (fetchOrigin silently failed for it)", async () => {
       resolveCommitShaMock.mockResolvedValue("base-sha-stale");
+      // Stale means behind (or beside) what GitHub reports — the reported base is not its ancestor.
+      isAncestorMock.mockResolvedValue(false);
 
       const result = await runWithBase("base-sha-current");
 
       expect(result.refsSynced).toBe(false);
+      expect(isAncestorMock).toHaveBeenCalledWith(
+        expect.any(String),
+        "base-sha-current",
+        "base-sha-stale",
+      );
+    });
+
+    // GitHub stops refreshing a CONFLICTING PR's `baseRefOid` until its head moves, so the fetched
+    // base can legitimately sit AHEAD of it. Reading that as stale skipped every fix round before
+    // claude ran — and only a fix round's push could ever refresh it (coach #9/#10/#12).
+    it("is true when origin/<base> is AHEAD of a lagging baseRefOid (conflicting PR)", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-newer");
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await runWithBase("base-sha-lagging");
+
+      expect(result.refsSynced).toBe(true);
+      expect(isAncestorMock).toHaveBeenCalledWith(
+        expect.any(String),
+        "base-sha-lagging",
+        "base-sha-newer",
+      );
+    });
+
+    // PR #342 review (chatgpt-codex-connector + claude): after a swallowed fetch failure,
+    // `origin/<base>` is whatever an EARLIER fetch left — a descendant of the lagging `baseRefOid`
+    // that the real tip may already have overtaken. Ancestry alone can't tell that apart from a
+    // fresh fetch, so the descendant path needs this round's own fetch to have landed.
+    it("is false when the fetch failed and origin/<base> is only a cached descendant", async () => {
+      vi.mocked(fetchOrigin).mockRejectedValueOnce(new Error("network blip"));
+      resolveCommitShaMock.mockResolvedValue("base-sha-cached-descendant");
+      isAncestorMock.mockResolvedValue(true);
+
+      const result = await runWithBase("base-sha-lagging");
+
+      expect(result.refsSynced).toBe(false);
+    });
+
+    // PR #342 review (chatgpt-codex-connector): a bare `git fetch origin <base>` can succeed while
+    // only writing FETCH_HEAD under a custom/missing fetch refspec, so a successful fetch would vouch
+    // for a tracking ref it never touched. Explicit destinations force `origin/<ref>` to be written.
+    it("fetches base and head into their remote-tracking refs explicitly", async () => {
+      resolveCommitShaMock.mockResolvedValue("base-sha-current");
+
+      await runWithBase("base-sha-current");
+
+      expect(vi.mocked(fetchOrigin)).toHaveBeenCalledWith(expect.any(String), [
+        "+refs/heads/main:refs/remotes/origin/main",
+        "+refs/heads/anton/fix-7:refs/remotes/origin/anton/fix-7",
+      ]);
+    });
+
+    it("still accepts an exact match when the fetch failed (the ref already equals GitHub's base)", async () => {
+      vi.mocked(fetchOrigin).mockRejectedValueOnce(new Error("network blip"));
+      resolveCommitShaMock.mockResolvedValue("base-sha-current");
+
+      const result = await runWithBase("base-sha-current");
+
+      expect(result.refsSynced).toBe(true);
     });
 
     it("is false when resolving origin/<base> fails outright", async () => {

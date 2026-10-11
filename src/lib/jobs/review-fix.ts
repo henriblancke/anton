@@ -777,7 +777,9 @@ async function handleEpic(args: {
       if (ctx.signal.aborted) {
         throw ctx.signal.reason ?? new DOMException("The operation was aborted", "AbortError");
       }
-      consoleLog.info(
+      // `error`, not `info`: this skip settles the job `done/noop` with no session, so a sync check
+      // that can never pass is otherwise invisible — it hid 576 skipped rounds on coach.
+      consoleLog.error(
         `PR #${number}: origin sync did not reach reported head ${pr.headSha} / base ${pr.baseRefOid ?? "unknown"} — skipping this round's fix session rather than gating/pushing against a potentially stale base`,
       );
       return "incomplete";
@@ -998,7 +1000,8 @@ export async function prepareFixWorktree(args: {
    * review) — the advertised base tree never actually landed in the worktree the gates ran against,
    * so that's just as untested as a stale fetch. A checkout that sits AHEAD of `expectedHeadSha`
    * (contains it as an ancestor, e.g. unpushed operator/prior-attempt commits on a resumed branch)
-   * still counts as synced, not stale.
+   * still counts as synced, not stale — and so does an `origin/<baseBranch>` AHEAD of
+   * `expectedBaseRefOid`, which GitHub leaves stale on a conflicting PR.
    */
   refsSynced: boolean;
 }> {
@@ -1070,8 +1073,20 @@ export async function prepareFixWorktree(args: {
     preFetchTrackingSha === expectedHeadSha &&
     (await branchAheadOfRemote(repo, branch));
 
-  await safe(() =>
-    fetchOrigin(worktree.path, baseBranch ? [baseBranch, branch] : [branch]),
+  // Kept, not discarded: `baseMatches` below only trusts a base that sits AHEAD of what GitHub
+  // reports when THIS fetch actually landed — otherwise `origin/<base>` is whatever an earlier fetch
+  // left, possibly an intermediate descendant already overtaken by the real tip.
+  //
+  // Explicit destination refspecs, as `resolveFreshBase` uses: a bare `git fetch origin <ref>`
+  // honours origin's configured fetch refspec, so with a custom or missing one it can succeed while
+  // only writing FETCH_HEAD — `fetched` would then vouch for an `origin/<base>` this fetch never
+  // touched (PR #342 review, chatgpt-codex-connector). `+` allows a non-fast-forward update.
+  const trackingRefspec = (ref: string) => `+refs/heads/${ref}:refs/remotes/origin/${ref}`;
+  const fetched = await safe(() =>
+    fetchOrigin(
+      worktree.path,
+      (baseBranch ? [baseBranch, branch] : [branch]).map(trackingRefspec),
+    ),
   );
 
   // Recheck the remote tip immediately after fetching — `aheadBeforeFetch` only proves the
@@ -1209,11 +1224,30 @@ export async function prepareFixWorktree(args: {
   // (nothing gets premerged, so a stale base ref can't feed the gates) or no `expectedBaseRefOid`
   // (a synthetic `PrReview` in tests) trusts the sync unconditionally, matching `expectedHeadSha`'s
   // own fallback.
+  //
+  // A fetched base that is a DESCENDANT of `expectedBaseRefOid` also counts as synced. GitHub stops
+  // refreshing a CONFLICTING PR's `baseRefOid` until its head moves, so on a stuck PR it lags the
+  // real base tip indefinitely — and the head only moves once this very round pushes a resolution.
+  // An exact-match check skipped every such round before claude ran, so a conflicting PR could
+  // never be fixed (coach #9/#10/#12: `baseRefOid` pinned 26 commits behind `origin/main`, 576
+  // skipped rounds). The fetch is only stale when it sits BEHIND or BESIDE what GitHub reports;
+  // ahead of it, the premerge below lands a strictly newer base, which still contains everything
+  // the caller classified against. Only when THIS round's fetch succeeded, though (PR #342 review,
+  // chatgpt-codex-connector + claude): after a swallowed fetch failure, a descendant left by an
+  // earlier fetch proves nothing about the base's current tip, and premerging it would test and
+  // push against a stale base under `refsSynced: true`. The exact match needs no such proof — it
+  // already equals what GitHub reports.
+  const fetchedBase =
+    baseBranch && expectedBaseRefOid
+      ? await resolveCommitSha(worktree.path, `origin/${baseBranch}`).catch(() => "")
+      : "";
   const baseMatches =
     !baseBranch ||
     !expectedBaseRefOid ||
-    (await resolveCommitSha(worktree.path, `origin/${baseBranch}`).catch(() => "")) ===
-      expectedBaseRefOid;
+    fetchedBase === expectedBaseRefOid ||
+    (fetched &&
+      fetchedBase !== "" &&
+      (await isAncestor(worktree.path, expectedBaseRefOid, fetchedBase).catch(() => false)));
 
   // Refs matching GitHub is necessary but not sufficient — `premergeBase` below still has to
   // actually land that base content in the tree the gates run against. Final `refsSynced` folds in
