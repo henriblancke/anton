@@ -41,8 +41,17 @@
  * The module reads as composition (anton-ni1j): the DECISION lives in apply-plan.ts, the WRITES in
  * apply-steps.ts, and this file is what locks the proposal, asks the one for the other, and settles.
  */
-import { beads, LABELS, type Bead } from "../beads/bd";
+import { beads, LABELS, type Bead, type DepCycle } from "../beads/bd";
+import { attachCycleEvidence, clearCycleEvidence } from "../beads/cycle-evidence";
 import { withBeadWriteLock, withBeadWriteLocks } from "../beads/claim-lock";
+import {
+  loadAllIssues,
+  sameBlockerLiveness,
+  sameBlocksEdges,
+  sameCycleMemberLiveness,
+  sameCycles,
+  sameTargetEligibilityState,
+} from "../beads/issues";
 import {
   notePrefix,
   planApply,
@@ -229,7 +238,7 @@ async function applyApproved(
   // the moment the patrol judged the board, which is what every "has this moved since we asked"
   // check compares to.
   const at: ApplyMoment = { nowMs: Date.now(), observedAtMs: observedAtOf(proposal) };
-  const decision = planApply(plan, board, at);
+  const decision = planApply(plan, await withCycleEvidenceIfNeeded(repo, plan, board), at);
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,
@@ -241,6 +250,147 @@ async function applyApproved(
     return settleUnwritten(repo, proposal, plan, decision, at, actor, signal);
   }
   return applySteps(repo, proposal, plan, decision.steps, decision.summary, actor, signal);
+}
+
+/**
+ * Move kinds whose decision consults `cycleEvidenceFor` — directly or through the picker. Exported
+ * so a caller that reads cycle evidence outside `applyProposal` (the shadow pass's board fetch,
+ * `shadow.ts`) can gate its own `bd dep cycles` call on the identical set rather than a copy that
+ * drifts from this one.
+ */
+export const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["approve", "unapprove"]);
+
+/**
+ * `bd dep cycles` evidence, fetched only for the moves that consume it — `unapprove`, via
+ * `unapproveSubject`'s `approvalGaps`, and `approve`, via `approveBarred`'s `startBarred` →
+ * `ineligibility` → `makeApprovalGate` (apply-plan.ts, picker-targets.ts) — and best-effort like
+ * `issues.ts`'s `attachCyclesBestEffort`, not required like execute-epic's own reads.
+ *
+ * Every other move (`reparent`, `link`, `retire`, `reprioritize`, `split`, `undefer`) never looks at
+ * `cycleEvidenceFor`, so paying for a `bd` subprocess under the proposal's write lock for those would
+ * extend the lock hold and gain nothing. And a `depCycles` failure (bd unavailable, timeout,
+ * unreadable output — a real, documented failure mode per hygiene.ts's `parseDepCycles`) must not
+ * fail the WHOLE apply for moves that have nothing to do with cycles or approval: it degrades to
+ * missing evidence instead, which `approvalGaps`'s own `missingCycleEvidenceGap` already fails closed
+ * on for the two decisions that ask.
+ *
+ * `board` here is often the caller's retained snapshot array, not a defensive copy — the approve
+ * route hands in `refreshAllIssuesRead`'s own `beads` (approve/route.ts), and evidence is attached by
+ * array IDENTITY (cycle-evidence.ts), so writing to it here writes into every other reader sharing
+ * that snapshot. Another writer can land or repair a `blocks` edge on a shared-server board in the
+ * gap between the caller's read and this `depCycles` call settling, and pairing a fresh `cycles`
+ * result with a `board` whose edges no longer describe it would poison that shared snapshot: every
+ * later `cycleEvidenceFor(board) === undefined` check elsewhere (`allIssues`/`readAllIssues`'s own
+ * enrichment) would then see evidence already present and skip re-fetching, serving a stale pairing
+ * until unrelated content changes it. Re-list and compare before attaching, exactly like `shadow.ts`'s
+ * own read — even when `board` itself starts edge-free, since that only describes the read that
+ * already happened, not whether a writer added the FIRST edge during this gap. Skipping the recheck
+ * on an edge-free `board` (as `issues.ts`'s `attachCyclesBestEffort`/`ensureCycleEvidence` still do
+ * for their own, differently-shaped callers) would let a cycle that only exists because of that new
+ * edge get attached to a board snapshot that predates it.
+ */
+/**
+ * A cycle can be made entirely of gates no work bead's `blocks` edge dangles toward (two gates
+ * blocking each other, nothing else pointing at either) — `board` never carried them, so
+ * `cycleMembers` can't map either id to a bead and reads a real, narrowly-scoped cycle as an
+ * unreadable board-wide fault, refusing an unrelated approval and letting an unrelated `unapprove`
+ * treat that synthetic fault as confirmed degradation (P2 review, PR #274, apply.ts:309). Hydrate
+ * whatever `cycles` names that `board` is still missing before attaching, same as `loadAllIssues`'s
+ * own `withCycles` path and `shadow.ts`'s copy of this helper.
+ */
+async function hydrateCycleOnlyGates(repo: string, board: Bead[], cycles: DepCycle[]): Promise<Bead[]> {
+  const knownIds = new Set(board.map((bead) => bead.id));
+  const missingCycleIds = [...new Set(cycles.flatMap((cycle) => cycle.ids))].filter(
+    (id) => !knownIds.has(id),
+  );
+  if (missingCycleIds.length === 0) return board;
+  const gates = await beads.list(repo, ["--status", "all", "--type", "gate"]);
+  const byId = new Map(board.map((bead) => [bead.id, bead]));
+  for (const gate of gates) if (!byId.has(gate.id)) byId.set(gate.id, gate);
+  return [...byId.values()];
+}
+
+async function withCycleEvidenceIfNeeded(
+  repo: string,
+  plan: GardenerPlan,
+  board: Bead[],
+): Promise<Bead[]> {
+  if (!CYCLE_AWARE_MOVES.has(plan.move)) return board;
+  try {
+    const cycles = await beads.depCycles(repo);
+    const freshBoard = await loadAllIssues(repo);
+    // `sameBlocksEdges` alone only proves the edges held steady — a cycle member can be reopened, or
+    // lose/gain its `abandoned` label, without moving an edge at all, and the approval gap this
+    // evidence feeds reads a cycle's blocking-ness off exactly that live/abandoned status (P2 review,
+    // PR #274, apply.ts:293). An ORDINARY (non-cycle) blocker is the same gap for a different reader
+    // (P2 review, PR #274, issues.ts:455): `cycles` never names an acyclic edge's target, so
+    // `blockedGap` can be reading a since-reopened blocker's stale closed status straight off `board`.
+    // Check all three, the same `boardStillMatchesCycles` pairing `loadAllIssues` itself runs.
+    // None of the three checks above look at a candidate target's OWN eligibility — only cycle
+    // members and blocker edges — so a target that gains `agent:human`, closes, or is deferred in
+    // this same gap slips through unless `sameTargetEligibilityState` is checked too (P2 review, PR
+    // #274, apply.ts:293).
+    const consistent =
+      sameBlocksEdges(board, freshBoard) &&
+      sameCycleMemberLiveness(cycles, board, freshBoard) &&
+      sameBlockerLiveness(board, freshBoard) &&
+      sameTargetEligibilityState(board, freshBoard);
+    if (!consistent) {
+      console.warn(
+        `[gardener.apply] ${repo}: board moved between the board read and cycle evidence while ` +
+          `applying a "${plan.move}" proposal — proceeding without cycle evidence, so its own ` +
+          `approval-gap check fails closed on the missing evidence rather than pairing it with a ` +
+          `board it may no longer describe`,
+      );
+      // `board` may be the caller's retained snapshot, already carrying an older sidecar from a
+      // prior attach on this same array (evidence is keyed by array IDENTITY) — clear it so
+      // `cycleEvidenceFor` actually reports missing, not that stale prior verdict (P2 review, PR
+      // #274, apply.ts:345).
+      clearCycleEvidence(board);
+      return board;
+    }
+    const hydratedBoard = await hydrateCycleOnlyGates(repo, board, cycles);
+    if (hydratedBoard === board) return attachCycleEvidence(hydratedBoard, cycles);
+    // Hydration is its OWN `bd list --type gate` read, made after the consistency check above already
+    // passed — so it can itself land after another writer repairs the cycle `cycles` named and opens a
+    // DIFFERENT gate-only cycle under a different pair of gates, the same gap `shadow.ts` guards
+    // against. Re-fetch cycles and rebuild a comparably-hydrated fresh board before pairing — a plain
+    // `loadAllIssues` baseline structurally omits gate-only cycle members, so it can't be reused as the
+    // comparison target.
+    const freshCycles = await beads.depCycles(repo);
+    const freshBase = await loadAllIssues(repo);
+    const freshHydratedBoard = await hydrateCycleOnlyGates(repo, freshBase, freshCycles);
+    const stillConsistent =
+      sameCycles(freshCycles, cycles) &&
+      sameBlocksEdges(hydratedBoard, freshHydratedBoard) &&
+      sameCycleMemberLiveness(cycles, hydratedBoard, freshHydratedBoard) &&
+      sameBlockerLiveness(hydratedBoard, freshHydratedBoard) &&
+      sameTargetEligibilityState(hydratedBoard, freshHydratedBoard);
+    if (!stillConsistent) {
+      console.warn(
+        `[gardener.apply] ${repo}: board moved during gate hydration for cycle evidence while ` +
+          `applying a "${plan.move}" proposal — proceeding without cycle evidence, so its own ` +
+          `approval-gap check fails closed on the missing evidence rather than pairing it with a ` +
+          `board it may no longer describe`,
+      );
+      // Same stale-sidecar hazard as the consistency check above — clear it (P2 review, PR #274,
+      // apply.ts:345).
+      clearCycleEvidence(board);
+      return board;
+    }
+    return attachCycleEvidence(hydratedBoard, cycles);
+  } catch (e) {
+    console.warn(
+      `[gardener.apply] ${repo}: dep cycles read failed while applying a "${plan.move}" proposal — ` +
+        `proceeding without cycle evidence, so its own approval-gap check fails closed on the ` +
+        `missing evidence rather than this failing the whole apply: ${messageOf(e)}`,
+    );
+    // The depCycles/loadAllIssues read itself failed here, but `board` can still already carry a
+    // sidecar attached by an EARLIER, successful call on this same array — clear it so the
+    // approval gap reads it as missing, not stale (P2 review, PR #274, apply.ts:345).
+    clearCycleEvidence(board);
+    return board;
+  }
 }
 
 /**
@@ -537,7 +687,7 @@ async function settledDrifted(
 ): Promise<string | undefined> {
   let board: Bead[];
   try {
-    board = await readWholeBoard(repo);
+    board = await readWholeBoard(repo, CYCLE_AWARE_MOVES.has(plan.move));
   } catch (e) {
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;

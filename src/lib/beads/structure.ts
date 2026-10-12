@@ -33,7 +33,11 @@ export type StructureRule =
   | "feature-without-epic"
   | "feature-without-tickets"
   | "feature-under-ticket-budget"
-  | "feature-over-ticket-budget";
+  | "feature-over-ticket-budget"
+  | "blocks-edge-dangling"
+  | "blocks-edge-self"
+  | "blocks-duplicates-parent"
+  | "blocks-cycle";
 
 export interface StructureViolation {
   /** The offending bead — the one an author has to move or re-type. */
@@ -52,9 +56,21 @@ export interface StructureReport {
   violations: StructureViolation[];
 }
 
+/** One authoritative `bd dep cycles` entry, parsed best-effort while keeping bd's original record. */
+export interface DepCycleEvidence {
+  ids: string[];
+  raw: unknown;
+}
+
+/** External graph evidence the pure rules can consume when a caller has it. */
+export interface StructureOptions {
+  /** `bd dep cycles --json` evidence; omit only where no authoritative graph read was requested. */
+  cycles?: DepCycleEvidence[];
+}
+
 /** Every way this board departs from `epic → feature → ticket`, in board order. */
-export const validateBoardStructure = (board: Bead[]): StructureViolation[] =>
-  validateBoardStructureJs(board);
+export const validateBoardStructure = (board: Bead[], options?: StructureOptions): StructureViolation[] =>
+  validateBoardStructureJs(board, options);
 
 /** A target's own faults and its descendants', split by severity — one board pass, both sets. */
 export interface StructureGaps {
@@ -68,15 +84,19 @@ export interface StructureGaps {
  * The violations a single run target owns: its own, plus every descendant's, by severity. Both sets
  * come from one pass so a caller that needs the refusal AND the warning can't walk the board twice.
  */
-export const structureGaps = (targetId: string, board: Bead[]): StructureGaps =>
-  structureGapsJs(targetId, board);
+export const structureGaps = (
+  targetId: string,
+  board: Bead[],
+  options?: StructureOptions,
+): StructureGaps => structureGapsJs(targetId, board, options);
 
 /** Violations as one line naming every offender and what is wrong — the body of a 422 or a park note. */
 export const formatStructureViolations = (violations: StructureViolation[]): string =>
   formatStructureViolationsJs(violations);
 
 /** The board's tier conformance, for `anton board-check` and `/shape`'s Phase 5 audit. */
-export const buildStructureReport = (board: Bead[]): StructureReport => buildStructureReportJs(board);
+export const buildStructureReport = (board: Bead[], options?: StructureOptions): StructureReport =>
+  buildStructureReportJs(board, options);
 
 /** The report as text: a headline, then one line per violation, worst severity first. */
 export const formatStructureReport = (report: StructureReport, label = ""): string =>

@@ -22,8 +22,9 @@ import {
   type PickerExclusion,
   type PickerPlanEntry,
 } from "./board-picker-plan";
-import { eligibleTargets } from "./jobs/picker-targets";
+import { eligibleTargets as projectEligibleTargets } from "./jobs/picker-targets";
 import { rankTargets } from "./beads/rank";
+import { attachCycleEvidence, cycleEvidenceFor } from "./beads/cycle-evidence";
 import type { Bead } from "./beads/types";
 import type { Clock } from "./jobs/queue";
 
@@ -71,6 +72,12 @@ const SHAPED_BODY = [
 function shaped(o: Partial<Bead> = {}): Bead {
   return bead({ description: SHAPED_BODY, acceptance_criteria: "- [ ] it works", ...o });
 }
+
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles (mirrors
+ *  picker-targets.test.ts) — the approve gate now refuses to answer without that evidence. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+const eligibleTargets = (board: Bead[]) => projectEligibleTargets(authoritative(board));
 
 function stamp(o: Partial<BoardStamp> = {}): BoardStamp {
   return { observedAtMs: OBSERVED, digest: "cafebabecafebabe", beadCount: 3, ...o };

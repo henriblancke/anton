@@ -389,6 +389,17 @@ describe("a named absence in place of the lane (anton-w579)", () => {
     );
   });
 
+  it("names unavailable cycle evidence, and that the next read clears it on its own", () => {
+    render(<EpicBoard slug="tmp" initialBoard={withAbsence("cycles-unavailable")} />);
+
+    const lane = absenceLane();
+    expect(lane.textContent).toContain("can’t read this board’s dependency graph");
+    expect(lane.textContent).toContain("clears on its own once the graph read succeeds");
+    expect(lane.querySelector('a[href="/projects/tmp/settings#policy"]')?.textContent).toBe(
+      "Work policy",
+    );
+  });
+
   it("says which nothing it is rather than counting zero picks", () => {
     // A `0` in the count's place is the one reading this must never give: two of the three states
     // say nothing at all about how much work the board holds.
@@ -397,6 +408,7 @@ describe("a named absence in place of the lane (anton-w579)", () => {
       "proposes-only",
       "policy-unreadable",
       "no-claimable-work",
+      "cycles-unavailable",
     ] as const) {
       cleanup();
       render(<EpicBoard slug="tmp" initialBoard={withAbsence(absence)} />);

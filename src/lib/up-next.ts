@@ -97,13 +97,21 @@ export function upNextEntries(
  */
 export function upNextAbsence(
   stance: UpNextStance,
+  cyclesKnown: boolean,
   entries: UpNextEntry[] | undefined,
 ): UpNextAbsence | undefined {
   if (!stance.scheduled) return "disarmed";
   // Ahead of the level, which comes from the very read that failed: a fail-soft "it offers" must not
   // be reported as the reason when what is actually true is that anton could not read the settings.
   if (!stance.policyKnown) return "policy-unreadable";
+  // Ahead of the cycles check: a level that never offers picks stays empty whether or not the graph
+  // read recovers, so blaming cycle evidence here would tell the operator this clears on its own when
+  // it never would (PR #274 review).
   if (!stance.levelOffers) return "proposes-only";
+  // Cycles are only load-bearing once a ranking could actually be offered: `bd dep cycles` failing is
+  // a board-read failure, not a verdict about the board, and it fails every target's approval gate
+  // closed (`missingCycleEvidenceGap`) regardless of what the picker settings say.
+  if (!cyclesKnown) return "cycles-unavailable";
   // An entry list that came back EMPTY is a pass that ran and found nothing it may start — distinct
   // from `undefined`, which is a ranking withheld rather than a board with nothing on it.
   return entries?.length === 0 ? "no-claimable-work" : undefined;

@@ -134,11 +134,25 @@ describe("anton board-check (bd stubbed on PATH)", () => {
   const dirs = tempDirs();
   let repo: string;
 
-  /** A `bd` whose `list` serves BOARD, optionally refusing `--status all` the way lean builds do. */
-  async function fakeBd(board: unknown[], { rejectsStatusAll = false } = {}): Promise<string> {
+  /** A `bd` whose list and dependency-cycle output are configurable at the CLI boundary. */
+  async function fakeBd(
+    board: unknown[],
+    {
+      rejectsStatusAll = false,
+      cycles = [],
+      cycleExit = 0,
+      cycleOutput = JSON.stringify(cycles),
+    }: {
+      rejectsStatusAll?: boolean;
+      cycles?: unknown[];
+      cycleExit?: number;
+      cycleOutput?: string;
+    } = {},
+  ): Promise<string> {
     const bin = await dirs.make("anton-bdbin-");
     const open = board.filter((b) => (b as { status?: string }).status !== "closed");
     const closed = board.filter((b) => (b as { status?: string }).status === "closed");
+    const gates = board.filter((b) => (b as { issue_type?: string }).issue_type === "gate");
     writeFakeBd(
       bin,
       [
@@ -146,12 +160,24 @@ describe("anton board-check (bd stubbed on PATH)", () => {
         "const a = process.argv.slice(2);",
         `const open = ${JSON.stringify(JSON.stringify(open))};`,
         `const closed = ${JSON.stringify(JSON.stringify(closed))};`,
-        `const all = ${JSON.stringify(JSON.stringify(board))};`,
+        `const all = ${JSON.stringify(JSON.stringify(board.filter((b) => (b as { issue_type?: string }).issue_type !== "gate")))};`,
+        `const gates = ${JSON.stringify(JSON.stringify(gates))};`,
+        `const cycleOutput = ${JSON.stringify(cycleOutput)};`,
+        `const cycleExit = ${cycleExit};`,
+        'if (a.includes("dep") && a.includes("cycles")) {',
+        '  if (cycleExit !== 0) console.error(cycleOutput); else console.log(cycleOutput);',
+        "  process.exit(cycleExit);",
+        "}",
         'const i = a.indexOf("--status");',
         'const status = i >= 0 ? a[i + 1] : "";',
         `if (status === "all" && ${rejectsStatusAll}) {`,
         '  console.error("unknown value for --status: all");',
         "  process.exit(2);",
+        "}",
+        'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+        '  const gateBoard = JSON.parse(gates);',
+        '  console.log(JSON.stringify(status === "all" ? gateBoard : status === "closed" ? gateBoard.filter((b) => b.status === "closed") : gateBoard.filter((b) => b.status !== "closed")));',
+        "  process.exit(0);",
         "}",
         'console.log(status === "all" ? all : status === "closed" ? closed : open);',
         "process.exit(0);",
@@ -202,6 +228,265 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     expect(r.status).toBe(1);
   });
 
+  // The four mechanical ordering faults (anton-5n57p) live in tiers.mjs and are unit-tested off
+  // literal boards there (structure.test.ts). What's under test here is the WIRING: board-check
+  // counts them into its blocking total, exits non-zero on them, and prints them apart from tier
+  // faults rather than interleaved in board order.
+  describe("ordering faults", () => {
+    const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+
+    it("counts a self-blocking edge as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "t3")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-edge-self]");
+      expect(r.stdout).toContain("t3");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks-edge to a nonexistent bead as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "ghost")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-edge-dangling]");
+      expect(r.stdout).toContain("ghost");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a blocks-edge that duplicates the parent-child edge as blocking and exits non-zero", async () => {
+      const board = [...HEALTHY, { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "f1")] }];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).toContain("[blocks-duplicates-parent]");
+      expect(r.status).toBe(1);
+    });
+
+    it("counts a cycle bd reports as blocking and exits non-zero", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "a", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("a", "b")] },
+        { id: "b", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("b", "a")] },
+      ];
+      const r = runCheck(await fakeBd(board, { cycles: [{ cycle: ["a", "b"] }] }));
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    it("refuses an unreadable populated cycle report rather than calling the board clean", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycles: [{ unfamiliar: true }] }));
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.stdout).toContain("bd dep cycles");
+      expect(r.status).toBe(1);
+    });
+
+    // P2 review, PR #274: `sameBlocksEdges` alone only proves the `blocks` EDGES held steady between
+    // the read and its recheck. Reopening a cycle member touches no edge at all, so without also
+    // comparing live/abandoned status the checker would accept a read taken BEFORE the reopen paired
+    // with cycle evidence that already reflects it — judging a now-live cycle by stale, closed status
+    // and calling the board clean. `t-1`/`t-2` start closed (a historical, non-faulting cycle); the
+    // stubbed bd reopens BOTH starting on the SECOND `bd list` call (the consistency recheck) and stays
+    // reopened from then on, so the pairing only settles once both reads agree the whole loop is live.
+    // (Reopening only one member would still leave the OTHER closed, which — after the P2 fix requiring
+    // the entire loop to stay live to deadlock — never faults either way and couldn't distinguish the
+    // drift from a stale read.)
+    it("retries a board read instead of pairing cycle evidence with a snapshot whose member liveness already drifted", async () => {
+      const bin = await dirs.make("anton-bdbin-liveness-");
+      const stateFile = join(bin, "calls");
+      writeFileSync(stateFile, "0");
+      const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+      const closedA = { id: "t-1", issue_type: "task", status: "closed", parent: "f1", dependencies: [dep("t-1", "t-2")] };
+      const closedB = { id: "t-2", issue_type: "task", status: "closed", parent: "f1", dependencies: [dep("t-2", "t-1")] };
+      const reopenedA = { ...closedA, status: "open" };
+      const reopenedB = { ...closedB, status: "open" };
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          "const a = process.argv.slice(2);",
+          `const stateFile = ${JSON.stringify(stateFile)};`,
+          `const healthy = ${JSON.stringify(HEALTHY)};`,
+          `const closedA = ${JSON.stringify(closedA)};`,
+          `const closedB = ${JSON.stringify(closedB)};`,
+          `const reopenedA = ${JSON.stringify(reopenedA)};`,
+          `const reopenedB = ${JSON.stringify(reopenedB)};`,
+          'if (a.includes("dep") && a.includes("cycles")) {',
+          '  console.log(JSON.stringify([{ cycle: ["t-1", "t-2"] }]));',
+          "  process.exit(0);",
+          "}",
+          "let n = Number(fs.readFileSync(stateFile, 'utf8')) + 1;",
+          "fs.writeFileSync(stateFile, String(n));",
+          // Call 1 (this attempt's read): both closed. Call 2 (its recheck): both already reopened —
+          // the same drift `sameBlocksEdges` alone can't see. Call 3+ (the retried attempt): stable.
+          "const cycleMembers = n === 1 ? [closedA, closedB] : [reopenedA, reopenedB];",
+          "console.log(JSON.stringify([...healthy, ...cycleMembers]));",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      // Converges on the fully reopened, live pairing — a cycle deadlocks once every member is live.
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    // P2 review, PR #274: a cycle can be made ENTIRELY of gates no ordinary bead's `blocks` edge
+    // dangles toward (two gates blocking each other, nothing else pointing at either) — `readBoard`'s
+    // dangling-edge check never fires for that shape, so the gate listing is never fetched and the
+    // cycle's own ids never land on `board`. `validateBoardStructure` intentionally lets a cycle with
+    // no live member pass; without hydrating those gate ids in first, the checker can't tell the two
+    // closed gates apart from an unreadable record and refuses the whole board over dead history.
+    it("clears a cycle made entirely of closed gates nothing else points at, instead of an unreadable-cycle fault", async () => {
+      const dep = (issue_id: string, depends_on_id: string) => ({ type: "blocks", issue_id, depends_on_id });
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "closed", dependencies: [dep("gate1", "gate2")] },
+        { id: "gate2", issue_type: "gate", status: "closed", dependencies: [dep("gate2", "gate1")] },
+      ];
+      const r = runCheck(await fakeBd(board, { cycles: [{ cycle: ["gate1", "gate2"] }] }));
+      expect(r.stdout).not.toContain("[blocks-cycle]");
+      expect(r.status).toBe(0);
+    });
+
+    // The bug the P2 review flagged (bin/anton.mjs:1759): the gate-only-cycle hydration above is its
+    // own live `bd list --type gate`, made AFTER the read/cycle/read consistency loop already passed
+    // — so it can land after another writer repairs the historical `gate1`/`gate2` cycle the first
+    // `bd dep cycles` named and opens a DIFFERENT, LIVE cycle under `gate3`/`gate4` in the same gap.
+    // `board` would then carry the newer gate records while the (unrevalidated) `cycles` still named
+    // only the repaired pair, so the mandatory check exits clean despite the live cycle. The stub's
+    // `bd dep cycles` names `gate1`/`gate2` only on the very first call and `gate3`/`gate4` (both
+    // open, genuinely blocking) on every call after — the shape of a repair-then-reopen landing
+    // mid-hydration — and its gate listing always answers with all four gates, live and historical
+    // alike, so hydration alone can't tell them apart without the revalidation this fix adds.
+    it("retries hydration instead of pairing a gate-only cycle with evidence that moved underneath it", async () => {
+      const bin = await dirs.make("anton-bdbin-gatecycle-drift-");
+      const depStateFile = join(bin, "dep-calls");
+      writeFileSync(depStateFile, "0");
+      const gates = [
+        { id: "gate1", issue_type: "gate", status: "closed" },
+        { id: "gate2", issue_type: "gate", status: "closed" },
+        {
+          id: "gate3",
+          issue_type: "gate",
+          status: "open",
+          dependencies: [{ type: "blocks", issue_id: "gate3", depends_on_id: "gate4" }],
+        },
+        {
+          id: "gate4",
+          issue_type: "gate",
+          status: "open",
+          dependencies: [{ type: "blocks", issue_id: "gate4", depends_on_id: "gate3" }],
+        },
+      ];
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          'const fs = require("node:fs");',
+          "const a = process.argv.slice(2);",
+          `const depStateFile = ${JSON.stringify(depStateFile)};`,
+          `const healthy = ${JSON.stringify(HEALTHY)};`,
+          `const gates = ${JSON.stringify(gates)};`,
+          'if (a.includes("dep") && a.includes("cycles")) {',
+          "  let n = Number(fs.readFileSync(depStateFile, 'utf8')) + 1;",
+          "  fs.writeFileSync(depStateFile, String(n));",
+          // Call 1: the historical, non-faulting pair. Every call after: the live pair a concurrent
+          // writer opened while this attempt's hydration was in flight.
+          "  const cycles = n === 1 ? [{ cycle: ['gate1', 'gate2'] }] : [{ cycle: ['gate3', 'gate4'] }];",
+          "  console.log(JSON.stringify(cycles));",
+          "  process.exit(0);",
+          "}",
+          'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+          "  console.log(JSON.stringify(gates));",
+          "  process.exit(0);",
+          "}",
+          "console.log(JSON.stringify(healthy));",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      // Converges on the live pairing instead of exiting clean on the repaired one it started with.
+      expect(r.stdout).toContain("[blocks-cycle]");
+      expect(r.status).toBe(1);
+    });
+
+    it("hydrates gate records before judging a blocks target", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "open" },
+        { id: "waiter", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("waiter", "gate1")] },
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+      expect(r.status).toBe(0);
+    });
+
+    it("hydrates gate records when bd wraps the gate listing in an { issues: [...] } envelope", async () => {
+      const board = [
+        ...HEALTHY,
+        { id: "gate1", issue_type: "gate", status: "open" },
+        { id: "waiter", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("waiter", "gate1")] },
+      ];
+      const open = board.filter((b) => b.status !== "closed" && b.issue_type !== "gate");
+      const gates = board.filter((b) => b.issue_type === "gate");
+      const bin = await dirs.make("anton-bdbin-envelope-");
+      writeFakeBd(
+        bin,
+        [
+          "#!/usr/bin/env node",
+          "const a = process.argv.slice(2);",
+          `const open = ${JSON.stringify(JSON.stringify(open))};`,
+          `const gates = ${JSON.stringify(JSON.stringify(gates))};`,
+          'if (a.includes("dep") && a.includes("cycles")) { console.log("[]"); process.exit(0); }',
+          "// Same shape bd uses for `bd ready`/some `bd list` builds: `{ issues: [...] }` rather than a bare array.",
+          'if (a.includes("--type") && a[a.indexOf("--type") + 1] === "gate") {',
+          '  console.log(JSON.stringify({ issues: JSON.parse(gates) }));',
+          "  process.exit(0);",
+          "}",
+          "console.log(open);",
+          "process.exit(0);",
+        ].join("\n"),
+      );
+      const r = runCheck(bin);
+      expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+      expect(r.status).toBe(0);
+    });
+
+    it("fails loud when bd's authoritative cycle output is malformed", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycleOutput: "not json" }));
+      expect(r.stderr).toContain("cycle output this build can't parse");
+      expect(r.status).toBe(1);
+    });
+
+    it("reports a non-zero cycle command with a usable fallback detail", async () => {
+      const r = runCheck(await fakeBd(HEALTHY, { cycleExit: 2, cycleOutput: "" }));
+      expect(r.stderr).toContain("bd dep cycles exited 2");
+      expect(r.status).toBe(1);
+    });
+
+    it("groups ordering faults apart from tier faults instead of interleaving them", async () => {
+      const board = [
+        ...HEALTHY,
+        STRAY, // a tier fault: ticket-under-container-epic
+        { id: "t3", issue_type: "task", status: "open", parent: "f1", dependencies: [dep("t3", "t3")] }, // an ordering fault
+      ];
+      const r = runCheck(await fakeBd(board));
+      expect(r.status).toBe(1);
+      const orderingHeader = r.stdout.indexOf("ordering faults:");
+      const tierHeader = r.stdout.indexOf("tier faults:");
+      const orderingLine = r.stdout.indexOf("[blocks-edge-self]");
+      const tierLine = r.stdout.indexOf("[ticket-under-container-epic]");
+      expect(orderingHeader).toBeGreaterThanOrEqual(0);
+      expect(tierHeader).toBeGreaterThan(orderingHeader);
+      // Every ordering line sits under its own header, before the tier header starts.
+      expect(orderingLine).toBeGreaterThan(orderingHeader);
+      expect(orderingLine).toBeLessThan(tierHeader);
+      expect(tierLine).toBeGreaterThan(tierHeader);
+    });
+  });
+
   // Some bd builds reject `--status all`; src/lib/beads/issues.ts already treats that as a supported
   // variation. Without the same fallback here, /shape's mandatory Phase 5 audit failed having
   // checked nothing at all on exactly those installs.
@@ -212,6 +497,23 @@ describe("anton board-check (bd stubbed on PATH)", () => {
     // The closed bead is read (so container-ness sees the whole graph) but never judged: 5 live of 6.
     expect(r.stdout).toContain("5 live beads");
     expect(r.status).toBe(1);
+  });
+
+  it("hydrates gates through the fallback when bd rejects --status all", async () => {
+    const board = [
+      ...HEALTHY,
+      { id: "gate1", issue_type: "gate", status: "open" },
+      {
+        id: "waiter",
+        issue_type: "task",
+        status: "open",
+        parent: "f1",
+        dependencies: [{ issue_id: "waiter", depends_on_id: "gate1", type: "blocks" }],
+      },
+    ];
+    const r = runCheck(await fakeBd(board, { rejectsStatusAll: true }));
+    expect(r.stdout).not.toContain("[blocks-edge-dangling]");
+    expect(r.status).toBe(0);
   });
 
   // The form rate belongs to `bun scripts/contract-report.ts` alone (anton-5ltn). board-check judges

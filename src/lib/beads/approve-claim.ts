@@ -78,6 +78,20 @@ export interface ApproveClaimInput<R> {
    * nothing is written and it comes back as {@link ApproveClaimResult}'s `refused`.
    */
   guard: (locked: Bead, board: Bead[]) => R | undefined | Promise<R | undefined>;
+  /**
+   * Whether the locked read needs authoritative `bd dep cycles` evidence for `guard` to consume —
+   * default true (codex review, PR #274: "Skip cycle reads for non-enqueuing takeovers").
+   *
+   * `loadAllIssues`'s `withCycles` lets a failed cycles read reject the WHOLE read (unlike the
+   * best-effort board paths), which is right for a guard that gates a run on cycle evidence but
+   * wrong for one that does not consume it at all: a pure ownership take-over that will enqueue
+   * nothing (the approve route's `willEnqueue === false`) still reached this same locked read, so
+   * `bd dep cycles` being unavailable, slow, or unreadable 500'd a transfer no cycle verdict was
+   * ever going to gate. Only the caller knows whether its own `guard` reads cycle evidence off the
+   * board it's handed, so it says so here instead of this module guessing from `nextOwner` or
+   * `expectedOwner`.
+   */
+  needsCycles?: boolean;
 }
 
 /**
@@ -120,7 +134,31 @@ export function approveAndClaim<R>(input: ApproveClaimInput<R>): Promise<Approve
     const unrefreshed = await input.refresh?.();
     if (unrefreshed !== undefined) return { refused: unrefreshed };
 
-    const board = await loadAllIssues(repoPath);
+    // `strictGates` (PR #274 review): both callers gate this locked read behind structural checks
+    // (`blocks-edge-dangling` among them), and a degraded gate-less board misreads a gate's own
+    // `blocks` edge as dangling — valid structure reported as board corruption. A transient gate
+    // listing failure must fail this write instead, the same as every other approval-path board read.
+    //
+    // `withCycles` is the CALLER's call (PR #274 review), not unconditional: unlike `strictGates`,
+    // which every caller needs, a guard that will not consume cycle evidence (the approve route's
+    // pure, non-enqueuing take-over) must not have this read reject over a `bd dep cycles` that
+    // timed out or came back unreadable — see {@link ApproveClaimInput.needsCycles}.
+    //
+    // The `sameBlocksEdges` consistency recheck stays ON here (PR #274 review, round 17): both this
+    // module's callers (the approve route's guard, the picker's `startGuard`) compose
+    // `structureGaps`/`makeApprovalGate`, which reads `cycleEvidenceFor(board)` for the cycle rule
+    // but walks `board`'s raw `blocks` edges DIRECTLY for the dangling-blocker, self-block and
+    // duplicates-parent rules — exactly the stale-edge case the recheck exists to catch. A previous
+    // version of this call skipped it on the theory that these guards only ever consumed cycle
+    // evidence; they don't, so skipping let an edge that changed between the `work` read and the
+    // `bd dep cycles` read (another writer landing on a shared-server board) go unnoticed by both
+    // the cycle check and these structural rules, letting this locked read approve or claim a
+    // target whose external blocker or structural edge had just changed. See the doc on
+    // `LoadIssuesOptions.skipCycleConsistencyRecheck` for the general rule this call now follows.
+    const board = await loadAllIssues(repoPath, {
+      withCycles: input.needsCycles ?? true,
+      strictGates: true,
+    });
     const locked = board.find((b) => b.id === beadId);
     if (!locked) return { vanished: true };
 

@@ -203,6 +203,37 @@ describeBd("POST /api/projects/[slug]/epics/[epicId]/approve — claims (temp an
     expect(await executeEpicJobs(epic)).toHaveLength(0);
   });
 
+  it("takes over a blocked target when `bd dep cycles` is unavailable — a pure transfer needs no cycle evidence", async () => {
+    // codex review (PR #274): a pure, non-enqueuing take-over (`willEnqueue === false`, same shape as
+    // the test above) never reaches the structure re-check that consumes cycle evidence, so the
+    // locked read behind it must not fail the whole request over a `bd dep cycles` that times out or
+    // returns unreadable output. Before the fix, `approveAndClaim`'s locked read unconditionally asked
+    // for `withCycles: true` and this 500'd even though no cycle verdict was ever going to gate.
+    const epic = await beads.create(repo, { title: "Take-over, no cycle evidence", type: "epic", acceptance: "- [ ] it works" });
+    const child = await beads.create(repo, { title: "Take-over, no cycle evidence child", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, epic, "parent-child");
+    await beads.assign(repo, epic, "someone-else");
+    await beads.approve(repo, epic); // approved + backlog, owned by a teammate
+
+    // A blocker lands only now, exactly as above — this is what makes the take-over non-enqueuing.
+    const blocker = await beads.create(repo, { title: "Late-arriving blocker for cycle-less take-over", type: "task", acceptance: "- [ ] it works" });
+    await beads.link(repo, child, blocker, "blocks");
+
+    const cyclesSpy = vi.spyOn(beads, "depCycles").mockRejectedValue(new Error("bd dep cycles: command timed out"));
+    try {
+      actAs("anton-test");
+      const res = await approve(epic, { steal: true });
+      expect(res.status).toBe(200);
+      // The reservation transfers to the new owner…
+      expect((await beads.show(repo, epic)).assignee).toBe("anton-test");
+      // …and no run is enqueued (a take-over suppresses the run despite the open blocker).
+      expect((await res.json()).jobId).toBeUndefined();
+      expect(await executeEpicJobs(epic)).toHaveLength(0);
+    } finally {
+      cyclesSpy.mockRestore();
+    }
+  });
+
   it("enqueues a local run when taking over an approved, ready target with no job on this instance", async () => {
     // The cross-instance take-over (anton-i71, PR #39): operator A approved on their machine, which
     // enqueued A's job in A's local anton.db — not this one. Here the target is approved + backlog,

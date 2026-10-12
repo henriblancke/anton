@@ -377,12 +377,17 @@ describe("parseDepCycles", () => {
       { cycle: ["b-1", "b-2"] },
       { path: [{ id: "c-1" }, { id: "c-2" }] },
       { issue_ids: ["d-1"] },
+      // bd's real `Cycle{Members, Partial}` shape (confirmed against issueops/cycledetector.go on
+      // 1.1.2, output bare via `outputJSON(report.Cycles)`): `members` was missing from the fallback
+      // chain, so this shape used to parse to `ids: []`.
+      { members: [{ id: "e-1" }, { id: "e-2", issue: { id: "e-2", title: "E2" } }], partial: true },
     ];
     expect(parseDepCycles(JSON.stringify(raws))).toEqual([
       { ids: ["a-1", "a-2"], raw: raws[0] },
       { ids: ["b-1", "b-2"], raw: raws[1] },
       { ids: ["c-1", "c-2"], raw: raws[2] },
       { ids: ["d-1"], raw: raws[3] },
+      { ids: ["e-1", "e-2"], raw: raws[4] },
     ]);
   });
 
@@ -390,6 +395,11 @@ describe("parseDepCycles", () => {
     expect(parseDepCycles(JSON.stringify([{ weird: 1 }]))).toEqual([
       { ids: [], raw: { weird: 1 } },
     ]);
+  });
+
+  it("throws on malformed or non-array output rather than treating it as cycle-free", () => {
+    expect(() => parseDepCycles("not json")).toThrow(/refusing to report unreadable cycle evidence/);
+    expect(() => parseDepCycles(JSON.stringify({ cycles: [] }))).toThrow(/could not read its --json output/);
   });
 });
 

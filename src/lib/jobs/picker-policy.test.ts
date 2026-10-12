@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Bead } from "../beads/types";
+import { attachCycleEvidence } from "../beads/cycle-evidence";
 import { armedPickerPolicy, ARMED_RULE } from "./picker-policy";
 
 /** A dated, contract-shaped bead — nothing for the approve gate to fault. */
@@ -25,16 +26,17 @@ function bead(id: string, o: Partial<Bead> = {}): Bead {
 }
 
 const NOW = new Date("2026-08-29T00:00:00Z");
+const authoritative = <T extends Bead[]>(board: T): T => attachCycleEvidence(board, []);
 
 describe("armedPickerPolicy", () => {
   it("admits a target the policy covers, naming the rule the plan records", () => {
-    const board = [bead("t1", { issue_type: "bug", priority: 1 })];
+    const board = authoritative([bead("t1", { issue_type: "bug", priority: 1 })]);
     const verdict = armedPickerPolicy({ types: ["bug"] }, board, NOW).admits(board[0]);
     expect(verdict).toEqual({ admitted: true, rule: ARMED_RULE });
   });
 
   it("refuses a target the policy excludes, in the words the editor uses", () => {
-    const board = [bead("t1", { issue_type: "bug" })];
+    const board = authoritative([bead("t1", { issue_type: "bug" })]);
     const verdict = armedPickerPolicy({ types: ["chore"] }, board, NOW).admits(board[0]);
     expect(verdict.admitted).toBe(false);
     // "Why not this one?" is asked of the plan as often as of the panel, and both answer the same.
@@ -42,7 +44,7 @@ describe("armedPickerPolicy", () => {
   });
 
   it("judges age against the pass's observation instant, not the moment each bead is read", () => {
-    const board = [bead("t1", { created_at: "2026-08-28T00:00:00Z" })];
+    const board = authoritative([bead("t1", { created_at: "2026-08-28T00:00:00Z" })]);
     const policy = { minAgeDays: 5 };
     expect(armedPickerPolicy(policy, board, NOW).admits(board[0]).admitted).toBe(false);
     const older = new Date("2026-09-30T00:00:00Z");
@@ -52,14 +54,14 @@ describe("armedPickerPolicy", () => {
   it("refuses a target the startable projection does not carry (R2.5)", () => {
     // Fails closed on the miss: the projection IS the startable set, so a target it does not carry
     // is one the picker could not start — admitting it would start work no rule covered.
-    const board = [bead("t1")];
+    const board = authoritative([bead("t1")]);
     const stranger = bead("elsewhere");
     const verdict = armedPickerPolicy({}, board, NOW).admits(stranger);
     expect(verdict).toEqual({ admitted: false, detail: expect.stringContaining("startable") });
   });
 
   it("admits everything the policy asserts nothing about", () => {
-    const board = [bead("t1"), bead("t2", { issue_type: "feature" })];
+    const board = authoritative([bead("t1"), bead("t2", { issue_type: "feature" })]);
     const policy = armedPickerPolicy({}, board, NOW);
     expect(board.every((b) => policy.admits(b).admitted)).toBe(true);
   });

@@ -39,6 +39,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { LABELS } from "./beads/bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "./beads/cycle-evidence";
 import type { Bead } from "./beads/types";
 import {
   DIGEST_FIELDS,
@@ -104,7 +105,14 @@ const POLICY: Policy = {
   labels: [{ namespace: "domain", values: ["eng"] }],
 };
 
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles (mirrors
+ *  picker-targets.test.ts) — the approve gate now refuses to answer without that evidence, and every
+ *  mutation helper below (`patch`, `relabel`, `heartbeat`) hands `decide` a freshly mapped array. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+
 function decide(board: Bead[], policy: Policy = POLICY) {
+  board = authoritative(board);
   return decideBoardPickerPlan({
     board,
     policy: armedPickerPolicy(policy, board, new Date(OBSERVED)),

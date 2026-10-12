@@ -10,6 +10,7 @@
 import { describe, expect, it } from "vitest";
 
 import { LABELS, type Bead } from "../beads/bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "../beads/cycle-evidence";
 import { planApply } from "./apply-plan";
 import { type GardenerPlan } from "./detections";
 import {
@@ -49,12 +50,17 @@ import {
   warm,
 } from "./apply.fixture";
 
+/** Nominal fixtures represent a completed `bd dep cycles` read with no cycles (mirrors
+ *  picker-targets.test.ts) — the approve gate now refuses to answer without that evidence. */
+const authoritative = <T extends Bead[]>(board: T): T =>
+  cycleEvidenceFor(board) === undefined ? attachCycleEvidence(board, []) : board;
+
 /**
  * Decide against a fixture board the way the route does: now, against a proposal filed a month ago.
  * A test that needs a different pair of moments calls `planApply` itself.
  */
 const decide = (plan: GardenerPlan, board: Bead[], nowMs: number = NOW) =>
-  planApply(plan, board, { nowMs, observedAtMs: Date.parse(FILED) });
+  planApply(plan, authoritative(board), { nowMs, observedAtMs: Date.parse(FILED) });
 
 describe("planApply — what an approval means against the board as it now is", () => {
   it("re-parents every subject that isn't already home, remembering the parent to undo to", () => {

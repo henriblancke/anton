@@ -403,6 +403,27 @@ describe("the park split — a quota window and a stop a human must clear are op
   });
 });
 
+describe("anton-tuf4l — the gate-fix round's two stop paths, each classified", () => {
+  it("parked after gate-fix round: anton failing, and nothing else moves", () => {
+    // `runGatesWithFollowUp` gives a red gate ONE bounded follow-up round (anton-pwekp); still red
+    // after that throws a `gateFailurePoison`, which parks the `review-fix-pr` job through the
+    // runner's ordinary non-quota path — no new counter, just the existing failure-park signal.
+    const jobs = [job({ type: "review-fix-pr", status: "parked", failureParkCount: 1 })];
+    expect(counts({ jobs })).toEqual({ ...ZEROES, prFixRounds: 1, failureParks: 1 });
+    expect(countHumanTouches({ jobs })).toBe(0);
+  });
+
+  it("suppressed: nothing to push at unchanged state — not anton failing, and nothing else moves", () => {
+    // A round that answered the review feedback without pushing settles `done` (`recordReviewFixAnswered`,
+    // anton-dfuvz) — nobody was asked anything and nothing is waiting on a person, so it moves only
+    // `prFixRounds`. The LATER suppression this enables (declining to re-dispatch at the same head +
+    // reasons) creates no job row of its own, so there is nothing further to count.
+    const jobs = [job({ type: "review-fix-pr", status: "done" })];
+    expect(counts({ jobs })).toEqual({ ...ZEROES, prFixRounds: 1 });
+    expect(countHumanTouches({ jobs })).toBe(0);
+  });
+});
+
 /** A `jobs` row as the counters read it. */
 function job(overrides: Partial<FrictionJobRow> = {}): FrictionJobRow {
   return { type: "execute-epic", status: "done", quotaParkCount: 0, failureParkCount: 0, ...overrides };

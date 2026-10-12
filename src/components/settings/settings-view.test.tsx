@@ -128,6 +128,7 @@ function renderView(
       policyCandidates={[]}
       policyNotStartable={0}
       boardUnavailable={false}
+      policyEvidenceUnavailable={false}
       earned={earned}
       pickerEarned={pickerEarned}
       quotaProjects={QUOTA_PROJECTS}

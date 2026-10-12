@@ -59,6 +59,13 @@ import {
   warm,
 } from "./apply.fixture";
 
+/**
+ * `bd dep cycles` under the write-time re-check, overridable per test (default: cycle-free). A
+ * `let` referenced only from inside the mock factory's lazily-invoked functions, the same hoisting
+ * trick `record`/`showBead`/`listBoard` already rely on.
+ */
+let cyclesAnswer: () => Promise<unknown[]> = async () => [];
+
 // Every reference to the seam sits INSIDE a wrapper: vitest hoists this factory above the imports
 // above, so touching one while building the object would read it before it is initialised.
 vi.mock("../beads/bd", async () => {
@@ -69,6 +76,7 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       show: (_cwd: string, id: string) => showBead(id),
       list: (_cwd: string, extra: string[] = []) => listBoard(extra),
+      depCycles: () => cyclesAnswer(),
       reparent: (_cwd: string, id: string, parent: string) => record("reparent", id, parent),
       link: (_cwd: string, a: string, b: string, type: string) => record("link", a, b, type),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
@@ -83,7 +91,10 @@ vi.mock("../beads/bd", async () => {
   };
 });
 
-beforeEach(resetSeam);
+beforeEach(() => {
+  resetSeam();
+  cyclesAnswer = async () => [];
+});
 
 describe("under the write lock — what a decided step re-asks before it lands", () => {
   // Every topology re-check treats a board read it could not make as a refusal, so on a bd without
@@ -98,6 +109,22 @@ describe("under the write lock — what a decided step re-asks before it lands",
         ? live.filter((b) => b.status === "closed")
         : live.filter((b) => b.status !== "closed");
     });
+
+    const result = await apply(proposal, [CARD, bead("anton-a"), proposal]);
+
+    expect(result.changed).toEqual(["anton-a"]);
+    expect(calls[0]).toBe("reparent anton-a anton-card");
+  });
+
+  // A reparent's write-time re-check never consults cycle evidence (only approve/unapprove do, via
+  // `startBarred`/`approvalGaps`), so a `bd dep cycles` failure here must not refuse it — otherwise
+  // a timing out or unreadable `bd dep cycles` would poison every reparent/retire/link step in every
+  // apply, not just the two moves that actually read cycle evidence (PR #274 review).
+  it("applies a reparent even when `bd dep cycles` fails, because reparent never reads cycle evidence", async () => {
+    const proposal = proposalFor(REPARENT);
+    cyclesAnswer = async () => {
+      throw new Error("bd: dep cycles timed out");
+    };
 
     const result = await apply(proposal, [CARD, bead("anton-a"), proposal]);
 

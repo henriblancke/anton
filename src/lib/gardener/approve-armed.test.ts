@@ -39,6 +39,7 @@ vi.mock("../beads/bd", async () => {
       ...actual.beads,
       show: (_cwd: string, id: string) => showBead(id),
       list: (_cwd: string, extra: string[] = []) => listBoard(extra),
+      depCycles: async () => [],
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
       close: (_cwd: string, id: string, reason?: string) => record("close", id, reason ?? ""),
       approve: (_cwd: string, id: string) => record("approve", id),

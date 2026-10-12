@@ -12,7 +12,7 @@
  *
  * apply.ts carries the three properties this whole layer rests on and why each exists.
  */
-import { approvalGaps, formatApprovalGaps, type ApprovalGap } from "../approval-gate";
+import { approvalGaps, formatApprovalGaps, onlyMissingEvidence, type ApprovalGap } from "../approval-gate";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { isTicketTier } from "../beads/contract";
 import {
@@ -1206,6 +1206,16 @@ function unapproveSubject(subject: Bead, index: BoardIndex, at: ApplyMoment): Ap
     return {
       status: "settled",
       summary: `${subject.id} meets the approve gate again — the gaps were repaired, so the approval stands`,
+    };
+  }
+  // Missing evidence is not a confirmed gap — see `onlyMissingEvidence`. `approve` fails closed on it
+  // because no evidence means no grant; `unapprove` must fail OPEN on it instead, because interpreting
+  // "unknown" as "still degraded" would strip a sound approval on nothing but a flaky `bd dep cycles`
+  // call. Refusing costs nothing: the next pass re-asks against fresh evidence.
+  if (onlyMissingEvidence(gaps)) {
+    return {
+      status: "refuse",
+      reason: `cannot confirm ${subject.id}'s approval is still degraded — ${formatApprovalGaps(gaps)}`,
     };
   }
   return {

@@ -12,21 +12,67 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./bd";
 
 const listMock = vi.fn();
+const cyclesMock = vi.fn();
+// Lets one test simulate a concurrent refresh landing in the gap between `readIssueSnapshot`
+// resolving and its caller reading the result — the exact race window PR #274 review flagged.
+// Defaults to the real implementation so every other test is unaffected.
+const readIssueSnapshotMock = vi.fn();
 
 vi.mock("./bd", async () => {
   const actual = await vi.importActual<typeof import("./bd")>("./bd");
   return {
     ...actual,
-    beads: { ...actual.beads, list: (...args: unknown[]) => listMock(...args) },
+    beads: {
+      ...actual.beads,
+      list: (...args: unknown[]) => listMock(...args),
+      depCycles: (...args: unknown[]) => cyclesMock(...args),
+    },
   };
 });
 
-const { loadAllIssues } = await import("./issues");
+vi.mock("./snapshot", async () => {
+  const actual = await vi.importActual<typeof import("./snapshot")>("./snapshot");
+  readIssueSnapshotMock.mockImplementation(
+    (...args: Parameters<typeof actual.readIssueSnapshot>) => actual.readIssueSnapshot(...args),
+  );
+  return {
+    ...actual,
+    readIssueSnapshot: (...args: Parameters<typeof actual.readIssueSnapshot>) =>
+      readIssueSnapshotMock(...args),
+  };
+});
+
+const {
+  allIssues,
+  ensureCycleEvidence,
+  loadAllIssues,
+  probeCycleEvidence,
+  readAllIssues,
+  refreshAllIssues,
+  refreshAllIssuesRead,
+  resetCycleEvidenceCheckedAt,
+  resetCycleProbes,
+  sameTargetEligibilityState,
+} = await import("./issues");
+const { attachCycleEvidence, cycleEvidenceFor } = await import("./cycle-evidence");
+const {
+  ISSUE_SNAPSHOT_MAX_AGE_MS,
+  invalidateIssueSnapshot,
+  issueSnapshotGeneration,
+  issueSnapshotVersion,
+  refreshIssueSnapshot,
+  resetIssueSnapshots,
+} = await import("./snapshot");
 
 const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
 beforeEach(() => {
+  resetIssueSnapshots();
+  resetCycleProbes();
+  resetCycleEvidenceCheckedAt();
   listMock.mockReset();
+  cyclesMock.mockReset();
+  cyclesMock.mockResolvedValue([]);
   warn.mockClear();
 });
 
@@ -112,6 +158,847 @@ describe("loadAllIssues", () => {
     expect(listMock).toHaveBeenCalledTimes(1);
   });
 
+  it("attaches cycle evidence to the cached board, so approval projections cannot read it cycle-free", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledWith(REPO);
+  });
+
+  it("keeps cycle evidence on a forced refresh for release re-derivation", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const board = await refreshAllIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledWith(REPO);
+  });
+
+  it("refreshAllIssues degrades to a board without cycle evidence rather than fail the whole forced refresh (PR #274 review)", async () => {
+    // The enrichment branch below only runs its OWN `fetchCyclesShared` call when a concurrent
+    // non-cycled refresh won the shared loader (same race as "bumps the version when a concurrent
+    // non-cycled refresh wins the shared loader race" above) — otherwise this call's own
+    // `loadAllIssues(cwd, { withCycles: true })` would have fetched cycles itself as part of its
+    // ordinary load, a DIFFERENT, intentionally-not-best-effort path (jobs rely on that one
+    // rejecting to retry). Stage that same race, but let the enrichment's own fetch fail: unlike
+    // every other cycles path in this file (`attachCyclesBestEffort`, `probeCycleEvidence`), this
+    // one had no try/catch and let the rejection fail the whole forced refresh.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await refreshAllIssues(REPO);
+
+    let resolveList!: (value: Bead[]) => void;
+    listMock.mockImplementationOnce(() => new Promise<Bead[]>((resolve) => { resolveList = resolve; }));
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { withCycles: true });
+
+    resolveList([{ ...target, dependencies: [] }]);
+    const [ordinaryBoard, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    expect(approvalBoard).toBe(ordinaryBoard);
+    expect(approvalBoard.map((b) => b.id)).toEqual(["t-1"]);
+    expect(cycleEvidenceFor(approvalBoard)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("bd: dep cycles timed out");
+  });
+
+  it("retries rather than attach empty cycle evidence to a board whose own edges are pre-repair (P2 review on PR #274)", async () => {
+    // `work`'s own read still carries a `blocks` edge — the cycle's other half sits on some other
+    // bead this test doesn't need — that a concurrent repair removes in the gap before `bd dep
+    // cycles` runs. Without the recheck, the empty cycles result would land on this stale, still-
+    // cyclic-looking `board` as if it described the same revision.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock
+      .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
+      .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
+      .mockImplementationOnce(async () => [repaired, other]) // retry's work read — no blocks edge left
+      .mockImplementationOnce(async () => [repaired, other]); // retry's own recheck — no longer skipped
+    // just because this snapshot carries no edge (P2 review, PR #274, issues.ts:315) — stable
+    cyclesMock.mockResolvedValue([]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([repaired, other]);
+    expect(cycleEvidenceFor(board)).toEqual([]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries when a reported cycle member's live/abandoned status drifts without any `blocks` edge moving (P2 review, PR #274, issues.ts:312)", async () => {
+    // `bd dep cycles` walks `blocks` edges only — reopening a bead touches none — so a plain
+    // `sameBlocksEdges` recheck would wave this pairing through even though `validateBoardStructure`'s
+    // cycle rule (tiers.mjs's `isLive`/`isJudged`) decides whether the cycle even faults purely off
+    // `status`/`abandoned`. Both cycle members start CLOSED (a historical, non-faulting cycle); the
+    // recheck observes one of them reopened while the edges stay byte-for-byte identical throughout.
+    const closedA: Bead = {
+      id: "t-1",
+      title: "A",
+      status: "closed",
+      issue_type: "task",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const closedB: Bead = {
+      id: "t-2",
+      title: "B",
+      status: "closed",
+      issue_type: "task",
+      dependencies: [{ issue_id: "t-2", depends_on_id: "t-1", type: "blocks" }],
+    };
+    const reopenedA: Bead = { ...closedA, status: "open" };
+    listMock
+      .mockImplementationOnce(async () => [closedA, closedB]) // this call's own work read — both closed
+      .mockImplementationOnce(async () => [reopenedA, closedB]) // the recheck — A reopened, edges unchanged
+      .mockImplementationOnce(async () => [reopenedA, closedB]) // retry's own work read — stable now
+      .mockImplementationOnce(async () => [reopenedA, closedB]); // retry's recheck — converges
+    cyclesMock.mockResolvedValue([{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([reopenedA, closedB]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries when an ORDINARY (non-cycle) blocker is reopened between reads, even though `bd dep cycles` never names it (P2 review, PR #274, issues.ts:455)", async () => {
+    // t-9 blocks t-1 with no cycle through it, so `cycles` never reports either id — only a re-list
+    // can catch t-9 being reopened, the same way it catches a reported cycle member's drift above.
+    // Without `sameBlockerLiveness`, `sameCycleMemberLiveness` skips t-9 (not a cycle member) and
+    // `sameBlocksEdges` sees no change (the edge itself never moved), so this would wave a stale
+    // CLOSED reading of t-9 through — exactly what `blockedGap` (approval-gate.ts) reads to decide
+    // whether t-1 is still blocked.
+    const closedBlocker: Bead = { id: "t-9", title: "Blocker", status: "closed", issue_type: "task" };
+    const reopenedBlocker: Bead = { ...closedBlocker, status: "open" };
+    const blocked: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-9", type: "blocks" }],
+    };
+    listMock
+      .mockImplementationOnce(async () => [blocked, closedBlocker]) // this call's own work read — blocker closed
+      .mockImplementationOnce(async () => [blocked, reopenedBlocker]) // the recheck — blocker reopened, edge unchanged
+      .mockImplementationOnce(async () => [blocked, reopenedBlocker]) // retry's own work read — stable now
+      .mockImplementationOnce(async () => [blocked, reopenedBlocker]); // retry's recheck — converges
+    cyclesMock.mockResolvedValue([]); // acyclic edge — `bd dep cycles` never names it
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([blocked, reopenedBlocker]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries when a cycle member's ANCESTOR is reparented into a different run, even though the member's own immediate parent never moves (P2 review, PR #274, issues.ts:410)", async () => {
+    // t-1 sits below an intermediate ticket (`mid`), not directly below a run. Between the two reads,
+    // `mid` itself gets reparented from run-a's subtree into run-b's — t-1's own `parentOf` (`mid`)
+    // never changes, and neither does any `blocks` edge or status, so a check that only compares each
+    // member's immediate parent would wave this through even though `descendantsOf` walking down from
+    // run-a no longer reaches t-1 while walking down from run-b now does.
+    const mid: Bead = { id: "mid-1", title: "Intermediate", status: "open", issue_type: "task", parent: "run-a" };
+    const midReparented: Bead = { ...mid, parent: "run-b" };
+    const cyclicA: Bead = {
+      id: "t-1",
+      title: "A",
+      status: "open",
+      issue_type: "task",
+      parent: "mid-1",
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const cyclicB: Bead = {
+      id: "t-2",
+      title: "B",
+      status: "open",
+      issue_type: "task",
+      dependencies: [{ issue_id: "t-2", depends_on_id: "t-1", type: "blocks" }],
+    };
+    listMock
+      .mockImplementationOnce(async () => [mid, cyclicA, cyclicB]) // this call's own work read — mid under run-a
+      .mockImplementationOnce(async () => [midReparented, cyclicA, cyclicB]) // recheck — mid moved to run-b
+      .mockImplementationOnce(async () => [midReparented, cyclicA, cyclicB]) // retry's work read — stable now
+      .mockImplementationOnce(async () => [midReparented, cyclicA, cyclicB]); // retry's recheck — converges
+    cyclesMock.mockResolvedValue([{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([midReparented, cyclicA, cyclicB]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }]);
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed instead of retrying forever when the graph keeps moving on every read (P2 review on PR #274)", async () => {
+    // Every work read disagrees with the one before it, so `sameBlocksEdges` never converges —
+    // simulating sustained shaping/concurrent writers on a shared-server board. Without a retry
+    // cap this recurses indefinitely, spawning `bd list`/`bd dep cycles` with no bound.
+    let call = 0;
+    listMock.mockImplementation(async () => {
+      call += 1;
+      return [{ ...target, dependencies: [{ issue_id: "t-1", depends_on_id: `g-${call}`, type: "blocks" }] }];
+    });
+    cyclesMock.mockResolvedValue([]);
+
+    await expect(loadAllIssues(REPO, { withCycles: true })).rejects.toThrow(
+      /dependency graph kept moving/,
+    );
+    // Bounded: one work read per attempt plus the recheck, capped rather than unbounded.
+    expect(listMock.mock.calls.length).toBeLessThan(20);
+  });
+
+  it("still runs the recheck when `work` carries no `blocks` edge at all (P2 review, PR #274, issues.ts:315)", async () => {
+    // A board that reads as edge-free is exactly what a shared-server writer's very FIRST `blocks`
+    // edge lands into, in the gap between this call's own work read and `bd dep cycles` settling. An
+    // acyclic edge never shows up in `cycles`, so only a re-list — not the cycle evidence itself —
+    // can catch it; skipping the recheck here (a prior version of this test locked that in) let a
+    // newly added blocker go unnoticed by both the cycle check and `structureGaps`' raw-edge rules.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([]);
+
+    await loadAllIssues(REPO, { withCycles: true });
+
+    expect(listMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("still retries on a non-empty cycles result when it doesn't cover a stale blocks edge in the earlier board (P2 review round 18 on PR #274)", async () => {
+    // A non-empty `cycles` result is only the fail-safe answer for the cycle(s) it actually names.
+    // Here it reports an unrelated cycle elsewhere (t-9) while `work`'s own t-1/t-2 edge was repaired
+    // by a concurrent writer in the gap before `bd dep cycles` ran — exactly the case `structureGaps`
+    // would miss because it scopes reported membership to a target's own subtree, never seeing t-1's
+    // now-stale cycle in evidence that only speaks to t-9.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock
+      .mockImplementationOnce(async () => [cyclic, other]) // this call's own work read
+      .mockImplementationOnce(async () => [repaired, other]) // the recheck — the repair already landed
+      .mockImplementationOnce(async () => [repaired, other]) // retry's work read — no blocks edge left
+      .mockImplementationOnce(async () => [repaired, other]) // retry's own recheck — no longer skipped
+      // just because this snapshot carries no edge (P2 review, PR #274, issues.ts:315) — stable
+      .mockImplementationOnce(async () => []); // retry's gate hydration read — t-9 isn't a gate either
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board).toEqual([repaired, other]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+    expect(listMock).toHaveBeenCalledTimes(5);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("hydrates gate members a cycle names when no work bead's edge dangles toward them (P2 review, PR #274, issues.ts:176)", async () => {
+    // Two gates blocking each other with no ticket pointing at either: `dangling` stays empty, so the
+    // ordinary load never reaches for the gate listing at all. Without hydrating what `cycles` itself
+    // names, `cycleMembers` can't map either id and reports a synthetic, unscoped "board" fault that
+    // blocks every approval target instead of just this cycle's own (empty) subtree.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
+
+  it("rejects rather than attach cycle evidence to a board that never got the gate hydration it names (P2 badge review, PR #274, issues.ts:284)", async () => {
+    // Same gate-only cycle as the test above, but the hydration read that would bring g-1/g-2 onto
+    // `board` fails. Swallowing it the way `opts.strictGates ?? false` used to (degrading to `[]`,
+    // indistinguishable from "neither id is a gate") would still attach `cycles` to a board missing
+    // both members it names — `cycleMembers` then can't map either id and reports an unscoped,
+    // board-wide fault instead of this read simply failing closed.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? Promise.reject(new Error("bd: database is locked")) : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    await expect(loadAllIssues(REPO, { withCycles: true })).rejects.toThrow("bd: database is locked");
+  });
+
+  it("degrades to a board without cycle evidence when gate hydration fails and the caller opted into it", async () => {
+    // Same failing hydration as above, but this caller set `degradeCyclesOnFailure` — mirrors how a
+    // failed `bd dep cycles` fetch itself already degrades instead of rejecting.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? Promise.reject(new Error("bd: database is locked")) : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true, degradeCyclesOnFailure: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-3"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("bd: database is locked");
+  });
+
+  it("retries when a gate-only cycle gets repaired and a different one opens between the cycles fetch and the gate hydration read (P2 review, PR #274, issues.ts:254)", async () => {
+    // `dangling` stays empty (no work bead points at either gate), so the hydration read below is
+    // the FIRST time `board` learns of any gate at all — a fresh `bd list --type gate` landing after
+    // a concurrent writer repairs cycle A (g-1/g-2) and opens cycle B (g-3/g-4) would otherwise merge
+    // B's gates onto `board` while `cycles` (fetched before this read) still names only A, and
+    // `structureGaps` — which trusts `cycles` alone for the cycle rule — would declare B's target
+    // clean.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    const gateC: Bead = {
+      id: "g-3",
+      title: "Gate: C",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-3", depends_on_id: "g-4", type: "blocks" }],
+    };
+    const gateD: Bead = {
+      id: "g-4",
+      title: "Gate: D",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-4", depends_on_id: "g-3", type: "blocks" }],
+    };
+    const cycleA = [{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }];
+    const cycleB = [{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }];
+    listMock
+      .mockImplementationOnce(async () => [solo]) // attempt 0's own work read
+      .mockImplementationOnce(async () => [solo]) // attempt 0's pre-hydration recheck re-list — unchanged
+      .mockImplementationOnce(async () => [gateA, gateB]) // attempt 0's gate hydration — still cycle A
+      .mockImplementationOnce(async () => [solo]) // attempt 1's own work read
+      .mockImplementationOnce(async () => [solo]) // attempt 1's pre-hydration recheck re-list — unchanged
+      .mockImplementationOnce(async () => [gateC, gateD]) // attempt 1's gate hydration — now cycle B
+      .mockImplementationOnce(async () => [solo]) // attempt 1's post-hydration edge recheck work read
+      .mockImplementationOnce(async () => [gateC, gateD]); // attempt 1's post-hydration edge recheck gate read — stable
+    cyclesMock
+      .mockImplementationOnce(async () => cycleA) // attempt 0's own cycles fetch
+      .mockImplementationOnce(async () => cycleB) // attempt 0's post-hydration recheck — A repaired, B opened
+      .mockImplementationOnce(async () => cycleB) // attempt 1's own cycles fetch
+      .mockImplementationOnce(async () => cycleB); // attempt 1's post-hydration recheck — stable
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id).sort()).toEqual(["g-3", "g-4", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual(cycleB);
+    expect(listMock).toHaveBeenCalledTimes(8);
+    expect(cyclesMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("retries when an unrelated acyclic blocks edge changes during gate hydration, even though the cycle set stays stable (P2 review, PR #274, issues.ts:263)", async () => {
+    // Same gate-only-cycle hydration as above, but this time the cycle itself (g-1/g-2) never moves —
+    // `bd dep cycles` reports identically every fetch, so `recheckCycleConsistency` alone waves this
+    // through. What changes instead is an ORDINARY, acyclic `blocks` edge gate g-1 also carries
+    // (g-1 -> t-6, nothing to do with the g-1/g-2 cycle), removed during the gap between the
+    // hydration's own `bd list --type gate` read and the recheck's fresh one. A recheck that only
+    // compares cycle sets would miss it entirely, leaving `board` paired with a stale edge that
+    // `structureGaps` walks directly.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateABefore: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [
+        { issue_id: "g-1", depends_on_id: "g-2", type: "blocks" },
+        { issue_id: "g-1", depends_on_id: "t-6", type: "blocks" }, // acyclic — resolved mid-flight
+      ],
+    };
+    const gateAAfter: Bead = {
+      ...gateABefore,
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    const cycleA = [{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }];
+    listMock
+      .mockImplementationOnce(async () => [solo]) // this call's own work read
+      .mockImplementationOnce(async () => [solo]) // pre-hydration recheck re-list — unchanged
+      .mockImplementationOnce(async () => [gateABefore, gateB]) // gate hydration — t-6 edge still present
+      .mockImplementationOnce(async () => [solo]) // post-hydration edge recheck work read
+      .mockImplementationOnce(async () => [gateAAfter, gateB]) // post-hydration edge recheck gate read — t-6 edge just resolved
+      .mockImplementationOnce(async () => [solo]) // retry's own work read
+      .mockImplementationOnce(async () => [solo]) // retry's pre-hydration recheck re-list — unchanged
+      .mockImplementationOnce(async () => [gateAAfter, gateB]) // retry's gate hydration — stable
+      .mockImplementationOnce(async () => [solo]) // retry's post-hydration edge recheck work read
+      .mockImplementationOnce(async () => [gateAAfter, gateB]); // retry's post-hydration edge recheck gate read — stable
+    cyclesMock.mockResolvedValue(cycleA); // identical every fetch — the cycle itself never moves
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(board.find((b) => b.id === "g-1")?.dependencies).toEqual(gateAAfter.dependencies);
+    expect(cycleEvidenceFor(board)).toEqual(cycleA);
+    expect(listMock).toHaveBeenCalledTimes(10);
+    expect(cyclesMock).toHaveBeenCalledTimes(4);
+  });
+
+  it("catches a gate-owned edge that moves between the cycles fetch and the recheck, not just a work-owned one (P2 badge review, issues.ts:224)", async () => {
+    // `target` dangles a blocker on `g-1`, so `board` merges the gate in. The gate itself gains a
+    // NEW `blocks` edge (gate-owned, never present on `work`) between this call's own board read and
+    // the recheck below — `bd dep cycles` walks gate-owned edges too, so a recheck that only compares
+    // `work` against a fresh `loadWorkIssues` would see identical work-edge sets and wave this
+    // through, attaching evidence that no longer describes `board`'s actual (now two-edge) graph.
+    const workBead: Bead = { ...target }; // t-1 -> g-1
+    const gateBefore: Bead = { id: "g-1", title: "Gate: gh:pr", status: "open", issue_type: "gate" };
+    const gateAfter: Bead = {
+      ...gateBefore,
+      dependencies: [{ issue_id: "g-1", depends_on_id: "t-9", type: "blocks" }],
+    };
+    listMock
+      .mockImplementationOnce(async () => [workBead]) // attempt 0's own work read
+      .mockImplementationOnce(async () => [gateBefore]) // attempt 0's own gate read
+      .mockImplementationOnce(async () => [workBead]) // attempt 0's recheck work read — unchanged
+      .mockImplementationOnce(async () => [gateAfter]) // attempt 0's recheck gate read — edge just landed
+      .mockImplementationOnce(async () => [workBead]) // attempt 1's own work read
+      .mockImplementationOnce(async () => [gateAfter]) // attempt 1's own gate read — edge now present
+      .mockImplementationOnce(async () => [workBead]) // attempt 1's recheck work read
+      .mockImplementationOnce(async () => [gateAfter]); // attempt 1's recheck gate read — now stable
+    cyclesMock.mockResolvedValue([]);
+
+    const board = await loadAllIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-1", "g-1"]);
+    expect(cycleEvidenceFor(board)).toEqual([]);
+    expect(listMock).toHaveBeenCalledTimes(8);
+    expect(cyclesMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("bumps the version when a concurrent non-cycled refresh wins the shared loader race", async () => {
+    // Warm the snapshot first so the race below reloads IDENTICAL content — isolating the assertion
+    // from the ordinary "first load ever" version bump every cold snapshot gets regardless of cycles.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await refreshAllIssues(REPO);
+    const before = issueSnapshotVersion(REPO);
+
+    // The shared loader in `refreshIssueSnapshot` is claimed by whichever caller reaches it first
+    // (issues.ts:188's own comment: "a concurrent non-authoritative refresh may have won the
+    // snapshot loader"). Deterministically stage that race: `refreshAllIssues(REPO)` (no cycles)
+    // is called first and claims the in-flight loader before `refreshAllIssues(REPO, {withCycles})`
+    // ever runs its own.
+    let resolveList!: (value: Bead[]) => void;
+    listMock.mockImplementationOnce(
+      () => new Promise<Bead[]>((resolve) => { resolveList = resolve; }),
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { withCycles: true });
+
+    resolveList([{ ...target, dependencies: [] }]);
+    const [ordinaryBoard, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    expect(approvalBoard).toBe(ordinaryBoard);
+    expect(cycleEvidenceFor(approvalBoard)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    // Content is identical to the warmed baseline, so this bump can only come from the evidence
+    // recovery itself — landed OUTSIDE `refreshIssueSnapshot`'s own recovery bump (its loader
+    // returned a board with none, so from its point of view nothing changed). Without it a poller
+    // stuck on missing evidence would never see a fresh token for a recovery that lands this way.
+    expect(issueSnapshotVersion(REPO)).toBeGreaterThan(before);
+  });
+
+  it("enriches a warm ordinary snapshot when an approval projection needs cycle evidence", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const ordinary = await allIssues(REPO);
+    const approval = await allIssues(REPO, { withCycles: true });
+
+    expect(approval).toBe(ordinary);
+    expect(cycleEvidenceFor(approval)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("bumps the snapshot version when a synchronous retry recovers evidence a prior read missed", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockRejectedValueOnce(new Error("bd: dep cycles timed out"));
+
+    // First read warms the snapshot with no evidence attached (degraded, per the test above).
+    await allIssues(REPO, { withCycles: true });
+    const before = issueSnapshotVersion(REPO);
+
+    // A later read's retry succeeds — a poller that already matched `before` must see a new token,
+    // or it 304s the same empty-startability board until unrelated bead content changes.
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("re-checks evidence past its trust window on an ordinary read, not just the background probe (P2 review, PR #274, issues.ts:966)", async () => {
+    // The board's own content never changes across either read — the same "gate-only cycle" gap
+    // `probeCycleEvidence`'s staleness handling closes, but reached here via a plain `readAllIssues`
+    // with no poller involved (e.g. the first page load after an idle period).
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const first = await readAllIssues(REPO, { withCycles: true });
+    expect(cycleEvidenceFor(first.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      // The cycle resolved (or a different one opened) among gates no work bead's edge dangles
+      // toward — content-based invalidation never fires for it, so only the age check can catch it.
+      cyclesMock.mockResolvedValueOnce([]);
+      const second = await readAllIssues(REPO, { withCycles: true });
+
+      expect(cyclesMock).toHaveBeenCalledTimes(2);
+      expect(cycleEvidenceFor(second.beads)).toEqual([]);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("invalidates expired evidence when an ordinary read's staleness refresh itself fails (codex review, PR #274, issues.ts:825)", async () => {
+    // Same setup as the trust-window test above: evidence attached once, board content never
+    // moves, so only the age check notices it's due for a refresh. If THAT refresh throws, the old
+    // WeakMap entry must not survive it — otherwise a shared-server writer who introduced a
+    // gate-only cycle in the meantime keeps being masked by the expired "no cycles" verdict forever,
+    // since nothing else about this board's own content will ever change to trigger another check.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const first = await readAllIssues(REPO, { withCycles: true });
+    expect(cycleEvidenceFor(first.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      cyclesMock.mockRejectedValueOnce(new Error("bd dep cycles failed"));
+      const second = await readAllIssues(REPO, { withCycles: true });
+
+      expect(cycleEvidenceFor(second.beads)).toBeUndefined();
+      // Mirrors the probe path's present->missing bump: a poller that already matched `before` must
+      // still learn evidence became unavailable rather than keep 304-ing the stale verdict.
+      expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("enriches a versioned board read before it reaches a policy projection", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const snapshot = await readAllIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(snapshot.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cyclesMock).toHaveBeenCalledWith(REPO);
+  });
+
+  it("readAllIssues degrades to a board without cycle evidence rather than fail the whole read", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    const snapshot = await readAllIssues(REPO, { withCycles: true });
+
+    expect(snapshot.beads.map((b) => b.id)).toEqual(["t-1"]);
+    expect(cycleEvidenceFor(snapshot.beads)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain("bd: dep cycles timed out");
+  });
+
+  it("allIssues degrades to a board without cycle evidence rather than fail the whole read", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-1"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("declines to attach empty cycle evidence to a retained board whose own edges are pre-repair (P2 review on PR #274)", async () => {
+    // The retained snapshot warms with a genuinely cyclic edge. By the time the best-effort enrichment's
+    // `bd dep cycles` call settles, every later `bd list` (simulating another machine's repair landing on
+    // a shared-server board, with no local refresh yet noticing) reports the cycle already resolved.
+    // Without the recheck, that empty result would land on this still-cyclic-looking retained board as
+    // if it described the same revision.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([]);
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    // The retained board itself is untouched — only the evidence attachment is gated — so the caller
+    // still sees the stale, pre-repair content, but without a cycle-free stamp on it.
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("declines to attach a non-empty cycles result that doesn't cover a stale blocks edge in the retained board (PR #274 review, round 21)", async () => {
+    // Same stale-repair race as the test above, but `cycles` comes back NON-empty — reporting an
+    // unrelated cycle (t-9) elsewhere on the board — while the retained board's own t-1/t-2 edge was
+    // repaired by a concurrent writer before the fetch settled. A non-empty result is only the
+    // fail-safe answer for the cycle(s) it actually names, so it must not skip the re-list/compare
+    // and get stamped onto this now-stale board as if it covered t-1 too.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("declines to attach evidence when gate hydration reveals the named cycle was repaired and a different one opened (best-effort path)", async () => {
+    // The gate-only cycle hydration below is its own live `bd list`, wide enough a gap for another
+    // shared-server writer to repair the cycle `cycles` named (g-1/g-2) while opening a DIFFERENT one
+    // (g-3/g-4) under a different pair of gates. Without a post-hydration recheck, this best-effort
+    // attach would stamp the board with the stale, already-repaired cycle and miss the new one.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    listMock.mockResolvedValueOnce([solo]); // warm the snapshot, no evidence yet
+    await allIssues(REPO);
+
+    cyclesMock
+      .mockResolvedValueOnce([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]) // initial fetch: cycle A
+      .mockResolvedValueOnce([{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }]); // post-hydration recheck: A repaired, B opened
+    // `board` (`[solo]`) carries no `blocks` edge, so the outer consistency check short-circuits
+    // without a re-list (`attachCyclesBestEffort`'s own edge-free fast path) — the first `bd list`
+    // this call spends is the gate hydration read below.
+    listMock
+      .mockImplementationOnce(async () => [gateA, gateB]) // gate hydration for cycle A's members
+      .mockImplementationOnce(async () => [solo]) // post-hydration recheck work read
+      .mockImplementationOnce(async () => [gateA, gateB]); // post-hydration recheck gate read — A still resolved-looking here
+
+    const board = await allIssues(REPO, { withCycles: true });
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("coalesces concurrent best-effort enrichments into one dep-cycles call and one version bump (PR #274 review, round 6)", async () => {
+    // Warm the snapshot with no evidence first, matching several cold page renders sharing one load.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+    const before = issueSnapshotVersion(REPO);
+
+    let resolveCycles!: (evidence: unknown) => void;
+    cyclesMock.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCycles = resolve; }),
+    );
+
+    // Two independent readers of the same repo — `readAllIssues` and `allIssues` — both observe
+    // missing evidence before either enrichment finishes.
+    const viaRead = readAllIssues(REPO, { withCycles: true });
+    const viaAll = allIssues(REPO, { withCycles: true });
+
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    resolveCycles([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const [snapshot, board] = await Promise.all([viaRead, viaAll]);
+
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+    expect(cycleEvidenceFor(snapshot.beads)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("does not reuse a cycles fetch started against the pre-refresh graph once the board's content moves (PR #274 review, round 8)", async () => {
+    // A shared-server board can move because ANOTHER machine wrote it, discovered here by a plain
+    // TTL/probe refresh with no local invalidation call in between. The generation guard exists to
+    // stop a cycles fetch spawned against the graph BEFORE that move from being stamped onto the
+    // board AFTER it — this reproduces the race directly rather than waiting out the real TTL.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+
+    let resolveFirst!: (v: unknown) => void;
+    let resolveSecond!: (v: unknown) => void;
+    cyclesMock
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecond = resolve; }));
+
+    // Reader A's cycles fetch starts against the current (pre-refresh) snapshot and stays in flight.
+    const readerA = allIssues(REPO, { withCycles: true });
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+
+    // The board moves while reader A's fetch is still pending.
+    await refreshIssueSnapshot(REPO, async () => [{ ...target, id: "t-2", dependencies: [] }]);
+
+    // Reader B enriches the NEW snapshot. Its generation differs from reader A's in-flight fetch, so
+    // it must spawn its own `bd dep cycles` call instead of coalescing onto reader A's.
+    const readerB = allIssues(REPO, { withCycles: true });
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+
+    resolveFirst([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    resolveSecond([]);
+
+    const [boardA, boardB] = await Promise.all([readerA, readerB]);
+
+    // Reader A's board predates the move: the generation guard refuses to stamp the stale-graph
+    // result onto it. Rather than hand back that retired array with no evidence (or, worse, a stale
+    // sidecar left over from an earlier call), `allIssues` retries against the CURRENT snapshot —
+    // mirroring `readAllIssues` — so both readers converge on the same current board and evidence.
+    expect(boardA.map((b) => b.id)).toEqual(["t-2"]);
+    expect(cycleEvidenceFor(boardA)).toEqual([]);
+    expect(boardB.map((b) => b.id)).toEqual(["t-2"]);
+    expect(cycleEvidenceFor(boardB)).toEqual([]);
+  });
+
+  it("does not serve a warm board's stale sidecar when a refresh's content move stops the enrichment mid-fetch (P2 review, PR #274)", async () => {
+    // Unlike the "does not reuse a cycles fetch" test above, this board comes in with EXPIRED
+    // evidence already attached (not merely missing) — the reviewer's exact scenario: a warm
+    // snapshot whose TTL refresh discovers changed content while `attachCyclesBestEffort` is
+    // awaiting its own fetch. `board` is the same retained array before and after the move, so a
+    // decline that leaves it untouched would hand back the OLD, now-provably-stale sidecar as if it
+    // were still trustworthy.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const warm = await allIssues(REPO, { withCycles: true });
+    expect(cycleEvidenceFor(warm)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      let resolveCycles!: (v: unknown) => void;
+      cyclesMock.mockImplementationOnce(() => new Promise((resolve) => { resolveCycles = resolve; }));
+
+      const reader = allIssues(REPO, { withCycles: true });
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+
+      // The board moves while that refresh is still in flight — the race the generation guard
+      // exists to catch.
+      listMock.mockResolvedValue([{ ...target, id: "t-2", dependencies: [] }]);
+      await refreshIssueSnapshot(REPO, async () => [{ ...target, id: "t-2", dependencies: [] }]);
+      cyclesMock.mockResolvedValueOnce([]); // for the retry against the moved snapshot
+
+      resolveCycles([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+      const board = await reader;
+
+      // Must reflect the current board with its own fresh evidence — never the retired array's
+      // expired sidecar, which would read to a caller (e.g. the settings page) as authoritative.
+      expect(board.map((b) => b.id)).toEqual(["t-2"]);
+      expect(cycleEvidenceFor(board)).toEqual([]);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("retries readAllIssues rather than pair a pre-move board with the post-move version (PR #274 review)", async () => {
+    // A refresh replaces the retained board in the gap between `readIssueSnapshot` resolving and
+    // `readAllIssues` reading the generation that pairs with it — the race the review flagged:
+    // capturing that generation via a fresh `issueSnapshotGeneration(cwd)` call after the fact can
+    // observe the POST-move generation while still holding the PRE-move beads array, so the mismatch
+    // check downstream trivially matches itself and never catches the move.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+
+    readIssueSnapshotMock.mockImplementationOnce(async (...args: unknown[]) => {
+      const snapshot = await (
+        await vi.importActual<typeof import("./snapshot")>("./snapshot")
+      ).readIssueSnapshot(
+        ...(args as Parameters<typeof import("./snapshot").readIssueSnapshot>),
+      );
+      await refreshIssueSnapshot(REPO, async () => [{ ...target, id: "t-2", dependencies: [] }]);
+      return snapshot;
+    });
+
+    const result = await readAllIssues(REPO, { withCycles: true });
+
+    // Must reflect the board that moved DURING the read, not the stale pre-move one — otherwise the
+    // returned version would describe beads the caller never actually returned, and the next
+    // `/board?version=...` poll would 304 against content the client never received.
+    expect(result.beads.map((b) => b.id)).toEqual(["t-2"]);
+    expect(cycleEvidenceFor(result.beads)).toEqual([]);
+  });
+
+  it("fails closed instead of retrying forever when the board keeps moving during cycle enrichment (P2 review on PR #274)", async () => {
+    // Every enrichment attempt observes another move, just like the `loadAllIssues` consistency
+    // retry above — simulating sustained shaping/concurrent writers on a shared-server board.
+    // Without a retry cap, `readAllIssues` recurses on the mismatch indefinitely. Each simulated
+    // move must actually change content (a fresh id), not just re-bump generation, since
+    // `refreshIssueSnapshot` only advances the generation when the loaded content differs.
+    //
+    // Queued via `mockImplementationOnce` (not a persistent `mockImplementation`), one per attempt
+    // the retry cap allows plus the one that trips it — a persistent override would keep forcing
+    // moves on every OTHER test's reads too, since this mock isn't reset between tests.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    await allIssues(REPO);
+
+    const forceMove = (call: number) => async (...args: unknown[]) => {
+      const snapshot = await (
+        await vi.importActual<typeof import("./snapshot")>("./snapshot")
+      ).readIssueSnapshot(
+        ...(args as Parameters<typeof import("./snapshot").readIssueSnapshot>),
+      );
+      await refreshIssueSnapshot(REPO, async () => [
+        { ...target, id: `moved-${call}`, dependencies: [] },
+      ]);
+      return snapshot;
+    };
+    for (let attempt = 0; attempt <= 3; attempt++) {
+      readIssueSnapshotMock.mockImplementationOnce(forceMove(attempt));
+    }
+
+    await expect(readAllIssues(REPO, { withCycles: true })).rejects.toThrow(
+      /dependency graph kept moving/,
+    );
+  });
+
   it("dedupes, so a bd that starts carrying gates in the ordinary listing doesn't double them", async () => {
     // Two gate edges, one of whose gates the ordinary listing already carries: the other still
     // dangles, so the second read fires and hands back both.
@@ -129,6 +1016,707 @@ describe("loadAllIssues", () => {
 
     expect((await loadAllIssues(REPO)).map((b) => b.id)).toEqual(["t-1", "g-1", "g-2"]);
   });
+
+  it("re-fetches gates strictly when a concurrent non-strict refresh already claimed the shared loader (PR #274 review)", async () => {
+    // Same race as the cycles case above, but for gates: `probeAllIssues`/a bare `refreshAllIssues`
+    // reaches `refreshIssueSnapshot` first with a NON-strict loader, so its own internal gate read
+    // degrades on failure (swallowed to []) instead of throwing. A caller that asked for
+    // `strictGates` must not silently accept that degraded board — it must notice the still-dangling
+    // blocker and re-fetch the gate strictly.
+    listMock.mockImplementationOnce(async () => [target]); // the one shared work read
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // the shared loader's own (non-strict) gate read — degrades, swallowed
+    listMock.mockImplementationOnce(async () => [gate]); // this call's own strict re-fetch — succeeds
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { strictGates: true });
+
+    const [ordinaryBoard, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    // The plain caller still gets the degraded (pre-existing, intentional) behaviour.
+    expect(ordinaryBoard.map((b) => b.id)).toEqual(["t-1"]);
+    // The strict caller recovers the gate rather than reading the dangling edge as an open blocker.
+    expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
+  });
+
+  it("keeps cycle evidence attached when the strictGates hydration branch rebuilds the array (PR #274 review)", async () => {
+    // Same race as above, but this caller also asks for `withCycles`. The concurrent non-strict
+    // refresh wins the shared loader with a gate-less, cycle-less board; this caller then attaches
+    // cycle evidence directly onto that shared board (the `withCycles` block above the strictGates
+    // one) before the strictGates branch rebuilds a NEW array via `dedupeById` to fold in the
+    // recovered gate. `dedupeById` allocates a fresh array, and the cycle sidecar is WeakMap-keyed
+    // on identity, so without re-attaching, the evidence just fetched is silently dropped from both
+    // this function's return value and the retained snapshot it hydrates.
+    listMock.mockImplementationOnce(async () => [target]); // the one shared work read
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // the shared loader's own (non-strict) gate read — degrades, swallowed
+    // The `boardStillMatchesCycles` re-list (thread on issues.ts:1292, PR #274 review): the shared
+    // board's own `blocks` edge means attaching evidence to it must re-list and compare before
+    // trusting the generation match alone, mirroring `attachCyclesBestEffort`.
+    listMock.mockImplementationOnce(async () => [target]); // re-list's own work read — unchanged
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // re-list's own (non-strict) gate read — degrades, swallowed
+    listMock.mockImplementationOnce(async () => [gate]); // this call's own strict re-fetch — succeeds
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { withCycles: true, strictGates: true });
+
+    const [, approvalBoard] = await Promise.all([ordinary, approval]);
+
+    expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
+    expect(cycleEvidenceFor(approvalBoard)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+  });
+
+  it("still throws under strictGates when the shared board is degraded and the re-fetch fails too", async () => {
+    listMock.mockImplementationOnce(async () => [target]);
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // shared loader's gate read — degrades
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // this call's own strict re-fetch — also fails, and strict must let it reject
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { strictGates: true });
+
+    await expect(approval).rejects.toThrow("database is locked");
+    await expect(ordinary).resolves.toEqual([{ ...target }]);
+  });
+
+  it("retries instead of returning a stale hydration when a write lands during the strict re-fetch (PR #274 review)", async () => {
+    // Same shared-loader race as above (ordinary wins with a non-strict, gate-less board), but this
+    // time a write (`invalidateIssueSnapshot`) lands while the strict caller's own gate re-fetch is
+    // still in flight. `hydrateIssueSnapshot`'s generation guard correctly refuses to stamp that
+    // re-fetch's result onto the now-different entry — this call must notice the same mismatch and
+    // retry against the current board, not hand back the array it built from beads read before the
+    // write.
+    listMock.mockImplementationOnce(async () => [target]); // shared work read
+    listMock.mockImplementationOnce(async () => {
+      throw new Error("bd: database is locked");
+    }); // shared loader's own (non-strict) gate read — degrades, swallowed
+
+    let resolveStrictRefetch!: (beads: Bead[]) => void;
+    listMock.mockImplementationOnce(
+      () => new Promise<Bead[]>((resolve) => { resolveStrictRefetch = resolve; }),
+    ); // this call's own strict re-fetch — held open to land the write mid-flight
+
+    // The post-retry read: a fresh board that already carries the gate (and the write's content
+    // change), so no further gate re-fetch is needed.
+    const updated: Bead = { ...target, title: "Ship it (updated)" };
+    listMock.mockImplementationOnce(async () => [updated, gate]);
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssues(REPO, { strictGates: true });
+
+    await ordinary;
+    invalidateIssueSnapshot(REPO, true);
+    resolveStrictRefetch([gate]);
+
+    const approvalBoard = await approval;
+
+    expect(listMock).toHaveBeenCalledTimes(4);
+    expect(approvalBoard.find((b) => b.id === "t-1")?.title).toEqual("Ship it (updated)");
+    expect(approvalBoard.map((b) => b.id).sort()).toEqual(["g-1", "t-1"]);
+  });
+});
+
+describe("probeCycleEvidence (PR #274 review, round 3)", () => {
+  it("shares one in-flight probe per repository instead of spawning one per call", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    let resolveCycles!: (evidence: unknown) => void;
+    cyclesMock.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCycles = resolve; }),
+    );
+
+    // Warm the snapshot without cycle evidence first, matching what the poll route does.
+    await allIssues(REPO);
+
+    probeCycleEvidence(REPO);
+    probeCycleEvidence(REPO);
+
+    // Both calls landed before the CLI call settled — only the first should have spawned it.
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+
+    resolveCycles([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    await vi.waitFor(async () =>
+      expect(cycleEvidenceFor(await allIssues(REPO))).toEqual([
+        { ids: ["t-1"], raw: { cycle: ["t-1"] } },
+      ]),
+    );
+  });
+
+  it("bumps the snapshot version only for the probe that attaches evidence, not every success", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    const before = issueSnapshotVersion(REPO);
+
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(issueSnapshotVersion(REPO)).toBe(before + 1));
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+
+    // Evidence is already attached to the retained board, so this probe must not re-fetch or
+    // bump the version again.
+    probeCycleEvidence(REPO);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("re-checks previously-attached evidence once it goes stale, even though the retained board's own content never moved (P2 review, PR #274, issues.ts:830)", async () => {
+    // A cycle built entirely out of gates no work bead's `blocks` edge dangles toward never touches
+    // the content `loadWorkIssues`/`readIssueSnapshot` compare on refresh, so the generation-bump
+    // invalidation that would otherwise force a fresh `bd dep cycles` read never fires for it. Without
+    // an independent expiry, evidence attached once — even an empty "no cycles" result — would be
+    // trusted forever. Simulated here without gate beads: the board's own content genuinely never
+    // changes across every read in this test, standing in for the same "content-invisible drift".
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    const before = issueSnapshotVersion(REPO);
+
+    // Immediately re-probing stays a no-op — the evidence just attached is still within its trust
+    // window, same as the "not every success" test above.
+    probeCycleEvidence(REPO);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+
+    // Advance the clock past the trust window with nothing about the board's own content changing.
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      probeCycleEvidence(REPO);
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // Same cycle set both times — nothing new for an already-current poller to catch, so the
+      // version stays put even though the evidence was re-verified.
+      expect(issueSnapshotVersion(REPO)).toBe(before);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("bumps the snapshot version when a staleness refresh turns up a different cycle set", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    const before = issueSnapshotVersion(REPO);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      // The cycle resolved (or a different one opened) in the gap the board's own content never
+      // surfaced — the exact case a stuck poller must still learn about.
+      cyclesMock.mockResolvedValueOnce([]);
+      probeCycleEvidence(REPO);
+      await vi.waitFor(() => expect(issueSnapshotVersion(REPO)).toBe(before + 1));
+      expect(cyclesMock).toHaveBeenCalledTimes(2);
+      expect(cycleEvidenceFor(await allIssues(REPO))).toEqual([]);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("invalidates expired evidence when the staleness refresh itself fails (codex review, PR #274)", async () => {
+    // Evidence attached once, then goes stale with the board's own content never moving (same
+    // setup as the "re-checks previously-attached evidence" test above). If the refresh triggered
+    // by that staleness then throws, the old WeakMap entry must not survive it — every consumer
+    // treats `cycleEvidenceFor(board) !== undefined` as authoritative, so leaving it in place would
+    // keep deriving/persisting picks off a verdict this process could no longer stand behind.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    const board = await allIssues(REPO);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      cyclesMock.mockRejectedValueOnce(new Error("bd dep cycles failed"));
+      probeCycleEvidence(REPO);
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(cycleEvidenceFor(await allIssues(REPO))).toBeUndefined();
+      // The board poll route 304s on an unchanged version — without this bump, a poller that
+      // already matched the pre-failure token would keep 304-ing the stale ranked verdict instead
+      // of ever learning evidence became unavailable (P2 review, PR #274, issues.ts:1214).
+      expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("preserves evidence a racing writer attached while this probe's own bd dep cycles call was in flight and then failed (P2 review, PR #274, issues.ts:1443)", async () => {
+    // Same staleness setup as the test above, but this time a concurrent caller sharing the same
+    // retained board (e.g. `ensureCycleEvidence`) successfully attaches fresh evidence WHILE this
+    // probe's own refresh is still awaiting its `bd dep cycles` call. Attaching evidence doesn't
+    // bump the snapshot generation, so nothing stops that race. When this probe's call then fails,
+    // it must not blindly clear whatever is on the board now — only clear if it's still the exact
+    // stale evidence this probe set out to refresh.
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValueOnce([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await allIssues(REPO);
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    const board = await allIssues(REPO);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    const realNow = Date.now();
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => realNow + ISSUE_SNAPSHOT_MAX_AGE_MS + 1);
+    try {
+      let rejectCycles!: (error: Error) => void;
+      cyclesMock.mockImplementationOnce(
+        () => new Promise((_resolve, reject) => { rejectCycles = reject; }),
+      );
+      probeCycleEvidence(REPO);
+      await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+
+      // The race: a concurrent writer attaches fresh, successful evidence onto the same retained
+      // board while this probe's `bd dep cycles` call is still pending.
+      const freshCycles = [{ ids: [], raw: { cycle: [] } }];
+      attachCycleEvidence(board, freshCycles);
+      const versionAfterRace = issueSnapshotVersion(REPO);
+
+      rejectCycles(new Error("bd dep cycles failed"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      // The racing writer's fresh evidence must survive this probe's own failed attempt — not get
+      // wiped out just because this probe's own refresh didn't succeed.
+      expect(cycleEvidenceFor(await allIssues(REPO))).toEqual(freshCycles);
+      expect(issueSnapshotVersion(REPO)).toBe(versionAfterRace);
+    } finally {
+      dateSpy.mockRestore();
+    }
+  });
+
+  it("declines to attach empty cycle evidence to a retained board whose own edges are pre-repair (P2 review on PR #274, round 20)", async () => {
+    // Same race as the `attachCyclesBestEffort` test above, but for the probe path: the retained
+    // snapshot warms with a genuinely cyclic edge and no evidence. By the time the probe's `bd dep
+    // cycles` call settles, `bd list` (simulating another machine's repair landing on a
+    // shared-server board, with no local generation bump because nothing refreshed THIS process's
+    // snapshot) reports the cycle already resolved. Without the re-list/compare, that empty result
+    // would land on this still-cyclic-looking retained board as if it described the same revision.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([]);
+
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    // Give the probe's internal re-list/compare a tick to settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const board = await allIssues(REPO);
+    // The retained board itself is untouched — only the evidence attachment is gated — so the
+    // caller still sees the stale, pre-repair content, but without a cycle-free stamp on it.
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("declines to attach a non-empty cycles result that doesn't cover a stale blocks edge in the retained board (PR #274 review, round 21)", async () => {
+    // Same race as the probe test above, but `cycles` comes back NON-empty — reporting an unrelated
+    // cycle (t-9) elsewhere on the board — while the retained board's own t-1/t-2 edge was repaired
+    // by a concurrent writer before the probe's fetch settled. Skipping the re-list/compare on a
+    // non-empty result would stamp this stale board as covered by evidence that only speaks to t-9.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockResolvedValueOnce([cyclic, other]);
+    await allIssues(REPO);
+
+    listMock.mockResolvedValue([repaired, other]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+
+    probeCycleEvidence(REPO);
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(1));
+    // Give the probe's internal re-list/compare a tick to settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const board = await allIssues(REPO);
+    expect(board.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("hydrates gate-only cycle members into the retained board before attaching evidence", async () => {
+    // A cycle made entirely of gates no work bead's `blocks` edge dangles toward — the probe's own
+    // `loadAllIssues(cwd)` re-list never carries them, the same gap `attachCyclesBestEffort` and
+    // `ensureCycleEvidence` both hydrate. Left unhydrated, `cycleMembers` can't map either id to a
+    // bead here and reports a synthetic, unscoped "board" fault instead of scoping it to the
+    // cycle's own subtree.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    await allIssues(REPO); // warm the snapshot, no evidence yet
+
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+
+    probeCycleEvidence(REPO);
+    // Two `bd dep cycles` calls: the initial fetch, then the post-hydration recheck the gate
+    // hydration's own live `bd list` requires (same as `attachCyclesBestEffort`/`ensureCycleEvidence`).
+    await vi.waitFor(() => expect(cyclesMock).toHaveBeenCalledTimes(2));
+    // Give the probe's internal hydration + post-hydration recheck a tick to settle.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const board = await allIssues(REPO);
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
+});
+
+describe("ensureCycleEvidence (codex review, PR #274)", () => {
+  it("attaches evidence and bumps the version when the board's own edges are still current", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+    const generation = issueSnapshotGeneration(REPO);
+
+    const returned = await ensureCycleEvidence(REPO, board, generation);
+
+    expect(returned).toBe(board);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("is a no-op when the board already carries fresh evidence", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    attachCycleEvidence(board, []);
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cyclesMock).not.toHaveBeenCalled();
+  });
+
+  it("refreshes and replaces evidence that's merely stale, not just missing (codex review, PR #274, issues.ts:884)", async () => {
+    // A presence-only guard would treat this board as already handled and skip `bd dep cycles`
+    // entirely — the exact gap that lets a shared-server writer introduce a gate-only cycle (one
+    // this board's own `blocks` edges never dangle toward) survive past the evidence's trust window
+    // undetected, since the board's own content has nothing to invalidate on.
+    const board = [{ ...target, dependencies: [] }];
+    attachCycleEvidence(board, [], Date.now() - ISSUE_SNAPSHOT_MAX_AGE_MS - 1);
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cyclesMock).toHaveBeenCalledTimes(1);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+  });
+
+  it("still runs the re-list/compare when the board carries no blocks edge at all (matches loadAllIssues's own fix, issues.ts:307)", async () => {
+    // An earlier version of this check skipped the re-list whenever `board` itself had no `blocks`
+    // edge, mirroring a bug `loadAllIssues`'s own `recheckBlocksConsistency` was fixed for: an
+    // edge-free board is exactly what a shared-server writer's very first `blocks` edge lands into,
+    // and an acyclic edge never shows up in `cycles` for anything else to catch.
+    const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockResolvedValue([]);
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(listMock).toHaveBeenCalledTimes(1);
+    expect(cycleEvidenceFor(board)).toEqual([]);
+  });
+
+  it("declines to attach empty cycle evidence to a board whose own edges are pre-repair (P2 badge review, thread on issues.ts:381)", async () => {
+    // `board` is the caller's own cached snapshot array (the approve route's pre-lock `allBeads`),
+    // still carrying a `blocks` edge from before a concurrent writer repaired it on a shared-server
+    // board. Without the re-list/compare, the empty `cycles` result below would land on this stale,
+    // still-cyclic-looking board as if it described the same revision — a spurious block for a
+    // board that has, in fact, already been repaired.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const board = [
+      { ...target, dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" as const }] },
+      other,
+    ];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }, other]); // the repair already landed
+    cyclesMock.mockResolvedValue([]);
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("declines to attach a non-empty cycles result that doesn't cover a stale blocks edge in the board (P2 badge review, thread on issues.ts:381)", async () => {
+    // Same race, but `cycles` comes back NON-empty — reporting an unrelated cycle (t-9) elsewhere —
+    // while `board`'s own t-1/t-2 edge was repaired by a concurrent writer before `bd dep cycles`
+    // settled. Skipping the re-list/compare on a non-empty result would stamp this stale board as
+    // covered by evidence that only speaks to t-9.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const board = [
+      { ...target, dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" as const }] },
+      other,
+    ];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }, other]); // the repair already landed
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("clears a pre-existing, merely-expired evidence entry rather than leaving it attached when the initial consistency check rejects the pairing (P2 review, PR #274, issues.ts:947)", async () => {
+    // `board` already carries evidence from an earlier check — stale, not absent, which is what
+    // routes this call through the refresh path via `cycleEvidenceMissingOrStale` instead of the
+    // no-op short-circuit. If the re-list below then finds the board's own edges no longer match
+    // what a fresh `bd dep cycles` describes, falling through without clearing would leave that old
+    // entry readable via `cycleEvidenceFor` as if it were still authoritative.
+    const other: Bead = { id: "t-2", title: "Other side of the stale cycle", status: "open", issue_type: "task" };
+    const board = [
+      { ...target, dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" as const }] },
+      other,
+    ];
+    attachCycleEvidence(
+      board,
+      [{ ids: ["t-1", "t-2"], raw: { cycle: ["t-1", "t-2"] } }],
+      Date.now() - ISSUE_SNAPSHOT_MAX_AGE_MS - 1,
+    );
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }, other]); // the repair already landed
+    cyclesMock.mockResolvedValue([{ ids: ["t-9"], raw: { cycle: ["t-9"] } }]); // names an unrelated cycle
+
+    await ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO));
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("still lets a failed depCycles call reject, unlike the best-effort paths", async () => {
+    const board = [{ ...target, dependencies: [] }];
+    cyclesMock.mockRejectedValue(new Error("bd: dep cycles timed out"));
+
+    await expect(ensureCycleEvidence(REPO, board, issueSnapshotGeneration(REPO))).rejects.toThrow(
+      "bd: dep cycles timed out",
+    );
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+  });
+
+  it("declines to attach evidence, and does not bump the version, when the snapshot's generation moves while depCycles is in flight (P2 badge review, PR #274, round 22)", async () => {
+    // `board` itself carries no `blocks` edge, so `sameBlocksEdges`'s re-list can't be what catches
+    // this — a concurrent local write (another request, or another machine on a shared-server board)
+    // invalidates the retained snapshot while `bd dep cycles` is still running. Attaching evidence to
+    // `board` here and bumping the version would tell every poller the retained snapshot recovered
+    // when it, in fact, was just swapped out from under this call and remains evidence-less.
+    const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    cyclesMock.mockImplementation(async () => {
+      invalidateIssueSnapshot(REPO);
+      return [{ ids: ["t-1"], raw: { cycle: ["t-1"] } }];
+    });
+    const before = issueSnapshotVersion(REPO);
+    const generation = issueSnapshotGeneration(REPO);
+
+    await ensureCycleEvidence(REPO, board, generation);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("declines to attach evidence when `board` was already retired before the call — the generation the caller passed no longer matches (P2 badge review, PR #274, round 24)", async () => {
+    // Simulates the approve route's own gap: `board` and its generation are captured atomically via
+    // `refreshAllIssuesRead`, then a background refresh replaces the retained snapshot (bumping the
+    // generation) before `ensureCycleEvidence` is finally called. Passing the STALE generation the
+    // caller actually captured — not a fresh `issueSnapshotGeneration(REPO)` read here — is what this
+    // test exists to force: sampling fresh at the call site would trivially match itself and mask
+    // exactly this staleness.
+    const board = [{ ...target, dependencies: [] }];
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+    const staleGeneration = issueSnapshotGeneration(REPO);
+    invalidateIssueSnapshot(REPO); // a concurrent refresh moves the retained snapshot on
+    cyclesMock.mockResolvedValue([{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board, staleGeneration);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before);
+  });
+
+  it("fails closed on a retired board even when its own evidence still looks fresh by time (P2 badge review, PR #274, thread on issues.ts:1013)", async () => {
+    // The round-24 test above doesn't cover this gap: there, `board` never carried evidence at all,
+    // so `cycleEvidenceMissingOrStale` already routed the call through the generation-checking
+    // refresh path on its own. Here `board` carries evidence attached moments ago — still well
+    // within its trust window — so a time/presence-only guard would treat it as already handled and
+    // return without ever comparing `generation` against the retained snapshot. Attaching evidence
+    // never bumps the snapshot generation, so a sidecar's time-freshness says nothing about whether
+    // the array it's attached to is still the one the retained snapshot points at.
+    const board = [{ ...target, dependencies: [] }];
+    attachCycleEvidence(board, [{ ids: ["t-1"], raw: { cycle: ["t-1"] } }]);
+    const staleGeneration = issueSnapshotGeneration(REPO);
+    invalidateIssueSnapshot(REPO); // a concurrent refresh moves the retained snapshot on
+    const before = issueSnapshotVersion(REPO);
+
+    await ensureCycleEvidence(REPO, board, staleGeneration);
+
+    // No wasted `bd dep cycles` call either: every attach branch further down is itself gated on the
+    // generation match, so a mismatch caught up front never needs the fetch at all.
+    expect(cyclesMock).not.toHaveBeenCalled();
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    expect(issueSnapshotVersion(REPO)).toBe(before + 1);
+  });
+
+  it("hydrates gate-only cycle members into the board before attaching evidence (P2 review, PR #274, issues.ts:599)", async () => {
+    // Two gates blocking each other with no ordinary bead's edge dangling toward either: `board`
+    // carries no `blocks` edge of its own, but the outer consistency re-list still runs and agrees
+    // (neither side has the gates yet), so hydration is the only thing that lets a consumer of this
+    // evidence map either cycle member to a bead instead of reading a synthetic, unscoped "board"
+    // fault.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    const board = [solo];
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+    const generation = issueSnapshotGeneration(REPO);
+
+    const returned = await ensureCycleEvidence(REPO, board, generation);
+
+    // Mutated in place, not replaced: the approve route holds this exact array and reads it
+    // directly after the call, discarding the return value.
+    expect(returned).toBe(board);
+    expect(board.map((b) => b.id).sort()).toEqual(["g-1", "g-2", "t-3"]);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
+
+  it("re-verifies a board that ALREADY carries gate-only cycle members from an earlier hydration, instead of rejecting them as drift (P2 review, PR #274, issues.ts:772)", async () => {
+    // Unlike the test above, `board` here already carries g-1/g-2 — as it would once a PRIOR call
+    // hydrated them onto the retained snapshot and evidence later expired. Both gates also carry
+    // `blocks` edges on each other (the way two gates actually blocking one another would), so the
+    // outer consistency re-list this refresh runs is NOT a no-op edge-free fast path. A plain
+    // `loadAllIssues(cwd)` re-list — the ordinary work listing — structurally omits both gates (no
+    // work bead's edge dangles toward either), so comparing `board` against that would misread their
+    // absence as drift and decline to attach otherwise-valid, unchanged evidence.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = {
+      id: "g-1",
+      title: "Gate: A",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-1", depends_on_id: "g-2", type: "blocks" }],
+    };
+    const gateB: Bead = {
+      id: "g-2",
+      title: "Gate: B",
+      status: "open",
+      issue_type: "gate",
+      dependencies: [{ issue_id: "g-2", depends_on_id: "g-1", type: "blocks" }],
+    };
+    const board = [solo, gateA, gateB];
+    listMock.mockImplementation(async (_cwd: string, extra: string[] = []) =>
+      isGateRead(extra) ? [gateA, gateB] : [solo],
+    );
+    cyclesMock.mockResolvedValue([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+    const generation = issueSnapshotGeneration(REPO);
+
+    const returned = await ensureCycleEvidence(REPO, board, generation);
+
+    expect(returned).toBe(board);
+    expect(cycleEvidenceFor(board)).toEqual([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]);
+  });
+
+  it("declines to attach evidence when gate hydration reveals the named cycle was repaired and a different one opened", async () => {
+    // Same drift as `attachCyclesBestEffort`'s equivalent test: the gate-only cycle hydration is its
+    // own live `bd list`, wide enough a gap for another shared-server writer to repair cycle A
+    // (g-1/g-2) while opening cycle B (g-3/g-4) under a different pair of gates.
+    const solo: Bead = { id: "t-3", title: "Unrelated work", status: "open", issue_type: "task" };
+    const gateA: Bead = { id: "g-1", title: "Gate: A", status: "open", issue_type: "gate" };
+    const gateB: Bead = { id: "g-2", title: "Gate: B", status: "open", issue_type: "gate" };
+    const board = [solo];
+    cyclesMock
+      .mockResolvedValueOnce([{ ids: ["g-1", "g-2"], raw: { cycle: ["g-1", "g-2"] } }]) // initial fetch: cycle A
+      .mockResolvedValueOnce([{ ids: ["g-3", "g-4"], raw: { cycle: ["g-3", "g-4"] } }]); // post-hydration recheck: A repaired, B opened
+    listMock
+      .mockImplementationOnce(async () => [solo]) // outer consistency re-list — unchanged
+      .mockImplementationOnce(async () => [gateA, gateB]) // gate hydration for cycle A's members
+      .mockImplementationOnce(async () => [solo]) // post-hydration recheck work read
+      .mockImplementationOnce(async () => [gateA, gateB]); // post-hydration recheck gate read
+    const generation = issueSnapshotGeneration(REPO);
+
+    await ensureCycleEvidence(REPO, board, generation);
+
+    expect(cycleEvidenceFor(board)).toBeUndefined();
+    // The gates staged for the rejected pairing must not survive on the real board either (P2
+    // review, PR #274, issues.ts:1001) — otherwise a rejected recheck still permanently serializes
+    // gate records into the retained snapshot, leaving later readers with a mixed-revision board.
+    expect(board.map((b) => b.id)).toEqual(["t-3"]);
+  });
+});
+
+describe("refreshAllIssuesRead", () => {
+  it("returns the generation the resolved board was actually retained under", async () => {
+    listMock.mockResolvedValue([{ ...target, dependencies: [] }]);
+
+    const { beads: board, generation } = await refreshAllIssuesRead(REPO);
+
+    expect(board.map((b) => b.id)).toEqual(["t-1"]);
+    expect(generation).toBe(issueSnapshotGeneration(REPO));
+  });
+
+  it("declines to attach cycle evidence a concurrent non-cycles refresh's board is stale for (thread on issues.ts:1292, PR #274 review)", async () => {
+    // A concurrent, non-authoritative `refreshAllIssues(REPO)` (no `withCycles`) wins the shared
+    // single-flight loader with a genuinely cyclic board (t-1 <-> t-2). This caller's own
+    // generation guard sees no local move — nothing refreshed THIS process's snapshot — but on a
+    // shared-server board another machine can repair the very cycle `fetchCyclesShared` is about to
+    // report on in the gap between that shared board read and this call's own fetch settling.
+    // Without the `boardStillMatchesCycles` re-list, the generation match alone would let an empty
+    // "no cycles" result land on this still-cyclic-looking board as if it described the same
+    // revision — exactly the bug `attachCyclesBestEffort` already guards against.
+    const other: Bead = { id: "t-2", title: "Other side of the cycle", status: "open", issue_type: "task" };
+    const cyclic: Bead = {
+      ...target,
+      dependencies: [{ issue_id: "t-1", depends_on_id: "t-2", type: "blocks" }],
+    };
+    const repaired: Bead = { ...target, dependencies: [] };
+    listMock.mockImplementationOnce(async () => [cyclic, other]); // the one shared work read
+    listMock.mockImplementationOnce(async () => [repaired, other]); // this call's own re-list — already repaired
+    cyclesMock.mockResolvedValue([]); // reports the repair, but for the graph as of THIS fetch
+
+    const ordinary = refreshAllIssues(REPO);
+    const approval = refreshAllIssuesRead(REPO, { withCycles: true });
+
+    const [, { beads: approvalBoard }] = await Promise.all([ordinary, approval]);
+
+    // The retained board itself is untouched — only the evidence attachment is gated — so the
+    // caller still sees the stale, pre-repair content, but without a cycle-free stamp on it.
+    expect(approvalBoard.map((b) => b.id)).toEqual(["t-1", "t-2"]);
+    expect(cycleEvidenceFor(approvalBoard)).toBeUndefined();
+  });
 });
 
  it.each(["database is locked", "connection refused", "command timed out"])("does not fan out a failed board read: %s", async (message) => {
@@ -136,3 +1724,70 @@ describe("loadAllIssues", () => {
    await expect(loadAllIssues(REPO)).rejects.toThrow(message);
    expect(listMock).toHaveBeenCalledTimes(1);
  });
+
+describe("sameTargetEligibilityState (P2 review, PR #274, issues.ts:373)", () => {
+  const epic: Bead = { id: "e-1", title: "Epic", status: "open", issue_type: "epic" };
+
+  it("flags drift when fresh adds a child under a board id, even with every board id unchanged", () => {
+    const board = [epic];
+    const newChild: Bead = {
+      id: "c-1",
+      title: "New child",
+      status: "open",
+      issue_type: "task",
+      parent: "e-1",
+    };
+
+    expect(sameTargetEligibilityState(board, [epic, newChild])).toBe(false);
+  });
+
+  it("stays consistent when fresh adds a bead unrelated to any board id that isn't itself a run target", () => {
+    const board = [epic];
+    const unrelatedChore: Bead = { id: "u-1", title: "Unrelated", status: "open", issue_type: "chore" };
+
+    expect(sameTargetEligibilityState(board, [epic, unrelatedChore])).toBe(true);
+  });
+
+  it("flags drift when fresh adds a new parentless run target unrelated to any board id (P2 review, PR #274, issues.ts:444)", () => {
+    const board = [epic];
+    const newTarget: Bead = { id: "u-1", title: "New target", status: "open", issue_type: "task" };
+
+    expect(sameTargetEligibilityState(board, [epic, newTarget])).toBe(false);
+  });
+
+  it("stays consistent when nothing changed", () => {
+    const board = [epic];
+
+    expect(sameTargetEligibilityState(board, [epic])).toBe(true);
+  });
+
+  it("flags drift when a target's description changes with status/labels/ancestors unchanged (P2 review, PR #274, issues.ts:353)", () => {
+    const withAcceptance: Bead = {
+      id: "t-1",
+      title: "Ship it",
+      status: "open",
+      issue_type: "task",
+      description: "## Acceptance\n- does the thing",
+    };
+    const board = [withAcceptance];
+    const contractGutted = { ...withAcceptance, description: "" };
+
+    expect(sameTargetEligibilityState(board, [contractGutted])).toBe(false);
+  });
+
+  it("flags drift when a target gains a PR pointer with status/labels otherwise unchanged (P1 review, PR #274, issues.ts:414)", () => {
+    // linkPr writes metadata.pr and the stage:in-review label as two separate calls, so the PR
+    // pointer can land before the label does — deriveStage reads the pointer directly and already
+    // sees `in-review` in that gap, while every other field this key compares stays identical.
+    const noPrYet: Bead = {
+      id: "t-1",
+      title: "Ship it",
+      status: "open",
+      issue_type: "task",
+    };
+    const board = [noPrYet];
+    const prLinked = { ...noPrYet, metadata: { pr: "gh-44" } };
+
+    expect(sameTargetEligibilityState(board, [prLinked])).toBe(false);
+  });
+});

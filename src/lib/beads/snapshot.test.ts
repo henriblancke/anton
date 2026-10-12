@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead } from "./bd";
+import { attachCycleEvidence, cycleEvidenceFor } from "./cycle-evidence";
 import {
   ISSUE_SNAPSHOT_MAX_AGE_MS,
   getBeadDescription,
   getIssueSnapshot,
   invalidateIssueSnapshot,
+  issueSnapshotGeneration,
   issueSnapshotVersion,
   onBoardChanged,
   readIssueSnapshot,
@@ -71,6 +73,135 @@ describe("issue snapshots", () => {
     invalidateIssueSnapshot("/a", true);
     expect(issueSnapshotVersion("/a")).toBe(aVersion + 1);
     expect(issueSnapshotVersion("/b")).toBe(bVersion);
+  });
+
+  it("keeps the retained array's identity across a refresh with identical content that didn't ask for it", async () => {
+    // Cycle evidence is a WeakMap sidecar keyed on array identity (cycle-evidence.ts). An ordinary
+    // refresh whose content hasn't changed must reuse the retained array rather than latch a
+    // fresh-but-identical one (PR #274 review round 9): a concurrent cycle probe racing this refresh
+    // may already hold a reference to the retained array and attach evidence to THAT object, and
+    // swapping in a new object here would silently discard that attachment even though the probe
+    // reported success. Reusing identity means evidence attached to the retained array — before,
+    // during, or after this refresh — stays visible.
+    const first = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    attachCycleEvidence(first, [{ ids: ["a"], raw: {} }]);
+
+    const second = await refreshIssueSnapshot("/repo", async () => [bead("a")], 200);
+
+    expect(second).toBe(first);
+    expect(cycleEvidenceFor(second)).toEqual([{ ids: ["a"], raw: {} }]);
+  });
+
+  it("does not discard evidence a concurrent probe attached to the retained array while an unrelated refresh was in flight", async () => {
+    // Reproduces the board/route.ts poll race (PR #274 review): probeAllIssues (an ordinary,
+    // cycles-blind refresh) and probeCycleEvidence (which attaches evidence to whatever array
+    // getIssueSnapshot handed it) fire together. If the ordinary refresh replaced the retained array
+    // even on unchanged content, evidence the probe attached to the now-discarded old array would
+    // never surface through the entry again.
+    const retained = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+
+    let resolveRefresh!: (beads: Bead[]) => void;
+    const refresh = refreshIssueSnapshot(
+      "/repo",
+      () => new Promise<Bead[]>((resolve) => (resolveRefresh = resolve)),
+      200,
+    );
+
+    // The probe attaches evidence to the array it read BEFORE the in-flight refresh resolves —
+    // exactly the object `retained` points to, since the entry hasn't moved yet.
+    attachCycleEvidence(retained, [{ ids: ["a"], raw: {} }]);
+
+    resolveRefresh([bead("a")]);
+    const next = await refresh;
+
+    expect(next).toBe(retained);
+    expect(cycleEvidenceFor(next)).toEqual([{ ids: ["a"], raw: {} }]);
+  });
+
+  it("carries evidence the refresh itself fetched onto the retained array's identity", async () => {
+    // Mirrors `refreshAllIssues({ withCycles: true })`: the loader's own result already carries
+    // evidence attached to a freshly-allocated array. Content is unchanged, so the retained array's
+    // identity is kept — the fresh evidence must be copied onto it rather than dropped along with
+    // the array it arrived on.
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+
+    const withEvidence = await refreshIssueSnapshot(
+      "/repo",
+      async () => attachCycleEvidence([bead("a")], [{ ids: ["a"], raw: {} }]),
+      200,
+    );
+
+    expect(cycleEvidenceFor(withEvidence)).toEqual([{ ids: ["a"], raw: {} }]);
+  });
+
+  it("replaces evidence already on the retained array when this refresh itself lands fresh evidence", async () => {
+    // A racing `bd list`/`bd dep cycles` pair (attachCyclesBestEffort in issues.ts) can observe two
+    // different graph revisions and attach evidence to the retained array that doesn't actually
+    // describe it. A later `withCycles` refresh is a consistent, authoritative read and must be able
+    // to correct that mismatch even though content hasn't changed since — otherwise the stale sidecar
+    // would stick until unrelated bead content changed too (PR #274 review, round 10).
+    const retained = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    attachCycleEvidence(retained, [{ ids: ["stale"], raw: {} }]);
+
+    const refreshed = await refreshIssueSnapshot(
+      "/repo",
+      async () => attachCycleEvidence([bead("a")], [{ ids: ["fresh"], raw: {} }]),
+      200,
+    );
+
+    expect(refreshed).toBe(retained);
+    expect(cycleEvidenceFor(refreshed)).toEqual([{ ids: ["fresh"], raw: {} }]);
+  });
+
+  it("does not carry stale cycle evidence forward once the graph content actually changes", async () => {
+    const first = await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    attachCycleEvidence(first, [{ ids: ["a"], raw: {} }]);
+
+    const second = await refreshIssueSnapshot(
+      "/repo",
+      async () => [bead("a"), bead("b")],
+      200,
+    );
+
+    expect(cycleEvidenceFor(second)).toBeUndefined();
+  });
+
+  it("bumps the generation when a refresh discovers changed content with no invalidation call in between (PR #274 review, round 8)", async () => {
+    // A shared-server board can move because ANOTHER machine wrote it — this repo only ever learns
+    // of that through a plain TTL refresh noticing the content differs, never through
+    // `invalidateIssueSnapshot`. The generation still has to move, or a cycles fetch started against
+    // the pre-refresh graph coalesces onto the replaced board as if it described it (issues.ts's
+    // `fetchCyclesShared`).
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    const before = issueSnapshotGeneration("/repo");
+
+    await refreshIssueSnapshot("/repo", async () => [bead("a"), bead("b")], 200);
+    expect(issueSnapshotGeneration("/repo")).toBe(before + 1);
+  });
+
+  it("does not bump the generation when a refresh lands identical content", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    const before = issueSnapshotGeneration("/repo");
+
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 200);
+    expect(issueSnapshotGeneration("/repo")).toBe(before);
+  });
+
+  it("bumps the version when a refresh recovers cycle evidence even though bead content is unchanged", async () => {
+    await refreshIssueSnapshot("/repo", async () => [bead("a")], 100);
+    const before = issueSnapshotVersion("/repo");
+
+    // Content is identical to the prior read, but this load itself attaches evidence the retained
+    // snapshot never had — a poller stuck on "evidence unavailable" needs a fresh token for this,
+    // not only for a content change.
+    const recovered = await refreshIssueSnapshot(
+      "/repo",
+      async () => attachCycleEvidence([bead("a")], [{ ids: ["a"], raw: {} }]),
+      200,
+    );
+
+    expect(cycleEvidenceFor(recovered)).toEqual([{ ids: ["a"], raw: {} }]);
+    expect(issueSnapshotVersion("/repo")).toBe(before + 1);
   });
 
   it("blocks a full board read on a fresh post-write load instead of serving the stale board", async () => {
@@ -149,10 +280,15 @@ describe("issue snapshots", () => {
     invalidateIssueSnapshot("/repo", true);
     resolveCold([bead("loaded")]);
 
-    // Version 1: the write bumped it, the discarded load did not.
+    // Version 1: the write bumped it, and this fallback always reads the entry's current version.
+    // Generation 0 (the ORIGINAL, pre-write generation this load actually ran against), not 1 (PR
+    // #274 review): stamping discarded, pre-write beads with the post-write generation would tell a
+    // caller comparing against `issueSnapshotGeneration` that they match the current board, when they
+    // describe the one the write replaced.
     await expect(read).resolves.toEqual({
       beads: [bead("loaded")],
       version: 1,
+      generation: 0,
     });
 
     // …and the guard still holds: the raced load did not repopulate the cache, so the next

@@ -22,6 +22,7 @@ const createMock =
   vi.fn<(cwd: string, opts: { title: string; labels?: string[] }) => Promise<string>>();
 const pushMock = vi.fn<(cwd: string) => Promise<SyncOutcome>>();
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
+const cyclesMock = vi.fn<(cwd: string) => Promise<unknown[]>>();
 
 vi.mock("../beads/bd", async () => {
   const actual = await vi.importActual<typeof import("../beads/bd")>("../beads/bd");
@@ -34,6 +35,7 @@ vi.mock("../beads/bd", async () => {
       show: (...a: [string, string]) => showMock(...a),
       close: (...a: [string, string, string?]) => closeMock(...a),
       create: (...a: [string, { title: string; labels?: string[] }]) => createMock(...a),
+      depCycles: (...a: [string]) => cyclesMock(...a),
     },
   };
 });
@@ -83,6 +85,7 @@ const file = (scope: ReturnType<typeof fakeScope>, findings = [ORPHAN_FINDING]) 
 beforeEach(() => {
   vi.clearAllMocks();
   listMock.mockResolvedValue([bead("t-4", { title: "shipped" })]);
+  cyclesMock.mockResolvedValue([]);
   // Fails closed: an unreadable bead makes every fold stand down, so only a case that stages a twin
   // can produce one.
   showMock.mockRejectedValue(new Error("no such bead"));

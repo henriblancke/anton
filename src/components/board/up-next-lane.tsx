@@ -212,6 +212,14 @@ const ABSENCE_COPY: Record<
     clears: "The next board read retries it — check the armed policy if this lane stays empty.",
     link: { label: "Work policy", hash: "policy" },
   },
+  "cycles-unavailable": {
+    badge: "?",
+    headline: "anton can’t read this board’s dependency graph, so it won’t guess a ranking.",
+    // Same as `policy-unreadable`: a `bd dep cycles` timeout is a transient board-read failure, not a
+    // setting to change, so the next board read retries it on its own.
+    clears: "The next board read retries it — this clears on its own once the graph read succeeds.",
+    link: { label: "Work policy", hash: "policy" },
+  },
   "no-claimable-work": {
     badge: "none",
     // Never "approve one" (PR #226 review): the board's Approve STARTS the target rather than making

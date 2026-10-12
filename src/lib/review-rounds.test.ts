@@ -67,6 +67,7 @@ function prWith(threads: ReviewThread[], threadsComplete = true): PrReview {
     url: "u",
     reviews: [],
     failingChecks: [],
+    failingCheckAttempts: [],
     pendingChecks: 0,
     threads,
     threadsComplete,

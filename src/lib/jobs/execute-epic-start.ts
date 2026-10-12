@@ -7,7 +7,9 @@
  */
 import { randomUUID } from "node:crypto";
 import { beads, type Bead } from "../beads/bd";
+import { cycleEvidenceFor } from "../beads/cycle-evidence";
 import { loadAllIssues } from "../beads/issues";
+import { formatStructureViolations, structureGaps } from "../beads/structure";
 import { isUnit } from "../epic-graph";
 import { runTickets } from "../ticket-view";
 import { bundledAgentIds, discoverAgents } from "../agents-discovery";
@@ -89,10 +91,27 @@ export async function beginEpicRun(args: {
   // target (anton-k0kj), a bare list would leave that edge dangling and poison the target's own
   // recovery run forever. STRICT for the same reason: a swallowed gate-listing failure would leave
   // that edge dangling and the blocker check would read it as open, poisoning a run a retry would
-  // have carried. Let it reject; the runner retries.
-  const all = await loadAllIssues(repo, { strictGates: true });
+  // have carried. Let it reject; the runner retries. `withCycles` reads authoritative `bd dep
+  // cycles` evidence alongside — see the structure re-check below.
+  const all = await loadAllIssues(repo, { strictGates: true, withCycles: true });
   const target = assertRunnableTarget(all, epicBeadId);
   if (!target) return null;
+
+  // Re-run the authoritative structure/cycle gate here too, not only at approval (route.ts).
+  // Approval only guarantees this target's tree was cycle-free at approval time; a cross-machine
+  // Dolt merge can land an internal `blocks` cycle among this run's OWN tickets after that check
+  // passed but before this job ever dispatches. `runReadiness` below treats an internal edge as
+  // ORDERING rather than a blocker, so it never sees a cycle — and `orderTickets`
+  // (execute-epic-board.ts) falls back to input order the moment its topological sort can't place
+  // every ticket, which would let the run dispatch a dependent ticket ahead of the prerequisite the
+  // very edges say it must follow. Poison the run before anything is held; the fix is on the board
+  // (remove the cycle edge), not a retry.
+  const structural = structureGaps(epicBeadId, all, { cycles: cycleEvidenceFor(all) });
+  if (structural.blocking.length > 0) {
+    throw new PoisonEpic(
+      `${epicBeadId} breaks the tier structure: ${formatStructureViolations(structural.blocking)}`,
+    );
+  }
 
   // Unit-ness is type-only (isUnit reads `issue_type`), so unlike the grouping shape it genuinely
   // can't change across a pull — captured here and reused against every board this run re-reads.
