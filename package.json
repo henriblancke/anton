@@ -3,7 +3,7 @@
   "version": "0.6.0",
   "private": true,
   "engines": {
-    "node": ">=20.20.2"
+    "node": ">=24.21.0"
   },
   "bin": {
     "anton": "bin/anton.mjs"
