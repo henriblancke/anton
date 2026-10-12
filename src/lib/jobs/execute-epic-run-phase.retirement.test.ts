@@ -104,6 +104,7 @@ const retiredDispatch = {
   delivered: [],
   satisfied: new Map(),
   skipped: new Map(),
+  boardEvidenceByTicket: new Map(),
   targetRetired: true,
 };
 

@@ -215,21 +215,48 @@ async function adoptPreservedWork(ctx: StepContext): Promise<StepResultWith<"com
 /**
  * Record the ticket attribution a commit's own subject lacks — false when one is already there, so
  * nothing is recorded twice.
+ *
+ * The idempotency check is bound to THIS run's delta (`baseForkSha..HEAD`, excluding whatever
+ * `alreadyShippedBase` carries now) rather than full branch history. A board-only ticket reopened
+ * under the same id can otherwise find its own OLD attribution commit sitting in base history from an
+ * earlier delivery, read that as "already recorded", and return `true` without ever writing a marker
+ * on this branch — leaving it byte-identical to its base and `step:pr` with no delta to open a PR on.
+ *
+ * `alreadyShippedBase`, not the movable `baseRef` (PR #284 review, "Exclude the refreshed base from
+ * attribution scans"): on a reused checkout refreshed onto a newer effective base, a failed fetch can
+ * resolve `baseRef` LOCALLY, behind the base that refresh actually incorporated into the branch.
+ * `alreadyShippedBase` is what tracks that refresh; using the stale `baseRef` here lets a same-ticket
+ * attribution commit inherited from the refreshed base still show up in this run's delta, so this
+ * check reads it as unrecorded and skips writing the marker `step:pr` needs to open a PR — the same
+ * bound the dispatch loop's own delivery-exclusion scans already apply (see `alreadyShippedBase`'s own
+ * doc comment).
+ *
+ * Left non-strict, unlike the dispatch loop's own bounded scan: a `git log` failure here should read
+ * as "no commit found" and fall through to writing the marker. That is the safe direction for THIS
+ * check — an extra empty commit is harmless, where skipping one on an unreadable range reproduces the
+ * exact bug this bound exists to close.
  */
 async function recordAttribution(ctx: StepContext, why: string): Promise<boolean> {
   const subject = stepSubject(ctx);
-  if (await worktreeHasCommitFor(ctx.worktreePath, subject.id)) return false;
+  if (
+    await worktreeHasCommitFor(ctx.worktreePath, subject.id, {
+      base: ctx.baseForkSha,
+      excludeBase: ctx.alreadyShippedBase,
+    })
+  )
+    return false;
   // `hooksPath` is resolved and passed through for the same reason `commitStep` above does it:
   // `commitMarker`'s `--no-verify` bypasses only `pre-commit`/`commit-msg`, so a generated,
   // base-only hook still needs the base repo's copy resolved rather than this cold worktree's own,
   // nonexistent one (PR #263 review, round 15).
   //
   // This call needs no round-37 stage-before-resolve fix: `commitMarker` stages nothing of its own
-  // (it `reset --mixed HEAD`s the index, then commits EMPTY) — both callers reach this only after
-  // the content itself already landed on HEAD, either the agent's own commits
-  // (`adoptAgentCommits`) or an earlier attempt's preserved commit (`adoptPreservedWork`). So
-  // `resolveHooksPathOverride` here reads a submodule gitlink that is already committed, not merely
-  // staged — the round-36/37 index-vs-HEAD gap this file's other call site closes does not apply.
+  // (it `reset --mixed HEAD`s the index, then commits EMPTY) — every caller reaches this only after
+  // the content itself already landed on HEAD (the agent's own commits in `adoptAgentCommits`, an
+  // earlier attempt's preserved commit in `adoptPreservedWork`), or, for `recordBoardOnlyAttribution`,
+  // after nothing in the git tree changed at all. Either way `resolveHooksPathOverride` here reads a
+  // submodule gitlink that is already committed, never one merely staged — the round-36/37
+  // index-vs-HEAD gap this file's other call site closes does not apply.
   const hooksPath = await resolveHooksPathOverride(ctx.repoPath, ctx.worktreePath);
   await commitMarker(ctx.worktreePath, `${subject.id}: ${subject.title}\n\n${why}`, {
     hooksPath,
@@ -237,6 +264,26 @@ async function recordAttribution(ctx: StepContext, why: string): Promise<boolean
     signal: ctx.ctx.signal,
   });
   return true;
+}
+
+/**
+ * The board-only case (anton-fc5x review round 3): `assertDelivered` calls this only once it has
+ * already confirmed the board changed and synced. `delivery:board`'s whole point is that its product
+ * is a bd write, which `.beads/.gitignore` keeps out of the git tree by design — so without this the
+ * branch stays byte-identical to its base, and the run's `step:pr` (which needs at least one commit
+ * ahead of base) fails `gh pr create` on an empty diff instead of reaching review. An empty
+ * attribution commit under this ticket's id closes that gap, and doubles as the marker
+ * `worktreeHasCommitFor` reads on a resume — so `recordAttribution`'s own idempotency check skips a
+ * second one when a previous attempt already recorded it.
+ */
+export async function recordBoardOnlyAttribution(ctx: StepContext): Promise<void> {
+  await recordAttribution(
+    ctx,
+    "This ticket's delivery is board-only — its product is a bd write, which `.beads/.gitignore` " +
+      "keeps out of the git tree by design. This empty commit records the ticket so the run's " +
+      "branch carries evidence of it and `step:pr` has a commit ahead of base to open a pull " +
+      "request on.",
+  );
 }
 
 /**
