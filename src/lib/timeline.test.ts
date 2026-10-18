@@ -309,6 +309,22 @@ describe("foldTimeline — resolves ticket to feature", () => {
     expect(onlyEvent.featureId).toBe("f1");
   });
 
+  it("resolves a feature-level event (ticketBeadId is the feature itself) to that feature", () => {
+    // picker.started, feature-level escalations, and a feature's own bead.closed/pr.merged rows
+    // carry the feature's own bead id as ticketBeadId. cardOf only walks ANCESTORS, so it would
+    // return undefined here were it not for the bead-is-already-a-card check in featureOf.
+    const board = [bead({ id: "f1", title: "Ship billing", issue_type: "feature", labels: ["approved"] })];
+    const row: TimelineSourceRow = {
+      source: "bead_closed",
+      id: "f1",
+      projectId: "p1",
+      ticketBeadId: "f1",
+      closedAt: 1,
+    };
+    const [onlyEvent] = foldTimeline([row], board);
+    expect(onlyEvent.featureId).toBe("f1");
+  });
+
   it("resolves to null when the ticket rides on no card, or the id is unknown to the snapshot", () => {
     // c1 is a CONTAINER epic (it has a feature child), so it is not itself a card — a task
     // parented directly on it rides on no run at all (ticket-view.ts's boardCards.cardOf).

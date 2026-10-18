@@ -210,6 +210,9 @@ function makeFeatureResolver(board: readonly Bead[]): (ticketBeadId: string | nu
     if (!ticketBeadId) return null;
     const bead = byId.get(ticketBeadId);
     if (!bead) return null;
+    // cardOf walks from the bead's PARENT, so it misses the case where the event's own bead is
+    // the card (feature-level events like picker.started / bead.closed on a feature itself).
+    if (cards.ids.has(bead.id)) return bead.id;
     return cards.cardOf(bead) ?? null;
   };
 }
