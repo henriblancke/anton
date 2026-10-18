@@ -1,18 +1,23 @@
 /**
- * The events-since window (anton-z8j4q), against a real in-memory anton.db.
+ * The events-since window (anton-z8j4q) and the events it folds (anton-uxgze, anton-4ldxk), against
+ * a real in-memory anton.db.
  *
- * What this route owns is the WINDOW, not the events: where a timeline read starts, and the instant
- * it is current as of. The cases that matter are the two ways a lower bound goes wrong — a viewer
- * who has never looked (whose window is all of history, not none of it) and an explicit `since`
- * that must look back WITHOUT disturbing the stored mark.
+ * The WINDOW cases that matter are the two ways a lower bound goes wrong — a viewer who has never
+ * looked (whose window is all of history, not none of it) and an explicit `since` that must look
+ * back WITHOUT disturbing the stored mark. The EVENTS case that matters is that the route actually
+ * calls the per-source readers and `foldTimeline` over this window, rather than handing back a
+ * window a caller has to assemble the timeline from itself.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Bead } from "@/lib/beads/bd";
 import { makeTestDb, type TestDb } from "@/lib/db/testing";
 import * as schema from "@/lib/db/schema";
 
 let tdb: TestDb;
+let board: Bead[] = [];
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
+vi.mock("@/lib/beads/issues", () => ({ allIssues: async () => board }));
 
 const { GET } = await import("./route");
 
@@ -27,6 +32,7 @@ async function mark(seenAt: number): Promise<void> {
 
 beforeEach(async () => {
   tdb = makeTestDb();
+  board = [];
   await tdb.db
     .insert(schema.projects)
     .values({ id: "p1", slug: "tmp", name: "tmp", repoPath: "/tmp/p1" });
@@ -73,5 +79,36 @@ describe("GET /timeline/events-since", () => {
 
   it("404s an unknown project", async () => {
     expect((await GET(get(), ctx("nope"))).status).toBe(404);
+  });
+
+  it("folds anton.db rows and the board snapshot into events, not just the window", async () => {
+    const startedAt = new Date(Date.now() - 10_000);
+    await tdb.db.insert(schema.runs).values({
+      id: "run-1",
+      projectId: "p1",
+      epicBeadId: "anton-epic",
+      status: "implementing",
+      startedAt,
+    });
+
+    const closedAt = new Date(Date.now() - 5_000).toISOString();
+    board = [
+      {
+        id: "anton-done",
+        title: "Ship it",
+        status: "closed",
+        issue_type: "task",
+        closed_at: closedAt,
+      } as Bead,
+    ];
+
+    const body = await (await GET(get(), ctx("tmp"))).json();
+
+    expect(body.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "run.started", sourceRefs: ["run-1"] }),
+        expect.objectContaining({ kind: "bead.closed", sourceRefs: ["anton-done"] }),
+      ]),
+    );
   });
 });
