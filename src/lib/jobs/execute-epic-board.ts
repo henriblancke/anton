@@ -739,32 +739,6 @@ export interface PrereqEdge {
 }
 
 /**
- * Re-order what a run has LEFT to dispatch so a prerequisite the run holds ITSELF runs before the
- * ticket that named it (anton-0gm2) — the scheduling correction that replaces parking the run
- * behind its own work.
- *
- * The run's own edges are passed in rather than read off `all`, because they are not there: the
- * board snapshot predates every write the repair makes, and it is never refreshed mid-dispatch.
- * Everything else about the graph is the snapshot's ({@link dependentEdges}), so a re-order can only
- * ever ADD orderings anton actually recorded.
- *
- * `drawn` carries the ones from EARLIER re-orders in the same run, and carrying them is load-bearing
- * (PR review): a second re-order that saw only its own edge would sort a graph the first one's
- * ordering is missing from, and could dispatch a ticket ahead of the prerequisite anton already
- * recorded for it — the same missing-prerequisite block again, which the repair's one-per-bead
- * guard then escalates.
- *
- * `ticket` goes back LAST in the input and the prerequisite FIRST, which is the whole preference
- * this function expresses: among tickets the edges leave equally ready, the prerequisite is
- * dispatched next and the ticket that has already failed once waits behind everything that hasn't.
- * The edges still decide — a prerequisite with an unmet dependency of its own queues behind it.
- *
- * A CYCLE is refused rather than ordered. {@link orderTickets} falls back to input order, which for
- * an ordinary run is a reasonable "we cannot tell, run them as given"; here it would be the run
- * executing the very ordering the new edge says is impossible, with the ticket that just blocked
- * first in line again.
- */
-/**
  * Where the prerequisite sits among what's left to dispatch, and the run's preferred input order
  * for the sort below — the prerequisite first, the blocked ticket last, among tickets the edges
  * leave equally ready.
@@ -798,6 +772,32 @@ function applyPrereqEdges(adj: Map<string, string[]>, input: Bead[], edges: read
   }
 }
 
+/**
+ * Re-order what a run has LEFT to dispatch so a prerequisite the run holds ITSELF runs before the
+ * ticket that named it (anton-0gm2) — the scheduling correction that replaces parking the run
+ * behind its own work.
+ *
+ * The run's own edges are passed in rather than read off `all`, because they are not there: the
+ * board snapshot predates every write the repair makes, and it is never refreshed mid-dispatch.
+ * Everything else about the graph is the snapshot's ({@link dependentEdges}), so a re-order can only
+ * ever ADD orderings anton actually recorded.
+ *
+ * `drawn` carries the ones from EARLIER re-orders in the same run, and carrying them is load-bearing
+ * (PR review): a second re-order that saw only its own edge would sort a graph the first one's
+ * ordering is missing from, and could dispatch a ticket ahead of the prerequisite anton already
+ * recorded for it — the same missing-prerequisite block again, which the repair's one-per-bead
+ * guard then escalates.
+ *
+ * `ticket` goes back LAST in the input and the prerequisite FIRST, which is the whole preference
+ * this function expresses: among tickets the edges leave equally ready, the prerequisite is
+ * dispatched next and the ticket that has already failed once waits behind everything that hasn't.
+ * The edges still decide — a prerequisite with an unmet dependency of its own queues behind it.
+ *
+ * A CYCLE is refused rather than ordered. {@link orderTickets} falls back to input order, which for
+ * an ordinary run is a reasonable "we cannot tell, run them as given"; here it would be the run
+ * executing the very ordering the new edge says is impossible, with the ticket that just blocked
+ * first in line again.
+ */
 export function reorderForPrereq(args: {
   /** The ticket that blocked — never dropped, always placed back in the order. */
   ticket: Bead;
