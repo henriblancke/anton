@@ -139,6 +139,33 @@ describe("readRunRows", () => {
     ]);
     tdb.close();
   });
+
+  it("never attributes the epic's PR to a failed run row, even one updated inside the window", async () => {
+    // Regression (PR #346 review, P2): an ordinary handler error settles a run row `failed` and
+    // the retry gets a FRESH row (runs.ts `findRunFormulaForBranch`) — both share `epicBeadId`, so
+    // without a status guard the stale failed row would claim the PR its retry actually opened.
+    const tdb = makeDb();
+    tdb.db
+      .insert(schema.runs)
+      .values({
+        id: "run-failed",
+        projectId: PROJECT,
+        epicBeadId: "anton-epic",
+        ticketBeadId: "anton-t1",
+        status: "failed",
+        startedAt: date(1_500),
+        updatedAt: date(1_800),
+      })
+      .run();
+
+    const board = [bead("anton-epic", { metadata: { pr: "gh-org/repo#9" } })];
+    const rows = await readRunRows(tdb.db, PROJECT, WINDOW, board);
+
+    expect(rows).toEqual([
+      expect.objectContaining({ id: "run-failed", startedAt: 1_500, prOpenedAt: null }),
+    ]);
+    tdb.close();
+  });
 });
 
 describe("readRunAttemptRows", () => {

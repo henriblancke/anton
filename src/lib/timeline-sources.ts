@@ -141,7 +141,14 @@ export async function readRunRows(
     const epic = ticketById.get(r.epicBeadId);
     const updatedAt = toEpoch(r.updatedAt);
     const hasPr = epic != null && beads.getPrRef(epic) !== undefined;
-    const prOpenedAt = hasPr && updatedAt != null && updatedAt > startedAt ? updatedAt : null;
+    // `failed` rows never deliver (runs.ts `findRunFormulaForBranch`: an ordinary handler error
+    // settles the row `failed` and the retry gets a FRESH row) — without this guard, a retried
+    // epic's stale failed row would claim the PR its successful retry opened, stamped with the
+    // failed row's own `updatedAt` rather than the one that actually did it (PR #346 review, P2).
+    const prOpenedAt =
+      hasPr && r.status !== "failed" && updatedAt != null && updatedAt > startedAt
+        ? updatedAt
+        : null;
     out.push({
       source: "run",
       id: r.id,
