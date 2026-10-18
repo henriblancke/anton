@@ -10,7 +10,7 @@
  * nothing downstream has to decide anything about it beyond saying it is not in the PR.
  */
 import { beads, LABELS, type Bead } from "../beads/bd";
-import { claimGuard } from "../beads/claim";
+import { claimGuard, type LockedSwap } from "../beads/claim";
 import { withBeadWriteLock } from "../beads/claim-lock";
 import { contractGaps, formatContractGaps } from "../beads/contract";
 import { latestSatisfiedRecord } from "../beads/satisfied-note";
@@ -741,6 +741,111 @@ async function reopenForRegeneration(repo: string, ticket: Bead): Promise<void> 
   });
 }
 
+/** What a skip must do to the ticket's board state, from a fresh read taken under its write lock. */
+type SkipAction =
+  | { kind: "moved-on" }
+  | { kind: "reopen-and-mark" }
+  | { kind: "mark" };
+
+/**
+ * Classifies what a skip does to the board, from `live` — a re-read taken under the ticket's write
+ * lock (PR #199 review), never the run's stale snapshot. Project concurrency lets the SAME operator
+ * own a second run that reparents and claims this ticket under the very actor string this run
+ * reserved it under; `moved-on` is what tells the two runs apart, by the rest of the bead (its
+ * parent and status) rather than a new assignee alone — a reservation says who runs the ticket
+ * NEXT, not that it left this run.
+ */
+function classifySkipAction(live: Bead, ticket: Bead, doneOnBoard: boolean): SkipAction {
+  if (beads.parentOf(live) !== beads.parentOf(ticket) || live.status !== ticket.status) {
+    return { kind: "moved-on" };
+  }
+  // Closed on another machine but its commit never reached this branch, and now it will never be
+  // regenerated here — reopen it, or the board advertises work no PR contains. Required, not
+  // best-effort: merge finalization only preserves and rehomes children that are still OPEN, so a
+  // ticket left closed here is recorded as shipped by the very merge that proves it never was.
+  if (doneOnBoard && ticket.status === "closed") return { kind: "reopen-and-mark" };
+  return { kind: "mark" };
+}
+
+/**
+ * Carries out a skip's classified board writes. Returns whether the board had already moved the
+ * ticket on (`moved-on`) — nothing is written in that case; every other action marks the ticket
+ * `not-delivered`, which is what stops merge finalization from closing it as shipped when the PR
+ * for the rest of the feature lands (anton-67xj). Retry, then park for a human rather than proceed
+ * on an unwritten fact — a run that cannot record this marker must not go on to open a PR whose
+ * merge would then file an undelivered ticket as shipped.
+ */
+async function recordSkipAction(
+  repo: string,
+  ticket: Bead,
+  skipping: SkipCause,
+  action: SkipAction,
+): Promise<boolean> {
+  if (action.kind === "moved-on") return true;
+  if (
+    action.kind === "reopen-and-mark" &&
+    !(await mustPersist(() => beads.reopen(repo, ticket.id)))
+  ) {
+    throw new PoisonEpic(
+      `${ticket.id} is closed on the board but its commit is on no branch here, and it ` +
+        `was skipped because ${skipping.stopped} ran out of time — bd would not reopen ` +
+        `it, so the merge of this run's pull request would file work no diff contains ` +
+        `as shipped. Check the beads DB, then resume the run`,
+    );
+  }
+  if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
+    throw new PoisonEpic(
+      `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+        `not record \`${LABELS.notDelivered}\` on it — the run stopped rather than open a ` +
+        `pull request whose merge would close this undelivered ticket as shipped. Check ` +
+        `the beads DB, then resume the run`,
+    );
+  }
+  return false;
+}
+
+/**
+ * The guarded read-classify-write a skip performs under the ticket's write lock (PR #199 review),
+ * and the reservation release that follows it. Pulled out of {@link makeSkipRecorder} as its own
+ * function so the lock body reads as one call rather than another level of nesting.
+ *
+ * The guarded read is the evidence the classification and every write are decided on, so it is
+ * retried like the writes are, and a run that still cannot take it stops. Tagging on an unreadable
+ * bead is not the safe half of the trade: a second run that has already reparented and claimed this
+ * ticket would deliver it with `not-delivered` still attached — runTicket only clears the label off
+ * its OWN snapshot, taken before this late write. So neither write is made on an unverified ticket:
+ * the run parks with the board named, and the resume re-reads it.
+ */
+async function writeSkipUnderLock(
+  repo: string,
+  ticket: Bead,
+  skipping: SkipCause,
+  doneOnBoard: boolean,
+  reservedFor: string | undefined,
+  swap: LockedSwap,
+): Promise<boolean> {
+  const live = await mustRead(repo, ticket.id);
+  if (!live) {
+    throw new PoisonEpic(
+      `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
+        `not read the ticket back, so anton cannot tell whether it is still this run's to ` +
+        `mark — the run stopped rather than write \`${LABELS.notDelivered}\` onto a ticket ` +
+        `another run may already own. Check the beads DB, then resume the run`,
+    );
+  }
+  const moved = await recordSkipAction(repo, ticket, skipping, classifySkipAction(live, ticket, doneOnBoard));
+  // …then hand it back: the run's claim cascade reserved it, and a ticket left assigned to a run
+  // that never dispatched it is invisible to `bd ready --unassigned` on every machine.
+  //
+  // ONLY this run's own reservation, under the cascade's compare-and-swap (anton-67xj), and only
+  // once the board write above actually landed — an operator who took this ticket over between the
+  // cascade and this skip is doing live work, and an unconditional unassign would advertise their
+  // ticket as claimable and invite a second run of it. `live` was read under this lock, so it IS
+  // the swap's own re-read: handed in rather than paid for twice.
+  if (!moved && reservedFor) await safe(() => swap(reservedFor, undefined, live));
+  return moved;
+}
+
 /**
  * Hand a ticket this run will NOT dispatch back to the board, and say so on it. Shared by the
  * dispatch loop and by the held tail, which reaches the same verdict for a ticket a cross-run
@@ -757,94 +862,9 @@ function makeSkipRecorder(
   return async (ticket, skipping, doneOnBoard) => {
     const reservedFor = run.childCascade?.actor;
     skipped.set(ticket.id, skipping);
-    // Every board write below is decided on a read taken under this ticket's write lock
-    // (PR #199 review). `tickets` is the run's snapshot, and project concurrency lets the SAME
-    // operator own a second run: that run can reparent this ticket onto a target of its own
-    // and claim it there under the very actor string this run reserved it under, which an
-    // actor-only CAS matches. Marking a ticket that has left this run `not-delivered` sends
-    // the OTHER run's merge finalization off preserving work that shipped, and releasing it
-    // clears a live reservation. What tells the two runs apart is the rest of the bead — its
-    // parent and its status — so the writes land only while a fresh read still finds the
-    // ticket exactly where and as this run left it. The lock orders every claim write made in
-    // THIS process; the cross-process half stays open on bd's current primitives (anton-od4).
-    //
-    // A new ASSIGNEE is deliberately not one of those signals (PR #199 review). A reservation
-    // says who will run the ticket next, not that it left this run: it is still this target's
-    // child, still open, and still in no diff this PR carries — and the merge closes what it
-    // finds open, so withholding the marker there is the silent loss the marker exists to
-    // prevent. The reservation itself is what the CAS below protects.
-
-    const moved = await claimGuard.withClaimLock(repo, ticket.id, async (swap) => {
-      // The guarded read is the evidence BOTH writes below are decided on, so it is retried
-      // like the writes are, and a run that still cannot take it stops (PR #199 review).
-      // Tagging on an unreadable bead is not the safe half of the trade: a second run that has
-      // already reparented and claimed this ticket would deliver it with `not-delivered` still
-      // attached — runTicket only clears the label off its OWN snapshot, taken before this late
-      // write — and merge finalization then preserves and rehomes work that shipped. Withholding
-      // the marker is not safe either; it is the silent loss the marker exists to prevent. So
-      // neither write is made on an unverified ticket: the run parks with the board named, and
-      // the resume re-reads it.
-      const live = await mustRead(repo, ticket.id);
-      if (!live) {
-        throw new PoisonEpic(
-          `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
-            `not read the ticket back, so anton cannot tell whether it is still this run's to ` +
-            `mark — the run stopped rather than write \`${LABELS.notDelivered}\` onto a ticket ` +
-            `another run may already own. Check the beads DB, then resume the run`,
-        );
-      }
-      if (
-        beads.parentOf(live) !== beads.parentOf(ticket) ||
-        live.status !== ticket.status
-      )
-        return true;
-      // Closed on another machine but its commit never reached this branch, and now it will
-      // never be regenerated here — reopen it, or the board advertises work no PR contains.
-      // Required, not best-effort: merge finalization only preserves and rehomes children that
-      // are still OPEN, so a ticket left closed here is recorded as shipped by the very merge
-      // that proves it never was — the `not-delivered` marker below cannot rescue it.
-      if (doneOnBoard && ticket.status === "closed") {
-        if (!(await mustPersist(() => beads.reopen(repo, ticket.id)))) {
-          throw new PoisonEpic(
-            `${ticket.id} is closed on the board but its commit is on no branch here, and it ` +
-              `was skipped because ${skipping.stopped} ran out of time — bd would not reopen ` +
-              `it, so the merge of this run's pull request would file work no diff contains ` +
-              `as shipped. Check the beads DB, then resume the run`,
-          );
-        }
-      }
-      // Mark it as work this run did NOT deliver, which is what stops merge finalization from
-      // closing it as shipped when the PR for the rest of the feature lands (anton-67xj). That
-      // marker is finalization's only input, so it is not best-effort: a run that cannot record
-      // it must not go on to open a PR whose merge would then file this ticket as shipped.
-      // Retry, then park for a human rather than proceed on an unwritten fact.
-      //
-      // Written BEFORE the reservation goes back (PR #199). The release is what makes this
-      // ticket claimable again on a shared board, and a second run that takes it in the gap
-      // would snapshot it without the marker — runTicket clears the label off its own snapshot,
-      // so it would never clear this one, and the ticket could deliver with `not-delivered`
-      // still attached, which sends merge finalization off preserving and rehoming work that
-      // actually shipped. While the reservation stands, `bd ready --unassigned` keeps the ticket
-      // out of every other worker's claimable set, so there is no such snapshot to take.
-      if (!(await mustPersist(() => beads.tag(repo, ticket.id, [LABELS.notDelivered])))) {
-        throw new PoisonEpic(
-          `${ticket.id} was skipped because ${skipping.stopped} ran out of time, but bd would ` +
-            `not record \`${LABELS.notDelivered}\` on it — the run stopped rather than open a ` +
-            `pull request whose merge would close this undelivered ticket as shipped. Check ` +
-            `the beads DB, then resume the run`,
-        );
-      }
-      // …then hand it back: the run's claim cascade reserved it, and a ticket left assigned to a
-      // run that never dispatched it is invisible to `bd ready --unassigned` on every machine.
-      //
-      // ONLY this run's own reservation, under the cascade's compare-and-swap (anton-67xj) —
-      // an operator who took this ticket over between the cascade and this skip is doing live
-      // work, and an unconditional unassign would advertise their ticket as claimable and
-      // invite a second run of it. `live` was read under this lock, so it IS the swap's own
-      // re-read: handed in rather than paid for twice.
-      if (reservedFor) await safe(() => swap(reservedFor, undefined, live));
-      return false;
-    });
+    const moved = await claimGuard.withClaimLock(repo, ticket.id, (swap) =>
+      writeSkipUnderLock(repo, ticket, skipping, doneOnBoard, reservedFor, swap),
+    );
     await safe(() => beads.note(repo, ticket.id, skipNote(skipping, moved)));
     console.warn(
       `[execute-epic] ${epicBeadId}: skipped ${ticket.id} — it depends on ` +

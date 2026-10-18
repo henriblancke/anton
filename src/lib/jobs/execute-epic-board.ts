@@ -739,6 +739,40 @@ export interface PrereqEdge {
 }
 
 /**
+ * Where the prerequisite sits among what's left to dispatch, and the run's preferred input order
+ * for the sort below — the prerequisite first, the blocked ticket last, among tickets the edges
+ * leave equally ready.
+ */
+function placePrereqFirst(
+  ticket: Bead,
+  remaining: Bead[],
+  blockerId: string,
+): { input: Bead[]; prereqPending: boolean } {
+  const prereq = remaining.find((t) => t.id === blockerId);
+  const input = [...(prereq ? [prereq] : []), ...remaining.filter((t) => t.id !== blockerId), ticket];
+  return { input, prereqPending: Boolean(prereq) };
+}
+
+/**
+ * Applies every ordering edge this reorder must honour — the run's earlier re-orders plus the new
+ * one, in that order — onto `adj`, in place. Dropped (not re-counted) once it no longer constrains
+ * anything left to sort: an edge against a ticket the loop has already passed, or one already
+ * recorded, would otherwise count twice in the in-degree and read as a cycle no edge actually closes.
+ */
+function applyPrereqEdges(adj: Map<string, string[]>, input: Bead[], edges: readonly PrereqEdge[]): void {
+  const ids = new Set(input.map((t) => t.id));
+  const seen = new Set<string>();
+  for (const [from, dependents] of adj) for (const to of dependents) seen.add(`${from}→${to}`);
+  for (const edge of edges) {
+    if (!ids.has(edge.blockerId) || !ids.has(edge.ticketId)) continue;
+    const key = `${edge.blockerId}→${edge.ticketId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    adj.get(edge.blockerId)!.push(edge.ticketId);
+  }
+}
+
+/**
  * Re-order what a run has LEFT to dispatch so a prerequisite the run holds ITSELF runs before the
  * ticket that named it (anton-0gm2) — the scheduling correction that replaces parking the run
  * behind its own work.
@@ -781,33 +815,16 @@ export function reorderForPrereq(args: {
   all: Bead[];
 }): PrereqReorder {
   const { ticket, remaining, blockerId, drawn, all } = args;
-  const prereq = remaining.find((t) => t.id === blockerId);
-  const input = [
-    ...(prereq ? [prereq] : []),
-    ...remaining.filter((t) => t.id !== blockerId),
-    ticket,
-  ];
+  const { input, prereqPending } = placePrereqFirst(ticket, remaining, blockerId);
   const adj = dependentEdges(input, all);
-  const ids = new Set(input.map((t) => t.id));
-  const seen = new Set<string>();
-  for (const [from, dependents] of adj) for (const to of dependents) seen.add(`${from}→${to}`);
-  const add = (edge: PrereqEdge): void => {
-    // An ordering against a ticket the loop has already passed constrains nothing left to sort, and
-    // a duplicate would count twice in the in-degree and read as a cycle no edge actually closes.
-    if (!ids.has(edge.blockerId) || !ids.has(edge.ticketId)) return;
-    if (seen.has(`${edge.blockerId}→${edge.ticketId}`)) return;
-    seen.add(`${edge.blockerId}→${edge.ticketId}`);
-    adj.get(edge.blockerId)!.push(edge.ticketId);
-  };
-  for (const edge of drawn) add(edge);
-  add({ blockerId, ticketId: ticket.id });
+  applyPrereqEdges(adj, input, [...drawn, { blockerId, ticketId: ticket.id }]);
   const placed = topoIds(input, adj);
   if (placed.length !== input.length) {
     const sorted = new Set(placed);
     return { ok: false, cycle: input.map((t) => t.id).filter((id) => !sorted.has(id)) };
   }
   const byId = new Map(input.map((t) => [t.id, t]));
-  return { ok: true, order: placed.map((id) => byId.get(id)!), prereqPending: Boolean(prereq) };
+  return { ok: true, order: placed.map((id) => byId.get(id)!), prereqPending };
 }
 
 /**
