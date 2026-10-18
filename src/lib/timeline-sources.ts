@@ -183,7 +183,16 @@ export async function readRunAttemptRows(
   }));
 }
 
-/** Escalations raised in this window. `resolvedAt` reuses `updatedAt`, the write a resolve stamps. */
+/**
+ * Escalations raised in this window. `resolvedAt` reuses `updatedAt`, the write a resolve stamps.
+ *
+ * Derived from the row's CURRENT status, not an immutable log (Out of scope: "no stored/
+ * denormalised events — computed on read", ADR-0001). A `restoreEscalation` that flips a dismissed
+ * row back to `open` before the next poll erases the evidence this reader uses to report
+ * `escalation.resolved` — the resolution genuinely happened, but nothing in the row still says so.
+ * Accepted for v1: closing that gap needs a resolution history independent of the row's live
+ * status, which is exactly the stored-event model this ticket chose not to build.
+ */
 export async function readEscalationRows(
   db: AntonDb,
   projectId: string,
