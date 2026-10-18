@@ -92,10 +92,19 @@ describe("POST /timeline/mark-seen", () => {
     expect(storedMark()).toBeUndefined();
   });
 
-  // Ordinary browser-vs-server skew still has to work — that is what the tolerance is for.
-  it("accepts a mark a few seconds ahead, within the skew tolerance", async () => {
-    const res = await POST(post({ seenAt: Math.floor(Date.now() / 1000) + 5 }), ctx("tmp"));
+  // A legitimate seenAt is an `until` this same server minted earlier, so it can never be ahead of
+  // the server's own clock by POST time — there is no skew to tolerate (PR #346 review, P2).
+  it("accepts a mark exactly at the server's current clock", async () => {
+    const res = await POST(post({ seenAt: Math.floor(Date.now() / 1000) }), ctx("tmp"));
     expect(res.status).toBe(200);
+  });
+
+  it("rejects a mark even a second ahead of the server's clock, storing nothing", async () => {
+    const res = await POST(post({ seenAt: Math.floor(Date.now() / 1000) + 1 }), ctx("tmp"));
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/ahead of this server/);
+    expect(storedMark()).toBeUndefined();
   });
 });
 

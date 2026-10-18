@@ -96,6 +96,21 @@ describe("GET /timeline/events-since", () => {
     }
   });
 
+  // PR #346 review, P2 (chatgpt-codex-connector): `since` only looks further BACK than the mark. A
+  // `since` ahead of it would read `[since, until)` while still handing out `until` as the next
+  // postable cursor, so marking it seen would silently bury `[mark, since)` forever.
+  it("rejects an explicit since ahead of the stored watermark", async () => {
+    await mark(1000);
+
+    const res = await GET(get("?since=2000"), ctx("tmp"));
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/ahead of the stored watermark/);
+    // The mark is untouched — no cursor was handed out to bury anything behind it.
+    const [row] = tdb.db.select().from(schema.viewerMarks).all();
+    expect(Math.floor(row!.seenAt!.getTime() / 1000)).toBe(1000);
+  });
+
   it("404s an unknown project", async () => {
     expect((await GET(get(), ctx("nope"))).status).toBe(404);
   });

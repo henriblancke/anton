@@ -68,6 +68,20 @@ export const GET = withProject<{ slug: string }>(async (request, { project }) =>
 
   const db = getDb();
   const mark = await getViewerMark(db, project.id);
+  // `since` only widens the read BACKWARD — past the stored mark, never ahead of it. A `since`
+  // beyond the watermark would read `[since, until)` while still handing back `until` as the next
+  // postable cursor, so marking it seen would advance the watermark straight past `[mark, since)`
+  // without ever returning those events, stranding them permanently.
+  if (parsed.data.since !== undefined && mark && parsed.data.since > mark.seenAt) {
+    return NextResponse.json(
+      {
+        error:
+          `since (${parsed.data.since}) is ahead of the stored watermark (${mark.seenAt}) — ` +
+          `since can only look further back than the mark, never past it`,
+      },
+      { status: 400 },
+    );
+  }
   const since = parsed.data.since ?? mark?.seenAt ?? null;
   const until = Math.floor(systemClock.now() / 1000);
 

@@ -337,6 +337,14 @@ export function refreshIssueSnapshotRead(
  * back a read that began earlier, silently omitting anything that changed in the gap and then
  * permanently stranding it once the caller marks that cursor seen. Waiting for the in-flight read
  * first (rather than racing a second `bd list` alongside it) keeps this at most one extra spawn.
+ *
+ * Loops rather than awaiting once: resuming from an `await` takes a few microtask hops (the awaited
+ * refresh's own `.finally` clearing `entry.refresh`, then this function's continuation), and a
+ * concurrent plain `refreshIssueSnapshotRead`/`refreshAllIssues` call can land in that gap and start
+ * a NEW refresh before we re-check. Re-checking `entry.refresh` after every await — and waiting out
+ * whatever is there, including a refresh that started during our own wait — closes that gap: the
+ * loop only calls {@link refreshIssueSnapshotRead} once `entry.refresh` is null at a point with no
+ * intervening `await`, so nothing can slip in between that check and the call (PR #346 review).
  */
 export async function refreshIssueSnapshotReadFresh(
   cwd: string,
@@ -344,7 +352,7 @@ export async function refreshIssueSnapshotReadFresh(
   now = Date.now(),
 ): Promise<SnapshotRead> {
   const entry = entryFor(cwd);
-  if (entry.refresh) {
+  while (entry.refresh) {
     await entry.refresh.catch(() => {});
   }
   return refreshIssueSnapshotRead(cwd, loader, now);

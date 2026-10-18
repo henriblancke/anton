@@ -14,18 +14,6 @@ const bodySchema = z.object({
 });
 
 /**
- * How far past the server's own clock a mark may name, in seconds.
- *
- * The contract above — post the `until` you were handed — makes a mark ahead of this server's clock
- * a sign the caller used its own instead, and that is the one error this write cannot absorb: the
- * watermark never moves back, so a mark minted from a fast clock buries every event up to it
- * permanently, including the ones that have not happened yet. Refused rather than clamped to `now`,
- * which would report the instant the caller named as stored. The tolerance covers the seconds of
- * skew between any two real clocks; beyond it the caller is not answering a window anton issued.
- */
-const FUTURE_TOLERANCE_SEC = 120;
-
-/**
  * Mark this project's timeline read up to an instant (anton-z8j4q).
  *
  * The watermark only ever moves FORWARD, and the store settles that rather than this route: an
@@ -46,8 +34,13 @@ export const POST = withProject<{ slug: string }>(async (request, { project }) =
     );
   }
 
+  // A legitimate `seenAt` is an `until` this same server minted in an earlier GET, so by the time
+  // the POST lands it can never be ahead of the server's own (monotonically advancing) clock. Any
+  // tolerance here is a window where a fast client clock buries events that have not happened yet
+  // behind an irreversible watermark, so this is capped at `nowSec` exactly rather than clamped —
+  // clamping would silently store a time the caller never actually answered.
   const nowSec = Math.floor(systemClock.now() / 1000);
-  if (parsed.data.seenAt > nowSec + FUTURE_TOLERANCE_SEC) {
+  if (parsed.data.seenAt > nowSec) {
     return NextResponse.json(
       {
         error:
