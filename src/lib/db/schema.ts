@@ -232,6 +232,10 @@ export const runs = sqliteTable("runs", {
   // The run-resume query receives its lifecycle states as bound parameters. SQLite cannot prove
   // those parameters imply a partial-index predicate, so keep status out of this ordered lookup.
   index("runs_project_epic_updated_idx").on(table.projectId, table.epicBeadId, table.updatedAt),
+  // The timeline's run reader (anton-4ldxk) seeks a project's runs over a `startedAt` window —
+  // `runs_project_epic_updated_idx` above is ordered by `epicBeadId` before `updatedAt`, so it can't
+  // serve a plain project+time range without scanning every epic bucket.
+  index("runs_project_started_idx").on(table.projectId, table.startedAt),
 ]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
@@ -866,6 +870,9 @@ export const escalations = sqliteTable(
     index("escalations_dismissed_idx")
       .on(table.projectId, table.findingKey)
       .where(sql`${table.dismissedAt} is not null`),
+    // The timeline's escalation reader (anton-4ldxk) seeks a project's escalations over a
+    // `raisedAt` window — without this, that read scans the project's whole escalation history.
+    index("escalations_project_raised_idx").on(table.projectId, table.raisedAt),
   ],
 );
 
@@ -1114,6 +1121,9 @@ export const runAttempts = sqliteTable(
     // The only read this table has: one run's attempts, in order. Both halves of it — the fold over
     // a settled run, and the open row `recordAttemptEnd` closes — seek on exactly this pair.
     index("run_attempts_run_idx").on(table.runId, table.attempt),
+    // The timeline's run-attempt reader (anton-4ldxk) seeks a project's settled attempts over an
+    // `endedAt` window — without this, that read scans every attempt the project ever recorded.
+    index("run_attempts_project_ended_idx").on(table.projectId, table.endedAt),
   ],
 );
 
