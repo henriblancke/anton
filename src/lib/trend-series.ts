@@ -731,18 +731,20 @@ export interface ReviewLoopPoint {
   selfReviewInvocations: number;
   /** PR-fix invocations — the correction round after a failed self-review or a reviewer's findings. */
   prFixInvocations: number;
-  /** `selfReviewInvocations + prFixInvocations` — what the median below is computed over. */
+  /** `selfReviewInvocations + prFixInvocations`, for display — NOT what `runaway` is computed over. */
   loopInvocations: number;
-  /** Whether `loopInvocations` exceeds {@link RUNAWAY_MEDIAN_MULTIPLE} times the cohort's median. */
+  /** Whether `prFixInvocations` exceeds {@link RUNAWAY_MEDIAN_MULTIPLE} times the cohort's median PR-fix count. */
   runaway: boolean;
 }
 
 /**
  * Self-review and PR-fix invocations per feature, counted from raw `claude_invocations` rows (never
  * jobs — one job can dispatch several invocations, and counting jobs would undercount the exact
- * features this fold exists to name). `runaway` is relative to the MEDIAN of every feature passed
- * in, so the threshold adapts to a project's own typical amount of looping rather than a fixed count
- * that would misfire on a project whose formula naturally runs more review rounds than another's.
+ * features this fold exists to name). `runaway` is relative to the MEDIAN `prFixInvocations` of every
+ * feature passed in — PR-fix rounds specifically, since those are the correction loop a reviewer or a
+ * failed self-review triggers, not the self-review gate itself — so the threshold adapts to a
+ * project's own typical amount of correction looping rather than a fixed count that would misfire on
+ * a project whose formula naturally runs more rounds than another's.
  */
 export function reviewLoopByFeature(
   invocations: readonly ReviewLoopInvocationPoint[],
@@ -759,17 +761,17 @@ export function reviewLoopByFeature(
   }
 
   const entries = [...byFeature.entries()];
-  const totals = entries.map(([, bucket]) => bucket.selfReview + bucket.prFix);
-  const med = median(totals);
+  const prFixTotals = entries.map(([, bucket]) => bucket.prFix);
+  const med = median(prFixTotals);
 
   return entries.map(([beadId, bucket], i) => {
-    const loopInvocations = totals[i];
+    const prFixInvocations = prFixTotals[i];
     return {
       beadId,
       selfReviewInvocations: bucket.selfReview,
-      prFixInvocations: bucket.prFix,
-      loopInvocations,
-      runaway: med !== undefined && loopInvocations > RUNAWAY_MEDIAN_MULTIPLE * med,
+      prFixInvocations,
+      loopInvocations: bucket.selfReview + prFixInvocations,
+      runaway: med !== undefined && prFixInvocations > RUNAWAY_MEDIAN_MULTIPLE * med,
     };
   });
 }

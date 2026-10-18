@@ -508,11 +508,11 @@ describe("reviewLoopByFeature", () => {
     expect(point.prFixInvocations).toBe(0);
   });
 
-  it("names a feature runaway only once its loop invocations clear the documented multiple of the median", () => {
+  it("names a feature runaway only once its PR-fix invocations clear the documented multiple of the median", () => {
     const invocations = [
-      invocation("typical-a", "self-review"),
-      invocation("typical-b", "self-review"),
-      ...Array.from({ length: RUNAWAY_MEDIAN_MULTIPLE + 1 }, () => invocation("outlier", "self-review")),
+      invocation("typical-a", "pr-fix"),
+      invocation("typical-b", "pr-fix"),
+      ...Array.from({ length: RUNAWAY_MEDIAN_MULTIPLE + 1 }, () => invocation("outlier", "pr-fix")),
     ];
     const points = reviewLoopByFeature(invocations);
     const byId = new Map(points.map((p) => [p.beadId, p]));
@@ -521,6 +521,15 @@ describe("reviewLoopByFeature", () => {
     expect(byId.get("typical-a")?.runaway).toBe(false);
     expect(byId.get("typical-b")?.runaway).toBe(false);
     expect(byId.get("outlier")?.runaway).toBe(true);
+  });
+
+  it("does not name a feature runaway on self-review retries alone, with zero PR-fix rounds", () => {
+    const invocations = [
+      invocation("typical", "self-review"),
+      ...Array.from({ length: RUNAWAY_MEDIAN_MULTIPLE + 5 }, () => invocation("heavy-self-review", "self-review")),
+    ];
+    const points = reviewLoopByFeature(invocations);
+    expect(points.every((p) => !p.runaway)).toBe(true);
   });
 
   it("never calls a feature runaway when every feature has the same loop count", () => {
