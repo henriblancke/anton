@@ -9,10 +9,10 @@
  */
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hasGit, initBareRemote } from "./integration";
+import { hasGit, initBareRemote, removeTempRepo } from "./integration";
 
 /** Comfortably past git's `gc.autoPackLimit` default of 50 — one push lands one pack here. */
 const PUSHES = 60;
@@ -31,6 +31,9 @@ describeGit("initBareRemote", () => {
       execFileSync("git", ["init", "-q", "-b", "main", work], { stdio: "ignore" });
       g("config", "user.email", "t@example.com");
       g("config", "user.name", "anton-test");
+      // Without this, the work repo's own background gc/index work can still be running when
+      // teardown starts deleting the tree underneath it — an ENOTEMPTY race, not a passing test.
+      g("config", "gc.auto", "0");
       g("remote", "add", "origin", bare);
 
       for (let i = 0; i < PUSHES; i++) {
@@ -43,7 +46,7 @@ describeGit("initBareRemote", () => {
       const packs = readdirSync(join(bare, "objects", "pack")).filter((f) => f.endsWith(".pack"));
       expect(packs).toHaveLength(PUSHES);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTempRepo(dir);
     }
   });
 });
