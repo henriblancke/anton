@@ -5,7 +5,15 @@
  * See DESIGN.md §3.
  */
 import { sql } from "drizzle-orm";
-import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  sqliteTable,
+  text,
+  integer,
+  real,
+  index,
+  uniqueIndex,
+  primaryKey,
+} from "drizzle-orm/sqlite-core";
 
 const ts = (name: string) => integer(name, { mode: "timestamp" });
 const now = sql`(unixepoch())`;
@@ -1343,4 +1351,40 @@ export const reviewRounds = sqliteTable(
     // window to leave to the index, unlike the project read above.
     index("review_rounds_bead_idx").on(table.beadId),
   ],
+);
+
+/**
+ * WHEN EACH VIEWER LAST LOOKED, per project (anton-z8j4q) — the watermark the since-you-looked
+ * timeline reads its window from.
+ *
+ * The timeline is a fold over rows anton already writes, so the only state the feature needs of its
+ * own is this: a line in the sand per viewer, moved forward when they say they have seen up to here.
+ * Nothing is denormalized into it — an event's existence is still the source row's business.
+ *
+ * `viewer_id` is `default` until accounts exist (DEFAULT_VIEWER_ID, src/lib/viewer-marks.ts). A
+ * column rather than a hardcoded single row, because the day identity lands the only change is who
+ * fills it in — a one-row table would have to be migrated into a keyed one, and every read rewritten.
+ *
+ * The composite PK (viewer, project) IS the uniqueness rule: one mark per viewer per project, which
+ * makes the write an upsert and makes a double-POST idempotent rather than a second row.
+ *
+ * `seen_at` only ever MOVES FORWARD. A mark naming an earlier instant is a no-op, not a rewind:
+ * marks arrive from whichever tab the operator clicked in, so a stale tab posting the watermark it
+ * loaded with would otherwise un-see everything that happened since — resurfacing events the
+ * operator already read, which is the exact failure the feature exists to prevent. Enforced in the
+ * upsert's `setWhere`, not by the reader, so two concurrent POSTs cannot interleave into a rewind.
+ */
+export const viewerMarks = sqliteTable(
+  "viewer_marks",
+  {
+    viewerId: text("viewer_id").notNull(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The instant the viewer has read up to — the window's lower bound, never its upper. */
+    seenAt: ts("seen_at").notNull(),
+    /** When the watermark above was last MOVED, which is a different question from what it names. */
+    updatedAt: ts("updated_at").notNull().default(now),
+  },
+  (table) => [primaryKey({ columns: [table.viewerId, table.projectId] })],
 );

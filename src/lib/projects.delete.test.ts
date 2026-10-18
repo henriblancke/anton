@@ -168,6 +168,14 @@ async function seedProject(slug: string) {
     round: 1,
   });
 
+  // A foreign key DOES tie this to the project, so leaving it behind doesn't orphan a row — it
+  // fails the project DELETE outright and rolls the whole teardown back.
+  await db.insert(schema.viewerMarks).values({
+    projectId,
+    viewerId: "default",
+    seenAt: new Date(1_000_000),
+  });
+
   return { projectId, burnSampleId, wt, branch, logPath };
 }
 
@@ -200,6 +208,12 @@ async function projectRowCounts(projectId: string) {
         .from(schema.reviewRounds)
         .where(eq(schema.reviewRounds.projectId, projectId))
     ).length,
+    viewerMarks: (
+      await db
+        .select()
+        .from(schema.viewerMarks)
+        .where(eq(schema.viewerMarks.projectId, projectId))
+    ).length,
   };
 }
 
@@ -224,6 +238,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       autopilotDisarms: 0,
       burnSamples: 0,
       reviewRounds: 0,
+      viewerMarks: 0,
     });
 
     // Worktree dir + branch removed; session log deleted.
@@ -285,6 +300,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       autopilotDisarms: 2,
       burnSamples: 1,
       reviewRounds: 1,
+      viewerMarks: 1,
     });
   });
 
