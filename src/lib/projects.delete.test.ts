@@ -338,4 +338,39 @@ suite("deleteProject (real git + temp anton.db)", () => {
       restore.close();
     }
   });
+
+  it("tears down a project even when viewer_marks hasn't been migrated yet (PR #346 review)", async () => {
+    // Simulates a source deployment that pulled this code before applying migration 0064: the
+    // optional watermark table simply doesn't exist. Teardown must still remove the project rather
+    // than fail after worktrees/branches/session logs are already gone.
+    const db = getDb();
+    const raw = new Database(fileDb.path);
+    const viewerMarksDdl = raw
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE tbl_name = 'viewer_marks' AND type IN ('table','index') AND sql IS NOT NULL",
+      )
+      .all() as { sql: string }[];
+    raw.exec("DROP TABLE viewer_marks");
+    raw.close();
+
+    const projectId = randomUUID();
+    try {
+      await db.insert(schema.projects).values({
+        id: projectId,
+        slug: "pre-0064",
+        name: "pre-0064",
+        repoPath: repo,
+      });
+
+      await deleteProject("pre-0064");
+
+      expect(
+        (await db.select().from(schema.projects).where(eq(schema.projects.id, projectId))).length,
+      ).toBe(0);
+    } finally {
+      const restore = new Database(fileDb.path);
+      for (const { sql } of viewerMarksDdl) restore.exec(sql);
+      restore.close();
+    }
+  });
 });

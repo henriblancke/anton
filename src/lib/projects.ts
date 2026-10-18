@@ -357,7 +357,14 @@ function deleteProjectRows(db: AntonDb, slug: string, projectId: string): void {
       tx.delete(schema.escalations).where(eq(schema.escalations.projectId, projectId)).run();
       // References the project, so it goes before the project DELETE or the whole teardown rolls
       // back on the foreign key. A watermark is meaningless once the timeline it indexed is gone.
-      tx.delete(schema.viewerMarks).where(eq(schema.viewerMarks.projectId, projectId)).run();
+      // The table itself is optional, same as review_rounds above: a deployment that pulled this
+      // code before applying migration 0064 has no `viewer_marks` table yet, and that absence must
+      // read as "nothing to clean up" rather than fail teardown after worktrees/logs are gone.
+      try {
+        tx.delete(schema.viewerMarks).where(eq(schema.viewerMarks.projectId, projectId)).run();
+      } catch (e) {
+        if (!/no such table/i.test(errMsg(e))) throw e;
+      }
       // Burn samples are DETACHED rather than dropped: what each job type costs this machine is a
       // property of the machine, not of the project that happened to spend it, and the per-type
       // averages pacing reads would otherwise regress to the tier seeds on every deregistration.
