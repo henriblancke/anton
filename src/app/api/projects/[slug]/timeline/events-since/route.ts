@@ -46,7 +46,10 @@ const querySchema = z.object({
  * would be the silence this feature exists to end.
  *
  * `until` is what a caller posts back to mark-seen: it names exactly the window it was handed, so
- * events landing mid-read are not marked as seen before anyone sees them.
+ * events landing mid-read are not marked as seen before anyone sees them. The window handed to the
+ * readers is `[since, until)` — `until` itself excluded — so an event timestamped exactly `until`
+ * is deferred to the NEXT read (whose `since` is this `until`, inclusive) rather than shown twice;
+ * see the window-semantics note on timeline-sources.ts.
  *
  * The events themselves are folded by `foldTimeline` (anton-uxgze) over rows this route collects
  * from the per-source readers (anton-4ldxk), one bd board read shared across the bd-derived readers
@@ -68,7 +71,18 @@ export const GET = withProject<{ slug: string }>(async (request, { project }) =>
   const since = parsed.data.since ?? mark?.seenAt ?? null;
   const until = Math.floor(systemClock.now() / 1000);
 
-  const events = await readTimelineEvents(db, project, { since: since ?? 0, until });
+  let events: TimelineEvent[];
+  try {
+    events = await readTimelineEvents(db, project, { since: since ?? 0, until });
+  } catch (err) {
+    // A client that marks THIS `until` seen would bury every event this read could not resolve
+    // (proposals, bead closes, PR merges all come off the bd board snapshot) permanently behind an
+    // irreversible watermark — failing the request keeps `until` un-postable instead.
+    return NextResponse.json(
+      { error: `Failed to read project board: ${(err as Error).message}` },
+      { status: 502 },
+    );
+  }
 
   return NextResponse.json({
     viewerId: DEFAULT_VIEWER_ID,
@@ -85,15 +99,23 @@ export const GET = withProject<{ slug: string }>(async (request, { project }) =>
  * `foldTimeline`'s own feature resolution — the same one-read-per-request contract operator-queue.ts
  * and feature-ledger.ts hold.
  *
- * Fails soft to an empty board on a `bd` error: a timeline that cannot resolve features is still
- * worth showing, degraded to `featureId: null` everywhere, rather than failing the whole read.
+ * Propagates a `bd` failure rather than degrading to an empty board: the bd-derived rows are not an
+ * enhancement to a DB-only timeline, they're entire event categories (proposals, bead closes, PR
+ * merges) with no other source, and the caller above refuses to hand out a cursor an operator could
+ * mark seen over a read that silently dropped all of them.
+ *
+ * `readRunRows` and `readEscalationRows` widen their SQL seek with an OR against `updatedAt` (see
+ * the module header on timeline-sources.ts), which can hand back a row whose OWN `startedAt`/
+ * `raisedAt` sits outside `window` — fetched only because its lifecycle's other half landed inside
+ * it. `foldTimeline` has no window to filter against (it's pure over rows, by design), so the final
+ * filter here is what turns that overfetch back into exactly the events `[since, until)` asked for.
  */
 async function readTimelineEvents(
   db: AntonDb,
   project: Pick<Project, "id" | "repoPath">,
   window: TimelineWindow,
 ): Promise<TimelineEvent[]> {
-  const board = await allIssues(project.repoPath).catch(() => []);
+  const board = await allIssues(project.repoPath);
 
   const [
     runRows,
@@ -120,7 +142,7 @@ async function readTimelineEvents(
     window,
   );
 
-  return foldTimeline(
+  const events = foldTimeline(
     [
       ...runRows,
       ...runAttemptRows,
@@ -135,4 +157,5 @@ async function readTimelineEvents(
     ],
     board,
   );
+  return events.filter((e) => e.at >= window.since && e.at < window.until);
 }

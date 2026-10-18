@@ -12,6 +12,11 @@ import * as schema from "@/lib/db/schema";
 let tdb: TestDb;
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
+// The "mark then read" case below drives the real events-since GET, which now fails the request
+// rather than degrading to an empty board on a `bd` error (anton-8ubg3 PR #346 review) — mocked
+// the same way events-since/route.test.ts does, so this suite stays hermetic instead of shelling
+// out to a real `bd` against /tmp/p1.
+vi.mock("@/lib/beads/issues", () => ({ allIssues: async () => [] }));
 
 const { POST } = await import("./route");
 const { GET } = await import("../events-since/route");

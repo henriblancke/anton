@@ -17,25 +17,38 @@
  *
  * ## Window semantics
  *
- * Each DB reader seeks on the ONE timestamp its table is indexed by (a run's `startedAt`, an
- * attempt's `endedAt`, …) — the column every other reader of that table already treats as "when
- * this row happened". A row can still fold into an event whose `at` falls outside `[since, until]`
- * (a run's `prOpenedAt`, an escalation's `resolvedAt`) when the OTHER half of its lifecycle moved
- * outside the queried window; that is an accepted v1 simplification (ADR-0001 scopes this feature
- * as a read-side fold over existing data, nothing new to meter) rather than a second index per
- * table. A caller that needs every event's `at` to land inside the window strictly should filter
- * `foldTimeline`'s output after folding, the same as it would for any overfetch.
+ * `[since, until)` — the lower bound inclusive, the upper bound EXCLUSIVE. A caller that polls by
+ * posting each read's `until` back as the next read's `since` (the mark-seen contract,
+ * viewer-marks.ts) needs that half-openness: with both ends inclusive, an event timestamped
+ * exactly `until` would land in this read AND be re-fetched by the next one (`since` === this
+ * read's `until`), since whole-second timestamps make that collision ordinary, not rare. Excluding
+ * `until` defers such an event to the next read instead of dropping it — the next read's
+ * inclusive `since` picks it up — so it is shown exactly once, whichever read that ends up being.
+ *
+ * Each DB reader still seeks on the table's own indexed timestamp first (a run's `startedAt`, an
+ * escalation's `raisedAt`, an attempt's `endedAt`, …), but `readRunRows` and `readEscalationRows`
+ * widen that seek with an OR against the row's `updatedAt` — the proxy for the OTHER half of its
+ * lifecycle (`prOpenedAt`, `resolvedAt`). Without it, a run started (or escalation raised) before
+ * `since` whose PR opened (or which resolved) INSIDE the window would never be fetched at all: the
+ * single-column WHERE excludes the row before folding ever sees it, so the in-window transition is
+ * silently dropped rather than reported late. The OR necessarily overfetches — a row can come back
+ * whose own `startedAt`/`raisedAt` sits outside the window — and `foldTimeline` always emits both
+ * halves of a lifecycle row unconditionally (it has no window to filter against), so the caller
+ * (events-since/route.ts) filters the folded events back down to `[since, until)` once, after the
+ * fold, which is also what trims the run/escalation fetched purely for its OTHER half back to just
+ * that half's event.
  *
  * The bd-derived readers have no such gap: they test every event they can see (`filed`/`applied`/
  * `refused`, `closedAt`, `mergedAt`) against the window directly, in memory, since the whole board
  * is already on hand.
  */
-import { and, eq, gte, inArray, lte } from "drizzle-orm";
+import { and, eq, gte, inArray, lt, or } from "drizzle-orm";
 
 import { beads, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
 import * as schema from "./db/schema";
 import { toEpoch } from "./db/epoch";
+import { prNumberFromRef } from "./git/pr";
 import { isFoldReason } from "./gardener/emit";
 import { isProposalBead, proposalPlanOf } from "./gardener/detections";
 import type { AntonDb } from "./jobs/queue";
@@ -52,18 +65,26 @@ import type {
   ScanSummaryRow,
 } from "./timeline";
 
-/** The window every reader is asked for, epoch SECONDS, both ends inclusive. */
+/** The window every reader is asked for, epoch SECONDS: `since` inclusive, `until` exclusive. */
 export interface TimelineWindow {
   since: number;
   until: number;
 }
 
-function range(window: TimelineWindow): { gte: Date; lte: Date } {
-  return { gte: new Date(window.since * 1000), lte: new Date(window.until * 1000) };
+function range(window: TimelineWindow): { gte: Date; lt: Date } {
+  return { gte: new Date(window.since * 1000), lt: new Date(window.until * 1000) };
+}
+
+/** A column-bounds test for one timestamp against `window`, `since` inclusive / `until` exclusive. */
+function columnInWindow(
+  w: { gte: Date; lt: Date },
+  column: Parameters<typeof gte>[0],
+): ReturnType<typeof and> {
+  return and(gte(column, w.gte), lt(column, w.lt));
 }
 
 function inWindow(at: number, window: TimelineWindow): boolean {
-  return at >= window.since && at <= window.until;
+  return at >= window.since && at < window.until;
 }
 
 /** A bd bead's ISO timestamp (`created_at`/`closed_at`) as epoch seconds, or null if unparseable. */
@@ -98,8 +119,10 @@ export async function readRunRows(
     .where(
       and(
         eq(schema.runs.projectId, projectId),
-        gte(schema.runs.startedAt, w.gte),
-        lte(schema.runs.startedAt, w.lte),
+        or(
+          columnInWindow(w, schema.runs.startedAt),
+          columnInWindow(w, schema.runs.updatedAt),
+        ),
       ),
     );
 
@@ -140,13 +163,7 @@ export async function readRunAttemptRows(
   const rows = await db
     .select()
     .from(schema.runAttempts)
-    .where(
-      and(
-        eq(schema.runAttempts.projectId, projectId),
-        gte(schema.runAttempts.endedAt, w.gte),
-        lte(schema.runAttempts.endedAt, w.lte),
-      ),
-    );
+    .where(and(eq(schema.runAttempts.projectId, projectId), columnInWindow(w, schema.runAttempts.endedAt)));
   if (rows.length === 0) return [];
 
   const runIds = [...new Set(rows.map((r) => r.runId))];
@@ -179,8 +196,10 @@ export async function readEscalationRows(
     .where(
       and(
         eq(schema.escalations.projectId, projectId),
-        gte(schema.escalations.raisedAt, w.gte),
-        lte(schema.escalations.raisedAt, w.lte),
+        or(
+          columnInWindow(w, schema.escalations.raisedAt),
+          columnInWindow(w, schema.escalations.updatedAt),
+        ),
       ),
     );
   return rows.map((r) => ({
@@ -203,13 +222,7 @@ export async function readPickerStartRows(
   const rows = await db
     .select()
     .from(schema.pickerStarts)
-    .where(
-      and(
-        eq(schema.pickerStarts.projectId, projectId),
-        gte(schema.pickerStarts.startedAt, w.gte),
-        lte(schema.pickerStarts.startedAt, w.lte),
-      ),
-    );
+    .where(and(eq(schema.pickerStarts.projectId, projectId), columnInWindow(w, schema.pickerStarts.startedAt)));
   return rows.map((r) => ({
     source: "picker_start",
     id: r.id,
@@ -230,11 +243,7 @@ export async function readPickerVerdictRows(
     .select()
     .from(schema.pickerVerdicts)
     .where(
-      and(
-        eq(schema.pickerVerdicts.projectId, projectId),
-        gte(schema.pickerVerdicts.decidedAt, w.gte),
-        lte(schema.pickerVerdicts.decidedAt, w.lte),
-      ),
+      and(eq(schema.pickerVerdicts.projectId, projectId), columnInWindow(w, schema.pickerVerdicts.decidedAt)),
     );
   return rows.map((r) => ({
     source: "picker_verdict",
@@ -257,11 +266,7 @@ export async function readAutopilotDisarmRows(
     .select()
     .from(schema.autopilotDisarms)
     .where(
-      and(
-        eq(schema.autopilotDisarms.projectId, projectId),
-        gte(schema.autopilotDisarms.disarmedAt, w.gte),
-        lte(schema.autopilotDisarms.disarmedAt, w.lte),
-      ),
+      and(eq(schema.autopilotDisarms.projectId, projectId), columnInWindow(w, schema.autopilotDisarms.disarmedAt)),
     );
   return rows.map((r) => ({
     source: "autopilot_disarm",
@@ -282,11 +287,7 @@ export async function readScanSummaryRows(
     .select()
     .from(schema.scanSummaries)
     .where(
-      and(
-        eq(schema.scanSummaries.projectId, projectId),
-        gte(schema.scanSummaries.generatedAt, w.gte),
-        lte(schema.scanSummaries.generatedAt, w.lte),
-      ),
+      and(eq(schema.scanSummaries.projectId, projectId), columnInWindow(w, schema.scanSummaries.generatedAt)),
     );
   return rows.map((r) => ({
     source: "scan_summary",
@@ -365,6 +366,24 @@ export function readProposalRows(
 }
 
 /**
+ * Has `bead`'s CURRENT pr ref actually merged? Mere presence of `getPrRef(bead)` is not enough — a
+ * PR closed without merging leaves the ref in place too (gate-targets.ts's `mergedOnPr`, whose
+ * header spells out the measured bd behaviour this mirrors: a `gh:pr` gate closes on MERGE and on
+ * nothing else, 1.1.0/1.1.2). So the proof has to be the gate, not the pointer: a `blocks` edge to a
+ * CLOSED `gh:pr` gate whose `await_id` names this bead's own PR number — a bead closed manually with
+ * an open or superseded merge-wait gate reports no `pr.merged` event here, same as gate-targets.ts
+ * would refuse to finalize it.
+ */
+function prActuallyMerged(bead: Bead, byId: ReadonlyMap<string, Bead>): boolean {
+  const prNumber = prNumberFromRef(beads.getPrRef(bead));
+  if (prNumber === undefined) return false;
+  return (bead.dependencies ?? []).some((d) => {
+    const gate = d.type === "blocks" ? byId.get(d.depends_on_id) : undefined;
+    return gate?.status === "closed" && beads.isMergeWaitGate(gate) && gate.await_id === String(prNumber);
+  });
+}
+
+/**
  * Beads closed in this window, and — among them — the ones that shipped behind a PR, off the
  * caller's own board snapshot. One pass, since both facts come off the same `closed_at` test.
  *
@@ -380,6 +399,7 @@ export function readBeadBoardRows(
 ): { closed: BeadClosedRow[]; merged: PrMergedRow[] } {
   const closed: BeadClosedRow[] = [];
   const merged: PrMergedRow[] = [];
+  const byId = new Map(board.map((b) => [b.id, b] as const));
 
   for (const bead of board) {
     if (bead.status !== "closed") continue;
@@ -395,7 +415,7 @@ export function readBeadBoardRows(
       closedAt,
     });
 
-    if (beads.getPrRef(bead) !== undefined && !beads.isAbandoned(bead)) {
+    if (prActuallyMerged(bead, byId)) {
       merged.push({
         source: "pr_merged",
         id: bead.id,

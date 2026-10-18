@@ -355,18 +355,39 @@ describe("readProposalRows — off the caller's bd snapshot, no bd spawn", () =>
 });
 
 describe("readBeadBoardRows — off the caller's bd snapshot, no bd spawn", () => {
-  it("reports a closed ticket as bead_closed, and additionally as pr_merged when it shipped behind a PR", () => {
+  const blockedBy = (id: string, gateId: string) => ({
+    issue_id: id,
+    depends_on_id: gateId,
+    type: "blocks" as const,
+  });
+
+  /** A closed `gh:pr` merge-wait gate on PR #<prNumber> — the only proof a bead's PR merged. */
+  const mergeGate = (id: string, prNumber: number): Bead => ({
+    id,
+    title: `Gate: ${id}`,
+    status: "closed",
+    issue_type: "gate",
+    await_type: "gh:pr",
+    await_id: String(prNumber),
+  });
+
+  it("reports a closed ticket as bead_closed, and additionally as pr_merged when its merge-wait gate confirms the merge", () => {
     const shipped = bead("anton-t1", {
       status: "closed",
       closed_at: new Date(1_200 * 1000).toISOString(),
-      metadata: { pr: "gh-org/repo#1" },
+      metadata: { pr: "gh-1" },
+      dependencies: [blockedBy("anton-t1", "gate-1")],
     });
     const closedNoPr = bead("anton-t2", {
       status: "closed",
       closed_at: new Date(1_300 * 1000).toISOString(),
     });
 
-    const { closed, merged } = readBeadBoardRows([shipped, closedNoPr], PROJECT, WINDOW);
+    const { closed, merged } = readBeadBoardRows(
+      [shipped, mergeGate("gate-1", 1), closedNoPr],
+      PROJECT,
+      WINDOW,
+    );
 
     expect(closed).toEqual([
       { source: "bead_closed", id: "anton-t1", projectId: PROJECT, ticketBeadId: "anton-t1", closedAt: 1_200 },
@@ -375,6 +396,33 @@ describe("readBeadBoardRows — off the caller's bd snapshot, no bd spawn", () =
     expect(merged).toEqual([
       { source: "pr_merged", id: "anton-t1", projectId: PROJECT, ticketBeadId: "anton-t1", mergedAt: 1_200 },
     ]);
+  });
+
+  it("reports no pr_merged when the bead carries a PR ref but its merge-wait gate is still open", () => {
+    const closedUnmerged = bead("anton-t1", {
+      status: "closed",
+      closed_at: new Date(1_200 * 1000).toISOString(),
+      metadata: { pr: "gh-1" },
+      dependencies: [blockedBy("anton-t1", "gate-1")],
+    });
+    const openGate: Bead = { ...mergeGate("gate-1", 1), status: "open" };
+
+    const { merged } = readBeadBoardRows([closedUnmerged, openGate], PROJECT, WINDOW);
+
+    expect(merged).toEqual([]);
+  });
+
+  it("reports no pr_merged when the closed merge-wait gate names a different, superseded PR", () => {
+    const resent = bead("anton-t1", {
+      status: "closed",
+      closed_at: new Date(1_200 * 1000).toISOString(),
+      metadata: { pr: "gh-2" },
+      dependencies: [blockedBy("anton-t1", "gate-1")],
+    });
+
+    const { merged } = readBeadBoardRows([resent, mergeGate("gate-1", 1)], PROJECT, WINDOW);
+
+    expect(merged).toEqual([]);
   });
 
   it("excludes proposals, pipeline artifacts, and anything outside the window", () => {

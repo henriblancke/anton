@@ -15,9 +15,15 @@ import * as schema from "@/lib/db/schema";
 
 let tdb: TestDb;
 let board: Bead[] = [];
+let boardError: Error | null = null;
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
-vi.mock("@/lib/beads/issues", () => ({ allIssues: async () => board }));
+vi.mock("@/lib/beads/issues", () => ({
+  allIssues: async () => {
+    if (boardError) throw boardError;
+    return board;
+  },
+}));
 
 const { GET } = await import("./route");
 
@@ -33,6 +39,7 @@ async function mark(seenAt: number): Promise<void> {
 beforeEach(async () => {
   tdb = makeTestDb();
   board = [];
+  boardError = null;
   await tdb.db
     .insert(schema.projects)
     .values({ id: "p1", slug: "tmp", name: "tmp", repoPath: "/tmp/p1" });
@@ -110,5 +117,100 @@ describe("GET /timeline/events-since", () => {
         expect.objectContaining({ kind: "bead.closed", sourceRefs: ["anton-done"] }),
       ]),
     );
+  });
+
+  // PR #346 review, P1 (chatgpt-codex-connector): a run started before the window must still
+  // surface its PR as opened if that happened inside it — the single-column `startedAt` seek used
+  // to drop the whole row, silently losing the transition.
+  it("reports run.pr_opened for a run started before the window whose PR opened inside it", async () => {
+    await mark(1_000);
+    await tdb.db.insert(schema.runs).values({
+      id: "run-old",
+      projectId: "p1",
+      epicBeadId: "anton-epic",
+      ticketBeadId: "anton-t1",
+      status: "in_review",
+      startedAt: new Date(500 * 1000),
+      updatedAt: new Date(1_500 * 1000),
+    });
+    board = [{ id: "anton-t1", title: "t1", status: "open", issue_type: "task", metadata: { pr: "gh-9" } } as Bead];
+
+    const body = await (await GET(get(), ctx("tmp"))).json();
+
+    expect(body.events).toEqual([
+      expect.objectContaining({ kind: "run.pr_opened", at: 1_500, sourceRefs: ["run-old"] }),
+    ]);
+  });
+
+  // Same defect, the escalation half: raised before the window, resolved inside it.
+  it("reports escalation.resolved for an escalation raised before the window but resolved inside it", async () => {
+    await mark(1_000);
+    await tdb.db.insert(schema.escalations).values({
+      id: "esc-old",
+      projectId: "p1",
+      findingKey: "k1",
+      kind: "parked-run",
+      reason: "stuck",
+      raisedAt: new Date(500 * 1000),
+      updatedAt: new Date(1_500 * 1000),
+      status: "resolved",
+      resolution: "resumed",
+    });
+
+    const body = await (await GET(get(), ctx("tmp"))).json();
+
+    expect(body.events).toEqual([
+      expect.objectContaining({ kind: "escalation.resolved", at: 1_500, sourceRefs: ["esc-old"] }),
+    ]);
+  });
+
+  // PR #346 review, P2 (chatgpt-codex-connector): the lower bound is inclusive and the upper bound
+  // exclusive specifically so that posting one read's `until` as the next read's `since` neither
+  // drops nor replays an event timestamped exactly at that boundary second.
+  it("never replays an event timestamped exactly at a prior read's until", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(10_000 * 1000);
+      board = [
+        {
+          id: "anton-done",
+          title: "Ship it",
+          status: "closed",
+          issue_type: "task",
+          closed_at: new Date(10_000 * 1000).toISOString(),
+        } as Bead,
+      ];
+
+      const first = await (await GET(get(), ctx("tmp"))).json();
+      expect(first.until).toBe(10_000);
+      // Excluded: the row's own `at` is exactly this read's (exclusive) upper bound.
+      expect(first.events).toEqual([]);
+
+      await tdb.db
+        .insert(schema.viewerMarks)
+        .values({ viewerId: "default", projectId: "p1", seenAt: new Date(first.until * 1000) });
+      vi.setSystemTime(10_001 * 1000);
+
+      const second = await (await GET(get(), ctx("tmp"))).json();
+      expect(second.since).toBe(10_000);
+      // Included exactly once: the next read's (inclusive) lower bound picks it up.
+      expect(second.events).toEqual([expect.objectContaining({ kind: "bead.closed" })]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // PR #346 review, P1 (chatgpt-codex-connector): a response that silently omitted every bd-derived
+  // event category (proposals, bead closes, PR merges) would still hand out a postable `until`,
+  // letting a client bury those events behind the watermark forever.
+  it("fails the request rather than handing out a cursor over a board it could not read", async () => {
+    boardError = new Error("bd: exit status 1");
+
+    const res = await GET(get(), ctx("tmp"));
+
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.until).toBeUndefined();
+    expect(body.since).toBeUndefined();
   });
 });
