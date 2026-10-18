@@ -18,12 +18,11 @@ let board: Bead[] = [];
 let boardError: Error | null = null;
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
-vi.mock("@/lib/beads/issues", () => ({
-  refreshAllIssues: async () => {
-    if (boardError) throw boardError;
-    return board;
-  },
-}));
+const refreshAllIssues = vi.fn(async () => {
+  if (boardError) throw boardError;
+  return board;
+});
+vi.mock("@/lib/beads/issues", () => ({ refreshAllIssues }));
 
 const { GET } = await import("./route");
 
@@ -40,6 +39,7 @@ beforeEach(async () => {
   tdb = makeTestDb();
   board = [];
   boardError = null;
+  refreshAllIssues.mockClear();
   await tdb.db
     .insert(schema.projects)
     .values({ id: "p1", slug: "tmp", name: "tmp", repoPath: "/tmp/p1" });
@@ -55,6 +55,18 @@ describe("GET /timeline/events-since", () => {
     expect(body.mark).toBeNull();
     expect(body.viewerId).toBe("default");
     expect(body.until).toEqual(expect.any(Number));
+  });
+
+  // requireFreshRead is the fix for the single-flight race (PR #346 review, round 2): without it,
+  // this call could join an in-flight refresh started before `until` was minted above and omit a
+  // closure that landed in between, stranding it below the cursor this response hands out.
+  it("forces a fresh, non-joined board read so the response reflects everything up to its own cursor", async () => {
+    await GET(get(), ctx("tmp"));
+
+    expect(refreshAllIssues).toHaveBeenCalledWith("/tmp/p1", {
+      strictGates: true,
+      requireFreshRead: true,
+    });
   });
 
   it("starts the window at the stored mark", async () => {

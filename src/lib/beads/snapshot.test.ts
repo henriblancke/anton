@@ -11,6 +11,7 @@ import {
   onBoardChanged,
   readIssueSnapshot,
   refreshIssueSnapshot,
+  refreshIssueSnapshotReadFresh,
   resetIssueSnapshots,
 } from "./snapshot";
 
@@ -331,6 +332,35 @@ describe("issue snapshots", () => {
         ISSUE_SNAPSHOT_MAX_AGE_MS,
       ),
     ).resolves.toEqual([bead("post-write")]);
+  });
+
+  it("refreshIssueSnapshotReadFresh waits out an in-flight refresh instead of joining it", async () => {
+    let resolveInFlight!: (value: Bead[]) => void;
+    const inFlightLoader = vi.fn(
+      () => new Promise<Bead[]>((resolve) => (resolveInFlight = resolve)),
+    );
+    // Started BEFORE the cursor below would be minted — e.g. an unrelated poll.
+    const inFlight = refreshIssueSnapshot("/repo", inFlightLoader);
+
+    const freshLoader = vi.fn(async () => [bead("after-cursor")]);
+    const fresh = refreshIssueSnapshotReadFresh("/repo", freshLoader);
+
+    // The fresh call must not have started its own loader while the in-flight one is still running.
+    expect(freshLoader).not.toHaveBeenCalled();
+
+    resolveInFlight([bead("before-cursor")]);
+    await inFlight;
+
+    await expect(fresh).resolves.toMatchObject({ beads: [bead("after-cursor")] });
+    expect(freshLoader).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshIssueSnapshotReadFresh starts its own loader immediately when nothing is in flight", async () => {
+    const loader = vi.fn(async () => [bead("solo")]);
+    await expect(refreshIssueSnapshotReadFresh("/repo", loader)).resolves.toMatchObject({
+      beads: [bead("solo")],
+    });
+    expect(loader).toHaveBeenCalledTimes(1);
   });
 });
 

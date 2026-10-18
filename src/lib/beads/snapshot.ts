@@ -330,6 +330,27 @@ export function refreshIssueSnapshotRead(
 }
 
 /**
+ * Like {@link refreshIssueSnapshotRead} but never joins an in-flight refresh that may have started
+ * before this call — it waits for one to finish, then always issues its own (PR #346 review,
+ * `events-since/route.ts:126`). A caller that mints a cursor and THEN reads the board to answer it
+ * needs every change that landed before the cursor; the plain single-flight join can instead hand
+ * back a read that began earlier, silently omitting anything that changed in the gap and then
+ * permanently stranding it once the caller marks that cursor seen. Waiting for the in-flight read
+ * first (rather than racing a second `bd list` alongside it) keeps this at most one extra spawn.
+ */
+export async function refreshIssueSnapshotReadFresh(
+  cwd: string,
+  loader: () => Promise<Bead[]>,
+  now = Date.now(),
+): Promise<SnapshotRead> {
+  const entry = entryFor(cwd);
+  if (entry.refresh) {
+    await entry.refresh.catch(() => {});
+  }
+  return refreshIssueSnapshotRead(cwd, loader, now);
+}
+
+/**
  * Overwrite the retained board with `hydrated`, guarded by `generation` (PR #274 review,
  * `issues.ts:294`). `refreshIssueSnapshot`'s single-flight loader is loader-blind: a concurrent
  * refresh that never asked for `strictGates` can win the race and latch a gate-less board onto this

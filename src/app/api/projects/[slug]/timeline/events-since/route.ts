@@ -112,6 +112,15 @@ export const GET = withProject<{ slug: string }>(async (request, { project }) =>
  * review, P1): a degraded gate listing would let `prActuallyMerged` read a merge-wait gate as
  * absent and silently suppress a `pr.merged` event behind that same irreversible cursor.
  *
+ * `requireFreshRead: true` for the same reason again (PR #346 review, round 2): `refreshAllIssues`
+ * is otherwise single-flight and loader-blind — if a refresh was already running when this request
+ * minted `until` above, a plain call here would join THAT read instead of starting its own. If the
+ * in-flight read had snapshotted the board before a bead closed but the closure landed before this
+ * request's `until`, the response would omit the closure while still handing out a cursor that
+ * permanently strands it once marked seen. `requireFreshRead` waits out any in-flight read first,
+ * then always starts a new one — guaranteeing this call's own board read began no earlier than the
+ * `until` minted above.
+ *
  * `readRunRows` and `readEscalationRows` widen their SQL seek with an OR against `updatedAt` (see
  * the module header on timeline-sources.ts), which can hand back a row whose OWN `startedAt`/
  * `raisedAt` sits outside `window` — fetched only because its lifecycle's other half landed inside
@@ -123,7 +132,10 @@ async function readTimelineEvents(
   project: Pick<Project, "id" | "repoPath">,
   window: TimelineWindow,
 ): Promise<TimelineEvent[]> {
-  const board = await refreshAllIssues(project.repoPath, { strictGates: true });
+  const board = await refreshAllIssues(project.repoPath, {
+    strictGates: true,
+    requireFreshRead: true,
+  });
 
   const [
     runRows,

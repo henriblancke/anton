@@ -18,6 +18,7 @@ import {
   probeIssueSnapshot,
   readIssueSnapshot,
   refreshIssueSnapshotRead,
+  refreshIssueSnapshotReadFresh,
   type SnapshotRead,
   type SnapshotReadOptions,
 } from "./snapshot";
@@ -185,6 +186,17 @@ export interface LoadIssuesOptions {
    * decides it wants graceful degradation should set this.
    */
   degradeCyclesOnFailure?: boolean;
+  /**
+   * Never join an in-flight refresh that may have started before this call — wait for it, then
+   * start a brand-new read (see {@link refreshIssueSnapshotReadFresh}).
+   *
+   * For a caller that mints a cursor and then reads the board to answer it (the events-since
+   * timeline, PR #346 review): a plain single-flight join can hand back a read that began before
+   * the cursor, omitting a change that landed in the gap and then permanently stranding it once the
+   * cursor is marked seen. Not the default — every other reader is fine sharing whatever read is
+   * already in flight.
+   */
+  requireFreshRead?: boolean;
 }
 
 /**
@@ -1339,7 +1351,9 @@ export async function refreshAllIssuesRead(
   // separate post-hoc read would land in. `hydrateIssueSnapshot`'s guard would then see that NEWER
   // generation match and accept `hydrated` (built from THIS stale `board`), overwriting the
   // already-current cache and hiding the concurrent change from `getBoard` and other warm readers.
-  const refreshed = await refreshIssueSnapshotRead(cwd, () => loadAllIssues(cwd, opts));
+  const refreshed = opts.requireFreshRead
+    ? await refreshIssueSnapshotReadFresh(cwd, () => loadAllIssues(cwd, opts))
+    : await refreshIssueSnapshotRead(cwd, () => loadAllIssues(cwd, opts));
   const board = refreshed.beads;
   // `let`, not `const`: the gate-hydration branch below re-stamps `boardGeneration` after pushing
   // newly-hydrated gate members onto `board` via `hydrateIssueSnapshot`, mirroring
