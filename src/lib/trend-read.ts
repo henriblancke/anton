@@ -10,17 +10,30 @@
  * and re-deriving it here would be a second, driftable copy of the same board + ledger walk.
  */
 import { and, asc, eq, gte, isNotNull } from "drizzle-orm";
+import type { ClaudeInvocationRow } from "./claude-invocations";
+import { listInvocations } from "./claude-invocations";
 import { cohortFeatures } from "./cohort-read";
 import { getDb, schema } from "./db";
+import { runsByCause } from "./failure-cause-read";
+import { ledgerPhase } from "./feature-ledger";
 import type { AntonDb } from "./jobs/queue";
+import { costOf } from "./model-pricing";
 import {
   qualityWeekPoints,
+  trendSeries as foldTrendSeries,
   windowStartMs,
+  type CostFeaturePoint,
   type DeliveredFeaturePoint,
+  type InvocationStampPoint,
+  type PhaseSpendPoint,
   type QualityInput,
   type QualityWeekPoint,
+  type ReviewLoopInvocationPoint,
   type ReviewRoundPoint,
+  type RunCausePoint,
   type ScoredRunPoint,
+  type TrendSeries,
+  type TrendSeriesInput,
 } from "./trend-series";
 
 /** One run's score, as the quality fold needs it — see {@link scoredRunPoints}. */
@@ -79,6 +92,7 @@ async function reviewRoundPoints(
   const rows = await db
     .select({
       recordedAt: schema.reviewRounds.recordedAt,
+      prNumber: schema.reviewRounds.prNumber,
       threadsActionable: schema.reviewRounds.threadsActionable,
       byAuthorJson: schema.reviewRounds.byAuthorJson,
     })
@@ -87,6 +101,7 @@ async function reviewRoundPoints(
 
   return rows.map((row) => ({
     atMs: row.recordedAt.getTime(),
+    prNumber: row.prNumber,
     threadsActionable: row.threadsActionable,
     byAuthor: parseByAuthor(row.byAuthorJson),
   }));
@@ -166,4 +181,147 @@ export function projectTrendQuality(
   opts?: { nowMs?: number },
 ): Promise<QualityWeekPoint[] | undefined> {
   return trendQuality(getDb(), projectId, weeks, opts);
+}
+
+/* ──────────────────  cost, phase spend, failures & review loop (anton-d6kw7 / anton-90875)  ───────────────── */
+
+/** The token fields `costOf` prices, minus `webSearchRequests` — not a token count, never summed in. */
+function totalTokens(
+  row: Pick<
+    ClaudeInvocationRow,
+    "inputTokens" | "outputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens"
+  >,
+): number {
+  return (
+    (row.inputTokens ?? 0) +
+    (row.outputTokens ?? 0) +
+    (row.cacheReadInputTokens ?? 0) +
+    (row.cacheCreationInputTokens ?? 0)
+  );
+}
+
+/**
+ * One project's `claude_invocations` rows in the window — shared by {@link phaseSpendPoints},
+ * {@link invocationStampPoints} and {@link reviewLoopInvocationPoints} below, each of which needs a
+ * different slice of the same rows. One query rather than three.
+ */
+function invocationWindowRows(db: AntonDb, projectId: string, since: Date): Promise<ClaudeInvocationRow[]> {
+  return listInvocations(db, projectId, { since });
+}
+
+/**
+ * Tokens and USD per invocation ROW, phase-classified by {@link ledgerPhase} — never grouped by
+ * invocation first, matching {@link PhaseWeekTotals.invocations}'s own "rows, never jobs" grain. A
+ * row `ledgerPhase` cannot classify (an unknown job type, a row from before `step_handler` existed)
+ * is dropped: an unattributed row has no phase to bucket it under, and `phaseSpendByWeek` carries no
+ * "unattributed" bucket to put it in.
+ */
+function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint[] {
+  const out: PhaseSpendPoint[] = [];
+  for (const row of rows) {
+    const phase = ledgerPhase(row);
+    if (phase === undefined) continue;
+    out.push({
+      atMs: row.recordedAt.getTime(),
+      phase,
+      tokens: totalTokens(row),
+      usd: costOf(row.modelReported, row, row.endpointHost),
+    });
+  }
+  return out;
+}
+
+/** The stamp columns {@link changeMarkers} reads off every invocation row in the window. */
+function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): InvocationStampPoint[] {
+  return rows.map((row) => ({
+    atMs: row.recordedAt.getTime(),
+    modelReported: row.modelReported,
+    promptDigest: row.promptDigest,
+    agentTag: row.agentTag,
+    skillId: row.skillId,
+    skillDigest: row.skillDigest,
+    antonVersion: row.antonVersion,
+  }));
+}
+
+/**
+ * The self-review/PR-fix invocations {@link reviewLoopByFeature} counts, classified the same way
+ * {@link phaseSpendPoints} classifies spend. A row with no `beadId` (a scheduled pass, never a
+ * feature) has nothing to bucket a loop count under and is dropped.
+ */
+function reviewLoopInvocationPoints(rows: readonly ClaudeInvocationRow[]): ReviewLoopInvocationPoint[] {
+  const out: ReviewLoopInvocationPoint[] = [];
+  for (const row of rows) {
+    if (row.beadId === null) continue;
+    const phase = ledgerPhase(row);
+    if (phase !== "self-review" && phase !== "pr-fix") continue;
+    out.push({ beadId: row.beadId, phase });
+  }
+  return out;
+}
+
+/** Failed/parked runs in the window, as {@link runsByCauseByWeek} needs them — see {@link runsByCause}. */
+async function runCausePoints(db: AntonDb, projectId: string, since: Date): Promise<RunCausePoint[]> {
+  const runs = await runsByCause(db, projectId, since);
+  return runs.map((run) => ({ settledAtMs: run.settledAt * 1000, cause: run.cause }));
+}
+
+/**
+ * The whole trend, one point per ISO week over the last `weeks` weeks — quality, cost, phase spend,
+ * change markers and failure causes, merged by {@link foldTrendSeries}. `undefined` only when
+ * `projectId` names no project `cohortFeatures` can resolve — the same contract {@link trendQuality}
+ * carries.
+ *
+ * `cohortFeatures` is read exactly once here, never twice the way calling both `trendQuality` and a
+ * separate cost read would: its rows back both the delivered-feature figures quality needs and the
+ * cost figures the cost fold needs, and it is expensive enough (one `bd` shell call per run target,
+ * bounded concurrency) that a second call over the same window would double real work for no new data.
+ */
+export async function trendSeries(
+  db: AntonDb,
+  projectId: string,
+  weeks: number,
+  opts: { nowMs?: number } = {},
+): Promise<TrendSeries | undefined> {
+  const nowMs = opts.nowMs ?? Date.now();
+  const since = new Date(windowStartMs(weeks, nowMs));
+
+  const [scoredRuns, reviewRounds, recordingStart, features, invocationRows, runCauses] = await Promise.all([
+    scoredRunPoints(db, projectId, since),
+    reviewRoundPoints(db, projectId, since),
+    recordingStartedAtMs(db, projectId),
+    cohortFeatures(db, projectId, { since }),
+    invocationWindowRows(db, projectId, since),
+    runCausePoints(db, projectId, since),
+  ]);
+  if (features === undefined) return undefined;
+
+  const deliveredFeatures: DeliveredFeaturePoint[] = features
+    .filter((f) => f.delivered && f.deliveredAtMs !== undefined)
+    .map((f) => ({ deliveredAtMs: f.deliveredAtMs as number, humanTouches: f.humanTouches }));
+  const costFeatures: CostFeaturePoint[] = features.map((f) => ({
+    delivered: f.delivered,
+    deliveredAtMs: f.deliveredAtMs,
+    activityAtMs: f.activityAtMs,
+    usd: f.usd,
+  }));
+
+  const input: TrendSeriesInput = {
+    quality: { scoredRuns, reviewRounds, deliveredFeatures, recordingStartedAtMs: recordingStart },
+    costFeatures,
+    phaseSpend: phaseSpendPoints(invocationRows),
+    runCauses,
+    invocationStamps: invocationStampPoints(invocationRows),
+    reviewLoopInvocations: reviewLoopInvocationPoints(invocationRows),
+  };
+  return foldTrendSeries(input, weeks, { nowMs });
+}
+
+/** UI/read path over the shared anton.db — see {@link trendSeries}. */
+export function projectTrendSeries(
+  projectId: string,
+  weeks: number,
+  opts?: { nowMs?: number },
+): Promise<TrendSeries | undefined> {
+  return trendSeries(getDb(), projectId, weeks, opts);
 }

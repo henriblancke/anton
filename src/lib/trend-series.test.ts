@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { MIN_COHORT } from "./prompt-series";
 import {
   changeMarkers,
   costByWeek,
@@ -15,6 +16,7 @@ import {
   scoreDistributionByWeek,
   skillChangeMarkers,
   threadsByWeek,
+  trendSeries,
   weekKeysBack,
   windowStartMs,
   zeroTouchByWeek,
@@ -26,6 +28,7 @@ import {
   type ReviewRoundPoint,
   type RunCausePoint,
   type ScoredRunPoint,
+  type TrendSeriesInput,
 } from "./trend-series";
 
 const DAY = 86_400_000;
@@ -114,24 +117,45 @@ describe("scoreDistributionByWeek", () => {
 });
 
 describe("threadsByWeek", () => {
-  const round = (atMs: number, threadsActionable: number, byAuthor: Record<string, number>): ReviewRoundPoint => ({
+  const round = (
+    atMs: number,
+    threadsActionable: number,
+    byAuthor: Record<string, number>,
+    prNumber = 1,
+  ): ReviewRoundPoint => ({
     atMs,
+    prNumber,
     threadsActionable,
     byAuthor,
   });
 
-  it("totals threads and splits them per reviewer, from the review-round record", () => {
+  it("totals threads and splits them per reviewer and per PR, from the review-round record", () => {
     const rounds = [
-      round(WEEK_1_MONDAY, 3, { alice: 2, bob: 1 }),
-      round(WEEK_1_MONDAY + DAY, 1, { alice: 1 }),
+      round(WEEK_1_MONDAY, 3, { alice: 2, bob: 1 }, 10),
+      round(WEEK_1_MONDAY + DAY, 1, { alice: 1 }, 10),
     ];
     const byWeek = threadsByWeek(rounds, [WEEK_1], WEEK_1_MONDAY);
-    expect(byWeek.get(WEEK_1)).toEqual({ total: 4, byReviewer: { alice: 3, bob: 1 } });
+    expect(byWeek.get(WEEK_1)).toEqual({ total: 4, byReviewer: { alice: 3, bob: 1 }, byPr: { 10: 4 } });
+  });
+
+  it("tells apart a week concentrated on one PR from one spread across several, same total", () => {
+    // Same total (4) and same reviewer split either way — only `byPr` shows the difference a reader
+    // would otherwise have no way to see: one problematic PR vs. ordinary review spread evenly.
+    const concentrated = [round(WEEK_1_MONDAY, 3, { alice: 3 }, 10), round(WEEK_1_MONDAY + DAY, 1, { alice: 1 }, 10)];
+    const spread = [round(WEEK_1_MONDAY, 3, { alice: 3 }, 10), round(WEEK_1_MONDAY + DAY, 1, { alice: 1 }, 20)];
+
+    const concentratedWeek = threadsByWeek(concentrated, [WEEK_1], WEEK_1_MONDAY).get(WEEK_1);
+    const spreadWeek = threadsByWeek(spread, [WEEK_1], WEEK_1_MONDAY).get(WEEK_1);
+
+    expect(concentratedWeek?.total).toBe(4);
+    expect(spreadWeek?.total).toBe(4);
+    expect(concentratedWeek?.byPr).toEqual({ 10: 4 });
+    expect(spreadWeek?.byPr).toEqual({ 10: 3, 20: 1 });
   });
 
   it("reports a real zero for a week after recording started that simply saw no rounds", () => {
     const byWeek = threadsByWeek([], [WEEK_1, WEEK_2], WEEK_1_MONDAY);
-    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {} });
+    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {}, byPr: {} });
   });
 
   it("reports a week predating the review-round record as absent, not zero", () => {
@@ -139,7 +163,7 @@ describe("threadsByWeek", () => {
     const byWeek = threadsByWeek([], [WEEK_1, WEEK_2], WEEK_1_MONDAY + 7 * DAY);
     expect(byWeek.has(WEEK_1)).toBe(false);
     expect(byWeek.has(WEEK_2)).toBe(true);
-    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {} });
+    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {}, byPr: {} });
   });
 
   it("reports every requested week as absent when the project has no review-round record at all", () => {
@@ -178,7 +202,9 @@ describe("qualityWeekPoints", () => {
     const points = qualityWeekPoints(
       {
         scoredRuns: [{ atMs: WEEK_1_MONDAY, score: 10 }],
-        reviewRounds: [{ atMs: WEEK_1_MONDAY + 7 * DAY, threadsActionable: 2, byAuthor: { alice: 2 } }],
+        reviewRounds: [
+          { atMs: WEEK_1_MONDAY + 7 * DAY, prNumber: 7, threadsActionable: 2, byAuthor: { alice: 2 } },
+        ],
         deliveredFeatures: [{ deliveredAtMs: WEEK_1_MONDAY, humanTouches: 0 }],
         recordingStartedAtMs: WEEK_1_MONDAY + 7 * DAY, // recording starts in WEEK_2
       },
@@ -197,7 +223,7 @@ describe("qualityWeekPoints", () => {
     expect(week2.week).toBe(WEEK_2);
     expect(week2.scoreDistribution).toBeUndefined();
     expect(week2.zeroTouch).toBeUndefined();
-    expect(week2.threads).toEqual({ total: 2, byReviewer: { alice: 2 } });
+    expect(week2.threads).toEqual({ total: 2, byReviewer: { alice: 2 }, byPr: { 7: 2 } });
   });
 });
 
@@ -501,5 +527,90 @@ describe("reviewLoopByFeature", () => {
     const invocations = [invocation("f1", "self-review"), invocation("f2", "self-review")];
     const points = reviewLoopByFeature(invocations);
     expect(points.every((p) => !p.runaway)).toBe(true);
+  });
+});
+
+describe("trendSeries", () => {
+  const emptyInput = (): TrendSeriesInput => ({
+    quality: { scoredRuns: [], reviewRounds: [], deliveredFeatures: [], recordingStartedAtMs: undefined },
+    costFeatures: [],
+    phaseSpend: [],
+    runCauses: [],
+    invocationStamps: [],
+    reviewLoopInvocations: [],
+  });
+  const deliveries = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({ deliveredAtMs: WEEK_1_MONDAY + i * 60_000 }));
+
+  it("merges quality, cost, phase spend and run-cause folds into one point per week", () => {
+    const input: TrendSeriesInput = {
+      ...emptyInput(),
+      quality: {
+        scoredRuns: [{ atMs: WEEK_1_MONDAY, score: 10 }],
+        reviewRounds: [],
+        deliveredFeatures: deliveries(MIN_COHORT),
+        recordingStartedAtMs: undefined,
+      },
+      costFeatures: [{ delivered: true, deliveredAtMs: WEEK_1_MONDAY, usd: 10 }],
+      phaseSpend: [{ atMs: WEEK_1_MONDAY, phase: "implement", tokens: 100, usd: 1 }],
+      runCauses: [{ settledAtMs: WEEK_1_MONDAY, cause: "quota" }],
+    };
+
+    const series = trendSeries(input, 2, { nowMs: WEEK_1_MONDAY + 7 * DAY + 2 * DAY });
+    expect(series.weeks).toHaveLength(2);
+    const [week1, week2] = series.weeks;
+
+    expect(week1.week).toBe(WEEK_1);
+    expect(week1.scoreDistribution?.n).toBe(1);
+    expect(week1.cost).toEqual({ delivered: 1, usd: 10, usdPerFeature: 10 });
+    expect(week1.phaseSpend).toEqual({ implement: { invocations: 1, tokens: 100, usd: 1, unpricedRows: 0 } });
+    expect(week1.runCauses).toEqual({ total: 1, byCause: { quota: 1 } });
+    // MIN_COHORT deliveries clears the floor — not underpowered.
+    expect(week1.underpowered).toBe(false);
+
+    expect(week2.week).toBe(WEEK_2);
+    expect(week2.cost).toBeUndefined();
+    expect(week2.phaseSpend).toBeUndefined();
+    // runCauses is a real zero, never absent — runsByCauseByWeek's own rule, preserved through the merge.
+    expect(week2.runCauses).toEqual({ total: 0, byCause: {} });
+    // Zero deliveries is the clearest underpowered week there is.
+    expect(week2.underpowered).toBe(true);
+  });
+
+  it("flags a week with fewer delivered features than MIN_COHORT as underpowered", () => {
+    const input: TrendSeriesInput = {
+      ...emptyInput(),
+      quality: { ...emptyInput().quality, deliveredFeatures: deliveries(MIN_COHORT - 1) },
+    };
+    const series = trendSeries(input, 1, { nowMs: WEEK_1_MONDAY });
+    expect(series.weeks[0].underpowered).toBe(true);
+  });
+
+  it("does not flag a week that clears MIN_COHORT delivered features", () => {
+    const input: TrendSeriesInput = {
+      ...emptyInput(),
+      quality: { ...emptyInput().quality, deliveredFeatures: deliveries(MIN_COHORT) },
+    };
+    const series = trendSeries(input, 1, { nowMs: WEEK_1_MONDAY });
+    expect(series.weeks[0].underpowered).toBe(false);
+  });
+
+  it("carries change markers and review-loop figures alongside the weeks, not nested inside them", () => {
+    const input: TrendSeriesInput = {
+      ...emptyInput(),
+      invocationStamps: [
+        { atMs: WEEK_1_MONDAY, modelReported: "sonnet-4-5" },
+        { atMs: WEEK_1_MONDAY + 7 * DAY, modelReported: "sonnet-5" },
+      ],
+      reviewLoopInvocations: [{ beadId: "f1", phase: "self-review" }],
+    };
+    const series = trendSeries(input, 2, { nowMs: WEEK_1_MONDAY + 7 * DAY + 2 * DAY });
+
+    expect(series.changeMarkers).toEqual([{ kind: "model", week: WEEK_2, before: "sonnet-4-5", after: "sonnet-5" }]);
+    expect(series.reviewLoop).toEqual([
+      { beadId: "f1", selfReviewInvocations: 1, prFixInvocations: 0, loopInvocations: 1, runaway: false },
+    ]);
+    expect(series.weeks[0]).not.toHaveProperty("changeMarkers");
+    expect(series.weeks[0]).not.toHaveProperty("reviewLoop");
   });
 });

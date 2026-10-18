@@ -25,6 +25,7 @@
  *
  * Pure and dependency-free, like `prompt-series.ts`: no db, no node builtins.
  */
+import { MIN_COHORT } from "./prompt-series";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -142,18 +143,26 @@ export function scoreDistributionByWeek(
 export interface ReviewRoundPoint {
   /** When the round was recorded, epoch ms. */
   atMs: number;
+  /** The PR this round belongs to (`review_rounds.pr_number`) — what `byPr` sums over. */
+  prNumber: number;
   /** Threads claude was actually handed this round (`review_rounds.threads_actionable`). */
   threadsActionable: number;
   /** The same threads, by the reviewer login who opened them (`review_rounds.by_author_json`). */
   byAuthor: Readonly<Record<string, number>>;
 }
 
-/** One week's reviewer-thread load — total, and split by who raised them. */
+/** One week's reviewer-thread load — total, and split two ways: by who raised them, and by which PR. */
 export interface ThreadsPoint {
   /** Actionable threads recorded this week, summed across every PR's rounds. */
   total: number;
   /** The same total, by reviewer login. */
   byReviewer: Record<string, number>;
+  /**
+   * The same total, by PR number — a distinct dimension from `byReviewer`: a week whose threads all
+   * landed on one PR reads differently than the same total spread evenly across several, a
+   * difference `byReviewer` alone cannot show.
+   */
+  byPr: Record<number, number>;
 }
 
 /**
@@ -173,23 +182,29 @@ export function threadsByWeek(
   const recordingStartWeek =
     recordingStartedAtMs === undefined ? undefined : isoWeekKey(recordingStartedAtMs);
 
-  const buckets = new Map<string, { total: number; byReviewer: Record<string, number> }>();
+  const buckets = new Map<
+    string,
+    { total: number; byReviewer: Record<string, number>; byPr: Record<number, number> }
+  >();
   for (const key of weekKeys) {
     if (recordingStartWeek === undefined || key < recordingStartWeek) continue;
-    buckets.set(key, { total: 0, byReviewer: Object.create(null) });
+    buckets.set(key, { total: 0, byReviewer: Object.create(null), byPr: Object.create(null) });
   }
 
   for (const round of rounds) {
     const bucket = buckets.get(isoWeekKey(round.atMs));
     if (!bucket) continue;
     bucket.total += round.threadsActionable;
+    bucket.byPr[round.prNumber] = (bucket.byPr[round.prNumber] ?? 0) + round.threadsActionable;
     for (const [author, n] of Object.entries(round.byAuthor)) {
       bucket.byReviewer[author] = (bucket.byReviewer[author] ?? 0) + n;
     }
   }
 
   const out = new Map<string, ThreadsPoint>();
-  for (const [key, bucket] of buckets) out.set(key, { total: bucket.total, byReviewer: bucket.byReviewer });
+  for (const [key, bucket] of buckets) {
+    out.set(key, { total: bucket.total, byReviewer: bucket.byReviewer, byPr: bucket.byPr });
+  }
   return out;
 }
 
@@ -757,4 +772,114 @@ export function reviewLoopByFeature(
       runaway: med !== undefined && loopInvocations > RUNAWAY_MEDIAN_MULTIPLE * med,
     };
   });
+}
+
+/* ──────────────────────  trendSeries: the whole trend, one series (anton-p38kx)  ───────────────────── */
+
+/**
+ * Everything {@link trendSeries} folds, already resolved by `trend-read.ts` — one slice per fold
+ * above. Nothing here does its own db work.
+ */
+export interface TrendSeriesInput {
+  quality: QualityInput;
+  costFeatures: readonly CostFeaturePoint[];
+  phaseSpend: readonly PhaseSpendPoint[];
+  runCauses: readonly RunCausePoint[];
+  invocationStamps: readonly InvocationStampPoint[];
+  reviewLoopInvocations: readonly ReviewLoopInvocationPoint[];
+}
+
+/** One ISO week's whole trend — quality, cost, phase spend and failure causes, independently present or absent. */
+export interface TrendWeekPoint {
+  week: string;
+  scoreDistribution?: ScoreDistribution;
+  threads?: ThreadsPoint;
+  zeroTouch?: ZeroTouchPoint;
+  cost?: CostWeekPoint;
+  phaseSpend?: Record<string, PhaseWeekTotals>;
+  /** Failed/parked runs this week — always present; see {@link runsByCauseByWeek}. */
+  runCauses: CauseWeekPoint;
+  /**
+   * Whether this week delivered fewer features than {@link MIN_COHORT} — too few to read the
+   * figures above as a trend rather than noise. Always present, never optional: unlike the figures
+   * above, underpowered is a verdict about the week itself, and a week with ZERO deliveries is the
+   * clearest case of it, not a gap to leave out.
+   */
+  underpowered: boolean;
+}
+
+/**
+ * The whole trend: one point per ISO week, plus the change events and per-feature review-loop
+ * figures that do not themselves bucket to a single week — see {@link changeMarkers} and
+ * {@link reviewLoopByFeature}.
+ */
+export interface TrendSeries {
+  weeks: TrendWeekPoint[];
+  changeMarkers: ChangeMarker[];
+  reviewLoop: ReviewLoopPoint[];
+}
+
+/** Delivered features per ISO week — the denominator {@link trendSeries} checks against {@link MIN_COHORT}. */
+function deliveredCountByWeek(
+  features: readonly DeliveredFeaturePoint[],
+  weekKeys: readonly string[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const key of weekKeys) counts.set(key, 0);
+  for (const feature of features) {
+    const key = isoWeekKey(feature.deliveredAtMs);
+    const current = counts.get(key);
+    if (current !== undefined) counts.set(key, current + 1);
+  }
+  return counts;
+}
+
+/**
+ * The whole trend, one point per ISO week over the last `weeks` weeks ending at `opts.nowMs`
+ * (defaults to now): quality (anton-6b835), cost/phase-spend/review-loop (anton-d6kw7) and change
+ * markers (anton-90875), merged into a single week-keyed series. `trend-read.ts` calls this once it
+ * has resolved {@link TrendSeriesInput}.
+ *
+ * `changeMarkers` and `reviewLoop` ride alongside `weeks` rather than nested inside each week's
+ * point: a change event and a feature's review loop are not themselves scalar to one ISO week (a
+ * marker already carries its own `week`; a feature's loop spans its whole life), so folding them
+ * into the per-week point would force a join neither source fold makes.
+ *
+ * `underpowered` reuses {@link MIN_COHORT} from `prompt-series.ts` rather than a second floor under
+ * a different name: "too few delivered features to read as a trend" is the same question whether
+ * it's asked of an attribution cohort or a calendar week.
+ */
+export function trendSeries(
+  input: TrendSeriesInput,
+  weeks: number,
+  opts: { nowMs?: number } = {},
+): TrendSeries {
+  const nowMs = opts.nowMs ?? Date.now();
+  const weekKeys = weekKeysBack(weeks, nowMs);
+
+  const quality = qualityWeekPoints(input.quality, weeks, { nowMs });
+  const cost = costByWeek(input.costFeatures, weekKeys);
+  const phaseSpendByWeekMap = phaseSpendByWeek(input.phaseSpend, weekKeys);
+  const runCausesByWeek = runsByCauseByWeek(input.runCauses, weekKeys);
+  const delivered = deliveredCountByWeek(input.quality.deliveredFeatures, weekKeys);
+
+  const weekPoints: TrendWeekPoint[] = weekKeys.map((week, i) => {
+    const q = quality[i];
+    return {
+      week,
+      ...(q.scoreDistribution ? { scoreDistribution: q.scoreDistribution } : {}),
+      ...(q.threads ? { threads: q.threads } : {}),
+      ...(q.zeroTouch ? { zeroTouch: q.zeroTouch } : {}),
+      ...(cost.has(week) ? { cost: cost.get(week) } : {}),
+      ...(phaseSpendByWeekMap.has(week) ? { phaseSpend: phaseSpendByWeekMap.get(week) } : {}),
+      runCauses: runCausesByWeek.get(week) ?? { total: 0, byCause: {} },
+      underpowered: (delivered.get(week) ?? 0) < MIN_COHORT,
+    };
+  });
+
+  return {
+    weeks: weekPoints,
+    changeMarkers: changeMarkers(input.invocationStamps, weeks, { nowMs }),
+    reviewLoop: reviewLoopByFeature(input.reviewLoopInvocations),
+  };
 }
