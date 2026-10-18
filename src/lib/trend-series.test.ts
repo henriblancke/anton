@@ -1,14 +1,20 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  changeMarkers,
   isoWeekKey,
+  modelChangeMarkers,
+  promptChangeMarkers,
   qualityWeekPoints,
+  releaseChangeMarkers,
   scoreDistributionByWeek,
+  skillChangeMarkers,
   threadsByWeek,
   weekKeysBack,
   windowStartMs,
   zeroTouchByWeek,
   type DeliveredFeaturePoint,
+  type InvocationStampPoint,
   type ReviewRoundPoint,
   type ScoredRunPoint,
 } from "./trend-series";
@@ -183,5 +189,156 @@ describe("qualityWeekPoints", () => {
     expect(week2.scoreDistribution).toBeUndefined();
     expect(week2.zeroTouch).toBeUndefined();
     expect(week2.threads).toEqual({ total: 2, byReviewer: { alice: 2 } });
+  });
+});
+
+describe("modelChangeMarkers", () => {
+  const stamp = (atMs: number, modelReported: string): InvocationStampPoint => ({ atMs, modelReported });
+
+  it("fires when a new model crosses a 50% majority in a later week", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY, "sonnet-4-5"),
+      stamp(WEEK_1_MONDAY + DAY, "sonnet-4-5"),
+      // WEEK_2: sonnet-5 takes a clean majority over the carried-forward sonnet-4-5.
+      stamp(WEEK_1_MONDAY + 7 * DAY, "sonnet-5"),
+      stamp(WEEK_1_MONDAY + 7 * DAY + DAY, "sonnet-5"),
+      stamp(WEEK_1_MONDAY + 7 * DAY + 2 * DAY, "sonnet-4-5"),
+    ];
+    const markers = modelChangeMarkers(rows, [WEEK_1, WEEK_2]);
+    expect(markers).toEqual([{ kind: "model", week: WEEK_2, before: "sonnet-4-5", after: "sonnet-5" }]);
+  });
+
+  it("stays silent on a week that merely ties at 50%, carrying the prior majority forward", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY, "sonnet-4-5"),
+      stamp(WEEK_1_MONDAY + DAY, "sonnet-4-5"),
+      // WEEK_2: an even 50/50 split — no majority, so this week decides nothing on its own.
+      stamp(WEEK_1_MONDAY + 7 * DAY, "sonnet-4-5"),
+      stamp(WEEK_1_MONDAY + 7 * DAY + DAY, "sonnet-5"),
+      // WEEK_3: sonnet-5 clears a real majority — the change is against WEEK_1's sonnet-4-5, since
+      // WEEK_2 never established one of its own.
+      stamp(WEEK_1_MONDAY + 14 * DAY, "sonnet-5"),
+      stamp(WEEK_1_MONDAY + 14 * DAY + DAY, "sonnet-5"),
+    ];
+    const markers = modelChangeMarkers(rows, [WEEK_1, WEEK_2, WEEK_3]);
+    expect(markers).toEqual([{ kind: "model", week: WEEK_3, before: "sonnet-4-5", after: "sonnet-5" }]);
+  });
+
+  it("stays silent when the same model keeps its majority across weeks", () => {
+    const rows = [stamp(WEEK_1_MONDAY, "sonnet-5"), stamp(WEEK_1_MONDAY + 7 * DAY, "sonnet-5")];
+    expect(modelChangeMarkers(rows, [WEEK_1, WEEK_2])).toEqual([]);
+  });
+});
+
+describe("promptChangeMarkers", () => {
+  const stamp = (atMs: number, promptDigest: string, agentTag?: string): InvocationStampPoint => ({
+    atMs,
+    promptDigest,
+    agentTag,
+  });
+
+  it("fires on a new digest inside one agent's own lineage", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY, "digest-a", "nextjs"),
+      stamp(WEEK_1_MONDAY + 7 * DAY, "digest-b", "nextjs"),
+    ];
+    const markers = promptChangeMarkers(rows, [WEEK_1, WEEK_2]);
+    expect(markers).toEqual([{ kind: "prompt", week: WEEK_2, before: "digest-a", after: "digest-b" }]);
+  });
+
+  it("stays silent on an agent switch, even to a lineage that never saw this digest before", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY, "digest-a", "nextjs"),
+      // A different agent starting its own lineage is not a prompt edit within either agent's own.
+      stamp(WEEK_1_MONDAY + 7 * DAY, "digest-b", "supabase"),
+    ];
+    expect(promptChangeMarkers(rows, [WEEK_1, WEEK_2])).toEqual([]);
+  });
+
+  it("fires on the SAME agent resuming with a new digest after another agent ran between", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY, "digest-a", "nextjs"),
+      stamp(WEEK_1_MONDAY + DAY, "digest-x", "supabase"),
+      stamp(WEEK_1_MONDAY + 7 * DAY, "digest-b", "nextjs"),
+    ];
+    const markers = promptChangeMarkers(rows, [WEEK_1, WEEK_2]);
+    expect(markers).toEqual([{ kind: "prompt", week: WEEK_2, before: "digest-a", after: "digest-b" }]);
+  });
+});
+
+describe("skillChangeMarkers", () => {
+  const stamp = (atMs: number, skillId: string, skillDigest: string): InvocationStampPoint => ({
+    atMs,
+    skillId,
+    skillDigest,
+  });
+
+  it("fires on a new skill_digest for a skill_id", () => {
+    const rows = [stamp(WEEK_1_MONDAY, "review", "sd-1"), stamp(WEEK_1_MONDAY + 7 * DAY, "review", "sd-2")];
+    const markers = skillChangeMarkers(rows, [WEEK_1, WEEK_2]);
+    expect(markers).toEqual([{ kind: "skill", week: WEEK_2, before: "sd-1", after: "sd-2" }]);
+  });
+
+  it("stays silent when a different skill_id starts its own lineage", () => {
+    const rows = [stamp(WEEK_1_MONDAY, "review", "sd-1"), stamp(WEEK_1_MONDAY + 7 * DAY, "review-fix", "sd-2")];
+    expect(skillChangeMarkers(rows, [WEEK_1, WEEK_2])).toEqual([]);
+  });
+});
+
+describe("releaseChangeMarkers", () => {
+  const stamp = (atMs: number, antonVersion: string): InvocationStampPoint => ({ atMs, antonVersion });
+
+  it("fires when the release half of anton_version changes", () => {
+    const rows = [stamp(WEEK_1_MONDAY, "0.5.1 (25ec011)"), stamp(WEEK_1_MONDAY + 7 * DAY, "0.5.2 (71092ab)")];
+    const markers = releaseChangeMarkers(rows, [WEEK_1, WEEK_2]);
+    expect(markers).toEqual([{ kind: "release", week: WEEK_2, before: "0.5.1", after: "0.5.2" }]);
+  });
+
+  it("stays silent on a revision bump under an unchanged release", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY, "0.5.1 (25ec011)"),
+      // Same release, new revision — a rebuild of the same code, not a release change.
+      stamp(WEEK_1_MONDAY + 7 * DAY, "0.5.1 (71092ab)"),
+      stamp(WEEK_1_MONDAY + 14 * DAY, "0.5.1 (71092ab, uncommitted a1b2c3)"),
+    ];
+    expect(releaseChangeMarkers(rows, [WEEK_1, WEEK_2, WEEK_3])).toEqual([]);
+  });
+});
+
+describe("changeMarkers", () => {
+  it("composes every kind, in kind order, each carrying its own week and before/after", () => {
+    const nowMs = WEEK_1_MONDAY + 7 * DAY + 2 * DAY; // mid WEEK_2
+    const rows: InvocationStampPoint[] = [
+      {
+        atMs: WEEK_1_MONDAY,
+        modelReported: "sonnet-4-5",
+        promptDigest: "digest-a",
+        agentTag: "nextjs",
+        skillId: "review",
+        skillDigest: "sd-1",
+        antonVersion: "0.5.1 (25ec011)",
+      },
+      {
+        atMs: WEEK_1_MONDAY + 7 * DAY,
+        modelReported: "sonnet-5",
+        promptDigest: "digest-b",
+        agentTag: "nextjs",
+        skillId: "review",
+        skillDigest: "sd-2",
+        antonVersion: "0.5.2 (71092ab)",
+      },
+      {
+        atMs: WEEK_1_MONDAY + 7 * DAY + DAY,
+        modelReported: "sonnet-5",
+      },
+    ];
+
+    const markers = changeMarkers(rows, 2, { nowMs });
+    expect(markers).toEqual([
+      { kind: "model", week: WEEK_2, before: "sonnet-4-5", after: "sonnet-5" },
+      { kind: "prompt", week: WEEK_2, before: "digest-a", after: "digest-b" },
+      { kind: "skill", week: WEEK_2, before: "sd-1", after: "sd-2" },
+      { kind: "release", week: WEEK_2, before: "0.5.1", after: "0.5.2" },
+    ]);
   });
 });

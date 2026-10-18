@@ -279,3 +279,223 @@ export function qualityWeekPoints(
     ...(zeroTouch.has(week) ? { zeroTouch: zeroTouch.get(week) } : {}),
   }));
 }
+
+/* ──────────────────────────  change markers (anton-90875)  ───────────────────────── */
+
+/**
+ * One `claude_invocations` row's stamp columns, as the change-marker fold needs them — already
+ * scoped to one project by the caller, the same contract `QualityInput`'s rows carry. Every field
+ * optional so a fixture naming one marker kind does not have to spell the other four, and because a
+ * row that predates a column (or whose write failed) genuinely has none.
+ */
+export interface InvocationStampPoint {
+  /** `claude_invocations.recorded_at`, epoch ms. */
+  atMs: number;
+  /** The model the result reported the usage under — `model_reported`. */
+  modelReported?: string | null;
+  /** The composed system prompt's digest — `prompt_digest`. */
+  promptDigest?: string | null;
+  /** The ticket's resolved `agent:<tag>` — `agent_tag`. The prompt lineage's own key. */
+  agentTag?: string | null;
+  /** The `skill:<id>` a step resolved — `skill_id`. The skill lineage's own key. */
+  skillId?: string | null;
+  /** The digest of the skill text a step resolved — `skill_digest`. */
+  skillDigest?: string | null;
+  /** The release + revision that ran it, `describeBuildIdentity`'s own shape — `anton_version`. */
+  antonVersion?: string | null;
+}
+
+export const CHANGE_MARKER_KINDS = ["model", "prompt", "skill", "release"] as const;
+export type ChangeMarkerKind = (typeof CHANGE_MARKER_KINDS)[number];
+
+/** One detected change, named by what moved, when it was first seen, and its before → after values. */
+export interface ChangeMarker {
+  kind: ChangeMarkerKind;
+  /** The ISO week the new value was first seen in. */
+  week: string;
+  before: string;
+  after: string;
+}
+
+/** A blank or whitespace-only stamp reads as absent — the never-fail-a-run rule's own reading. */
+function stamped(value: string | null | undefined): string | undefined {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed || undefined;
+}
+
+/** `rows`, in `weekKeys`' window and chronological order — every marker fold's own starting point. */
+function inWindow(
+  rows: readonly InvocationStampPoint[],
+  weekKeys: readonly string[],
+): InvocationStampPoint[] {
+  const weekSet = new Set(weekKeys);
+  return [...rows]
+    .filter((row) => weekSet.has(isoWeekKey(row.atMs)))
+    .sort((a, b) => a.atMs - b.atMs);
+}
+
+/**
+ * The model with the most stamped invocations in one week, and its share of that week's stamped
+ * total — undefined wherever no model cleared a true majority (nothing stamped at all, or the top
+ * model split the week with another at or below 50%). A plurality is not a majority: three models at
+ * roughly a third each must read as "no determined model" rather than crown whichever happened to
+ * have one more row, or a later tie-break would manufacture a model marker off noise.
+ */
+function weekMajorityModel(rows: readonly InvocationStampPoint[]): string | undefined {
+  const counts = new Map<string, number>();
+  let total = 0;
+  for (const row of rows) {
+    const model = stamped(row.modelReported);
+    if (!model) continue;
+    counts.set(model, (counts.get(model) ?? 0) + 1);
+    total += 1;
+  }
+  if (total === 0) return undefined;
+  let best: string | undefined;
+  let bestCount = 0;
+  for (const [model, n] of counts) {
+    if (n > bestCount) {
+      best = model;
+      bestCount = n;
+    }
+  }
+  return best !== undefined && bestCount / total > 0.5 ? best : undefined;
+}
+
+/**
+ * Model markers: one per week whose majority model crossed 50% as a DIFFERENT model than the last
+ * week that had a determined majority. A week with no determined majority (including one with no
+ * stamped invocation) carries the prior majority forward unchanged rather than resetting it — a
+ * quiet week, or one split evenly between two models, must not read as "no model running" and then
+ * manufacture a change marker on the next week that happens to clear 50% again.
+ */
+export function modelChangeMarkers(
+  rows: readonly InvocationStampPoint[],
+  weekKeys: readonly string[],
+): ChangeMarker[] {
+  const byWeek = new Map<string, InvocationStampPoint[]>();
+  for (const row of inWindow(rows, weekKeys)) {
+    const week = isoWeekKey(row.atMs);
+    const bucket = byWeek.get(week);
+    if (bucket) bucket.push(row);
+    else byWeek.set(week, [row]);
+  }
+
+  const markers: ChangeMarker[] = [];
+  let current: string | undefined;
+  for (const week of weekKeys) {
+    const majority = weekMajorityModel(byWeek.get(week) ?? []);
+    if (majority === undefined) continue;
+    if (current !== undefined && majority !== current) {
+      markers.push({ kind: "model", week, before: current, after: majority });
+    }
+    current = majority;
+  }
+  return markers;
+}
+
+/**
+ * Prompt markers: one per invocation whose composed-prompt digest DIFFERS from the last one seen
+ * for the SAME `agentTag` lineage. Keyed per agent deliberately — an agent switch starts a fresh
+ * lineage with nothing to compare against yet, so alternating specialists never fires a marker on
+ * its own; only an edit to the prompt text an agent itself keeps running under does.
+ */
+export function promptChangeMarkers(
+  rows: readonly InvocationStampPoint[],
+  weekKeys: readonly string[],
+): ChangeMarker[] {
+  const lastByAgent = new Map<string, string>();
+  const markers: ChangeMarker[] = [];
+  for (const row of inWindow(rows, weekKeys)) {
+    const digest = stamped(row.promptDigest);
+    if (!digest) continue;
+    const agent = stamped(row.agentTag) ?? "";
+    const previous = lastByAgent.get(agent);
+    if (previous !== undefined && previous !== digest) {
+      markers.push({ kind: "prompt", week: isoWeekKey(row.atMs), before: previous, after: digest });
+    }
+    lastByAgent.set(agent, digest);
+  }
+  return markers;
+}
+
+/**
+ * Skill markers: one per invocation whose `skill_digest` DIFFERS from the last one seen for the SAME
+ * `skill_id` — the sibling of {@link promptChangeMarkers}, keyed on the skill rather than the agent.
+ * A row naming a skill id with no digest (or vice versa) names neither lineage cleanly and is
+ * skipped rather than guessed at.
+ */
+export function skillChangeMarkers(
+  rows: readonly InvocationStampPoint[],
+  weekKeys: readonly string[],
+): ChangeMarker[] {
+  const lastBySkill = new Map<string, string>();
+  const markers: ChangeMarker[] = [];
+  for (const row of inWindow(rows, weekKeys)) {
+    const skillId = stamped(row.skillId);
+    const digest = stamped(row.skillDigest);
+    if (!skillId || !digest) continue;
+    const previous = lastBySkill.get(skillId);
+    if (previous !== undefined && previous !== digest) {
+      markers.push({ kind: "skill", week: isoWeekKey(row.atMs), before: previous, after: digest });
+    }
+    lastBySkill.set(skillId, digest);
+  }
+  return markers;
+}
+
+/**
+ * The RELEASE half of an `anton_version` stamp — `"0.5.1 (25ec011)"` → `"0.5.1"`, per
+ * `describeBuildIdentity` (`build/identity.mjs`), the sole writer of this column's shape. Everything
+ * from the first `" ("` on is the revision (the git commit, plus an `uncommitted …`/`sources …`
+ * suffix when the checkout carried more) — stripped here on purpose, since {@link
+ * releaseChangeMarkers} must never fire on a revision bump under an unchanged release.
+ */
+function releasePart(antonVersion: string): string {
+  const paren = antonVersion.indexOf(" (");
+  return paren === -1 ? antonVersion : antonVersion.slice(0, paren);
+}
+
+/**
+ * Release markers: one per invocation whose `anton_version` names a different RELEASE than the last
+ * one seen, anywhere in the window — `anton`'s own release is one thing the whole system runs under
+ * at a time (the same reasoning `prompt-series.ts`'s `REVISION_DIMENSIONS` gives it), so unlike
+ * prompt and skill this tracks a single running value rather than a per-key lineage. A revision bump
+ * with the release unchanged (a hotfix rebuild, an uncommitted-worktree digest moving) never fires.
+ */
+export function releaseChangeMarkers(
+  rows: readonly InvocationStampPoint[],
+  weekKeys: readonly string[],
+): ChangeMarker[] {
+  const markers: ChangeMarker[] = [];
+  let current: string | undefined;
+  for (const row of inWindow(rows, weekKeys)) {
+    const raw = stamped(row.antonVersion);
+    if (!raw) continue;
+    const release = releasePart(raw);
+    if (current !== undefined && release !== current) {
+      markers.push({ kind: "release", week: isoWeekKey(row.atMs), before: current, after: release });
+    }
+    current = release;
+  }
+  return markers;
+}
+
+/**
+ * Every change marker over the last `weeks` weeks ending at `opts.nowMs` (defaults to now) — the
+ * entry point `trend-read.ts` calls once it has resolved the project's stamped `claude_invocations`
+ * rows. Kind order matches {@link CHANGE_MARKER_KINDS}; within a kind, markers are chronological.
+ */
+export function changeMarkers(
+  rows: readonly InvocationStampPoint[],
+  weeks: number,
+  opts: { nowMs?: number } = {},
+): ChangeMarker[] {
+  const weekKeys = weekKeysBack(weeks, opts.nowMs ?? Date.now());
+  return [
+    ...modelChangeMarkers(rows, weekKeys),
+    ...promptChangeMarkers(rows, weekKeys),
+    ...skillChangeMarkers(rows, weekKeys),
+    ...releaseChangeMarkers(rows, weekKeys),
+  ];
+}
