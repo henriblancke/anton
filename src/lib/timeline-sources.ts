@@ -145,8 +145,12 @@ export async function readRunRows(
     // settles the row `failed` and the retry gets a FRESH row) — without this guard, a retried
     // epic's stale failed row would claim the PR its successful retry opened, stamped with the
     // failed row's own `updatedAt` rather than the one that actually did it (PR #346 review, P2).
+    // `status: "done"` is not enough on its own: a retired standalone target also settles `done`
+    // but with `delivered: false` (execute-epic-run-phase.ts) when it opened no PR at all. Without
+    // this guard, reopening that epic and landing a PR on a later run would make this earlier,
+    // undelivered row claim the later PR, stamped with ITS OWN `updatedAt` (PR #346 review, round 3).
     const prOpenedAt =
-      hasPr && r.status !== "failed" && updatedAt != null && updatedAt > startedAt
+      hasPr && r.status !== "failed" && r.delivered && updatedAt != null && updatedAt > startedAt
         ? updatedAt
         : null;
     out.push({

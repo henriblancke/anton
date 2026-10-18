@@ -166,6 +166,35 @@ describe("readRunRows", () => {
     ]);
     tdb.close();
   });
+
+  it("never attributes the epic's PR to a done run row that settled without one", async () => {
+    // Regression (PR #346 review, round 3): a retired standalone target also settles `done`, but
+    // with `delivered: false` (execute-epic-run-phase.ts) when it opened no PR at all. Without this
+    // guard, reopening that epic and landing a PR on a later run would make this earlier,
+    // undelivered row claim the later PR, stamped with its own `updatedAt`.
+    const tdb = makeDb();
+    tdb.db
+      .insert(schema.runs)
+      .values({
+        id: "run-undelivered",
+        projectId: PROJECT,
+        epicBeadId: "anton-epic",
+        ticketBeadId: "anton-t1",
+        status: "done",
+        delivered: false,
+        startedAt: date(1_500),
+        updatedAt: date(1_800),
+      })
+      .run();
+
+    const board = [bead("anton-epic", { metadata: { pr: "gh-org/repo#9" } })];
+    const rows = await readRunRows(tdb.db, PROJECT, WINDOW, board);
+
+    expect(rows).toEqual([
+      expect.objectContaining({ id: "run-undelivered", startedAt: 1_500, prOpenedAt: null }),
+    ]);
+    tdb.close();
+  });
 });
 
 describe("readRunAttemptRows", () => {

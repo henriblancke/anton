@@ -111,6 +111,18 @@ describe("GET /timeline/events-since", () => {
     expect(Math.floor(row!.seenAt!.getTime() / 1000)).toBe(1000);
   });
 
+  // PR #346 review, round 3 (chatgpt-codex-connector): an unmarked viewer's implicit mark is 0 (its
+  // default window is all history), not "no bound" — an explicit `since` ahead of 0 is still ahead
+  // of the mark and would otherwise mint a postable `until` whose mark-seen buries `[0, since)`.
+  it("rejects an explicit nonzero since when the viewer has no stored mark", async () => {
+    const res = await GET(get("?since=2000"), ctx("tmp"));
+
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/ahead of the stored watermark/);
+    const rows = tdb.db.select().from(schema.viewerMarks).all();
+    expect(rows).toEqual([]);
+  });
+
   it("404s an unknown project", async () => {
     expect((await GET(get(), ctx("nope"))).status).toBe(404);
   });
