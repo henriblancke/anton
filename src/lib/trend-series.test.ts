@@ -2,20 +2,29 @@ import { describe, expect, it } from "vitest";
 
 import {
   changeMarkers,
+  costByWeek,
   isoWeekKey,
   modelChangeMarkers,
+  phaseSpendByWeek,
   promptChangeMarkers,
   qualityWeekPoints,
   releaseChangeMarkers,
+  reviewLoopByFeature,
+  RUNAWAY_MEDIAN_MULTIPLE,
+  runsByCauseByWeek,
   scoreDistributionByWeek,
   skillChangeMarkers,
   threadsByWeek,
   weekKeysBack,
   windowStartMs,
   zeroTouchByWeek,
+  type CostFeaturePoint,
   type DeliveredFeaturePoint,
   type InvocationStampPoint,
+  type PhaseSpendPoint,
+  type ReviewLoopInvocationPoint,
   type ReviewRoundPoint,
+  type RunCausePoint,
   type ScoredRunPoint,
 } from "./trend-series";
 
@@ -340,5 +349,157 @@ describe("changeMarkers", () => {
       { kind: "skill", week: WEEK_2, before: "sd-1", after: "sd-2" },
       { kind: "release", week: WEEK_2, before: "0.5.1", after: "0.5.2" },
     ]);
+  });
+});
+
+describe("costByWeek", () => {
+  const delivered = (deliveredAtMs: number, usd: number | undefined): CostFeaturePoint => ({
+    delivered: true,
+    deliveredAtMs,
+    usd,
+  });
+  const gaveUp = (activityAtMs: number, usd: number | undefined): CostFeaturePoint => ({
+    delivered: false,
+    activityAtMs,
+    usd,
+  });
+
+  it("buckets a delivered feature by delivery and an undelivered one by last activity", () => {
+    const features = [delivered(WEEK_1_MONDAY, 10), gaveUp(WEEK_1_MONDAY + 7 * DAY, 5)];
+    const byWeek = costByWeek(features, [WEEK_1, WEEK_2]);
+    expect(byWeek.get(WEEK_1)).toEqual({ delivered: 1, usd: 10, usdPerFeature: 10 });
+    expect(byWeek.get(WEEK_2)).toEqual({ delivered: 0, usd: 5, usdPerFeature: undefined });
+  });
+
+  it("follows the numerator rule: undelivered spend sums into the week's usd but never the denominator", () => {
+    const features = [
+      delivered(WEEK_1_MONDAY, 10),
+      gaveUp(WEEK_1_MONDAY + DAY, 20),
+      gaveUp(WEEK_1_MONDAY + 2 * DAY, 5),
+    ];
+    const point = costByWeek(features, [WEEK_1]).get(WEEK_1);
+    // usd sums every attributed feature (10 + 20 + 5), while delivered — the denominator — counts
+    // only the one that actually delivered. A cheapest-looking average that dropped the gave-ups'
+    // spend would read 10, not the true 35 / 1.
+    expect(point).toEqual({ delivered: 1, usd: 35, usdPerFeature: 35 });
+  });
+
+  it("is absent for a week with no feature bucketed into it at all", () => {
+    const byWeek = costByWeek([delivered(WEEK_1_MONDAY, 10)], [WEEK_1, WEEK_2]);
+    expect(byWeek.has(WEEK_2)).toBe(false);
+  });
+
+  it("carries usd as a floor (undefined) when nothing in the week could be priced", () => {
+    const byWeek = costByWeek([delivered(WEEK_1_MONDAY, undefined)], [WEEK_1]);
+    expect(byWeek.get(WEEK_1)).toEqual({ delivered: 1, usd: undefined, usdPerFeature: undefined });
+  });
+});
+
+describe("phaseSpendByWeek", () => {
+  const row = (atMs: number, phase: string, tokens: number, usd: number | undefined): PhaseSpendPoint => ({
+    atMs,
+    phase,
+    tokens,
+    usd,
+  });
+
+  it("sums tokens and usd per phase per week, keeping phases separate", () => {
+    const rows = [
+      row(WEEK_1_MONDAY, "implement", 100, 1),
+      row(WEEK_1_MONDAY + DAY, "implement", 50, 0.5),
+      row(WEEK_1_MONDAY + DAY, "self-review", 20, 0.2),
+      row(WEEK_1_MONDAY + 7 * DAY, "implement", 10, 0.1),
+    ];
+    const byWeek = phaseSpendByWeek(rows, [WEEK_1, WEEK_2]);
+    expect(byWeek.get(WEEK_1)).toEqual({
+      implement: { invocations: 2, tokens: 150, usd: 1.5, unpricedRows: 0 },
+      "self-review": { invocations: 1, tokens: 20, usd: 0.2, unpricedRows: 0 },
+    });
+    expect(byWeek.get(WEEK_2)).toEqual({
+      implement: { invocations: 1, tokens: 10, usd: 0.1, unpricedRows: 0 },
+    });
+  });
+
+  it("reports usd as a floor when some rows in a phase could not be priced", () => {
+    const rows = [row(WEEK_1_MONDAY, "implement", 100, 1), row(WEEK_1_MONDAY + DAY, "implement", 50, undefined)];
+    const byWeek = phaseSpendByWeek(rows, [WEEK_1]);
+    expect(byWeek.get(WEEK_1)).toEqual({
+      implement: { invocations: 2, tokens: 150, usd: 1, unpricedRows: 1 },
+    });
+  });
+
+  it("is absent for a week with no invocation at all", () => {
+    const byWeek = phaseSpendByWeek([row(WEEK_1_MONDAY, "implement", 100, 1)], [WEEK_1, WEEK_2]);
+    expect(byWeek.has(WEEK_2)).toBe(false);
+  });
+});
+
+describe("runsByCauseByWeek", () => {
+  const run = (settledAtMs: number, cause: string): RunCausePoint => ({ settledAtMs, cause });
+
+  it("buckets failed/parked runs per cause per week", () => {
+    const runs = [
+      run(WEEK_1_MONDAY, "quota"),
+      run(WEEK_1_MONDAY + DAY, "quota"),
+      run(WEEK_1_MONDAY + 2 * DAY, "gate"),
+      run(WEEK_1_MONDAY + 7 * DAY, "infra"),
+    ];
+    const byWeek = runsByCauseByWeek(runs, [WEEK_1, WEEK_2]);
+    expect(byWeek.get(WEEK_1)).toEqual({ total: 3, byCause: { quota: 2, gate: 1 } });
+    expect(byWeek.get(WEEK_2)).toEqual({ total: 1, byCause: { infra: 1 } });
+  });
+
+  it("reports a real zero for a week with no settled run, never absent", () => {
+    const byWeek = runsByCauseByWeek([run(WEEK_1_MONDAY, "quota")], [WEEK_1, WEEK_2]);
+    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byCause: {} });
+  });
+});
+
+describe("reviewLoopByFeature", () => {
+  const invocation = (beadId: string, phase: string): ReviewLoopInvocationPoint => ({ beadId, phase });
+
+  it("counts raw invocations, not jobs: several rows under one feature all count individually", () => {
+    // Five self-review rows attributed to the same feature simulate a gate that retried several
+    // times within what might have been a single job/run — the fold must count every row.
+    const invocations = [
+      invocation("f1", "self-review"),
+      invocation("f1", "self-review"),
+      invocation("f1", "self-review"),
+      invocation("f1", "self-review"),
+      invocation("f1", "self-review"),
+      invocation("f1", "pr-fix"),
+    ];
+    const [point] = reviewLoopByFeature(invocations);
+    expect(point.selfReviewInvocations).toBe(5);
+    expect(point.prFixInvocations).toBe(1);
+    expect(point.loopInvocations).toBe(6);
+  });
+
+  it("ignores invocations outside self-review and pr-fix", () => {
+    const invocations = [invocation("f1", "implement"), invocation("f1", "describe"), invocation("f1", "self-review")];
+    const [point] = reviewLoopByFeature(invocations);
+    expect(point.selfReviewInvocations).toBe(1);
+    expect(point.prFixInvocations).toBe(0);
+  });
+
+  it("names a feature runaway only once its loop invocations clear the documented multiple of the median", () => {
+    const invocations = [
+      invocation("typical-a", "self-review"),
+      invocation("typical-b", "self-review"),
+      ...Array.from({ length: RUNAWAY_MEDIAN_MULTIPLE + 1 }, () => invocation("outlier", "self-review")),
+    ];
+    const points = reviewLoopByFeature(invocations);
+    const byId = new Map(points.map((p) => [p.beadId, p]));
+    // Median across {1, 1, RUNAWAY_MEDIAN_MULTIPLE + 1} is 1, so the outlier's count must exceed
+    // RUNAWAY_MEDIAN_MULTIPLE * 1 to be named — which it does, by construction.
+    expect(byId.get("typical-a")?.runaway).toBe(false);
+    expect(byId.get("typical-b")?.runaway).toBe(false);
+    expect(byId.get("outlier")?.runaway).toBe(true);
+  });
+
+  it("never calls a feature runaway when every feature has the same loop count", () => {
+    const invocations = [invocation("f1", "self-review"), invocation("f2", "self-review")];
+    const points = reviewLoopByFeature(invocations);
+    expect(points.every((p) => !p.runaway)).toBe(true);
   });
 });

@@ -499,3 +499,262 @@ export function changeMarkers(
     ...releaseChangeMarkers(rows, weekKeys),
   ];
 }
+
+/* ──────────────────  cost, phase spend & the review loop (anton-d6kw7)  ───────────────── */
+
+/**
+ * The second slice of a project's trend series, after quality (anton-6b835): what delivery cost,
+ * where the tokens and dollars went by phase, and how much self-review/PR-fix looping a feature
+ * needed. Same ground rules as above — pure, dependency-free, nothing averaged that should be a
+ * share, absence kept distinct from a measured zero.
+ *
+ * ## The numerator rule, inherited from `promptSeries`
+ *
+ * {@link costByWeek} follows `prompt-series.ts`'s own denominator rule verbatim: every feature's
+ * spend sums into a week's numerator whether it delivered or gave up, while only DELIVERED features
+ * count toward the denominator a per-feature average divides by. Dropping a gave-up feature's spend
+ * would make the prompt (or week) that gives up earliest read as the cheapest — exactly the trap
+ * `prompt-series.ts`'s header warns against.
+ *
+ * ## Invocations, never jobs
+ *
+ * {@link reviewLoopByFeature} counts raw `claude_invocations` rows, not `runs`/job rows — one job
+ * can dispatch several invocations (a gate retry, a resumed attempt), and counting jobs would
+ * undercount exactly the runaway features this fold exists to name.
+ */
+
+/** One feature as {@link costByWeek} needs it — delivered or not, spend included either way. */
+export interface CostFeaturePoint {
+  /** Whether the feature delivered. Only deliveries count toward the per-feature denominator. */
+  delivered: boolean;
+  /** When it delivered, epoch ms. Buckets a delivered feature's spend — absent if never delivered. */
+  deliveredAtMs?: number;
+  /** Its latest recorded activity, epoch ms. Buckets an UNDELIVERED feature's spend by last activity. */
+  activityAtMs?: number;
+  /** What it cost, or undefined when anton could price none of its rows — never 0. */
+  usd: number | undefined;
+}
+
+/** One week's cost: total spend (every attributed feature) over deliveries (the denominator) alone. */
+export interface CostWeekPoint {
+  /** Delivered features bucketed into this week — the denominator. */
+  delivered: number;
+  /** Σ usd over every feature bucketed here, delivered or not — undefined when none could be priced. */
+  usd: number | undefined;
+  /** `usd / delivered`, or undefined when there is no delivery to divide by, or nothing to divide. */
+  usdPerFeature: number | undefined;
+}
+
+/**
+ * Cost per ISO week, bucketed by delivery for a delivered feature and by last activity for one that
+ * never delivered (the ticket's own bucketing rule). A week with no feature bucketed into it at all
+ * — delivered or not — is absent, the same "nothing measured" reading {@link zeroTouchByWeek} gives
+ * a week with no delivery. A week that saw ONLY undelivered spend still gets a real point: `usd` is
+ * set but `delivered` is 0, so `usdPerFeature` reads as undefined rather than a division by zero.
+ */
+export function costByWeek(
+  features: readonly CostFeaturePoint[],
+  weekKeys: readonly string[],
+): Map<string, CostWeekPoint> {
+  const weekSet = new Set(weekKeys);
+  const buckets = new Map<string, { delivered: number; usd: number | undefined }>();
+
+  for (const feature of features) {
+    const atMs = feature.delivered ? feature.deliveredAtMs : feature.activityAtMs;
+    if (atMs === undefined) continue;
+    const week = isoWeekKey(atMs);
+    if (!weekSet.has(week)) continue;
+
+    let bucket = buckets.get(week);
+    if (!bucket) {
+      bucket = { delivered: 0, usd: undefined };
+      buckets.set(week, bucket);
+    }
+    if (feature.usd !== undefined) bucket.usd = (bucket.usd ?? 0) + feature.usd;
+    if (feature.delivered) bucket.delivered += 1;
+  }
+
+  const out = new Map<string, CostWeekPoint>();
+  for (const [week, bucket] of buckets) {
+    out.set(week, {
+      delivered: bucket.delivered,
+      usd: bucket.usd,
+      usdPerFeature:
+        bucket.usd !== undefined && bucket.delivered > 0 ? bucket.usd / bucket.delivered : undefined,
+    });
+  }
+  return out;
+}
+
+/** One invocation row's phase spend, as {@link phaseSpendByWeek} needs it — one row, one invocation. */
+export interface PhaseSpendPoint {
+  /** `claude_invocations.recorded_at`, epoch ms. */
+  atMs: number;
+  /** The ledger phase this invocation classified to (`feature-ledger.ts`'s `ledgerPhase`). */
+  phase: string;
+  /** Tokens this invocation reported, already summed by the caller. */
+  tokens: number;
+  /** What it cost, or undefined when anton could not price it — never 0. */
+  usd: number | undefined;
+}
+
+/** One phase's totals for one ISO week. */
+export interface PhaseWeekTotals {
+  /** Invocation rows folded in — never jobs; see the module header. */
+  invocations: number;
+  tokens: number;
+  /** Σ usd over the rows anton could price, or undefined when it priced none of them. */
+  usd: number | undefined;
+  /** Rows that produced no dollar figure — with this non-zero, {@link usd} is a floor, not a total. */
+  unpricedRows: number;
+}
+
+/**
+ * Tokens and USD per phase, per ISO week. A week with no invocation at all is absent; a week that
+ * had invocations only in some phases carries an entry for exactly those phases, the same "renders
+ * only what happened" reading a feature's own ledger breakdown gives.
+ */
+export function phaseSpendByWeek(
+  rows: readonly PhaseSpendPoint[],
+  weekKeys: readonly string[],
+): Map<string, Record<string, PhaseWeekTotals>> {
+  const weekSet = new Set(weekKeys);
+  const buckets = new Map<string, Map<string, PhaseWeekTotals>>();
+
+  for (const row of rows) {
+    const week = isoWeekKey(row.atMs);
+    if (!weekSet.has(week)) continue;
+
+    let phases = buckets.get(week);
+    if (!phases) {
+      phases = new Map();
+      buckets.set(week, phases);
+    }
+    let totals = phases.get(row.phase);
+    if (!totals) {
+      totals = { invocations: 0, tokens: 0, usd: undefined, unpricedRows: 0 };
+      phases.set(row.phase, totals);
+    }
+    totals.invocations += 1;
+    totals.tokens += row.tokens;
+    if (row.usd === undefined) totals.unpricedRows += 1;
+    else totals.usd = (totals.usd ?? 0) + row.usd;
+  }
+
+  const out = new Map<string, Record<string, PhaseWeekTotals>>();
+  for (const [week, phases] of buckets) out.set(week, Object.fromEntries(phases));
+  return out;
+}
+
+/** One failed/parked run as {@link runsByCauseByWeek} needs it — `runsByCause`'s own `RunCause` shape. */
+export interface RunCausePoint {
+  /** When it settled, epoch ms (`RunCause.settledAt`, converted from epoch seconds by the caller). */
+  settledAtMs: number;
+  /** Its classified cause (`FailureCause`, kept as a plain string here — see the module header). */
+  cause: string;
+}
+
+/** One week's failed/parked runs — total, and split by cause. */
+export interface CauseWeekPoint {
+  total: number;
+  byCause: Record<string, number>;
+}
+
+/**
+ * Failed/parked runs per cause, per ISO week, bucketed straight from `runsByCause`'s rows. Unlike
+ * {@link threadsByWeek}, every week gets a real point — `runs` has recorded failures since the
+ * project's first run, so a week with none is a genuine zero, never "table didn't exist yet".
+ */
+export function runsByCauseByWeek(
+  runs: readonly RunCausePoint[],
+  weekKeys: readonly string[],
+): Map<string, CauseWeekPoint> {
+  const buckets = new Map<string, { total: number; byCause: Record<string, number> }>();
+  for (const key of weekKeys) buckets.set(key, { total: 0, byCause: Object.create(null) });
+
+  for (const run of runs) {
+    const bucket = buckets.get(isoWeekKey(run.settledAtMs));
+    if (!bucket) continue;
+    bucket.total += 1;
+    bucket.byCause[run.cause] = (bucket.byCause[run.cause] ?? 0) + 1;
+  }
+
+  const out = new Map<string, CauseWeekPoint>();
+  for (const [week, bucket] of buckets) out.set(week, { total: bucket.total, byCause: bucket.byCause });
+  return out;
+}
+
+/** One `claude_invocations` row as {@link reviewLoopByFeature} needs it — one row, one invocation. */
+export interface ReviewLoopInvocationPoint {
+  /** The feature's run target id. */
+  beadId: string;
+  /** This invocation's ledger phase. Only `"self-review"` and `"pr-fix"` are counted; others are ignored. */
+  phase: string;
+}
+
+/**
+ * How many times the multiplier a feature's loop invocations must clear ITS OWN median to be named
+ * runaway. 3x is a conservative first cut — loud enough that a feature at 2x the typical loop still
+ * reads as normal variance, quiet enough that a feature needing many times the typical looping still
+ * gets named. Exported so a caller can explain the number it is showing, and a future tuning pass has
+ * one constant to change rather than a magic number buried in the fold.
+ */
+export const RUNAWAY_MEDIAN_MULTIPLE = 3;
+
+/** The median of `values`, or undefined for an empty input — never 0 for "nothing to compare against". */
+function median(values: readonly number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+/** One feature's self-review/PR-fix invocation counts, and whether they are a runaway outlier. */
+export interface ReviewLoopPoint {
+  beadId: string;
+  /** Self-review GATE invocations — `step_handler: "review"`, not the fix round after it. */
+  selfReviewInvocations: number;
+  /** PR-fix invocations — the correction round after a failed self-review or a reviewer's findings. */
+  prFixInvocations: number;
+  /** `selfReviewInvocations + prFixInvocations` — what the median below is computed over. */
+  loopInvocations: number;
+  /** Whether `loopInvocations` exceeds {@link RUNAWAY_MEDIAN_MULTIPLE} times the cohort's median. */
+  runaway: boolean;
+}
+
+/**
+ * Self-review and PR-fix invocations per feature, counted from raw `claude_invocations` rows (never
+ * jobs — one job can dispatch several invocations, and counting jobs would undercount the exact
+ * features this fold exists to name). `runaway` is relative to the MEDIAN of every feature passed
+ * in, so the threshold adapts to a project's own typical amount of looping rather than a fixed count
+ * that would misfire on a project whose formula naturally runs more review rounds than another's.
+ */
+export function reviewLoopByFeature(
+  invocations: readonly ReviewLoopInvocationPoint[],
+): ReviewLoopPoint[] {
+  const byFeature = new Map<string, { selfReview: number; prFix: number }>();
+  for (const invocation of invocations) {
+    let bucket = byFeature.get(invocation.beadId);
+    if (!bucket) {
+      bucket = { selfReview: 0, prFix: 0 };
+      byFeature.set(invocation.beadId, bucket);
+    }
+    if (invocation.phase === "self-review") bucket.selfReview += 1;
+    else if (invocation.phase === "pr-fix") bucket.prFix += 1;
+  }
+
+  const entries = [...byFeature.entries()];
+  const totals = entries.map(([, bucket]) => bucket.selfReview + bucket.prFix);
+  const med = median(totals);
+
+  return entries.map(([beadId, bucket], i) => {
+    const loopInvocations = totals[i];
+    return {
+      beadId,
+      selfReviewInvocations: bucket.selfReview,
+      prFixInvocations: bucket.prFix,
+      loopInvocations,
+      runaway: med !== undefined && loopInvocations > RUNAWAY_MEDIAN_MULTIPLE * med,
+    };
+  });
+}
