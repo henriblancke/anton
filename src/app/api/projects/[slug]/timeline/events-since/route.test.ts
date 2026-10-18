@@ -133,7 +133,7 @@ describe("GET /timeline/events-since", () => {
       startedAt: new Date(500 * 1000),
       updatedAt: new Date(1_500 * 1000),
     });
-    board = [{ id: "anton-t1", title: "t1", status: "open", issue_type: "task", metadata: { pr: "gh-9" } } as Bead];
+    board = [{ id: "anton-epic", title: "epic", status: "open", issue_type: "epic", metadata: { pr: "gh-9" } } as Bead];
 
     const body = await (await GET(get(), ctx("tmp"))).json();
 

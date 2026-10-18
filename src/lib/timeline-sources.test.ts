@@ -43,7 +43,7 @@ const bead = (id: string, extra: Partial<Bead> = {}): Bead => ({
 });
 
 describe("readRunRows", () => {
-  it("reads a run started in the window, and resolves prOpenedAt off the caller's own board", async () => {
+  it("reads a run started in the window, and resolves prOpenedAt off the epic bead on the caller's board", async () => {
     const tdb = makeDb();
     tdb.db
       .insert(schema.runs)
@@ -68,7 +68,7 @@ describe("readRunRows", () => {
       ])
       .run();
 
-    const board = [bead("anton-t1", { metadata: { pr: "gh-org/repo#9" } })];
+    const board = [bead("anton-epic", { metadata: { pr: "gh-org/repo#9" } })];
     const rows = await readRunRows(tdb.db, PROJECT, WINDOW, board);
 
     expect(rows).toEqual([
@@ -84,7 +84,7 @@ describe("readRunRows", () => {
     tdb.close();
   });
 
-  it("reports no PR-opened time when the ticket carries no PR ref", async () => {
+  it("reports no PR-opened time when the epic carries no PR ref", async () => {
     const tdb = makeDb();
     tdb.db
       .insert(schema.runs)
@@ -99,11 +99,43 @@ describe("readRunRows", () => {
       })
       .run();
 
-    const board = [bead("anton-t1")];
+    const board = [bead("anton-epic"), bead("anton-t1")];
     const rows = await readRunRows(tdb.db, PROJECT, WINDOW, board);
 
     expect(rows).toEqual([
       expect.objectContaining({ id: "run-1", startedAt: 1_500, prOpenedAt: null }),
+    ]);
+    tdb.close();
+  });
+
+  it("resolves prOpenedAt off the epic even for a multi-ticket run whose own ticket carries no PR ref", async () => {
+    // Regression: execute-epic-run-phase.ts writes the PR ref onto the epic bead, never the child
+    // ticket currently being worked (execute-epic-ticket-bookends.ts) — checking the ticket bead
+    // alone left `hasPr` permanently false for multi-ticket epic runs.
+    const tdb = makeDb();
+    tdb.db
+      .insert(schema.runs)
+      .values({
+        id: "run-1",
+        projectId: PROJECT,
+        epicBeadId: "anton-epic",
+        ticketBeadId: "anton-t2",
+        status: "in_review",
+        startedAt: date(1_500),
+        updatedAt: date(1_800),
+      })
+      .run();
+
+    const board = [bead("anton-epic", { metadata: { pr: "gh-org/repo#9" } }), bead("anton-t2")];
+    const rows = await readRunRows(tdb.db, PROJECT, WINDOW, board);
+
+    expect(rows).toEqual([
+      expect.objectContaining({
+        id: "run-1",
+        ticketBeadId: "anton-t2",
+        startedAt: 1_500,
+        prOpenedAt: 1_800,
+      }),
     ]);
     tdb.close();
   });

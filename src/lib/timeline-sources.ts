@@ -105,6 +105,12 @@ function beadEpochSeconds(iso: string | undefined): number | null {
  * `updatedAt` (already written on every change to the row) is the best already-existing proxy for
  * "when", used only once the caller's board snapshot shows the ticket actually carrying a PR ref —
  * never guessed from `startedAt` alone, which would fire on every run `foldTimeline` ever saw.
+ *
+ * The PR ref is checked against `epicBeadId`, not `ticketBeadId`: for a multi-ticket epic run,
+ * `execute-epic-run-phase.ts` writes the PR ref onto the epic bead, while `ticketBeadId` on this
+ * row only ever names whichever child ticket was being worked when the row was written
+ * (execute-epic-ticket-bookends.ts). `ticketBeadId` is still what feature attribution
+ * (`foldTimeline`'s `featureOf`) keys off, so it stays on the row unchanged.
  */
 export async function readRunRows(
   db: AntonDb,
@@ -132,9 +138,9 @@ export async function readRunRows(
   for (const r of rows) {
     const startedAt = toEpoch(r.startedAt);
     if (startedAt == null) continue;
-    const ticket = r.ticketBeadId ? ticketById.get(r.ticketBeadId) : undefined;
+    const epic = ticketById.get(r.epicBeadId);
     const updatedAt = toEpoch(r.updatedAt);
-    const hasPr = ticket != null && beads.getPrRef(ticket) !== undefined;
+    const hasPr = epic != null && beads.getPrRef(epic) !== undefined;
     const prOpenedAt = hasPr && updatedAt != null && updatedAt > startedAt ? updatedAt : null;
     out.push({
       source: "run",
