@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { allIssues } from "@/lib/beads/issues";
+import { refreshAllIssues } from "@/lib/beads/issues";
 import { getDb } from "@/lib/db";
 import type { AntonDb } from "@/lib/jobs/queue";
 import { systemClock } from "@/lib/jobs/queue";
@@ -104,6 +104,14 @@ export const GET = withProject<{ slug: string }>(async (request, { project }) =>
  * merges) with no other source, and the caller above refuses to hand out a cursor an operator could
  * mark seen over a read that silently dropped all of them.
  *
+ * Reads via `refreshAllIssues`, not `allIssues` (PR #346 review, P1): `allIssues` serves the
+ * retained stale-while-revalidate snapshot (up to `ISSUE_SNAPSHOT_MAX_AGE_MS` old) and only
+ * refreshes in the background, so a bead closed after that snapshot was cached but before this
+ * request's `until` would be omitted here and then permanently stranded below the watermark once
+ * the client marks `until` seen. `strictGates: true` for the same cursor-safety reason (PR #346
+ * review, P1): a degraded gate listing would let `prActuallyMerged` read a merge-wait gate as
+ * absent and silently suppress a `pr.merged` event behind that same irreversible cursor.
+ *
  * `readRunRows` and `readEscalationRows` widen their SQL seek with an OR against `updatedAt` (see
  * the module header on timeline-sources.ts), which can hand back a row whose OWN `startedAt`/
  * `raisedAt` sits outside `window` — fetched only because its lifecycle's other half landed inside
@@ -115,7 +123,7 @@ async function readTimelineEvents(
   project: Pick<Project, "id" | "repoPath">,
   window: TimelineWindow,
 ): Promise<TimelineEvent[]> {
-  const board = await allIssues(project.repoPath);
+  const board = await refreshAllIssues(project.repoPath, { strictGates: true });
 
   const [
     runRows,

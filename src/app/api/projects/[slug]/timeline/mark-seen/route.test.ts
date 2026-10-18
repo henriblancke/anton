@@ -16,7 +16,7 @@ vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 // rather than degrading to an empty board on a `bd` error (anton-8ubg3 PR #346 review) — mocked
 // the same way events-since/route.test.ts does, so this suite stays hermetic instead of shelling
 // out to a real `bd` against /tmp/p1.
-vi.mock("@/lib/beads/issues", () => ({ allIssues: async () => [] }));
+vi.mock("@/lib/beads/issues", () => ({ refreshAllIssues: async () => [] }));
 
 const { POST } = await import("./route");
 const { GET } = await import("../events-since/route");

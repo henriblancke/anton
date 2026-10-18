@@ -236,6 +236,11 @@ export const runs = sqliteTable("runs", {
   // `runs_project_epic_updated_idx` above is ordered by `epicBeadId` before `updatedAt`, so it can't
   // serve a plain project+time range without scanning every epic bucket.
   index("runs_project_started_idx").on(table.projectId, table.startedAt),
+  // That same reader ALSO widens its seek with `OR updatedAt` (timeline-sources.ts) to catch a
+  // `prOpenedAt` that lands inside the window on a run started before it — without this, SQLite's
+  // planner has no index for the `updatedAt` side of that OR and falls back to scanning every run
+  // in the project (PR #346 review, P2).
+  index("runs_project_updated_idx").on(table.projectId, table.updatedAt),
 ]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
@@ -873,6 +878,11 @@ export const escalations = sqliteTable(
     // The timeline's escalation reader (anton-4ldxk) seeks a project's escalations over a
     // `raisedAt` window — without this, that read scans the project's whole escalation history.
     index("escalations_project_raised_idx").on(table.projectId, table.raisedAt),
+    // That same reader ALSO widens its seek with `OR updatedAt` (timeline-sources.ts) to catch a
+    // `resolvedAt` that lands inside the window on an escalation raised before it — without this,
+    // SQLite's planner has no index for the `updatedAt` side of that OR and falls back to scanning
+    // the project's whole escalation history (PR #346 review, P2).
+    index("escalations_project_updated_idx").on(table.projectId, table.updatedAt),
   ],
 );
 

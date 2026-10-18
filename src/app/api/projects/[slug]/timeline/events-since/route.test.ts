@@ -19,7 +19,7 @@ let boardError: Error | null = null;
 
 vi.mock("@/lib/db", () => ({ getDb: () => tdb.db, schema }));
 vi.mock("@/lib/beads/issues", () => ({
-  allIssues: async () => {
+  refreshAllIssues: async () => {
     if (boardError) throw boardError;
     return board;
   },
