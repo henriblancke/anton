@@ -9,10 +9,10 @@
  */
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hasGit, initBareRemote } from "./integration";
+import { hasGit, initBareRemote, removeTempRepo } from "./integration";
 
 /** Comfortably past git's `gc.autoPackLimit` default of 50 — one push lands one pack here. */
 const PUSHES = 60;
@@ -31,6 +31,12 @@ describeGit("initBareRemote", () => {
       execFileSync("git", ["init", "-q", "-b", "main", work], { stdio: "ignore" });
       g("config", "user.email", "t@example.com");
       g("config", "user.name", "anton-test");
+      // Every commit forks `git maintenance run --auto --quiet --detach` regardless of gc.auto
+      // (confirmed via GIT_TRACE=1: it fires even at well under gc.auto's 6700-loose-object
+      // default). That detached process can still be touching the tree when teardown starts
+      // deleting it — an ENOTEMPTY race, not a passing test. `maintenance.auto false` is what
+      // actually suppresses the spawn; `gc.auto 0` does not.
+      g("config", "maintenance.auto", "false");
       g("remote", "add", "origin", bare);
 
       for (let i = 0; i < PUSHES; i++) {
@@ -43,7 +49,7 @@ describeGit("initBareRemote", () => {
       const packs = readdirSync(join(bare, "objects", "pack")).filter((f) => f.endsWith(".pack"));
       expect(packs).toHaveLength(PUSHES);
     } finally {
-      rmSync(dir, { recursive: true, force: true });
+      removeTempRepo(dir);
     }
   });
 });
