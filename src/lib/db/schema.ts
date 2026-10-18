@@ -5,7 +5,15 @@
  * See DESIGN.md §3.
  */
 import { sql } from "drizzle-orm";
-import { sqliteTable, text, integer, real, index, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  sqliteTable,
+  text,
+  integer,
+  real,
+  index,
+  uniqueIndex,
+  primaryKey,
+} from "drizzle-orm/sqlite-core";
 
 const ts = (name: string) => integer(name, { mode: "timestamp" });
 const now = sql`(unixepoch())`;
@@ -224,6 +232,15 @@ export const runs = sqliteTable("runs", {
   // The run-resume query receives its lifecycle states as bound parameters. SQLite cannot prove
   // those parameters imply a partial-index predicate, so keep status out of this ordered lookup.
   index("runs_project_epic_updated_idx").on(table.projectId, table.epicBeadId, table.updatedAt),
+  // The timeline's run reader (anton-4ldxk) seeks a project's runs over a `startedAt` window —
+  // `runs_project_epic_updated_idx` above is ordered by `epicBeadId` before `updatedAt`, so it can't
+  // serve a plain project+time range without scanning every epic bucket.
+  index("runs_project_started_idx").on(table.projectId, table.startedAt),
+  // That same reader ALSO widens its seek with `OR updatedAt` (timeline-sources.ts) to catch a
+  // `prOpenedAt` that lands inside the window on a run started before it — without this, SQLite's
+  // planner has no index for the `updatedAt` side of that OR and falls back to scanning every run
+  // in the project (PR #346 review, P2).
+  index("runs_project_updated_idx").on(table.projectId, table.updatedAt),
 ]);
 
 /** Durable job queue. Idempotent; resumable via leases + backoff. See DESIGN.md §4. */
@@ -858,6 +875,14 @@ export const escalations = sqliteTable(
     index("escalations_dismissed_idx")
       .on(table.projectId, table.findingKey)
       .where(sql`${table.dismissedAt} is not null`),
+    // The timeline's escalation reader (anton-4ldxk) seeks a project's escalations over a
+    // `raisedAt` window — without this, that read scans the project's whole escalation history.
+    index("escalations_project_raised_idx").on(table.projectId, table.raisedAt),
+    // That same reader ALSO widens its seek with `OR updatedAt` (timeline-sources.ts) to catch a
+    // `resolvedAt` that lands inside the window on an escalation raised before it — without this,
+    // SQLite's planner has no index for the `updatedAt` side of that OR and falls back to scanning
+    // the project's whole escalation history (PR #346 review, P2).
+    index("escalations_project_updated_idx").on(table.projectId, table.updatedAt),
   ],
 );
 
@@ -1106,6 +1131,9 @@ export const runAttempts = sqliteTable(
     // The only read this table has: one run's attempts, in order. Both halves of it — the fold over
     // a settled run, and the open row `recordAttemptEnd` closes — seek on exactly this pair.
     index("run_attempts_run_idx").on(table.runId, table.attempt),
+    // The timeline's run-attempt reader (anton-4ldxk) seeks a project's settled attempts over an
+    // `endedAt` window — without this, that read scans every attempt the project ever recorded.
+    index("run_attempts_project_ended_idx").on(table.projectId, table.endedAt),
   ],
 );
 
@@ -1343,4 +1371,40 @@ export const reviewRounds = sqliteTable(
     // window to leave to the index, unlike the project read above.
     index("review_rounds_bead_idx").on(table.beadId),
   ],
+);
+
+/**
+ * WHEN EACH VIEWER LAST LOOKED, per project (anton-z8j4q) — the watermark the since-you-looked
+ * timeline reads its window from.
+ *
+ * The timeline is a fold over rows anton already writes, so the only state the feature needs of its
+ * own is this: a line in the sand per viewer, moved forward when they say they have seen up to here.
+ * Nothing is denormalized into it — an event's existence is still the source row's business.
+ *
+ * `viewer_id` is `default` until accounts exist (DEFAULT_VIEWER_ID, src/lib/viewer-marks.ts). A
+ * column rather than a hardcoded single row, because the day identity lands the only change is who
+ * fills it in — a one-row table would have to be migrated into a keyed one, and every read rewritten.
+ *
+ * The composite PK (viewer, project) IS the uniqueness rule: one mark per viewer per project, which
+ * makes the write an upsert and makes a double-POST idempotent rather than a second row.
+ *
+ * `seen_at` only ever MOVES FORWARD. A mark naming an earlier instant is a no-op, not a rewind:
+ * marks arrive from whichever tab the operator clicked in, so a stale tab posting the watermark it
+ * loaded with would otherwise un-see everything that happened since — resurfacing events the
+ * operator already read, which is the exact failure the feature exists to prevent. Enforced in the
+ * upsert's `setWhere`, not by the reader, so two concurrent POSTs cannot interleave into a rewind.
+ */
+export const viewerMarks = sqliteTable(
+  "viewer_marks",
+  {
+    viewerId: text("viewer_id").notNull(),
+    projectId: text("project_id")
+      .notNull()
+      .references(() => projects.id),
+    /** The instant the viewer has read up to — the window's lower bound, never its upper. */
+    seenAt: ts("seen_at").notNull(),
+    /** When the watermark above was last MOVED, which is a different question from what it names. */
+    updatedAt: ts("updated_at").notNull().default(now),
+  },
+  (table) => [primaryKey({ columns: [table.viewerId, table.projectId] })],
 );

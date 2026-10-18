@@ -168,6 +168,14 @@ async function seedProject(slug: string) {
     round: 1,
   });
 
+  // A foreign key DOES tie this to the project, so leaving it behind doesn't orphan a row — it
+  // fails the project DELETE outright and rolls the whole teardown back.
+  await db.insert(schema.viewerMarks).values({
+    projectId,
+    viewerId: "default",
+    seenAt: new Date(1_000_000),
+  });
+
   return { projectId, burnSampleId, wt, branch, logPath };
 }
 
@@ -200,6 +208,12 @@ async function projectRowCounts(projectId: string) {
         .from(schema.reviewRounds)
         .where(eq(schema.reviewRounds.projectId, projectId))
     ).length,
+    viewerMarks: (
+      await db
+        .select()
+        .from(schema.viewerMarks)
+        .where(eq(schema.viewerMarks.projectId, projectId))
+    ).length,
   };
 }
 
@@ -224,6 +238,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       autopilotDisarms: 0,
       burnSamples: 0,
       reviewRounds: 0,
+      viewerMarks: 0,
     });
 
     // Worktree dir + branch removed; session log deleted.
@@ -285,6 +300,7 @@ suite("deleteProject (real git + temp anton.db)", () => {
       autopilotDisarms: 2,
       burnSamples: 1,
       reviewRounds: 1,
+      viewerMarks: 1,
     });
   });
 
@@ -319,6 +335,41 @@ suite("deleteProject (real git + temp anton.db)", () => {
     } finally {
       const restore = new Database(fileDb.path);
       for (const { sql } of reviewRoundsDdl) restore.exec(sql);
+      restore.close();
+    }
+  });
+
+  it("tears down a project even when viewer_marks hasn't been migrated yet (PR #346 review)", async () => {
+    // Simulates a source deployment that pulled this code before applying migration 0064: the
+    // optional watermark table simply doesn't exist. Teardown must still remove the project rather
+    // than fail after worktrees/branches/session logs are already gone.
+    const db = getDb();
+    const raw = new Database(fileDb.path);
+    const viewerMarksDdl = raw
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE tbl_name = 'viewer_marks' AND type IN ('table','index') AND sql IS NOT NULL",
+      )
+      .all() as { sql: string }[];
+    raw.exec("DROP TABLE viewer_marks");
+    raw.close();
+
+    const projectId = randomUUID();
+    try {
+      await db.insert(schema.projects).values({
+        id: projectId,
+        slug: "pre-0064",
+        name: "pre-0064",
+        repoPath: repo,
+      });
+
+      await deleteProject("pre-0064");
+
+      expect(
+        (await db.select().from(schema.projects).where(eq(schema.projects.id, projectId))).length,
+      ).toBe(0);
+    } finally {
+      const restore = new Database(fileDb.path);
+      for (const { sql } of viewerMarksDdl) restore.exec(sql);
       restore.close();
     }
   });
