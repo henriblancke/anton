@@ -171,7 +171,7 @@ export function removeTempRepo(dir: string, rm: typeof rmSync = rmSync): void {
     const code = (e as NodeJS.ErrnoException).code;
     if (!code || !BUSY_ERRNOS.has(code)) throw e;
     console.warn(
-      `[integration] leaked temp dir ${dir} (${code}): a bd subprocess outlived the suite`,
+      `[integration] leaked temp dir ${dir} (${code}): a background process outlived the suite`,
     );
   }
 }

@@ -31,9 +31,12 @@ describeGit("initBareRemote", () => {
       execFileSync("git", ["init", "-q", "-b", "main", work], { stdio: "ignore" });
       g("config", "user.email", "t@example.com");
       g("config", "user.name", "anton-test");
-      // Without this, the work repo's own background gc/index work can still be running when
-      // teardown starts deleting the tree underneath it — an ENOTEMPTY race, not a passing test.
-      g("config", "gc.auto", "0");
+      // Every commit forks `git maintenance run --auto --quiet --detach` regardless of gc.auto
+      // (confirmed via GIT_TRACE=1: it fires even at well under gc.auto's 6700-loose-object
+      // default). That detached process can still be touching the tree when teardown starts
+      // deleting it — an ENOTEMPTY race, not a passing test. `maintenance.auto false` is what
+      // actually suppresses the spawn; `gc.auto 0` does not.
+      g("config", "maintenance.auto", "false");
       g("remote", "add", "origin", bare);
 
       for (let i = 0; i < PUSHES; i++) {
