@@ -631,6 +631,106 @@ describe("duplicate proposals from overlapping patrols", () => {
 });
 
 /**
+ * A changed suggestion (PR #351 review): the board moves under an open `unlinked-outcome` ask — a
+ * parent epic gets labelled, say — so the next patrol's fresh detection carries the SAME subject
+ * but a DIFFERENT `detail`, and therefore a different fingerprint. Not a duplicate
+ * `reconcileDuplicateProposals` would fold (the two claims never matched), so without this the
+ * stale ask just sits open forever next to the fresh one.
+ */
+describe("superseding a changed outcome suggestion", () => {
+  const unknown = (subject: string) =>
+    makeDetection({
+      kind: "unlinked-outcome",
+      move: "attach-outcome",
+      subjects: [subject],
+      detail: "unknown",
+      summary: `${subject} carries no outcome`,
+      evidence: [`${subject} has no outcome:<id> label`],
+    });
+
+  const inherited = (subject: string) =>
+    makeDetection({
+      kind: "unlinked-outcome",
+      move: "attach-outcome",
+      subjects: [subject],
+      detail: "oriented-operator",
+      summary: `${subject} carries no outcome`,
+      evidence: [`${subject}'s parent epic now names one outcome`],
+    });
+
+  /** A proposal bead for `detection`, carrying the metadata plan a real `bd create` would have —
+   * not just the fingerprint label, since `staleSiblingsOf` reads the plan to compare claims. */
+  const staleProposal = (id: string, detection: GardenerDetection): Bead =>
+    bead(id, {
+      labels: [detection.fingerprint, ...PROPOSAL_LABELS],
+      metadata: {
+        [GARDENER_PLAN_KEY]: {
+          kind: detection.kind,
+          move: detection.move,
+          fingerprint: detection.fingerprint,
+          subjects: detection.subjects,
+          detail: detection.detail,
+        },
+      },
+    });
+
+  it("closes the stale sibling once the fresh ask for the same bead lands", async () => {
+    const stale = staleProposal("anton-stale", unknown("anton-feat"));
+    liveBeads.set(stale.id, stale);
+    const board = [stale];
+
+    const result = await emitProposals(REPO, { board, detections: [inherited("anton-feat")] });
+
+    expect(result.created).toHaveLength(1);
+    expect(result.superseded).toEqual([{ id: "anton-stale", label: fingerprintLabelOf(stale) }]);
+    expect(closeMock).toHaveBeenCalledTimes(1);
+    const [, closedId, reason] = closeMock.mock.calls[0];
+    expect(closedId).toBe("anton-stale");
+    expect(reason).toContain(result.created[0].id);
+    // Plain close, not abandoned — the claim changed, nobody declined anything.
+    expect(abandonMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves an approved stale sibling standing — superseding it would discard a decision", async () => {
+    const stale = staleProposal("anton-stale", unknown("anton-feat"));
+    stale.labels = [...(stale.labels ?? []), LABELS.approved];
+    liveBeads.set(stale.id, stale);
+
+    const result = await emitProposals(REPO, { board: [stale], detections: [inherited("anton-feat")] });
+
+    expect(result.superseded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("does nothing when the fresh ask's own suggestion has not changed", async () => {
+    const same = staleProposal("anton-same", unknown("anton-feat"));
+    liveBeads.set(same.id, same);
+
+    const result = await emitProposals(REPO, { board: [same], detections: [unknown("anton-feat")] });
+
+    // The fresh detection is suppressed outright (the board already carries this exact claim), so
+    // nothing new is created and nothing is superseded.
+    expect(result.created).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("never supersedes across kinds whose fingerprint already hashes the whole claim", async () => {
+    // `container-orphan` has no DetailShape, so two different fingerprints for it are two different
+    // asks, not one ask that moved — nothing here should ever close one for the other.
+    const other = bead("anton-other", { labels: [reparent().fingerprint, ...PROPOSAL_LABELS] });
+    liveBeads.set(other.id, other);
+
+    const result = await emitProposals(REPO, {
+      board: [other],
+      detections: [reparent({ subjects: ["anton-different"] })],
+    });
+
+    expect(result.superseded).toEqual([]);
+    expect(closeMock).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * The race itself (anton-x4ks), staged at this seam: TWO patrols emit against ONE synced board,
  * neither seeing the other's create, and each then arbitrates its own pass. What must come out is a
  * single standing ask per fingerprint — and it must come out that way whichever patrol arbitrates,
@@ -939,7 +1039,7 @@ describe("a patrol pass", () => {
   it("writes nothing on a quiet board", async () => {
     const quiet = [bead("anton-f", { issue_type: "feature" }), bead("anton-t", { parent: "anton-f" })];
     const result = await emitProposals(REPO, { board: quiet, detections: detect(quiet) });
-    expect(result).toEqual({ created: [], suppressed: 0, deferred: 0 });
+    expect(result).toEqual({ created: [], suppressed: 0, deferred: 0, superseded: [] });
     expect(createMock).not.toHaveBeenCalled();
   });
 });

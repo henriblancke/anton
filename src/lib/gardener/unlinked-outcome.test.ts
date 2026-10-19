@@ -9,7 +9,12 @@ import { describe, expect, it } from "vitest";
 
 import type { Bead } from "../beads/bd";
 import { indexWorkBoard } from "./detect";
-import { STRINGER_OUTCOME, UNKNOWN_OUTCOME, detectUnlinkedOutcomes } from "./unlinked-outcome";
+import {
+  STRINGER_OUTCOME,
+  UNKNOWN_OUTCOME,
+  detectUnlinkedOutcomes,
+  suggestOutcome,
+} from "./unlinked-outcome";
 
 const bead = (id: string, over: Partial<Bead> = {}): Bead => ({
   id,
@@ -160,6 +165,38 @@ describe("unlinked-outcome (anton-vie0k)", () => {
   it("says nothing about a Goal when the bead states none", () => {
     const detection = only([feature("anton-feat")]);
     expect(detection.evidence.some((line) => line.includes("its own Goal"))).toBe(false);
+  });
+
+  // suggestOutcome's `parent` tells a caller which epic to lock before writing (apply-steps.ts
+  // premiseBeadsOf) — it has to name the epic whenever the epic's OWN label count decided the
+  // rung, not only on the rung that actually inherited from it (anton-9... PR #351 review).
+  describe("suggestOutcome's parent (what apply-steps.ts has to lock)", () => {
+    it("names the parent epic even when it falls through to the stringer default", () => {
+      const index = indexWorkBoard([
+        epic("anton-epic"),
+        feature("anton-feat", { labels: ["source:stringer"], parent: "anton-epic" }),
+      ]);
+      const suggestion = suggestOutcome(index, index.byId.get("anton-feat")!);
+
+      expect(suggestion.outcome).toBe(STRINGER_OUTCOME);
+      expect(suggestion.parent).toBe("anton-epic");
+    });
+
+    it("names the parent epic even when it falls through to unknown", () => {
+      const index = indexWorkBoard([epic("anton-epic"), feature("anton-feat", { parent: "anton-epic" })]);
+      const suggestion = suggestOutcome(index, index.byId.get("anton-feat")!);
+
+      expect(suggestion.outcome).toBe(UNKNOWN_OUTCOME);
+      expect(suggestion.parent).toBe("anton-epic");
+    });
+
+    it("names no parent for a bead with no parent epic at all", () => {
+      const index = indexWorkBoard([bead("anton-task", { issue_type: "task" })]);
+      const suggestion = suggestOutcome(index, index.byId.get("anton-task")!);
+
+      expect(suggestion.outcome).toBe(UNKNOWN_OUTCOME);
+      expect(suggestion.parent).toBeUndefined();
+    });
   });
 
   it("fingerprints each subject distinctly and stably across repeated passes", () => {

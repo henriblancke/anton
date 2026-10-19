@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 
 import type { Project } from "@/lib/types";
 import type { QuotaShareProject } from "@/lib/quota-share";
+import type { JevHealth } from "@/lib/decide/backends/jev-fallback";
 import { PageHeader } from "@/components/atoms";
 import {
   PolicyDraftSection,
@@ -23,6 +24,7 @@ import { ExecutionSection } from "@/components/settings/sections/execution-secti
 import { GatesSection } from "@/components/settings/sections/gates-section";
 import { GatewaySection } from "@/components/settings/sections/gateway-section";
 import { GeneralSection } from "@/components/settings/sections/general-section";
+import { JevSection, type JevDisclosureRow } from "@/components/settings/sections/jev-section";
 import {
   PickerAutonomySection,
   type EarnedPicker,
@@ -70,6 +72,9 @@ export function SettingsView({
   pickerEarned,
   quotaProjects,
   decisionPoints,
+  jevApiKeyConfigured,
+  jevDisclosure,
+  jevHealth,
 }: {
   project: Project;
   settings: EditableSettings;
@@ -143,6 +148,13 @@ export function SettingsView({
    * module has registered, which a client bundle never imports.
    */
   decisionPoints: DecisionPointRow[];
+  /** Whether a jev API key is already stored (anton-p32iy) — the server never sends the key itself
+   *  back; see project-settings.ts's `redactSecrets`. */
+  jevApiKeyConfigured: boolean;
+  /** Every registered decide() point and the state fields it would disclose to Jev, if turned on. */
+  jevDisclosure: JevDisclosureRow[];
+  /** Undefined until a decide() call has actually exercised the jev backend — see jev-fallback.ts. */
+  jevHealth?: JevHealth;
 }) {
   // Which panel is displayed. The URL hash IS the state — not a copy of it — so /settings#automation
   // lands where it says it will, a reload returns to the same place, and a link points at a section
@@ -193,6 +205,14 @@ export function SettingsView({
     value: <ValueSection form={form} labelVocabulary={labelVocabulary} />,
     repairs: <RepairsSection form={form} projectSlug={project.slug} />,
     decide: <DecisionPointsSection slug={project.slug} points={decisionPoints} />,
+    jev: (
+      <JevSection
+        form={form}
+        apiKeyConfigured={jevApiKeyConfigured}
+        disclosure={jevDisclosure}
+        health={jevHealth}
+      />
+    ),
     gates: <GatesSection form={form} />,
     review: <ReviewSection form={form} agents={agents} />,
     describe: <DescribeSection form={form} />,

@@ -76,6 +76,12 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
         `files at most ${MAX_PROPOSALS_PER_PASS}; the next one picks them up`,
     );
   }
+  if (emission.superseded.length > 0) {
+    console.log(
+      `[product-master] ${scope.slug}: superseded ${emission.superseded.length} stale proposal(s) ` +
+        `whose own suggestion had changed (${emission.superseded.map((p) => p.id).join(", ")})`,
+    );
+  }
 }
 
 /** A tier's filer, plus the snapshot the tier AFTER it must judge. */

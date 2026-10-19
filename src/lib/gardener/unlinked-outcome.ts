@@ -80,11 +80,12 @@ export interface Suggestion {
   outcome: string;
   evidence: string[];
   /**
-   * The epic whose own label DETERMINED `outcome` — set only in the inherit rung below. Named so a
-   * caller that is about to WRITE the outcome can lock this bead too (apply-steps.ts
-   * `lockedBeads`/`premiseBeadsOf`): the guess is read off the parent's label, not the subject's own,
-   * so nothing serializes it against a concurrent relabel of the parent unless the caller locks the
-   * parent explicitly.
+   * The parent epic whose own label state DECIDED `outcome` — set whenever one exists, not only
+   * when an outcome was actually inherited from it. Named so a caller that is about to WRITE the
+   * outcome can lock this bead too (apply-steps.ts `lockedBeads`/`premiseBeadsOf`): even a
+   * `codebase-health`/`unknown` fallback was read off the parent's label count (zero vs. one vs.
+   * many), so a relabel of the parent between the read and the write can change which rung fires —
+   * nothing serializes against that unless the caller locks the parent explicitly.
    */
   parent?: string;
 }
@@ -101,21 +102,26 @@ export interface Suggestion {
 export function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
   const parentId = beads.parentOf(bead);
   const parent = parentId ? index.byId.get(parentId) : undefined;
-  if (parent && beads.isEpic(parent)) {
-    const epicOutcomes = epicOutcomeLabels(parent);
+  const parentEpic = parent && beads.isEpic(parent) ? parent : undefined;
+
+  if (parentEpic) {
+    const epicOutcomes = epicOutcomeLabels(parentEpic);
     if (epicOutcomes.length === 1) {
       return {
         outcome: epicOutcomes[0],
-        evidence: [`its parent epic ${parent.id} carries exactly one outcome:${epicOutcomes[0]} label — inherit it`],
-        parent: parent.id,
+        evidence: [
+          `its parent epic ${parentEpic.id} carries exactly one outcome:${epicOutcomes[0]} label — inherit it`,
+        ],
+        parent: parentEpic.id,
       };
     }
     if (epicOutcomes.length > 1) {
       return {
         outcome: UNKNOWN_OUTCOME,
         evidence: [
-          `its parent epic ${parent.id} carries ${epicOutcomes.length} outcome labels (${epicOutcomes.join(", ")}) — no single one to inherit`,
+          `its parent epic ${parentEpic.id} carries ${epicOutcomes.length} outcome labels (${epicOutcomes.join(", ")}) — no single one to inherit`,
         ],
+        parent: parentEpic.id,
       };
     }
   }
@@ -124,12 +130,14 @@ export function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
     return {
       outcome: STRINGER_OUTCOME,
       evidence: [`${bead.id} carries source:stringer — scan-triage-produced work always serves ${STRINGER_OUTCOME}`],
+      parent: parentEpic?.id,
     };
   }
 
   return {
     outcome: UNKNOWN_OUTCOME,
     evidence: [`neither a parent epic's outcome nor a source:stringer label suggests one — ask the operator which outcome this serves`],
+    parent: parentEpic?.id,
   };
 }
 

@@ -108,6 +108,12 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
         `at most ${MAX_PROPOSALS_PER_PASS}; the next patrol picks them up`,
     );
   }
+  if (emission.superseded.length > 0) {
+    console.log(
+      `[gardener] ${scope.project.id}: superseded ${emission.superseded.length} stale proposal(s) ` +
+        `whose own suggestion had changed (${emission.superseded.map((p) => p.id).join(", ")})`,
+    );
+  }
 }
 
 /**

@@ -50,6 +50,12 @@ export interface SettingsDraft {
   claudeGatewayModelDiscovery: boolean;
   /** Which router connection this project meters on (anton-m5oc); "" clears (no routed meter). */
   routerConnectionId: string;
+  /** Opt-in Jev backend (anton-p32iy). `jevApiKey` NEVER seeds from the server — it always starts
+   *  "", and a save only sends it when the operator actually typed a new one (see settingsPatchBody);
+   *  leaving it blank keeps whatever key is already stored. */
+  jevEnabled: boolean;
+  jevApiKey: string;
+  jevModel: string;
   seedPrompt: string;
   describePrompt: string;
   reviewFixPrompt: string;
@@ -125,6 +131,10 @@ export function draftFromSettings(
     claudeAuthTokenEnv: settings.claudeAuthTokenEnv ?? "",
     claudeGatewayModelDiscovery: settings.claudeGatewayModelDiscovery ?? false,
     routerConnectionId: settings.routerConnectionId ?? "",
+    jevEnabled: settings.jevEnabled ?? false,
+    // Never seeded from the server — see the field's own doc comment above.
+    jevApiKey: "",
+    jevModel: settings.jevModel ?? "",
     seedPrompt: settings.seedPrompt ?? "",
     describePrompt: settings.describePrompt ?? "",
     reviewFixPrompt: settings.reviewFixPrompt ?? "",
@@ -196,6 +206,7 @@ const DIRTY_FIELDS: Record<string, (keyof SettingsDraft)[]> = {
     "claudeGatewayModelDiscovery",
     "routerConnectionId",
   ],
+  jev: ["jevEnabled", "jevApiKey", "jevModel"],
   seedPrompt: ["seedPrompt"],
   describePrompt: ["describePrompt"],
   reviewFixPrompt: ["reviewFixPrompt"],
@@ -302,6 +313,12 @@ export function settingsPatchBody(
     claudeAuthTokenEnv: orNull(draft.claudeAuthTokenEnv),
     claudeGatewayModelDiscovery: draft.claudeGatewayModelDiscovery,
     routerConnectionId: orNull(draft.routerConnectionId),
+    // Opt-in Jev backend (anton-p32iy). jevApiKey is sent ONLY when the operator typed a new one —
+    // it is never seeded from the server, so an untouched field must never resend "" and clear the
+    // key that is already stored.
+    jevEnabled: draft.jevEnabled,
+    ...(draft.jevApiKey.trim() ? { jevApiKey: draft.jevApiKey.trim() } : {}),
+    jevModel: orNull(draft.jevModel),
     seedPrompt: orNull(draft.seedPrompt),
     describePrompt: orNull(draft.describePrompt),
     reviewFixPrompt: orNull(draft.reviewFixPrompt),

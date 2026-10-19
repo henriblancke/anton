@@ -37,6 +37,22 @@ export function boundedString(max: number): FieldParser<string> {
   };
 }
 
+/**
+ * A non-blank secret value, e.g. a vendor API key: trimmed and rejected outright if blank, rather
+ * than silently stored as a key that will 401 every call. Mirrors `settingsPatchBody`'s own
+ * client-side guard (`draft.jevApiKey.trim() ? ... : {}`) so a direct API caller can't bypass it.
+ */
+export function boundedSecret(max: number): FieldParser<string> {
+  return (raw, key) => {
+    if (isClear(raw)) return accept(undefined);
+    if (typeof raw !== "string") return reject(`${key} must be a string`);
+    const trimmed = raw.trim();
+    if (!trimmed) return reject(`${key} must not be blank`);
+    if (trimmed.length > max) return reject(`${key} too long (max ${max} chars)`);
+    return accept(trimmed);
+  };
+}
+
 export const booleanValue: FieldParser<boolean> = (raw, key) => {
   if (isClear(raw)) return accept(undefined);
   if (typeof raw !== "boolean") return reject(`${key} must be a boolean`);

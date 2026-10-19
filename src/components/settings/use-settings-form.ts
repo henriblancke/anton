@@ -80,6 +80,14 @@ export interface SettingsForm {
    * through saving.
    */
   patchSettings: (body: Record<string, unknown>) => Promise<Response>;
+  /**
+   * Folds a settings row a caller already stored (via {@link patchSettings}, outside `save()`) into
+   * the baseline everything else diffs against. Without this, a write that bypasses `save()` (e.g.
+   * the Jev section's key-clear button) only updates `draft`, and `baseline` — fixed since the last
+   * `save()` or the SSR snapshot — keeps reporting that field dirty forever even though the server
+   * already holds the new value.
+   */
+  syncBaseline: (settings: EditableSettings) => void;
 }
 
 /**
@@ -175,6 +183,16 @@ export function useSettingsForm({
       // session. If the response somehow carries no row we leave the baseline alone rather than
       // guess — an over-eager clear would claim edits were persisted that may not have been.
       if (stored) setBaseline(stored);
+      // jevApiKey is write-only — the server never echoes it back, so the baseline's copy is always
+      // "". Left staged, a submitted key would diff against that "" forever and read as permanently
+      // dirty; clearing it here matches what the server now holds (anton-l70sq PR #349 review).
+      // Only clear when `prev` still holds the exact value this save submitted — the field stays
+      // editable while the request is in flight, and an operator who types a replacement before the
+      // response lands must not have that newer, never-submitted value wiped out from under them.
+      const submittedKey = draft.jevApiKey;
+      if (submittedKey.trim()) {
+        setDraft((prev) => (prev.jevApiKey === submittedKey ? { ...prev, jevApiKey: "" } : prev));
+      }
       toast.success("Settings saved");
       // The server tree still holds the pre-save row; refresh it so navigating away and back
       // doesn't restore stale values out of the router cache.
@@ -257,6 +275,7 @@ export function useSettingsForm({
     saving,
     save,
     patchSettings,
+    syncBaseline: setBaseline,
   };
 }
 
