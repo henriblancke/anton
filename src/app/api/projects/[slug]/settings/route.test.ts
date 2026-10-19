@@ -1922,6 +1922,38 @@ describe("settings route — Jev backend (anton-p32iy)", () => {
     expect("jevApiKey" in persisted()).toBe(false);
     expect("jevModel" in persisted()).toBe(false);
   });
+
+  it("PATCH rejects a whitespace-only jevApiKey instead of storing a credential that will 401 every call", async () => {
+    const res = await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "   ", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/jevApiKey/);
+    expect("jevApiKey" in persisted()).toBe(false);
+  });
+
+  it("trims a jevApiKey with incidental surrounding whitespace before storing it", async () => {
+    const res = await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "  sk-test  ", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect(persisted().jevApiKey).toBe("sk-test");
+  });
+
+  it("PATCH rejects jevEnabled: true alone when the stored jevModel predates the pin check (hand-edited row)", async () => {
+    // Simulate a row that already carries a key and an unpinned model from before this check
+    // existed — a partial enable must not trust it was ever validated.
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ jevApiKey: "sk-test", jevModel: "jev-latest" }) });
+
+    const res = await PATCH(patchReq({ jevEnabled: true }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/jevEnabled needs both/);
+    expect("jevEnabled" in persisted()).toBe(false);
+  });
 });
 
 /**

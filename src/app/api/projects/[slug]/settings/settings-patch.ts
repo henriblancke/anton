@@ -48,6 +48,7 @@ import {
   accept,
   applyFieldRules,
   booleanValue,
+  boundedSecret,
   boundedString,
   connectionId,
   envVarName,
@@ -229,7 +230,7 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     // Opt-in Jev backend for decide() (anton-p32iy). The cross-check below (checkJevConfigured)
     // refuses turning it on without both a key and a pinned model.
     settingsField("jevEnabled", booleanValue),
-    settingsField("jevApiKey", boundedString(MAX_JEV_KEY)),
+    settingsField("jevApiKey", boundedSecret(MAX_JEV_KEY)),
     settingsField("jevModel", pinnedJevModel),
 
     // Policy blobs. Each parsed partial is deep-merged into the stored policy by
@@ -365,7 +366,10 @@ function checkJevConfigured(
   const enabled = "jevEnabled" in patch ? patch.jevEnabled : current.jevEnabled;
   const apiKey = "jevApiKey" in patch ? patch.jevApiKey : current.jevApiKey;
   const model = "jevModel" in patch ? patch.jevModel : current.jevModel;
-  if (enabled && (!apiKey || !model)) {
+  // Re-check the pin even when `model` itself isn't in this patch — a partial `{jevEnabled: true}`
+  // would otherwise pass on a stale/hand-edited unpinned model and leave resolveJevConfig silently
+  // reading it as off, the same wrong-failure-mode this check exists to catch.
+  if (enabled && (!apiKey || !model || !isPinnedJevModel(model))) {
     return "jevEnabled needs both jevApiKey and a pinned jevModel — set both, or leave Jev off.";
   }
   return null;

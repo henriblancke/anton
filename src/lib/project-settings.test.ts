@@ -240,4 +240,10 @@ describe("resolveJevConfig", () => {
       resolveJevConfig({ jevEnabled: true, jevApiKey: "sk-key", jevModel: "jev-1.13.0" }),
     ).toEqual({ apiKey: "sk-key", model: "jev-1.13.0" });
   });
+
+  it("is undefined when the stored key is whitespace-only (predates the write-time boundary check)", () => {
+    expect(
+      resolveJevConfig({ jevEnabled: true, jevApiKey: "   ", jevModel: "jev-1.13.0" }),
+    ).toBeUndefined();
+  });
 });

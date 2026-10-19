@@ -204,6 +204,47 @@ describe("jevBackend — response parsing (fixtures from the docs example)", () 
     });
   });
 
+  it("rejects a choice answer whose probabilities don't cover exactly the question's options", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: {
+          department: {
+            type: "choice",
+            choice: "technical",
+            confidence: 0.9,
+            // Missing "other" — not a full distribution over the registered options.
+            probabilities: { billing: 0.1, technical: 0.9 },
+          },
+        },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(choicePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+  });
+
+  it("rejects a choice answer whose probabilities sum far from 1", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: {
+          department: {
+            type: "choice",
+            choice: "technical",
+            confidence: 0.9,
+            probabilities: { billing: 0.8, technical: 0.8, other: 0.8 },
+          },
+        },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(choicePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+  });
+
   it("rescales a score answer from Jev's 0..1 index position onto the point's own [min, max]", async () => {
     const ask = jevBackend({
       apiKey: "k",
@@ -228,6 +269,19 @@ describe("jevBackend — response parsing (fixtures from the docs example)", () 
     expect(answer.confidence).toBe(0.82);
     expect(answer.backend).toBe("jev");
     expect(answer.modelVersion).toBe("jev-1.13.0");
+  });
+
+  it("rejects a score reply outside Jev's documented 0..1 index range instead of rescaling past the point's own bounds", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: { frustration: { type: "score", score: 1.4, confidence: 0.8 } },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(scorePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
   });
 
   it("derives a yes/no answer and its distribution from the noul probability", async () => {

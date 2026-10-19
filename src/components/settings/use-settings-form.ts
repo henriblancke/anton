@@ -80,6 +80,14 @@ export interface SettingsForm {
    * through saving.
    */
   patchSettings: (body: Record<string, unknown>) => Promise<Response>;
+  /**
+   * Folds a settings row a caller already stored (via {@link patchSettings}, outside `save()`) into
+   * the baseline everything else diffs against. Without this, a write that bypasses `save()` (e.g.
+   * the Jev section's key-clear button) only updates `draft`, and `baseline` — fixed since the last
+   * `save()` or the SSR snapshot — keeps reporting that field dirty forever even though the server
+   * already holds the new value.
+   */
+  syncBaseline: (settings: EditableSettings) => void;
 }
 
 /**
@@ -267,6 +275,7 @@ export function useSettingsForm({
     saving,
     save,
     patchSettings,
+    syncBaseline: setBaseline,
   };
 }
 

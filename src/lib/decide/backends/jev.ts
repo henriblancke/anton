@@ -83,7 +83,10 @@ const choiceAnswerSchema = z.object({
 
 const scoreAnswerSchema = z.object({
   type: z.literal("score"),
-  score: z.number(),
+  // Jev's documented 0..1 index range over the two criteria entries this module sends — unlike
+  // `noul` just below, nothing downstream clamps this, so an out-of-range reply must fail here to
+  // trigger the claude-local fallback instead of rescaling past the point's own [min, max] bounds.
+  score: z.number().min(0).max(1),
   confidence: z.number().min(0).max(1),
   legend: z.record(z.string(), z.string()).optional(),
   probabilities: z.record(z.string(), z.number()).optional(),
@@ -150,6 +153,33 @@ function rescaleScore(score: number, min: number, max: number): number {
   return min + score * (max - min);
 }
 
+/** How far a distribution's total may drift from 1 and still be trusted — matches claude-local's own
+ * tolerance (claude-local.ts), wide enough for a model's own rounding, narrow enough to reject
+ * something like `{fix: 0.8, decline: 0.8}`, which is not a probability distribution at all. */
+const DISTRIBUTION_SUM_TOLERANCE = 0.05;
+
+/** Mirrors claude-local's `readDistribution`: a `choice` distribution is only trustworthy if it has
+ * exactly one entry per registered option (no extras, nothing missing), every value sits in
+ * `[0, 1]`, and the total is close enough to 1 to be a real distribution. Jev's own schema only
+ * constrains `probabilities` to a string-keyed record of numbers, so a malformed one would
+ * otherwise resolve successfully and never reach decide()'s own validation on the healthy path. */
+function isValidProbabilityDistribution(
+  probabilities: Record<string, number>,
+  options: readonly string[],
+): boolean {
+  const optionSet = new Set(options);
+  for (const key of Object.keys(probabilities)) {
+    if (!optionSet.has(key)) return false;
+  }
+  let sum = 0;
+  for (const option of options) {
+    const probability = probabilities[option];
+    if (probability === undefined || probability < 0 || probability > 1) return false;
+    sum += probability;
+  }
+  return Math.abs(sum - 1) <= DISTRIBUTION_SUM_TOLERANCE;
+}
+
 function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAnswer): ModelAnswer {
   const base = { backend: BACKEND, modelVersion };
   const { question } = point;
@@ -162,6 +192,12 @@ function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAn
     if (!question.options.includes(answer.choice)) {
       throw new ModelCallError(
         `decide/jev: choice "${answer.choice}" for "${point.id}" is not one of its question's options`,
+        base,
+      );
+    }
+    if (!isValidProbabilityDistribution(answer.probabilities, question.options)) {
+      throw new ModelCallError(
+        `decide/jev: probabilities for "${point.id}" are not a valid distribution over its question's options`,
         base,
       );
     }

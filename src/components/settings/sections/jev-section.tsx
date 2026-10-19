@@ -8,6 +8,7 @@ import { Toggle } from "@/components/atoms";
 import { Button } from "@/components/ui/button";
 import { SectionHeading, TextField } from "@/components/settings/settings-fields";
 import type { SettingsForm } from "@/components/settings/use-settings-form";
+import type { EditableSettings } from "@/components/settings/settings-types";
 import type { JevHealth } from "@/lib/decide/backends/jev-fallback";
 
 /** A registered decide() point and the state fields it would disclose to a model backend — the same
@@ -49,26 +50,38 @@ export function JevSection({
 
   async function clearKey() {
     setClearing(true);
+    // Stage the cleared values BEFORE the request resolves, not after: the global Save button reads
+    // `draft` synchronously the moment it's clicked, so a Save fired while this PATCH is still in
+    // flight would otherwise still see the stale `jevEnabled: true` (plus any replacement key typed
+    // in the meantime) and resend it right after the clear succeeds — restoring the credential and
+    // re-enabling Jev the instant this button reported it revoked. Rolled back on failure below.
+    const previousEnabled = draft.jevEnabled;
+    const previousApiKey = draft.jevApiKey;
+    set("jevEnabled", false);
+    set("jevApiKey", "");
     try {
       // jevEnabled rides along: checkJevConfigured (settings-patch.ts) refuses `enabled && !apiKey`,
       // so clearing the key while Jev is still on would otherwise 400 the whole PATCH — exactly the
       // revoke-a-compromised-key case this button exists for.
       const res = await form.patchSettings({ jevApiKey: null, jevEnabled: false });
-      if (!res.ok) {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `Clear failed (${res.status})`);
-      }
-      set("jevEnabled", false);
-      // A replacement key typed before clearing must not survive the revoke — otherwise the next
-      // ordinary Save resubmits it through settingsPatchBody and silently restores what this button
-      // just told the operator was cleared.
-      set("jevApiKey", "");
+      const body = (await res.json().catch(() => null)) as {
+        settings?: EditableSettings;
+        error?: string;
+      } | null;
+      if (!res.ok) throw new Error(body?.error ?? `Clear failed (${res.status})`);
+      // Fold the server's own stored row into the baseline everything diffs against — without this,
+      // `baseline.jevEnabled` stays whatever it was before the clear and the Jev section reads as
+      // permanently unsaved even though the server already holds the cleared value.
+      if (body?.settings) form.syncBaseline(body.settings);
       // `apiKeyConfigured` is an SSR-seeded prop (page.tsx), not form state — without this the
       // "stored key" affordance (copy + the Clear button itself) stays stuck on even though the
       // server no longer holds a key, and re-enabling the toggle would 400 on save with no warning.
       router.refresh();
       toast.success("Jev API key cleared");
     } catch (err) {
+      // Roll back the optimistic clear so a toggle/key the operator had staged isn't silently lost.
+      set("jevEnabled", previousEnabled);
+      set("jevApiKey", previousApiKey);
       toast.error(err instanceof Error ? err.message : "Clear failed");
     } finally {
       setClearing(false);

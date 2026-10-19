@@ -9,6 +9,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { JevSection } from "@/components/settings/sections/jev-section";
 import type { SettingsForm } from "@/components/settings/use-settings-form";
+import type { EditableSettings } from "@/components/settings/settings-types";
 import type { JevHealth } from "@/lib/decide/backends/jev-fallback";
 
 const refresh = vi.fn();
@@ -20,13 +21,16 @@ function renderSection(opts: {
   disclosure?: { id: string; stateFields: string[] }[];
   health?: JevHealth;
   patchSettings?: SettingsForm["patchSettings"];
+  syncBaseline?: SettingsForm["syncBaseline"];
 } = {}) {
   const set = vi.fn();
   const patchSettings = opts.patchSettings ?? vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
+  const syncBaseline = opts.syncBaseline ?? vi.fn();
   const form = {
     draft: { jevEnabled: false, jevApiKey: "", jevModel: "" },
     set,
     patchSettings,
+    syncBaseline,
   } as unknown as SettingsForm;
   render(
     <JevSection
@@ -36,7 +40,7 @@ function renderSection(opts: {
       health={opts.health}
     />,
   );
-  return { set, patchSettings };
+  return { set, patchSettings, syncBaseline };
 }
 
 afterEach(() => {
@@ -107,6 +111,60 @@ describe("JevSection — the key is never round-tripped", () => {
     const { set } = renderSection({ apiKeyConfigured: true });
     fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
     await vi.waitFor(() => expect(set).toHaveBeenCalledWith("jevEnabled", false));
+  });
+
+  it("stages jevEnabled/jevApiKey to cleared values before the PATCH resolves, not after", async () => {
+    // A Save fired while the clear is still in flight reads `draft` synchronously — staging the
+    // clear only on success would let that Save resend the stale enabled+key and silently undo
+    // the revoke the instant this PATCH reports it succeeded.
+    let resolvePatch!: (response: Response) => void;
+    const patchSettings = vi.fn(
+      () => new Promise<Response>((resolve) => { resolvePatch = resolve; }),
+    );
+    const { set } = renderSection({ apiKeyConfigured: true, patchSettings });
+
+    fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
+
+    expect(set).toHaveBeenCalledWith("jevEnabled", false);
+    expect(set).toHaveBeenCalledWith("jevApiKey", "");
+
+    resolvePatch(new Response("{}", { status: 200 }));
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalled());
+  });
+
+  it("syncs the form baseline from the server's stored settings once the clear succeeds", async () => {
+    const stored = { jevEnabled: false, jevModel: "jev-1.13.0" } as unknown as EditableSettings;
+    const patchSettings = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ settings: stored }), { status: 200 }));
+    const { syncBaseline } = renderSection({ apiKeyConfigured: true, patchSettings });
+
+    fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
+
+    await vi.waitFor(() => expect(syncBaseline).toHaveBeenCalledWith(stored));
+  });
+
+  it("rolls back the staged clear to the pre-clear draft when the PATCH fails", async () => {
+    const patchSettings = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
+    const set = vi.fn();
+    const syncBaseline = vi.fn();
+    const form = {
+      // A replacement key typed before the (failing) clear — rollback must restore exactly this,
+      // not leave the field blanked out from under the operator.
+      draft: { jevEnabled: true, jevApiKey: "sk-replacement", jevModel: "jev-1.13.0" },
+      set,
+      patchSettings,
+      syncBaseline,
+    } as unknown as SettingsForm;
+    render(<JevSection form={form} apiKeyConfigured disclosure={[]} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
+
+    await vi.waitFor(() => expect(set).toHaveBeenCalledWith("jevEnabled", true));
+    expect(set).toHaveBeenCalledWith("jevApiKey", "sk-replacement");
+    expect(syncBaseline).not.toHaveBeenCalled();
   });
 
   it("refreshes the router once the clear succeeds, so the SSR-seeded apiKeyConfigured prop stops reading stale", async () => {

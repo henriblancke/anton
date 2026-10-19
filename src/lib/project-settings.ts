@@ -908,7 +908,9 @@ export interface JevSettingsConfig {
 export function resolveJevConfig(settings: ProjectSettings): JevSettingsConfig | undefined {
   if (!settings.jevEnabled) return undefined;
   const { jevApiKey: apiKey, jevModel: model } = settings;
-  if (!apiKey || !model || !isPinnedJevModel(model)) return undefined;
+  // `apiKey?.trim()` catches a whitespace-only key that predates the write-time boundary check
+  // (boundedSecret) ever having rejected it — same defense-in-depth as the pin re-check above.
+  if (!apiKey?.trim() || !model || !isPinnedJevModel(model)) return undefined;
   return { apiKey, model };
 }
 
