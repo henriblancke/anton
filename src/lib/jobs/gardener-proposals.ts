@@ -20,7 +20,12 @@ import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
 import type { ProposalTrackRecord } from "../gardener/autonomy";
-import { detectBoard, detectDeferredRejudgements, indexWorkBoard } from "../gardener/detect";
+import {
+  detectBoard,
+  detectDeferredRejudgements,
+  detectUnlinkedOutcomes,
+  indexWorkBoard,
+} from "../gardener/detect";
 import {
   arbitrateEmission,
   emitProposals,
@@ -254,12 +259,13 @@ export async function fileGardenerProposals(
   // where the board is — rather than read again by the walks that consult it.
   const record = proposalTrackRecord(board);
   const now = scope.clock.now();
-  // Board SHAPE, then the one RE-JUDGEMENT (anton-30vo) — appended rather than merged into
-  // `detectBoard`, because it asks about a decision anton's own tiers made rather than about how the
-  // board hangs together (gardener/detect.ts).
+  // Board SHAPE, then the UNLINKED OUTCOMES (anton-vie0k) and the one RE-JUDGEMENT (anton-30vo) —
+  // both appended rather than merged into `detectBoard`, because neither asks about the board's
+  // shape: one asks about a decision anton's own tiers made, the other about a label the outcome
+  // contract predates (gardener/detect.ts).
   //
-  // The order is the write budget's. Both lists are internally deterministic, so concatenating them
-  // keeps two passes over an unchanged board agreeing on which claims fit under
+  // The order is the write budget's. All three lists are internally deterministic, so concatenating
+  // them keeps two passes over an unchanged board agreeing on which claims fit under
   // `MAX_PROPOSALS_PER_PASS` — and putting the re-judgements last means a neglected board spends its
   // cap on work that is still live before it spends any on work parked a quarter ago. What overflows
   // is not lost: the next patrol files it.
@@ -267,9 +273,11 @@ export async function fileGardenerProposals(
   // Every pass, on the patrol's own cadence, because the claim is a duration and costs no session to
   // measure. Re-asking nightly is not noise either: an ask already standing suppresses on its
   // fingerprint, and a declined one holds for the stated window (detections.ts `REASK_AFTER_DAYS`).
+  const index = indexWorkBoard(board);
   const detections = [
     ...detectBoard({ board, hygiene: { findings: input.findings }, now }),
-    ...detectDeferredRejudgements(indexWorkBoard(board), now),
+    ...detectUnlinkedOutcomes(index),
+    ...detectDeferredRejudgements(index, now),
   ];
   await ctx.heartbeat();
   // Re-check RIGHT before the first write. The board read and detection above take real time, and a

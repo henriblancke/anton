@@ -54,11 +54,14 @@ const ORPHAN_FINDING: HygieneFinding = {
   detail: "named by a commit (abc1234) but still open",
 };
 
+// `outcome:` labelled by default so a fixture bead stays out of the unlinked-outcome detector
+// unless a test means to exercise it — that detector has its own suite (unlinked-outcome.test.ts).
 const bead = (id: string, o: Partial<Bead> = {}): Bead => ({
   id,
   title: id,
   status: "open",
   issue_type: "task",
+  labels: ["outcome:test"],
   ...o,
 });
 
@@ -225,6 +228,21 @@ describe("fileGardenerProposals", () => {
       "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
     );
     expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("asks about a run target carrying no outcome:<id> label (anton-vie0k)", async () => {
+    // t-4 here carries no `outcome:` label, unlike the default `bead()` fixture — the composed
+    // `detectUnlinkedOutcomes` has to be the one that notices, since no hygiene finding can.
+    listMock.mockResolvedValue([bead("t-4", { title: "untracked", labels: [] })]);
+    const scope = fakeScope(REPO);
+
+    expect(await file(scope, [])).toBe(1);
+    const [, draft] = createMock.mock.calls[0];
+    expect(draft.title).toContain("t-4");
+    expect(draft.labels?.some((l) => l.startsWith("gardener:unlinked-outcome:"))).toBe(true);
+    // The move is the approver's: the tier only asks, it never labels t-4 itself.
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(scope.nudged).toEqual([scope.project]);
   });
 });
 
