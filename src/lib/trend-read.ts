@@ -231,23 +231,31 @@ function wholeLifeInvocationRows(db: AntonDb, projectId: string): Promise<Claude
 }
 
 /**
- * Tokens and USD per invocation ROW, phase-classified by {@link ledgerPhase} — never grouped by
- * invocation first, matching {@link PhaseWeekTotals.invocations}'s own "rows, never jobs" grain. A
- * row `ledgerPhase` cannot classify (an unknown job type, a row from before `step_handler` existed)
- * is dropped: an unattributed row has no phase to bucket it under, and `phaseSpendByWeek` carries no
- * "unattributed" bucket to put it in.
+ * Tokens and USD per invocation ROW, phase-classified by {@link ledgerPhase} — one point per row, not
+ * per job, matching {@link PhaseWeekTotals}'s own token/dollar grain: a sidecar row's tokens and
+ * dollars are real spend and must sum in beside its primary's. Each point carries its REAL
+ * invocation's key, grouped via {@link groupInvocations}, so {@link phaseSpendByWeek} can count real
+ * invocations rather than rows — an opus invocation's haiku sidecar shares its primary's key, so the
+ * pair reads as one invocation, not two (P2, PR #348 review). A row `ledgerPhase` cannot classify (an
+ * unknown job type, a row from before `step_handler` existed) is dropped: an unattributed row has no
+ * phase to bucket it under, and `phaseSpendByWeek` carries no "unattributed" bucket to put it in.
  */
 function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint[] {
   const out: PhaseSpendPoint[] = [];
-  for (const row of rows) {
-    const phase = ledgerPhase(row);
-    if (phase === undefined) continue;
-    out.push({
-      atMs: row.recordedAt.getTime(),
-      phase,
-      tokens: totalTokens(row),
-      usd: costOf(row.modelReported, row, row.endpointHost),
-    });
+  let invocationIndex = 0;
+  for (const fact of groupInvocations(rows)) {
+    const invocationKey = `inv:${invocationIndex++}`;
+    for (const row of fact.rows) {
+      const phase = ledgerPhase(row);
+      if (phase === undefined) continue;
+      out.push({
+        atMs: row.recordedAt.getTime(),
+        phase,
+        tokens: totalTokens(row),
+        usd: costOf(row.modelReported, row, row.endpointHost),
+        invocationKey,
+      });
+    }
   }
   return out;
 }
@@ -382,13 +390,22 @@ export async function trendSeries(
 
   const board = await listAllBeads(project);
 
+  // `cohortFeatures` already decided which run targets belong to THIS window (activity or delivery
+  // inside it) — a feature with neither has no place in the cohort's median/runaway verdicts, even
+  // though `wholeLifeInvocationRows` still carries its old rows for every OTHER cohort member's
+  // whole-life fold (P1, PR #348 review).
+  const cohortBeadIds = new Set(features.map((f) => f.beadId));
+  const reviewLoopInvocations = reviewLoopInvocationPoints(wholeLifeRows, board).filter((p) =>
+    cohortBeadIds.has(p.beadId),
+  );
+
   const input: TrendSeriesInput = {
     quality: { scoredRuns, reviewRounds, deliveredFeatures, recordingStartedAtMs: recordingStart },
     costFeatures,
     phaseSpend: phaseSpendPoints(windowRows),
     runCauses,
     invocationStamps: invocationStampPoints(wholeLifeRows),
-    reviewLoopInvocations: reviewLoopInvocationPoints(wholeLifeRows, board),
+    reviewLoopInvocations,
   };
   return foldTrendSeries(input, weeks, { nowMs });
 }

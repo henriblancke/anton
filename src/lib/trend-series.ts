@@ -740,11 +740,18 @@ export interface PhaseSpendPoint {
   tokens: number;
   /** What it cost, or undefined when anton could not price it — never 0. */
   usd: number | undefined;
+  /**
+   * Groups the rows written by the same REAL invocation — a sidecar row shares its primary's key.
+   * {@link phaseSpendByWeek} counts distinct keys for {@link PhaseWeekTotals.invocations}, never
+   * rows, so an opus invocation and its haiku sidecar read as one invocation, not two (P2, PR #348
+   * review). Tokens and usd still sum every row regardless of key — those are real spend either way.
+   */
+  invocationKey: string;
 }
 
 /** One phase's totals for one ISO week. */
 export interface PhaseWeekTotals {
-  /** Invocation rows folded in — never jobs; see the module header. */
+  /** Real invocations folded in, deduped by {@link PhaseSpendPoint.invocationKey} — never rows. */
   invocations: number;
   tokens: number;
   /** Σ usd over the rows anton could price, or undefined when it priced none of them. */
@@ -763,7 +770,7 @@ export function phaseSpendByWeek(
   weekKeys: readonly string[],
 ): Map<string, Record<string, PhaseWeekTotals>> {
   const weekSet = new Set(weekKeys);
-  const buckets = new Map<string, Map<string, PhaseWeekTotals>>();
+  const buckets = new Map<string, Map<string, { tokens: number; usd: number | undefined; unpricedRows: number; invocationKeys: Set<string> }>>();
 
   for (const row of rows) {
     const week = isoWeekKey(row.atMs);
@@ -776,17 +783,28 @@ export function phaseSpendByWeek(
     }
     let totals = phases.get(row.phase);
     if (!totals) {
-      totals = { invocations: 0, tokens: 0, usd: undefined, unpricedRows: 0 };
+      totals = { tokens: 0, usd: undefined, unpricedRows: 0, invocationKeys: new Set() };
       phases.set(row.phase, totals);
     }
-    totals.invocations += 1;
+    totals.invocationKeys.add(row.invocationKey);
     totals.tokens += row.tokens;
     if (row.usd === undefined) totals.unpricedRows += 1;
     else totals.usd = (totals.usd ?? 0) + row.usd;
   }
 
   const out = new Map<string, Record<string, PhaseWeekTotals>>();
-  for (const [week, phases] of buckets) out.set(week, Object.fromEntries(phases));
+  for (const [week, phases] of buckets) {
+    const phaseTotals: Record<string, PhaseWeekTotals> = {};
+    for (const [phase, totals] of phases) {
+      phaseTotals[phase] = {
+        invocations: totals.invocationKeys.size,
+        tokens: totals.tokens,
+        usd: totals.usd,
+        unpricedRows: totals.unpricedRows,
+      };
+    }
+    out.set(week, phaseTotals);
+  }
   return out;
 }
 

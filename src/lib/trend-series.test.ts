@@ -264,6 +264,19 @@ describe("modelChangeMarkers", () => {
     const rows = [stamp(WEEK_1_MONDAY, "sonnet-5"), stamp(WEEK_1_MONDAY + 7 * DAY, "sonnet-5")];
     expect(modelChangeMarkers(rows, [WEEK_1, WEEK_2])).toEqual([]);
   });
+
+  it("seeds the carry-forward from a stamp strictly before the window, firing in the first requested week", () => {
+    // The only predecessor to WEEK_1's majority landed a week before WEEK_1 even starts — without
+    // seeding from it, WEEK_1 would read as sonnet-5's first-ever value rather than a change (P2, PR
+    // #348 review).
+    const rows = [
+      stamp(WEEK_1_MONDAY - 7 * DAY, "sonnet-4-5"),
+      stamp(WEEK_1_MONDAY, "sonnet-5"),
+      stamp(WEEK_1_MONDAY + DAY, "sonnet-5"),
+    ];
+    const markers = modelChangeMarkers(rows, [WEEK_1]);
+    expect(markers).toEqual([{ kind: "model", week: WEEK_1, before: "sonnet-4-5", after: "sonnet-5" }]);
+  });
 });
 
 describe("promptChangeMarkers", () => {
@@ -321,6 +334,15 @@ describe("promptChangeMarkers", () => {
       { kind: "prompt", week: WEEK_2, before: "digest-implement", after: "digest-implement-2" },
     ]);
   });
+
+  it("seeds each agent's lineage from a digest strictly before the window, firing in the first requested week", () => {
+    const rows = [
+      stamp(WEEK_1_MONDAY - 7 * DAY, "digest-a", "nextjs"),
+      stamp(WEEK_1_MONDAY, "digest-b", "nextjs"),
+    ];
+    const markers = promptChangeMarkers(rows, [WEEK_1]);
+    expect(markers).toEqual([{ kind: "prompt", week: WEEK_1, before: "digest-a", after: "digest-b" }]);
+  });
 });
 
 describe("skillChangeMarkers", () => {
@@ -340,6 +362,12 @@ describe("skillChangeMarkers", () => {
     const rows = [stamp(WEEK_1_MONDAY, "review", "sd-1"), stamp(WEEK_1_MONDAY + 7 * DAY, "review-fix", "sd-2")];
     expect(skillChangeMarkers(rows, [WEEK_1, WEEK_2])).toEqual([]);
   });
+
+  it("seeds each skill's lineage from a digest strictly before the window, firing in the first requested week", () => {
+    const rows = [stamp(WEEK_1_MONDAY - 7 * DAY, "review", "sd-1"), stamp(WEEK_1_MONDAY, "review", "sd-2")];
+    const markers = skillChangeMarkers(rows, [WEEK_1]);
+    expect(markers).toEqual([{ kind: "skill", week: WEEK_1, before: "sd-1", after: "sd-2" }]);
+  });
 });
 
 describe("releaseChangeMarkers", () => {
@@ -349,6 +377,12 @@ describe("releaseChangeMarkers", () => {
     const rows = [stamp(WEEK_1_MONDAY, "0.5.1 (25ec011)"), stamp(WEEK_1_MONDAY + 7 * DAY, "0.5.2 (71092ab)")];
     const markers = releaseChangeMarkers(rows, [WEEK_1, WEEK_2]);
     expect(markers).toEqual([{ kind: "release", week: WEEK_2, before: "0.5.1", after: "0.5.2" }]);
+  });
+
+  it("seeds the release lineage from a version strictly before the window, firing in the first requested week", () => {
+    const rows = [stamp(WEEK_1_MONDAY - 7 * DAY, "0.5.1 (25ec011)"), stamp(WEEK_1_MONDAY, "0.5.2 (71092ab)")];
+    const markers = releaseChangeMarkers(rows, [WEEK_1]);
+    expect(markers).toEqual([{ kind: "release", week: WEEK_1, before: "0.5.1", after: "0.5.2" }]);
   });
 
   it("stays silent on a revision bump under an unchanged release", () => {
@@ -459,19 +493,20 @@ describe("costByWeek", () => {
 });
 
 describe("phaseSpendByWeek", () => {
-  const row = (atMs: number, phase: string, tokens: number, usd: number | undefined): PhaseSpendPoint => ({
-    atMs,
-    phase,
-    tokens,
-    usd,
-  });
+  const row = (
+    atMs: number,
+    phase: string,
+    tokens: number,
+    usd: number | undefined,
+    invocationKey: string,
+  ): PhaseSpendPoint => ({ atMs, phase, tokens, usd, invocationKey });
 
   it("sums tokens and usd per phase per week, keeping phases separate", () => {
     const rows = [
-      row(WEEK_1_MONDAY, "implement", 100, 1),
-      row(WEEK_1_MONDAY + DAY, "implement", 50, 0.5),
-      row(WEEK_1_MONDAY + DAY, "self-review", 20, 0.2),
-      row(WEEK_1_MONDAY + 7 * DAY, "implement", 10, 0.1),
+      row(WEEK_1_MONDAY, "implement", 100, 1, "inv-1"),
+      row(WEEK_1_MONDAY + DAY, "implement", 50, 0.5, "inv-2"),
+      row(WEEK_1_MONDAY + DAY, "self-review", 20, 0.2, "inv-3"),
+      row(WEEK_1_MONDAY + 7 * DAY, "implement", 10, 0.1, "inv-4"),
     ];
     const byWeek = phaseSpendByWeek(rows, [WEEK_1, WEEK_2]);
     expect(byWeek.get(WEEK_1)).toEqual({
@@ -484,7 +519,10 @@ describe("phaseSpendByWeek", () => {
   });
 
   it("reports usd as a floor when some rows in a phase could not be priced", () => {
-    const rows = [row(WEEK_1_MONDAY, "implement", 100, 1), row(WEEK_1_MONDAY + DAY, "implement", 50, undefined)];
+    const rows = [
+      row(WEEK_1_MONDAY, "implement", 100, 1, "inv-1"),
+      row(WEEK_1_MONDAY + DAY, "implement", 50, undefined, "inv-2"),
+    ];
     const byWeek = phaseSpendByWeek(rows, [WEEK_1]);
     expect(byWeek.get(WEEK_1)).toEqual({
       implement: { invocations: 2, tokens: 150, usd: 1, unpricedRows: 1 },
@@ -492,8 +530,23 @@ describe("phaseSpendByWeek", () => {
   });
 
   it("is absent for a week with no invocation at all", () => {
-    const byWeek = phaseSpendByWeek([row(WEEK_1_MONDAY, "implement", 100, 1)], [WEEK_1, WEEK_2]);
+    const byWeek = phaseSpendByWeek([row(WEEK_1_MONDAY, "implement", 100, 1, "inv-1")], [WEEK_1, WEEK_2]);
     expect(byWeek.has(WEEK_2)).toBe(false);
+  });
+
+  it("counts a primary row and its haiku sidecar as ONE invocation, summing both rows' tokens and usd", () => {
+    // Essentially every real opus invocation also writes a haiku sidecar row under the same
+    // invocation — a per-row count would read this as two invocations instead of one (P2, PR #348
+    // review).
+    const rows = [
+      row(WEEK_1_MONDAY, "implement", 100, 1, "inv-1"),
+      row(WEEK_1_MONDAY, "implement", 20, 0.02, "inv-1"),
+      row(WEEK_1_MONDAY, "implement", 50, 0.5, "inv-2"),
+    ];
+    const byWeek = phaseSpendByWeek(rows, [WEEK_1]);
+    expect(byWeek.get(WEEK_1)).toEqual({
+      implement: { invocations: 2, tokens: 170, usd: 1.52, unpricedRows: 0 },
+    });
   });
 });
 
@@ -625,7 +678,7 @@ describe("trendSeries", () => {
         recordingStartedAtMs: undefined,
       },
       costFeatures: [{ delivered: true, deliveredAtMs: WEEK_1_MONDAY, usd: 10 }],
-      phaseSpend: [{ atMs: WEEK_1_MONDAY, phase: "implement", tokens: 100, usd: 1 }],
+      phaseSpend: [{ atMs: WEEK_1_MONDAY, phase: "implement", tokens: 100, usd: 1, invocationKey: "inv-1" }],
       runCauses: [{ settledAtMs: WEEK_1_MONDAY, cause: "quota" }],
     };
 

@@ -196,7 +196,10 @@ describe("trendSeries", () => {
   });
 
   it("surfaces a model change marker, and counts self-review invocations into the review loop, off the same claude_invocations stamps", async () => {
-    fakeBoard([]);
+    // feat-1 must be on the board for cohortFeatures to admit it as a candidate — reviewLoop is now
+    // restricted to the selected cohort (P1, PR #348 review), so an id the board does not recognize
+    // would never reach it.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature" })]);
     const weekTwoKey = isoWeekKey(WEEK_MONDAY + 7 * DAY);
     await t.db.insert(schema.claudeInvocations).values([
       {
@@ -244,7 +247,8 @@ describe("trendSeries", () => {
     // feat-1 never entered self-review or PR-fix at all — its only invocation is an `implement`
     // row. Dropping it from the fold entirely (rather than giving it a zero-count bucket) would
     // exclude a legitimate zero-PR-fix observation from the cohort's median (P2, PR #348 review).
-    fakeBoard([]);
+    // feat-1 must be on the board for cohortFeatures to admit it into the cohort in the first place.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature" })]);
     await t.db.insert(schema.claudeInvocations).values({
       id: "inv-implement-only",
       projectId: t.projectId,
@@ -270,7 +274,8 @@ describe("trendSeries", () => {
   });
 
   it("groups a sidecar row into its real invocation before counting change markers and the review loop", async () => {
-    fakeBoard([]);
+    // feat-1 must be on the board for cohortFeatures to admit it as a candidate.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature" })]);
     const weekTwoKey = isoWeekKey(WEEK_MONDAY + 7 * DAY);
 
     // Essentially every real invocation also writes a haiku sidecar row under the same
@@ -362,6 +367,120 @@ describe("trendSeries", () => {
       loopInvocations: 4,
       runaway: false,
     });
+  });
+
+  it("normalizes a ticket-phase invocation and a self-review invocation onto the same feature before counting the review loop", async () => {
+    // A real epic/ticket pair: `task-1`'s nearest run target is `feat-1`. `execute-epic-ticket.ts`
+    // stamps a ticket-phase invocation with the child ticket's own id, while `review-gate.ts` stamps
+    // self-review with the run TARGET's id — without `currentRunTargetOf` normalizing both onto
+    // `feat-1`, this would split into two buckets and manufacture an artificial zero-loop observation
+    // for `task-1` (P1, PR #348 review).
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature" }), bead({ id: "task-1", parent: "feat-1" })]);
+    await t.db.insert(schema.claudeInvocations).values([
+      {
+        id: "inv-ticket",
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "implement",
+        runId: "r1",
+        beadId: "task-1",
+        modelRequested: "sonnet-5",
+        modelReported: "sonnet-5",
+        outcome: "ok",
+        recordedAt: new Date(WEEK_MONDAY),
+      },
+      {
+        id: "inv-self-review",
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "review",
+        runId: "r1",
+        beadId: "feat-1",
+        modelRequested: "sonnet-5",
+        modelReported: "sonnet-5",
+        outcome: "ok",
+        recordedAt: new Date(WEEK_MONDAY),
+      },
+    ]);
+
+    const series = await trendSeries(t.db, t.projectId, 1, { nowMs: NOW_MS });
+    expect(series?.reviewLoop).toEqual([
+      { beadId: "feat-1", selfReviewInvocations: 1, prFixInvocations: 0, loopInvocations: 1, runaway: false },
+    ]);
+  });
+
+  it("folds a feature's review loop over its WHOLE life, never truncated to the requested window", async () => {
+    // feat-1's self-review ran 10 weeks before the 1-week window, but it DELIVERED inside the
+    // window — cohortFeatures admits it on delivery alone, and its review loop must still count the
+    // old self-review rather than a `since`-bound read silently dropping it (P1, PR #348 review).
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature" })]);
+    await t.db.insert(schema.claudeInvocations).values({
+      id: "inv-old-review",
+      projectId: t.projectId,
+      jobType: "execute-epic",
+      step: "implement",
+      stepHandler: "review",
+      runId: "r0",
+      beadId: "feat-1",
+      modelRequested: "sonnet-5",
+      modelReported: "sonnet-5",
+      outcome: "ok",
+      recordedAt: new Date(WEEK_MONDAY - 10 * 7 * DAY),
+    });
+    await t.db.insert(schema.runs).values({
+      id: "run-feat-1",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      branch: "anton/feat-1",
+      status: "done",
+      startedAt: new Date(WEEK_MONDAY),
+      endedAt: new Date(WEEK_MONDAY),
+      updatedAt: new Date(WEEK_MONDAY),
+    });
+
+    const series = await trendSeries(t.db, t.projectId, 1, { nowMs: NOW_MS });
+    expect(series?.reviewLoop.find((p) => p.beadId === "feat-1")).toEqual({
+      beadId: "feat-1",
+      selfReviewInvocations: 1,
+      prFixInvocations: 0,
+      loopInvocations: 1,
+      runaway: false,
+    });
+  });
+
+  it("excludes a feature's review loop once neither its activity nor its delivery falls in the requested window", async () => {
+    // Every invocation AND the only recorded run for feat-old predate the 1-week window by 10 weeks —
+    // cohortFeatures will not admit it, so its review loop must not leak into the CURRENT cohort's
+    // median/runaway verdicts (P1, PR #348 review: "restrict review loops to the selected cohort").
+    fakeBoard([bead({ id: "feat-old", issue_type: "feature" })]);
+    await t.db.insert(schema.claudeInvocations).values({
+      id: "inv-ancient-review",
+      projectId: t.projectId,
+      jobType: "execute-epic",
+      step: "implement",
+      stepHandler: "pr-fix",
+      runId: "r-old",
+      beadId: "feat-old",
+      modelRequested: "sonnet-5",
+      modelReported: "sonnet-5",
+      outcome: "ok",
+      recordedAt: new Date(WEEK_MONDAY - 10 * 7 * DAY),
+    });
+    await t.db.insert(schema.runs).values({
+      id: "run-feat-old",
+      projectId: t.projectId,
+      epicBeadId: "feat-old",
+      branch: "anton/feat-old",
+      status: "done",
+      startedAt: new Date(WEEK_MONDAY - 10 * 7 * DAY),
+      endedAt: new Date(WEEK_MONDAY - 10 * 7 * DAY),
+      updatedAt: new Date(WEEK_MONDAY - 10 * 7 * DAY),
+    });
+
+    const series = await trendSeries(t.db, t.projectId, 1, { nowMs: NOW_MS });
+    expect(series?.reviewLoop.find((p) => p.beadId === "feat-old")).toBeUndefined();
   });
 
   it("stays silent on an agent-tagged feature's own describe pass, whose narrower prompt is not an edit", async () => {
