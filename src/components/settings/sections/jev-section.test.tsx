@@ -11,6 +11,8 @@ import { JevSection } from "@/components/settings/sections/jev-section";
 import type { SettingsForm } from "@/components/settings/use-settings-form";
 import type { JevHealth } from "@/lib/decide/backends/jev-fallback";
 
+const refresh = vi.fn();
+vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
 function renderSection(opts: {
@@ -37,7 +39,10 @@ function renderSection(opts: {
   return { set, patchSettings };
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  refresh.mockClear();
+});
 
 describe("JevSection — opt-in is explicit", () => {
   it("renders an off-by-default toggle that stages jevEnabled", () => {
@@ -102,6 +107,12 @@ describe("JevSection — the key is never round-tripped", () => {
     const { set } = renderSection({ apiKeyConfigured: true });
     fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
     await vi.waitFor(() => expect(set).toHaveBeenCalledWith("jevEnabled", false));
+  });
+
+  it("refreshes the router once the clear succeeds, so the SSR-seeded apiKeyConfigured prop stops reading stale", async () => {
+    renderSection({ apiKeyConfigured: true });
+    fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalled());
   });
 });
 

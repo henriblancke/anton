@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 
 import { Toggle } from "@/components/atoms";
@@ -44,6 +45,7 @@ export function JevSection({
 }) {
   const { draft, set } = form;
   const [clearing, setClearing] = useState(false);
+  const router = useRouter();
 
   async function clearKey() {
     setClearing(true);
@@ -57,6 +59,10 @@ export function JevSection({
         throw new Error(body?.error ?? `Clear failed (${res.status})`);
       }
       set("jevEnabled", false);
+      // `apiKeyConfigured` is an SSR-seeded prop (page.tsx), not form state — without this the
+      // "stored key" affordance (copy + the Clear button itself) stays stuck on even though the
+      // server no longer holds a key, and re-enabling the toggle would 400 on save with no warning.
+      router.refresh();
       toast.success("Jev API key cleared");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Clear failed");

@@ -59,6 +59,21 @@ function assertPinnedModel(model: string): void {
   }
 }
 
+/**
+ * A systemone failure the retry loop should NOT spend its one retry on: a bad key or malformed
+ * request (4xx) and a reply that fails schema validation or the pin check all fail the exact same
+ * way on a second attempt, unlike a network blip, a timeout, or a 5xx — those stay plain `Error`s
+ * and keep the default retry.
+ */
+class JevCallError extends Error {
+  readonly retryable: boolean;
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.name = "JevCallError";
+    this.retryable = retryable;
+  }
+}
+
 const choiceAnswerSchema = z.object({
   type: z.literal("choice"),
   choice: z.string(),
@@ -169,9 +184,12 @@ function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAn
 }
 
 /**
- * One POST to `/v1/systemone`, parsed and Zod-validated. Throws a plain `Error` on a non-2xx
- * response, a network failure, or a body that fails schema validation — the caller (the returned
- * `ask`) is what attaches backend/model attribution and decides whether to retry.
+ * One POST to `/v1/systemone`, parsed and Zod-validated. A network failure (fetch itself
+ * rejecting, including an aborted/timed-out signal) surfaces as a plain `Error` and stays
+ * retryable by default; a non-2xx response, a reply that fails schema validation, or an unpinned
+ * model surfaces as a {@link JevCallError} carrying whether a retry could possibly help. The
+ * caller (the returned `ask`) is what attaches backend/model attribution and decides whether to
+ * retry.
  */
 async function callSystemOne(
   config: JevConfig,
@@ -195,18 +213,34 @@ async function callSystemOne(
   });
 
   if (!response.ok) {
-    throw new Error(`decide/jev: systemone responded ${response.status} for "${point.id}"`);
+    // A 4xx (bad key, malformed request) repeats identically on retry; only 5xx/other server
+    // trouble is the kind of transient failure the one retry exists to absorb.
+    const retryable = response.status >= 500;
+    throw new JevCallError(
+      `decide/jev: systemone responded ${response.status} for "${point.id}"`,
+      retryable,
+    );
   }
 
   const body: unknown = await response.json();
-  const parsed = systemOneResponseSchema.parse(body);
+  const parseResult = systemOneResponseSchema.safeParse(body);
+  if (!parseResult.success) {
+    // A reply that doesn't match the documented shape will fail the same way again — not worth the
+    // retry's budget.
+    throw new JevCallError(
+      `decide/jev: systemone reply for "${point.id}" failed schema validation: ${parseResult.error.message}`,
+      false,
+    );
+  }
+  const parsed = parseResult.data;
   // The pin is only real if the answer is checked against it — an unpinned or substituted model
   // (e.g. "jev-latest") would otherwise land in the decision log as the configured version, defeating
-  // the pinning guarantee this backend exists to enforce. Treated as an ordinary call failure (not a
-  // `ModelCallError`) so it goes through the same retry-then-fallback path as a network error.
+  // the pinning guarantee this backend exists to enforce. Non-retryable: a misconfigured/substituted
+  // model on one call will be the same model on the next.
   if (parsed.model !== config.model) {
-    throw new Error(
+    throw new JevCallError(
       `decide/jev: systemone answered with model "${parsed.model}", expected pinned "${config.model}" for "${point.id}"`,
+      false,
     );
   }
   return parsed;
@@ -240,6 +274,11 @@ export function jevBackend(config: JevConfig): ModelCaller {
       } catch (error) {
         if (error instanceof ModelCallError) throw error;
         lastError = error;
+        // A non-retryable failure (bad key, malformed request, a reply that fails schema
+        // validation or the pin check) fails the exact same way on the second attempt — skip
+        // straight to the fallback instead of spending the retry's timeout budget on a call that
+        // cannot succeed.
+        if (error instanceof JevCallError && !error.retryable) break;
       } finally {
         clearTimeout(timer);
       }

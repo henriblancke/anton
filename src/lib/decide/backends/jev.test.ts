@@ -371,4 +371,44 @@ describe("jevBackend — retry and failure (one retry, no more)", () => {
   it("defaults to a short timeout suited to Jev's own ~70-500ms response figures", () => {
     expect(DEFAULT_JEV_TIMEOUT_MS).toBeLessThan(30_000);
   });
+
+  it("does not retry a 401 — a bad key fails the same way twice", async () => {
+    const fetchImpl = vi.fn(async () => new Response("unauthorized", { status: 401 }));
+    const ask = jevBackend({ apiKey: "bad-key", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a 400 — a malformed request fails the same way twice", async () => {
+    const fetchImpl = vi.fn(async () => new Response("bad request", { status: 400 }));
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry a reply that fails schema validation", async () => {
+    const fetchImpl = fakeFetch({ model: PINNED_MODEL, answers: { is_urgent: { type: "noul", noul: "not-a-number" } } });
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not retry an unpinned/substituted model in the reply", async () => {
+    const fetchImpl = fakeFetch({ model: "jev-9.9.9", answers: { is_urgent: { type: "noul", noul: 0.8 } } });
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("still retries a 503 exactly once", async () => {
+    const fetchImpl = vi.fn(async () => new Response("server error", { status: 503 }));
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
 });

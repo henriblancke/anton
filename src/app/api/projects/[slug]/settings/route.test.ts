@@ -1852,11 +1852,17 @@ describe("settings route — Jev backend (anton-p32iy)", () => {
       ctx("tmp"),
     );
     expect(res.status).toBe(200);
-    expect((await res.json()).settings).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+    const resSettings = (await res.json()).settings;
+    expect(resSettings).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+    // toMatchObject above only checks the keys it lists — it would not fail even if the response
+    // also carried the raw key, so the redaction itself needs its own assertion.
+    expect("jevApiKey" in resSettings).toBe(false);
     expect(persisted()).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
 
     const get = await GET(new Request("http://t/"), ctx("tmp"));
-    expect((await get.json()).settings).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+    const getSettings = (await get.json()).settings;
+    expect(getSettings).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+    expect("jevApiKey" in getSettings).toBe(false);
   });
 
   it("PATCH rejects jevEnabled: true with no key or no pinned model", async () => {

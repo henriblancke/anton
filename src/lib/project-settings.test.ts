@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   mergeSettings,
+  redactSecrets,
   resolveDecisionMode,
+  resolveJevConfig,
   resolveWarmConfig,
   type ProjectSettings,
 } from "./project-settings";
@@ -183,5 +185,59 @@ describe("resolveDecisionMode", () => {
   it("falls back to defaultMode on a hand-edited, unreadable value", () => {
     const settings = { decisionModes: { "test-point": "armed" } } as unknown as ProjectSettings;
     expect(resolveDecisionMode(settings, point())).toBe("shadow");
+  });
+});
+
+/**
+ * The jev API key is "the one value this settings row carries that must never reach the browser"
+ * (redactSecrets' own doc comment) — a direct test here, not just an indirect one through the
+ * route's `toMatchObject` assertions (those only check the listed keys, so they would not fail
+ * even if this function were deleted entirely).
+ */
+describe("redactSecrets", () => {
+  it("strips a stored jevApiKey", () => {
+    const settings: ProjectSettings = { jevEnabled: true, jevApiKey: "sk-secret", jevModel: "jev-1.13.0" };
+    const redacted = redactSecrets(settings);
+    expect(redacted.jevApiKey).toBeUndefined();
+    expect("jevApiKey" in redacted).toBe(false);
+  });
+
+  it("leaves a row with no key untouched", () => {
+    const settings: ProjectSettings = { jevEnabled: false, model: "claude-sonnet-5" };
+    expect(redactSecrets(settings)).toEqual(settings);
+  });
+
+  it("does not mutate the settings object it's given", () => {
+    const settings: ProjectSettings = { jevApiKey: "sk-secret" };
+    redactSecrets(settings);
+    expect(settings.jevApiKey).toBe("sk-secret");
+  });
+});
+
+/** Whether a project may actually call the jev backend (anton-p32iy) — collapsing every reason it
+ * can't into one `undefined` answer. */
+describe("resolveJevConfig", () => {
+  it("is undefined when Jev is off, even with a key and a pinned model stored", () => {
+    expect(resolveJevConfig({ jevEnabled: false, jevApiKey: "sk-key", jevModel: "jev-1.13.0" })).toBeUndefined();
+  });
+
+  it("is undefined when enabled but no key is stored", () => {
+    expect(resolveJevConfig({ jevEnabled: true, jevModel: "jev-1.13.0" })).toBeUndefined();
+  });
+
+  it("is undefined when enabled but no model is stored", () => {
+    expect(resolveJevConfig({ jevEnabled: true, jevApiKey: "sk-key" })).toBeUndefined();
+  });
+
+  it("is undefined when the stored model is not an exact pinned version", () => {
+    expect(
+      resolveJevConfig({ jevEnabled: true, jevApiKey: "sk-key", jevModel: "jev-latest" }),
+    ).toBeUndefined();
+  });
+
+  it("resolves the apiKey and model when fully configured", () => {
+    expect(
+      resolveJevConfig({ jevEnabled: true, jevApiKey: "sk-key", jevModel: "jev-1.13.0" }),
+    ).toEqual({ apiKey: "sk-key", model: "jev-1.13.0" });
   });
 });
