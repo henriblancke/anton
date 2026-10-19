@@ -81,8 +81,31 @@ describe("trendQuality", () => {
     const recordedWeek = points?.find((p) => p.week === WEEK_KEY);
     const priorWeek = points?.find((p) => p.week === isoWeekKey(WEEK_MONDAY - 7 * DAY));
 
-    expect(recordedWeek?.threads).toEqual({ total: 2, byReviewer: { alice: 2 }, byPr: { 42: 2 } });
+    expect(recordedWeek?.threads).toEqual({
+      total: 2,
+      byReviewer: { alice: 2 },
+      byPr: { 42: 2 },
+      complete: true,
+    });
     expect(priorWeek?.threads).toBeUndefined();
+  });
+
+  it("marks a week's threads incomplete when a round's GitHub thread read degraded", async () => {
+    fakeBoard([]);
+    await t.db.insert(schema.reviewRounds).values({
+      id: randomUUID(),
+      projectId: t.projectId,
+      prNumber: 42,
+      round: 1,
+      threadsActionable: 2,
+      byAuthorJson: JSON.stringify({ alice: 2 }),
+      threadsComplete: false,
+      recordedAt: new Date(WEEK_MONDAY),
+    });
+
+    const points = await trendQuality(t.db, t.projectId, 1, { nowMs: NOW_MS });
+    const week = points?.find((p) => p.week === WEEK_KEY);
+    expect(week?.threads?.complete).toBe(false);
   });
 
   it("buckets a delivered feature's zero-touch share off cohortFeatures", async () => {
@@ -367,6 +390,90 @@ describe("trendSeries", () => {
       loopInvocations: 4,
       runaway: false,
     });
+  });
+
+  it("picks the primary row's substituted model, not the haiku sidecar's, when a gateway diverges outright", async () => {
+    // feat-1 must be on the board for cohortFeatures to admit it as a candidate.
+    fakeBoard([bead({ id: "feat-1", issue_type: "feature" })]);
+    const weekTwoKey = isoWeekKey(WEEK_MONDAY + 7 * DAY);
+
+    const sidecarPair = (opts: {
+      invocationId: string;
+      runId: string;
+      modelRequested: string;
+      modelReported: string;
+      recordedAt: Date;
+    }) => [
+      {
+        id: `${opts.invocationId}-primary`,
+        invocationId: opts.invocationId,
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "review",
+        runId: opts.runId,
+        beadId: "feat-1",
+        modelRequested: opts.modelRequested,
+        modelReported: opts.modelReported,
+        outcome: "ok",
+        recordedAt: opts.recordedAt,
+      },
+      {
+        id: `${opts.invocationId}-sidecar`,
+        invocationId: opts.invocationId,
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "review",
+        runId: opts.runId,
+        beadId: "feat-1",
+        modelRequested: opts.modelRequested,
+        modelReported: "claude-haiku-4-5",
+        outcome: "ok",
+        recordedAt: opts.recordedAt,
+      },
+    ];
+
+    await t.db.insert(schema.claudeInvocations).values([
+      // Week 1: served as requested — a clean claude-opus-5 majority.
+      ...sidecarPair({
+        invocationId: "w1-a",
+        runId: "r1",
+        modelRequested: "claude-opus-5",
+        modelReported: "claude-opus-5-20260101",
+        recordedAt: new Date(WEEK_MONDAY),
+      }),
+      ...sidecarPair({
+        invocationId: "w1-b",
+        runId: "r2",
+        modelRequested: "claude-opus-5",
+        modelReported: "claude-opus-5-20260101",
+        recordedAt: new Date(WEEK_MONDAY),
+      }),
+      // Week 2: the gateway silently substitutes the primary to claude-sonnet-5 — neither it nor the
+      // haiku sidecar matches the claude-opus-5 request, so this is a full divergence. The change
+      // marker must read the PRIMARY's substituted model, never the untouched sidecar's.
+      ...sidecarPair({
+        invocationId: "w2-a",
+        runId: "r3",
+        modelRequested: "claude-opus-5",
+        modelReported: "claude-sonnet-5",
+        recordedAt: new Date(WEEK_MONDAY + 7 * DAY),
+      }),
+      ...sidecarPair({
+        invocationId: "w2-b",
+        runId: "r4",
+        modelRequested: "claude-opus-5",
+        modelReported: "claude-sonnet-5",
+        recordedAt: new Date(WEEK_MONDAY + 7 * DAY),
+      }),
+    ]);
+
+    const series = await trendSeries(t.db, t.projectId, 2, { nowMs: NOW_MS + 7 * DAY });
+
+    expect(series?.changeMarkers).toEqual([
+      { kind: "model", week: weekTwoKey, before: "claude-opus-5-20260101", after: "claude-sonnet-5" },
+    ]);
   });
 
   it("normalizes a ticket-phase invocation and a self-review invocation onto the same feature before counting the review loop", async () => {

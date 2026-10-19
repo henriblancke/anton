@@ -100,6 +100,7 @@ async function reviewRoundPoints(
       prNumber: schema.reviewRounds.prNumber,
       threadsActionable: schema.reviewRounds.threadsActionable,
       byAuthorJson: schema.reviewRounds.byAuthorJson,
+      threadsComplete: schema.reviewRounds.threadsComplete,
     })
     .from(schema.reviewRounds)
     .where(and(eq(schema.reviewRounds.projectId, projectId), gte(schema.reviewRounds.recordedAt, since)));
@@ -109,6 +110,7 @@ async function reviewRoundPoints(
     prNumber: row.prNumber,
     threadsActionable: row.threadsActionable,
     byAuthor: parseByAuthor(row.byAuthorJson),
+    threadsComplete: row.threadsComplete,
   }));
 }
 
@@ -276,15 +278,22 @@ function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint
  * `desc(recordedAt), desc(rowid)` and a sidecar row is written after (so sorts before) its primary.
  * The model that answered anton's OWN request — the one {@link modelsMatch} confirms against
  * `modelRequested` — is what a change marker means to track; a sidecar/subagent row never matches it.
- * Falls back to the first reported model only when the request diverged outright (no row matches).
+ *
+ * Falls back to the PRIMARY reported model only when the request diverged outright (no row
+ * matches) — the LAST entry of `fact.modelsReported`, never the first. That list is built in the
+ * same `desc(rowid)` row order as `fact.rows`, so its first entry is the most-recently-written row
+ * (ordinarily the haiku sidecar) and its last entry is the first-written row (the primary, whatever
+ * answered the actual request). Falling back to `[0]` would report the sidecar's own untouched
+ * model as the gateway's substitution, which is never what diverged (P2, PR #348 review).
  */
 function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): InvocationStampPoint[] {
   return groupInvocations(rows).map((fact) => {
     const row = fact.rows[0];
     const servedModel = fact.modelsReported.find((model) => modelsMatch(fact.modelRequested, model));
+    const primaryModel = fact.modelsReported[fact.modelsReported.length - 1];
     return {
       atMs: row.recordedAt.getTime(),
-      modelReported: servedModel ?? fact.modelsReported[0] ?? null,
+      modelReported: servedModel ?? primaryModel ?? null,
       promptDigest: row.promptDigest,
       agentTag: row.agentTag,
       skillId: row.skillId,

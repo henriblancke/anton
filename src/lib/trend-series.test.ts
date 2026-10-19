@@ -123,11 +123,13 @@ describe("threadsByWeek", () => {
     threadsActionable: number,
     byAuthor: Record<string, number>,
     prNumber = 1,
+    threadsComplete = true,
   ): ReviewRoundPoint => ({
     atMs,
     prNumber,
     threadsActionable,
     byAuthor,
+    threadsComplete,
   });
 
   it("totals threads and splits them per reviewer and per PR, from the review-round record", () => {
@@ -136,7 +138,28 @@ describe("threadsByWeek", () => {
       round(WEEK_1_MONDAY + DAY, 1, { alice: 1 }, 10),
     ];
     const byWeek = threadsByWeek(rounds, [WEEK_1], WEEK_1_MONDAY);
-    expect(byWeek.get(WEEK_1)).toEqual({ total: 4, byReviewer: { alice: 3, bob: 1 }, byPr: { 10: 4 } });
+    expect(byWeek.get(WEEK_1)).toEqual({
+      total: 4,
+      byReviewer: { alice: 3, bob: 1 },
+      byPr: { 10: 4 },
+      complete: true,
+    });
+  });
+
+  it("marks the whole week incomplete when any one round in it had a partial thread read", () => {
+    // One round's GitHub page failed mid-read (threadsComplete: false) — the week's total is still
+    // summed from what was seen, but the flag must say that total cannot be trusted as the real one.
+    const rounds = [
+      round(WEEK_1_MONDAY, 3, { alice: 3 }, 10, true),
+      round(WEEK_1_MONDAY + DAY, 1, { alice: 1 }, 11, false),
+    ];
+    const byWeek = threadsByWeek(rounds, [WEEK_1], WEEK_1_MONDAY);
+    expect(byWeek.get(WEEK_1)).toEqual({
+      total: 4,
+      byReviewer: { alice: 4 },
+      byPr: { 10: 3, 11: 1 },
+      complete: false,
+    });
   });
 
   it("tells apart a week concentrated on one PR from one spread across several, same total", () => {
@@ -156,7 +179,7 @@ describe("threadsByWeek", () => {
 
   it("reports a real zero for a week after recording started that simply saw no rounds", () => {
     const byWeek = threadsByWeek([], [WEEK_1, WEEK_2], WEEK_1_MONDAY);
-    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {}, byPr: {} });
+    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {}, byPr: {}, complete: true });
   });
 
   it("reports a week predating the review-round record as absent, not zero", () => {
@@ -164,7 +187,7 @@ describe("threadsByWeek", () => {
     const byWeek = threadsByWeek([], [WEEK_1, WEEK_2], WEEK_1_MONDAY + 7 * DAY);
     expect(byWeek.has(WEEK_1)).toBe(false);
     expect(byWeek.has(WEEK_2)).toBe(true);
-    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {}, byPr: {} });
+    expect(byWeek.get(WEEK_2)).toEqual({ total: 0, byReviewer: {}, byPr: {}, complete: true });
   });
 
   it("reports every requested week as absent when the project has no review-round record at all", () => {
@@ -204,7 +227,13 @@ describe("qualityWeekPoints", () => {
       {
         scoredRuns: [{ atMs: WEEK_1_MONDAY, score: 10 }],
         reviewRounds: [
-          { atMs: WEEK_1_MONDAY + 7 * DAY, prNumber: 7, threadsActionable: 2, byAuthor: { alice: 2 } },
+          {
+            atMs: WEEK_1_MONDAY + 7 * DAY,
+            prNumber: 7,
+            threadsActionable: 2,
+            byAuthor: { alice: 2 },
+            threadsComplete: true,
+          },
         ],
         deliveredFeatures: [{ deliveredAtMs: WEEK_1_MONDAY, humanTouches: 0 }],
         recordingStartedAtMs: WEEK_1_MONDAY + 7 * DAY, // recording starts in WEEK_2
@@ -224,7 +253,7 @@ describe("qualityWeekPoints", () => {
     expect(week2.week).toBe(WEEK_2);
     expect(week2.scoreDistribution).toBeUndefined();
     expect(week2.zeroTouch).toBeUndefined();
-    expect(week2.threads).toEqual({ total: 2, byReviewer: { alice: 2 }, byPr: { 7: 2 } });
+    expect(week2.threads).toEqual({ total: 2, byReviewer: { alice: 2 }, byPr: { 7: 2 }, complete: true });
   });
 });
 

@@ -149,6 +149,14 @@ export interface ReviewRoundPoint {
   threadsActionable: number;
   /** The same threads, by the reviewer login who opened them (`review_rounds.by_author_json`). */
   byAuthor: Readonly<Record<string, number>>;
+  /**
+   * Whether this round's counts are the PR's whole inline history rather than an understated prefix
+   * left by a failed GitHub thread page (`review_rounds.threads_complete` — see `RoundCounts`'
+   * own contract in `review-rounds.ts`). `false` here must not be read as "fewer threads that
+   * round" — it means the round's own counts cannot be trusted, and {@link threadsByWeek} marks the
+   * whole week accordingly rather than silently summing a partial total as if it were complete.
+   */
+  threadsComplete: boolean;
 }
 
 /** One week's reviewer-thread load — total, and split two ways: by who raised them, and by which PR. */
@@ -163,6 +171,13 @@ export interface ThreadsPoint {
    * difference `byReviewer` alone cannot show.
    */
   byPr: Record<number, number>;
+  /**
+   * `false` when any round folded into this week had `threadsComplete: false` — a GitHub thread
+   * page failed mid-read, so `total`/`byReviewer`/`byPr` are a floor, not the real count. Readers
+   * must check this before trusting a low or zero total the same way `RoundCounts.threadsComplete`
+   * already requires of a single round (P2, PR #348 review).
+   */
+  complete: boolean;
 }
 
 /**
@@ -184,16 +199,17 @@ export function threadsByWeek(
 
   const buckets = new Map<
     string,
-    { total: number; byReviewer: Record<string, number>; byPr: Record<number, number> }
+    { total: number; byReviewer: Record<string, number>; byPr: Record<number, number>; complete: boolean }
   >();
   for (const key of weekKeys) {
     if (recordingStartWeek === undefined || key < recordingStartWeek) continue;
-    buckets.set(key, { total: 0, byReviewer: Object.create(null), byPr: Object.create(null) });
+    buckets.set(key, { total: 0, byReviewer: Object.create(null), byPr: Object.create(null), complete: true });
   }
 
   for (const round of rounds) {
     const bucket = buckets.get(isoWeekKey(round.atMs));
     if (!bucket) continue;
+    if (!round.threadsComplete) bucket.complete = false;
     bucket.total += round.threadsActionable;
     bucket.byPr[round.prNumber] = (bucket.byPr[round.prNumber] ?? 0) + round.threadsActionable;
     for (const [author, n] of Object.entries(round.byAuthor)) {
@@ -203,7 +219,12 @@ export function threadsByWeek(
 
   const out = new Map<string, ThreadsPoint>();
   for (const [key, bucket] of buckets) {
-    out.set(key, { total: bucket.total, byReviewer: bucket.byReviewer, byPr: bucket.byPr });
+    out.set(key, {
+      total: bucket.total,
+      byReviewer: bucket.byReviewer,
+      byPr: bucket.byPr,
+      complete: bucket.complete,
+    });
   }
   return out;
 }
