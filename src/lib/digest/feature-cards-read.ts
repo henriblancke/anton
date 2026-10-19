@@ -14,7 +14,6 @@ import { featureLedger } from "../feature-ledger-read";
 import type { AntonDb } from "../jobs/queue";
 import type { GatewayPricing } from "../model-pricing";
 import { readProjectOutcomes } from "../outcomes";
-import { getDb } from "../db";
 import { getProjectById } from "../projects";
 import type { TimelineEvent } from "../timeline";
 import { listAllBeads } from "../tickets";
@@ -97,13 +96,4 @@ export async function digestFeatureGroups(
   );
 
   return groupFeatureCards(cards, outcomes);
-}
-
-/** UI/read path over the shared anton.db — see {@link digestFeatureGroups}. */
-export function projectDigestFeatureGroups(
-  projectId: string,
-  events: readonly TimelineEvent[],
-  opts?: DigestFeatureCardsOptions,
-): Promise<DigestFeatureGroup[] | undefined> {
-  return digestFeatureGroups(getDb(), projectId, events, opts);
 }

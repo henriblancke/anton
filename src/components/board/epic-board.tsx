@@ -75,10 +75,14 @@ export function EpicBoard({
    * job parking, and the watcher being armed elsewhere — happen off this board entirely.
    */
   parks?: UnwatchedParks;
-  /** The board's since-you-looked summary (anton-16s0t), server-rendered by the page — needsYou
-   *  counts plus how much changed, fed to the digest banner. Absent only when the page has no
-   *  project to read it for. */
-  digest?: DigestBoardSummary;
+  /**
+   * The board's since-you-looked summary (anton-16s0t) — needsYou counts plus how much changed,
+   * fed to the digest banner. Absent only when the page has no project to read it for.
+   *
+   * A PROMISE, not a value (PR #350 review): the read awaits a breaker check that can take
+   * minutes, so the cards must not wait on it, same as `breaker` below.
+   */
+  digest?: Promise<DigestBoardSummary | undefined>;
   /**
    * Why the autopilot has stopped filling the queue, if it has (anton-5c8h). The FIRST paint only:
    * the board re-reads it on its own slower cadence because a hold is released by a PR merging or

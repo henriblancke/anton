@@ -15,7 +15,7 @@ import { openEscalations } from "../escalations";
 import { systemClock } from "../jobs/queue";
 import type { AntonDb } from "../jobs/queue";
 import { operatorQueue, openProposals } from "../operator-queue";
-import { readDigestBoard, readTimelineEventsForBoard } from "../timeline-read";
+import { readDigestBoard, readDigestBoardCached, readTimelineEventsForBoard } from "../timeline-read";
 import type { Project } from "../types";
 import { getViewerMark } from "../viewer-marks";
 import { digestFeatureGroups } from "./feature-cards-read";
@@ -59,14 +59,22 @@ export interface DigestBoardSummary {
  * `parks` input at all (see attention.ts) — the digest's needs-you list only ever promotes a
  * disarmed breaker, a parked ask, a merge-ready PR, an open proposal, or an unblocked human ticket,
  * so a parks read here would pay for a signal nothing on this page shows.
+ *
+ * `freshBoard` (default true) picks {@link readDigestBoard}'s forced-fresh rescan vs
+ * {@link readDigestBoardCached}'s stale-while-revalidate read. Only {@link projectDigest} needs the
+ * fresh guarantee — it hands `until` back to the client as a cursor to post on mark-seen, and a
+ * stale board here could omit a closure that then gets permanently stranded below the watermark.
+ * {@link projectDigestSummary} commits no such cursor (PR #350 review), so it passes `false` and
+ * joins the same cached snapshot `getBoard` already reads, instead of doubling the board page's
+ * `bd` subprocess cost for a display-only count.
  */
-async function readDigestWindow(db: AntonDb, project: Project) {
+async function readDigestWindow(db: AntonDb, project: Project, opts: { freshBoard?: boolean } = {}) {
   const mark = await getViewerMark(db, project.id);
   const since = mark?.seenAt ?? null;
   const until = Math.floor(systemClock.now() / 1000);
 
   const [board, escalations, breaker] = await Promise.all([
-    readDigestBoard(project),
+    opts.freshBoard === false ? readDigestBoardCached(project) : readDigestBoard(project),
     openEscalations(project.id),
     currentBreaker(project).catch((err) => {
       console.error(`[digest] autopilot breaker read failed for ${project.slug}`, err);
@@ -106,9 +114,10 @@ export async function projectDigest(db: AntonDb, project: Project): Promise<Proj
  * The board banner's own read (anton-16s0t) — the SAME window {@link projectDigest} serves the page
  * from, minus the feature-card assembly (`digestFeatureGroups`) the banner never renders: that read
  * spawns a `bd show` per changed feature, a cost worth paying once for the digest page but not on
- * every board load.
+ * every board load. Reads the board via the cached snapshot (`freshBoard: false`), not a forced
+ * rescan, for the same reason (PR #350 review): a display-only count commits no cursor.
  */
 export async function projectDigestSummary(db: AntonDb, project: Project): Promise<DigestBoardSummary> {
-  const { events, needsYou } = await readDigestWindow(db, project);
+  const { events, needsYou } = await readDigestWindow(db, project, { freshBoard: false });
   return { needsYou, activityCount: events.length };
 }

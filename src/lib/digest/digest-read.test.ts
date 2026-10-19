@@ -31,7 +31,12 @@ vi.mock("../escalations", async (importOriginal) => {
 vi.mock("../autopilot-state", () => ({ currentBreaker: vi.fn(async () => undefined) }));
 
 let board: Bead[] = [];
-vi.mock("../beads/issues", () => ({ refreshAllIssues: vi.fn(async () => board) }));
+vi.mock("../beads/issues", () => ({
+  refreshAllIssues: vi.fn(async () => board),
+  // `projectDigestSummary` reads the cached snapshot (PR #350 review), not `refreshAllIssues` —
+  // same underlying board either way, so the test fixtures stay a single `board` variable.
+  readAllIssues: vi.fn(async () => ({ beads: board, version: 1, generation: 0 })),
+}));
 
 const bead = (over: Partial<Bead> & { id: string }): Bead =>
   ({ title: over.id, status: "open", issue_type: "feature", labels: [], ...over }) as Bead;

@@ -127,15 +127,21 @@ describe("BoardAttentionSlot", () => {
     expect(screen.queryByText("Review queue is full")).toBeNull();
   });
 
-  it("renders the digest banner alongside the strip when the page hands down a digest summary", () => {
+  it("renders the digest banner alongside the strip once the page's digest promise resolves", async () => {
     // anton-16s0t's acceptance ("Board banner with counts linking to the digest") was never wired
     // to anything on the board page — DigestBanner was defined but nothing rendered it. Fed through
     // this slot's own `digest` prop now, same as `escalations`/`parks`.
-    mount({
-      digest: {
-        needsYou: { items: [], counts: EMPTY_NEEDS_YOU_COUNTS, total: 2 },
-        activityCount: 5,
-      },
+    //
+    // A promise, not a resolved value (PR #350 review): the banner must not gate the board on a
+    // read that awaits a breaker check that can take minutes, so it streams in behind its own
+    // boundary exactly like the breaker strip does.
+    await act(async () => {
+      mount({
+        digest: Promise.resolve({
+          needsYou: { items: [], counts: EMPTY_NEEDS_YOU_COUNTS, total: 2 },
+          activityCount: 5,
+        }),
+      });
     });
     expect(screen.getByText("5 things since you looked · 2 need you")).toBeTruthy();
     expect(screen.getByRole("link", { name: "Open digest" }).getAttribute("href")).toBe(
@@ -145,6 +151,19 @@ describe("BoardAttentionSlot", () => {
 
   it("renders no digest banner when the page hands down no digest summary", () => {
     mount();
+    expect(screen.queryByRole("link", { name: "Open digest" })).toBeNull();
+  });
+
+  it("renders no digest banner when the page's digest promise resolves to nothing", async () => {
+    await act(async () => {
+      mount({ digest: Promise.resolve(undefined) });
+    });
+    expect(screen.queryByRole("link", { name: "Open digest" })).toBeNull();
+  });
+
+  it("keeps the board unblocked while the digest summary is still outstanding", () => {
+    mount({ digest: new Promise<undefined>(() => {}) });
+    expect(screen.queryByText("the board, already rendered")).toBeNull();
     expect(screen.queryByRole("link", { name: "Open digest" })).toBeNull();
   });
 

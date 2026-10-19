@@ -178,8 +178,13 @@ export function DigestBanner({
       </h2>
       {counts.breaker > 0 ? <MetaChip tone="risk-high">autopilot stopped</MetaChip> : null}
       {counts["merge-ready-pr"] > 0 ? (
+        // "stale", not "to merge" (PR #350 review): the underlying finding (`detectStalePrs`,
+        // run-health.ts) only knows the PR is open and idle, not that it's approved, passing, or
+        // mergeable — drafts and failing/conflicted PRs raise it too. The honest claim is the same
+        // one `ESCALATION_LABELS["stale-pr"]` already makes on the Health page: it's stale, not
+        // ready.
         <MetaChip tone="pr">
-          {counts["merge-ready-pr"]} PR{counts["merge-ready-pr"] === 1 ? "" : "s"} to merge
+          {counts["merge-ready-pr"]} stale PR{counts["merge-ready-pr"] === 1 ? "" : "s"}
         </MetaChip>
       ) : null}
       {counts.proposal > 0 ? (

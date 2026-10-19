@@ -181,7 +181,7 @@ describe("DigestBanner", () => {
     expect(screen.getByText("0 things since you looked · 1 need you")).toBeTruthy();
   });
 
-  it("breaks out merge-ready PRs, proposals and a stopped autopilot apart from the total", () => {
+  it("breaks out stale PRs, proposals and a stopped autopilot apart from the total", () => {
     render(
       <DigestBanner
         slug="anton"
@@ -189,7 +189,9 @@ describe("DigestBanner", () => {
         activityCount={3}
       />,
     );
-    expect(screen.getByText("1 PR to merge")).toBeTruthy();
+    // "stale", not "to merge" (PR #350 review): the underlying finding only knows the PR is idle,
+    // not that it's actually mergeable — see attention-strip.tsx.
+    expect(screen.getByText("1 stale PR")).toBeTruthy();
     expect(screen.getByText("2 proposals")).toBeTruthy();
     expect(screen.getByText("autopilot stopped")).toBeTruthy();
   });

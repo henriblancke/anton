@@ -12,7 +12,7 @@
  * folds it. {@link readTimelineEvents} composes both for a caller (the events-since route) that only
  * wants the events.
  */
-import { refreshAllIssues } from "./beads/issues";
+import { readAllIssues, refreshAllIssues } from "./beads/issues";
 import type { Bead } from "./beads/bd";
 import { foldTimeline, type TimelineEvent } from "./timeline";
 import {
@@ -54,6 +54,23 @@ export type { TimelineWindow } from "./timeline-sources";
  */
 export function readDigestBoard(project: Pick<Project, "repoPath">): Promise<Bead[]> {
   return refreshAllIssues(project.repoPath, { strictGates: true, requireFreshRead: true });
+}
+
+/**
+ * The CACHED counterpart to {@link readDigestBoard} — the same stale-while-revalidate snapshot
+ * `getBoard` itself reads (`readAllIssues`, not `refreshAllIssues`), for a caller that commits no
+ * cursor and so has none of the staleness risk the doc above guards against. Gates come back
+ * best-effort, not strict — `readAllIssues` has no strict-gate option to give it, the same as
+ * `getBoard`'s own call.
+ *
+ * `projectDigestSummary` (the board banner's read, PR #350 review) is the one caller: it hands out
+ * no `until` for a client to post back as seen, so there is no cursor a stale snapshot or a
+ * degraded gate listing could silently strand. Paying for `readDigestBoard`'s forced fresh `bd`
+ * rescan there bought nothing — it only doubled the subprocess cost of every board page load, on
+ * top of `getBoard`'s own read of the same underlying snapshot.
+ */
+export async function readDigestBoardCached(project: Pick<Project, "repoPath">): Promise<Bead[]> {
+  return (await readAllIssues(project.repoPath)).beads;
 }
 
 /**

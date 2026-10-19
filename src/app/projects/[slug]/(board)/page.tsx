@@ -32,21 +32,11 @@ export default async function ProjectBoardPage({
   //   • grouping — stage columns or epic swimlanes, the operator's own choice (anton-wds3). Read
   //     here so the FIRST paint is already the layout they picked, instead of painting the default
   //     and dropping the Up Next lane again once the client adopts the stored preference.
-  //   • digest — the since-you-looked summary the board banner links to (anton-16s0t): needs-you
-  //     counts plus how much changed. Its own read, not derived from `board` above, because it
-  //     judges a different snapshot (the viewer's watermark window) and degrading it must not take
-  //     the cards down with it.
-  const [board, settings, escalations, parks, digest, cookieStore] = await Promise.all([
+  const [board, settings, escalations, parks, cookieStore] = await Promise.all([
     project ? getBoard(project) : null,
     getProjectSettingsBySlug(slug),
     project ? openEscalations(project.id) : [],
     project ? unwatchedParksForProject(project.id) : undefined,
-    project
-      ? projectDigestSummary(getDb(), project).catch((err) => {
-          console.error(`[board] digest summary read failed for ${slug}`, err);
-          return undefined;
-        })
-      : undefined,
     cookies(),
   ]);
   const grouping = parseBoardGrouping(cookieStore.get(boardGroupingCookieName(slug))?.value);
@@ -62,6 +52,19 @@ export default async function ProjectBoardPage({
   const breaker = project
     ? currentBreaker(project).catch((err) => {
         console.error(`[board] autopilot breaker read failed for ${slug}`, err);
+        return undefined;
+      })
+    : undefined;
+
+  // The since-you-looked summary the board banner links to (anton-16s0t): needs-you counts plus
+  // how much changed. Also NOT awaited, for the same reason `breaker` isn't (PR #350 review):
+  // `projectDigestSummary` itself awaits a breaker read that can take minutes (see digest-read.ts),
+  // so gating the board on it would reintroduce exactly the latency `breaker` above was pulled out
+  // of this `Promise.all` to avoid. Handed to the board and unwrapped inside its own Suspense
+  // boundary, same as `breaker`.
+  const digest = project
+    ? projectDigestSummary(getDb(), project).catch((err) => {
+        console.error(`[board] digest summary read failed for ${slug}`, err);
         return undefined;
       })
     : undefined;
