@@ -172,6 +172,23 @@ describe("JevSection — the key is never round-tripped", () => {
     fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
     await vi.waitFor(() => expect(refresh).toHaveBeenCalled());
   });
+
+  it("disables the toggle and key input while the clear is in flight, so a rollback can never clobber a newer edit", async () => {
+    let resolvePatch!: (response: Response) => void;
+    const patchSettings = vi.fn(
+      () => new Promise<Response>((resolve) => { resolvePatch = resolve; }),
+    );
+    renderSection({ apiKeyConfigured: true, patchSettings });
+
+    fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
+
+    expect(screen.getByLabelText("Use Jev for decide()")).toHaveProperty("disabled", true);
+    expect(screen.getByLabelText("API key")).toHaveProperty("disabled", true);
+
+    resolvePatch(new Response("{}", { status: 200 }));
+    await vi.waitFor(() => expect(screen.getByLabelText("API key")).toHaveProperty("disabled", false));
+    expect(screen.getByLabelText("Use Jev for decide()")).toHaveProperty("disabled", false);
+  });
 });
 
 describe("JevSection — per-point field disclosure", () => {

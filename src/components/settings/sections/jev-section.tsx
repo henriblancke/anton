@@ -80,6 +80,8 @@ export function JevSection({
       toast.success("Jev API key cleared");
     } catch (err) {
       // Roll back the optimistic clear so a toggle/key the operator had staged isn't silently lost.
+      // Safe to do unconditionally: the toggle and key input are disabled for the duration of this
+      // request (below), so neither field could have been edited again in the meantime.
       set("jevEnabled", previousEnabled);
       set("jevApiKey", previousApiKey);
       toast.error(err instanceof Error ? err.message : "Clear failed");
@@ -103,7 +105,12 @@ export function JevSection({
           </span>
         </div>
         <span className="ml-auto">
-          <Toggle checked={draft.jevEnabled} onChange={(next) => set("jevEnabled", next)} label="Use Jev for decide()" />
+          <Toggle
+            checked={draft.jevEnabled}
+            onChange={(next) => set("jevEnabled", next)}
+            label="Use Jev for decide()"
+            disabled={clearing}
+          />
         </span>
       </div>
 
@@ -118,7 +125,8 @@ export function JevSection({
               placeholder={apiKeyConfigured ? "stored — leave blank to keep it" : "paste your Jev API key"}
               maxLength={500}
               aria-label="API key"
-              className="rounded-lg border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60"
+              disabled={clearing}
+              className="rounded-lg border border-border bg-card px-3 py-2 font-mono text-[12.5px] text-foreground outline-none placeholder:text-subtle focus:border-primary/60 disabled:cursor-not-allowed disabled:opacity-50"
             />
           </label>
           <span className="text-[11px] text-subtle">

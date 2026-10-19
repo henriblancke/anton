@@ -62,16 +62,40 @@ function assertPinnedModel(model: string): void {
 /**
  * A systemone failure the retry loop should NOT spend its one retry on: a bad key or malformed
  * request (4xx) and a reply that fails schema validation or the pin check all fail the exact same
- * way on a second attempt, unlike a network blip, a timeout, or a 5xx — those stay plain `Error`s
- * and keep the default retry.
+ * way on a second attempt, unlike a network blip, a timeout, a 5xx, or a 429 — those stay plain
+ * `Error`s (or carry `retryable: true`) and keep the default retry.
  */
 class JevCallError extends Error {
   readonly retryable: boolean;
-  constructor(message: string, retryable: boolean) {
+  /** Only set for a 429 — how long to wait before the retry, per TypeSafe's own API reference
+   * (docs.typesafe.ai/api), which instructs clients to back off rather than retry immediately. */
+  readonly retryAfterMs?: number;
+  constructor(message: string, retryable: boolean, retryAfterMs?: number) {
     super(message);
     this.name = "JevCallError";
     this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
   }
+}
+
+/** The longest this backend will wait on a 429's `Retry-After` before giving up and retrying
+ * anyway — Jev is meant to answer in milliseconds (see {@link DEFAULT_JEV_TIMEOUT_MS}), so honoring
+ * an arbitrarily long vendor-side backoff would defeat the point of having a fast path at all. */
+const MAX_RETRY_AFTER_MS = 3_000;
+
+/** `Retry-After` is either a count of seconds or an HTTP-date (RFC 9110 §10.2.3). Returns
+ * `undefined` for a missing/unparseable header rather than guessing a delay. */
+function parseRetryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(header);
+  if (Number.isNaN(dateMs)) return undefined;
+  return Math.max(0, dateMs - Date.now());
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 const choiceAnswerSchema = z.object({
@@ -259,12 +283,16 @@ async function callSystemOne(
   });
 
   if (!response.ok) {
-    // A 4xx (bad key, malformed request) repeats identically on retry; only 5xx/other server
-    // trouble is the kind of transient failure the one retry exists to absorb.
-    const retryable = response.status >= 500;
+    // A 4xx (bad key, malformed request) repeats identically on retry; a 5xx is transient server
+    // trouble; a 429 is also transient but only after backing off — TypeSafe's own API reference
+    // (docs.typesafe.ai/api) instructs clients to retry rate limits with a delay, never immediately.
+    const retryable = response.status === 429 || response.status >= 500;
+    const retryAfterMs =
+      response.status === 429 ? parseRetryAfterMs(response.headers.get("Retry-After")) : undefined;
     throw new JevCallError(
       `decide/jev: systemone responded ${response.status} for "${point.id}"`,
       retryable,
+      retryAfterMs,
     );
   }
 
@@ -324,7 +352,14 @@ export function jevBackend(config: JevConfig): ModelCaller {
         // validation or the pin check) fails the exact same way on the second attempt — skip
         // straight to the fallback instead of spending the retry's timeout budget on a call that
         // cannot succeed.
-        if (error instanceof JevCallError && !error.retryable) break;
+        if (error instanceof JevCallError) {
+          if (!error.retryable) break;
+          // A 429 asked for a specific backoff — honor it (capped) before consuming the one retry,
+          // rather than hammering systemone again immediately.
+          if (attempt === 0 && error.retryAfterMs) {
+            await sleep(Math.min(error.retryAfterMs, MAX_RETRY_AFTER_MS));
+          }
+        }
       } finally {
         clearTimeout(timer);
       }

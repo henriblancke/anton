@@ -465,4 +465,51 @@ describe("jevBackend — retry and failure (one retry, no more)", () => {
     await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
+
+  it("retries a 429, waiting out its Retry-After before the second attempt, and succeeds", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ model: "jev-1.13.0", answers: { is_urgent: { type: "noul", noul: 0.8 } } }),
+          { status: 200 },
+        ),
+      );
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const answer = await ask(yesNoPoint(), { ticketText: "x" });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(answer.value).toBe(true);
+  });
+
+  it("falls back after exactly one retry when every attempt is rate-limited", async () => {
+    const fetchImpl = vi.fn(
+      async () => new Response("rate limited", { status: 429, headers: { "Retry-After": "0" } }),
+    );
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("caps an excessive Retry-After instead of honoring it in full", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("rate limited", { status: 429, headers: { "Retry-After": "120" } }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ model: "jev-1.13.0", answers: { is_urgent: { type: "noul", noul: 0.8 } } }),
+          { status: 200 },
+        ),
+      );
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const start = Date.now();
+    await ask(yesNoPoint(), { ticketText: "x" });
+    // A 120s Retry-After honored in full would make this test (and a real decide() caller) hang far
+    // longer than Jev's own ~70-500ms promise — the cap keeps it well under that.
+    expect(Date.now() - start).toBeLessThan(5_000);
+  });
 });
