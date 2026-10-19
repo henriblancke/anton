@@ -72,6 +72,13 @@ export {
   RETIRE_STALE_IN_PROGRESS_DAYS,
   RETIRE_STALE_OPEN_DAYS,
 } from "./retire";
+// Deliberately NOT part of {@link detectBoard} yet: there is no apply route for `attach-outcome`
+// until anton-15xcn lands, and every nightly patrol feeds detectBoard's output straight into
+// emission (gardener-proposals.ts) — wiring it in now would file an un-appliable proposal for
+// every run target predating the outcome contract, all at once, on a project's real board. The
+// pass that turns this claim into a decidable proposal composes `detectUnlinkedOutcomes` itself,
+// the same way `detectDeferredRejudgements` is composed on its own cadence below.
+export { detectUnlinkedOutcomes, STRINGER_OUTCOME, UNKNOWN_OUTCOME } from "./unlinked-outcome";
 // Deliberately NOT part of {@link detectBoard}: re-judgement asks about a decision the board's own
 // tiers made rather than about its shape, and it runs on its own cadence (anton-30vo) — so the pass
 // that schedules it composes `detectDeferredRejudgements`, which is the claim with its verb already

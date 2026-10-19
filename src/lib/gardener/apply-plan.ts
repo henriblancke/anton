@@ -377,6 +377,13 @@ export function planApply(
       return planApprove(plan, index, at);
     case "undefer":
       return planUndefer(plan, index, at);
+    case "attach-outcome":
+      // Not wired yet — anton-15xcn adds the write. Refusing rather than silently no-op'ing keeps
+      // an armed pass from settling this proposal without ever having applied it.
+      return {
+        status: "refuse",
+        reason: `adding outcome:${plan.detail ?? "?"} to ${list(plan.subjects)} has no apply route yet — add the label by hand and decline this proposal`,
+      };
   }
 }
 
@@ -1968,6 +1975,11 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
     still: "the parked bead nobody had been back to",
     harm: "returning it to the board now would answer a question somebody has since looked at themselves",
   },
+  // No fence, for the same reason as `degraded-approval`: the whole claim is "this run target
+  // carries no outcome:<id> to group under", which is re-derivable from the fresh board at apply
+  // time rather than something an edit since the filing could falsify unnoticed (anton-15xcn wires
+  // the write itself).
+  "unlinked-outcome": undefined,
 };
 
 /**

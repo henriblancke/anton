@@ -1,0 +1,147 @@
+/**
+ * `unlinked-outcome` (anton-vie0k), driven over fixture boards.
+ *
+ * Not part of {@link detectBoard}'s composed set yet (see detect.ts) — there is no apply route for
+ * `attach-outcome` until anton-15xcn lands — so these drive {@link detectUnlinkedOutcomes} directly,
+ * through the same `indexWorkBoard` every other detector is handed its board through.
+ */
+import { describe, expect, it } from "vitest";
+
+import type { Bead } from "../beads/bd";
+import { indexWorkBoard } from "./detect";
+import { STRINGER_OUTCOME, UNKNOWN_OUTCOME, detectUnlinkedOutcomes } from "./unlinked-outcome";
+
+const bead = (id: string, over: Partial<Bead> = {}): Bead => ({
+  id,
+  title: id,
+  status: "open",
+  issue_type: "task",
+  ...over,
+});
+
+const epic = (id: string, over: Partial<Bead> = {}) => bead(id, { issue_type: "epic", ...over });
+const feature = (id: string, over: Partial<Bead> = {}) =>
+  bead(id, { issue_type: "feature", ...over });
+
+const detect = (board: Bead[]) => detectUnlinkedOutcomes(indexWorkBoard(board));
+
+const only = (board: Bead[]) => {
+  const detections = detect(board);
+  expect(detections).toHaveLength(1);
+  return detections[0];
+};
+
+describe("unlinked-outcome (anton-vie0k)", () => {
+  it("flags an open run target with no outcome:<id>, suggesting unknown when nothing else fires", () => {
+    const detection = only([feature("anton-feat", { title: "The runnable feature" })]);
+
+    expect(detection.kind).toBe("unlinked-outcome");
+    expect(detection.move).toBe("attach-outcome");
+    expect(detection.subjects).toEqual(["anton-feat"]);
+    expect(detection.detail).toBe(UNKNOWN_OUTCOME);
+    expect(detection.evidence.join("\n")).toContain("anton-feat");
+  });
+
+  it("inherits the parent epic's outcome when it carries exactly one", () => {
+    const detection = only([
+      epic("anton-epic", { labels: ["outcome:oriented-operator"] }),
+      feature("anton-feat", { parent: "anton-epic" }),
+    ]);
+
+    expect(detection.detail).toBe("oriented-operator");
+    expect(detection.evidence.join("\n")).toContain("anton-epic");
+  });
+
+  it("asks the operator when the parent epic carries more than one outcome", () => {
+    const detection = only([
+      epic("anton-epic", { labels: ["outcome:oriented-operator", "outcome:codebase-health"] }),
+      feature("anton-feat", { parent: "anton-epic" }),
+    ]);
+
+    expect(detection.detail).toBe(UNKNOWN_OUTCOME);
+  });
+
+  it("suggests codebase-health for stringer-filed work with no epic outcome to inherit", () => {
+    const detection = only([bead("anton-bug", { issue_type: "bug", labels: ["source:stringer"] })]);
+
+    expect(detection.detail).toBe(STRINGER_OUTCOME);
+    expect(detection.evidence.join("\n")).toContain("source:stringer");
+  });
+
+  it("prefers the epic's own outcome over the stringer default when both are present", () => {
+    // A bug with a parent rides that parent's run rather than being a run target itself (only a
+    // PARENTLESS task/bug is), so the epic-inheriting subject here has to be a feature.
+    const detection = only([
+      epic("anton-epic", { labels: ["outcome:trustworthy-board"] }),
+      feature("anton-feat", { labels: ["source:stringer"], parent: "anton-epic" }),
+    ]);
+
+    expect(detection.detail).toBe("trustworthy-board");
+  });
+
+  it("stays silent once the run target already carries an outcome:<id> label", () => {
+    expect(detect([feature("anton-feat", { labels: ["outcome:oriented-operator"] })])).toEqual([]);
+  });
+
+  it("stays silent for a standalone epic whose contract states its outcome as body text", () => {
+    expect(
+      detect([
+        epic("anton-epic", {
+          description: "## Outcome IDs\n\noutcome:oriented-operator\n",
+        }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("stays silent for a parentless task or bug — the stringer/unknown rungs still apply to it", () => {
+    // No epic to inherit from (it has no parent at all), so it falls straight to unknown.
+    const detection = only([bead("anton-task", { issue_type: "task" })]);
+    expect(detection.detail).toBe(UNKNOWN_OUTCOME);
+  });
+
+  it("stays silent for a ticket that is not itself a run target", () => {
+    // A task parented under a feature rides that feature's run; it is not its own run target, and
+    // the digest groups it through the feature rather than by its own outcome label.
+    expect(
+      detect([
+        feature("anton-feat", { labels: ["outcome:oriented-operator"] }),
+        bead("anton-ticket", { parent: "anton-feat" }),
+      ]),
+    ).toEqual([]);
+  });
+
+  it("never names a container epic as a subject — it groups run targets rather than being one", () => {
+    // The container itself is missing an outcome too, but it is not a RUN TARGET (an epic with a
+    // feature child groups run targets rather than being one), so only the feature is ever asked.
+    const detection = only([
+      epic("anton-cont"),
+      feature("anton-feat", { parent: "anton-cont" }),
+    ]);
+    expect(detection.subjects).toEqual(["anton-feat"]);
+  });
+
+  it("skips a closed run target", () => {
+    expect(detect([feature("anton-feat", { status: "closed" })])).toEqual([]);
+  });
+
+  it("skips a deferred run target", () => {
+    expect(detect([feature("anton-feat", { status: "deferred" })])).toEqual([]);
+  });
+
+  it("skips the gardener's own proposal beads", () => {
+    const proposal = feature("anton-p1", {
+      labels: ["gardener:unlinked-outcome:abcdef012345"],
+    });
+    expect(detect([proposal])).toEqual([]);
+  });
+
+  it("fingerprints each subject distinctly and stably across repeated passes", () => {
+    const board = [feature("anton-a"), feature("anton-b")];
+    const first = detect(board);
+    const second = detect(board);
+
+    expect(first.map((d) => d.subjects[0]).sort()).toEqual(["anton-a", "anton-b"]);
+    expect(new Set(first.map((d) => d.fingerprint)).size).toBe(2);
+    expect(first.map((d) => d.fingerprint).sort()).toEqual(second.map((d) => d.fingerprint).sort());
+  });
+});

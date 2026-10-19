@@ -702,6 +702,8 @@ function moveClause(detection: GardenerDetection): string {
       return `approve ${subjects} so a run can start on ${pronoun(detection)}`;
     case "undefer":
       return `return ${subjects} to the board, or leave ${pronoun(detection)} parked`;
+    case "attach-outcome":
+      return `add outcome:${detection.detail ?? "?"} to ${subjects}`;
   }
 }
 
@@ -761,6 +763,8 @@ function appliedState(detection: GardenerDetection): string {
       // one, and no claim is written over their write (apply-plan.ts `planApprove`). The gate alone
       // is what every applied outcome guarantees, so the gate alone is what the box asserts.
       return `${subjects} ${is} approved — the gate is granted, which is the state a run starts from`;
+    case "attach-outcome":
+      return `${subjects} ${is} labelled outcome:${detection.detail}, so the digest groups ${detection.subjects.length === 1 ? "it" : "them"} under that outcome`;
   }
 }
 

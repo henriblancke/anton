@@ -74,6 +74,7 @@ export const DEFAULT_PROPOSAL_AUTONOMY_POLICY: ProposalAutonomyPolicy = {
   "degraded-approval": "propose",
   "withheld-approval": "propose",
   "aged-defer": "propose",
+  "unlinked-outcome": "propose",
 };
 
 function isAutonomy(value: unknown): value is ProposalAutonomy {
@@ -186,6 +187,10 @@ export function autonomyTierOf(plan: { move: GardenerMove; retireAs?: RetireVerb
       // and what follows is the run `approve` is priced for. A tier read off the common case would
       // arm the uncommon one at the cheapest bar.
       return "history";
+    case "attach-outcome":
+      // Writes one label, undone by one `bd update` the same way a re-parent or a priority is —
+      // nothing else on the bead moves, and no run starts from it.
+      return "reversible";
   }
 }
 

@@ -121,6 +121,10 @@ export const AUTONOMY_GROUPS: {
         id: "misfiled",
         does: "re-parents a bead whose home is the wrong one under the epic or card its contract belongs to",
       },
+      {
+        id: "unlinked-outcome",
+        does: "labels a run target with the project outcome it serves, inherited from its epic or stringer, so the digest can group it",
+      },
     ],
   },
   {
