@@ -120,7 +120,15 @@ describe("jevBackend — request shaping", () => {
       return new Response(
         JSON.stringify({
           model: PINNED_MODEL,
-          answers: { frustration: { type: "score", score: 0.5, confidence: 0.8 } },
+          answers: {
+            frustration: {
+              type: "score",
+              score: 0.5,
+              confidence: 0.8,
+              legend: { "0": "0", "1": "10" },
+              probabilities: { "0": 0.5, "1": 0.5 },
+            },
+          },
         }),
         { status: 200 },
       );
@@ -279,7 +287,7 @@ describe("jevBackend — response parsing (fixtures from the docs example)", () 
             score: 0.67,
             confidence: 0.82,
             legend: { "0": "calm", "1": "annoyed" },
-            probabilities: { "0": 0.2, "1": 0.8 },
+            probabilities: { "0": 0.33, "1": 0.67 },
           },
         },
       }) as unknown as typeof fetch,
@@ -291,6 +299,63 @@ describe("jevBackend — response parsing (fixtures from the docs example)", () 
     expect(answer.confidence).toBe(0.82);
     expect(answer.backend).toBe("jev");
     expect(answer.modelVersion).toBe("jev-1.13.0");
+  });
+
+  it("rejects a score reply missing legend/probabilities", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: { frustration: { type: "score", score: 0.5, confidence: 0.8 } },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(scorePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+  });
+
+  it("rejects a score reply whose probabilities don't sum to 1", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: {
+          frustration: {
+            type: "score",
+            score: 0.67,
+            confidence: 0.8,
+            legend: { "0": "calm", "1": "annoyed" },
+            probabilities: { "0": 0.8, "1": 0.8 },
+          },
+        },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(scorePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+  });
+
+  it("rejects a score reply whose probabilities imply a different score than reported", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: {
+          frustration: {
+            type: "score",
+            // probabilities imply a weighted average of 0.1, nowhere near the reported 0.9 — an
+            // internally inconsistent reply per TypeSafe's own probability-weighted score contract.
+            score: 0.9,
+            confidence: 0.8,
+            legend: { "0": "calm", "1": "annoyed" },
+            probabilities: { "0": 0.9, "1": 0.1 },
+          },
+        },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(scorePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
   });
 
   it("rejects a score reply outside Jev's documented 0..1 index range instead of rescaling past the point's own bounds", async () => {

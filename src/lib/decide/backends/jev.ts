@@ -118,8 +118,12 @@ const scoreAnswerSchema = z.object({
   // trigger the claude-local fallback instead of rescaling past the point's own [min, max] bounds.
   score: z.number().min(0).max(1),
   confidence: z.number().min(0).max(1),
-  legend: z.record(z.string(), z.string()).optional(),
-  probabilities: z.record(z.string(), z.number()).optional(),
+  // TypeSafe documents both maps as required and the score as probability-weighted over them
+  // (docs.typesafe.ai/api) — optional here would let a reply that omits them (or carries one
+  // inconsistent with `score`) resolve successfully and never reach decide()'s own validation on
+  // the healthy path. {@link isValidScoreDistribution} checks their shape and agreement with `score`.
+  legend: z.record(z.string(), z.string()),
+  probabilities: z.record(z.string(), z.number()),
 });
 
 const noulAnswerSchema = z.object({
@@ -214,6 +218,45 @@ function isValidProbabilityDistribution(
  * tolerance like {@link DISTRIBUTION_SUM_TOLERANCE}, just enough to absorb rounding on an exact tie. */
 const CHOICE_PROBABILITY_EPSILON = 1e-9;
 
+/** The legend/probabilities keys this module's `score` questions always get back — {@link
+ * toJevQuestion} only ever sends two criteria entries (the point's min and max), so Jev's rubric
+ * index range is always `{"0", "1"}`. */
+const SCORE_RUBRIC_INDICES = ["0", "1"] as const;
+
+/** How far the weighted average implied by `probabilities` may drift from the reported `score`
+ * before the reply is rejected as internally inconsistent. */
+const SCORE_AGREEMENT_TOLERANCE = 0.05;
+
+/** TypeSafe documents `score` as a probability-weighted position over `legend`'s rubric
+ * (docs.typesafe.ai/api). This module's rubric is always the 2-entry `{"0", "1"}` shape (see
+ * {@link toJevQuestion}), so `legend` and `probabilities` must both carry exactly those keys, the
+ * distribution must sum to ~1 with every value in `[0, 1]`, and the weighted average those
+ * probabilities imply — which for a 2-entry rubric reduces to `probabilities["1"]` alone — must
+ * agree with `score`. A reply failing any of this is internally inconsistent and must not be
+ * trusted as a healthy answer. */
+function isValidScoreDistribution(
+  legend: Record<string, string>,
+  probabilities: Record<string, number>,
+  score: number,
+): boolean {
+  const hasExactIndices = (record: Record<string, unknown>) => {
+    const keys = Object.keys(record).sort();
+    return keys.length === SCORE_RUBRIC_INDICES.length && keys.every((key, i) => key === SCORE_RUBRIC_INDICES[i]);
+  };
+  if (!hasExactIndices(legend) || !hasExactIndices(probabilities)) return false;
+
+  let sum = 0;
+  for (const index of SCORE_RUBRIC_INDICES) {
+    const probability = probabilities[index];
+    if (probability === undefined || probability < 0 || probability > 1) return false;
+    sum += probability;
+  }
+  if (Math.abs(sum - 1) > DISTRIBUTION_SUM_TOLERANCE) return false;
+
+  const weightedAverage = probabilities["1"] ?? 0;
+  return Math.abs(weightedAverage - score) <= SCORE_AGREEMENT_TOLERANCE;
+}
+
 /** TypeSafe documents `choice` as the highest-probability entry in `probabilities`
  * (docs.typesafe.ai/api) — a reply naming some other option as the choice is internally
  * inconsistent and must fail here rather than record a contradictory decision. */
@@ -257,6 +300,12 @@ function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAn
     return { ...base, value: answer.choice, confidence: answer.confidence, distribution: answer.probabilities };
   }
   if (question.kind === "score" && answer.type === "score") {
+    if (!isValidScoreDistribution(answer.legend, answer.probabilities, answer.score)) {
+      throw new ModelCallError(
+        `decide/jev: score distribution for "${point.id}" is malformed or inconsistent with its reported score`,
+        base,
+      );
+    }
     return {
       ...base,
       value: rescaleScore(answer.score, question.min, question.max),

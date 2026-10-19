@@ -246,4 +246,10 @@ describe("resolveJevConfig", () => {
       resolveJevConfig({ jevEnabled: true, jevApiKey: "   ", jevModel: "jev-1.13.0" }),
     ).toBeUndefined();
   });
+
+  it("trims a stored key with incidental surrounding whitespace (predates the write-time boundary check)", () => {
+    expect(
+      resolveJevConfig({ jevEnabled: true, jevApiKey: "  sk-key  ", jevModel: "jev-1.13.0" }),
+    ).toEqual({ apiKey: "sk-key", model: "jev-1.13.0" });
+  });
 });

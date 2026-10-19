@@ -913,7 +913,7 @@ export function resolveJevConfig(settings: ProjectSettings): JevSettingsConfig |
   // would otherwise throw instead of returning `undefined` as this resolver promises.
   if (typeof apiKey !== "string" || !apiKey.trim()) return undefined;
   if (typeof model !== "string" || !isPinnedJevModel(model)) return undefined;
-  return { apiKey, model };
+  return { apiKey: apiKey.trim(), model };
 }
 
 /**
