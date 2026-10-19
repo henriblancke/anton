@@ -1,0 +1,456 @@
+/**
+ * The jev backend (anton-7i3ui): decide()'s `ask` implemented as one HTTP call to TypeSafe's Jev
+ * (`POST /v1/systemone`) — a calibrated choice/score/yes-no answer in milliseconds, not a claude
+ * session (claude-local.ts is the fallback the parent epic, anton-l70sq, wires this behind).
+ *
+ * Three things this module owns, matching the three acceptance bars:
+ *
+ *  - QUESTION MAPPING. decide()'s three question kinds become Jev's `choice`/`score`/`noul` types.
+ *    `choice` and `noul` (yes-no) map directly. `score` has no natural fit: Jev's score primitive
+ *    answers against a named rubric (`criteria`, an ordered list of level descriptions) and returns a
+ *    position over that rubric's own index range, not the point's `[min, max]` — so this module sends
+ *    exactly two criteria entries (the point's min and max, stringified) and rescales Jev's 0..1
+ *    response linearly back onto `[min, max]`. See {@link toJevQuestion} and {@link rescaleScore}.
+ *  - ZOD-VALIDATED RESPONSE. The reply is parsed against a schema shaped from Jev's own documented
+ *    response (`model`, `answers` keyed by question id, each carrying confidence/probabilities per
+ *    docs.typesafe.ai/introduction/quickstart) — never trusted from a bare `.json()` cast.
+ *  - PINNED VERSION ENFORCED. `jevBackend` refuses to construct against `jev-latest` or any model
+ *    string that isn't an exact `jev-X.Y.Z`, and every reply's own `model` is checked against that
+ *    pin too — a decision log row must be able to name the one version that answered, not a moving
+ *    target (parent epic's own acceptance bar).
+ */
+import { z } from "zod";
+import { ModelCallError, type ModelAnswer, type ModelCaller } from "../index";
+import { narrowState, type DecisionPoint, type DecisionState } from "../points";
+
+const BACKEND = "jev";
+const SYSTEMONE_URL = "https://api.typesafe.ai/v1/systemone";
+
+/** `jev-<major>.<minor>.<patch>` — an exact version, never `jev-latest` or a bare tag. */
+const PINNED_MODEL_PATTERN = /^jev-\d+\.\d+\.\d+$/;
+
+/** Jev answers in ~70-500 ms per vendor figures (parent epic's own doc) — generous enough to absorb
+ * ordinary network jitter without making a caller wait anywhere near claude-local's budget. */
+export const DEFAULT_JEV_TIMEOUT_MS = 5_000;
+
+export interface JevConfig {
+  apiKey: string;
+  /** Must be an exact `jev-X.Y.Z` — {@link jevBackend} throws at construction time otherwise. */
+  model: string;
+  /** Overrides {@link SYSTEMONE_URL}, for tests. */
+  baseUrl?: string;
+  /** Overrides {@link DEFAULT_JEV_TIMEOUT_MS}. */
+  timeoutMs?: number;
+  /** Injectable so a test can drive the backend without a real network call. */
+  fetchImpl?: typeof fetch;
+}
+
+/** Exported so Settings can refuse an unpinned version at the API boundary (anton-p32iy), before a
+ * misconfigured project ever gets as far as constructing a backend. */
+export function isPinnedJevModel(model: string): boolean {
+  return PINNED_MODEL_PATTERN.test(model);
+}
+
+function assertPinnedModel(model: string): void {
+  if (!isPinnedJevModel(model)) {
+    throw new Error(
+      `decide/jev: model must be pinned to an exact version (e.g. "jev-1.13.0"), got "${model}"`,
+    );
+  }
+}
+
+/**
+ * A systemone failure the retry loop should NOT spend its one retry on: a bad key or malformed
+ * request (4xx) and a reply that fails schema validation or the pin check all fail the exact same
+ * way on a second attempt, unlike a network blip, a timeout, a 5xx, or a 429 — those stay plain
+ * `Error`s (or carry `retryable: true`) and keep the default retry.
+ */
+class JevCallError extends Error {
+  readonly retryable: boolean;
+  /** Only set for a 429 or 529 (Overloaded) — how long to wait before the retry, per TypeSafe's own
+   * API reference (docs.typesafe.ai/api), which instructs clients to back off rather than retry
+   * immediately on either status. */
+  readonly retryAfterMs?: number;
+  constructor(message: string, retryable: boolean, retryAfterMs?: number) {
+    super(message);
+    this.name = "JevCallError";
+    this.retryable = retryable;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/** The longest this backend will wait on a 429/529's `Retry-After` before giving up and retrying
+ * anyway — Jev is meant to answer in milliseconds (see {@link DEFAULT_JEV_TIMEOUT_MS}), so honoring
+ * an arbitrarily long vendor-side backoff would defeat the point of having a fast path at all. */
+const MAX_RETRY_AFTER_MS = 3_000;
+
+/** Backoff used for a 429/529 that carries no (or an unparsable) `Retry-After` header — TypeSafe's
+ * API reference (docs.typesafe.ai/api) instructs clients to back off on both statuses, so the single
+ * retry still pauses rather than hammering systemone again immediately. */
+const DEFAULT_RETRY_BACKOFF_MS = 500;
+
+/** `Retry-After` is either a count of seconds or an HTTP-date (RFC 9110 §10.2.3). Returns
+ * `undefined` for a missing/unparseable header rather than guessing a delay. */
+function parseRetryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const dateMs = Date.parse(header);
+  if (Number.isNaN(dateMs)) return undefined;
+  return Math.max(0, dateMs - Date.now());
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const choiceAnswerSchema = z.object({
+  type: z.literal("choice"),
+  choice: z.string(),
+  confidence: z.number().min(0).max(1),
+  probabilities: z.record(z.string(), z.number()),
+});
+
+const scoreAnswerSchema = z.object({
+  type: z.literal("score"),
+  // Jev's documented 0..1 index range over the two criteria entries this module sends — unlike
+  // `noul` just below, nothing downstream clamps this, so an out-of-range reply must fail here to
+  // trigger the claude-local fallback instead of rescaling past the point's own [min, max] bounds.
+  score: z.number().min(0).max(1),
+  confidence: z.number().min(0).max(1),
+  // TypeSafe documents both maps as required and the score as probability-weighted over them
+  // (docs.typesafe.ai/api) — optional here would let a reply that omits them (or carries one
+  // inconsistent with `score`) resolve successfully and never reach decide()'s own validation on
+  // the healthy path. {@link isValidScoreDistribution} checks their shape and agreement with `score`.
+  legend: z.record(z.string(), z.string()),
+  probabilities: z.record(z.string(), z.number()),
+});
+
+const noulAnswerSchema = z.object({
+  type: z.literal("noul"),
+  noul: z.number().min(0).max(1),
+});
+
+const jevAnswerSchema = z.discriminatedUnion("type", [
+  choiceAnswerSchema,
+  scoreAnswerSchema,
+  noulAnswerSchema,
+]);
+
+const systemOneResponseSchema = z.object({
+  model: z.string(),
+  answers: z.record(z.string(), jevAnswerSchema),
+  usage: z
+    .object({ input_tokens: z.number(), output_tokens: z.number() })
+    .optional(),
+});
+
+type JevAnswer = z.infer<typeof jevAnswerSchema>;
+
+type JevQuestion =
+  | { type: "choice"; instructions: string; criteria: Record<string, string> }
+  | { type: "score"; instructions: string; criteria: string[] }
+  | { type: "noul"; instructions: string };
+
+/** decide()'s question shapes, mapped to Jev's `choice`/`score`/`noul` primitives (docs.typesafe.ai
+ * /introduction/quickstart). A `ChoiceQuestion` has no per-option description to send as Jev's
+ * `criteria` text (only the option labels themselves), so each option stands in as its own
+ * criteria entry — the point's shared `instructions` is what actually distinguishes them. A
+ * `ScoreQuestion` has no rubric levels either, just `[min, max]`; two criteria entries (the
+ * endpoints) are enough to let {@link rescaleScore} map Jev's 0..1 response back onto that range. */
+function toJevQuestion(point: DecisionPoint): JevQuestion {
+  const { question, instruction } = point;
+  switch (question.kind) {
+    case "choice":
+      return {
+        type: "choice",
+        instructions: instruction,
+        criteria: Object.fromEntries(question.options.map((option) => [option, option])),
+      };
+    case "score":
+      return {
+        type: "score",
+        instructions: `${instruction} (answer on a scale from ${question.min} to ${question.max})`,
+        criteria: [String(question.min), String(question.max)],
+      };
+    case "yes-no":
+      return { type: "noul", instructions: instruction };
+  }
+}
+
+/** Jev's `score` reports a weighted position over the `criteria` array's own index range (0 to
+ * `criteria.length - 1`), not the point's `[min, max]` — confirmed against the docs' own example
+ * (a 3-entry rubric, legend keyed "0"/"1"/"2", score 0.67 landing inside that span). Sending exactly
+ * two criteria entries (the endpoints) makes that index range `[0, 1]`, so this rescale is a plain
+ * linear map onto `[min, max]` with no further knowledge of what lies between. */
+function rescaleScore(score: number, min: number, max: number): number {
+  return min + score * (max - min);
+}
+
+/** How far a distribution's total may drift from 1 and still be trusted — matches claude-local's own
+ * tolerance (claude-local.ts), wide enough for a model's own rounding, narrow enough to reject
+ * something like `{fix: 0.8, decline: 0.8}`, which is not a probability distribution at all. */
+const DISTRIBUTION_SUM_TOLERANCE = 0.05;
+
+/** Mirrors claude-local's `readDistribution`: a `choice` distribution is only trustworthy if it has
+ * exactly one entry per registered option (no extras, nothing missing), every value sits in
+ * `[0, 1]`, and the total is close enough to 1 to be a real distribution. Jev's own schema only
+ * constrains `probabilities` to a string-keyed record of numbers, so a malformed one would
+ * otherwise resolve successfully and never reach decide()'s own validation on the healthy path. */
+function isValidProbabilityDistribution(
+  probabilities: Record<string, number>,
+  options: readonly string[],
+): boolean {
+  const optionSet = new Set(options);
+  for (const key of Object.keys(probabilities)) {
+    if (!optionSet.has(key)) return false;
+  }
+  let sum = 0;
+  for (const option of options) {
+    const probability = probabilities[option];
+    if (probability === undefined || probability < 0 || probability > 1) return false;
+    sum += probability;
+  }
+  return Math.abs(sum - 1) <= DISTRIBUTION_SUM_TOLERANCE;
+}
+
+/** Float slack for comparing a chosen probability against the distribution's max — not a real
+ * tolerance like {@link DISTRIBUTION_SUM_TOLERANCE}, just enough to absorb rounding on an exact tie. */
+const CHOICE_PROBABILITY_EPSILON = 1e-9;
+
+/** The legend/probabilities keys this module's `score` questions always get back — {@link
+ * toJevQuestion} only ever sends two criteria entries (the point's min and max), so Jev's rubric
+ * index range is always `{"0", "1"}`. */
+const SCORE_RUBRIC_INDICES = ["0", "1"] as const;
+
+/** How far the weighted average implied by `probabilities` may drift from the reported `score`
+ * before the reply is rejected as internally inconsistent. */
+const SCORE_AGREEMENT_TOLERANCE = 0.05;
+
+/** TypeSafe documents `score` as a probability-weighted position over `legend`'s rubric
+ * (docs.typesafe.ai/api). This module's rubric is always the 2-entry `{"0", "1"}` shape (see
+ * {@link toJevQuestion}), so `legend` and `probabilities` must both carry exactly those keys, the
+ * distribution must sum to ~1 with every value in `[0, 1]`, and the weighted average those
+ * probabilities imply — which for a 2-entry rubric reduces to `probabilities["1"]` alone — must
+ * agree with `score`. A reply failing any of this is internally inconsistent and must not be
+ * trusted as a healthy answer. */
+function isValidScoreDistribution(
+  legend: Record<string, string>,
+  probabilities: Record<string, number>,
+  score: number,
+): boolean {
+  const hasExactIndices = (record: Record<string, unknown>) => {
+    const keys = Object.keys(record).sort();
+    return keys.length === SCORE_RUBRIC_INDICES.length && keys.every((key, i) => key === SCORE_RUBRIC_INDICES[i]);
+  };
+  if (!hasExactIndices(legend) || !hasExactIndices(probabilities)) return false;
+
+  let sum = 0;
+  for (const index of SCORE_RUBRIC_INDICES) {
+    const probability = probabilities[index];
+    if (probability === undefined || probability < 0 || probability > 1) return false;
+    sum += probability;
+  }
+  if (Math.abs(sum - 1) > DISTRIBUTION_SUM_TOLERANCE) return false;
+
+  const weightedAverage = probabilities["1"] ?? 0;
+  return Math.abs(weightedAverage - score) <= SCORE_AGREEMENT_TOLERANCE;
+}
+
+/** TypeSafe documents `choice` as the highest-probability entry in `probabilities`
+ * (docs.typesafe.ai/api) — a reply naming some other option as the choice is internally
+ * inconsistent and must fail here rather than record a contradictory decision. */
+function isMaxProbabilityChoice(choice: string, probabilities: Record<string, number>): boolean {
+  const chosenProbability = probabilities[choice];
+  if (chosenProbability === undefined) return false;
+  const maxProbability = Math.max(...Object.values(probabilities));
+  return chosenProbability >= maxProbability - CHOICE_PROBABILITY_EPSILON;
+}
+
+function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAnswer): ModelAnswer {
+  const base = { backend: BACKEND, modelVersion };
+  const { question } = point;
+
+  if (question.kind === "choice" && answer.type === "choice") {
+    // Jev's response schema only constrains `choice` to be a string, not one of the options we sent
+    // — an unknown value here would otherwise resolve successfully and never reach decide()'s own
+    // validation on the healthy path, so createJevFallbackCaller would never see the failure that's
+    // supposed to trigger the claude-local fallback.
+    if (!question.options.includes(answer.choice)) {
+      throw new ModelCallError(
+        `decide/jev: choice "${answer.choice}" for "${point.id}" is not one of its question's options`,
+        base,
+      );
+    }
+    if (!isValidProbabilityDistribution(answer.probabilities, question.options)) {
+      throw new ModelCallError(
+        `decide/jev: probabilities for "${point.id}" are not a valid distribution over its question's options`,
+        base,
+      );
+    }
+    // TypeSafe defines `choice` as the highest-probability option — a reply naming a different one
+    // (e.g. choice: "technical" over {billing: 0.9, technical: 0.1}) is internally inconsistent and
+    // must fall back to claude-local rather than record a contradictory decision.
+    if (!isMaxProbabilityChoice(answer.choice, answer.probabilities)) {
+      throw new ModelCallError(
+        `decide/jev: choice "${answer.choice}" for "${point.id}" is not the maximum-probability option in its distribution`,
+        base,
+      );
+    }
+    return { ...base, value: answer.choice, confidence: answer.confidence, distribution: answer.probabilities };
+  }
+  if (question.kind === "score" && answer.type === "score") {
+    if (!isValidScoreDistribution(answer.legend, answer.probabilities, answer.score)) {
+      throw new ModelCallError(
+        `decide/jev: score distribution for "${point.id}" is malformed or inconsistent with its reported score`,
+        base,
+      );
+    }
+    return {
+      ...base,
+      value: rescaleScore(answer.score, question.min, question.max),
+      confidence: answer.confidence,
+    };
+  }
+  if (question.kind === "yes-no" && answer.type === "noul") {
+    const value = answer.noul >= 0.5;
+    return {
+      ...base,
+      value,
+      confidence: value ? answer.noul : 1 - answer.noul,
+      distribution: { yes: answer.noul, no: 1 - answer.noul },
+    };
+  }
+
+  // Jev echoed a different `type` than the question we sent asked for — not a shape decide() itself
+  // would ever pass through as a trustworthy answer, so attribute the attempt and let the caller fall
+  // back rather than coerce a mismatched reply into this point's question.
+  throw new ModelCallError(
+    `decide/jev: response type "${answer.type}" for "${point.id}" doesn't match its question kind "${question.kind}"`,
+    base,
+  );
+}
+
+/**
+ * One POST to `/v1/systemone`, parsed and Zod-validated. A network failure (fetch itself
+ * rejecting, including an aborted/timed-out signal) surfaces as a plain `Error` and stays
+ * retryable by default; a non-2xx response, a reply that fails schema validation, or an unpinned
+ * model surfaces as a {@link JevCallError} carrying whether a retry could possibly help. The
+ * caller (the returned `ask`) is what attaches backend/model attribution and decides whether to
+ * retry.
+ */
+async function callSystemOne(
+  config: JevConfig,
+  point: DecisionPoint,
+  state: DecisionState,
+  signal: AbortSignal,
+): Promise<z.infer<typeof systemOneResponseSchema>> {
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const response = await fetchImpl(config.baseUrl ?? SYSTEMONE_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      state,
+      model: config.model,
+      questions: { [point.id]: toJevQuestion(point) },
+    }),
+    signal,
+  });
+
+  if (!response.ok) {
+    // A 4xx (bad key, malformed request) repeats identically on retry; a 5xx is transient server
+    // trouble. 429 and 529 (Overloaded) are also transient but only after backing off — TypeSafe's
+    // own API reference (docs.typesafe.ai/api) instructs clients to retry both with a delay, never
+    // immediately, so both get a `Retry-After`-or-default backoff rather than the plain 5xx path.
+    const retryable = response.status === 429 || response.status >= 500;
+    const retryAfterMs =
+      response.status === 429 || response.status === 529
+        ? parseRetryAfterMs(response.headers.get("Retry-After")) ?? DEFAULT_RETRY_BACKOFF_MS
+        : undefined;
+    throw new JevCallError(
+      `decide/jev: systemone responded ${response.status} for "${point.id}"`,
+      retryable,
+      retryAfterMs,
+    );
+  }
+
+  const body: unknown = await response.json();
+  const parseResult = systemOneResponseSchema.safeParse(body);
+  if (!parseResult.success) {
+    // A reply that doesn't match the documented shape will fail the same way again — not worth the
+    // retry's budget.
+    throw new JevCallError(
+      `decide/jev: systemone reply for "${point.id}" failed schema validation: ${parseResult.error.message}`,
+      false,
+    );
+  }
+  const parsed = parseResult.data;
+  // The pin is only real if the answer is checked against it — an unpinned or substituted model
+  // (e.g. "jev-latest") would otherwise land in the decision log as the configured version, defeating
+  // the pinning guarantee this backend exists to enforce. Non-retryable: a misconfigured/substituted
+  // model on one call will be the same model on the next.
+  if (parsed.model !== config.model) {
+    throw new JevCallError(
+      `decide/jev: systemone answered with model "${parsed.model}", expected pinned "${config.model}" for "${point.id}"`,
+      false,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Build the jev {@link ModelCaller}. Validates the pinned model up front — a misconfigured
+ * `jev-latest` (or any non-exact version) fails at construction, never silently at call time — and
+ * retries the systemone call exactly once on failure (out of scope: anything past one retry).
+ */
+export function jevBackend(config: JevConfig): ModelCaller {
+  assertPinnedModel(config.model);
+  const timeoutMs = config.timeoutMs ?? DEFAULT_JEV_TIMEOUT_MS;
+
+  return async function ask(point: DecisionPoint, state: DecisionState): Promise<ModelAnswer> {
+    const narrowed = narrowState(point, state);
+    let lastError: unknown;
+
+    // One attempt, one retry — no more (out of scope). Each gets its own deadline so a stuck first
+    // attempt can't eat the retry's own timeout budget.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const parsed = await callSystemOne(config, point, narrowed, controller.signal);
+        const answer = parsed.answers[point.id];
+        if (!answer) {
+          throw new Error(`decide/jev: systemone reply carried no answer for "${point.id}"`);
+        }
+        return toModelAnswer(point, parsed.model, answer);
+      } catch (error) {
+        if (error instanceof ModelCallError) throw error;
+        lastError = error;
+        // A non-retryable failure (bad key, malformed request, a reply that fails schema
+        // validation or the pin check) fails the exact same way on the second attempt — skip
+        // straight to the fallback instead of spending the retry's timeout budget on a call that
+        // cannot succeed.
+        if (error instanceof JevCallError) {
+          if (!error.retryable) break;
+          // A 429 asked for a specific backoff — honor it (capped) before consuming the one retry,
+          // rather than hammering systemone again immediately.
+          if (attempt === 0 && error.retryAfterMs) {
+            await sleep(Math.min(error.retryAfterMs, MAX_RETRY_AFTER_MS));
+          }
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    throw new ModelCallError(
+      `decide/jev: systemone call failed for "${point.id}": ${
+        lastError instanceof Error ? lastError.message : String(lastError)
+      }`,
+      { backend: BACKEND, modelVersion: config.model },
+    );
+  };
+}

@@ -64,6 +64,7 @@ import { MODEL_ROUTABLE_STEP_IDS, PIPELINE_JOB_TYPE, isModelRoutableStepId } fro
 import type { FormulaVariant } from "./jobs/run-formula";
 import type { AntonDb } from "./jobs/queue";
 import { DECISION_MODES, getPoint, type DecisionMode, type DecisionPoint } from "./decide/points";
+import { isPinnedJevModel } from "./decide/backends/jev";
 
 /** Parsed project settings (settingsJson). All optional; sensible defaults applied by callers. */
 export interface ProjectSettings {
@@ -422,6 +423,29 @@ export interface ProjectSettings {
    * before ever calling decide(), never the other way round.
    */
   decisionModes?: Record<string, DecisionMode>;
+  /**
+   * Opt this project into TypeSafe's Jev as decide()'s backend (anton-l70sq) — a direct HTTP call,
+   * in milliseconds, instead of a claude-local session. A hosted API is a deliberate exception to
+   * anton's local-first default, so it is OFF by default and per-project only: a project opts in
+   * explicitly, never a machine-wide switch (out of scope, anton-p32iy). Absent/false ⇒ every point
+   * runs claude-local exactly as it does today. See {@link resolveJevConfig}, which also treats
+   * "enabled but missing a key or pinned model" as off rather than a broken backend.
+   */
+  jevEnabled?: boolean;
+  /**
+   * Jev's API key, held directly in local settings. Unlike the Claude gateway's token
+   * ({@link claudeAuthTokenEnv}, an env-var NAME only), this is the credential itself: Jev is
+   * decide()'s own per-project backend choice rather than anton's whole Claude session, so there is
+   * no separate process environment for it to live in. Never sent back to the Settings UI once
+   * saved — the API redacts it to a boolean ("a key is stored") rather than echo the value.
+   */
+  jevApiKey?: string;
+  /**
+   * The exact `jev-X.Y.Z` version decide() is pinned to. `jev-latest`, or any string that isn't an
+   * exact version, is refused at the API boundary ({@link isPinnedJevModel}) — a decision log row
+   * must be able to name the one version that answered, never a moving target.
+   */
+  jevModel?: string;
   /**
    * The operator's standing answer to the cadence offer arming the board-picker makes (anton-3xa9,
    * design R7.1): true = keep product-master weekly, and never ask again. Absent = not yet asked.
@@ -865,6 +889,44 @@ export function resolveDecisionMode(
 ): DecisionMode {
   const stored = settings.decisionModes?.[point.id];
   return stored && (DECISION_MODES as readonly string[]).includes(stored) ? stored : point.defaultMode;
+}
+
+/** What {@link resolveJevConfig} hands a caller ready to construct the jev backend from. */
+export interface JevSettingsConfig {
+  apiKey: string;
+  /** Always a pinned `jev-X.Y.Z` — re-checked here, not just trusted from the write-time validation,
+   * the same defense-in-depth {@link resolveDecisionMode} applies to a stored decision mode. */
+  model: string;
+}
+
+/**
+ * This project's usable Jev config, or `undefined` when Jev cannot run (anton-p32iy): off, no key,
+ * no model, or a model that somehow isn't pinned despite the write-time check. Collapsing every one
+ * of those into the same "absent" result is deliberate — a caller building a {@link ModelCaller}
+ * needs one answer to "can I use jev here", not four different reasons it might say no.
+ */
+export function resolveJevConfig(settings: ProjectSettings): JevSettingsConfig | undefined {
+  if (!settings.jevEnabled) return undefined;
+  const { jevApiKey: apiKey, jevModel: model } = settings;
+  // Hand-edited JSON can carry a non-string value (e.g. a number) for either field, so check
+  // `typeof` before `.trim()` — optional chaining alone only guards against nullish values and
+  // would otherwise throw instead of returning `undefined` as this resolver promises.
+  if (typeof apiKey !== "string" || !apiKey.trim()) return undefined;
+  if (typeof model !== "string" || !isPinnedJevModel(model)) return undefined;
+  return { apiKey: apiKey.trim(), model };
+}
+
+/**
+ * Strips the one value this settings row carries that must never reach the browser (anton-p32iy):
+ * the jev API key. Used by both the Settings route (GET/PATCH responses) and the Settings page's
+ * SSR props, so "what the client may see" is decided in exactly one place rather than re-applied,
+ * and possibly forgotten, at every call site that happens to touch a settings row today.
+ */
+export function redactSecrets(settings: ProjectSettings): ProjectSettings {
+  if (settings.jevApiKey === undefined) return settings;
+  const next = { ...settings };
+  delete next.jevApiKey;
+  return next;
 }
 
 /**

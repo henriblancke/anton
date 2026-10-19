@@ -14,6 +14,7 @@ vi.mock("@/lib/projects", () => ({
   getProjectBySlug: async () => ({ id: "p1", slug: "anton", name: "anton", repoPath: "/settings-test" }),
   getProjectSettingsBySlug: async () => ({}),
   resolvePickerApplyOverride: () => undefined,
+  redactSecrets: (settings: object) => settings,
 }));
 vi.mock("@/lib/agents-discovery", () => ({
   discoverAgents: async () => [],

@@ -8,6 +8,7 @@
  * real value ("no agents active").
  */
 import { discoverAgents } from "@/lib/agents-discovery";
+import { isPinnedJevModel } from "@/lib/decide/backends/jev";
 import {
   AUTOPILOT_FAILURE_STREAK_RANGE,
   AUTOPILOT_SCORE_FLOOR_RANGE,
@@ -47,6 +48,7 @@ import {
   accept,
   applyFieldRules,
   booleanValue,
+  boundedSecret,
   boundedString,
   connectionId,
   envVarName,
@@ -81,6 +83,27 @@ const MAX_URL = 2000;
 const MAX_ENV_NAME = 256;
 /** Upper bound on a router connection id (anton-m5oc) — well past any real router's id length. */
 const MAX_CONNECTION_ID = 256;
+/** Upper bound on the jev API key (anton-p32iy) — generous for any vendor key shape. */
+const MAX_JEV_KEY = 500;
+/** Upper bound on a pinned jev model string (anton-p32iy) — `jev-` plus a semver, with headroom. */
+const MAX_JEV_MODEL = 64;
+
+/**
+ * An exact `jev-X.Y.Z` version, never `jev-latest` or a bare tag (anton-p32iy) — the same refusal
+ * {@link isPinnedJevModel} enforces at `jevBackend`'s own construction, applied here so a bad pin
+ * 400s at save time instead of surfacing only once something tries to decide.
+ */
+const pinnedJevModel: FieldParser<string> = (raw, key) => {
+  if (isClear(raw)) return accept(undefined);
+  if (typeof raw !== "string") return reject(`${key} must be a string`);
+  if (raw.length > MAX_JEV_MODEL) return reject(`${key} too long (max ${MAX_JEV_MODEL} chars)`);
+  if (!isPinnedJevModel(raw)) {
+    return reject(
+      `${key} must be an exact pinned version like "jev-1.13.0" — "jev-latest" and bare tags are refused`,
+    );
+  }
+  return accept(raw);
+};
 
 const settingsField = <K extends keyof ProjectSettings & string>(
   key: K,
@@ -204,6 +227,12 @@ function projectFields(agentIds: () => Promise<Set<string>>): readonly FieldRule
     // `reserve my share` (R6.5) — cleared, the share flows to whoever has work.
     settingsField("reserveQuotaShare", booleanValue),
 
+    // Opt-in Jev backend for decide() (anton-p32iy). The cross-check below (checkJevConfigured)
+    // refuses turning it on without both a key and a pinned model.
+    settingsField("jevEnabled", booleanValue),
+    settingsField("jevApiKey", boundedSecret(MAX_JEV_KEY)),
+    settingsField("jevModel", pinnedJevModel),
+
     // Policy blobs. Each parsed partial is deep-merged into the stored policy by
     // updateProjectSettings, so a client that exposes one knob never wipes the others —
     // except valueLabels (replaced wholesale because its ORDER is the band order) and
@@ -324,7 +353,32 @@ function checkRouterConnectionNeedsGateway(
 }
 
 /**
- * The cross-field checks that read settings as they STAND. Both weigh a patched field against a
+ * Jev is explicit and safe to fail (anton-p32iy): turning it on without both a key and a pinned
+ * model would leave `resolveJevConfig` silently reading it as off, which is the wrong failure mode
+ * for a setting an operator just explicitly flipped on. Same write-time reasoning as the gateway's
+ * own credential check below.
+ */
+function checkJevConfigured(
+  patch: Partial<ProjectSettings>,
+  current: ProjectSettings,
+): string | null {
+  if (!("jevEnabled" in patch || "jevApiKey" in patch || "jevModel" in patch)) return null;
+  const enabled = "jevEnabled" in patch ? patch.jevEnabled : current.jevEnabled;
+  const apiKey = "jevApiKey" in patch ? patch.jevApiKey : current.jevApiKey;
+  const model = "jevModel" in patch ? patch.jevModel : current.jevModel;
+  // Re-check the pin even when `model` itself isn't in this patch — a partial `{jevEnabled: true}`
+  // would otherwise pass on a stale/hand-edited unpinned model and leave resolveJevConfig silently
+  // reading it as off, the same wrong-failure-mode this check exists to catch.
+  // `apiKey` may be a non-string on a hand-edited/legacy row — `resolveJevConfig` guards the same
+  // way before calling `.trim()`.
+  if (enabled && (typeof apiKey !== "string" || !apiKey.trim() || !model || !isPinnedJevModel(model))) {
+    return "jevEnabled needs both jevApiKey and a pinned jevModel — set both, or leave Jev off.";
+  }
+  return null;
+}
+
+/**
+ * The cross-field checks that read settings as they STAND. Each weighs a patched field against a
  * sibling that may not be in this patch, so they must run against the settings AT WRITE TIME — i.e.
  * inside `updateProjectSettingsIf`'s transaction — not a pre-write snapshot. Two overlapping PATCHes
  * could each pass against a snapshot and then commit a combination neither validated (e.g. one saves
@@ -338,7 +392,8 @@ export function checkSettingsCrossFields(
   return (
     checkReviewAlarmReachable(patch, current) ??
     checkGatewayCredentialed(patch, current) ??
-    checkRouterConnectionNeedsGateway(patch, current)
+    checkRouterConnectionNeedsGateway(patch, current) ??
+    checkJevConfigured(patch, current)
   );
 }
 
