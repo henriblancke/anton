@@ -45,6 +45,7 @@ function emptyDigest(overrides: Partial<ProjectDigest> = {}): ProjectDigest {
     until: 1_700_000_000,
     headline: "No new activity",
     needsYou: EMPTY_SUMMARY,
+    activityCount: 0,
     groups: [],
     isEmpty: true,
     ...overrides,

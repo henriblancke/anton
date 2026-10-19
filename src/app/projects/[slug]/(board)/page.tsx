@@ -7,6 +7,8 @@ import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
 import { boardGroupingCookieName, parseBoardGrouping } from "@/lib/board-grouping";
+import { getDb } from "@/lib/db";
+import { projectDigestSummary } from "@/lib/digest/digest-read";
 import { openEscalations } from "@/lib/escalations";
 import { currentBreaker } from "@/lib/autopilot-state";
 import { unwatchedParksForProject } from "@/lib/unwatched-parks";
@@ -30,11 +32,21 @@ export default async function ProjectBoardPage({
   //   • grouping — stage columns or epic swimlanes, the operator's own choice (anton-wds3). Read
   //     here so the FIRST paint is already the layout they picked, instead of painting the default
   //     and dropping the Up Next lane again once the client adopts the stored preference.
-  const [board, settings, escalations, parks, cookieStore] = await Promise.all([
+  //   • digest — the since-you-looked summary the board banner links to (anton-16s0t): needs-you
+  //     counts plus how much changed. Its own read, not derived from `board` above, because it
+  //     judges a different snapshot (the viewer's watermark window) and degrading it must not take
+  //     the cards down with it.
+  const [board, settings, escalations, parks, digest, cookieStore] = await Promise.all([
     project ? getBoard(project) : null,
     getProjectSettingsBySlug(slug),
     project ? openEscalations(project.id) : [],
     project ? unwatchedParksForProject(project.id) : undefined,
+    project
+      ? projectDigestSummary(getDb(), project).catch((err) => {
+          console.error(`[board] digest summary read failed for ${slug}`, err);
+          return undefined;
+        })
+      : undefined,
     cookies(),
   ]);
   const grouping = parseBoardGrouping(cookieStore.get(boardGroupingCookieName(slug))?.value);
@@ -69,6 +81,7 @@ export default async function ProjectBoardPage({
             initialGrouping={grouping}
             escalations={escalations}
             parks={parks}
+            digest={digest}
             breaker={breaker}
             budgetAware={settings.budgetAware === true}
           />

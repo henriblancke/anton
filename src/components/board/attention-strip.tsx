@@ -140,16 +140,28 @@ export function AttentionStrip({
 }
 
 /**
- * The board's pointer to the digest (anton-16s0t): how many things only the operator can do,
- * counted but not listed — the same trade this file's `AttentionStrip` already makes, for the same
- * reason. The rows themselves, with their Resolve-and-resume / Dismiss / Mark done / re-arm, live
- * on the digest page (`DigestNeedsYou`, needs-you-section.tsx); this is one click away from them.
+ * The board's pointer to the digest (anton-16s0t): what changed since the viewer last looked, and
+ * how much of it only the operator can act on — counted but not listed, the same trade this file's
+ * `AttentionStrip` already makes, for the same reason. The rows themselves, with their
+ * Resolve-and-resume / Dismiss / Mark done / re-arm, live on the digest page (`DigestNeedsYou`,
+ * needs-you-section.tsx); this is one click away from them.
  *
- * Renders NOTHING when `digestNeedsYou` found nothing to promote, same honesty contract as every
- * other band here: a standing banner on a clean board is an ornament.
+ * Visible whenever EITHER count is nonzero: a window with substantial new activity but nothing
+ * actionable is still news worth a link, even though `digestNeedsYou` alone would say nothing. Only
+ * when both are zero — nothing happened and nothing needs the operator — does it render NOTHING,
+ * same honesty contract as every other band here: a standing banner on a clean board is an ornament.
  */
-export function DigestBanner({ slug, needsYou }: { slug: string; needsYou: DigestNeedsYouSummary }) {
-  if (needsYou.total === 0) return null;
+export function DigestBanner({
+  slug,
+  needsYou,
+  activityCount,
+}: {
+  slug: string;
+  needsYou: DigestNeedsYouSummary;
+  /** `events.length` for the same since-you-looked window (anton-rokar's `projectDigest`). */
+  activityCount: number;
+}) {
+  if (activityCount === 0 && needsYou.total === 0) return null;
   const { counts } = needsYou;
 
   return (
@@ -162,9 +174,8 @@ export function DigestBanner({ slug, needsYou }: { slug: string; needsYou: Diges
     >
       <HandIcon className="size-3.5 shrink-0 text-stage-in-review" aria-hidden="true" />
       <h2 id="digest-banner-heading" className="text-xs font-medium text-foreground">
-        Needs you
+        {activityCount} thing{activityCount === 1 ? "" : "s"} since you looked · {needsYou.total} need you
       </h2>
-      <MetaChip tone="pr">{needsYou.total} need you</MetaChip>
       {counts.breaker > 0 ? <MetaChip tone="risk-high">autopilot stopped</MetaChip> : null}
       {counts["merge-ready-pr"] > 0 ? (
         <MetaChip tone="pr">

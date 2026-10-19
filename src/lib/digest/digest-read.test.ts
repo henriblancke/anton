@@ -16,7 +16,7 @@ import * as schema from "../db/schema";
 import type { EscalationView } from "../escalations";
 import { makeProjectDb, type TestProjectDb } from "../testing/project";
 import type { Project } from "../types";
-import { projectDigest } from "./digest-read";
+import { projectDigest, projectDigestSummary } from "./digest-read";
 
 vi.mock("../git/remote", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../git/remote")>();
@@ -115,6 +115,8 @@ describe("projectDigest", () => {
     expect(digest.isEmpty).toBe(false);
     expect(digest.groups.flatMap((g) => g.cards).map((c) => c.id)).toContain("feat-1");
     expect(digest.headline).toMatch(/run started/);
+    // The board banner's "N things since you looked" (anton-16s0t) names this same count.
+    expect(digest.activityCount).toBe(1);
   });
 
   it("starts the window at the viewer's own watermark, not at zero", async () => {
@@ -125,5 +127,37 @@ describe("projectDigest", () => {
     const digest = await projectDigest(t.db, project);
 
     expect(digest.since).toBe(5000);
+  });
+});
+
+describe("projectDigestSummary", () => {
+  it("reports the same needsYou and activityCount the full digest would, without feature groups", async () => {
+    board = [bead({ id: "feat-1" })];
+    escalations = [escalation({ id: "esc-1" })];
+    await t.db.insert(schema.runs).values({
+      id: "run-1",
+      projectId: t.projectId,
+      epicBeadId: "feat-1",
+      ticketBeadId: "feat-1",
+      status: "implementing",
+      startedAt: new Date(Date.now() - 5000),
+    });
+
+    const [summary, digest] = await Promise.all([
+      projectDigestSummary(t.db, project),
+      projectDigest(t.db, project),
+    ]);
+
+    expect(summary.needsYou.total).toBe(digest.needsYou.total);
+    expect(summary.activityCount).toBe(digest.activityCount);
+    expect(summary.activityCount).toBe(1);
+    expect(summary.needsYou.total).toBe(1);
+  });
+
+  it("reports zero/zero for a quiet project", async () => {
+    const summary = await projectDigestSummary(t.db, project);
+
+    expect(summary.needsYou.total).toBe(0);
+    expect(summary.activityCount).toBe(0);
   });
 });

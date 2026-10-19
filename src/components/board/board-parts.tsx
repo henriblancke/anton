@@ -5,10 +5,11 @@ import { TriangleAlertIcon } from "lucide-react";
 import { DragOverlay } from "@dnd-kit/core";
 
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
+import type { DigestBoardSummary } from "@/lib/digest/digest-read";
 import type { Epic, EscalationView, UnwatchedParks } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { EpicCard } from "@/components/board/epic-card";
-import { AttentionStrip } from "@/components/board/attention-strip";
+import { AttentionStrip, DigestBanner } from "@/components/board/attention-strip";
 import type { PolledBreaker } from "@/components/board/use-board-breaker";
 
 /**
@@ -45,6 +46,7 @@ export function BoardAttentionSlot({
   slug,
   escalations,
   parks,
+  digest,
   onArmed,
   polled,
   streamed,
@@ -52,6 +54,9 @@ export function BoardAttentionSlot({
   slug: string;
   escalations: EscalationView[];
   parks?: UnwatchedParks;
+  /** The board's since-you-looked summary (anton-16s0t), server-rendered by the page. Absent only
+   *  when the page has no project to read it for. */
+  digest?: DigestBoardSummary;
   onArmed: () => void;
   polled: PolledBreaker;
   /** The page's server-rendered read — a promise, because deciding the hold reads GitHub. */
@@ -67,9 +72,16 @@ export function BoardAttentionSlot({
     />
   );
   return (
-    <Suspense fallback={strip(undefined)}>
-      {polled ? strip(polled.value) : <StreamedAttentionStrip streamed={streamed} render={strip} />}
-    </Suspense>
+    <>
+      <Suspense fallback={strip(undefined)}>
+        {polled ? strip(polled.value) : <StreamedAttentionStrip streamed={streamed} render={strip} />}
+      </Suspense>
+      {/* Below the stopped/waiting strip, never instead of it: this band is standing "what changed"
+          context, not a stopped run needing a decision now. */}
+      {digest ? (
+        <DigestBanner slug={slug} needsYou={digest.needsYou} activityCount={digest.activityCount} />
+      ) : null}
+    </>
   );
 }
 

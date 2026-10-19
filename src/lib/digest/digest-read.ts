@@ -31,26 +31,36 @@ export interface ProjectDigest {
    * `since`..`until` held nothing, which {@link isEmpty} also keys off. */
   headline: string;
   needsYou: DigestNeedsYouSummary;
+  /** `events.length` for this window — the board banner's "N things since you looked" (anton-16s0t). */
+  activityCount: number;
   groups: DigestFeatureGroup[];
   /** Nothing happened AND nothing needs the operator — the page's empty-window state. */
   isEmpty: boolean;
 }
 
+/** `needsYou` plus the activity count — everything the board's digest banner needs (anton-16s0t). */
+export interface DigestBoardSummary {
+  needsYou: DigestNeedsYouSummary;
+  activityCount: number;
+}
+
 /**
- * One project's digest, for the page to render directly.
+ * The since-you-looked window shared by {@link projectDigest} and {@link projectDigestSummary}: the
+ * viewer's watermark, the board snapshot every bd-derived source judges against, the folded events,
+ * and the needs-you queue off that same board.
  *
  * `escalations` and `breaker` read the same way the board page already does (see `(board)/page.tsx`)
- * — `breaker` is awaited here rather than streamed, because `DigestNeedsYou` (needs-you-section.tsx)
- * takes a resolved `AutopilotBreaker`, not a promise: the digest is a single load, not a polled
- * surface, so there is no streaming boundary worth adding. A `gh pr view` failure degrades to no
- * breaker band rather than failing the page, the same resilience the board gives it.
+ * — `breaker` is awaited here rather than streamed, because `digestNeedsYou` takes a resolved
+ * `AutopilotBreaker`, not a promise: the digest is a single load, not a polled surface, so there is
+ * no streaming boundary worth adding. A `gh pr view` failure degrades to no breaker rather than
+ * failing the read, the same resilience the board gives it.
  *
  * Unwatched parks are deliberately NOT read here, unlike the board: {@link digestNeedsYou} has no
  * `parks` input at all (see attention.ts) — the digest's needs-you list only ever promotes a
  * disarmed breaker, a parked ask, a merge-ready PR, an open proposal, or an unblocked human ticket,
  * so a parks read here would pay for a signal nothing on this page shows.
  */
-export async function projectDigest(db: AntonDb, project: Project): Promise<ProjectDigest> {
+async function readDigestWindow(db: AntonDb, project: Project) {
   const mark = await getViewerMark(db, project.id);
   const since = mark?.seenAt ?? null;
   const until = Math.floor(systemClock.now() / 1000);
@@ -73,6 +83,12 @@ export async function projectDigest(db: AntonDb, project: Project): Promise<Proj
     proposals: openProposals(board),
   });
 
+  return { since, until, board, events, needsYou };
+}
+
+/** One project's digest, for the page to render directly. */
+export async function projectDigest(db: AntonDb, project: Project): Promise<ProjectDigest> {
+  const { since, until, board, events, needsYou } = await readDigestWindow(db, project);
   const groups = (await digestFeatureGroups(db, project.id, events, { board })) ?? [];
 
   return {
@@ -80,7 +96,19 @@ export async function projectDigest(db: AntonDb, project: Project): Promise<Proj
     until,
     headline: templateHeadline(events),
     needsYou,
+    activityCount: events.length,
     groups,
     isEmpty: needsYou.total === 0 && events.length === 0,
   };
+}
+
+/**
+ * The board banner's own read (anton-16s0t) — the SAME window {@link projectDigest} serves the page
+ * from, minus the feature-card assembly (`digestFeatureGroups`) the banner never renders: that read
+ * spawns a `bd show` per changed feature, a cost worth paying once for the digest page but not on
+ * every board load.
+ */
+export async function projectDigestSummary(db: AntonDb, project: Project): Promise<DigestBoardSummary> {
+  const { events, needsYou } = await readDigestWindow(db, project);
+  return { needsYou, activityCount: events.length };
 }
