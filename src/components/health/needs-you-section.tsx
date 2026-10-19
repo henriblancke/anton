@@ -92,9 +92,18 @@ function isRequest(escalation: EscalationView): boolean {
 export function NeedsYouSection({
   slug,
   escalations,
+  id = "needs-you",
+  headingId = "needs-you-heading",
 }: {
   slug: string;
   escalations: EscalationView[];
+  /**
+   * Section/heading ids, overridable because `DigestNeedsYou` mounts this component twice (parked
+   * asks, merge-ready PRs) in the same document — the hardcoded defaults below would collide,
+   * leaving two elements sharing an id and an `aria-labelledby` with undefined resolution.
+   */
+  id?: string;
+  headingId?: string;
 }) {
   if (escalations.length === 0) return null;
 
@@ -105,8 +114,8 @@ export function NeedsYouSection({
 
   return (
     <section
-      id="needs-you"
-      aria-labelledby="needs-you-heading"
+      id={id}
+      aria-labelledby={headingId}
       className={cn(
         "overflow-hidden rounded-xl border",
         broken
@@ -120,7 +129,7 @@ export function NeedsYouSection({
         ) : (
           <HandIcon className="size-3.5 text-stage-in-review" aria-hidden="true" />
         )}
-        <h2 id="needs-you-heading" className="text-xs font-medium text-foreground">
+        <h2 id={headingId} className="text-xs font-medium text-foreground">
           Needs you
         </h2>
         {/* Counted apart, because one number covering both would answer neither question a founder
@@ -514,10 +523,20 @@ export function DigestNeedsYou({
       ) : (
         <AutopilotBreakerHeader slug={slug} breaker={breakerItem?.breaker} />
       )}
-      <NeedsYouSection slug={slug} escalations={parkedAsks} />
+      <NeedsYouSection
+        slug={slug}
+        escalations={parkedAsks}
+        id="needs-you-parked"
+        headingId="needs-you-parked-heading"
+      />
       <ProposalQueue slug={slug} proposals={proposals} />
       <OperatorQueue slug={slug} items={humanTickets} onOpenTicket={onOpenTicket} onDone={onDone} />
-      <NeedsYouSection slug={slug} escalations={mergeReadyPrs} />
+      <NeedsYouSection
+        slug={slug}
+        escalations={mergeReadyPrs}
+        id="needs-you-merge-ready"
+        headingId="needs-you-merge-ready-heading"
+      />
     </div>
   );
 }

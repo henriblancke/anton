@@ -1,6 +1,6 @@
 /**
  * `templateHeadline` (anton-qitea): the one-line summary a feature card or the project digest
- * reads above its event list — "4 events: 2 runs finished, 1 PR opened, 1 escalation raised".
+ * reads above its event list — "4 events: 2 runs finished, PR opened, escalation raised".
  *
  * Deliberately template-only, no LLM (that is a later feature, per the digest epic's "Out of
  * scope"): a fixed phrase per {@link TimelineEventKind}, grouped and counted, in the kind's

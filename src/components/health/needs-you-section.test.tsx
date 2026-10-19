@@ -439,6 +439,32 @@ describe("DigestNeedsYou", () => {
     }
   });
 
+  it("gives the parked-ask and merge-ready-PR sections distinct ids when both are non-empty", () => {
+    // DigestNeedsYou mounts NeedsYouSection twice — once for parked asks, once for merge-ready
+    // PRs. Each mount renders a `<section id="needs-you-heading">`-labelled region; sharing the
+    // same ids (the component's old hardcoded default) would produce invalid duplicate-id HTML
+    // and an ambiguous `aria-labelledby` the moment both buckets are non-empty at once.
+    const summary = digestNeedsYou({
+      escalations: [
+        escalation({ kind: "needs-human", id: "esc-ask", gateId: "gate-1" }),
+        escalation({ kind: "stale-pr", id: "esc-pr", prNumber: 7, prUrl: "https://gh/pr/7" }),
+      ],
+    });
+    const { container } = render(
+      <DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />,
+    );
+
+    const sections = container.querySelectorAll("section[aria-labelledby^='needs-you']");
+    expect(sections).toHaveLength(2);
+    const ids = Array.from(sections).map((section) => section.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const section of Array.from(sections)) {
+      const labelledBy = section.getAttribute("aria-labelledby");
+      expect(labelledBy).toBeTruthy();
+      expect(document.querySelectorAll(`#${labelledBy}`)).toHaveLength(1);
+    }
+  });
+
   it("streams the breaker row separately from an already-resolved summary", async () => {
     const breaker: AutopilotBreaker = {
       kind: "disarm",
