@@ -334,4 +334,42 @@ describe("trendSeries", () => {
       runaway: false,
     });
   });
+
+  it("stays silent on an agent-tagged feature's own describe pass, whose narrower prompt is not an edit", async () => {
+    fakeBoard([]);
+    // `describe.ts` composes base+seed only (no agent layer), so an agent-tagged feature running
+    // implement then describe records two DIFFERENT promptDigest values under the same agentTag —
+    // the common delivered-feature shape, not a real prompt edit.
+    await t.db.insert(schema.claudeInvocations).values([
+      {
+        id: "inv-implement",
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "implement",
+        agentTag: "nextjs",
+        promptDigest: "digest-implement",
+        runId: "r1",
+        beadId: "feat-1",
+        outcome: "ok",
+        recordedAt: new Date(WEEK_MONDAY),
+      },
+      {
+        id: "inv-describe",
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "describe",
+        stepHandler: "describe",
+        agentTag: "nextjs",
+        promptDigest: "digest-describe",
+        runId: "r1",
+        beadId: "feat-1",
+        outcome: "ok",
+        recordedAt: new Date(WEEK_MONDAY + DAY),
+      },
+    ]);
+
+    const series = await trendSeries(t.db, t.projectId, 1, { nowMs: NOW_MS });
+    expect(series?.changeMarkers).toEqual([]);
+  });
 });

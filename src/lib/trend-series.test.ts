@@ -266,10 +266,16 @@ describe("modelChangeMarkers", () => {
 });
 
 describe("promptChangeMarkers", () => {
-  const stamp = (atMs: number, promptDigest: string, agentTag?: string): InvocationStampPoint => ({
+  const stamp = (
+    atMs: number,
+    promptDigest: string,
+    agentTag?: string,
+    stepHandler?: string,
+  ): InvocationStampPoint => ({
     atMs,
     promptDigest,
     agentTag,
+    stepHandler,
   });
 
   it("fires on a new digest inside one agent's own lineage", () => {
@@ -298,6 +304,21 @@ describe("promptChangeMarkers", () => {
     ];
     const markers = promptChangeMarkers(rows, [WEEK_1, WEEK_2]);
     expect(markers).toEqual([{ kind: "prompt", week: WEEK_2, before: "digest-a", after: "digest-b" }]);
+  });
+
+  it("stays silent on an agent's own describe pass, whose structurally narrower prompt is not an edit", () => {
+    const rows = [
+      // implement, then describe, same agentTag, same week — the common delivered-feature shape.
+      stamp(WEEK_1_MONDAY, "digest-implement", "nextjs", "implement"),
+      stamp(WEEK_1_MONDAY + DAY, "digest-describe", "nextjs", "describe"),
+      // The next real implement digest must still compare against the IMPLEMENT lineage, not the
+      // describe row that happened to run most recently.
+      stamp(WEEK_1_MONDAY + 7 * DAY, "digest-implement-2", "nextjs", "implement"),
+    ];
+    const markers = promptChangeMarkers(rows, [WEEK_1, WEEK_2]);
+    expect(markers).toEqual([
+      { kind: "prompt", week: WEEK_2, before: "digest-implement", after: "digest-implement-2" },
+    ]);
   });
 });
 

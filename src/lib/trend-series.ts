@@ -25,7 +25,7 @@
  *
  * Pure and dependency-free, like `prompt-series.ts`: no db, no node builtins.
  */
-import { MIN_COHORT } from "./prompt-series";
+import { DESCRIBER_STEP_HANDLER, MIN_COHORT } from "./prompt-series";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const WEEK_MS = 7 * DAY_MS;
@@ -318,6 +318,14 @@ export interface InvocationStampPoint {
   skillDigest?: string | null;
   /** The release + revision that ran it, `describeBuildIdentity`'s own shape — `anton_version`. */
   antonVersion?: string | null;
+  /**
+   * The resolved formula-step handler this row ran under (`claude-invocations.ts`'s `stepHandler`) —
+   * read only so {@link promptChangeMarkers} can exclude `step:describe`'s own invocations, the same
+   * carve-out `prompt-series.ts`'s {@link DESCRIBER_STEP_HANDLER} documents: `describe.ts` composes a
+   * structurally narrower prompt (base+seed, no agent layer) than `step:implement` does, so an
+   * agent-tagged feature running both would otherwise read that structural difference as a prompt edit.
+   */
+  stepHandler?: string | null;
 }
 
 export const CHANGE_MARKER_KINDS = ["model", "prompt", "skill", "release"] as const;
@@ -422,6 +430,10 @@ export function promptChangeMarkers(
   const lastByAgent = new Map<string, string>();
   const markers: ChangeMarker[] = [];
   for (const row of inWindow(rows, weekKeys)) {
+    // The describer's own system prompt is structurally narrower than the implementer's (no agent
+    // layer) — see DESCRIBER_STEP_HANDLER. Counting it here would read every agent-tagged feature's
+    // describe pass as a prompt edit on the common implement-then-describe path.
+    if (row.stepHandler === DESCRIBER_STEP_HANDLER) continue;
     const digest = stamped(row.promptDigest);
     if (!digest) continue;
     const agent = stamped(row.agentTag) ?? "";

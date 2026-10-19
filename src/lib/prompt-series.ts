@@ -677,7 +677,7 @@ function isScaffoldingFallback(row: CohortStampRow): boolean {
  * instead of the cohort its implementation ran under — silently excluding nearly every agent-run
  * delivered feature from the one dimension meant to measure it.
  */
-const DESCRIBER_STEP_HANDLER = "describe";
+export const DESCRIBER_STEP_HANDLER = "describe";
 
 /**
  * `review-gate.ts`'s own formula-step handler (`meter`'s `stepHandler: "review"`) — the phase whose

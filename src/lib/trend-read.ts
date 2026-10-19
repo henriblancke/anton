@@ -239,9 +239,10 @@ function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint
  * majority vote {@link modelChangeMarkers} takes over a week. Grouped via {@link groupInvocations},
  * the same regrouping {@link ledgerTotals} applies before classifying a row.
  *
- * `promptDigest`/`agentTag`/`skillId`/`skillDigest`/`antonVersion` are genuinely invariant across an
- * invocation's rows (`claude-invocations.ts`'s `invocationRows` stamps them once into the `shared`
- * object every row of the call copies), so `fact.rows[0]` carries them regardless of row order. The
+ * `promptDigest`/`agentTag`/`skillId`/`skillDigest`/`antonVersion`/`stepHandler` are genuinely
+ * invariant across an invocation's rows (`claude-invocations.ts`'s `invocationRows` stamps them once
+ * into the `shared` object every row of the call copies), so `fact.rows[0]` carries them regardless
+ * of row order. The
  * model is the opposite case — it is the ONE column that differs row to row BY DESIGN — so picking
  * `rows[0]`'s would silently report the sidecar's model on ties, since `listInvocations` orders rows
  * `desc(recordedAt), desc(rowid)` and a sidecar row is written after (so sorts before) its primary.
@@ -261,6 +262,7 @@ function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): Invocation
       skillId: row.skillId,
       skillDigest: row.skillDigest,
       antonVersion: row.antonVersion,
+      stepHandler: row.stepHandler,
     };
   });
 }
