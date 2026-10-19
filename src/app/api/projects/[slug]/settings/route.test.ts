@@ -1954,6 +1954,19 @@ describe("settings route — Jev backend (anton-p32iy)", () => {
     expect((await res.json()).error).toMatch(/jevEnabled needs both/);
     expect("jevEnabled" in persisted()).toBe(false);
   });
+
+  it("PATCH rejects jevEnabled: true alone when the stored jevApiKey is a non-string (hand-edited row)", async () => {
+    // A hand-edited or legacy row can carry a non-string jevApiKey — `apiKey?.trim()` would throw
+    // a raw TypeError here instead of the intended "needs both" 400.
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ jevApiKey: 42, jevModel: "jev-1.13.0" }) });
+
+    const res = await PATCH(patchReq({ jevEnabled: true }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/jevEnabled needs both/);
+    expect("jevEnabled" in persisted()).toBe(false);
+  });
 });
 
 /**

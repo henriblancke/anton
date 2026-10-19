@@ -67,8 +67,9 @@ function assertPinnedModel(model: string): void {
  */
 class JevCallError extends Error {
   readonly retryable: boolean;
-  /** Only set for a 429 — how long to wait before the retry, per TypeSafe's own API reference
-   * (docs.typesafe.ai/api), which instructs clients to back off rather than retry immediately. */
+  /** Only set for a 429 or 529 (Overloaded) — how long to wait before the retry, per TypeSafe's own
+   * API reference (docs.typesafe.ai/api), which instructs clients to back off rather than retry
+   * immediately on either status. */
   readonly retryAfterMs?: number;
   constructor(message: string, retryable: boolean, retryAfterMs?: number) {
     super(message);
@@ -78,10 +79,15 @@ class JevCallError extends Error {
   }
 }
 
-/** The longest this backend will wait on a 429's `Retry-After` before giving up and retrying
+/** The longest this backend will wait on a 429/529's `Retry-After` before giving up and retrying
  * anyway — Jev is meant to answer in milliseconds (see {@link DEFAULT_JEV_TIMEOUT_MS}), so honoring
  * an arbitrarily long vendor-side backoff would defeat the point of having a fast path at all. */
 const MAX_RETRY_AFTER_MS = 3_000;
+
+/** Backoff used for a 429/529 that carries no (or an unparsable) `Retry-After` header — TypeSafe's
+ * API reference (docs.typesafe.ai/api) instructs clients to back off on both statuses, so the single
+ * retry still pauses rather than hammering systemone again immediately. */
+const DEFAULT_RETRY_BACKOFF_MS = 500;
 
 /** `Retry-After` is either a count of seconds or an HTTP-date (RFC 9110 §10.2.3). Returns
  * `undefined` for a missing/unparseable header rather than guessing a delay. */
@@ -204,6 +210,20 @@ function isValidProbabilityDistribution(
   return Math.abs(sum - 1) <= DISTRIBUTION_SUM_TOLERANCE;
 }
 
+/** Float slack for comparing a chosen probability against the distribution's max — not a real
+ * tolerance like {@link DISTRIBUTION_SUM_TOLERANCE}, just enough to absorb rounding on an exact tie. */
+const CHOICE_PROBABILITY_EPSILON = 1e-9;
+
+/** TypeSafe documents `choice` as the highest-probability entry in `probabilities`
+ * (docs.typesafe.ai/api) — a reply naming some other option as the choice is internally
+ * inconsistent and must fail here rather than record a contradictory decision. */
+function isMaxProbabilityChoice(choice: string, probabilities: Record<string, number>): boolean {
+  const chosenProbability = probabilities[choice];
+  if (chosenProbability === undefined) return false;
+  const maxProbability = Math.max(...Object.values(probabilities));
+  return chosenProbability >= maxProbability - CHOICE_PROBABILITY_EPSILON;
+}
+
 function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAnswer): ModelAnswer {
   const base = { backend: BACKEND, modelVersion };
   const { question } = point;
@@ -222,6 +242,15 @@ function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAn
     if (!isValidProbabilityDistribution(answer.probabilities, question.options)) {
       throw new ModelCallError(
         `decide/jev: probabilities for "${point.id}" are not a valid distribution over its question's options`,
+        base,
+      );
+    }
+    // TypeSafe defines `choice` as the highest-probability option — a reply naming a different one
+    // (e.g. choice: "technical" over {billing: 0.9, technical: 0.1}) is internally inconsistent and
+    // must fall back to claude-local rather than record a contradictory decision.
+    if (!isMaxProbabilityChoice(answer.choice, answer.probabilities)) {
+      throw new ModelCallError(
+        `decide/jev: choice "${answer.choice}" for "${point.id}" is not the maximum-probability option in its distribution`,
         base,
       );
     }
@@ -284,11 +313,14 @@ async function callSystemOne(
 
   if (!response.ok) {
     // A 4xx (bad key, malformed request) repeats identically on retry; a 5xx is transient server
-    // trouble; a 429 is also transient but only after backing off — TypeSafe's own API reference
-    // (docs.typesafe.ai/api) instructs clients to retry rate limits with a delay, never immediately.
+    // trouble. 429 and 529 (Overloaded) are also transient but only after backing off — TypeSafe's
+    // own API reference (docs.typesafe.ai/api) instructs clients to retry both with a delay, never
+    // immediately, so both get a `Retry-After`-or-default backoff rather than the plain 5xx path.
     const retryable = response.status === 429 || response.status >= 500;
     const retryAfterMs =
-      response.status === 429 ? parseRetryAfterMs(response.headers.get("Retry-After")) : undefined;
+      response.status === 429 || response.status === 529
+        ? parseRetryAfterMs(response.headers.get("Retry-After")) ?? DEFAULT_RETRY_BACKOFF_MS
+        : undefined;
     throw new JevCallError(
       `decide/jev: systemone responded ${response.status} for "${point.id}"`,
       retryable,

@@ -245,6 +245,28 @@ describe("jevBackend — response parsing (fixtures from the docs example)", () 
     await expect(ask(choicePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
   });
 
+  it("rejects a choice that contradicts its own distribution's maximum-probability option", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-1.13.0",
+        answers: {
+          department: {
+            type: "choice",
+            // "technical" is named as the choice, but "billing" holds the max probability — an
+            // internally inconsistent reply per TypeSafe's own choice/distribution contract.
+            choice: "technical",
+            confidence: 0.9,
+            probabilities: { billing: 0.9, technical: 0.1, other: 0.0 },
+          },
+        },
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(ask(choicePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
+  });
+
   it("rescales a score answer from Jev's 0..1 index position onto the point's own [min, max]", async () => {
     const ask = jevBackend({
       apiKey: "k",
@@ -492,6 +514,28 @@ describe("jevBackend — retry and failure (one retry, no more)", () => {
 
     await expect(ask(yesNoPoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off before retrying a 529 even with no Retry-After header, and succeeds", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("overloaded", { status: 529 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ model: "jev-1.13.0", answers: { is_urgent: { type: "noul", noul: 0.8 } } }),
+          { status: 200 },
+        ),
+      );
+    const ask = jevBackend({ apiKey: "k", model: PINNED_MODEL, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const start = Date.now();
+    const answer = await ask(yesNoPoint(), { ticketText: "x" });
+
+    // The single retry must not fire immediately — a 529 is retried only after backing off, per
+    // TypeSafe's own API reference, same as a 429.
+    expect(Date.now() - start).toBeGreaterThanOrEqual(400);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(answer.value).toBe(true);
   });
 
   it("caps an excessive Retry-After instead of honoring it in full", async () => {

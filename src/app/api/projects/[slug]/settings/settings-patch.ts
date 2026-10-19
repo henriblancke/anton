@@ -369,7 +369,9 @@ function checkJevConfigured(
   // Re-check the pin even when `model` itself isn't in this patch — a partial `{jevEnabled: true}`
   // would otherwise pass on a stale/hand-edited unpinned model and leave resolveJevConfig silently
   // reading it as off, the same wrong-failure-mode this check exists to catch.
-  if (enabled && (!apiKey?.trim() || !model || !isPinnedJevModel(model))) {
+  // `apiKey` may be a non-string on a hand-edited/legacy row — `resolveJevConfig` guards the same
+  // way before calling `.trim()`.
+  if (enabled && (typeof apiKey !== "string" || !apiKey.trim() || !model || !isPinnedJevModel(model))) {
     return "jevEnabled needs both jevApiKey and a pinned jevModel — set both, or leave Jev off.";
   }
   return null;
