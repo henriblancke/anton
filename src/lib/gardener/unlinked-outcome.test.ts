@@ -1,9 +1,11 @@
 /**
  * `unlinked-outcome` (anton-vie0k), driven over fixture boards.
  *
- * Not part of {@link detectBoard}'s composed set yet (see detect.ts) — there is no apply route for
- * `attach-outcome` until anton-15xcn lands — so these drive {@link detectUnlinkedOutcomes} directly,
- * through the same `indexWorkBoard` every other detector is handed its board through.
+ * Deliberately NOT part of {@link detectBoard}'s composed set (see detect.ts) — it asks about a
+ * label the outcome contract predates rather than about how the board hangs together, so it is
+ * composed on its own by `gardener-proposals.ts` instead. These tests drive
+ * {@link detectUnlinkedOutcomes} directly for the same reason, through the same `indexWorkBoard`
+ * every other detector is handed its board through.
  */
 import { describe, expect, it } from "vitest";
 

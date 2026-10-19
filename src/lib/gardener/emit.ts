@@ -212,6 +212,15 @@ export function planEmission(input: EmissionInput): EmissionPlan {
     const stale = staleSiblingsOf(input.board, detection);
     if (stale.length > 0) supersedes.set(detection.fingerprint, stale);
   }
+  // A SUPPRESSED claim's own ask already stands on the board, but a stale sibling from before that
+  // ask landed can still be open too — the close that should have retired it may have failed
+  // transiently (closeStaleSiblings catches and leaves it standing rather than losing the fresh
+  // ask over it). Checking suppressed claims here as well is what lets emitProposals retry that
+  // close on every later pass, not just the one pass that happened to create the fresh ask.
+  for (const detection of suppressed) {
+    const stale = staleSiblingsOf(input.board, detection);
+    if (stale.length > 0) supersedes.set(detection.fingerprint, stale);
+  }
 
   return { emit, suppressed, deferred: fresh.slice(limit), supersedes };
 }
@@ -379,7 +388,32 @@ export async function emitProposals(repo: string, input: EmissionInput): Promise
     if (stale) superseded.push(...(await closeStaleSiblings(repo, id, detection.fingerprint, stale)));
   }
 
+  // A SUPPRESSED claim's fresh ask already stands — nothing to create — but its own stale sibling
+  // may still be open from a close that failed on an earlier pass (see planEmission). Retrying here
+  // is what actually makes good on closeStaleSiblings' claim that "the next pass retries": without
+  // this loop, a suppressed claim's stale sibling is never looked at again, because it only ever
+  // reaches staleSiblingsOf by way of a detection that is about to be freshly created.
+  for (const detection of plan.suppressed) {
+    if (input.signal?.aborted) throw new PartialEmissionError(sofar(), input.signal.reason);
+    const stale = plan.supersedes.get(detection.fingerprint);
+    if (!stale) continue;
+    const keep = openProposalIdFor(input.board, detection.fingerprint);
+    if (!keep) continue;
+    superseded.push(...(await closeStaleSiblings(repo, keep, detection.fingerprint, stale)));
+  }
+
   return sofar();
+}
+
+/** The id of the open proposal already on the board answering for `fingerprint`, if any — the
+ * `keep` a retried {@link closeStaleSiblings} supersedes stale siblings in favor of, when the fresh
+ * ask that outgrew them was created on an earlier pass rather than this one. */
+function openProposalIdFor(board: Bead[], fingerprint: string): string | undefined {
+  return board.find(
+    (bead) =>
+      isOpenWork(bead) &&
+      (fingerprintLabelOf(bead) === fingerprint || canonicalFingerprintOf(bead) === fingerprint),
+  )?.id;
 }
 
 /**
@@ -390,7 +424,9 @@ export async function emitProposals(repo: string, input: EmissionInput): Promise
  * reconcileDuplicateProposals} holds a fold to: an approval or a claim landing between the plan's
  * board read and this close makes the sibling untouchable. A skipped or failed close is left
  * standing, never thrown — the fresh ask that just landed matters more than tidying the stale one,
- * and the next pass's own plan sees the same sibling and retries.
+ * and the next pass's own plan sees the same sibling and retries — via {@link emitProposals}'
+ * suppressed-claim loop, since the claim that outgrew this sibling is suppressed (its own ask
+ * already stands) on every pass after this one, not just this one.
  */
 async function closeStaleSiblings(
   repo: string,
