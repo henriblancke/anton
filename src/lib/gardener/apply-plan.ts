@@ -43,7 +43,7 @@ import {
   MIN_CARRIED_TICKETS,
   MIN_CLUSTER_SIZE,
 } from "./reparent";
-import { suggestOutcome, UNKNOWN_OUTCOME } from "./unlinked-outcome";
+import { suggestOutcome, UNKNOWN_OUTCOME, type Suggestion } from "./unlinked-outcome";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -174,7 +174,19 @@ export type ApplyStep =
    * `attachOutcomeBarred`, and apply-steps.ts's write-time re-check), so `outcome` here is only ever
    * the freshly-derived value a step is about to write, never the detection's frozen guess.
    */
-  | (StepSubject & EvidenceFence & { verb: "attach-outcome"; outcome: string });
+  | (StepSubject &
+      EvidenceFence & {
+        verb: "attach-outcome";
+        outcome: string;
+        /**
+         * The epic whose own label DETERMINED `outcome` (unlinked-outcome.ts `Suggestion.parent`),
+         * or undefined when the guess came from `source:stringer` or named no signal at all. Locked
+         * alongside the subject (apply-steps.ts `premiseBeadsOf`) so the write-time re-check of
+         * `suggestOutcome` cannot land between a concurrent relabel of the parent and this write —
+         * without it, the recheck reads a parent `lockedBeads(step)` never actually holds.
+         */
+        parent?: string;
+      });
 
 /** The one verb whose steps come in clusters — the shape both halves of the move are written in. */
 export type ReparentStep = Extract<ApplyStep, { verb: "reparent" }>;
@@ -1195,18 +1207,18 @@ function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMomen
   // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
   // frozen at filing time, and a parent epic relabelled (or re-parented away) since then must change
   // the answer the write actually lands, not just the evidence text the approver saw.
-  const outcome = suggestOutcome(index, subject).outcome;
+  const suggestion = suggestOutcome(index, subject);
   // The literal answer `detectUnlinkedOutcomes` suggests when neither board signal fired — the ask
   // is "which outcome does this serve?", and only a human can answer it. Refused here rather than
   // left to the manual floor alone (autonomy.ts `isManualProposal`), which only ever keeps this OFF
   // an armed pass's own writes; a human clicking Approve on it must be refused the same way.
-  if (outcome === UNKNOWN_OUTCOME) {
+  if (suggestion.outcome === UNKNOWN_OUTCOME) {
     return {
       status: "refuse",
       reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
     };
   }
-  return attachOutcomeSubject(plan, subject, outcome, index, at);
+  return attachOutcomeSubject(plan, subject, suggestion, index, at);
 }
 
 /** The label decided against the bead itself, once {@link planAttachOutcome} has settled the
@@ -1214,7 +1226,7 @@ function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMomen
 function attachOutcomeSubject(
   plan: GardenerPlan,
   subject: Bead,
-  outcome: string,
+  suggestion: Suggestion,
   index: BoardIndex,
   at: ApplyMoment,
 ): ApplyDecision {
@@ -1227,12 +1239,13 @@ function attachOutcomeSubject(
         verb: "attach-outcome",
         id: subject.id,
         claim: runClaimOf(subject),
-        outcome,
+        outcome: suggestion.outcome,
+        parent: suggestion.parent,
         kind: plan.kind,
         observedAtMs: at.observedAtMs,
       },
     ],
-    summary: `labelled ${subject.id} outcome:${outcome}`,
+    summary: `labelled ${subject.id} outcome:${suggestion.outcome}`,
   };
 }
 

@@ -87,6 +87,7 @@ vi.mock("../beads/bd", async () => {
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
+      tag: (_cwd: string, id: string, labels: string[]) => record("tag", id, labels.join(",")),
     },
   };
 });
@@ -349,6 +350,38 @@ describe("under the write lock — what a decided step re-asks before it lands",
       }
       await expect(run).resolves.toMatchObject({ changed: ["anton-a", "anton-b"] });
     }
+  });
+
+  /**
+   * The attach-outcome mirror: when the decided outcome was INHERITED from a parent epic's own
+   * label, the write-time re-check (`assertOutcomeHolds`) reads that epic, not the subject — so
+   * the step holds the epic's write lock too, the same way a cluster re-parent holds its premise
+   * beads. Unheld, a concurrent relabel of the epic could land between the locked board read and
+   * this write, and the recheck would pass by reading a parent nothing actually serialized it
+   * against.
+   */
+  it("takes the write lock of the parent epic an inherited outcome was read off", async () => {
+    const epic = bead("anton-epic", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const feature = child("anton-feat", epic.id, { issue_type: "feature" });
+    const plan = planFor({
+      kind: "unlinked-outcome",
+      move: "attach-outcome",
+      subjects: [feature.id],
+      detail: "first-outcome",
+    });
+    const proposal = proposalFor(plan);
+    let release = () => {};
+    const queued = withBeadWriteLock(REPO, epic.id, () => new Promise<void>((r) => (release = r)));
+
+    const run = apply(proposal, [epic, feature, proposal]);
+    try {
+      await new Promise((r) => setTimeout(r, 10));
+      expect(calls, `${epic.id} was not held`).toEqual([]);
+    } finally {
+      release();
+      await queued;
+    }
+    await expect(run).resolves.toMatchObject({ changed: [feature.id] });
   });
 
   /**

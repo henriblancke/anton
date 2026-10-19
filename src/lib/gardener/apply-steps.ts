@@ -168,10 +168,20 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
  * across an intermediate is only as durable as that intermediate. None is written to, and none is
  * derivable from the step's ends — which is why the decision carries them (apply-plan.ts
  * `ClusterPremise`) and why they are locked (see {@link lockedBeads}).
+ *
+ * An `attach-outcome` step owes its own premise bead the same lock, for the mirror reason: when the
+ * decided outcome was inherited from a parent epic's label, `assertOutcomeHolds` re-derives it by
+ * reading THAT epic, not the subject — so without locking it here, a concurrent relabel of the
+ * parent can land between the read and this write, and the recheck would pass by reading a parent
+ * nothing actually serializes against the write.
  */
 function premiseBeadsOf(step: ApplyStep): string[] {
-  const cluster = step.verb === "reparent" ? step.cluster : undefined;
-  return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
+  if (step.verb === "reparent") {
+    const cluster = step.cluster;
+    return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
+  }
+  if (step.verb === "attach-outcome") return step.parent ? [step.parent] : [];
+  return [];
 }
 
 /**

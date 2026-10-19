@@ -16,7 +16,7 @@ import { beads, labelValueOf, labelValuesOf, type Bead } from "../beads/bd";
 import { outcomeIdsOf } from "../backlog";
 import { goalBody, isAuthoredBody, preambleOf } from "../beads/contract";
 import { AREA_SHAPE } from "../epic-patch";
-import { isOpenWork, type BoardIndex } from "./board-index";
+import { isClaimed, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import { makeDetection, type GardenerDetection } from "./detections";
 
 /** What scan-triage-produced work always serves (outcomes.ts's built-in) — stringer's own beads
@@ -37,13 +37,20 @@ const MAX_GOAL_HINT_CHARS = 240;
  * status `isOpenWork` alone does not exclude. A bead's own proposals never reach here at all: the
  * caller indexes the board through {@link indexWorkBoard}, which filters them before any detector
  * sees a snapshot.
+ *
+ * Also skipped: a target already {@link isInFlight} or {@link isClaimed} — the same busy bar every
+ * other move/order/settle detector proposes under. Without it, a run that claims an unlabelled
+ * target between this pass's read and approval leaves the proposal unappliable (`subjectBusy`
+ * refuses it) for good once that run closes the target — a stale ask a human has to notice and
+ * decline by hand rather than one the next pass simply stops re-raising.
  */
-export function detectUnlinkedOutcomes(index: BoardIndex): GardenerDetection[] {
+export function detectUnlinkedOutcomes(index: BoardIndex, nowMs: number): GardenerDetection[] {
   const detections: GardenerDetection[] = [];
 
   for (const bead of index.all) {
     if (!isOpenWork(bead) || beads.isDeferred(bead)) continue;
     if (!beads.isRunTarget(bead, index.all)) continue;
+    if (isInFlight(bead, nowMs) || isClaimed(bead)) continue;
     if (outcomeIdsOf(bead).length > 0) continue;
 
     const suggestion = suggestOutcome(index, bead);
@@ -72,6 +79,14 @@ export function detectUnlinkedOutcomes(index: BoardIndex): GardenerDetection[] {
 export interface Suggestion {
   outcome: string;
   evidence: string[];
+  /**
+   * The epic whose own label DETERMINED `outcome` — set only in the inherit rung below. Named so a
+   * caller that is about to WRITE the outcome can lock this bead too (apply-steps.ts
+   * `lockedBeads`/`premiseBeadsOf`): the guess is read off the parent's label, not the subject's own,
+   * so nothing serializes it against a concurrent relabel of the parent unless the caller locks the
+   * parent explicitly.
+   */
+  parent?: string;
 }
 
 /**
@@ -92,6 +107,7 @@ export function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
       return {
         outcome: epicOutcomes[0],
         evidence: [`its parent epic ${parent.id} carries exactly one outcome:${epicOutcomes[0]} label — inherit it`],
+        parent: parent.id,
       };
     }
     if (epicOutcomes.length > 1) {

@@ -23,7 +23,9 @@ const epic = (id: string, over: Partial<Bead> = {}) => bead(id, { issue_type: "e
 const feature = (id: string, over: Partial<Bead> = {}) =>
   bead(id, { issue_type: "feature", ...over });
 
-const detect = (board: Bead[]) => detectUnlinkedOutcomes(indexWorkBoard(board));
+const NOW_MS = Date.parse("2026-01-01T00:00:00Z");
+
+const detect = (board: Bead[]) => detectUnlinkedOutcomes(indexWorkBoard(board), NOW_MS);
 
 const only = (board: Bead[]) => {
   const detections = detect(board);
@@ -126,6 +128,18 @@ describe("unlinked-outcome (anton-vie0k)", () => {
 
   it("skips a deferred run target", () => {
     expect(detect([feature("anton-feat", { status: "deferred" })])).toEqual([]);
+  });
+
+  it("skips a run target a worker has already claimed", () => {
+    expect(
+      detect([feature("anton-feat", { status: "in_progress", assignee: "worker-1" })]),
+    ).toEqual([]);
+  });
+
+  it("skips a run target with an unexpired run-lease", () => {
+    expect(
+      detect([feature("anton-feat", { labels: [`run-lease:${NOW_MS + 100_000}`] })]),
+    ).toEqual([]);
   });
 
   it("skips the gardener's own proposal beads", () => {

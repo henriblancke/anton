@@ -276,7 +276,7 @@ export async function fileGardenerProposals(
   const index = indexWorkBoard(board);
   const detections = [
     ...detectBoard({ board, hygiene: { findings: input.findings }, now }),
-    ...detectUnlinkedOutcomes(index),
+    ...detectUnlinkedOutcomes(index, now),
     ...detectDeferredRejudgements(index, now),
   ];
   await ctx.heartbeat();
