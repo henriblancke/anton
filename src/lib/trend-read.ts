@@ -12,12 +12,12 @@
 import { and, asc, eq, gte, isNotNull } from "drizzle-orm";
 import type { Bead } from "./beads/bd";
 import type { ClaudeInvocationRow } from "./claude-invocations";
-import { listInvocations } from "./claude-invocations";
+import { invocationsForBeads, listInvocations } from "./claude-invocations";
 import { cohortFeatures } from "./cohort-read";
 import { getDb, schema } from "./db";
 import { runsByCause } from "./failure-cause-read";
 import { ledgerPhase } from "./feature-ledger";
-import { currentRunTargetOf } from "./feature-scope";
+import { currentRunTargetOf, ledgerScope } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { groupInvocations, modelsMatch } from "./model-divergence";
 import { costOf } from "./model-pricing";
@@ -217,16 +217,19 @@ function invocationWindowRows(db: AntonDb, projectId: string, since: Date): Prom
 }
 
 /**
- * Every `claude_invocations` row this project has ever recorded, UNBOUNDED by the window — shared by
- * {@link invocationStampPoints} and {@link reviewLoopInvocationPoints}, each of which needs history
- * the window itself does not carry:
+ * Every `claude_invocations` row this project has ever recorded, UNBOUNDED by the window — feeds
+ * {@link invocationStampPoints} alone: {@link changeMarkers} seeds each lineage's starting value from
+ * the latest stamp BEFORE the requested window, so a change whose only predecessor sits just outside
+ * it still reads as a change rather than a first-ever value (P2, PR #348 review). A
+ * model/prompt/skill/release marker isn't bead-scoped, so this genuinely has to see every invocation
+ * the project has ever recorded, not just the cohort's.
  *
- *  - {@link changeMarkers} seeds each lineage's starting value from the latest stamp BEFORE the
- *    requested window, so a change whose only predecessor sits just outside it still reads as a
- *    change rather than a first-ever value (P2, PR #348 review).
- *  - {@link ReviewLoopPoint}'s own contract is that a feature's self-review/PR-fix loop spans its
- *    WHOLE life, never just the requested window — a feature whose review started before `since` but
- *    delivered inside it must not have its earlier rounds truncated away (P1, PR #348 review).
+ * {@link reviewLoopInvocationPoints} does NOT share this read, even though its own contract is the
+ * same "whole life, never just the window" one {@link ReviewLoopPoint} states: its output is
+ * immediately filtered down to the cohort's own bead ids in {@link trendSeries}, so it only ever
+ * needs THOSE beads' whole-life rows — {@link invocationsForBeads} (indexed on
+ * `claude_invocations_bead_idx`) reads exactly that bounded set, instead of this unbounded scan
+ * growing without bound as the project accumulates invocations (P2, PR #348 review).
  */
 function wholeLifeInvocationRows(db: AntonDb, projectId: string): Promise<ClaudeInvocationRow[]> {
   return listInvocations(db, projectId, {});
@@ -308,8 +311,11 @@ function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): Invocation
  * The invocations {@link reviewLoopByFeature} counts, one point per real invocation for the same
  * sidecar-row reason {@link invocationStampPoints} groups: a raw-row count overcounts by the
  * sidecar factor, corrupting both the displayed per-feature counts and the median-based runaway
- * comparison. Built from {@link wholeLifeInvocationRows}, never a window-bound query — see its own
- * note on why a feature's loop needs its whole life, not just the requested window.
+ * comparison. `rows` is never a window-bound query — a feature's self-review/PR-fix loop spans its
+ * whole life, never just the requested window — but it is also never {@link wholeLifeInvocationRows}'
+ * project-wide scan: {@link trendSeries} reads it from {@link invocationsForBeads} over the cohort's
+ * own {@link ledgerScope} ids instead, since this fold's output is filtered down to the cohort right
+ * after (P2, PR #348 review).
  *
  * Every fact's `beadId` is resolved to its CURRENT run target via {@link currentRunTargetOf} before
  * bucketing: a ticket-phase invocation is stamped with the child TICKET's id
@@ -362,9 +368,13 @@ async function runCausePoints(db: AntonDb, projectId: string, since: Date): Prom
  * cost figures the cost fold needs, and it is expensive enough (one `bd` shell call per run target,
  * bounded concurrency) that a second call over the same window would double real work for no new data.
  *
- * `invocationStamps` and `reviewLoopInvocations` are both built from {@link wholeLifeInvocationRows}
- * (no `since` bound), never from the same window-bound rows `phaseSpendPoints` uses — see that
- * function's own note on why each needs history the window alone does not carry.
+ * `invocationStamps` and `reviewLoopInvocations` are both whole-life reads, never from the same
+ * window-bound rows `phaseSpendPoints` uses — see {@link wholeLifeInvocationRows}'s own note on why
+ * each needs history the window alone does not carry. They are NOT read from the same rows, though:
+ * `invocationStamps` reads {@link wholeLifeInvocationRows}'s project-wide scan (a change marker isn't
+ * bead-scoped), while `reviewLoopInvocations` reads {@link invocationsForBeads} over the cohort's own
+ * {@link ledgerScope} ids — a bounded, indexed read, since its output is filtered down to the cohort
+ * right after (P2, PR #348 review).
  */
 export async function trendSeries(
   db: AntonDb,
@@ -402,11 +412,15 @@ export async function trendSeries(
   const board = await listAllBeads(project);
 
   // `cohortFeatures` already decided which run targets belong to THIS window (activity or delivery
-  // inside it) — a feature with neither has no place in the cohort's median/runaway verdicts, even
-  // though `wholeLifeInvocationRows` still carries its old rows for every OTHER cohort member's
-  // whole-life fold (P1, PR #348 review).
+  // inside it) — a feature with neither has no place in the cohort's median/runaway verdicts. Reading
+  // `reviewLoopInvocations` from each cohort member's own `ledgerScope` (rather than every row the
+  // project has ever recorded) already excludes a stale feature's rows at the query itself; the
+  // `cohortBeadIds` filter below stays as a cheap belt-and-suspenders against a row whose
+  // `currentRunTargetOf` resolution drifted from the scope it was fetched under (P1, PR #348 review).
   const cohortBeadIds = new Set(features.map((f) => f.beadId));
-  const reviewLoopInvocations = reviewLoopInvocationPoints(wholeLifeRows, board).filter((p) =>
+  const reviewLoopScopeIds = [...new Set(features.flatMap((f) => ledgerScope(board, f.beadId).ids))];
+  const reviewLoopRows = await invocationsForBeads(db, projectId, reviewLoopScopeIds);
+  const reviewLoopInvocations = reviewLoopInvocationPoints(reviewLoopRows, board).filter((p) =>
     cohortBeadIds.has(p.beadId),
   );
 
