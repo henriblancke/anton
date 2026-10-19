@@ -86,11 +86,22 @@ describe("JevSection — the key is never round-tripped", () => {
     expect(screen.getByRole("button", { name: /clear stored key/i })).toBeTruthy();
   });
 
-  it("clearing the key PATCHes jevApiKey: null, not the staged draft value", async () => {
+  it("clearing the key PATCHes jevApiKey: null and jevEnabled: false, not the staged draft value", async () => {
+    // jevEnabled must ride along: the server's own cross-check (checkJevConfigured in
+    // settings-patch.ts) refuses `jevEnabled: true` with no key, so clearing a key that's actively
+    // in use would otherwise 400 the whole PATCH — see settings-patch.test.ts for that real path.
     const patchSettings = vi.fn().mockResolvedValue(new Response("{}", { status: 200 }));
     renderSection({ apiKeyConfigured: true, patchSettings });
     fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
-    await vi.waitFor(() => expect(patchSettings).toHaveBeenCalledWith({ jevApiKey: null }));
+    await vi.waitFor(() =>
+      expect(patchSettings).toHaveBeenCalledWith({ jevApiKey: null, jevEnabled: false }),
+    );
+  });
+
+  it("stages jevEnabled back to off locally once the clear succeeds", async () => {
+    const { set } = renderSection({ apiKeyConfigured: true });
+    fireEvent.click(screen.getByRole("button", { name: /clear stored key/i }));
+    await vi.waitFor(() => expect(set).toHaveBeenCalledWith("jevEnabled", false));
   });
 });
 

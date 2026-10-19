@@ -48,11 +48,15 @@ export function JevSection({
   async function clearKey() {
     setClearing(true);
     try {
-      const res = await form.patchSettings({ jevApiKey: null });
+      // jevEnabled rides along: checkJevConfigured (settings-patch.ts) refuses `enabled && !apiKey`,
+      // so clearing the key while Jev is still on would otherwise 400 the whole PATCH — exactly the
+      // revoke-a-compromised-key case this button exists for.
+      const res = await form.patchSettings({ jevApiKey: null, jevEnabled: false });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         throw new Error(body?.error ?? `Clear failed (${res.status})`);
       }
+      set("jevEnabled", false);
       toast.success("Jev API key cleared");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Clear failed");
