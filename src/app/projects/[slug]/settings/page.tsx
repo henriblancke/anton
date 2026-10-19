@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 import {
   getProjectBySlug,
   getProjectSettingsBySlug,
+  redactSecrets,
   resolveDecisionMode,
   resolvePickerApplyOverride,
 } from "@/lib/projects";
@@ -181,10 +182,19 @@ export default async function ProjectSettingsPage({
     },
   ];
 
+  // Per-point field disclosure (anton-p32iy): exactly what each registered point would send to
+  // Jev, off the same registry `decisionPoints` above reads — read straight from `stateFields`
+  // rather than duplicated, so this can never promise less than narrowState actually enforces.
+  const jevDisclosure = listPoints().map((point) => ({ id: point.id, stateFields: [...point.stateFields] }));
+
   return (
     <SettingsView
       project={project}
-      settings={settings}
+      // The jev API key never reaches the client (anton-p32iy) — see redactSecrets' own doc
+      // comment. `jevApiKeyConfigured` carries the one fact the UI needs instead of the value.
+      settings={redactSecrets(settings)}
+      jevApiKeyConfigured={!!settings.jevApiKey}
+      jevDisclosure={jevDisclosure}
       basePrompt={basePrompt}
       schedules={schedules}
       defaultCrons={defaultCrons}

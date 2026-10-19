@@ -73,6 +73,11 @@ export interface EditableSettings {
    * from. Absent = no routed meter, even when a gateway is configured.
    */
   routerConnectionId?: string;
+  /** Opt this project into Jev as decide()'s backend (anton-p32iy); absent/false = claude-local only. */
+  jevEnabled?: boolean;
+  /** The pinned `jev-X.Y.Z` version decide() calls against. Note: `jevApiKey` deliberately has no
+   *  mirror here — the server never sends it back; see `jevApiKeyConfigured` on SettingsView. */
+  jevModel?: string;
   seedPrompt?: string;
   /** PR narrative reasoning contract; absent = the shipped describe skill. */
   describePrompt?: string;

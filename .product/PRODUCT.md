@@ -28,10 +28,11 @@ server *the team runs* so a small team works one real-time board instead of push
 ## Why it wins
 Local, not deployed — it drives your existing `claude`, `git`, `gh`, `bd`, and `stringer`, so
 there's no hosted runtime and nothing leaves your machine except what you deliberately point it
-at (the opt-in team Dolt server above, which is yours). Epic-first and approval-gated: the
-founder authors the boundary, anton owns everything inside it. It doesn't stop at the PR — it
-keeps working the PR (review comments + red CI) until it's mergeable, which is the part most
-"AI writes a PR" tools drop.
+at (the opt-in team Dolt server above, which is yours, and an opt-in per-project Jev backend for
+decide() — see `.product/decisions/2026-10-19-jev-local-first-exception.md`). Epic-first and
+approval-gated: the founder authors the boundary, anton owns everything inside it. It doesn't
+stop at the PR — it keeps working the PR (review comments + red CI) until it's mergeable, which
+is the part most "AI writes a PR" tools drop.
 
 ## What we're deliberately NOT doing
 - Not a hosted/deployed service — no Vercel Workflow, no Cache Components, no multi-tenant

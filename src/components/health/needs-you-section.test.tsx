@@ -489,6 +489,30 @@ describe("DigestNeedsYou", () => {
     expect(screen.getByText("Merge these duplicates")).toBeTruthy();
   });
 
+  it("drops a streamed wip-limit hold rather than rendering a non-actionable breaker band", async () => {
+    const hold: AutopilotBreaker = {
+      kind: "hold",
+      reason: "wip-limit",
+      detail: "3 of 3 PRs are open in review.",
+    };
+    const summary = digestNeedsYou({});
+
+    await act(async () => {
+      render(
+        <DigestNeedsYou
+          slug="anton"
+          summary={summary}
+          breaker={Promise.resolve(hold)}
+          onOpenTicket={() => {}}
+        />,
+      );
+    });
+
+    // A hold is excluded from `digestNeedsYou` (it clears itself and asks for nothing); the
+    // streamed breaker row must honor that same rule rather than rendering it anyway.
+    expect(screen.queryByText("Autopilot is holding")).toBeNull();
+  });
+
   it("renders nothing yet, not an error, while the breaker promise is still pending", () => {
     const summary = digestNeedsYou({});
     const { container } = render(

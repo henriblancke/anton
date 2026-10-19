@@ -104,6 +104,9 @@ export const SECTIONS = [
     group: "While a run works",
     dirtyKeys: [],
   },
+  // Beside decision points: Jev is a backend CHOICE for decide(), so the toggle that opts a
+  // project into it sits next to the points it would answer.
+  { id: "jev", label: "Jev backend", group: "While a run works", dirtyKeys: ["jev"] },
   { id: "gates", label: "Verify gates", group: "Before the PR opens", dirtyKeys: ["gates"] },
   {
     id: "review",

@@ -12,7 +12,7 @@ import { EscalationActions } from "@/components/health/escalation-actions";
 import { escalationAge } from "@/components/health/escalation-age";
 import { OperatorQueue } from "@/components/board/operator-queue";
 import type { DigestNeedsYouSummary } from "@/lib/attention";
-import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
+import { isDisarm, type AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { isBoardUnreachableFindingKey, isDismissable } from "@/lib/escalation-kinds";
 import type { EscalationKind, EscalationView, ProposalAsk } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -546,6 +546,11 @@ export function DigestNeedsYou({
  * component rather than an inline `use()` in `DigestNeedsYou`, for the same reason
  * `StreamedAttentionStrip` (board-parts.tsx) is: the whole point of the boundary is that only this
  * unwrap suspends, not the rest of the section already on screen.
+ *
+ * Filtered to `isDisarm` here because this path bypasses `digestNeedsYou` (the promise is handed
+ * down unresolved, so it can't go through the summary's own item list) — without the filter a
+ * wip-limit hold would render a non-actionable band at the top of a "needs you" section while the
+ * board's own summary correctly reports zero breaker items.
  */
 function StreamedBreakerHeader({
   slug,
@@ -554,7 +559,8 @@ function StreamedBreakerHeader({
   slug: string;
   breaker: Promise<AutopilotBreaker | undefined>;
 }) {
-  return <AutopilotBreakerHeader slug={slug} breaker={use(breaker)} />;
+  const resolved = use(breaker);
+  return <AutopilotBreakerHeader slug={slug} breaker={resolved && isDisarm(resolved) ? resolved : undefined} />;
 }
 
 /**

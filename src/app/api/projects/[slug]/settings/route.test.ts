@@ -1830,6 +1830,146 @@ describe("settings route — model routing table (anton-uu7r)", () => {
 });
 
 /**
+ * Opt-in Jev backend for decide() (anton-p32iy): the cross-check refuses `jevEnabled: true` without
+ * both a key and a pinned model, including when a later PATCH clears the key out from under a
+ * project that already had Jev on — the "Clear stored key" button's own PATCH (anton-l70sq review)
+ * has to turn jevEnabled off in the same request, or this same check 400s it.
+ */
+describe("settings route — Jev backend (anton-p32iy)", () => {
+  beforeEach(async () => {
+    tdb = makeTestDb();
+    await tdb.db.insert(schema.projects).values({
+      id: "p1",
+      slug: "tmp",
+      name: "tmp",
+      repoPath: "/tmp/p1",
+    });
+  });
+
+  it("PATCH persists jevEnabled with a key and a pinned model, and GET restores them", async () => {
+    const res = await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "sk-test", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    const resSettings = (await res.json()).settings;
+    expect(resSettings).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+    // toMatchObject above only checks the keys it lists — it would not fail even if the response
+    // also carried the raw key, so the redaction itself needs its own assertion.
+    expect("jevApiKey" in resSettings).toBe(false);
+    expect(persisted()).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+
+    const get = await GET(new Request("http://t/"), ctx("tmp"));
+    const getSettings = (await get.json()).settings;
+    expect(getSettings).toMatchObject({ jevEnabled: true, jevModel: "jev-1.13.0" });
+    expect("jevApiKey" in getSettings).toBe(false);
+  });
+
+  it("PATCH rejects jevEnabled: true with no key or no pinned model", async () => {
+    const noKey = await PATCH(patchReq({ jevEnabled: true, jevModel: "jev-1.13.0" }), ctx("tmp"));
+    expect(noKey.status).toBe(400);
+    expect((await noKey.json()).error).toMatch(/jevEnabled needs both/);
+
+    const noModel = await PATCH(patchReq({ jevEnabled: true, jevApiKey: "sk-test" }), ctx("tmp"));
+    expect(noModel.status).toBe(400);
+    expect("jevEnabled" in persisted()).toBe(false);
+  });
+
+  it("rejects clearing the stored key alone while jevEnabled is still on — the real path the 'Clear stored key' button must avoid", async () => {
+    await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "sk-test", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+
+    // The bug this test guards: PATCHing only jevApiKey: null leaves jevEnabled: true standing,
+    // which checkJevConfigured refuses — exactly what blocked clearing an in-use key.
+    const orphaned = await PATCH(patchReq({ jevApiKey: null }), ctx("tmp"));
+    expect(orphaned.status).toBe(400);
+    expect((await orphaned.json()).error).toMatch(/jevEnabled needs both/);
+    expect(persisted().jevEnabled).toBe(true);
+  });
+
+  it("clearing the key alongside jevEnabled: false succeeds — the fix the button now sends", async () => {
+    await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "sk-test", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+
+    const res = await PATCH(patchReq({ jevApiKey: null, jevEnabled: false }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect((await res.json()).settings.jevEnabled).toBe(false);
+    expect(persisted().jevEnabled).toBe(false);
+    // jevModel is untouched by this PATCH, so a later re-enable only needs a fresh key.
+    expect(persisted().jevModel).toBe("jev-1.13.0");
+  });
+
+  it("PATCH rejects an unpinned or malformed jevModel", async () => {
+    for (const bad of ["jev-latest", "latest", "1.13.0", "jev-1.x", 42]) {
+      const res = await PATCH(patchReq({ jevModel: bad }), ctx("tmp"));
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/jevModel/);
+    }
+    expect("jevModel" in persisted()).toBe(false);
+  });
+
+  it('PATCH "" / null clears jevModel and jevApiKey back to unset (keys removed)', async () => {
+    await PATCH(
+      patchReq({ jevEnabled: false, jevApiKey: "sk-test", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+    const res = await PATCH(patchReq({ jevApiKey: null, jevModel: "" }), ctx("tmp"));
+    expect(res.status).toBe(200);
+    expect("jevApiKey" in persisted()).toBe(false);
+    expect("jevModel" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects a whitespace-only jevApiKey instead of storing a credential that will 401 every call", async () => {
+    const res = await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "   ", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/jevApiKey/);
+    expect("jevApiKey" in persisted()).toBe(false);
+  });
+
+  it("trims a jevApiKey with incidental surrounding whitespace before storing it", async () => {
+    const res = await PATCH(
+      patchReq({ jevEnabled: true, jevApiKey: "  sk-test  ", jevModel: "jev-1.13.0" }),
+      ctx("tmp"),
+    );
+    expect(res.status).toBe(200);
+    expect(persisted().jevApiKey).toBe("sk-test");
+  });
+
+  it("PATCH rejects jevEnabled: true alone when the stored jevModel predates the pin check (hand-edited row)", async () => {
+    // Simulate a row that already carries a key and an unpinned model from before this check
+    // existed — a partial enable must not trust it was ever validated.
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ jevApiKey: "sk-test", jevModel: "jev-latest" }) });
+
+    const res = await PATCH(patchReq({ jevEnabled: true }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/jevEnabled needs both/);
+    expect("jevEnabled" in persisted()).toBe(false);
+  });
+
+  it("PATCH rejects jevEnabled: true alone when the stored jevApiKey is a non-string (hand-edited row)", async () => {
+    // A hand-edited or legacy row can carry a non-string jevApiKey — `apiKey?.trim()` would throw
+    // a raw TypeError here instead of the intended "needs both" 400.
+    await tdb.db
+      .update(schema.projects)
+      .set({ settingsJson: JSON.stringify({ jevApiKey: 42, jevModel: "jev-1.13.0" }) });
+
+    const res = await PATCH(patchReq({ jevEnabled: true }), ctx("tmp"));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/jevEnabled needs both/);
+    expect("jevEnabled" in persisted()).toBe(false);
+  });
+});
+
+/**
  * Per-project worktree warming (anton-z5li2): the pinned setup command and its on/off flag. The
  * two defaults are what keep existing projects unchanged — absent `warmEnabled` is ON, and a
  * cleared `warmCommand` falls back to the env var / lockfile table rather than skipping the warm.

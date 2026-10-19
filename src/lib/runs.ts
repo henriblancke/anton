@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import { decodeGateFailure, type RecordedGateFailure } from "./jobs/gate-failure-record";
@@ -1033,6 +1033,67 @@ export async function listDeliveriesByBead(
         : toEpoch(row.endedAt);
     if (at === undefined || row.beadId === null) continue;
     record(row.beadId, at);
+  }
+  return out;
+}
+
+/**
+ * Run-target bead ids (epic or ticket) with a DELIVERED run that settled at-or-after `since` —
+ * read without a known bead set, unlike {@link listDeliveriesByBead}, so a caller can DISCOVER a
+ * target that delivered in a window rather than only confirm one it already suspects (P1, PR #348
+ * review, cohort-read.ts): a target whose last invocation predates `since` (a PR that waited days
+ * to merge) has no row in `claude_invocations` to surface it as a candidate, but its run row still
+ * settled inside the window.
+ *
+ * The run-row arm alone misses a REPARENTED child (P2, PR #348 review): when a grouped run
+ * delivers child A, later overwrites `ticketBeadId` with child B, and A is reparented onto another
+ * feature, the run row names only the epic and B — A's id never appears in either column once
+ * overwritten. {@link listDeliveriesByBead}'s session arm credits exactly this case against a bead
+ * set it is already given; the second query below is its discovery-side twin, finding every
+ * `execute` session whose CONTAINING RUN settled delivered inside the window, regardless of
+ * whether that session's own bead id still matches the run's current columns.
+ */
+export async function listRunBeadIdsDeliveredSince(
+  db: AntonDb,
+  projectId: string,
+  since: Date,
+): Promise<Set<string>> {
+  const settledSince = or(
+    gte(schema.runs.endedAt, since),
+    and(isNull(schema.runs.endedAt), gte(schema.runs.updatedAt, since)),
+  );
+  const [runRows, sessionRows] = await Promise.all([
+    db
+      .select({
+        epicBeadId: schema.runs.epicBeadId,
+        ticketBeadId: schema.runs.ticketBeadId,
+      })
+      .from(schema.runs)
+      .where(
+        and(eq(schema.runs.projectId, projectId), eq(schema.runs.status, "done"), eq(schema.runs.delivered, true), settledSince),
+      ),
+    db
+      .select({ beadId: schema.sessions.beadId })
+      .from(schema.sessions)
+      .innerJoin(schema.runs, eq(schema.sessions.runId, schema.runs.id))
+      .where(
+        and(
+          eq(schema.sessions.projectId, projectId),
+          eq(schema.sessions.kind, "execute"),
+          eq(schema.sessions.status, "done"),
+          eq(schema.runs.status, "done"),
+          eq(schema.runs.delivered, true),
+          settledSince,
+        ),
+      ),
+  ]);
+  const out = new Set<string>();
+  for (const row of runRows) {
+    if (row.epicBeadId !== null) out.add(row.epicBeadId);
+    if (row.ticketBeadId !== null) out.add(row.ticketBeadId);
+  }
+  for (const row of sessionRows) {
+    if (row.beadId !== null) out.add(row.beadId);
   }
   return out;
 }
