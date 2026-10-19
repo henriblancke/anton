@@ -7,13 +7,17 @@
  *
  * A feature's cost, friction and stamps are its WHOLE LIFE — `feature-ledger-read.ts`'s own rule,
  * repeated here rather than reinvented: there is no window to bound one feature's ledger by, since
- * spend before a cutoff is still spend that feature incurred. So the window is applied once, at the
- * `claude_invocations` read that decides which run targets even enter the fold — the "windowed
- * project read" the design's own risk table names as covered by `claude_invocations_project_idx` —
- * and every run target that had activity in the window then gets its full, whole-life
- * {@link CohortFeature}. A feature whose LAST invocation lands just inside the window but whose
- * first landed months earlier is not truncated to the window's slice of it; the alternative would
- * shrink `usdPerFeature` by whatever the window happened to clip.
+ * spend before a cutoff is still spend that feature incurred. So the window decides which run
+ * targets even enter the fold — the "windowed project read" the design's own risk table names as
+ * covered by `claude_invocations_project_idx` — off TWO sources, not one: activity
+ * (`claude_invocations`) and delivery (`runs`, {@link listRunBeadIdsDeliveredSince}). Activity
+ * alone misses a target whose last invocation predates the window but whose delivery (a PR that
+ * waited days to merge) lands inside it, which would otherwise vanish from every delivery-bucketed
+ * fold (zero-touch, weekly cost, `underpowered`) despite genuinely belonging to the window (P1, PR
+ * #348 review). Either source is enough to admit a target; once admitted, it gets its full,
+ * whole-life {@link CohortFeature}. A feature whose LAST invocation lands just inside the window but
+ * whose first landed months earlier is not truncated to the window's slice of it; the alternative
+ * would shrink `usdPerFeature` by whatever the window happened to clip.
  *
  * ## Composed from the one read a single feature's ledger page already makes
  *
@@ -34,7 +38,12 @@ import { ledgerScope } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { getProjectById } from "./projects";
 import type { CohortFeature } from "./prompt-series";
-import { listDeliveriesByBead, listOpenRunAttemptStartMs, listRunBeadIdsByStatus } from "./runs";
+import {
+  listDeliveriesByBead,
+  listOpenRunAttemptStartMs,
+  listRunBeadIdsByStatus,
+  listRunBeadIdsDeliveredSince,
+} from "./runs";
 import { listAllBeads } from "./tickets";
 import { boardCards } from "./ticket-view";
 
@@ -135,13 +144,23 @@ async function activeRunTargetIds(
   };
 
   const candidates = new Map<string, Bead>();
-  for (const row of rows) {
-    if (!row.beadId) continue;
-    const bead = byId.get(row.beadId);
-    if (!bead) continue;
+  const addCandidate = (beadId: string) => {
+    const bead = byId.get(beadId);
+    if (!bead) return;
     const targetId = isRunTargetCached(bead) ? bead.id : cards.cardOf(bead) ?? bead.id;
     const target = byId.get(targetId);
     if (target && isRunTargetCached(target)) candidates.set(targetId, target);
+  };
+  for (const row of rows) {
+    if (row.beadId) addCandidate(row.beadId);
+  }
+  // Activity alone misses a target whose LAST invocation predates `since` but whose DELIVERY —
+  // a PR that waited days to merge — landed inside it (P1, PR #348 review): without this, such a
+  // target never becomes a candidate at all, so its whole-life figures vanish from every fold that
+  // buckets by delivery week (zero-touch, weekly cost, `underpowered`).
+  if (since) {
+    const deliveredIds = await listRunBeadIdsDeliveredSince(db, projectId, since);
+    for (const beadId of deliveredIds) addCandidate(beadId);
   }
 
   const scopeCache = new Map<string, string[]>();

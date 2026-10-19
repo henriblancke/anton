@@ -2,7 +2,7 @@
  * Read-only access to the machine-local `runs` table. Runs are execution plumbing (worktree,
  * lease, model, agent); stage/PR live in beads. See DESIGN.md §3.
  */
-import { and, count, desc, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, gte, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { getDb, schema } from "./db";
 import { toEpoch } from "./db/epoch";
 import { decodeGateFailure, type RecordedGateFailure } from "./jobs/gate-failure-record";
@@ -1033,6 +1033,45 @@ export async function listDeliveriesByBead(
         : toEpoch(row.endedAt);
     if (at === undefined || row.beadId === null) continue;
     record(row.beadId, at);
+  }
+  return out;
+}
+
+/**
+ * Run-target bead ids (epic or ticket) with a DELIVERED run that settled at-or-after `since` —
+ * read without a known bead set, unlike {@link listDeliveriesByBead}, so a caller can DISCOVER a
+ * target that delivered in a window rather than only confirm one it already suspects (P1, PR #348
+ * review, cohort-read.ts): a target whose last invocation predates `since` (a PR that waited days
+ * to merge) has no row in `claude_invocations` to surface it as a candidate, but its run row still
+ * settled inside the window. Only the run-row evidence {@link listDeliveriesByBead} itself trusts
+ * most — the session arm there exists to credit a REPARENTED child's own commit against a bead set
+ * already known, not to discover new candidates, so it has no equivalent here.
+ */
+export async function listRunBeadIdsDeliveredSince(
+  db: AntonDb,
+  projectId: string,
+  since: Date,
+): Promise<Set<string>> {
+  const rows = await db
+    .select({
+      epicBeadId: schema.runs.epicBeadId,
+      ticketBeadId: schema.runs.ticketBeadId,
+      endedAt: schema.runs.endedAt,
+      updatedAt: schema.runs.updatedAt,
+    })
+    .from(schema.runs)
+    .where(
+      and(
+        eq(schema.runs.projectId, projectId),
+        eq(schema.runs.status, "done"),
+        eq(schema.runs.delivered, true),
+        or(gte(schema.runs.endedAt, since), and(isNull(schema.runs.endedAt), gte(schema.runs.updatedAt, since))),
+      ),
+    );
+  const out = new Set<string>();
+  for (const row of rows) {
+    if (row.epicBeadId !== null) out.add(row.epicBeadId);
+    if (row.ticketBeadId !== null) out.add(row.ticketBeadId);
   }
   return out;
 }

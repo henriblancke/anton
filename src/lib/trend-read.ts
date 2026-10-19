@@ -268,18 +268,25 @@ function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): Invocation
 }
 
 /**
- * The self-review/PR-fix invocations {@link reviewLoopByFeature} counts, one point per real
- * invocation for the same sidecar-row reason {@link invocationStampPoints} groups: a raw-row count
- * overcounts by the sidecar factor, corrupting both the displayed per-feature counts and the
- * median-based runaway comparison. A fact with no `beadId` (a scheduled pass, never a feature) has
- * nothing to bucket a loop count under and is dropped.
+ * The invocations {@link reviewLoopByFeature} counts, one point per real invocation for the same
+ * sidecar-row reason {@link invocationStampPoints} groups: a raw-row count overcounts by the
+ * sidecar factor, corrupting both the displayed per-feature counts and the median-based runaway
+ * comparison. A fact with no `beadId` (a scheduled pass, never a feature) has nothing to bucket a
+ * loop count under and is dropped.
+ *
+ * Every CLASSIFIED phase passes through, not only `self-review`/`pr-fix`: {@link reviewLoopByFeature}
+ * only increments on those two, but it keys its per-feature bucket off ANY point carrying the
+ * feature's `beadId` — a feature with only `implement`/`describe` invocations in the window still
+ * needs a point here so that fold can give it a genuine zero-count bucket instead of dropping it
+ * from the cohort entirely (P2, PR #348 review). Only a row `ledgerPhase` cannot classify at all is
+ * dropped, since it has no phase to report.
  */
 function reviewLoopInvocationPoints(rows: readonly ClaudeInvocationRow[]): ReviewLoopInvocationPoint[] {
   const out: ReviewLoopInvocationPoint[] = [];
   for (const fact of groupInvocations(rows)) {
     if (fact.beadId === null) continue;
     const phase = ledgerPhase(fact.rows[0]);
-    if (phase !== "self-review" && phase !== "pr-fix") continue;
+    if (phase === undefined) continue;
     out.push({ beadId: fact.beadId, phase });
   }
   return out;
@@ -329,6 +336,7 @@ export async function trendSeries(
     deliveredAtMs: f.deliveredAtMs,
     activityAtMs: f.activityAtMs,
     usd: f.usd,
+    unpricedRows: f.unpricedRows,
   }));
 
   const input: TrendSeriesInput = {

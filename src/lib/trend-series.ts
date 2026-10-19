@@ -560,6 +560,14 @@ export interface CostFeaturePoint {
   activityAtMs?: number;
   /** What it cost, or undefined when anton could price none of its rows — never 0. */
   usd: number | undefined;
+  /**
+   * Rows this feature's own `usd` could NOT price (`CohortFeature.unpricedRows`). A defined `usd`
+   * beside a non-zero count here is only a FLOOR for the feature — the same distinction
+   * `PhaseWeekTotals.unpricedRows` draws at the phase level, carried through so a week mixing priced
+   * and unpriced features does not let the priced subtotal pass for a complete total (P1, PR #348
+   * review).
+   */
+  unpricedRows?: number;
 }
 
 /** One week's cost: total spend (every attributed feature) over deliveries (the denominator) alone. */
@@ -570,6 +578,12 @@ export interface CostWeekPoint {
   usd: number | undefined;
   /** `usd / delivered`, or undefined when there is no delivery to divide by, or nothing to divide. */
   usdPerFeature: number | undefined;
+  /**
+   * Σ `unpricedRows` over every feature bucketed here. With this non-zero, {@link usd} and
+   * {@link usdPerFeature} are a FLOOR, not a total — some of the week's spend has no dollar figure
+   * at all, so the priced subtotal alone understates it (P1, PR #348 review).
+   */
+  unpricedRows: number;
 }
 
 /**
@@ -578,13 +592,18 @@ export interface CostWeekPoint {
  * — delivered or not — is absent, the same "nothing measured" reading {@link zeroTouchByWeek} gives
  * a week with no delivery. A week that saw ONLY undelivered spend still gets a real point: `usd` is
  * set but `delivered` is 0, so `usdPerFeature` reads as undefined rather than a division by zero.
+ *
+ * A week mixing priced and unpriced features sums only what priced — the alternative, dropping the
+ * week's `usd` entirely because one feature couldn't be priced, would hide real spend the project DID
+ * price. {@link CostWeekPoint.unpricedRows} carries the count through instead, so a caller can mark
+ * the total as a floor rather than read it as complete (P1, PR #348 review).
  */
 export function costByWeek(
   features: readonly CostFeaturePoint[],
   weekKeys: readonly string[],
 ): Map<string, CostWeekPoint> {
   const weekSet = new Set(weekKeys);
-  const buckets = new Map<string, { delivered: number; usd: number | undefined }>();
+  const buckets = new Map<string, { delivered: number; usd: number | undefined; unpricedRows: number }>();
 
   for (const feature of features) {
     const atMs = feature.delivered ? feature.deliveredAtMs : feature.activityAtMs;
@@ -594,10 +613,11 @@ export function costByWeek(
 
     let bucket = buckets.get(week);
     if (!bucket) {
-      bucket = { delivered: 0, usd: undefined };
+      bucket = { delivered: 0, usd: undefined, unpricedRows: 0 };
       buckets.set(week, bucket);
     }
     if (feature.usd !== undefined) bucket.usd = (bucket.usd ?? 0) + feature.usd;
+    bucket.unpricedRows += feature.unpricedRows ?? 0;
     if (feature.delivered) bucket.delivered += 1;
   }
 
@@ -608,6 +628,7 @@ export function costByWeek(
       usd: bucket.usd,
       usdPerFeature:
         bucket.usd !== undefined && bucket.delivered > 0 ? bucket.usd / bucket.delivered : undefined,
+      unpricedRows: bucket.unpricedRows,
     });
   }
   return out;
@@ -728,6 +749,16 @@ export interface ReviewLoopInvocationPoint {
  */
 export const RUNAWAY_MEDIAN_MULTIPLE = 3;
 
+/**
+ * The absolute floor `prFixInvocations` must still clear, even on a multiple of the median — since
+ * most features need zero PR-fix rounds, a cohort's median is commonly 0, and
+ * `prFixInvocations > RUNAWAY_MEDIAN_MULTIPLE * 0` degenerates to `prFixInvocations > 0`: any single,
+ * completely ordinary correction round would then read as runaway alongside a feature that genuinely
+ * needed many (PR #348 review). Requiring at least this many PR-fix invocations regardless of the
+ * median keeps one normal round in an otherwise-clean cohort from misfiring.
+ */
+export const MIN_RUNAWAY_COUNT = 3;
+
 /** The median of `values`, or undefined for an empty input — never 0 for "nothing to compare against". */
 function median(values: readonly number[]): number | undefined {
   if (values.length === 0) return undefined;
@@ -745,7 +776,11 @@ export interface ReviewLoopPoint {
   prFixInvocations: number;
   /** `selfReviewInvocations + prFixInvocations`, for display — NOT what `runaway` is computed over. */
   loopInvocations: number;
-  /** Whether `prFixInvocations` exceeds {@link RUNAWAY_MEDIAN_MULTIPLE} times the cohort's median PR-fix count. */
+  /**
+   * Whether `prFixInvocations` exceeds the larger of {@link MIN_RUNAWAY_COUNT} and
+   * {@link RUNAWAY_MEDIAN_MULTIPLE} times the cohort's median PR-fix count — the floor keeps a
+   * median of 0 (the common case) from flagging a single ordinary correction round.
+   */
   runaway: boolean;
 }
 
@@ -783,7 +818,8 @@ export function reviewLoopByFeature(
       selfReviewInvocations: bucket.selfReview,
       prFixInvocations,
       loopInvocations: bucket.selfReview + prFixInvocations,
-      runaway: med !== undefined && prFixInvocations > RUNAWAY_MEDIAN_MULTIPLE * med,
+      runaway:
+        med !== undefined && prFixInvocations > Math.max(MIN_RUNAWAY_COUNT, RUNAWAY_MEDIAN_MULTIPLE * med),
     };
   });
 }

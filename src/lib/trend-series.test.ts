@@ -5,6 +5,7 @@ import {
   changeMarkers,
   costByWeek,
   isoWeekKey,
+  MIN_RUNAWAY_COUNT,
   modelChangeMarkers,
   phaseSpendByWeek,
   promptChangeMarkers,
@@ -414,8 +415,8 @@ describe("costByWeek", () => {
   it("buckets a delivered feature by delivery and an undelivered one by last activity", () => {
     const features = [delivered(WEEK_1_MONDAY, 10), gaveUp(WEEK_1_MONDAY + 7 * DAY, 5)];
     const byWeek = costByWeek(features, [WEEK_1, WEEK_2]);
-    expect(byWeek.get(WEEK_1)).toEqual({ delivered: 1, usd: 10, usdPerFeature: 10 });
-    expect(byWeek.get(WEEK_2)).toEqual({ delivered: 0, usd: 5, usdPerFeature: undefined });
+    expect(byWeek.get(WEEK_1)).toEqual({ delivered: 1, usd: 10, usdPerFeature: 10, unpricedRows: 0 });
+    expect(byWeek.get(WEEK_2)).toEqual({ delivered: 0, usd: 5, usdPerFeature: undefined, unpricedRows: 0 });
   });
 
   it("follows the numerator rule: undelivered spend sums into the week's usd but never the denominator", () => {
@@ -428,7 +429,7 @@ describe("costByWeek", () => {
     // usd sums every attributed feature (10 + 20 + 5), while delivered — the denominator — counts
     // only the one that actually delivered. A cheapest-looking average that dropped the gave-ups'
     // spend would read 10, not the true 35 / 1.
-    expect(point).toEqual({ delivered: 1, usd: 35, usdPerFeature: 35 });
+    expect(point).toEqual({ delivered: 1, usd: 35, usdPerFeature: 35, unpricedRows: 0 });
   });
 
   it("is absent for a week with no feature bucketed into it at all", () => {
@@ -438,7 +439,22 @@ describe("costByWeek", () => {
 
   it("carries usd as a floor (undefined) when nothing in the week could be priced", () => {
     const byWeek = costByWeek([delivered(WEEK_1_MONDAY, undefined)], [WEEK_1]);
-    expect(byWeek.get(WEEK_1)).toEqual({ delivered: 1, usd: undefined, usdPerFeature: undefined });
+    expect(byWeek.get(WEEK_1)).toEqual({
+      delivered: 1,
+      usd: undefined,
+      usdPerFeature: undefined,
+      unpricedRows: 0,
+    });
+  });
+
+  it("sums unpricedRows across the week's features, marking a priced subtotal as a floor", () => {
+    // One feature priced cleanly (usd: 10, nothing unpriced); the other priced only some of its
+    // rows (usd: 5 is itself a floor, with 2 rows anton could not price at all). The week's usd
+    // (15) must not read as the complete week's spend — unpricedRows carries the gap through
+    // instead of letting the priced subtotal pass for a total (P1, PR #348 review).
+    const partial: CostFeaturePoint = { delivered: true, deliveredAtMs: WEEK_1_MONDAY, usd: 5, unpricedRows: 2 };
+    const byWeek = costByWeek([delivered(WEEK_1_MONDAY, 10), partial], [WEEK_1]);
+    expect(byWeek.get(WEEK_1)).toEqual({ delivered: 2, usd: 15, usdPerFeature: 7.5, unpricedRows: 2 });
   });
 });
 
@@ -558,6 +574,33 @@ describe("reviewLoopByFeature", () => {
     const points = reviewLoopByFeature(invocations);
     expect(points.every((p) => !p.runaway)).toBe(true);
   });
+
+  it("does not name a feature runaway on one ordinary PR-fix round in an otherwise-zero cohort", () => {
+    // Median prFixInvocations across {0, 0, 1} is 0 — without the absolute floor,
+    // `prFixInvocations > RUNAWAY_MEDIAN_MULTIPLE * 0` degenerates to `prFixInvocations > 0`,
+    // which would call "one-fix" runaway alongside features that never needed a fix at all.
+    expect(MIN_RUNAWAY_COUNT).toBeGreaterThan(1);
+    const invocations = [
+      invocation("zero-a", "self-review"),
+      invocation("zero-b", "self-review"),
+      invocation("one-fix", "pr-fix"),
+    ];
+    const points = reviewLoopByFeature(invocations);
+    const byId = new Map(points.map((p) => [p.beadId, p]));
+    expect(byId.get("one-fix")?.prFixInvocations).toBe(1);
+    expect(byId.get("one-fix")?.runaway).toBe(false);
+  });
+
+  it("still names a feature runaway on a zero-median cohort once it clears the absolute floor", () => {
+    const invocations = [
+      invocation("zero-a", "self-review"),
+      invocation("zero-b", "self-review"),
+      ...Array.from({ length: MIN_RUNAWAY_COUNT + 1 }, () => invocation("outlier", "pr-fix")),
+    ];
+    const points = reviewLoopByFeature(invocations);
+    const byId = new Map(points.map((p) => [p.beadId, p]));
+    expect(byId.get("outlier")?.runaway).toBe(true);
+  });
 });
 
 describe("trendSeries", () => {
@@ -592,7 +635,7 @@ describe("trendSeries", () => {
 
     expect(week1.week).toBe(WEEK_1);
     expect(week1.scoreDistribution?.n).toBe(1);
-    expect(week1.cost).toEqual({ delivered: 1, usd: 10, usdPerFeature: 10 });
+    expect(week1.cost).toEqual({ delivered: 1, usd: 10, usdPerFeature: 10, unpricedRows: 0 });
     expect(week1.phaseSpend).toEqual({ implement: { invocations: 1, tokens: 100, usd: 1, unpricedRows: 0 } });
     expect(week1.runCauses).toEqual({ total: 1, byCause: { quota: 1 } });
     // MIN_COHORT deliveries clears the floor — not underpowered.

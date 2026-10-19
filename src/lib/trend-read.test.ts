@@ -171,7 +171,7 @@ describe("trendSeries", () => {
     expect(week?.phaseSpend).toEqual({
       implement: { invocations: 1, tokens: 200, usd: 0.003, unpricedRows: 0 },
     });
-    expect(week?.cost).toEqual({ delivered: 1, usd: 0.003, usdPerFeature: 0.003 });
+    expect(week?.cost).toEqual({ delivered: 1, usd: 0.003, usdPerFeature: 0.003, unpricedRows: 0 });
     // One delivered feature is well under MIN_COHORT — the clearest underpowered case there is.
     expect(week?.underpowered).toBe(true);
   });
@@ -236,6 +236,35 @@ describe("trendSeries", () => {
       selfReviewInvocations: 2,
       prFixInvocations: 0,
       loopInvocations: 2,
+      runaway: false,
+    });
+  });
+
+  it("keeps a feature with only implement invocations in the review-loop cohort, as a genuine zero", async () => {
+    // feat-1 never entered self-review or PR-fix at all — its only invocation is an `implement`
+    // row. Dropping it from the fold entirely (rather than giving it a zero-count bucket) would
+    // exclude a legitimate zero-PR-fix observation from the cohort's median (P2, PR #348 review).
+    fakeBoard([]);
+    await t.db.insert(schema.claudeInvocations).values({
+      id: "inv-implement-only",
+      projectId: t.projectId,
+      jobType: "execute-epic",
+      step: "implement",
+      stepHandler: "implement",
+      runId: "r1",
+      beadId: "feat-1",
+      modelRequested: "sonnet-5",
+      modelReported: "sonnet-5",
+      outcome: "ok",
+      recordedAt: new Date(WEEK_MONDAY),
+    });
+
+    const series = await trendSeries(t.db, t.projectId, 1, { nowMs: NOW_MS });
+    expect(series?.reviewLoop.find((p) => p.beadId === "feat-1")).toEqual({
+      beadId: "feat-1",
+      selfReviewInvocations: 0,
+      prFixInvocations: 0,
+      loopInvocations: 0,
       runaway: false,
     });
   });
