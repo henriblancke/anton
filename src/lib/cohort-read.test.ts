@@ -134,6 +134,25 @@ describe("cohortFeatures", () => {
     expect(features).toEqual([]);
   });
 
+  it("includes a target whose delivery lands in the window even though its last invocation predates it (P1, PR #348 review)", async () => {
+    // Every invocation happened before `since` — a PR that then waited over a week before merging,
+    // so the delivery itself (the run's own endedAt) is the only evidence inside the window. Activity
+    // alone would never make feat-1 a candidate at all, dropping it from every delivery-bucketed fold
+    // (zero-touch, weekly cost, underpowered) despite genuinely belonging to the window.
+    fakeBoard(BOARD);
+    await seedInvocation({ id: "i-old", beadId: "feat-1", recordedAt: new Date("2026-09-01T00:00:00Z") });
+    await seedDelivery({ epicBeadId: "feat-1", endedAt: new Date("2026-09-25T00:00:00Z") });
+
+    const features = await cohortFeatures(t.db, t.projectId, {
+      since: new Date("2026-09-20T00:00:00Z"),
+    });
+
+    expect(features).toHaveLength(1);
+    expect(features?.[0]?.beadId).toBe("feat-1");
+    expect(features?.[0]?.delivered).toBe(true);
+    expect(features?.[0]?.deliveredAtMs).toBe(new Date("2026-09-25T00:00:00Z").getTime());
+  });
+
   it("reports delivered: false and no deliveredAtMs for a feature that has not shipped", async () => {
     fakeBoard(BOARD);
     await seedInvocation({ id: "i1", beadId: "feat-1", recordedAt: new Date("2026-09-25T00:00:00Z") });
