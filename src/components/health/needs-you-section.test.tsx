@@ -12,11 +12,11 @@
  * "Dismiss all".
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 
 import { DigestNeedsYou, NeedsYouSection } from "@/components/health/needs-you-section";
 import { digestNeedsYou } from "@/lib/attention";
-import type { AutopilotDisarm } from "@/lib/autopilot-breaker";
+import type { AutopilotBreaker, AutopilotDisarm } from "@/lib/autopilot-breaker";
 import type { EscalationView, OperatorQueueItem, ProposalAsk } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -414,5 +414,67 @@ describe("DigestNeedsYou", () => {
       <DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />,
     );
     expect(container.innerHTML).toBe("");
+  });
+
+  it("renders the merge-ready PR group after the proposal and ticket bands, not before (PR #350 review)", () => {
+    // `DIGEST_KIND_RANK` puts a merge-ready PR (rank 4) behind a proposal (rank 2) and a human
+    // ticket (rank 3) — a stale PR waits on a reviewer, not on a decision only the founder can make
+    // right now, so it must not obscure the higher-priority rows above it.
+    const summary = digestNeedsYou({
+      escalations: [escalation({ kind: "stale-pr", prNumber: 7, prUrl: "https://gh/pr/7" })],
+      proposals: [proposal()],
+      operatorQueue: [queueItem()],
+    });
+    render(<DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />);
+
+    const headings = [
+      screen.getByText("Merge these duplicates"),
+      screen.getByText("Buy the domain"),
+      screen.getByText("Stale PR"),
+    ];
+    const positions = headings.map((el) => el.compareDocumentPosition(headings[2]));
+    // Every other row's node precedes the stale-PR heading in document order.
+    for (const pos of positions.slice(0, 2)) {
+      expect(pos & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it("streams the breaker row separately from an already-resolved summary", async () => {
+    const breaker: AutopilotBreaker = {
+      kind: "disarm",
+      reason: "consecutive-failures",
+      detail: "3 runs failed in a row",
+      evidence: [],
+    };
+    const summary = digestNeedsYou({ proposals: [proposal()] });
+
+    await act(async () => {
+      render(
+        <DigestNeedsYou
+          slug="anton"
+          summary={summary}
+          breaker={Promise.resolve(breaker)}
+          onOpenTicket={() => {}}
+        />,
+      );
+    });
+
+    expect(screen.getByText("Autopilot is disarmed")).toBeTruthy();
+    expect(screen.getByText("Merge these duplicates")).toBeTruthy();
+  });
+
+  it("renders nothing yet, not an error, while the breaker promise is still pending", () => {
+    const summary = digestNeedsYou({});
+    const { container } = render(
+      <DigestNeedsYou
+        slug="anton"
+        summary={summary}
+        breaker={new Promise<AutopilotBreaker | undefined>(() => {})}
+        onOpenTicket={() => {}}
+      />,
+    );
+    // Nothing else to promote and the breaker hasn't answered yet: the section mounts (so the
+    // Suspense boundary can resolve later) but paints nothing visible in the meantime.
+    expect(container.textContent).toBe("");
   });
 });

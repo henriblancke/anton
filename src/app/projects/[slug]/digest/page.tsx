@@ -37,13 +37,15 @@ export default async function ProjectDigestPage({
       </PageHeader>
       <div className="min-h-0 flex-1 overflow-auto p-[18px]">
         <div className="mx-auto flex max-w-3xl flex-col gap-5">
+          {/* Rendered ahead of the isEmpty branch below, and unconditionally: `digest.needsYou`
+              is folded WITHOUT the breaker check (PR #350 review — see `ProjectDigest.breaker`),
+              so a window with no events and no other needs-you item can still owe the operator a
+              disarmed-autopilot row once that streamed read resolves. */}
+          <DigestNeedsYouHost slug={slug} summary={digest.needsYou} breaker={digest.breaker} />
           {digest.isEmpty ? (
             <DigestEmptyWindow since={digest.since} />
           ) : (
-            <>
-              <DigestNeedsYouHost slug={slug} summary={digest.needsYou} />
-              <DigestFeatureGroups slug={slug} groups={digest.groups} />
-            </>
+            <DigestFeatureGroups slug={slug} groups={digest.groups} />
           )}
           {/* Opening this page never marks it seen — only this button, or scrolling to it, does. */}
           <MarkSeenFooter slug={slug} until={digest.until} />

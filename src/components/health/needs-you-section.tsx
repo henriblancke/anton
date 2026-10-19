@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useSyncExternalStore } from "react";
+import { Suspense, use, useState, useSyncExternalStore } from "react";
 import { HandIcon, TriangleAlertIcon } from "lucide-react";
 import Link from "next/link";
 
@@ -12,6 +12,7 @@ import { EscalationActions } from "@/components/health/escalation-actions";
 import { escalationAge } from "@/components/health/escalation-age";
 import { OperatorQueue } from "@/components/board/operator-queue";
 import type { DigestNeedsYouSummary } from "@/lib/attention";
+import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { isBoardUnreachableFindingKey, isDismissable } from "@/lib/escalation-kinds";
 import type { EscalationKind, EscalationView, ProposalAsk } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -444,31 +445,58 @@ function EscalationRow({
  * first, each with the action it already has elsewhere on the board — nothing new here.
  *
  * Composes four existing surfaces over `digestNeedsYou`'s ranked list rather than rendering its
- * own rows: `AutopilotBreakerHeader` (re-arm), this file's own `NeedsYouSection` (parked asks,
- * merge-ready PRs — both are escalations, so the one component that already renders them with
- * Resolve-and-resume / Dismiss is reused unchanged), `ProposalQueue` (links to where approve/
- * decline already live), and `OperatorQueue` (unblocked `agent:human` tickets, with its own Mark
- * done). Renders nothing when `digestNeedsYou` found nothing to promote — the same silence rule
- * every band on this board keeps.
+ * own rows: `AutopilotBreakerHeader` (re-arm), this file's own `NeedsYouSection` (parked asks and,
+ * separately, merge-ready PRs — both are escalations, so the one component that already renders
+ * them with Resolve-and-resume / Dismiss is reused unchanged), `ProposalQueue` (links to where
+ * approve/decline already live), and `OperatorQueue` (unblocked `agent:human` tickets, with its
+ * own Mark done).
+ *
+ * Rendered in `DIGEST_KIND_RANK` order, not DOM-source order: `NeedsYouSection` is mounted TWICE,
+ * once for `parked-ask` escalations (rank 1, ahead of proposals and tickets) and once for
+ * `merge-ready-pr` ones (rank 4, after them). A merge-ready PR waits on a reviewer, not on a
+ * decision only the founder can make right now, so interleaving it with `proposal`/`human-ticket`
+ * items — as a single combined escalation list would, since React renders each component's whole
+ * output as one block — would put the least urgent row ahead of the ones `digestNeedsYou` ranked
+ * higher.
+ *
+ * Renders nothing when `digestNeedsYou` found nothing to promote and there is no `breaker` to
+ * stream — the same silence rule every band on this board keeps.
  */
 export function DigestNeedsYou({
   slug,
   summary,
+  breaker,
   onOpenTicket,
   onDone,
 }: {
   slug: string;
   summary: DigestNeedsYouSummary;
+  /**
+   * The autopilot-stopped row, streamed rather than folded into `summary` (PR #350 review): the
+   * digest page hands this down UNRESOLVED, because confirming a WIP hold can read GitHub for
+   * minutes, and that must not gate the headline or feature cards the rest of the page already
+   * painted. Unwrapped inside its own Suspense boundary below — the same arrangement the board page
+   * uses for its own breaker band (board-parts.tsx) — so only this row, not the whole section,
+   * waits on it.
+   */
+  breaker?: Promise<AutopilotBreaker | undefined>;
   /** Opens a parented human ticket in the page's shared TicketDialog — see `OperatorQueue`. */
   onOpenTicket: (ticketId: string) => void;
   /** A queued ticket's Mark done landed — re-read whatever feeds `summary`. */
   onDone?: () => void;
 }) {
-  if (summary.total === 0) return null;
+  if (summary.total === 0 && !breaker) return null;
 
+  // Only used when the caller folded a resolved `breaker` into `summary` itself (the older,
+  // fully-synchronous call shape some tests and non-streaming callers still use). The digest page
+  // never does this any more — it passes `breaker` as a promise below instead — so the two paths
+  // never both have something to show.
   const breakerItem = summary.items.find((item) => item.kind === "breaker");
-  const escalations = summary.items
-    .filter((item) => item.kind === "parked-ask" || item.kind === "merge-ready-pr")
+  const parkedAsks = summary.items
+    .filter((item) => item.kind === "parked-ask")
+    .map((item) => item.escalation);
+  const mergeReadyPrs = summary.items
+    .filter((item) => item.kind === "merge-ready-pr")
     .map((item) => item.escalation);
   const proposals = summary.items
     .filter((item) => item.kind === "proposal")
@@ -479,12 +507,35 @@ export function DigestNeedsYou({
 
   return (
     <div className="flex flex-col gap-3">
-      <AutopilotBreakerHeader slug={slug} breaker={breakerItem?.breaker} />
-      <NeedsYouSection slug={slug} escalations={escalations} />
+      {breaker ? (
+        <Suspense fallback={null}>
+          <StreamedBreakerHeader slug={slug} breaker={breaker} />
+        </Suspense>
+      ) : (
+        <AutopilotBreakerHeader slug={slug} breaker={breakerItem?.breaker} />
+      )}
+      <NeedsYouSection slug={slug} escalations={parkedAsks} />
       <ProposalQueue slug={slug} proposals={proposals} />
       <OperatorQueue slug={slug} items={humanTickets} onOpenTicket={onOpenTicket} onDone={onDone} />
+      <NeedsYouSection slug={slug} escalations={mergeReadyPrs} />
     </div>
   );
+}
+
+/**
+ * The breaker band, unwrapping the digest page's streamed promise inside the boundary above. A
+ * component rather than an inline `use()` in `DigestNeedsYou`, for the same reason
+ * `StreamedAttentionStrip` (board-parts.tsx) is: the whole point of the boundary is that only this
+ * unwrap suspends, not the rest of the section already on screen.
+ */
+function StreamedBreakerHeader({
+  slug,
+  breaker,
+}: {
+  slug: string;
+  breaker: Promise<AutopilotBreaker | undefined>;
+}) {
+  return <AutopilotBreakerHeader slug={slug} breaker={use(breaker)} />;
 }
 
 /**

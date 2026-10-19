@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { DigestNeedsYou } from "@/components/health/needs-you-section";
 import { TicketDialog } from "@/components/ticket/ticket-dialog";
 import type { DigestNeedsYouSummary } from "@/lib/attention";
+import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 
 /**
  * The digest page's one client boundary for its needs-you list (anton-rokar) — mirrors Health's
@@ -16,9 +17,12 @@ import type { DigestNeedsYouSummary } from "@/lib/attention";
 export function DigestNeedsYouHost({
   slug,
   summary,
+  breaker,
 }: {
   slug: string;
   summary: DigestNeedsYouSummary;
+  /** The page's streamed breaker read — see `ProjectDigest.breaker` (digest-read.ts). */
+  breaker?: Promise<AutopilotBreaker | undefined>;
 }) {
   const router = useRouter();
   const [openTicketId, setOpenTicketId] = useState<string | null>(null);
@@ -28,6 +32,7 @@ export function DigestNeedsYouHost({
       <DigestNeedsYou
         slug={slug}
         summary={summary}
+        breaker={breaker}
         onOpenTicket={setOpenTicketId}
         onDone={() => router.refresh()}
       />

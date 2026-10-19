@@ -10,6 +10,7 @@
  * has no "look further back" control of its own (out of scope for this ticket).
  */
 import { digestNeedsYou, type DigestNeedsYouSummary } from "../attention";
+import type { AutopilotBreaker } from "../autopilot-breaker";
 import { currentBreaker } from "../autopilot-state";
 import { openEscalations } from "../escalations";
 import { systemClock } from "../jobs/queue";
@@ -31,6 +32,15 @@ export interface ProjectDigest {
    * `since`..`until` held nothing, which {@link isEmpty} also keys off. */
   headline: string;
   needsYou: DigestNeedsYouSummary;
+  /**
+   * Whether the autopilot has stopped, streamed rather than resolved (PR #350 review): confirming a
+   * WIP hold spawns a `gh pr view` per in-review PR, the same read the board already keeps off its
+   * own critical path (see `(board)/page.tsx`). `needsYou` above is computed WITHOUT this — its
+   * `breaker` count is always 0 here — so the page can decide `isEmpty` and paint the headline and
+   * feature cards without waiting on GitHub; the breaker-derived needs-you row is unwrapped inside
+   * its own Suspense boundary by `DigestNeedsYouHost`.
+   */
+  breaker: Promise<AutopilotBreaker | undefined>;
   /** `events.length` for this window — the board banner's "N things since you looked" (anton-16s0t). */
   activityCount: number;
   groups: DigestFeatureGroup[];
@@ -67,19 +77,34 @@ export interface DigestBoardSummary {
  * {@link projectDigestSummary} commits no such cursor (PR #350 review), so it passes `false` and
  * joins the same cached snapshot `getBoard` already reads, instead of doubling the board page's
  * `bd` subprocess cost for a display-only count.
+ *
+ * `streamBreaker` (default false) keeps the breaker read OUT of the `needsYou` folded here, handing
+ * it back unresolved instead (PR #350 review): only {@link projectDigest} streams it — it is the one
+ * caller whose page awaits this window directly, so an unreachable or slow GitHub would otherwise
+ * gate the headline and feature cards behind a check that is, at most, one optional row on the
+ * page. {@link projectDigestSummary} leaves it false: the board page never awaits that call either
+ * (it hands the whole thing down as a promise, same as this window's `breaker` would be), so there
+ * is nothing to protect by deferring it twice, and its `needsYou.counts.breaker` must stay accurate
+ * for the "autopilot stopped" chip on `DigestBanner` (board/attention-strip.tsx).
  */
-async function readDigestWindow(db: AntonDb, project: Project, opts: { freshBoard?: boolean } = {}) {
+async function readDigestWindow(
+  db: AntonDb,
+  project: Project,
+  opts: { freshBoard?: boolean; streamBreaker?: boolean } = {},
+) {
   const mark = await getViewerMark(db, project.id);
   const since = mark?.seenAt ?? null;
   const until = Math.floor(systemClock.now() / 1000);
 
+  const breakerRead = currentBreaker(project).catch((err) => {
+    console.error(`[digest] autopilot breaker read failed for ${project.slug}`, err);
+    return undefined;
+  });
+
   const [board, escalations, breaker] = await Promise.all([
     opts.freshBoard === false ? readDigestBoardCached(project) : readDigestBoard(project),
     openEscalations(project.id),
-    currentBreaker(project).catch((err) => {
-      console.error(`[digest] autopilot breaker read failed for ${project.slug}`, err);
-      return undefined;
-    }),
+    opts.streamBreaker ? Promise.resolve(undefined) : breakerRead,
   ]);
 
   const events = await readTimelineEventsForBoard(db, project, { since: since ?? 0, until }, board);
@@ -91,12 +116,14 @@ async function readDigestWindow(db: AntonDb, project: Project, opts: { freshBoar
     proposals: openProposals(board),
   });
 
-  return { since, until, board, events, needsYou };
+  return { since, until, board, events, needsYou, breaker: breakerRead };
 }
 
 /** One project's digest, for the page to render directly. */
 export async function projectDigest(db: AntonDb, project: Project): Promise<ProjectDigest> {
-  const { since, until, board, events, needsYou } = await readDigestWindow(db, project);
+  const { since, until, board, events, needsYou, breaker } = await readDigestWindow(db, project, {
+    streamBreaker: true,
+  });
   const groups = (await digestFeatureGroups(db, project.id, events, { board })) ?? [];
 
   return {
@@ -104,6 +131,7 @@ export async function projectDigest(db: AntonDb, project: Project): Promise<Proj
     until,
     headline: templateHeadline(events),
     needsYou,
+    breaker,
     activityCount: events.length,
     groups,
     isEmpty: needsYou.total === 0 && events.length === 0,

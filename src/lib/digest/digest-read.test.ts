@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { beads, type Bead } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
+import type { AutopilotBreaker } from "../autopilot-breaker";
 import * as schema from "../db/schema";
 import type { EscalationView } from "../escalations";
 import { makeProjectDb, type TestProjectDb } from "../testing/project";
@@ -28,7 +29,9 @@ vi.mock("../escalations", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../escalations")>();
   return { ...actual, openEscalations: vi.fn(async () => escalations) };
 });
-vi.mock("../autopilot-state", () => ({ currentBreaker: vi.fn(async () => undefined) }));
+
+let breaker: AutopilotBreaker | undefined;
+vi.mock("../autopilot-state", () => ({ currentBreaker: vi.fn(async () => breaker) }));
 
 let board: Bead[] = [];
 vi.mock("../beads/issues", () => ({
@@ -71,6 +74,7 @@ beforeEach(() => {
   };
   board = [];
   escalations = [];
+  breaker = undefined;
   vi.spyOn(beads, "list").mockImplementation(async () => [...board]);
   vi.spyOn(beads, "showWithComments").mockImplementation(async (_cwd, id) => ({
     ...bead({ id }),
@@ -133,6 +137,20 @@ describe("projectDigest", () => {
 
     expect(digest.since).toBe(5000);
   });
+
+  it("streams the breaker check instead of folding it into needsYou (PR #350 review)", async () => {
+    breaker = { kind: "disarm", reason: "consecutive-failures", detail: "3 runs failed", evidence: [] };
+
+    const digest = await projectDigest(t.db, project);
+
+    // The headline/groups/isEmpty decision does not wait on — or count — the breaker: an otherwise
+    // quiet window stays "nothing happened" even though the autopilot is in fact disarmed, because
+    // that row streams in separately rather than gating this read.
+    expect(digest.needsYou.counts.breaker).toBe(0);
+    expect(digest.isEmpty).toBe(true);
+    // The streamed promise still carries the real answer, for whoever unwraps it.
+    await expect(digest.breaker).resolves.toEqual(breaker);
+  });
 });
 
 describe("projectDigestSummary", () => {
@@ -157,6 +175,17 @@ describe("projectDigestSummary", () => {
     expect(summary.activityCount).toBe(digest.activityCount);
     expect(summary.activityCount).toBe(1);
     expect(summary.needsYou.total).toBe(1);
+  });
+
+  it("folds the breaker into needsYou synchronously, unlike projectDigest", async () => {
+    breaker = { kind: "disarm", reason: "consecutive-failures", detail: "3 runs failed", evidence: [] };
+
+    const summary = await projectDigestSummary(t.db, project);
+
+    // The board never awaits this call directly either (it hands the whole thing down as a
+    // promise), so there is nothing to protect by deferring the breaker a second time here — and
+    // `DigestBanner`'s "autopilot stopped" chip (board/attention-strip.tsx) needs this count.
+    expect(summary.needsYou.counts.breaker).toBe(1);
   });
 
   it("reports zero/zero for a quiet project", async () => {

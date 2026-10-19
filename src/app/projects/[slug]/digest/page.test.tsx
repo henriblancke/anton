@@ -45,6 +45,10 @@ function emptyDigest(overrides: Partial<ProjectDigest> = {}): ProjectDigest {
     until: 1_700_000_000,
     headline: "No new activity",
     needsYou: EMPTY_SUMMARY,
+    // Streamed, not resolved on the real page (PR #350 review) — resolved here since this suite
+    // renders the page's output synchronously and has nothing to prove about the streaming itself;
+    // that's covered by needs-you-section.test.tsx and digest-read.test.ts.
+    breaker: Promise.resolve(undefined),
     activityCount: 0,
     groups: [],
     isEmpty: true,
