@@ -41,6 +41,8 @@ export function DigestNeedsYouHost({
         ticketId={openTicketId}
         open={openTicketId !== null}
         onClose={() => setOpenTicketId(null)}
+        onSaved={() => router.refresh()}
+        onDeleted={() => router.refresh()}
       />
     </>
   );

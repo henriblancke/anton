@@ -30,12 +30,28 @@ vi.mock("@/components/health/needs-you-section", () => ({
 }));
 
 vi.mock("@/components/ticket/ticket-dialog", () => ({
-  TicketDialog: ({ ticketId, open }: { ticketId: string | null; open: boolean }) => (
-    <div data-testid="dialog" data-open={open} data-ticket={ticketId ?? ""} />
+  TicketDialog: ({
+    ticketId,
+    open,
+    onSaved,
+    onDeleted,
+  }: {
+    ticketId: string | null;
+    open: boolean;
+    onSaved?: () => void;
+    onDeleted?: () => void;
+  }) => (
+    <div data-testid="dialog" data-open={open} data-ticket={ticketId ?? ""}>
+      <button onClick={() => onSaved?.()}>save ticket</button>
+      <button onClick={() => onDeleted?.()}>delete ticket</button>
+    </div>
   ),
 }));
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  refresh.mockClear();
+});
 
 const summary: DigestNeedsYouSummary = {
   items: [],
@@ -64,6 +80,22 @@ describe("DigestNeedsYouHost", () => {
     render(<DigestNeedsYouHost slug="anton" summary={summary} />);
 
     fireEvent.click(screen.getByText("mark done"));
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the page when a parented human ticket is saved in the dialog", () => {
+    render(<DigestNeedsYouHost slug="anton" summary={summary} />);
+
+    fireEvent.click(screen.getByText("save ticket"));
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the page when a parented human ticket is deleted in the dialog", () => {
+    render(<DigestNeedsYouHost slug="anton" summary={summary} />);
+
+    fireEvent.click(screen.getByText("delete ticket"));
 
     expect(refresh).toHaveBeenCalledTimes(1);
   });
