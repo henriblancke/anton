@@ -322,12 +322,14 @@ function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): Invocation
  * own contract. A fact with no `beadId` (a scheduled pass, never a feature) has nothing to bucket a
  * loop count under and is dropped.
  *
- * Every CLASSIFIED phase passes through, not only `self-review`/`pr-fix`: {@link reviewLoopByFeature}
- * only increments on those two, but it keys its per-feature bucket off ANY point carrying the
- * feature's `beadId` — a feature with only `implement`/`describe` invocations still needs a point
- * here so that fold can give it a genuine zero-count bucket instead of dropping it from the cohort
- * entirely (P2, PR #348 review). Only a row `ledgerPhase` cannot classify at all is dropped, since it
- * has no phase to report.
+ * Every CLASSIFIED phase passes through, not only `self-review`/`pr-fix` — {@link reviewLoopByFeature}
+ * only increments on those two, but still folds a point for any other classified phase so a feature
+ * with only `implement`/`describe` invocations is not silently dropped before its zero-count bucket
+ * is seeded. A row `ledgerPhase` cannot classify at all (e.g. a legacy pre-`step_handler` row) is
+ * dropped here, since it has no phase to report — but that no longer loses the feature's zero entry:
+ * {@link trendSeries} seeds `reviewLoopByFeature` from every cohort feature's own id directly, not
+ * from this list, so a feature with ONLY unclassifiable rows (or no Claude rows at all) still gets a
+ * genuine zero rather than being dropped from the cohort's median/runaway verdict (P2, PR #348 review).
  */
 function reviewLoopInvocationPoints(
   rows: readonly ClaudeInvocationRow[],
@@ -415,6 +417,7 @@ export async function trendSeries(
     runCauses,
     invocationStamps: invocationStampPoints(wholeLifeRows),
     reviewLoopInvocations,
+    reviewLoopFeatureIds: [...cohortBeadIds],
   };
   return foldTrendSeries(input, weeks, { nowMs });
 }

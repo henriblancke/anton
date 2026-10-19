@@ -1043,35 +1043,57 @@ export async function listDeliveriesByBead(
  * target that delivered in a window rather than only confirm one it already suspects (P1, PR #348
  * review, cohort-read.ts): a target whose last invocation predates `since` (a PR that waited days
  * to merge) has no row in `claude_invocations` to surface it as a candidate, but its run row still
- * settled inside the window. Only the run-row evidence {@link listDeliveriesByBead} itself trusts
- * most — the session arm there exists to credit a REPARENTED child's own commit against a bead set
- * already known, not to discover new candidates, so it has no equivalent here.
+ * settled inside the window.
+ *
+ * The run-row arm alone misses a REPARENTED child (P2, PR #348 review): when a grouped run
+ * delivers child A, later overwrites `ticketBeadId` with child B, and A is reparented onto another
+ * feature, the run row names only the epic and B — A's id never appears in either column once
+ * overwritten. {@link listDeliveriesByBead}'s session arm credits exactly this case against a bead
+ * set it is already given; the second query below is its discovery-side twin, finding every
+ * `execute` session whose CONTAINING RUN settled delivered inside the window, regardless of
+ * whether that session's own bead id still matches the run's current columns.
  */
 export async function listRunBeadIdsDeliveredSince(
   db: AntonDb,
   projectId: string,
   since: Date,
 ): Promise<Set<string>> {
-  const rows = await db
-    .select({
-      epicBeadId: schema.runs.epicBeadId,
-      ticketBeadId: schema.runs.ticketBeadId,
-      endedAt: schema.runs.endedAt,
-      updatedAt: schema.runs.updatedAt,
-    })
-    .from(schema.runs)
-    .where(
-      and(
-        eq(schema.runs.projectId, projectId),
-        eq(schema.runs.status, "done"),
-        eq(schema.runs.delivered, true),
-        or(gte(schema.runs.endedAt, since), and(isNull(schema.runs.endedAt), gte(schema.runs.updatedAt, since))),
+  const settledSince = or(
+    gte(schema.runs.endedAt, since),
+    and(isNull(schema.runs.endedAt), gte(schema.runs.updatedAt, since)),
+  );
+  const [runRows, sessionRows] = await Promise.all([
+    db
+      .select({
+        epicBeadId: schema.runs.epicBeadId,
+        ticketBeadId: schema.runs.ticketBeadId,
+      })
+      .from(schema.runs)
+      .where(
+        and(eq(schema.runs.projectId, projectId), eq(schema.runs.status, "done"), eq(schema.runs.delivered, true), settledSince),
       ),
-    );
+    db
+      .select({ beadId: schema.sessions.beadId })
+      .from(schema.sessions)
+      .innerJoin(schema.runs, eq(schema.sessions.runId, schema.runs.id))
+      .where(
+        and(
+          eq(schema.sessions.projectId, projectId),
+          eq(schema.sessions.kind, "execute"),
+          eq(schema.sessions.status, "done"),
+          eq(schema.runs.status, "done"),
+          eq(schema.runs.delivered, true),
+          settledSince,
+        ),
+      ),
+  ]);
   const out = new Set<string>();
-  for (const row of rows) {
+  for (const row of runRows) {
     if (row.epicBeadId !== null) out.add(row.epicBeadId);
     if (row.ticketBeadId !== null) out.add(row.ticketBeadId);
+  }
+  for (const row of sessionRows) {
+    if (row.beadId !== null) out.add(row.beadId);
   }
   return out;
 }

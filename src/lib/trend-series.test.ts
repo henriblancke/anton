@@ -683,6 +683,24 @@ describe("reviewLoopByFeature", () => {
     const byId = new Map(points.map((p) => [p.beadId, p]));
     expect(byId.get("outlier")?.runaway).toBe(true);
   });
+
+  it("seeds a genuine zero entry for a cohort feature with no classifiable invocation at all", () => {
+    // A feature whose only rows are legacy pre-`step_handler` ones (or that has no Claude rows
+    // whatsoever, e.g. delivery-only) never appears in `invocations` — without seeding from the
+    // cohort id list directly, it would be silently dropped from the result and from the median.
+    const invocations = [invocation("has-rows", "pr-fix")];
+    const points = reviewLoopByFeature(invocations, ["has-rows", "legacy-only", "delivery-only"]);
+    const byId = new Map(points.map((p) => [p.beadId, p]));
+    expect(byId.get("legacy-only")).toEqual({
+      beadId: "legacy-only",
+      selfReviewInvocations: 0,
+      prFixInvocations: 0,
+      loopInvocations: 0,
+      runaway: false,
+    });
+    expect(byId.get("delivery-only")?.loopInvocations).toBe(0);
+    expect(points).toHaveLength(3);
+  });
 });
 
 describe("trendSeries", () => {

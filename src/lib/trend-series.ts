@@ -927,11 +927,21 @@ export interface ReviewLoopPoint {
  * failed self-review triggers, not the self-review gate itself — so the threshold adapts to a
  * project's own typical amount of correction looping rather than a fixed count that would misfire on
  * a project whose formula naturally runs more rounds than another's.
+ *
+ * `cohortFeatureIds` seeds a zero-count bucket for every id it carries BEFORE any invocation is
+ * folded in, so a feature with no classifiable invocation at all — one with only legacy
+ * pre-`step_handler` rows ({@link ledgerPhase} returns `undefined` for those), or a delivery-only
+ * feature with no Claude rows whatsoever — still gets a genuine zero entry instead of being dropped
+ * from the result (and from the median/runaway verdict) entirely (P2, PR #348 review).
  */
 export function reviewLoopByFeature(
   invocations: readonly ReviewLoopInvocationPoint[],
+  cohortFeatureIds: readonly string[] = [],
 ): ReviewLoopPoint[] {
   const byFeature = new Map<string, { selfReview: number; prFix: number }>();
+  for (const beadId of cohortFeatureIds) {
+    if (!byFeature.has(beadId)) byFeature.set(beadId, { selfReview: 0, prFix: 0 });
+  }
   for (const invocation of invocations) {
     let bucket = byFeature.get(invocation.beadId);
     if (!bucket) {
@@ -972,6 +982,8 @@ export interface TrendSeriesInput {
   runCauses: readonly RunCausePoint[];
   invocationStamps: readonly InvocationStampPoint[];
   reviewLoopInvocations: readonly ReviewLoopInvocationPoint[];
+  /** Every cohort feature's run-target id — seeds {@link reviewLoopByFeature}'s zero-count buckets. */
+  reviewLoopFeatureIds?: readonly string[];
 }
 
 /** One ISO week's whole trend — quality, cost, phase spend and failure causes, independently present or absent. */
@@ -1065,6 +1077,6 @@ export function trendSeries(
   return {
     weeks: weekPoints,
     changeMarkers: changeMarkers(input.invocationStamps, weeks, { nowMs }),
-    reviewLoop: reviewLoopByFeature(input.reviewLoopInvocations),
+    reviewLoop: reviewLoopByFeature(input.reviewLoopInvocations, input.reviewLoopFeatureIds ?? []),
   };
 }

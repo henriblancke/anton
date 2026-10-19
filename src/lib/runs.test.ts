@@ -768,6 +768,32 @@ describe("listRunBeadIdsDeliveredSince", () => {
 
     expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(new Set());
   });
+
+  it("discovers a reparented child whose own invocation predates `since` via its run's settle time", async () => {
+    // A grouped run delivers child A, then overwrites `ticketBeadId` with child B — A's id never
+    // appears in either run column again, so only A's own `execute` session (joined through the
+    // run it belongs to) can still surface it once it is reparented onto another feature.
+    await seed({
+      id: "r1",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-epic",
+      ticketBeadId: "anton-child-b",
+    });
+    await seedSession({
+      id: "child-a-execute",
+      beadId: "anton-child-a",
+      kind: "execute",
+      status: "done",
+      endedAt: SETTLED - 10 * 24 * 60 * 60 * 1000,
+      runId: "r1",
+    });
+
+    expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(
+      new Set(["anton-epic", "anton-child-b", "anton-child-a"]),
+    );
+  });
 });
 
 /** The endpoint a run drove is recorded as provenance (anton-oom5). */
