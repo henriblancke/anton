@@ -467,12 +467,12 @@ export function pickerApplyVerdict(
  * The kind, the move and the record arrive separately because they answer different halves: the
  * policy is a decision about the KIND, the manual floor a fact about the MOVE, the earned floor a
  * count of what the FOUNDER decided. Both shapes that consult this — a detection about to be filed, a
- * plan read back off a proposal bead — carry the move/target/retireAs triple, so neither has to be
- * converted into the other first.
+ * plan read back off a proposal bead — carry the move/target/retireAs/detail quadruple, so neither
+ * has to be converted into the other first.
  */
 export function autonomyFor(
   kind: GardenerDetectionKind,
-  plan: { move: GardenerMove; target?: string; retireAs?: RetireVerb },
+  plan: { move: GardenerMove; target?: string; retireAs?: RetireVerb; detail?: string },
   policy: ProposalAutonomyPolicy,
   record: ProposalTrackRecord,
 ): ProposalAutonomy {

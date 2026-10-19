@@ -14,6 +14,7 @@
  */
 import { beads, labelValueOf, labelValuesOf, type Bead } from "../beads/bd";
 import { outcomeIdsOf } from "../backlog";
+import { goalBody, isAuthoredBody, preambleOf } from "../beads/contract";
 import { AREA_SHAPE } from "../epic-patch";
 import { isOpenWork, type BoardIndex } from "./board-index";
 import { makeDetection, type GardenerDetection } from "./detections";
@@ -24,6 +25,9 @@ export const STRINGER_OUTCOME = "codebase-health";
 
 /** The suggestion that asks the operator rather than guessing — neither signal below fired. */
 export const UNKNOWN_OUTCOME = "unknown";
+
+/** How much of a bead's own Goal rides along as evidence — a hint, not the whole contract. */
+const MAX_GOAL_HINT_CHARS = 240;
 
 /**
  * Every open run target with no outcome to group under, each with a deterministic suggestion.
@@ -43,6 +47,7 @@ export function detectUnlinkedOutcomes(index: BoardIndex): GardenerDetection[] {
     if (outcomeIdsOf(bead).length > 0) continue;
 
     const suggestion = suggestOutcome(index, bead);
+    const goalHint = goalHintOf(bead);
     detections.push(
       makeDetection({
         kind: "unlinked-outcome",
@@ -53,6 +58,9 @@ export function detectUnlinkedOutcomes(index: BoardIndex): GardenerDetection[] {
         evidence: [
           `${bead.id} ("${bead.title}") is a ${bead.status} ${bead.issue_type ?? "bead"} and a run target, but no outcome:<id> label (or, for a standalone epic, ## Outcome IDs body) names what it serves`,
           ...suggestion.evidence,
+          // Read by the approver when the suggestion is `unknown`: the board gave no signal to
+          // read, so the bead's own stated purpose is the only thing left to judge the outcome by.
+          ...(goalHint ? [`its own Goal: ${goalHint}`] : []),
         ],
       }),
     );
@@ -103,6 +111,24 @@ function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
     outcome: UNKNOWN_OUTCOME,
     evidence: [`neither a parent epic's outcome nor a source:stringer label suggests one — ask the operator which outcome this serves`],
   };
+}
+
+/**
+ * What the bead itself states it is FOR, excerpted — the one piece of evidence an approver has left
+ * to judge an `unknown` suggestion by, since by construction neither board signal above fired for
+ * it. Its `## Goal` where the bead states one, else the description's opening prose, mirroring
+ * pm/bead-line.ts's own `goalOf` (not imported: that module reads the product-master's own board
+ * context, and this one has no reason to depend on it for three lines of text).
+ *
+ * AUTHORED text only ({@link isAuthoredBody}) — the formula's unfilled `TODO — …` prompt is not a
+ * hint, and quoting it as one would send the approver chasing a Goal the bead never actually states.
+ */
+function goalHintOf(bead: Bead): string | undefined {
+  const description = typeof bead.description === "string" ? bead.description : "";
+  const authored = [goalBody(bead), preambleOf(description)].find(isAuthoredBody);
+  const text = (authored ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return undefined;
+  return text.length > MAX_GOAL_HINT_CHARS ? `${text.slice(0, MAX_GOAL_HINT_CHARS)}…` : text;
 }
 
 /** The epic's own `outcome:<id>` label values — label-safe syntax only, same bar `outcomeIdsOf`

@@ -362,6 +362,41 @@ describe("the proposal bead", () => {
     expect(draft.description).not.toContain("approving it applies the move");
     expect(draft.acceptance).toContain("DECLINED");
   });
+
+  // Mirrors the targetless re-parent case above: `unknown` is the literal `detectUnlinkedOutcomes`
+  // suggests when neither board signal fired, and apply refuses it the same way (anton-15xcn).
+  it("tells an outcome proposal suggesting unknown to be labelled by hand and DECLINED, not approved", () => {
+    const unguessed = makeDetection({
+      kind: "unlinked-outcome",
+      move: "attach-outcome",
+      subjects: ["anton-feat"],
+      detail: "unknown",
+      summary: "anton-feat carries no outcome:<id>",
+      evidence: ["neither signal fired", "its own Goal: ship the thing"],
+    });
+    const draft = proposalDraft(unguessed);
+
+    expect(draft.description).toContain("Approve is refused");
+    expect(draft.description).toContain("bd update <id> --add-label outcome:<id>");
+    expect(draft.description).not.toContain("approving it applies the move");
+    expect(draft.acceptance).toContain("DECLINED");
+  });
+
+  it("states the suggested outcome as the applied state when there is one to apply", () => {
+    const guessed = makeDetection({
+      kind: "unlinked-outcome",
+      move: "attach-outcome",
+      subjects: ["anton-feat"],
+      detail: "codebase-health",
+      summary: "anton-feat carries no outcome:<id>",
+      evidence: ["anton-feat carries source:stringer"],
+    });
+    const draft = proposalDraft(guessed);
+
+    expect(draft.acceptance).toContain("anton-feat is labelled outcome:codebase-health");
+    expect(draft.description).toContain("approving it applies the move");
+    expect(draft.acceptance).toContain("is closed with a note naming what changed");
+  });
 });
 
 describe("dedup by fingerprint", () => {

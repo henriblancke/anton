@@ -110,6 +110,22 @@ describe("the hard floor — a move with no mechanical answer", () => {
       autonomyFor("container-orphan", { move: "reparent", target: "anton-feat" }, ALL_APPLY, EARNED),
     ).toBe("apply");
   });
+
+  // The same shape a third time: `unknown` is the literal `detectUnlinkedOutcomes` suggests when
+  // neither board signal fired, and it is a question, not a move anton can run — even armed.
+  it("keeps an UNKNOWN-suggestion attach-outcome at propose under an apply policy", () => {
+    expect(
+      autonomyFor("unlinked-outcome", { move: "attach-outcome", detail: "unknown" }, ALL_APPLY, EARNED),
+    ).toBe("propose");
+    expect(
+      autonomyFor(
+        "unlinked-outcome",
+        { move: "attach-outcome", detail: "codebase-health" },
+        ALL_APPLY,
+        EARNED,
+      ),
+    ).toBe("apply");
+  });
 });
 
 describe("the earned floor — a kind is armable only once its proposals have a record (anton-m29g)", () => {
@@ -166,6 +182,8 @@ describe("the earned floor — a kind is armable only once its proposals have a 
     expect(autonomyTierOf({ move: "reparent" })).toBe("reversible");
     expect(autonomyTierOf({ move: "link" })).toBe("reversible");
     expect(autonomyTierOf({ move: "reprioritize" })).toBe("reversible");
+    // One label, undone by one `bd update` the same way a re-parent or a priority is.
+    expect(autonomyTierOf({ move: "attach-outcome" })).toBe("reversible");
     expect(autonomyTierOf({ move: "unapprove" })).toBe("dequeued");
     expect(autonomyTierOf({ move: "retire", retireAs: "defer" })).toBe("dequeued");
     expect(autonomyTierOf({ move: "retire", retireAs: "close" })).toBe("history");

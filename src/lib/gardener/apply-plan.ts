@@ -13,6 +13,7 @@
  * apply.ts carries the three properties this whole layer rests on and why each exists.
  */
 import { approvalGaps, formatApprovalGaps, onlyMissingEvidence, type ApprovalGap } from "../approval-gate";
+import { outcomeIdsOf } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { isTicketTier } from "../beads/contract";
 import {
@@ -42,6 +43,7 @@ import {
   MIN_CARRIED_TICKETS,
   MIN_CLUSTER_SIZE,
 } from "./reparent";
+import { UNKNOWN_OUTCOME } from "./unlinked-outcome";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -159,7 +161,16 @@ export type ApplyStep =
    * because the whole claim is "nothing has touched this since it was parked", which a write since
    * the filing is precisely what falsifies.
    */
-  | (StepSubject & TicketOwner & EvidenceFence & { verb: "undefer" });
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "undefer" })
+  /**
+   * Labels a run target with the outcome it serves (anton-15xcn) — mechanical and single-bead, like
+   * `reprioritize`, and fenced for the same reason: a fresh board read cannot tell whether the
+   * approver's own judgment (reading the Goal hint on an `unknown` ask, or simply agreeing with the
+   * guess) still holds, so the evidence fence stands in — except `unlinked-outcome` resolves to no
+   * premise at all ({@link EVIDENCE_PREMISE}), because the claim it rests on ("no outcome:<id> yet")
+   * is re-derivable from the board exactly like the gardener's own re-parents.
+   */
+  | (StepSubject & EvidenceFence & { verb: "attach-outcome"; outcome: string });
 
 /** The one verb whose steps come in clusters — the shape both halves of the move are written in. */
 export type ReparentStep = Extract<ApplyStep, { verb: "reparent" }>;
@@ -378,12 +389,7 @@ export function planApply(
     case "undefer":
       return planUndefer(plan, index, at);
     case "attach-outcome":
-      // Not wired yet — anton-15xcn adds the write. Refusing rather than silently no-op'ing keeps
-      // an armed pass from settling this proposal without ever having applied it.
-      return {
-        status: "refuse",
-        reason: `adding outcome:${plan.detail ?? "?"} to ${list(plan.subjects)} has no apply route yet — add the label by hand and decline this proposal`,
-      };
+      return planAttachOutcome(plan, index, at);
   }
 }
 
@@ -1163,6 +1169,76 @@ function reprioritizeBarred(
 /** Where the bead is ranked now, as the summary reads it — omitted when it carries no priority. */
 const fromPriority = (subject: Bead): string =>
   typeof subject.priority === "number" ? `from P${subject.priority} ` : "";
+
+// ── attach-outcome ──
+
+function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "an outcome proposal names exactly one bead" };
+  }
+  const outcome = plan.detail;
+  if (!outcome) {
+    return { status: "refuse", reason: "this proposal names no outcome to add" };
+  }
+  // The literal answer `detectUnlinkedOutcomes` suggests when neither board signal fired — the ask
+  // is "which outcome does this serve?", and only a human can answer it. Refused here rather than
+  // left to the manual floor alone (autonomy.ts `isManualProposal`), which only ever keeps this OFF
+  // an armed pass's own writes; a human clicking Approve on it must be refused the same way.
+  if (outcome === UNKNOWN_OUTCOME) {
+    return {
+      status: "refuse",
+      reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
+    };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  return attachOutcomeSubject(plan, subject, outcome, at);
+}
+
+/**
+ * The label decided against the bead itself. A subject that already carries an outcome settles
+ * BEFORE the evidence fence is consulted — the same order `reprioritizeSubject` settles in, for the
+ * same reason: whoever labelled it, by hand or by a concurrent approval, produced the state this ask
+ * wanted.
+ */
+function attachOutcomeSubject(
+  plan: GardenerPlan,
+  subject: Bead,
+  outcome: string,
+  at: ApplyMoment,
+): ApplyDecision {
+  if (outcomeIdsOf(subject).length > 0) {
+    return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
+  }
+  const barred = attachOutcomeBarred(plan, subject, at);
+  if (barred) return { status: "refuse", reason: barred };
+  return {
+    status: "apply",
+    steps: [
+      {
+        verb: "attach-outcome",
+        id: subject.id,
+        claim: runClaimOf(subject),
+        outcome,
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
+    summary: `labelled ${subject.id} outcome:${outcome}`,
+  };
+}
+
+/** Why this bead cannot be labelled, or undefined. */
+function attachOutcomeBarred(plan: GardenerPlan, subject: Bead, at: ApplyMoment): string | undefined {
+  if (!isOpenWork(subject)) {
+    return `${subject.id} is ${settledWord(subject)} — an outcome label would group nothing`;
+  }
+  return (
+    subjectBusy(subject, at, DOING["attach-outcome"]) ??
+    premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs)
+  );
+}
 
 // ── unapprove ──
 
@@ -1977,8 +2053,8 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
   },
   // No fence, for the same reason as `degraded-approval`: the whole claim is "this run target
   // carries no outcome:<id> to group under", which is re-derivable from the fresh board at apply
-  // time rather than something an edit since the filing could falsify unnoticed (anton-15xcn wires
-  // the write itself).
+  // time ({@link attachOutcomeSubject}'s own settled check) rather than something an edit since
+  // the filing could falsify unnoticed.
   "unlinked-outcome": undefined,
 };
 
@@ -2164,6 +2240,7 @@ export const DOING: Record<ApplyStep["verb"], string> = {
   supersede: "retiring it",
   defer: "retiring it",
   undefer: "returning it to the board",
+  "attach-outcome": "labelling it",
 };
 
 /**

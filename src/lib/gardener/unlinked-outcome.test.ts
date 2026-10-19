@@ -135,6 +135,19 @@ describe("unlinked-outcome (anton-vie0k)", () => {
     expect(detect([proposal])).toEqual([]);
   });
 
+  it("quotes the bead's own Goal as evidence — the only thing left to judge an unknown by", () => {
+    const detection = only([
+      feature("anton-feat", { description: "## Goal\n\nShip the thing that matters.\n" }),
+    ]);
+    expect(detection.detail).toBe(UNKNOWN_OUTCOME);
+    expect(detection.evidence.join("\n")).toContain("Ship the thing that matters.");
+  });
+
+  it("says nothing about a Goal when the bead states none", () => {
+    const detection = only([feature("anton-feat")]);
+    expect(detection.evidence.some((line) => line.includes("its own Goal"))).toBe(false);
+  });
+
   it("fingerprints each subject distinctly and stably across repeated passes", () => {
     const board = [feature("anton-a"), feature("anton-b")];
     const first = detect(board);

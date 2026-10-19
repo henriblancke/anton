@@ -103,8 +103,9 @@ export const AUTONOMY_GROUPS: {
       "Armed, a pass re-shapes the graph overnight without asking. A wrong one costs you the one " +
       "write that puts it back — the cheapest group to arm first.",
     floor:
-      "A re-parent filed without a target names no home — the ask is “which feature?”, and only " +
-      "you can answer it. Those are never applied, whatever this says.",
+      "A re-parent filed without a target names no home, and an outcome proposal suggesting " +
+      "`unknown` names no outcome — both ask “which one?”, and only you can answer. Those are " +
+      "never applied, whatever this says.",
     kinds: [
       {
         id: "container-orphan",

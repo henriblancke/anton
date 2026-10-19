@@ -782,6 +782,13 @@ const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> 
     "sketch below as a starting point, then DECLINE this proposal — declining is what settles it and",
     "stops the pass re-asking.",
   ],
+  "attach-outcome": [
+    "This bead is a DECISION only a human can make: neither signal this patrol reads (a parent",
+    "epic's own outcome label, a `source:stringer` default) suggested one, so the proposal names",
+    "`unknown` and **Approve is refused**. Read the Goal hint in the Evidence below, label the",
+    "bead by hand (`bd update <id> --add-label outcome:<id>`), then DECLINE this proposal —",
+    "declining is what settles it and stops the patrol re-asking.",
+  ],
 };
 
 function acceptanceOf(detection: GardenerDetection): string {

@@ -81,6 +81,7 @@ vi.mock("../beads/bd", async () => {
       update: (_cwd: string, id: string, patch: { priority?: number }) =>
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
+      tag: (_cwd: string, id: string, labels: string[]) => record("tag", id, labels.join(",")),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
       approve: (_cwd: string, id: string) => record("approve", id),
       assign: (_cwd: string, id: string, actor: string) => record("assign", id, actor),
@@ -1594,5 +1595,76 @@ describe("the product master's moves", () => {
     expect(err.message).toMatch(/decline this proposal/);
     // Nothing but the refusal note: the board is untouched.
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+});
+
+/**
+ * Attach-outcome (anton-15xcn): the gardener's own write for `unlinked-outcome`, labelling a run
+ * target with the outcome `detectUnlinkedOutcomes` suggested. Mechanical and single-bead, like
+ * `reprioritize` above, with the same two shapes worth testing here: a board that already agrees
+ * SETTLES rather than writing twice, and `unknown` — the literal answer that means "neither board
+ * signal fired" — has no mechanical move at all, so Approve refuses it exactly like a split.
+ */
+describe("the gardener's outcome label", () => {
+  const OUTCOME = planFor({
+    kind: "unlinked-outcome",
+    move: "attach-outcome",
+    subjects: ["anton-a"],
+    detail: "codebase-health",
+  });
+  const UNKNOWN = planFor({
+    kind: "unlinked-outcome",
+    move: "attach-outcome",
+    subjects: ["anton-a"],
+    detail: "unknown",
+  });
+
+  it("writes the outcome label the plan names, and closes the proposal as applied", async () => {
+    const subject = cold("anton-a");
+    const result = await applyWith(proposalFor(OUTCOME), [subject]);
+    expect(calls).toEqual([
+      "tag anton-a outcome:codebase-health",
+      "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
+      "close anton-p1 applied: labelled anton-a outcome:codebase-health",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
+  });
+
+  it("settles rather than writing when the bead already carries an outcome", async () => {
+    // Warm on purpose: labelling it by hand IS a write since the filing, and the evidence fence
+    // must not turn the outcome the ask wanted into a refusal.
+    await applyWith(proposalFor(OUTCOME), [warm("anton-a", { labels: ["outcome:trustworthy-board"] })]);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+    expect(calls).toContain(
+      "close anton-p1 applied: anton-a already carries an outcome — nothing to add",
+    );
+  });
+
+  it("refuses to label a bead a run has claimed since the filing", async () => {
+    const claimed = warm("anton-a", { status: "in_progress", assignee: "runner-1" });
+    const err = (await applyWith(proposalFor(OUTCOME), [claimed]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  // `unknown` is the suggestion `detectUnlinkedOutcomes` files when neither board signal fired —
+  // the same shape as a split or a targetless re-parent, and refused the same way: approving it
+  // would have to invent an outcome rather than run a move anton actually knows how to make.
+  it("refuses an UNKNOWN suggestion with an answer, rather than guessing or writing nothing silently", async () => {
+    const err = (await applyWith(proposalFor(UNKNOWN), [cold("anton-a")]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/could not guess which outcome/);
+    expect(err.message).toMatch(/decline this proposal/);
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  it("invalidates a plan whose outcome was edited after it was filed", () => {
+    const tampered = { ...OUTCOME, detail: "a-different-outcome" };
+    expect(parseGardenerPlan(tampered)).toBeUndefined();
+    expect(parseGardenerPlan(OUTCOME)).toEqual(OUTCOME);
   });
 });

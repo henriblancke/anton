@@ -263,18 +263,30 @@ export function namespaceOf(kind: GardenerDetectionKind): ProposalNamespace {
 /**
  * Does this proposal name a move anton can RUN, or only a question a human can answer?
  *
- * Two shapes reach here. A `split` never has a mechanical answer — decomposing a ticket writes new
- * contracts, which is `/shape`'s work. A container orphan with no single open feature home files
- * WITHOUT a target on purpose (see reparent.ts): the ask is real, but the answer is a choice.
+ * Three shapes reach here. A `split` never has a mechanical answer — decomposing a ticket writes
+ * new contracts, which is `/shape`'s work. A container orphan with no single open feature home
+ * files WITHOUT a target on purpose (see reparent.ts): the ask is real, but the answer is a choice.
+ * An `attach-outcome` suggesting `unknown` is the same shape a third time: neither signal
+ * `detectUnlinkedOutcomes` reads (a parent epic's own outcome, a `source:stringer` default) fired,
+ * so the detail names no outcome to write — the literal string this module restates rather than
+ * imports, for the reason `DETAIL_PATTERN` does above.
  *
- * Both are filed anyway, because the ASK belongs on the board with its evidence and its fingerprint;
- * what changes is how it settles. Approve refuses, and DECLINING is what records the answer — which
- * both the proposal's own prose (emit.ts) and the apply's refusal have to say out loud, or a card
- * that reads "approving applies the move" while Approve always refuses is worse than the bead it is
- * about.
+ * All three are filed anyway, because the ASK belongs on the board with its evidence and its
+ * fingerprint; what changes is how it settles. Approve refuses, and DECLINING is what records the
+ * answer — which both the proposal's own prose (emit.ts) and the apply's refusal have to say out
+ * loud, or a card that reads "approving applies the move" while Approve always refuses is worse than
+ * the bead it is about.
  */
-export function isManualProposal(plan: { move: GardenerMove; target?: string }): boolean {
-  return plan.move === "split" || (plan.move === "reparent" && !plan.target);
+export function isManualProposal(plan: {
+  move: GardenerMove;
+  target?: string;
+  detail?: string;
+}): boolean {
+  return (
+    plan.move === "split" ||
+    (plan.move === "reparent" && !plan.target) ||
+    (plan.move === "attach-outcome" && plan.detail === "unknown")
+  );
 }
 
 /**

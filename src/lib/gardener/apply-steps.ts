@@ -10,6 +10,7 @@
  * decision held the snapshot to.
  */
 import { approvalGaps, formatApprovalGaps, onlyMissingEvidence, type ApprovalGap } from "../approval-gate";
+import { outcomeIdsOf } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf as claimHolder, swapUnderLock, type SwapResult } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
@@ -118,7 +119,8 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * `link` is here for its `missing-order` half alone and `reparent` for its `misfiled` half alone; an
  * `implied-order` and the gardener's two re-parents resolve to no premise in
  * {@link EVIDENCE_PREMISE} and are re-derived from the board instead ({@link assertOrderingStated},
- * apply-plan.ts `reparentPremiseGone`).
+ * apply-plan.ts `reparentPremiseGone`). `attach-outcome` is the same shape as those two: its premise
+ * resolves to none either, re-derived from the board by {@link alreadySatisfied} instead.
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -130,6 +132,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "reparent":
     case "approve":
     case "undefer":
+    case "attach-outcome":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -497,6 +500,9 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // the filing, so an unguarded evidence check would refuse the very state the ask was after (the
   // same order `planUndefer` reads its settled states in).
   if (step.verb === "undefer") return !beads.isDeferred(subject);
+  // Somebody labelled it by hand, or a concurrent approval already did — the outcome this ask
+  // wanted is on the board, whoever wrote it, so there is nothing left to write and nothing to undo.
+  if (step.verb === "attach-outcome") return outcomeIdsOf(subject).length > 0;
   return false;
 }
 
@@ -867,6 +873,9 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
       return true;
     case "undefer":
       await beads.undefer(repo, step.id);
+      return true;
+    case "attach-outcome":
+      await beads.tag(repo, step.id, [`outcome:${step.outcome}`]);
       return true;
   }
 }
