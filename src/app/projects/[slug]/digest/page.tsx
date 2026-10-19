@@ -47,8 +47,11 @@ export default async function ProjectDigestPage({
           ) : (
             <DigestFeatureGroups slug={slug} groups={digest.groups} />
           )}
-          {/* Opening this page never marks it seen — only this button, or scrolling to it, does. */}
-          <MarkSeenFooter slug={slug} until={digest.until} />
+          {/* Opening this page never marks it seen — only this button, or scrolling to it, does.
+              Keyed by the window: a `router.refresh()` after marking seen swaps in a new `until`
+              for the same route, and without a fresh key React would keep this component's `done`
+              state mounted across windows it never actually marked (PR #350 review). */}
+          <MarkSeenFooter key={digest.until} slug={slug} until={digest.until} />
         </div>
       </div>
     </div>

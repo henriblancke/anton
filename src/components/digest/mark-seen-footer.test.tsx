@@ -134,6 +134,27 @@ describe("MarkSeenFooter", () => {
     );
   });
 
+  it("starts fresh in a new digest window, mirroring the page's key={until} remount", async () => {
+    // The page keys this component by `digest.until` (PR #350 review) so a `router.refresh()`
+    // after marking seen — which swaps in a new window's `until` on the same route — remounts a
+    // fresh instance instead of keeping a stale "done" state around for events it never marked.
+    const { rerender } = render(<MarkSeenFooter key={111} slug="anton" until={111} />);
+    fireEvent.click(screen.getByRole("button", { name: "Mark all as seen" }));
+    await waitFor(() => expect(screen.getByText("Marked as seen")).toBeTruthy());
+
+    rerender(<MarkSeenFooter key={222} slug="anton" until={222} />);
+
+    const button = screen.getByRole("button", { name: "Mark all as seen" }) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+
+    fireEvent.click(button);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      "/api/projects/anton/timeline/mark-seen",
+      expect.objectContaining({ body: JSON.stringify({ seenAt: 222 }) }),
+    );
+  });
+
   it("does not post twice when the button and the scroll trigger both fire", async () => {
     render(<MarkSeenFooter slug="anton" until={10} />);
     const observer = FakeIntersectionObserver.instances[0]!;
