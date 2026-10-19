@@ -9,6 +9,27 @@ import { Button } from "@/components/ui/button";
 type MarkState = "idle" | "pending" | "done";
 
 /**
+ * Whether `el` is currently visible within the nearest scrollable ancestor (or the window, if
+ * none). Used as a synchronous substitute for the IntersectionObserver's own (always-async)
+ * initial read — see the module comment above.
+ */
+function isInViewport(el: HTMLElement): boolean {
+  const rect = el.getBoundingClientRect();
+  let top = 0;
+  let bottom = window.innerHeight || document.documentElement.clientHeight;
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if (overflowY === "auto" || overflowY === "scroll") {
+      const containerRect = node.getBoundingClientRect();
+      top = Math.max(top, containerRect.top);
+      bottom = Math.min(bottom, containerRect.bottom);
+      break;
+    }
+  }
+  return rect.bottom > top && rect.top < bottom;
+}
+
+/**
  * The digest's own mark-seen affordance (anton-rokar): an explicit button, or reaching the end of
  * the page — either one calls mark-seen; opening the page never does.
  *
@@ -18,10 +39,14 @@ type MarkState = "idle" | "pending" | "done";
  *
  * The scroll trigger watches this component's OWN root with an IntersectionObserver rather than a
  * window scroll-position listener, so it fires however the surrounding layout scrolls and needs no
- * resize math. Its first callback is deliberately IGNORED: that callback reports the state the
- * observer found on `observe()`, not a scroll the operator made — on a short or empty window this
- * footer can already be on screen before anything moved, and opening the page must never read as
- * having reached its end.
+ * resize math. The baseline "already on screen" state is captured synchronously via
+ * `getBoundingClientRect` right before `observe()` is called, NOT from the observer's first
+ * callback (PR #350 review): that callback is delivered asynchronously, so a fast scroll straight
+ * to the end between `observe()` and its delivery can already report `isIntersecting: true` on
+ * what looks like the "initial" entry — treating that as the ignorable baseline would silently
+ * drop the one event meant to trigger the automatic mark. Every entry in every callback batch is
+ * processed (not just the batch's first) for the same reason: a fast scroll can coalesce the
+ * baseline and the entering transition into one batch with two entries for this single target.
  */
 export function MarkSeenFooter({ slug, until }: { slug: string; until: number }) {
   const [state, setState] = useState<MarkState>("idle");
@@ -54,14 +79,16 @@ export function MarkSeenFooter({ slug, until }: { slug: string; until: number })
   useEffect(() => {
     const el = rootRef.current;
     if (!el || typeof IntersectionObserver === "undefined") return;
+    const wasVisibleAtMount = isInViewport(el);
     let skippedInitial = false;
-    const observer = new IntersectionObserver(([entry]) => {
-      if (!entry) return;
-      if (!skippedInitial) {
-        skippedInitial = true;
-        return;
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!skippedInitial) {
+          skippedInitial = true;
+          if (wasVisibleAtMount) continue;
+        }
+        if (entry.isIntersecting) void markSeen();
       }
-      if (entry.isIntersecting) void markSeen();
     });
     observer.observe(el);
     return () => observer.disconnect();

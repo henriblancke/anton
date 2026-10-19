@@ -62,8 +62,13 @@ export default async function ProjectBoardPage({
   // so gating the board on it would reintroduce exactly the latency `breaker` above was pulled out
   // of this `Promise.all` to avoid. Handed to the board and unwrapped inside its own Suspense
   // boundary, same as `breaker`.
+  //
+  // `breaker` is passed through rather than left to start its own read (PR #350 review): without
+  // it, `projectDigestSummary` would spawn a second, independent `currentBreaker` call — doubling
+  // the `gh pr view` fan-out `currentWipHold` can do, and risking the attention strip and this
+  // summary observing different breaker states.
   const digest = project
-    ? projectDigestSummary(getDb(), project).catch((err) => {
+    ? projectDigestSummary(getDb(), project, breaker).catch((err) => {
         console.error(`[board] digest summary read failed for ${slug}`, err);
         return undefined;
       })

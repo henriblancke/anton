@@ -86,20 +86,32 @@ export interface DigestBoardSummary {
  * (it hands the whole thing down as a promise, same as this window's `breaker` would be), so there
  * is nothing to protect by deferring it twice, and its `needsYou.counts.breaker` must stay accurate
  * for the "autopilot stopped" chip on `DigestBanner` (board/attention-strip.tsx).
+ *
+ * `breaker` (optional) reuses an ALREADY-STARTED breaker read instead of starting a new one
+ * (PR #350 review): the board page starts its own `currentBreaker` read for the attention strip
+ * before calling {@link projectDigestSummary}, and `currentWipHold` inside that read can spawn a
+ * `gh pr view` per in-review PR — starting a second, independent read here would double that
+ * CLI/network fan-out on every board load and risk the two reads observing different states.
  */
 async function readDigestWindow(
   db: AntonDb,
   project: Project,
-  opts: { freshBoard?: boolean; streamBreaker?: boolean } = {},
+  opts: {
+    freshBoard?: boolean;
+    streamBreaker?: boolean;
+    breaker?: Promise<AutopilotBreaker | undefined>;
+  } = {},
 ) {
   const mark = await getViewerMark(db, project.id);
   const since = mark?.seenAt ?? null;
   const until = Math.floor(systemClock.now() / 1000);
 
-  const breakerRead = currentBreaker(project).catch((err) => {
-    console.error(`[digest] autopilot breaker read failed for ${project.slug}`, err);
-    return undefined;
-  });
+  const breakerRead =
+    opts.breaker ??
+    currentBreaker(project).catch((err) => {
+      console.error(`[digest] autopilot breaker read failed for ${project.slug}`, err);
+      return undefined;
+    });
 
   const [board, escalations, breaker] = await Promise.all([
     opts.freshBoard === false ? readDigestBoardCached(project) : readDigestBoard(project),
@@ -144,8 +156,16 @@ export async function projectDigest(db: AntonDb, project: Project): Promise<Proj
  * spawns a `bd show` per changed feature, a cost worth paying once for the digest page but not on
  * every board load. Reads the board via the cached snapshot (`freshBoard: false`), not a forced
  * rescan, for the same reason (PR #350 review): a display-only count commits no cursor.
+ *
+ * `breaker`, when passed, is the caller's own already-started breaker read — see
+ * {@link readDigestWindow}'s `breaker` option. The board page always has one in flight for the
+ * attention strip, so pass it here rather than letting this call start its own.
  */
-export async function projectDigestSummary(db: AntonDb, project: Project): Promise<DigestBoardSummary> {
-  const { events, needsYou } = await readDigestWindow(db, project, { freshBoard: false });
+export async function projectDigestSummary(
+  db: AntonDb,
+  project: Project,
+  breaker?: Promise<AutopilotBreaker | undefined>,
+): Promise<DigestBoardSummary> {
+  const { events, needsYou } = await readDigestWindow(db, project, { freshBoard: false, breaker });
   return { needsYou, activityCount: events.length };
 }

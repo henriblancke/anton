@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { beads, type Bead } from "../beads/bd";
 import { resetIssueSnapshots } from "../beads/snapshot";
 import type { AutopilotBreaker } from "../autopilot-breaker";
+import { currentBreaker } from "../autopilot-state";
 import * as schema from "../db/schema";
 import type { EscalationView } from "../escalations";
 import { makeProjectDb, type TestProjectDb } from "../testing/project";
@@ -193,5 +194,18 @@ describe("projectDigestSummary", () => {
 
     expect(summary.needsYou.total).toBe(0);
     expect(summary.activityCount).toBe(0);
+  });
+
+  it("reuses a passed-in breaker read instead of starting its own (PR #350 review)", async () => {
+    breaker = { kind: "disarm", reason: "consecutive-failures", detail: "3 runs failed", evidence: [] };
+    const callsBefore = vi.mocked(currentBreaker).mock.calls.length;
+    const sharedRead = currentBreaker(project);
+
+    const summary = await projectDigestSummary(t.db, project, sharedRead);
+
+    // The board page starts exactly one breaker read for the attention strip (the line above); this
+    // call must not spawn a second one, or the two could observe different `gh pr view` states.
+    expect(vi.mocked(currentBreaker).mock.calls.length - callsBefore).toBe(1);
+    expect(summary.needsYou.counts.breaker).toBe(1);
   });
 });
