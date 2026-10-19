@@ -2684,6 +2684,30 @@ describe("SettingsView review-fix concurrency (anton-kwi6)", () => {
   });
 });
 
+describe("SettingsView Jev API key staging (anton-l70sq)", () => {
+  showing("jev");
+
+  it("clears the staged API key after a successful save, so it doesn't read as dirty forever", async () => {
+    stubFetch();
+    renderView({});
+
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "sk-test-key" } });
+    const saveButton = screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement;
+    expect(saveButton.disabled).toBe(false);
+    fireEvent.click(saveButton);
+
+    // The server never echoes jevApiKey back, so without clearing the staged value the "jev" group
+    // would diff a typed key against a baseline that's always "" and stay dirty past the save that
+    // just stored it.
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: /save changes/i }) as HTMLButtonElement).disabled).toBe(
+        true,
+      ),
+    );
+    expect((screen.getByLabelText("API key") as HTMLInputElement).value).toBe("");
+  });
+});
+
 describe("SettingsView PR narrative", () => {
   showing("describe");
 

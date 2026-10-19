@@ -175,6 +175,10 @@ export function useSettingsForm({
       // session. If the response somehow carries no row we leave the baseline alone rather than
       // guess — an over-eager clear would claim edits were persisted that may not have been.
       if (stored) setBaseline(stored);
+      // jevApiKey is write-only — the server never echoes it back, so the baseline's copy is always
+      // "". Left staged, a submitted key would diff against that "" forever and read as permanently
+      // dirty; clearing it here matches what the server now holds (anton-l70sq PR #349 review).
+      if (draft.jevApiKey.trim()) setDraft((prev) => ({ ...prev, jevApiKey: "" }));
       toast.success("Settings saved");
       // The server tree still holds the pre-save row; refresh it so navigating away and back
       // doesn't restore stale values out of the router cache.

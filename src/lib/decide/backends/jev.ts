@@ -15,8 +15,9 @@
  *    response (`model`, `answers` keyed by question id, each carrying confidence/probabilities per
  *    docs.typesafe.ai/introduction/quickstart) — never trusted from a bare `.json()` cast.
  *  - PINNED VERSION ENFORCED. `jevBackend` refuses to construct against `jev-latest` or any model
- *    string that isn't an exact `jev-X.Y.Z` — a decision log row must be able to name the one version
- *    that answered, not a moving target (parent epic's own acceptance bar).
+ *    string that isn't an exact `jev-X.Y.Z`, and every reply's own `model` is checked against that
+ *    pin too — a decision log row must be able to name the one version that answered, not a moving
+ *    target (parent epic's own acceptance bar).
  */
 import { z } from "zod";
 import { ModelCallError, type ModelAnswer, type ModelCaller } from "../index";
@@ -198,7 +199,17 @@ async function callSystemOne(
   }
 
   const body: unknown = await response.json();
-  return systemOneResponseSchema.parse(body);
+  const parsed = systemOneResponseSchema.parse(body);
+  // The pin is only real if the answer is checked against it — an unpinned or substituted model
+  // (e.g. "jev-latest") would otherwise land in the decision log as the configured version, defeating
+  // the pinning guarantee this backend exists to enforce. Treated as an ordinary call failure (not a
+  // `ModelCallError`) so it goes through the same retry-then-fallback path as a network error.
+  if (parsed.model !== config.model) {
+    throw new Error(
+      `decide/jev: systemone answered with model "${parsed.model}", expected pinned "${config.model}" for "${point.id}"`,
+    );
+  }
+  return parsed;
 }
 
 /**

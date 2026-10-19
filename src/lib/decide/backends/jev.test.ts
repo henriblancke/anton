@@ -289,6 +289,22 @@ describe("jevBackend — response parsing (fixtures from the docs example)", () 
     await expect(ask(choicePoint(), { ticketText: "x" })).rejects.toThrow(ModelCallError);
   });
 
+  it("rejects a reply whose model doesn't match the configured pin, even if otherwise well-formed", async () => {
+    const ask = jevBackend({
+      apiKey: "k",
+      model: PINNED_MODEL,
+      fetchImpl: fakeFetch({
+        model: "jev-latest",
+        answers: { is_urgent: { type: "noul", noul: 0.9 } },
+      }) as unknown as typeof fetch,
+    });
+
+    const error = await ask(yesNoPoint(), { ticketText: "x" }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ModelCallError);
+    expect((error as ModelCallError).modelVersion).toBe(PINNED_MODEL);
+  });
+
   it("attributes backend and the pinned model on a thrown error", async () => {
     const ask = jevBackend({
       apiKey: "k",
