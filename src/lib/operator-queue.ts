@@ -14,6 +14,7 @@
  */
 import { beads, type Bead } from "./beads/bd";
 import { isPipelineArtifact } from "./beads/contract";
+import { isProposalBead } from "./gardener/detections";
 import {
   boardCards,
   deriveStage,
@@ -24,7 +25,7 @@ import {
   liveRunTargetOf,
   parseGoal,
 } from "./ticket-view";
-import type { OperatorQueueItem } from "./types";
+import type { OperatorQueueItem, ProposalAsk } from "./types";
 
 /**
  * Still someone's to do. Broader than the claimable set's `status === "open"`, and deliberately: a
@@ -41,8 +42,11 @@ function isOpenWork(bead: Bead): boolean {
  * operator is least likely to have already seen; the older asks keep their place below it rather
  * than being reshuffled by anything else. Id breaks the tie so two renders of an unchanged board are
  * identical, and a bead whose read carried no timestamp sorts last instead of pretending to be new.
+ *
+ * Generic over just `id`/`createdAt` — both {@link OperatorQueueItem} and {@link ProposalAsk} are
+ * "an ask, filed at some time" and share this exact ordering rule.
  */
-function byNewestAsk(a: OperatorQueueItem, b: OperatorQueueItem): number {
+function byNewestAsk<T extends { id: string; createdAt: string }>(a: T, b: T): number {
   if (a.createdAt !== b.createdAt) {
     if (!a.createdAt) return 1;
     if (!b.createdAt) return -1;
@@ -134,4 +138,23 @@ export function operatorQueue(all: Bead[]): OperatorQueueItem[] {
   }
 
   return items.sort(byNewestAsk);
+}
+
+/**
+ * Proposals still asking for a decision, newest ask first (anton-16s0t) — the digest's needs-you
+ * list reads these alongside {@link operatorQueue}'s human tickets.
+ *
+ * `isProposalBead` names the fingerprint a gardener/pm pass files a claim under; `isOpenWork`
+ * excludes the two settled answers (closed, abandoned), and the `isApproved` check excludes the
+ * third — a proposal a human already approved behaves like any other approved run target from
+ * there on, so it belongs on the board, not on this queue of still-open asks.
+ *
+ * Pure over the same raw `all` snapshot `operatorQueue` takes, for the same reason: the caller
+ * already paid for one board read, and this must not spawn a second.
+ */
+export function openProposals(all: Bead[]): ProposalAsk[] {
+  return all
+    .filter((bead) => isProposalBead(bead) && isOpenWork(bead) && !beads.isApproved(bead))
+    .map((bead) => ({ id: bead.id, title: bead.title, createdAt: bead.created_at ?? "" }))
+    .sort(byNewestAsk);
 }

@@ -9,7 +9,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { operatorQueue } from "./operator-queue";
+import { openProposals, operatorQueue } from "./operator-queue";
 import type { Bead } from "./beads/bd";
 
 const bead = (b: Partial<Bead>): Bead =>
@@ -278,5 +278,47 @@ describe("operatorQueue — the order", () => {
       bead({ id: "dated", created_at: "2026-07-01T00:00:00.000Z" }),
     ];
     expect(ids(operatorQueue(board))).toEqual(["dated", "undated"]);
+  });
+});
+
+describe("openProposals", () => {
+  const proposal = (b: Partial<Bead>): Bead =>
+    bead({
+      labels: ["gardener:duplicate:0123456789ab", "domain:eng"],
+      ...b,
+    });
+
+  it("keeps an open proposal still asking for a decision", () => {
+    const board = [proposal({ id: "p1", title: "Merge these duplicates" })];
+    const asks = openProposals(board);
+    expect(asks).toEqual([{ id: "p1", title: "Merge these duplicates", createdAt: "2026-08-01T00:00:00.000Z" }]);
+  });
+
+  it("drops a non-proposal bead — ordinary approved work is not a decision", () => {
+    const board = [bead({ id: "t1", labels: ["approved"] })];
+    expect(openProposals(board)).toEqual([]);
+  });
+
+  it("drops a proposal once it is approved — it behaves like any other run target from there", () => {
+    const board = [proposal({ id: "p1", labels: ["gardener:duplicate:0123456789ab", "approved"] })];
+    expect(openProposals(board)).toEqual([]);
+  });
+
+  it("drops a closed proposal — delivered or declined, a settled answer is not still asking", () => {
+    // Both outcomes close the bead: `applyProposal` closes it on apply, and a decline closes it with
+    // the `abandoned` label (gardener/apply.ts) — `isOpenWork`'s status check catches either.
+    const board = [
+      proposal({ id: "p1", status: "closed" }),
+      proposal({ id: "p2", status: "closed", labels: ["gardener:duplicate:0123456789ab", "abandoned"] }),
+    ];
+    expect(openProposals(board)).toEqual([]);
+  });
+
+  it("orders newest ask first, same rule as the operator queue", () => {
+    const board = [
+      proposal({ id: "old", created_at: "2026-07-01T00:00:00.000Z" }),
+      proposal({ id: "new", created_at: "2026-08-20T00:00:00.000Z" }),
+    ];
+    expect(openProposals(board).map((p) => p.id)).toEqual(["new", "old"]);
   });
 });

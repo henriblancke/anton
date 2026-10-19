@@ -14,8 +14,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { NeedsYouSection } from "@/components/health/needs-you-section";
-import type { EscalationView } from "@/lib/types";
+import { DigestNeedsYou, NeedsYouSection } from "@/components/health/needs-you-section";
+import { digestNeedsYou } from "@/lib/attention";
+import type { AutopilotDisarm } from "@/lib/autopilot-breaker";
+import type { EscalationView, OperatorQueueItem, ProposalAsk } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -339,5 +341,78 @@ describe("NeedsYouSection", () => {
     const section = container.querySelector("section");
     expect(section?.getAttribute("aria-labelledby")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Needs you" })).toBeTruthy();
+  });
+});
+
+describe("DigestNeedsYou", () => {
+  const disarm: AutopilotDisarm = {
+    kind: "disarm",
+    reason: "consecutive-failures",
+    detail: "3 runs failed in a row",
+    evidence: ["run r-1 failed", "run r-2 failed"],
+  };
+
+  const proposal = (o: Partial<ProposalAsk> = {}): ProposalAsk => ({
+    id: "anton-prop1",
+    title: "Merge these duplicates",
+    createdAt: "2026-08-01T00:00:00Z",
+    ...o,
+  });
+
+  const queueItem = (o: Partial<OperatorQueueItem> = {}): OperatorQueueItem => ({
+    id: "anton-t1",
+    title: "Buy the domain",
+    stage: "backlog",
+    createdAt: "2026-08-01T00:00:00Z",
+    ...o,
+  });
+
+  it("renders nothing when digestNeedsYou found nothing to promote", () => {
+    const { container } = render(
+      <DigestNeedsYou slug="anton" summary={digestNeedsYou({})} onOpenTicket={() => {}} />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("composes the breaker band, the escalation list, the proposal queue, and the operator queue", () => {
+    const summary = digestNeedsYou({
+      breaker: disarm,
+      escalations: [escalation({ kind: "needs-human", gateId: "g-1", runId: undefined })],
+      proposals: [proposal()],
+      operatorQueue: [queueItem()],
+    });
+    render(<DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />);
+
+    // The breaker band's own re-arm affordance.
+    expect(screen.getByText("Autopilot is disarmed")).toBeTruthy();
+    expect(screen.getByText("Re-arm")).toBeTruthy();
+    // The existing escalation section, reused unchanged, with its own "to answer" count.
+    expect(screen.getByText("Waiting on you")).toBeTruthy();
+    expect(screen.getByText("1 to answer")).toBeTruthy();
+    // The proposal, linked to where approve/decline already live — no button here.
+    expect(screen.getByRole("link", { name: "Merge these duplicates" }).getAttribute("href")).toBe(
+      "/projects/anton/epics/anton-prop1",
+    );
+    expect(screen.getByText("1 to decide")).toBeTruthy();
+    // The operator queue's own row, with its own Mark done.
+    expect(screen.getByText("Buy the domain")).toBeTruthy();
+    expect(screen.getByText("Mark done")).toBeTruthy();
+  });
+
+  it("omits the merge-ready PR's own escalation group count from the proposal/ticket bands", () => {
+    const summary = digestNeedsYou({
+      escalations: [escalation({ kind: "stale-pr", prNumber: 7, prUrl: "https://gh/pr/7" })],
+    });
+    render(<DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />);
+    expect(screen.getByText("Stale PR")).toBeTruthy();
+    expect(screen.queryByText(/to decide/)).toBeNull();
+  });
+
+  it("withholds a human ticket something else still holds", () => {
+    const summary = digestNeedsYou({ operatorQueue: [queueItem({ hasOpenBlockers: true })] });
+    const { container } = render(
+      <DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />,
+    );
+    expect(container.innerHTML).toBe("");
   });
 });

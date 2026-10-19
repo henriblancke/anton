@@ -19,11 +19,14 @@
  * and better-sqlite3). It decides severity and order ONLY — every label an operator reads is copy,
  * and copy lives in the component.
  */
+import { isDisarm, type AutopilotBreaker } from "@/lib/autopilot-breaker";
 import type {
   EscalationView,
   HygieneFinding,
   HygieneFindingKind,
   HygieneReport,
+  OperatorQueueItem,
+  ProposalAsk,
   ReviewTrajectory,
   ScoredTarget,
 } from "@/lib/types";
@@ -190,4 +193,124 @@ export function rankAttention({
 export function hasAppliedActions(hygiene: HygieneReport | undefined): boolean {
   if (!hygiene) return false;
   return hygiene.actions.closedEpics.length > 0 || hygiene.actions.rowsRecomputed > 0;
+}
+
+/**
+ * The digest's own "needs you" list (anton-16s0t) — a DIFFERENT merge than {@link rankAttention}'s.
+ *
+ * `rankAttention` answers "what did a patrol or a run-health sweep find wrong" and ranks by how
+ * much the board can be trusted. This answers a narrower question the digest asks first: of
+ * everything on the board right now, what are the few things ONLY the operator can move — a
+ * decision, a click, an answer — with nothing an agent could do instead? Five sources, each
+ * carrying the one existing action it already has elsewhere on the board:
+ *
+ *   • `breaker`       — the autopilot stopped filling the queue; re-arming it is a human call
+ *                       (`AutopilotBreakerHeader`'s `ReArmButton`). A HOLD is excluded: it clears
+ *                       itself and asks for nothing (see `isDisarm`).
+ *   • `parked-ask`    — an open human gate (`needs-human` escalation): the founder asked to be
+ *                       asked, and `NeedsYouSection`'s Resolve & resume is the answer.
+ *   • `merge-ready-pr`— a `stale-pr` escalation: the PR is open and sitting idle, which is exactly
+ *                       the "only a human can review or merge it" case; `NeedsYouSection` renders
+ *                       it with its existing Dismiss.
+ *   • `proposal`      — a gardener/pm claim still awaiting approve-or-decline (`openProposals`,
+ *                       operator-queue.ts). Its action lives on the proposal's own page.
+ *   • `human-ticket`  — an UNBLOCKED `agent:human` bead from {@link OperatorQueueItem} (hygiene's
+ *                       `operatorQueue`): one no `hasOpenBlockers` holds up, so the operator can
+ *                       act on it today rather than once something else closes first.
+ *
+ * Every other escalation kind (`parked-run`, `dead-lease`, `exhausted-job`) and every hygiene/
+ * review finding `rankAttention` promotes is deliberately absent: those are things an agent's own
+ * retry or a patrol already handles, or will — reporting them here too would blur "only you can do
+ * this" into "something, somewhere, needs attention", which is the question the Health page
+ * already answers.
+ */
+export type DigestNeedsYouKind = "breaker" | "parked-ask" | "merge-ready-pr" | "proposal" | "human-ticket";
+
+export type DigestNeedsYouItem =
+  | { key: string; kind: "breaker"; breaker: AutopilotBreaker }
+  | { key: string; kind: "parked-ask"; escalation: EscalationView }
+  | { key: string; kind: "merge-ready-pr"; escalation: EscalationView }
+  | { key: string; kind: "proposal"; proposal: ProposalAsk }
+  | { key: string; kind: "human-ticket"; item: OperatorQueueItem };
+
+export interface DigestNeedsYouInput {
+  /** Open escalations — only `needs-human` and `stale-pr` rows are promoted; see the doc above. */
+  escalations?: EscalationView[];
+  /** Why the autopilot has stopped, if it has. Only a DISARM is promoted; a hold asks for nothing. */
+  breaker?: AutopilotBreaker;
+  /** The board's own operator queue; only entries with no open blocker are promoted. */
+  operatorQueue?: OperatorQueueItem[];
+  /** Open proposals awaiting approve-or-decline (`openProposals`, operator-queue.ts). */
+  proposals?: ProposalAsk[];
+}
+
+export interface DigestNeedsYouSummary {
+  /** Every promoted row, ranked. */
+  items: DigestNeedsYouItem[];
+  counts: Record<DigestNeedsYouKind, number>;
+  total: number;
+}
+
+/**
+ * Fixed rather than by age: each kind is already a different KIND of ask, and ranking them by a
+ * shared clock would compare asks that cost the operator differently. A stopped autopilot outranks
+ * everything else (it affects every OTHER target too); the rest follow roughly by how long the
+ * decision takes to make.
+ */
+const DIGEST_KIND_RANK: Record<DigestNeedsYouKind, number> = {
+  breaker: 0,
+  "parked-ask": 1,
+  proposal: 2,
+  "human-ticket": 3,
+  "merge-ready-pr": 4,
+};
+
+export function digestNeedsYou({
+  escalations = [],
+  breaker,
+  operatorQueue = [],
+  proposals = [],
+}: DigestNeedsYouInput): DigestNeedsYouSummary {
+  const items: DigestNeedsYouItem[] = [];
+
+  if (breaker && isDisarm(breaker)) {
+    items.push({ key: `breaker:${breaker.reason}`, kind: "breaker", breaker });
+  }
+
+  for (const escalation of escalations) {
+    if (escalation.kind === "needs-human") {
+      items.push({ key: `parked-ask:${escalation.id}`, kind: "parked-ask", escalation });
+    } else if (escalation.kind === "stale-pr") {
+      items.push({ key: `merge-ready-pr:${escalation.id}`, kind: "merge-ready-pr", escalation });
+    }
+  }
+
+  for (const proposal of proposals) {
+    items.push({ key: `proposal:${proposal.id}`, kind: "proposal", proposal });
+  }
+
+  // `hasOpenBlockers` is the same gate `operator-queue.tsx`'s Mark done withholds on: a ticket
+  // something else still holds is not yet the operator's to act on.
+  for (const item of operatorQueue) {
+    if (item.hasOpenBlockers) continue;
+    items.push({ key: `human-ticket:${item.id}`, kind: "human-ticket", item });
+  }
+
+  const ordered = items
+    .map((item, index) => ({ item, index }))
+    .sort(
+      (a, b) => DIGEST_KIND_RANK[a.item.kind] - DIGEST_KIND_RANK[b.item.kind] || a.index - b.index,
+    )
+    .map(({ item }) => item);
+
+  const counts: Record<DigestNeedsYouKind, number> = {
+    breaker: 0,
+    "parked-ask": 0,
+    "merge-ready-pr": 0,
+    proposal: 0,
+    "human-ticket": 0,
+  };
+  for (const item of ordered) counts[item.kind] += 1;
+
+  return { items: ordered, counts, total: ordered.length };
 }

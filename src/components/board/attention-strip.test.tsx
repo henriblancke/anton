@@ -11,7 +11,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { AttentionStrip } from "@/components/board/attention-strip";
+import { AttentionStrip, DigestBanner } from "@/components/board/attention-strip";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 import type { EscalationView, UnwatchedParks } from "@/lib/types";
 
@@ -136,5 +137,45 @@ describe("AttentionStrip", () => {
   it("says how much is parked, and that nothing is watching it", () => {
     mount({ parks });
     expect(screen.getByText("13 parked, unwatched")).toBeTruthy();
+  });
+});
+
+const EMPTY_COUNTS: DigestNeedsYouSummary["counts"] = {
+  breaker: 0,
+  "parked-ask": 0,
+  "merge-ready-pr": 0,
+  proposal: 0,
+  "human-ticket": 0,
+};
+
+function needsYou(o: Partial<DigestNeedsYouSummary["counts"]> = {}, total?: number): DigestNeedsYouSummary {
+  const counts = { ...EMPTY_COUNTS, ...o };
+  return { items: [], counts, total: total ?? Object.values(counts).reduce((a, b) => a + b, 0) };
+}
+
+describe("DigestBanner", () => {
+  it("renders nothing when nothing needs you", () => {
+    const { container } = render(<DigestBanner slug="anton" needsYou={needsYou()} />);
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("counts everything that needs you, and links to the digest", () => {
+    render(<DigestBanner slug="anton" needsYou={needsYou({ "parked-ask": 2 })} />);
+    expect(screen.getByText("2 need you")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open digest" }).getAttribute("href")).toBe(
+      "/projects/anton/digest",
+    );
+  });
+
+  it("breaks out merge-ready PRs, proposals and a stopped autopilot apart from the total", () => {
+    render(
+      <DigestBanner
+        slug="anton"
+        needsYou={needsYou({ "merge-ready-pr": 1, proposal: 2, breaker: 1 })}
+      />,
+    );
+    expect(screen.getByText("1 PR to merge")).toBeTruthy();
+    expect(screen.getByText("2 proposals")).toBeTruthy();
+    expect(screen.getByText("autopilot stopped")).toBeTruthy();
   });
 });

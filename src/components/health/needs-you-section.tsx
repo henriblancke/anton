@@ -4,13 +4,16 @@ import { useState, useSyncExternalStore } from "react";
 import { HandIcon, TriangleAlertIcon } from "lucide-react";
 import Link from "next/link";
 
-import { MetaChip } from "@/components/atoms";
+import { MetaChip, RelativeTime } from "@/components/atoms";
+import { AutopilotBreakerHeader } from "@/components/health/autopilot-breaker-band";
 import { Disclosure } from "@/components/health/disclosure";
 import { DismissAllButton } from "@/components/health/dismiss-all-button";
 import { EscalationActions } from "@/components/health/escalation-actions";
 import { escalationAge } from "@/components/health/escalation-age";
+import { OperatorQueue } from "@/components/board/operator-queue";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
 import { isBoardUnreachableFindingKey, isDismissable } from "@/lib/escalation-kinds";
-import type { EscalationKind, EscalationView } from "@/lib/types";
+import type { EscalationKind, EscalationView, ProposalAsk } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** What each class is, said the way a founder would say it. */
@@ -433,5 +436,97 @@ function EscalationRow({
         target={actionTarget(escalation)}
       />
     </>
+  );
+}
+
+/**
+ * The digest's own needs-you section (anton-16s0t): the few things only the operator can do,
+ * first, each with the action it already has elsewhere on the board — nothing new here.
+ *
+ * Composes four existing surfaces over `digestNeedsYou`'s ranked list rather than rendering its
+ * own rows: `AutopilotBreakerHeader` (re-arm), this file's own `NeedsYouSection` (parked asks,
+ * merge-ready PRs — both are escalations, so the one component that already renders them with
+ * Resolve-and-resume / Dismiss is reused unchanged), `ProposalQueue` (links to where approve/
+ * decline already live), and `OperatorQueue` (unblocked `agent:human` tickets, with its own Mark
+ * done). Renders nothing when `digestNeedsYou` found nothing to promote — the same silence rule
+ * every band on this board keeps.
+ */
+export function DigestNeedsYou({
+  slug,
+  summary,
+  onOpenTicket,
+  onDone,
+}: {
+  slug: string;
+  summary: DigestNeedsYouSummary;
+  /** Opens a parented human ticket in the page's shared TicketDialog — see `OperatorQueue`. */
+  onOpenTicket: (ticketId: string) => void;
+  /** A queued ticket's Mark done landed — re-read whatever feeds `summary`. */
+  onDone?: () => void;
+}) {
+  if (summary.total === 0) return null;
+
+  const breakerItem = summary.items.find((item) => item.kind === "breaker");
+  const escalations = summary.items
+    .filter((item) => item.kind === "parked-ask" || item.kind === "merge-ready-pr")
+    .map((item) => item.escalation);
+  const proposals = summary.items
+    .filter((item) => item.kind === "proposal")
+    .map((item) => item.proposal);
+  const humanTickets = summary.items
+    .filter((item) => item.kind === "human-ticket")
+    .map((item) => item.item);
+
+  return (
+    <div className="flex flex-col gap-3">
+      <AutopilotBreakerHeader slug={slug} breaker={breakerItem?.breaker} />
+      <NeedsYouSection slug={slug} escalations={escalations} />
+      <ProposalQueue slug={slug} proposals={proposals} />
+      <OperatorQueue slug={slug} items={humanTickets} onOpenTicket={onOpenTicket} onDone={onDone} />
+    </div>
+  );
+}
+
+/**
+ * Open asks for a decision — approve or decline. No button here: both verbs already live on the
+ * proposal's own page (the standalone approval surface every other run target gets), and a second
+ * copy of them here would be a second place for the two to drift apart. This is a pointer to that
+ * page, nothing more.
+ */
+function ProposalQueue({ slug, proposals }: { slug: string; proposals: ProposalAsk[] }) {
+  if (proposals.length === 0) return null;
+
+  return (
+    <section
+      aria-labelledby="digest-proposals-heading"
+      className="overflow-hidden rounded-xl border border-stage-in-review/25 bg-stage-in-review/[0.04]"
+    >
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 border-b border-border/60 px-3 py-2">
+        <HandIcon className="size-3.5 text-stage-in-review" aria-hidden="true" />
+        <h2 id="digest-proposals-heading" className="text-xs font-medium text-foreground">
+          Proposals awaiting approval
+        </h2>
+        <MetaChip tone="pr">{proposals.length} to decide</MetaChip>
+      </div>
+      <ul className="divide-y divide-border/50">
+        {proposals.map((proposal) => (
+          <li
+            key={proposal.id}
+            className="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-3 py-2"
+          >
+            <Link
+              href={`/projects/${slug}/epics/${proposal.id}`}
+              className="rounded-sm text-[13px] font-medium text-foreground underline-offset-2 hover:underline focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+            >
+              {proposal.title}
+            </Link>
+            <span className="font-mono text-[11px] text-subtle">{proposal.id}</span>
+            <MetaChip>
+              asked <RelativeTime iso={proposal.createdAt} />
+            </MetaChip>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }

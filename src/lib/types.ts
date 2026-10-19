@@ -463,6 +463,19 @@ export interface OperatorQueueItem {
   hasOpenBlockers?: boolean;
 }
 
+/**
+ * A proposal bead still awaiting a decision — the digest's needs-you list reads these off
+ * `operator-queue.ts`'s `openProposals` (anton-16s0t). Deliberately thin: the approve/decline
+ * controls already live on the proposal's own page, so this carries just enough to link there and
+ * order the row, not a copy of the bead.
+ */
+export interface ProposalAsk {
+  id: string;
+  title: string;
+  /** ISO timestamp the proposal was filed, from the raw bead's created_at. */
+  createdAt: string;
+}
+
 export interface Board {
   projectSlug: string;
   /** Monotonic issue-snapshot version used for change-aware refreshes. */

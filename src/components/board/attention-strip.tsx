@@ -7,6 +7,7 @@ import { MetaChip } from "@/components/atoms";
 import { ArmWatcherButton } from "@/components/board/arm-watcher-button";
 import { ReArmButton } from "@/components/board/re-arm-button";
 import { buttonVariants } from "@/components/ui/button";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
 import {
   BREAKER_HEADLINE,
   BREAKER_REASON_LABEL,
@@ -134,6 +135,56 @@ export function AttentionStrip({
           Open
         </Link>
       </div>
+    </section>
+  );
+}
+
+/**
+ * The board's pointer to the digest (anton-16s0t): how many things only the operator can do,
+ * counted but not listed — the same trade this file's `AttentionStrip` already makes, for the same
+ * reason. The rows themselves, with their Resolve-and-resume / Dismiss / Mark done / re-arm, live
+ * on the digest page (`DigestNeedsYou`, needs-you-section.tsx); this is one click away from them.
+ *
+ * Renders NOTHING when `digestNeedsYou` found nothing to promote, same honesty contract as every
+ * other band here: a standing banner on a clean board is an ornament.
+ */
+export function DigestBanner({ slug, needsYou }: { slug: string; needsYou: DigestNeedsYouSummary }) {
+  if (needsYou.total === 0) return null;
+  const { counts } = needsYou;
+
+  return (
+    <section
+      aria-labelledby="digest-banner-heading"
+      className={cn(
+        "mb-3 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-xl border px-3 py-2",
+        REGISTER_STYLE.request,
+      )}
+    >
+      <HandIcon className="size-3.5 shrink-0 text-stage-in-review" aria-hidden="true" />
+      <h2 id="digest-banner-heading" className="text-xs font-medium text-foreground">
+        Needs you
+      </h2>
+      <MetaChip tone="pr">{needsYou.total} need you</MetaChip>
+      {counts.breaker > 0 ? <MetaChip tone="risk-high">autopilot stopped</MetaChip> : null}
+      {counts["merge-ready-pr"] > 0 ? (
+        <MetaChip tone="pr">
+          {counts["merge-ready-pr"]} PR{counts["merge-ready-pr"] === 1 ? "" : "s"} to merge
+        </MetaChip>
+      ) : null}
+      {counts.proposal > 0 ? (
+        <MetaChip tone="pr">
+          {counts.proposal} proposal{counts.proposal === 1 ? "" : "s"}
+        </MetaChip>
+      ) : null}
+
+      <span className="flex-1" />
+
+      <Link
+        href={`/projects/${slug}/digest`}
+        className={buttonVariants({ size: "xs", variant: "outline" })}
+      >
+        Open digest
+      </Link>
     </section>
   );
 }
