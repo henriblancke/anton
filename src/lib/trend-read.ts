@@ -10,15 +10,19 @@
  * and re-deriving it here would be a second, driftable copy of the same board + ledger walk.
  */
 import { and, asc, eq, gte, isNotNull } from "drizzle-orm";
+import type { Bead } from "./beads/bd";
 import type { ClaudeInvocationRow } from "./claude-invocations";
 import { listInvocations } from "./claude-invocations";
 import { cohortFeatures } from "./cohort-read";
 import { getDb, schema } from "./db";
 import { runsByCause } from "./failure-cause-read";
 import { ledgerPhase } from "./feature-ledger";
+import { currentRunTargetOf } from "./feature-scope";
 import type { AntonDb } from "./jobs/queue";
 import { groupInvocations, modelsMatch } from "./model-divergence";
 import { costOf } from "./model-pricing";
+import { getProjectById } from "./projects";
+import { listAllBeads } from "./tickets";
 import {
   qualityWeekPoints,
   trendSeries as foldTrendSeries,
@@ -202,12 +206,28 @@ function totalTokens(
 }
 
 /**
- * One project's `claude_invocations` rows in the window — shared by {@link phaseSpendPoints},
- * {@link invocationStampPoints} and {@link reviewLoopInvocationPoints} below, each of which needs a
- * different slice of the same rows. One query rather than three.
+ * One project's `claude_invocations` rows in the window — feeds {@link phaseSpendPoints} alone: a
+ * week's phase spend is genuinely about what happened THAT week, unlike the stamp- and loop-derived
+ * folds below, which both need history beyond it (see {@link wholeLifeInvocationRows}).
  */
 function invocationWindowRows(db: AntonDb, projectId: string, since: Date): Promise<ClaudeInvocationRow[]> {
   return listInvocations(db, projectId, { since });
+}
+
+/**
+ * Every `claude_invocations` row this project has ever recorded, UNBOUNDED by the window — shared by
+ * {@link invocationStampPoints} and {@link reviewLoopInvocationPoints}, each of which needs history
+ * the window itself does not carry:
+ *
+ *  - {@link changeMarkers} seeds each lineage's starting value from the latest stamp BEFORE the
+ *    requested window, so a change whose only predecessor sits just outside it still reads as a
+ *    change rather than a first-ever value (P2, PR #348 review).
+ *  - {@link ReviewLoopPoint}'s own contract is that a feature's self-review/PR-fix loop spans its
+ *    WHOLE life, never just the requested window — a feature whose review started before `since` but
+ *    delivered inside it must not have its earlier rounds truncated away (P1, PR #348 review).
+ */
+function wholeLifeInvocationRows(db: AntonDb, projectId: string): Promise<ClaudeInvocationRow[]> {
+  return listInvocations(db, projectId, {});
 }
 
 /**
@@ -271,23 +291,37 @@ function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): Invocation
  * The invocations {@link reviewLoopByFeature} counts, one point per real invocation for the same
  * sidecar-row reason {@link invocationStampPoints} groups: a raw-row count overcounts by the
  * sidecar factor, corrupting both the displayed per-feature counts and the median-based runaway
- * comparison. A fact with no `beadId` (a scheduled pass, never a feature) has nothing to bucket a
+ * comparison. Built from {@link wholeLifeInvocationRows}, never a window-bound query — see its own
+ * note on why a feature's loop needs its whole life, not just the requested window.
+ *
+ * Every fact's `beadId` is resolved to its CURRENT run target via {@link currentRunTargetOf} before
+ * bucketing: a ticket-phase invocation is stamped with the child TICKET's id
+ * (`execute-epic-ticket.ts`) while a self-review or PR-fix invocation is stamped with the run
+ * TARGET's id (`review-gate.ts`), so grouping raw rows by `claude_invocations.bead_id` directly would
+ * split one feature's loop across several ids and manufacture artificial zero-loop observations for
+ * its children (P1, PR #348 review). `currentRunTargetOf` collapses both onto the same id — the
+ * feature's own — whichever one a given row happens to carry; an id the board does not recognize at
+ * all (purged, or no board snapshot given) passes through unchanged, same as `currentRunTargetOf`'s
+ * own contract. A fact with no `beadId` (a scheduled pass, never a feature) has nothing to bucket a
  * loop count under and is dropped.
  *
  * Every CLASSIFIED phase passes through, not only `self-review`/`pr-fix`: {@link reviewLoopByFeature}
  * only increments on those two, but it keys its per-feature bucket off ANY point carrying the
- * feature's `beadId` — a feature with only `implement`/`describe` invocations in the window still
- * needs a point here so that fold can give it a genuine zero-count bucket instead of dropping it
- * from the cohort entirely (P2, PR #348 review). Only a row `ledgerPhase` cannot classify at all is
- * dropped, since it has no phase to report.
+ * feature's `beadId` — a feature with only `implement`/`describe` invocations still needs a point
+ * here so that fold can give it a genuine zero-count bucket instead of dropping it from the cohort
+ * entirely (P2, PR #348 review). Only a row `ledgerPhase` cannot classify at all is dropped, since it
+ * has no phase to report.
  */
-function reviewLoopInvocationPoints(rows: readonly ClaudeInvocationRow[]): ReviewLoopInvocationPoint[] {
+function reviewLoopInvocationPoints(
+  rows: readonly ClaudeInvocationRow[],
+  board: Bead[],
+): ReviewLoopInvocationPoint[] {
   const out: ReviewLoopInvocationPoint[] = [];
   for (const fact of groupInvocations(rows)) {
     if (fact.beadId === null) continue;
     const phase = ledgerPhase(fact.rows[0]);
     if (phase === undefined) continue;
-    out.push({ beadId: fact.beadId, phase });
+    out.push({ beadId: currentRunTargetOf(board, fact.beadId), phase });
   }
   return out;
 }
@@ -308,6 +342,10 @@ async function runCausePoints(db: AntonDb, projectId: string, since: Date): Prom
  * separate cost read would: its rows back both the delivered-feature figures quality needs and the
  * cost figures the cost fold needs, and it is expensive enough (one `bd` shell call per run target,
  * bounded concurrency) that a second call over the same window would double real work for no new data.
+ *
+ * `invocationStamps` and `reviewLoopInvocations` are both built from {@link wholeLifeInvocationRows}
+ * (no `since` bound), never from the same window-bound rows `phaseSpendPoints` uses — see that
+ * function's own note on why each needs history the window alone does not carry.
  */
 export async function trendSeries(
   db: AntonDb,
@@ -318,15 +356,18 @@ export async function trendSeries(
   const nowMs = opts.nowMs ?? Date.now();
   const since = new Date(windowStartMs(weeks, nowMs));
 
-  const [scoredRuns, reviewRounds, recordingStart, features, invocationRows, runCauses] = await Promise.all([
-    scoredRunPoints(db, projectId, since),
-    reviewRoundPoints(db, projectId, since),
-    recordingStartedAtMs(db, projectId),
-    cohortFeatures(db, projectId, { since }),
-    invocationWindowRows(db, projectId, since),
-    runCausePoints(db, projectId, since),
-  ]);
-  if (features === undefined) return undefined;
+  const [project, scoredRuns, reviewRounds, recordingStart, features, windowRows, wholeLifeRows, runCauses] =
+    await Promise.all([
+      getProjectById(db, projectId),
+      scoredRunPoints(db, projectId, since),
+      reviewRoundPoints(db, projectId, since),
+      recordingStartedAtMs(db, projectId),
+      cohortFeatures(db, projectId, { since }),
+      invocationWindowRows(db, projectId, since),
+      wholeLifeInvocationRows(db, projectId),
+      runCausePoints(db, projectId, since),
+    ]);
+  if (!project || features === undefined) return undefined;
 
   const deliveredFeatures: DeliveredFeaturePoint[] = features
     .filter((f) => f.delivered && f.deliveredAtMs !== undefined)
@@ -339,13 +380,15 @@ export async function trendSeries(
     unpricedRows: f.unpricedRows,
   }));
 
+  const board = await listAllBeads(project);
+
   const input: TrendSeriesInput = {
     quality: { scoredRuns, reviewRounds, deliveredFeatures, recordingStartedAtMs: recordingStart },
     costFeatures,
-    phaseSpend: phaseSpendPoints(invocationRows),
+    phaseSpend: phaseSpendPoints(windowRows),
     runCauses,
-    invocationStamps: invocationStampPoints(invocationRows),
-    reviewLoopInvocations: reviewLoopInvocationPoints(invocationRows),
+    invocationStamps: invocationStampPoints(wholeLifeRows),
+    reviewLoopInvocations: reviewLoopInvocationPoints(wholeLifeRows, board),
   };
   return foldTrendSeries(input, weeks, { nowMs });
 }

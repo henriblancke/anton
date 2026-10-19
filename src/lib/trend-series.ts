@@ -386,11 +386,41 @@ function weekMajorityModel(rows: readonly InvocationStampPoint[]): string | unde
 }
 
 /**
+ * The majority model as of right before `beforeWeek` — the seed {@link modelChangeMarkers} starts
+ * its carry-forward from, folded chronologically over every week strictly earlier than `beforeWeek`.
+ * Without this, the oldest requested week has no history to compare against: a change whose only
+ * predecessor value sits just outside the window would read as that lineage's first-ever value
+ * instead of a change (P2, PR #348 review).
+ */
+function seedMajorityModel(rows: readonly InvocationStampPoint[], beforeWeek: string): string | undefined {
+  const byWeek = new Map<string, InvocationStampPoint[]>();
+  for (const row of rows) {
+    const week = isoWeekKey(row.atMs);
+    if (week >= beforeWeek) continue;
+    const bucket = byWeek.get(week);
+    if (bucket) bucket.push(row);
+    else byWeek.set(week, [row]);
+  }
+  let current: string | undefined;
+  for (const week of [...byWeek.keys()].sort()) {
+    const majority = weekMajorityModel(byWeek.get(week)!);
+    if (majority !== undefined) current = majority;
+  }
+  return current;
+}
+
+/**
  * Model markers: one per week whose majority model crossed 50% as a DIFFERENT model than the last
  * week that had a determined majority. A week with no determined majority (including one with no
  * stamped invocation) carries the prior majority forward unchanged rather than resetting it — a
  * quiet week, or one split evenly between two models, must not read as "no model running" and then
  * manufacture a change marker on the next week that happens to clear 50% again.
+ *
+ * `current` seeds from {@link seedMajorityModel} rather than `undefined`, so a change whose only
+ * predecessor landed before the requested window still fires in the oldest requested week instead
+ * of reading as that lineage's first value (P2, PR #348 review). `rows` may carry history before
+ * `weekKeys[0]` for exactly this reason — {@link inWindow} still confines every EMITTED marker to
+ * the requested weeks.
  */
 export function modelChangeMarkers(
   rows: readonly InvocationStampPoint[],
@@ -405,7 +435,7 @@ export function modelChangeMarkers(
   }
 
   const markers: ChangeMarker[] = [];
-  let current: string | undefined;
+  let current: string | undefined = weekKeys.length > 0 ? seedMajorityModel(rows, weekKeys[0]) : undefined;
   for (const week of weekKeys) {
     const majority = weekMajorityModel(byWeek.get(week) ?? []);
     if (majority === undefined) continue;
@@ -418,16 +448,41 @@ export function modelChangeMarkers(
 }
 
 /**
+ * Each agent lineage's last prompt digest as of right before `beforeWeek` — the seed
+ * {@link promptChangeMarkers} starts each lineage from, folded chronologically over every week
+ * strictly earlier than `beforeWeek`. Without this, a lineage's digest change landing in the oldest
+ * requested week has no predecessor to compare against and is silently read as its first value
+ * rather than a change (P2, PR #348 review).
+ */
+function seedByAgent(rows: readonly InvocationStampPoint[], beforeWeek: string): Map<string, string> {
+  const lastByAgent = new Map<string, string>();
+  const prior = rows.filter((row) => isoWeekKey(row.atMs) < beforeWeek).sort((a, b) => a.atMs - b.atMs);
+  for (const row of prior) {
+    if (row.stepHandler === DESCRIBER_STEP_HANDLER) continue;
+    const digest = stamped(row.promptDigest);
+    if (!digest) continue;
+    const agent = stamped(row.agentTag) ?? "";
+    lastByAgent.set(agent, digest);
+  }
+  return lastByAgent;
+}
+
+/**
  * Prompt markers: one per invocation whose composed-prompt digest DIFFERS from the last one seen
  * for the SAME `agentTag` lineage. Keyed per agent deliberately — an agent switch starts a fresh
  * lineage with nothing to compare against yet, so alternating specialists never fires a marker on
  * its own; only an edit to the prompt text an agent itself keeps running under does.
+ *
+ * `lastByAgent` seeds from {@link seedByAgent} rather than empty, so a lineage change whose only
+ * predecessor landed before the requested window still fires in the oldest requested week (P2, PR
+ * #348 review). `rows` may carry history before `weekKeys[0]` for exactly this reason —
+ * {@link inWindow} still confines every EMITTED marker to the requested weeks.
  */
 export function promptChangeMarkers(
   rows: readonly InvocationStampPoint[],
   weekKeys: readonly string[],
 ): ChangeMarker[] {
-  const lastByAgent = new Map<string, string>();
+  const lastByAgent = weekKeys.length > 0 ? seedByAgent(rows, weekKeys[0]) : new Map<string, string>();
   const markers: ChangeMarker[] = [];
   for (const row of inWindow(rows, weekKeys)) {
     // The describer's own system prompt is structurally narrower than the implementer's (no agent
@@ -447,16 +502,37 @@ export function promptChangeMarkers(
 }
 
 /**
+ * Each skill lineage's last skill digest as of right before `beforeWeek` — the seed
+ * {@link skillChangeMarkers} starts each lineage from, the sibling of {@link seedByAgent}. Without
+ * this, a lineage's digest change landing in the oldest requested week has no predecessor to compare
+ * against and is silently read as its first value rather than a change (P2, PR #348 review).
+ */
+function seedBySkill(rows: readonly InvocationStampPoint[], beforeWeek: string): Map<string, string> {
+  const lastBySkill = new Map<string, string>();
+  const prior = rows.filter((row) => isoWeekKey(row.atMs) < beforeWeek).sort((a, b) => a.atMs - b.atMs);
+  for (const row of prior) {
+    const skillId = stamped(row.skillId);
+    const digest = stamped(row.skillDigest);
+    if (!skillId || !digest) continue;
+    lastBySkill.set(skillId, digest);
+  }
+  return lastBySkill;
+}
+
+/**
  * Skill markers: one per invocation whose `skill_digest` DIFFERS from the last one seen for the SAME
  * `skill_id` — the sibling of {@link promptChangeMarkers}, keyed on the skill rather than the agent.
  * A row naming a skill id with no digest (or vice versa) names neither lineage cleanly and is
  * skipped rather than guessed at.
+ *
+ * `lastBySkill` seeds from {@link seedBySkill} rather than empty — see {@link promptChangeMarkers}'s
+ * own note on why (P2, PR #348 review).
  */
 export function skillChangeMarkers(
   rows: readonly InvocationStampPoint[],
   weekKeys: readonly string[],
 ): ChangeMarker[] {
-  const lastBySkill = new Map<string, string>();
+  const lastBySkill = weekKeys.length > 0 ? seedBySkill(rows, weekKeys[0]) : new Map<string, string>();
   const markers: ChangeMarker[] = [];
   for (const row of inWindow(rows, weekKeys)) {
     const skillId = stamped(row.skillId);
@@ -484,18 +560,38 @@ function releasePart(antonVersion: string): string {
 }
 
 /**
+ * The running RELEASE as of right before `beforeWeek` — the seed {@link releaseChangeMarkers} starts
+ * from, folded chronologically over every week strictly earlier than `beforeWeek`. Without this, a
+ * release bump landing in the oldest requested week has no predecessor to compare against and is
+ * silently read as the first release ever seen rather than a change (P2, PR #348 review).
+ */
+function seedRelease(rows: readonly InvocationStampPoint[], beforeWeek: string): string | undefined {
+  let current: string | undefined;
+  const prior = rows.filter((row) => isoWeekKey(row.atMs) < beforeWeek).sort((a, b) => a.atMs - b.atMs);
+  for (const row of prior) {
+    const raw = stamped(row.antonVersion);
+    if (!raw) continue;
+    current = releasePart(raw);
+  }
+  return current;
+}
+
+/**
  * Release markers: one per invocation whose `anton_version` names a different RELEASE than the last
  * one seen, anywhere in the window — `anton`'s own release is one thing the whole system runs under
  * at a time (the same reasoning `prompt-series.ts`'s `REVISION_DIMENSIONS` gives it), so unlike
  * prompt and skill this tracks a single running value rather than a per-key lineage. A revision bump
  * with the release unchanged (a hotfix rebuild, an uncommitted-worktree digest moving) never fires.
+ *
+ * `current` seeds from {@link seedRelease} rather than `undefined` — see {@link modelChangeMarkers}'s
+ * own note on why (P2, PR #348 review).
  */
 export function releaseChangeMarkers(
   rows: readonly InvocationStampPoint[],
   weekKeys: readonly string[],
 ): ChangeMarker[] {
   const markers: ChangeMarker[] = [];
-  let current: string | undefined;
+  let current: string | undefined = weekKeys.length > 0 ? seedRelease(rows, weekKeys[0]) : undefined;
   for (const row of inWindow(rows, weekKeys)) {
     const raw = stamped(row.antonVersion);
     if (!raw) continue;
