@@ -44,8 +44,14 @@ export interface JevConfig {
   fetchImpl?: typeof fetch;
 }
 
+/** Exported so Settings can refuse an unpinned version at the API boundary (anton-p32iy), before a
+ * misconfigured project ever gets as far as constructing a backend. */
+export function isPinnedJevModel(model: string): boolean {
+  return PINNED_MODEL_PATTERN.test(model);
+}
+
 function assertPinnedModel(model: string): void {
-  if (!PINNED_MODEL_PATTERN.test(model)) {
+  if (!isPinnedJevModel(model)) {
     throw new Error(
       `decide/jev: model must be pinned to an exact version (e.g. "jev-1.13.0"), got "${model}"`,
     );

@@ -133,6 +133,8 @@ function renderView(
       pickerEarned={pickerEarned}
       quotaProjects={QUOTA_PROJECTS}
       decisionPoints={[]}
+      jevApiKeyConfigured={false}
+      jevDisclosure={[]}
     />,
   );
 }
