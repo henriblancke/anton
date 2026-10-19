@@ -59,6 +59,10 @@ export function JevSection({
         throw new Error(body?.error ?? `Clear failed (${res.status})`);
       }
       set("jevEnabled", false);
+      // A replacement key typed before clearing must not survive the revoke — otherwise the next
+      // ordinary Save resubmits it through settingsPatchBody and silently restores what this button
+      // just told the operator was cleared.
+      set("jevApiKey", "");
       // `apiKeyConfigured` is an SSR-seeded prop (page.tsx), not form state — without this the
       // "stored key" affordance (copy + the Clear button itself) stays stuck on even though the
       // server no longer holds a key, and re-enabling the toggle would 400 on save with no warning.

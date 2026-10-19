@@ -155,6 +155,16 @@ function toModelAnswer(point: DecisionPoint, modelVersion: string, answer: JevAn
   const { question } = point;
 
   if (question.kind === "choice" && answer.type === "choice") {
+    // Jev's response schema only constrains `choice` to be a string, not one of the options we sent
+    // — an unknown value here would otherwise resolve successfully and never reach decide()'s own
+    // validation on the healthy path, so createJevFallbackCaller would never see the failure that's
+    // supposed to trigger the claude-local fallback.
+    if (!question.options.includes(answer.choice)) {
+      throw new ModelCallError(
+        `decide/jev: choice "${answer.choice}" for "${point.id}" is not one of its question's options`,
+        base,
+      );
+    }
     return { ...base, value: answer.choice, confidence: answer.confidence, distribution: answer.probabilities };
   }
   if (question.kind === "score" && answer.type === "score") {

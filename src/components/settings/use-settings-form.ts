@@ -178,7 +178,13 @@ export function useSettingsForm({
       // jevApiKey is write-only — the server never echoes it back, so the baseline's copy is always
       // "". Left staged, a submitted key would diff against that "" forever and read as permanently
       // dirty; clearing it here matches what the server now holds (anton-l70sq PR #349 review).
-      if (draft.jevApiKey.trim()) setDraft((prev) => ({ ...prev, jevApiKey: "" }));
+      // Only clear when `prev` still holds the exact value this save submitted — the field stays
+      // editable while the request is in flight, and an operator who types a replacement before the
+      // response lands must not have that newer, never-submitted value wiped out from under them.
+      const submittedKey = draft.jevApiKey;
+      if (submittedKey.trim()) {
+        setDraft((prev) => (prev.jevApiKey === submittedKey ? { ...prev, jevApiKey: "" } : prev));
+      }
       toast.success("Settings saved");
       // The server tree still holds the pre-save row; refresh it so navigating away and back
       // doesn't restore stale values out of the router cache.
