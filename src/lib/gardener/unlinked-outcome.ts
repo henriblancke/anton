@@ -69,7 +69,7 @@ export function detectUnlinkedOutcomes(index: BoardIndex): GardenerDetection[] {
   return detections;
 }
 
-interface Suggestion {
+export interface Suggestion {
   outcome: string;
   evidence: string[];
 }
@@ -78,8 +78,12 @@ interface Suggestion {
  * The deterministic guess, in the order the acceptance criteria states it: inherit the parent
  * epic's own outcome when it names exactly one, fall back to the stringer default, and otherwise
  * ask. Each rung only fires when the one above it found nothing to read.
+ *
+ * Exported so apply-plan.ts/apply-steps.ts can re-run the same guess against a FRESH board before
+ * writing the label — the proposal's own `detail` is frozen at detection time, and a parent epic
+ * relabelled between filing and approval must change the answer, not just the evidence text.
  */
-function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
+export function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
   const parentId = beads.parentOf(bead);
   const parent = parentId ? index.byId.get(parentId) : undefined;
   if (parent && beads.isEpic(parent)) {

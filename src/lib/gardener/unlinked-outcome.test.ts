@@ -93,7 +93,7 @@ describe("unlinked-outcome (anton-vie0k)", () => {
     ).toEqual([]);
   });
 
-  it("stays silent for a parentless task or bug — the stringer/unknown rungs still apply to it", () => {
+  it("falls straight to unknown for a parentless task or bug with no epic to inherit from", () => {
     // No epic to inherit from (it has no parent at all), so it falls straight to unknown.
     const detection = only([bead("anton-task", { issue_type: "task" })]);
     expect(detection.detail).toBe(UNKNOWN_OUTCOME);

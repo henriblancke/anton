@@ -1620,7 +1620,9 @@ describe("the gardener's outcome label", () => {
   });
 
   it("writes the outcome label the plan names, and closes the proposal as applied", async () => {
-    const subject = cold("anton-a");
+    // source:stringer so a fresh board re-derives the same "codebase-health" the plan was filed
+    // with — the write re-derives the outcome rather than trusting the plan's frozen `detail`.
+    const subject = cold("anton-a", { labels: ["source:stringer"] });
     const result = await applyWith(proposalFor(OUTCOME), [subject]);
     expect(calls).toEqual([
       "tag anton-a outcome:codebase-health",
@@ -1641,7 +1643,13 @@ describe("the gardener's outcome label", () => {
   });
 
   it("refuses to label a bead a run has claimed since the filing", async () => {
-    const claimed = warm("anton-a", { status: "in_progress", assignee: "runner-1" });
+    // source:stringer so the claim-busy refusal is the one that fires — without it, a fresh
+    // re-derive would find no signal at all and refuse as `unknown` before ever reaching the claim.
+    const claimed = warm("anton-a", {
+      status: "in_progress",
+      assignee: "runner-1",
+      labels: ["source:stringer"],
+    });
     const err = (await applyWith(proposalFor(OUTCOME), [claimed]).catch((e) => e)) as InstanceType<
       typeof ProposalApplyError
     >;
@@ -1660,6 +1668,35 @@ describe("the gardener's outcome label", () => {
     expect(err.message).toMatch(/could not guess which outcome/);
     expect(err.message).toMatch(/decline this proposal/);
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  it("refuses at the write boundary when the subject stopped being a run target since the decision", async () => {
+    // Open at the decision (a parentless task, a run target), then adopted under a feature before
+    // the write's own locked board read — ceasing to be a run target without ceasing to be open
+    // work, which the decide-time snapshot alone cannot see.
+    const subject = cold("anton-a", { labels: ["source:stringer"] });
+    liveBeads.set("anton-a", { ...subject, parent: "anton-feat" });
+    const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/no longer a run target/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  it("refuses at the write boundary when the suggested outcome has moved since the decision", async () => {
+    // The subject inherits its parent epic's single outcome label at the decision, then that label
+    // is relabelled before the write's own locked board read — the board now deterministically
+    // suggests a different outcome than the one the decision chose.
+    const epic = bead("anton-epic", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const feature = bead("anton-a", { issue_type: "feature", parent: "anton-epic" });
+    liveBeads.set("anton-epic", { ...epic, labels: ["outcome:second-outcome"] });
+    const err = (await applyWith(proposalFor(OUTCOME), [epic, feature]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/outcome has moved to second-outcome/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
   });
 
   it("invalidates a plan whose outcome was edited after it was filed", () => {

@@ -53,6 +53,7 @@ import {
   type TicketOwner,
 } from "./apply-plan";
 import { impliesOrdering } from "./relink";
+import { suggestOutcome } from "./unlinked-outcome";
 
 /** A subject the board moved on between the decision and the write. Never a bd failure. */
 export class SubjectMovedError extends Error {}
@@ -120,7 +121,9 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * `implied-order` and the gardener's two re-parents resolve to no premise in
  * {@link EVIDENCE_PREMISE} and are re-derived from the board instead ({@link assertOrderingStated},
  * apply-plan.ts `reparentPremiseGone`). `attach-outcome` is the same shape as those two: its premise
- * resolves to none either, re-derived from the board by {@link alreadySatisfied} instead.
+ * resolves to none either — "already labelled" is re-derived from the board by
+ * {@link alreadySatisfied}, and "still a run target, still the right outcome" by
+ * {@link assertOutcomeHolds}.
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -273,6 +276,7 @@ export async function applyStep(
     await assertRetirementHolds(repo, step);
     await assertHomeHolds(repo, step);
     await assertEvidenceHolds(repo, step);
+    await assertOutcomeHolds(repo, step);
     await assertStartHolds(repo, step);
     const write = await lockedWrite(repo, step);
     signal?.throwIfAborted();
@@ -419,6 +423,35 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
   if (step.verb !== "link" || step.kind !== "implied-order") return;
   const doing = `before recording ${step.blocker} as ${step.id}'s blocker`;
   assertOrderingStated(step.id, step.blocker, await lockedBoard(repo, doing, false));
+}
+
+/**
+ * What an OUTCOME LABEL owes a fresh board before it writes: the subject is still a run target, and
+ * the suggestion is still the one the current board derives — both re-derived rather than carried
+ * from the decision, the same treatment `assertHomeHolds`/`assertOrderingStated` give the gardener's
+ * own re-parents and the `implied-order` link.
+ *
+ * Covers two drifts the lock window can introduce between `planAttachOutcome`'s read and this write:
+ * a parentless task adopted under a feature (or a standalone epic that grew a feature child) stops
+ * being a run target without closing, and a parent epic relabelled since the decision changes which
+ * outcome the board now says to inherit.
+ */
+async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "attach-outcome") return;
+  const board = await lockedBoard(repo, `before labelling ${step.id} outcome:${step.outcome}`, false);
+  const subject = board.byId.get(step.id);
+  if (!subject) throw new SubjectMovedError(missing(step.id));
+  if (!beads.isRunTarget(subject, board.all)) {
+    throw new SubjectMovedError(
+      `${step.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`,
+    );
+  }
+  const current = suggestOutcome(board, subject).outcome;
+  if (current !== step.outcome) {
+    throw new SubjectMovedError(
+      `${step.id}'s suggested outcome has moved to ${current} since this was decided — the board changed underneath this approval, so it refuses rather than write a stale guess`,
+    );
+  }
 }
 
 /**

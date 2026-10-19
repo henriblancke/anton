@@ -62,6 +62,10 @@ describeBd("gardener shadow pass e2e (real handler · real bd)", () => {
       title: "the work a commit already shipped",
       type: "task",
       acceptance: "- [ ] it shipped",
+      // Labelled, like the other two below, so `detectUnlinkedOutcomes` (anton-vie0k) stays silent
+      // on this fixture — it composes into the same pass, and an unlabelled parentless task is
+      // exactly the open run target it would otherwise (correctly) raise a second ask about.
+      labels: ["outcome:test-outcome"],
     });
 
     // Staleness is a clock property and bd rejects `--days 0`, so the only way to seed it is to
@@ -79,6 +83,7 @@ describeBd("gardener shadow pass e2e (real handler · real bd)", () => {
           title: "forgotten open bead",
           status: "open",
           issue_type: "task",
+          labels: ["outcome:test-outcome"],
           created_at: "2025-01-01T00:00:00Z",
           updated_at: "2025-01-02T00:00:00Z",
         }),
@@ -89,6 +94,7 @@ describeBd("gardener shadow pass e2e (real handler · real bd)", () => {
           status: "in_progress",
           issue_type: "task",
           assignee: "someone",
+          labels: ["outcome:test-outcome"],
           created_at: "2025-01-01T00:00:00Z",
           updated_at: "2025-01-03T00:00:00Z",
         }),

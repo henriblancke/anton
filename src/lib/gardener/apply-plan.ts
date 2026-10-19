@@ -43,7 +43,7 @@ import {
   MIN_CARRIED_TICKETS,
   MIN_CLUSTER_SIZE,
 } from "./reparent";
-import { UNKNOWN_OUTCOME } from "./unlinked-outcome";
+import { suggestOutcome, UNKNOWN_OUTCOME } from "./unlinked-outcome";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -168,7 +168,11 @@ export type ApplyStep =
    * approver's own judgment (reading the Goal hint on an `unknown` ask, or simply agreeing with the
    * guess) still holds, so the evidence fence stands in — except `unlinked-outcome` resolves to no
    * premise at all ({@link EVIDENCE_PREMISE}), because the claim it rests on ("no outcome:<id> yet")
-   * is re-derivable from the board exactly like the gardener's own re-parents.
+   * is re-derivable from the board exactly like the gardener's own re-parents. The outcome VALUE and
+   * the subject's run-target status are the same kind of claim and get the same treatment: both are
+   * re-derived from a fresh board rather than carried from the proposal (`planAttachOutcome`,
+   * `attachOutcomeBarred`, and apply-steps.ts's write-time re-check), so `outcome` here is only ever
+   * the freshly-derived value a step is about to write, never the detection's frozen guess.
    */
   | (StepSubject & EvidenceFence & { verb: "attach-outcome"; outcome: string });
 
@@ -1177,10 +1181,21 @@ function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMomen
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "an outcome proposal names exactly one bead" };
   }
-  const outcome = plan.detail;
-  if (!outcome) {
+  if (!plan.detail) {
     return { status: "refuse", reason: "this proposal names no outcome to add" };
   }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  // Settled BEFORE the outcome is even re-derived — the same order `reprioritizeSubject` settles
+  // in, for the same reason: whoever labelled it, by hand or by a concurrent approval, produced the
+  // state this ask wanted, whatever outcome a fresh read would now suggest.
+  if (outcomeIdsOf(subject).length > 0) {
+    return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
+  }
+  // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
+  // frozen at filing time, and a parent epic relabelled (or re-parented away) since then must change
+  // the answer the write actually lands, not just the evidence text the approver saw.
+  const outcome = suggestOutcome(index, subject).outcome;
   // The literal answer `detectUnlinkedOutcomes` suggests when neither board signal fired — the ask
   // is "which outcome does this serve?", and only a human can answer it. Refused here rather than
   // left to the manual floor alone (autonomy.ts `isManualProposal`), which only ever keeps this OFF
@@ -1191,27 +1206,19 @@ function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMomen
       reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
     };
   }
-  const subject = index.byId.get(id);
-  if (!subject) return { status: "refuse", reason: missing(id) };
-  return attachOutcomeSubject(plan, subject, outcome, at);
+  return attachOutcomeSubject(plan, subject, outcome, index, at);
 }
 
-/**
- * The label decided against the bead itself. A subject that already carries an outcome settles
- * BEFORE the evidence fence is consulted — the same order `reprioritizeSubject` settles in, for the
- * same reason: whoever labelled it, by hand or by a concurrent approval, produced the state this ask
- * wanted.
- */
+/** The label decided against the bead itself, once {@link planAttachOutcome} has settled the
+ * already-labelled case and re-derived a real outcome to write. */
 function attachOutcomeSubject(
   plan: GardenerPlan,
   subject: Bead,
   outcome: string,
+  index: BoardIndex,
   at: ApplyMoment,
 ): ApplyDecision {
-  if (outcomeIdsOf(subject).length > 0) {
-    return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
-  }
-  const barred = attachOutcomeBarred(plan, subject, at);
+  const barred = attachOutcomeBarred(plan, subject, index, at);
   if (barred) return { status: "refuse", reason: barred };
   return {
     status: "apply",
@@ -1230,9 +1237,21 @@ function attachOutcomeSubject(
 }
 
 /** Why this bead cannot be labelled, or undefined. */
-function attachOutcomeBarred(plan: GardenerPlan, subject: Bead, at: ApplyMoment): string | undefined {
+function attachOutcomeBarred(
+  plan: GardenerPlan,
+  subject: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
   if (!isOpenWork(subject)) {
     return `${subject.id} is ${settledWord(subject)} — an outcome label would group nothing`;
+  }
+  // Re-asked rather than trusted from the detection: a parentless task adopted under a feature, or a
+  // standalone epic that gained a feature child, stops being a run target without ceasing to be open
+  // work — and an outcome label on a container or a child ticket would group a card the digest never
+  // reads as a run target to begin with.
+  if (!beads.isRunTarget(subject, index.all)) {
+    return `${subject.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`;
   }
   return (
     subjectBusy(subject, at, DOING["attach-outcome"]) ??

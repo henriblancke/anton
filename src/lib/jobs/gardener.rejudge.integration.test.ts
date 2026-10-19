@@ -76,6 +76,10 @@ describeBd("gardener re-judgement e2e (real handler · real bd)", () => {
       title: "the feature that is being built",
       type: "feature",
       acceptance: "- [ ] it works",
+      // Labelled so a "well-formed" board stays silent under `detectUnlinkedOutcomes` (anton-vie0k)
+      // too — an open run target with no outcome:<id> would otherwise be exactly the kind of thing
+      // THIS fixture means to rule out, and the re-judgement pass composes both detectors.
+      labels: ["outcome:test-outcome"],
     });
     ticket = await beads.create(repo, {
       title: "the ticket under it",
