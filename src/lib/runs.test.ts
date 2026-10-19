@@ -28,6 +28,7 @@ import {
   getRunGateFailure,
   listDeliveriesByBead,
   listRecentRunOutcomes,
+  listRunBeadIdsDeliveredSince,
   updateRun,
 } from "./runs";
 import { eq } from "drizzle-orm";
@@ -704,6 +705,68 @@ describe("listDeliveriesByBead", () => {
     });
 
     expect(await listDeliveriesByBead(t.db, PROJECT, [EPIC])).toEqual(new Map());
+  });
+});
+
+describe("listRunBeadIdsDeliveredSince", () => {
+  const SETTLED = 1_800_000_000_000;
+  const SINCE = new Date(SETTLED);
+
+  it("discovers a run target by its epicBeadId when its row settled at-or-after `since`", async () => {
+    await seed({ id: "r1", status: "done", updatedAt: SETTLED, endedAt: SETTLED });
+
+    expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(new Set([EPIC]));
+  });
+
+  it("adds BOTH the epic and the ticket bead id for a grouped run's row, not just one", async () => {
+    // `epicBeadId` is NOT NULL on every row — a grouped run's row still names a `ticketBeadId` too,
+    // and both must land in the discovered set, not just whichever one the caller expects.
+    await seed({
+      id: "r1",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-epic",
+      ticketBeadId: "anton-ticket",
+    });
+
+    expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(
+      new Set(["anton-epic", "anton-ticket"]),
+    );
+  });
+
+  it("excludes a row whose endedAt settled BEFORE `since`, even though its updatedAt is after it", async () => {
+    // The `isNull(endedAt)` guard means the `updatedAt` fallback only ever applies to a legacy row
+    // with no `endedAt` at all — a row that DOES carry an `endedAt` is read by that column alone,
+    // never rescued by a later `updatedAt` (e.g. a late relabel) once it has already settled.
+    await seed({
+      id: "r1",
+      status: "done",
+      updatedAt: SETTLED + 60_000,
+      endedAt: SETTLED - 60_000,
+    });
+
+    expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(new Set());
+  });
+
+  it("falls back to `updatedAt` only for a legacy row written before `endedAt` existed", async () => {
+    await seed({ id: "r1", status: "done", updatedAt: SETTLED });
+
+    expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(new Set([EPIC]));
+  });
+
+  it("excludes a run that is not done, or that settled done without delivering anything", async () => {
+    await seed({ id: "parked", status: "parked", updatedAt: SETTLED, endedAt: SETTLED });
+    await seed({
+      id: "retired",
+      status: "done",
+      updatedAt: SETTLED,
+      endedAt: SETTLED,
+      epicBeadId: "anton-retired",
+      delivered: false,
+    });
+
+    expect(await listRunBeadIdsDeliveredSince(t.db, PROJECT, SINCE)).toEqual(new Set());
   });
 });
 

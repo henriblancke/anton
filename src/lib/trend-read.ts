@@ -239,8 +239,10 @@ function wholeLifeInvocationRows(db: AntonDb, projectId: string): Promise<Claude
  * invocation's key, grouped via {@link groupInvocations}, so {@link phaseSpendByWeek} can count real
  * invocations rather than rows — an opus invocation's haiku sidecar shares its primary's key, so the
  * pair reads as one invocation, not two (P2, PR #348 review). A row `ledgerPhase` cannot classify (an
- * unknown job type, a row from before `step_handler` existed) is dropped: an unattributed row has no
- * phase to bucket it under, and `phaseSpendByWeek` carries no "unattributed" bucket to put it in.
+ * unknown job type, a row from before `step_handler` existed) still carries real spend, so it routes
+ * into an explicit `unattributed` bucket rather than being dropped — the same rule `feature-ledger.ts`'s
+ * own fold applies to `LedgerTotals.unattributed`, so a window's phase totals reconcile with actual
+ * spend instead of silently undercounting legacy rows (P2, PR #348 review).
  */
 function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint[] {
   const out: PhaseSpendPoint[] = [];
@@ -248,11 +250,9 @@ function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint
   for (const fact of groupInvocations(rows)) {
     const invocationKey = `inv:${invocationIndex++}`;
     for (const row of fact.rows) {
-      const phase = ledgerPhase(row);
-      if (phase === undefined) continue;
       out.push({
         atMs: row.recordedAt.getTime(),
-        phase,
+        phase: ledgerPhase(row) ?? "unattributed",
         tokens: totalTokens(row),
         usd: costOf(row.modelReported, row, row.endpointHost),
         invocationKey,

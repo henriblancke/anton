@@ -177,6 +177,23 @@ describe("trendSeries", () => {
       recordedAt: new Date(WEEK_MONDAY),
       durationMs: 60_000,
     });
+    // A legacy row `ledgerPhase` cannot classify — no job type it recognizes — must still land its
+    // spend somewhere rather than vanish from the window's phase totals (P2, PR #348 review).
+    await t.db.insert(schema.claudeInvocations).values({
+      id: "inv-legacy",
+      projectId: t.projectId,
+      jobType: "no-longer-defined-job",
+      runId: "r1",
+      beadId: "feat-1",
+      modelRequested: "claude-opus-5",
+      modelReported: "claude-opus-5",
+      endpointHost: "api.anthropic.com",
+      inputTokens: 10,
+      outputTokens: 10,
+      outcome: "ok",
+      recordedAt: new Date(WEEK_MONDAY),
+      durationMs: 60_000,
+    });
     await t.db.insert(schema.runs).values({
       id: "run-feat-1",
       projectId: t.projectId,
@@ -193,8 +210,11 @@ describe("trendSeries", () => {
     // claude-opus-5 normalizes to a known price: (100 * $5 + 100 * $25) / 1e6 = 0.003.
     expect(week?.phaseSpend).toEqual({
       implement: { invocations: 1, tokens: 200, usd: 0.003, unpricedRows: 0 },
+      unattributed: { invocations: 1, tokens: 20, usd: 0.0003, unpricedRows: 0 },
     });
-    expect(week?.cost).toEqual({ delivered: 1, usd: 0.003, usdPerFeature: 0.003, unpricedRows: 0 });
+    // cohortFeatures' own ledger fold merges the unattributed row into the feature's total too
+    // (feature-ledger.ts), so the window's total cost reflects both: 0.003 + 0.0003 = 0.0033.
+    expect(week?.cost).toEqual({ delivered: 1, usd: 0.0033, usdPerFeature: 0.0033, unpricedRows: 0 });
     // One delivered feature is well under MIN_COHORT — the clearest underpowered case there is.
     expect(week?.underpowered).toBe(true);
   });
