@@ -41,6 +41,12 @@ const PHRASE: Readonly<Record<TimelineEventKind, Phrase>> = Object.freeze({
 
 const KIND_ORDER = Object.keys(PHRASE) as readonly TimelineEventKind[];
 
+/** One event's own phrase, singular — what a feature card's "last 5 events" list reads per row
+ * (anton-y1uxp). Same template, same no-LLM rule as {@link templateHeadline}; just not folded by count. */
+export function eventPhrase(kind: TimelineEventKind): string {
+  return PHRASE[kind].one;
+}
+
 /**
  * One deterministic line for either a single feature's events or a whole project's — the caller
  * decides which by what it filters `events` to before calling. Order and wording never depend on
