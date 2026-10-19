@@ -17,6 +17,7 @@ import { getDb, schema } from "./db";
 import { runsByCause } from "./failure-cause-read";
 import { ledgerPhase } from "./feature-ledger";
 import type { AntonDb } from "./jobs/queue";
+import { groupInvocations, modelsMatch } from "./model-divergence";
 import { costOf } from "./model-pricing";
 import {
   qualityWeekPoints,
@@ -231,31 +232,53 @@ function phaseSpendPoints(rows: readonly ClaudeInvocationRow[]): PhaseSpendPoint
   return out;
 }
 
-/** The stamp columns {@link changeMarkers} reads off every invocation row in the window. */
+/**
+ * The stamp columns {@link changeMarkers} reads, one point per real INVOCATION rather than per row:
+ * essentially every real opus invocation also writes a haiku sidecar row (same invocation, a second
+ * `modelReported`), so folding raw rows would double-count every model change and corrupt the
+ * majority vote {@link modelChangeMarkers} takes over a week. Grouped via {@link groupInvocations},
+ * the same regrouping {@link ledgerTotals} applies before classifying a row.
+ *
+ * `promptDigest`/`agentTag`/`skillId`/`skillDigest`/`antonVersion` are genuinely invariant across an
+ * invocation's rows (`claude-invocations.ts`'s `invocationRows` stamps them once into the `shared`
+ * object every row of the call copies), so `fact.rows[0]` carries them regardless of row order. The
+ * model is the opposite case — it is the ONE column that differs row to row BY DESIGN — so picking
+ * `rows[0]`'s would silently report the sidecar's model on ties, since `listInvocations` orders rows
+ * `desc(recordedAt), desc(rowid)` and a sidecar row is written after (so sorts before) its primary.
+ * The model that answered anton's OWN request — the one {@link modelsMatch} confirms against
+ * `modelRequested` — is what a change marker means to track; a sidecar/subagent row never matches it.
+ * Falls back to the first reported model only when the request diverged outright (no row matches).
+ */
 function invocationStampPoints(rows: readonly ClaudeInvocationRow[]): InvocationStampPoint[] {
-  return rows.map((row) => ({
-    atMs: row.recordedAt.getTime(),
-    modelReported: row.modelReported,
-    promptDigest: row.promptDigest,
-    agentTag: row.agentTag,
-    skillId: row.skillId,
-    skillDigest: row.skillDigest,
-    antonVersion: row.antonVersion,
-  }));
+  return groupInvocations(rows).map((fact) => {
+    const row = fact.rows[0];
+    const servedModel = fact.modelsReported.find((model) => modelsMatch(fact.modelRequested, model));
+    return {
+      atMs: row.recordedAt.getTime(),
+      modelReported: servedModel ?? fact.modelsReported[0] ?? null,
+      promptDigest: row.promptDigest,
+      agentTag: row.agentTag,
+      skillId: row.skillId,
+      skillDigest: row.skillDigest,
+      antonVersion: row.antonVersion,
+    };
+  });
 }
 
 /**
- * The self-review/PR-fix invocations {@link reviewLoopByFeature} counts, classified the same way
- * {@link phaseSpendPoints} classifies spend. A row with no `beadId` (a scheduled pass, never a
- * feature) has nothing to bucket a loop count under and is dropped.
+ * The self-review/PR-fix invocations {@link reviewLoopByFeature} counts, one point per real
+ * invocation for the same sidecar-row reason {@link invocationStampPoints} groups: a raw-row count
+ * overcounts by the sidecar factor, corrupting both the displayed per-feature counts and the
+ * median-based runaway comparison. A fact with no `beadId` (a scheduled pass, never a feature) has
+ * nothing to bucket a loop count under and is dropped.
  */
 function reviewLoopInvocationPoints(rows: readonly ClaudeInvocationRow[]): ReviewLoopInvocationPoint[] {
   const out: ReviewLoopInvocationPoint[] = [];
-  for (const row of rows) {
-    if (row.beadId === null) continue;
-    const phase = ledgerPhase(row);
+  for (const fact of groupInvocations(rows)) {
+    if (fact.beadId === null) continue;
+    const phase = ledgerPhase(fact.rows[0]);
     if (phase !== "self-review" && phase !== "pr-fix") continue;
-    out.push({ beadId: row.beadId, phase });
+    out.push({ beadId: fact.beadId, phase });
   }
   return out;
 }

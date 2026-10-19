@@ -239,4 +239,99 @@ describe("trendSeries", () => {
       runaway: false,
     });
   });
+
+  it("groups a sidecar row into its real invocation before counting change markers and the review loop", async () => {
+    fakeBoard([]);
+    const weekTwoKey = isoWeekKey(WEEK_MONDAY + 7 * DAY);
+
+    // Essentially every real invocation also writes a haiku sidecar row under the same
+    // `invocationId` — one real self-review per (invocationId, week), never two. `modelRequested`
+    // matches the primary row's reported model, never the sidecar's, so the switch below is a
+    // genuine served-model change rather than a divergence off a stale request.
+    const sidecarPair = (opts: {
+      invocationId: string;
+      runId: string;
+      modelRequested: string;
+      modelReported: string;
+      recordedAt: Date;
+    }) => [
+      {
+        id: `${opts.invocationId}-primary`,
+        invocationId: opts.invocationId,
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "review",
+        runId: opts.runId,
+        beadId: "feat-1",
+        modelRequested: opts.modelRequested,
+        modelReported: opts.modelReported,
+        outcome: "ok",
+        recordedAt: opts.recordedAt,
+      },
+      {
+        id: `${opts.invocationId}-sidecar`,
+        invocationId: opts.invocationId,
+        projectId: t.projectId,
+        jobType: "execute-epic",
+        step: "implement",
+        stepHandler: "review",
+        runId: opts.runId,
+        beadId: "feat-1",
+        modelRequested: opts.modelRequested,
+        modelReported: "claude-haiku-4-5",
+        outcome: "ok",
+        recordedAt: opts.recordedAt,
+      },
+    ];
+
+    await t.db.insert(schema.claudeInvocations).values([
+      ...sidecarPair({
+        invocationId: "w1-a",
+        runId: "r1",
+        modelRequested: "claude-opus-5",
+        modelReported: "claude-opus-5-20260101",
+        recordedAt: new Date(WEEK_MONDAY),
+      }),
+      ...sidecarPair({
+        invocationId: "w1-b",
+        runId: "r2",
+        modelRequested: "claude-opus-5",
+        modelReported: "claude-opus-5-20260101",
+        recordedAt: new Date(WEEK_MONDAY),
+      }),
+      ...sidecarPair({
+        invocationId: "w2-a",
+        runId: "r3",
+        modelRequested: "claude-sonnet-5",
+        modelReported: "claude-sonnet-5",
+        recordedAt: new Date(WEEK_MONDAY + 7 * DAY),
+      }),
+      ...sidecarPair({
+        invocationId: "w2-b",
+        runId: "r4",
+        modelRequested: "claude-sonnet-5",
+        modelReported: "claude-sonnet-5",
+        recordedAt: new Date(WEEK_MONDAY + 7 * DAY),
+      }),
+    ]);
+
+    const series = await trendSeries(t.db, t.projectId, 2, { nowMs: NOW_MS + 7 * DAY });
+
+    // A per-row fold would split each week 50/50 between the primary model and the haiku sidecar and
+    // never clear the 50% majority `modelChangeMarkers` requires, so the marker below only appears
+    // once rows are grouped into real invocations first.
+    expect(series?.changeMarkers).toEqual([
+      { kind: "model", week: weekTwoKey, before: "claude-opus-5-20260101", after: "claude-sonnet-5" },
+    ]);
+    // Four real invocations ran against feat-1 (two self-review per week) — eight rows, not eight
+    // invocations.
+    expect(series?.reviewLoop.find((p) => p.beadId === "feat-1")).toEqual({
+      beadId: "feat-1",
+      selfReviewInvocations: 4,
+      prFixInvocations: 0,
+      loopInvocations: 4,
+      runaway: false,
+    });
+  });
 });
