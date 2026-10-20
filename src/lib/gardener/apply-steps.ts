@@ -962,15 +962,16 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
       // review, PR #351). Re-read rather than trusted from the plan: the subject's labels are what
       // this write is about to change, and nothing upstream locked them against drifting further.
       //
-      // The stale label comes off BEFORE the right one goes on, not after: dying between the two
-      // writes leaves the bead with no outcome label at all, which reads as unlinked again next
-      // patrol — the same self-healing state this system already re-asks for — rather than leaving
-      // the dead label standing ALONGSIDE the new one, which reproduces the exact bug this write
-      // exists to fix.
+      // Only the FIRST id is ever stale here, never every id but the new one: `assertOutcomeHolds`
+      // (run under the same lock, just before this) already refused the write outright if the first
+      // id were a still-recognized outcome other than `step.outcome`, so by the time this runs it is
+      // either already `step.outcome` (nothing to strip) or the obsolete guess this step exists to
+      // replace. A still-valid SECOND label — a target serving both `codebase-health` and a product
+      // outcome is a supported state — sits at index 1+ and must survive; treating it as stale too
+      // deletes a legitimate association while repairing the digest-selected one (P2 review, PR #351).
       const subject = await reread(repo, step.id);
-      const stale = (subject ? outcomeIdsOf(subject) : [])
-        .filter((id) => id !== step.outcome)
-        .map((id) => `outcome:${id}`);
+      const ownFirstId = subject ? outcomeIdsOf(subject)[0] : undefined;
+      const stale = ownFirstId !== undefined && ownFirstId !== step.outcome ? [`outcome:${ownFirstId}`] : [];
       if (stale.length > 0) await beads.untag(repo, step.id, stale);
       try {
         await beads.tag(repo, step.id, [`outcome:${step.outcome}`]);

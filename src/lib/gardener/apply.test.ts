@@ -1673,6 +1673,27 @@ describe("the gardener's outcome label", () => {
     expect(result.changed).toEqual(["anton-a"]);
   });
 
+  // Codex review, PR #351: the write used to treat every outcome label but the new one as stale,
+  // which also untagged a still-valid SECOND label — a target serving both `codebase-health` and a
+  // product outcome is a supported state. Only the dead FIRST id, the one `featureCardOf` reads,
+  // is ever stale by the time this reaches the write (`assertOutcomeHolds` already refused the
+  // write outright had a recognized first id disagreed with `step.outcome`).
+  it("repairs the dead first outcome label without touching a valid second one", async () => {
+    productMarkdown =
+      "## Outcomes\n- `oriented-operator` — Users feel oriented.\n- `codebase-health` — repo health.\n";
+    const subject = cold("anton-a", {
+      labels: ["outcome:typo-dh", "outcome:oriented-operator", "source:stringer"],
+    });
+    const result = await applyWith(proposalFor(OUTCOME), [subject]);
+    expect(calls).toEqual([
+      "untag anton-a outcome:typo-dh",
+      "tag anton-a outcome:codebase-health",
+      "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
+      "close anton-p1 applied: labelled anton-a outcome:codebase-health",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
+  });
+
   it("refuses to label a bead a run has claimed since the filing", async () => {
     // source:stringer so the claim-busy refusal is the one that fires — without it, a fresh
     // re-derive would find no signal at all and refuse as `unknown` before ever reaching the claim.
