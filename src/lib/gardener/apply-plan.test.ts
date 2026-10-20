@@ -59,8 +59,19 @@ const authoritative = <T extends Bead[]>(board: T): T =>
  * Decide against a fixture board the way the route does: now, against a proposal filed a month ago.
  * A test that needs a different pair of moments calls `planApply` itself.
  */
-const decide = (plan: GardenerPlan, board: Bead[], nowMs: number = NOW) =>
-  planApply(plan, authoritative(board), { nowMs, observedAtMs: Date.parse(FILED) });
+const decide = (
+  plan: GardenerPlan,
+  board: Bead[],
+  nowMs: number = NOW,
+  validOutcomeIds?: ReadonlySet<string>,
+) =>
+  planApply(
+    plan,
+    authoritative(board),
+    { nowMs, observedAtMs: Date.parse(FILED) },
+    undefined,
+    validOutcomeIds,
+  );
 
 describe("planApply — what an approval means against the board as it now is", () => {
   it("re-parents every subject that isn't already home, remembering the parent to undo to", () => {
@@ -1239,5 +1250,49 @@ describe("planApply — returning parked work to the board", () => {
       /names exactly one bead/,
     );
     expect(refuse(decide(UNDEFER, []))).toMatch(/anton-a/);
+  });
+});
+
+// P2 review, PR #351: the "already carries an outcome" settle used to accept ANY parseable
+// `outcome:<id>` label, so a target whose own label named an id the project no longer defines (a
+// typo, or one deleted from PRODUCT.md) settled here forever — while `detectUnlinkedOutcomes` kept
+// reading the same target as unlinked and re-filing the same proposal every patrol, with no write
+// that could ever answer it. The settle has to agree with detection: recognized against the same
+// `validOutcomeIds` set, not just "parses as an outcome label".
+describe("planApply — attach-outcome's settle agrees with detection on what counts as an outcome", () => {
+  const OUTCOME = planFor({
+    kind: "unlinked-outcome",
+    move: "attach-outcome",
+    subjects: ["anton-a"],
+    detail: "codebase-health",
+  });
+  const VALID = new Set(["codebase-health", "oriented-operator"]);
+
+  it("does not settle when the subject's own label names an outcome the project no longer defines", () => {
+    const subject = bead("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
+    const decision = decide(OUTCOME, [subject], NOW, VALID);
+
+    // Re-derives rather than settling: source:stringer suggests codebase-health, which the plan
+    // also names, so the only live outcome is a fresh write of the SAME label the dead one left.
+    expect(decision).toMatchObject({
+      status: "apply",
+      steps: [{ verb: "attach-outcome", id: "anton-a", outcome: "codebase-health" }],
+    });
+  });
+
+  it("still settles when the subject's own label names an outcome the project defines", () => {
+    const subject = bead("anton-a", { labels: ["outcome:oriented-operator"] });
+    expect(decide(OUTCOME, [subject], NOW, VALID)).toEqual({
+      status: "settled",
+      summary: "anton-a already carries an outcome — nothing to add",
+    });
+  });
+
+  it("trusts any parseable label unchecked when no valid set is given, same as before this validation existed", () => {
+    const subject = bead("anton-a", { labels: ["outcome:anything-at-all"] });
+    expect(decide(OUTCOME, [subject])).toEqual({
+      status: "settled",
+      summary: "anton-a already carries an outcome — nothing to add",
+    });
   });
 });

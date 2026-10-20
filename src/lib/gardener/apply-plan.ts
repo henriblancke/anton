@@ -1224,8 +1224,17 @@ function planAttachOutcome(
   }
   // Settled BEFORE the outcome is even re-derived — the same order `reprioritizeSubject` settles
   // in, for the same reason: whoever labelled it, by hand or by a concurrent approval, produced the
-  // state this ask wanted, whatever outcome a fresh read would now suggest.
-  if (outcomeIdsOf(subject).length > 0) {
+  // state this ask wanted, whatever outcome a fresh read would now suggest. Checked against
+  // `validOutcomeIds`, same as `detectUnlinkedOutcomes`'s own `ownOutcomeRecognized` (P2 review, PR
+  // #351): a syntactically valid but nonexistent id (a typo, or one deleted from PRODUCT.md
+  // outright) must NOT settle here, or the digest keeps treating the subject as unlinked while this
+  // check keeps declaring it already done — the same proposal filed again every patrol with no path
+  // to ever landing a label `groupFeatureCards` recognizes.
+  const ownOutcomeIds = outcomeIdsOf(subject);
+  const ownOutcomeRecognized = validOutcomeIds
+    ? ownOutcomeIds.some((outcomeId) => validOutcomeIds.has(outcomeId))
+    : ownOutcomeIds.length > 0;
+  if (ownOutcomeRecognized) {
     return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
   }
   // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
