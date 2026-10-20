@@ -441,10 +441,15 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
  * from the decision, the same treatment `assertHomeHolds`/`assertOrderingStated` give the gardener's
  * own re-parents and the `implied-order` link.
  *
- * Covers two drifts the lock window can introduce between `planAttachOutcome`'s read and this write:
- * a parentless task adopted under a feature (or a standalone epic that grew a feature child) stops
- * being a run target without closing, and a parent epic relabelled since the decision changes which
- * outcome the board now says to inherit.
+ * Covers three drifts the lock window can introduce between `planAttachOutcome`'s read and this
+ * write: a parentless task adopted under a feature (or a standalone epic that grew a feature
+ * child) stops being a run target without closing; a parent epic relabelled since the decision
+ * changes which outcome the board now says to inherit; and the subject itself re-parented onto a
+ * DIFFERENT determining epic that, by coincidence, currently suggests the same outcome string —
+ * `premiseBeadsOf` only locks `step.parent`, the epic the decision read, so a re-parent swaps in a
+ * new determining epic this write holds no lock on at all. Without comparing parents too, that
+ * swap passes here on the outcome matching alone, and a relabel of the NEW epic landing right after
+ * this check (and before `beads.tag`) writes a guess nothing serialized against.
  */
 async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> {
   if (step.verb !== "attach-outcome") return;
@@ -456,10 +461,15 @@ async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> 
       `${step.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`,
     );
   }
-  const current = suggestOutcome(board, subject).outcome;
-  if (current !== step.outcome) {
+  const current = suggestOutcome(board, subject);
+  if (current.parent !== step.parent) {
     throw new SubjectMovedError(
-      `${step.id}'s suggested outcome has moved to ${current} since this was decided — the board changed underneath this approval, so it refuses rather than write a stale guess`,
+      `${step.id}'s determining parent has moved to ${current.parent ?? "none"} since this was decided — the board changed underneath this approval, so it refuses rather than write a guess nothing locked`,
+    );
+  }
+  if (current.outcome !== step.outcome) {
+    throw new SubjectMovedError(
+      `${step.id}'s suggested outcome has moved to ${current.outcome} since this was decided — the board changed underneath this approval, so it refuses rather than write a stale guess`,
     );
   }
 }

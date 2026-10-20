@@ -10,9 +10,10 @@
  * better-sqlite3 dependency along.
  */
 import { beads, type Bead } from "../beads/bd";
+import { outcomeIdsOf } from "../backlog";
 import { CODEBASE_HEALTH_OUTCOME_ID, type ProjectOutcome } from "../outcomes";
 import type { TimelineEvent, TimelineEventKind } from "../timeline";
-import { labelValue, deriveStage, parseWhy, reviewScoreOf } from "../ticket-view";
+import { deriveStage, parseWhy, reviewScoreOf } from "../ticket-view";
 import type { Stage } from "../types";
 import { eventPhrase, templateHeadline } from "./headline-template";
 
@@ -36,7 +37,8 @@ export interface DigestFeatureCard {
   headline: string;
   /** The feature's `## Why`, quoted verbatim — undefined when the bead never authored one. */
   why: string | undefined;
-  /** The `outcome:<id>` label this feature serves, or undefined when it names none. */
+  /** The outcome this feature serves — an `outcome:<id>` label, or (for a standalone epic) its
+   * `## Outcome IDs` body — per {@link outcomeIdsOf}; undefined when it names none. */
   outcomeId: string | undefined;
   stage: Stage;
   prRef: string | undefined;
@@ -83,7 +85,7 @@ export function featureCardOf(
     title: bead.title,
     headline: templateHeadline(events),
     why: parseWhy(bead),
-    outcomeId: labelValue(bead.labels, "outcome"),
+    outcomeId: outcomeIdsOf(bead)[0],
     stage,
     prRef: beads.getPrRef(bead),
     prUrl: undefined,

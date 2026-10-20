@@ -52,6 +52,15 @@ describe("featureCardOf", () => {
     expect(featureCardOf(unlinked, [], undefined).outcomeId).toBeUndefined();
   });
 
+  it("also reads a standalone epic's ## Outcome IDs body, when it carries no outcome: label", () => {
+    const bodyLinked = makeBead({
+      id: "epic-1",
+      labels: [],
+      description: "## Outcome IDs\n\noutcome:reports-are-shareable",
+    });
+    expect(featureCardOf(bodyLinked, [], undefined).outcomeId).toBe("reports-are-shareable");
+  });
+
   it("passes the resolved cost straight through, including the unpriced undefined", () => {
     const bead = makeBead({ id: "feat-1" });
     expect(featureCardOf(bead, [], 12.5).costUsd).toBe(12.5);

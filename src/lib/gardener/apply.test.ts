@@ -1714,6 +1714,24 @@ describe("the gardener's outcome label", () => {
     expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
   });
 
+  it("refuses at the write boundary when the subject was re-parented onto a different epic, even one that currently suggests the same outcome", async () => {
+    // The decision reads the subject under epicA (inheriting its single outcome label). Before the
+    // write's own locked board read, the subject is re-parented onto epicB — a DIFFERENT determining
+    // epic that, by coincidence, carries the very same outcome label. The write locks epicA
+    // (`premiseBeadsOf`), never epicB, so comparing the outcome string alone would pass here on a
+    // parent nothing serialized against.
+    const epicA = bead("anton-epicA", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const epicB = bead("anton-epicB", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const feature = bead("anton-a", { issue_type: "feature", parent: "anton-epicA" });
+    liveBeads.set("anton-a", { ...feature, parent: "anton-epicB" });
+    const err = (await applyWith(proposalFor(OUTCOME), [epicA, epicB, feature]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/determining parent has moved to anton-epicB/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
   it("invalidates a plan whose outcome was edited after it was filed", () => {
     const tampered = { ...OUTCOME, detail: "a-different-outcome" };
     expect(parseGardenerPlan(tampered)).toBeUndefined();
