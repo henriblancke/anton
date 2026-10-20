@@ -1,16 +1,20 @@
 "use client";
 
-import { useState, useSyncExternalStore } from "react";
+import { Suspense, use, useState, useSyncExternalStore } from "react";
 import { HandIcon, TriangleAlertIcon } from "lucide-react";
 import Link from "next/link";
 
-import { MetaChip } from "@/components/atoms";
+import { MetaChip, RelativeTime } from "@/components/atoms";
+import { AutopilotBreakerHeader } from "@/components/health/autopilot-breaker-band";
 import { Disclosure } from "@/components/health/disclosure";
 import { DismissAllButton } from "@/components/health/dismiss-all-button";
 import { EscalationActions } from "@/components/health/escalation-actions";
 import { escalationAge } from "@/components/health/escalation-age";
+import { OperatorQueue } from "@/components/board/operator-queue";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
+import { isDisarm, type AutopilotBreaker } from "@/lib/autopilot-breaker";
 import { isBoardUnreachableFindingKey, isDismissable } from "@/lib/escalation-kinds";
-import type { EscalationKind, EscalationView } from "@/lib/types";
+import type { EscalationKind, EscalationView, ProposalAsk } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** What each class is, said the way a founder would say it. */
@@ -88,9 +92,18 @@ function isRequest(escalation: EscalationView): boolean {
 export function NeedsYouSection({
   slug,
   escalations,
+  id = "needs-you",
+  headingId = "needs-you-heading",
 }: {
   slug: string;
   escalations: EscalationView[];
+  /**
+   * Section/heading ids, overridable because `DigestNeedsYou` mounts this component twice (parked
+   * asks, merge-ready PRs) in the same document — the hardcoded defaults below would collide,
+   * leaving two elements sharing an id and an `aria-labelledby` with undefined resolution.
+   */
+  id?: string;
+  headingId?: string;
 }) {
   if (escalations.length === 0) return null;
 
@@ -101,8 +114,8 @@ export function NeedsYouSection({
 
   return (
     <section
-      id="needs-you"
-      aria-labelledby="needs-you-heading"
+      id={id}
+      aria-labelledby={headingId}
       className={cn(
         "overflow-hidden rounded-xl border",
         broken
@@ -116,7 +129,7 @@ export function NeedsYouSection({
         ) : (
           <HandIcon className="size-3.5 text-stage-in-review" aria-hidden="true" />
         )}
-        <h2 id="needs-you-heading" className="text-xs font-medium text-foreground">
+        <h2 id={headingId} className="text-xs font-medium text-foreground">
           Needs you
         </h2>
         {/* Counted apart, because one number covering both would answer neither question a founder
@@ -433,5 +446,163 @@ function EscalationRow({
         target={actionTarget(escalation)}
       />
     </>
+  );
+}
+
+/**
+ * The digest's own needs-you section (anton-16s0t): the few things only the operator can do,
+ * first, each with the action it already has elsewhere on the board — nothing new here.
+ *
+ * Composes four existing surfaces over `digestNeedsYou`'s ranked list rather than rendering its
+ * own rows: `AutopilotBreakerHeader` (re-arm), this file's own `NeedsYouSection` (parked asks and,
+ * separately, merge-ready PRs — both are escalations, so the one component that already renders
+ * them with Resolve-and-resume / Dismiss is reused unchanged), `ProposalQueue` (links to where
+ * approve/decline already live), and `OperatorQueue` (unblocked `agent:human` tickets, with its
+ * own Mark done).
+ *
+ * Rendered in `DIGEST_KIND_RANK` order, not DOM-source order: `NeedsYouSection` is mounted TWICE,
+ * once for `parked-ask` escalations (rank 1, ahead of proposals and tickets) and once for
+ * `merge-ready-pr` ones (rank 4, after them). A merge-ready PR waits on a reviewer, not on a
+ * decision only the founder can make right now, so interleaving it with `proposal`/`human-ticket`
+ * items — as a single combined escalation list would, since React renders each component's whole
+ * output as one block — would put the least urgent row ahead of the ones `digestNeedsYou` ranked
+ * higher.
+ *
+ * Renders nothing when `digestNeedsYou` found nothing to promote and there is no `breaker` to
+ * stream — the same silence rule every band on this board keeps.
+ */
+export function DigestNeedsYou({
+  slug,
+  summary,
+  breaker,
+  onOpenTicket,
+  onDone,
+}: {
+  slug: string;
+  summary: DigestNeedsYouSummary;
+  /**
+   * The autopilot-stopped row, streamed rather than folded into `summary` (PR #350 review): the
+   * digest page hands this down UNRESOLVED, because confirming a WIP hold can read GitHub for
+   * minutes, and that must not gate the headline or feature cards the rest of the page already
+   * painted. Unwrapped inside its own Suspense boundary below — the same arrangement the board page
+   * uses for its own breaker band (board-parts.tsx) — so only this row, not the whole section,
+   * waits on it.
+   */
+  breaker?: Promise<AutopilotBreaker | undefined>;
+  /** Opens a parented human ticket in the page's shared TicketDialog — see `OperatorQueue`. */
+  onOpenTicket: (ticketId: string) => void;
+  /** A queued ticket's Mark done landed — re-read whatever feeds `summary`. */
+  onDone?: () => void;
+}) {
+  if (summary.total === 0 && !breaker) return null;
+
+  // Only used when the caller folded a resolved `breaker` into `summary` itself (the older,
+  // fully-synchronous call shape some tests and non-streaming callers still use). The digest page
+  // never does this any more — it passes `breaker` as a promise below instead — so the two paths
+  // never both have something to show.
+  const breakerItem = summary.items.find((item) => item.kind === "breaker");
+  const parkedAsks = summary.items
+    .filter((item) => item.kind === "parked-ask")
+    .map((item) => item.escalation);
+  const mergeReadyPrs = summary.items
+    .filter((item) => item.kind === "merge-ready-pr")
+    .map((item) => item.escalation);
+  const proposals = summary.items
+    .filter((item) => item.kind === "proposal")
+    .map((item) => item.proposal);
+  const humanTickets = summary.items
+    .filter((item) => item.kind === "human-ticket")
+    .map((item) => item.item);
+
+  return (
+    <div className="flex flex-col gap-3">
+      {breaker ? (
+        <Suspense fallback={null}>
+          <StreamedBreakerHeader slug={slug} breaker={breaker} />
+        </Suspense>
+      ) : (
+        <AutopilotBreakerHeader slug={slug} breaker={breakerItem?.breaker} />
+      )}
+      <NeedsYouSection
+        slug={slug}
+        escalations={parkedAsks}
+        id="needs-you-parked"
+        headingId="needs-you-parked-heading"
+      />
+      <ProposalQueue slug={slug} proposals={proposals} />
+      <OperatorQueue slug={slug} items={humanTickets} onOpenTicket={onOpenTicket} onDone={onDone} />
+      <NeedsYouSection
+        slug={slug}
+        escalations={mergeReadyPrs}
+        id="needs-you-merge-ready"
+        headingId="needs-you-merge-ready-heading"
+      />
+    </div>
+  );
+}
+
+/**
+ * The breaker band, unwrapping the digest page's streamed promise inside the boundary above. A
+ * component rather than an inline `use()` in `DigestNeedsYou`, for the same reason
+ * `StreamedAttentionStrip` (board-parts.tsx) is: the whole point of the boundary is that only this
+ * unwrap suspends, not the rest of the section already on screen.
+ *
+ * Filtered to `isDisarm` here because this path bypasses `digestNeedsYou` (the promise is handed
+ * down unresolved, so it can't go through the summary's own item list) — without the filter a
+ * wip-limit hold would render a non-actionable band at the top of a "needs you" section while the
+ * board's own summary correctly reports zero breaker items.
+ */
+function StreamedBreakerHeader({
+  slug,
+  breaker,
+}: {
+  slug: string;
+  breaker: Promise<AutopilotBreaker | undefined>;
+}) {
+  const resolved = use(breaker);
+  return <AutopilotBreakerHeader slug={slug} breaker={resolved && isDisarm(resolved) ? resolved : undefined} />;
+}
+
+/**
+ * Open asks for a decision — approve or decline. No button here: both verbs already live on the
+ * proposal's own page (the standalone approval surface every other run target gets), and a second
+ * copy of them here would be a second place for the two to drift apart. This is a pointer to that
+ * page, nothing more.
+ */
+function ProposalQueue({ slug, proposals }: { slug: string; proposals: ProposalAsk[] }) {
+  if (proposals.length === 0) return null;
+
+  return (
+    <section
+      aria-labelledby="digest-proposals-heading"
+      className="overflow-hidden rounded-xl border border-stage-in-review/25 bg-stage-in-review/[0.04]"
+    >
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 border-b border-border/60 px-3 py-2">
+        <HandIcon className="size-3.5 text-stage-in-review" aria-hidden="true" />
+        <h2 id="digest-proposals-heading" className="text-xs font-medium text-foreground">
+          Proposals awaiting approval
+        </h2>
+        <MetaChip tone="pr">{proposals.length} to decide</MetaChip>
+      </div>
+      <ul className="divide-y divide-border/50">
+        {proposals.map((proposal) => (
+          <li
+            key={proposal.id}
+            className="flex flex-wrap items-center gap-x-2.5 gap-y-1 px-3 py-2"
+          >
+            <Link
+              href={`/projects/${slug}/epics/${proposal.id}`}
+              className="rounded-sm text-[13px] font-medium text-foreground underline-offset-2 hover:underline focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+            >
+              {proposal.title}
+            </Link>
+            <span className="font-mono text-[11px] text-subtle">{proposal.id}</span>
+            <MetaChip>
+              asked <RelativeTime iso={proposal.createdAt} />
+            </MetaChip>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }

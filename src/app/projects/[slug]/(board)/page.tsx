@@ -7,6 +7,8 @@ import { BoardSkeleton } from "@/components/board/board-skeleton";
 import { Topbar } from "@/components/shell/topbar";
 import { getBoard } from "@/lib/board";
 import { boardGroupingCookieName, parseBoardGrouping } from "@/lib/board-grouping";
+import { getDb } from "@/lib/db";
+import { projectDigestSummary } from "@/lib/digest/digest-read";
 import { openEscalations } from "@/lib/escalations";
 import { currentBreaker } from "@/lib/autopilot-state";
 import { unwatchedParksForProject } from "@/lib/unwatched-parks";
@@ -54,6 +56,24 @@ export default async function ProjectBoardPage({
       })
     : undefined;
 
+  // The since-you-looked summary the board banner links to (anton-16s0t): needs-you counts plus
+  // how much changed. Also NOT awaited, for the same reason `breaker` isn't (PR #350 review):
+  // `projectDigestSummary` itself awaits a breaker read that can take minutes (see digest-read.ts),
+  // so gating the board on it would reintroduce exactly the latency `breaker` above was pulled out
+  // of this `Promise.all` to avoid. Handed to the board and unwrapped inside its own Suspense
+  // boundary, same as `breaker`.
+  //
+  // `breaker` is passed through rather than left to start its own read (PR #350 review): without
+  // it, `projectDigestSummary` would spawn a second, independent `currentBreaker` call — doubling
+  // the `gh pr view` fan-out `currentWipHold` can do, and risking the attention strip and this
+  // summary observing different breaker states.
+  const digest = project
+    ? projectDigestSummary(getDb(), project, breaker).catch((err) => {
+        console.error(`[board] digest summary read failed for ${slug}`, err);
+        return undefined;
+      })
+    : undefined;
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <Topbar projectSlug={slug} projectName={project?.name} />
@@ -69,6 +89,7 @@ export default async function ProjectBoardPage({
             initialGrouping={grouping}
             escalations={escalations}
             parks={parks}
+            digest={digest}
             breaker={breaker}
             budgetAware={settings.budgetAware === true}
           />

@@ -151,6 +151,28 @@ export function CohortsIcon({ className }: { className?: string }) {
   );
 }
 
+/** Summary lines with a highlighted dot — the digest reads as what's new, not as board columns. */
+export function DigestIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      className={className}
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.3}
+      strokeLinecap="round"
+      aria-hidden="true"
+    >
+      <line x1="2" y1="4.5" x2="10.5" y2="4.5" />
+      <line x1="2" y1="8" x2="12.5" y2="8" />
+      <line x1="2" y1="11.5" x2="9" y2="11.5" />
+      <circle cx="13.3" cy="4.5" r="1.4" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function SpendIcon({ className }: { className?: string }) {
   return (
     <svg

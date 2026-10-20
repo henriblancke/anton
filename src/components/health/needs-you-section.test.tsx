@@ -12,10 +12,12 @@
  * "Dismiss all".
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 
-import { NeedsYouSection } from "@/components/health/needs-you-section";
-import type { EscalationView } from "@/lib/types";
+import { DigestNeedsYou, NeedsYouSection } from "@/components/health/needs-you-section";
+import { digestNeedsYou } from "@/lib/attention";
+import type { AutopilotBreaker, AutopilotDisarm } from "@/lib/autopilot-breaker";
+import type { EscalationView, OperatorQueueItem, ProposalAsk } from "@/lib/types";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -339,5 +341,190 @@ describe("NeedsYouSection", () => {
     const section = container.querySelector("section");
     expect(section?.getAttribute("aria-labelledby")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Needs you" })).toBeTruthy();
+  });
+});
+
+describe("DigestNeedsYou", () => {
+  const disarm: AutopilotDisarm = {
+    kind: "disarm",
+    reason: "consecutive-failures",
+    detail: "3 runs failed in a row",
+    evidence: ["run r-1 failed", "run r-2 failed"],
+  };
+
+  const proposal = (o: Partial<ProposalAsk> = {}): ProposalAsk => ({
+    id: "anton-prop1",
+    title: "Merge these duplicates",
+    createdAt: "2026-08-01T00:00:00Z",
+    ...o,
+  });
+
+  const queueItem = (o: Partial<OperatorQueueItem> = {}): OperatorQueueItem => ({
+    id: "anton-t1",
+    title: "Buy the domain",
+    stage: "backlog",
+    createdAt: "2026-08-01T00:00:00Z",
+    ...o,
+  });
+
+  it("renders nothing when digestNeedsYou found nothing to promote", () => {
+    const { container } = render(
+      <DigestNeedsYou slug="anton" summary={digestNeedsYou({})} onOpenTicket={() => {}} />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("composes the breaker band, the escalation list, the proposal queue, and the operator queue", () => {
+    const summary = digestNeedsYou({
+      breaker: disarm,
+      escalations: [escalation({ kind: "needs-human", gateId: "g-1", runId: undefined })],
+      proposals: [proposal()],
+      operatorQueue: [queueItem()],
+    });
+    render(<DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />);
+
+    // The breaker band's own re-arm affordance.
+    expect(screen.getByText("Autopilot is disarmed")).toBeTruthy();
+    expect(screen.getByText("Re-arm")).toBeTruthy();
+    // The existing escalation section, reused unchanged, with its own "to answer" count.
+    expect(screen.getByText("Waiting on you")).toBeTruthy();
+    expect(screen.getByText("1 to answer")).toBeTruthy();
+    // The proposal, linked to where approve/decline already live — no button here.
+    expect(screen.getByRole("link", { name: "Merge these duplicates" }).getAttribute("href")).toBe(
+      "/projects/anton/epics/anton-prop1",
+    );
+    expect(screen.getByText("1 to decide")).toBeTruthy();
+    // The operator queue's own row, with its own Mark done.
+    expect(screen.getByText("Buy the domain")).toBeTruthy();
+    expect(screen.getByText("Mark done")).toBeTruthy();
+  });
+
+  it("omits the merge-ready PR's own escalation group count from the proposal/ticket bands", () => {
+    const summary = digestNeedsYou({
+      escalations: [escalation({ kind: "stale-pr", prNumber: 7, prUrl: "https://gh/pr/7" })],
+    });
+    render(<DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />);
+    expect(screen.getByText("Stale PR")).toBeTruthy();
+    expect(screen.queryByText(/to decide/)).toBeNull();
+  });
+
+  it("withholds a human ticket something else still holds", () => {
+    const summary = digestNeedsYou({ operatorQueue: [queueItem({ hasOpenBlockers: true })] });
+    const { container } = render(
+      <DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("renders the merge-ready PR group after the proposal and ticket bands, not before (PR #350 review)", () => {
+    // `DIGEST_KIND_RANK` puts a merge-ready PR (rank 4) behind a proposal (rank 2) and a human
+    // ticket (rank 3) — a stale PR waits on a reviewer, not on a decision only the founder can make
+    // right now, so it must not obscure the higher-priority rows above it.
+    const summary = digestNeedsYou({
+      escalations: [escalation({ kind: "stale-pr", prNumber: 7, prUrl: "https://gh/pr/7" })],
+      proposals: [proposal()],
+      operatorQueue: [queueItem()],
+    });
+    render(<DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />);
+
+    const headings = [
+      screen.getByText("Merge these duplicates"),
+      screen.getByText("Buy the domain"),
+      screen.getByText("Stale PR"),
+    ];
+    const positions = headings.map((el) => el.compareDocumentPosition(headings[2]));
+    // Every other row's node precedes the stale-PR heading in document order.
+    for (const pos of positions.slice(0, 2)) {
+      expect(pos & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    }
+  });
+
+  it("gives the parked-ask and merge-ready-PR sections distinct ids when both are non-empty", () => {
+    // DigestNeedsYou mounts NeedsYouSection twice — once for parked asks, once for merge-ready
+    // PRs. Each mount renders a `<section id="needs-you-heading">`-labelled region; sharing the
+    // same ids (the component's old hardcoded default) would produce invalid duplicate-id HTML
+    // and an ambiguous `aria-labelledby` the moment both buckets are non-empty at once.
+    const summary = digestNeedsYou({
+      escalations: [
+        escalation({ kind: "needs-human", id: "esc-ask", gateId: "gate-1" }),
+        escalation({ kind: "stale-pr", id: "esc-pr", prNumber: 7, prUrl: "https://gh/pr/7" }),
+      ],
+    });
+    const { container } = render(
+      <DigestNeedsYou slug="anton" summary={summary} onOpenTicket={() => {}} />,
+    );
+
+    const sections = container.querySelectorAll("section[aria-labelledby^='needs-you']");
+    expect(sections).toHaveLength(2);
+    const ids = Array.from(sections).map((section) => section.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const section of Array.from(sections)) {
+      const labelledBy = section.getAttribute("aria-labelledby");
+      expect(labelledBy).toBeTruthy();
+      expect(document.querySelectorAll(`#${labelledBy}`)).toHaveLength(1);
+    }
+  });
+
+  it("streams the breaker row separately from an already-resolved summary", async () => {
+    const breaker: AutopilotBreaker = {
+      kind: "disarm",
+      reason: "consecutive-failures",
+      detail: "3 runs failed in a row",
+      evidence: [],
+    };
+    const summary = digestNeedsYou({ proposals: [proposal()] });
+
+    await act(async () => {
+      render(
+        <DigestNeedsYou
+          slug="anton"
+          summary={summary}
+          breaker={Promise.resolve(breaker)}
+          onOpenTicket={() => {}}
+        />,
+      );
+    });
+
+    expect(screen.getByText("Autopilot is disarmed")).toBeTruthy();
+    expect(screen.getByText("Merge these duplicates")).toBeTruthy();
+  });
+
+  it("drops a streamed wip-limit hold rather than rendering a non-actionable breaker band", async () => {
+    const hold: AutopilotBreaker = {
+      kind: "hold",
+      reason: "wip-limit",
+      detail: "3 of 3 PRs are open in review.",
+    };
+    const summary = digestNeedsYou({});
+
+    await act(async () => {
+      render(
+        <DigestNeedsYou
+          slug="anton"
+          summary={summary}
+          breaker={Promise.resolve(hold)}
+          onOpenTicket={() => {}}
+        />,
+      );
+    });
+
+    // A hold is excluded from `digestNeedsYou` (it clears itself and asks for nothing); the
+    // streamed breaker row must honor that same rule rather than rendering it anyway.
+    expect(screen.queryByText("Autopilot is holding")).toBeNull();
+  });
+
+  it("renders nothing yet, not an error, while the breaker promise is still pending", () => {
+    const summary = digestNeedsYou({});
+    const { container } = render(
+      <DigestNeedsYou
+        slug="anton"
+        summary={summary}
+        breaker={new Promise<AutopilotBreaker | undefined>(() => {})}
+        onOpenTicket={() => {}}
+      />,
+    );
+    // Nothing else to promote and the breaker hasn't answered yet: the section mounts (so the
+    // Suspense boundary can resolve later) but paints nothing visible in the meantime.
+    expect(container.textContent).toBe("");
   });
 });

@@ -68,7 +68,6 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
         `(${emission.created.map((p) => p.id).join(", ")})` +
         `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
     );
-    scope.nudge(scope.project);
   }
   if (emission.deferred > 0) {
     console.log(
@@ -81,6 +80,11 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
       `[product-master] ${scope.slug}: superseded ${emission.superseded.length} stale proposal(s) ` +
         `whose own suggestion had changed (${emission.superseded.map((p) => p.id).join(", ")})`,
     );
+  }
+  // A retry-only pass can close stale siblings with nothing new created; those closes are still
+  // board writes another machine needs to see, so propagation can't gate on created alone.
+  if (emission.created.length > 0 || emission.superseded.length > 0) {
+    scope.nudge(scope.project);
   }
 }
 

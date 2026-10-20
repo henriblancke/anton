@@ -5,10 +5,11 @@ import { TriangleAlertIcon } from "lucide-react";
 import { DragOverlay } from "@dnd-kit/core";
 
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
+import type { DigestBoardSummary } from "@/lib/digest/digest-read";
 import type { Epic, EscalationView, UnwatchedParks } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { EpicCard } from "@/components/board/epic-card";
-import { AttentionStrip } from "@/components/board/attention-strip";
+import { AttentionStrip, DigestBanner } from "@/components/board/attention-strip";
 import type { PolledBreaker } from "@/components/board/use-board-breaker";
 
 /**
@@ -45,6 +46,7 @@ export function BoardAttentionSlot({
   slug,
   escalations,
   parks,
+  digest,
   onArmed,
   polled,
   streamed,
@@ -52,6 +54,14 @@ export function BoardAttentionSlot({
   slug: string;
   escalations: EscalationView[];
   parks?: UnwatchedParks;
+  /**
+   * The board's since-you-looked summary (anton-16s0t). A PROMISE, not a value (PR #350 review):
+   * the page's own read awaits a breaker check that can take minutes, so it is handed down
+   * unresolved and unwrapped inside its own Suspense boundary below — the same arrangement as
+   * `streamed`, and for the same reason: the cards must not wait on it either. Absent only when
+   * the page has no project to read it for.
+   */
+  digest?: Promise<DigestBoardSummary | undefined>;
   onArmed: () => void;
   polled: PolledBreaker;
   /** The page's server-rendered read — a promise, because deciding the hold reads GitHub. */
@@ -67,9 +77,18 @@ export function BoardAttentionSlot({
     />
   );
   return (
-    <Suspense fallback={strip(undefined)}>
-      {polled ? strip(polled.value) : <StreamedAttentionStrip streamed={streamed} render={strip} />}
-    </Suspense>
+    <>
+      <Suspense fallback={strip(undefined)}>
+        {polled ? strip(polled.value) : <StreamedAttentionStrip streamed={streamed} render={strip} />}
+      </Suspense>
+      {/* Below the stopped/waiting strip, never instead of it: this band is standing "what changed"
+          context, not a stopped run needing a decision now. Its own boundary, falling back to
+          nothing: unlike the strip above, there are no already-resolved counts to show in the
+          meantime, so the banner simply appears once the read answers rather than painting twice. */}
+      <Suspense fallback={null}>
+        <StreamedDigestBanner slug={slug} digest={digest} />
+      </Suspense>
+    </>
   );
 }
 
@@ -87,6 +106,19 @@ function StreamedAttentionStrip({
   render: (breaker?: AutopilotBreaker) => React.ReactNode;
 }) {
   return <>{render(streamed ? use(streamed) : undefined)}</>;
+}
+
+/** The digest banner, unwrapping the page's digest-summary promise inside its own boundary above. */
+function StreamedDigestBanner({
+  slug,
+  digest,
+}: {
+  slug: string;
+  digest?: Promise<DigestBoardSummary | undefined>;
+}) {
+  const resolved = digest ? use(digest) : undefined;
+  if (!resolved) return null;
+  return <DigestBanner slug={slug} needsYou={resolved.needsYou} activityCount={resolved.activityCount} />;
 }
 
 /** The card that follows the cursor mid-drag. */

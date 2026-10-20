@@ -5,12 +5,15 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { rankAttention, hasAppliedActions, REWORK_SCORE_CEILING } from "@/lib/attention";
+import { digestNeedsYou, rankAttention, hasAppliedActions, REWORK_SCORE_CEILING } from "@/lib/attention";
+import type { AutopilotDisarm, AutopilotHold } from "@/lib/autopilot-breaker";
 import type {
   EscalationView,
   HygieneFinding,
   HygieneFindingKind,
   HygieneReport,
+  OperatorQueueItem,
+  ProposalAsk,
   ReviewTrajectory,
   ScoredTarget,
 } from "@/lib/types";
@@ -159,6 +162,92 @@ describe("rankAttention", () => {
       expect(summary.reported).toBe(true);
       expect(summary.clean).toBe(false);
     });
+  });
+});
+
+describe("digestNeedsYou", () => {
+  const disarm = (o: Partial<AutopilotDisarm> = {}): AutopilotDisarm => ({
+    kind: "disarm",
+    reason: "consecutive-failures",
+    detail: "3 runs failed in a row",
+    evidence: ["run r-1 failed", "run r-2 failed", "run r-3 failed"],
+    ...o,
+  });
+
+  const hold = (): AutopilotHold => ({ kind: "hold", reason: "wip-limit", detail: "3/3 in review" });
+
+  const proposalAsk = (o: Partial<ProposalAsk> = {}): ProposalAsk => ({
+    id: "p-1",
+    title: "Merge these duplicates",
+    createdAt: "2026-08-01T00:00:00Z",
+    ...o,
+  });
+
+  const queueItem = (o: Partial<OperatorQueueItem> = {}): OperatorQueueItem => ({
+    id: "t-1",
+    title: "Buy the domain",
+    stage: "backlog",
+    createdAt: "2026-08-01T00:00:00Z",
+    ...o,
+  });
+
+  it("promotes a disarmed autopilot, but not a hold — a hold asks for nothing", () => {
+    expect(digestNeedsYou({ breaker: disarm() }).counts.breaker).toBe(1);
+    expect(digestNeedsYou({ breaker: hold() }).total).toBe(0);
+    expect(digestNeedsYou({}).total).toBe(0);
+  });
+
+  it("splits escalations into parked asks and merge-ready PRs, dropping every other kind", () => {
+    const { items, counts } = digestNeedsYou({
+      escalations: [
+        escalation({ id: "e-ask", kind: "needs-human" }),
+        escalation({ id: "e-pr", kind: "stale-pr", prNumber: 7, prUrl: "https://gh/pr/7" }),
+        escalation({ id: "e-run", kind: "parked-run" }),
+        escalation({ id: "e-lease", kind: "dead-lease" }),
+        escalation({ id: "e-job", kind: "exhausted-job" }),
+      ],
+    });
+    expect(items.map((i) => i.kind)).toEqual(["parked-ask", "merge-ready-pr"]);
+    expect(counts).toMatchObject({ "parked-ask": 1, "merge-ready-pr": 1 });
+  });
+
+  it("includes an open proposal", () => {
+    const { items } = digestNeedsYou({ proposals: [proposalAsk()] });
+    expect(items).toEqual([{ key: "proposal:p-1", kind: "proposal", proposal: proposalAsk() }]);
+  });
+
+  it("promotes an unblocked human ticket but withholds one something else still holds", () => {
+    const { items } = digestNeedsYou({
+      operatorQueue: [queueItem({ id: "free" }), queueItem({ id: "held", hasOpenBlockers: true })],
+    });
+    expect(items.map((i) => (i.kind === "human-ticket" ? i.item.id : i.kind))).toEqual(["free"]);
+  });
+
+  it("ranks a stopped autopilot first, then asks, proposals, tickets, merge-ready PRs last", () => {
+    const { items } = digestNeedsYou({
+      breaker: disarm(),
+      escalations: [
+        escalation({ id: "e-ask", kind: "needs-human" }),
+        escalation({ id: "e-pr", kind: "stale-pr" }),
+      ],
+      proposals: [proposalAsk()],
+      operatorQueue: [queueItem()],
+    });
+    expect(items.map((i) => i.kind)).toEqual([
+      "breaker",
+      "parked-ask",
+      "proposal",
+      "human-ticket",
+      "merge-ready-pr",
+    ]);
+  });
+
+  it("counts total as the number of promoted rows", () => {
+    const { total } = digestNeedsYou({
+      escalations: [escalation({ kind: "needs-human" }), escalation({ id: "e2", kind: "stale-pr" })],
+      proposals: [proposalAsk()],
+    });
+    expect(total).toBe(3);
   });
 });
 
