@@ -380,6 +380,10 @@ describe("the proposal bead", () => {
     expect(draft.description).toContain("bd update <id> --add-label outcome:<id>");
     expect(draft.description).not.toContain("approving it applies the move");
     expect(draft.acceptance).toContain("DECLINED");
+    // The done-state checkbox must not advertise `outcome:unknown` itself as the applied state —
+    // that would pass outcomeIdsOf's own regex, contradicting the by-hand instruction above.
+    expect(draft.acceptance).not.toContain("labelled outcome:unknown");
+    expect(draft.acceptance).toContain("never `outcome:unknown`");
   });
 
   it("states the suggested outcome as the applied state when there is one to apply", () => {

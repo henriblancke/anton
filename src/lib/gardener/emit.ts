@@ -912,7 +912,14 @@ function appliedState(detection: GardenerDetection): string {
       // is what every applied outcome guarantees, so the gate alone is what the box asserts.
       return `${subjects} ${is} approved — the gate is granted, which is the state a run starts from`;
     case "attach-outcome":
-      return `${subjects} ${is} labelled outcome:${detection.detail}, so the digest groups ${detection.subjects.length === 1 ? "it" : "them"} under that outcome`;
+      // `unknown` is a sentinel for "no signal suggested one" (unlinked-outcome.ts), never a label
+      // anton writes (apply-plan.ts `planAttachOutcome` refuses it). Asserting it here would tell
+      // the operator that labelling the bead `outcome:unknown` is the done state, which both
+      // contradicts MANUAL_INSTRUCTIONS' "pick a real id" and would pass outcomeIdsOf's regex if
+      // someone followed it literally, suppressing this gap instead of resolving it.
+      return isManualProposal(detection)
+        ? `${subjects} ${is} labelled with the real outcome:<id> chosen by hand, so the digest groups ${detection.subjects.length === 1 ? "it" : "them"} under that outcome — never \`outcome:unknown\``
+        : `${subjects} ${is} labelled outcome:${detection.detail}, so the digest groups ${detection.subjects.length === 1 ? "it" : "them"} under that outcome`;
   }
 }
 
