@@ -467,6 +467,22 @@ async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> 
   // exhaustive (see apply.ts `outcomeIdsIfNeeded`, which this mirrors).
   const markdown = await readProductMd(repo);
   const validOutcomeIds = outcomesConfigured(markdown) ? allOutcomeIds(parseOutcomes(markdown)) : undefined;
+  // Mirrors `planAttachOutcome`'s own settle, re-asked against THIS read: a recognized label the
+  // subject already carries — placed by hand, or by a concurrent approval, in the window between
+  // the decision and this lock — is a live decision, not a stale guess to overwrite. Checked
+  // against the FIRST id alone, the one `featureCardOf` reads, and ahead of the parent/outcome
+  // re-derivation below: without this, a fresh human pick that happens to leave the parent-derived
+  // suggestion unchanged for THIS subject would sail through and `runStep` would untag it in favor
+  // of the older guess this step was decided with (P2 review, PR #351).
+  const ownFirstId = outcomeIdsOf(subject)[0];
+  const ownFirstRecognized = validOutcomeIds
+    ? ownFirstId !== undefined && validOutcomeIds.has(ownFirstId)
+    : ownFirstId !== undefined;
+  if (ownFirstRecognized && ownFirstId !== step.outcome) {
+    throw new SubjectMovedError(
+      `${step.id} now carries outcome:${ownFirstId} — labelled since this was decided, so the apply refuses rather than replace a recognized outcome with its own older guess`,
+    );
+  }
   const current = suggestOutcome(board, subject, validOutcomeIds);
   if (current.parent !== step.parent) {
     throw new SubjectMovedError(
@@ -956,7 +972,19 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
         .filter((id) => id !== step.outcome)
         .map((id) => `outcome:${id}`);
       if (stale.length > 0) await beads.untag(repo, step.id, stale);
-      await beads.tag(repo, step.id, [`outcome:${step.outcome}`]);
+      try {
+        await beads.tag(repo, step.id, [`outcome:${step.outcome}`]);
+      } catch (err) {
+        // The untag already landed, so a rejected/timed-out tag leaves the subject carrying no
+        // outcome label at all — invisible to `applySteps`' `changed` prefix (this step never
+        // returns) and to every caller that walks that list to report what the apply moved. Name
+        // it as stranded rather than let the bare error read as "nothing was written".
+        if (stale.length === 0) throw err;
+        throw new StrandedWriteError(
+          `${step.id} had its stale outcome label(s) removed but could not be tagged outcome:${step.outcome} (${messageOf(err)}) — it is left carrying no outcome label at all until a human re-tags it`,
+          [step.id],
+        );
+      }
       return true;
     }
   }

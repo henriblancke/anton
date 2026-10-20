@@ -1778,6 +1778,43 @@ describe("the gardener's outcome label", () => {
     expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
   });
 
+  // P2 review, PR #351: a fresh board read saw a human's newer outcome label but categorized it as
+  // stale solely because it differed from `step.outcome` — `assertOutcomeHolds` only re-derived the
+  // parent/stringer suggestion and never checked the subject's own newly selected outcome, so the
+  // write would have removed the operator's live decision and replaced it with its own older guess.
+  it("refuses at the write boundary when the subject was hand-labelled with a different, recognized outcome since the decision", async () => {
+    const subject = cold("anton-a", { labels: ["source:stringer"] });
+    liveBeads.set("anton-a", { ...subject, labels: ["source:stringer", "outcome:trustworthy-board"] });
+    const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/anton-a now carries outcome:trustworthy-board/);
+    expect(calls.filter((c) => c.startsWith("tag") || c.startsWith("untag"))).toEqual([]);
+  });
+
+  // P2 review, PR #351: removing the stale label and then having the tag write reject (a `bd`
+  // subprocess that times out or exits nonzero) used to throw the raw error, which leaves the
+  // subject off `applySteps`' `changed` prefix as if nothing were written — even though the stale
+  // label is already gone. Name the subject as stranded instead.
+  it("names the stranded subject when the outcome tag write fails after the stale label is already removed", async () => {
+    productMarkdown = "## Outcomes\n- `oriented-operator` — Users feel oriented.\n";
+    const subject = cold("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
+    failOn.set("tag:anton-a", 1);
+    const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("failed");
+    expect(err.message).toMatch(
+      /anton-a had its stale outcome label\(s\) removed but could not be tagged outcome:codebase-health/,
+    );
+    expect(err.changed).toEqual(["anton-a"]);
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([
+      "untag anton-a outcome:typo-dh",
+      "tag anton-a outcome:codebase-health",
+    ]);
+  });
+
   it("invalidates a plan whose outcome was edited after it was filed", () => {
     const tampered = { ...OUTCOME, detail: "a-different-outcome" };
     expect(parseGardenerPlan(tampered)).toBeUndefined();
