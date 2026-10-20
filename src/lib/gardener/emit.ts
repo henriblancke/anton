@@ -393,25 +393,39 @@ export async function emitProposals(repo: string, input: EmissionInput): Promise
   // is what actually makes good on closeStaleSiblings' claim that "the next pass retries": without
   // this loop, a suppressed claim's stale sibling is never looked at again, because it only ever
   // reaches staleSiblingsOf by way of a detection that is about to be freshly created.
+  //
+  // The claim's own ask may itself be DECLINED by now rather than open — suppression keys on "not
+  // settled", not "open" (see suppressedFingerprints) — and the stale sibling is just as obsolete
+  // either way: the board moved under it before anyone decided anything, which has nothing to do
+  // with what the operator later decided about the fresh ask. Requiring an open `answering` bead
+  // here would skip the retry for as long as the decline suppresses the fingerprint, leaving the
+  // stale sibling open and approvable indefinitely.
   for (const detection of plan.suppressed) {
     if (input.signal?.aborted) throw new PartialEmissionError(sofar(), input.signal.reason);
     const stale = plan.supersedes.get(detection.fingerprint);
     if (!stale) continue;
-    const keep = openProposalIdFor(input.board, detection.fingerprint);
-    if (!keep) continue;
-    superseded.push(...(await closeStaleSiblings(repo, keep, detection.fingerprint, stale)));
+    const answering = answeringProposalIdFor(input.board, detection.fingerprint);
+    if (!answering) continue;
+    superseded.push(...(await closeStaleSiblings(repo, answering, detection.fingerprint, stale)));
   }
 
   return sofar();
 }
 
-/** The id of the open proposal already on the board answering for `fingerprint`, if any — the
- * `keep` a retried {@link closeStaleSiblings} supersedes stale siblings in favor of, when the fresh
- * ask that outgrew them was created on an earlier pass rather than this one. */
-function openProposalIdFor(board: Bead[], fingerprint: string): string | undefined {
+/**
+ * The id of the proposal already on the board answering for `fingerprint`, if any — the `keep` a
+ * retried {@link closeStaleSiblings} supersedes stale siblings in favor of, when the fresh ask that
+ * outgrew them was created on an earlier pass rather than this one.
+ *
+ * Open OR declined-and-still-suppressing: the only caller reaches this from `plan.suppressed`, where
+ * `suppressedFingerprints` has already proven some bead currently answers for this fingerprint one
+ * way or the other. Requiring the bead be open missed the declined case — a stale sibling whose
+ * replacement was declined before this retry ran would never be found again.
+ */
+function answeringProposalIdFor(board: Bead[], fingerprint: string): string | undefined {
   return board.find(
     (bead) =>
-      isOpenWork(bead) &&
+      (isOpenWork(bead) || beads.isAbandoned(bead)) &&
       (fingerprintLabelOf(bead) === fingerprint || canonicalFingerprintOf(bead) === fingerprint),
   )?.id;
 }

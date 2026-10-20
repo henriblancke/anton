@@ -744,6 +744,36 @@ describe("superseding a changed outcome suggestion", () => {
     expect(reason).toContain(createdBeads[0].id);
   });
 
+  it("retries closing a stale sibling even once its own replacement was declined, not just while open", async () => {
+    const stale = staleProposal("anton-stale", unknown("anton-feat"));
+    liveBeads.set(stale.id, stale);
+    closeMock.mockRejectedValueOnce(new Error("transient dolt write failure"));
+
+    const first = await emitProposals(REPO, { board: [stale], detections: [inherited("anton-feat")] });
+    expect(first.superseded).toEqual([]);
+    closeMock.mockClear();
+
+    // The operator declines the replacement before the next patrol runs — it stays on the board as
+    // a closed, abandoned bead. Suppression keys on "not settled", not "open" (a human's no is not
+    // re-litigated), so the detection is still suppressed, and the stale sibling it was meant to
+    // outgrow is just as obsolete as it was the moment it was created — that has nothing to do with
+    // what the operator later decided about the fresh ask.
+    const declined: Bead = {
+      ...createdBeads[0],
+      status: "closed",
+      labels: [...(createdBeads[0].labels ?? []), LABELS.abandoned],
+    };
+    const board = [stale, declined];
+    const second = await emitProposals(REPO, { board, detections: [inherited("anton-feat")] });
+
+    expect(second.created).toEqual([]);
+    expect(second.superseded).toEqual([{ id: "anton-stale", label: fingerprintLabelOf(stale) }]);
+    expect(closeMock).toHaveBeenCalledTimes(1);
+    const [, closedId, reason] = closeMock.mock.calls[0];
+    expect(closedId).toBe("anton-stale");
+    expect(reason).toContain(declined.id);
+  });
+
   it("never supersedes across kinds whose fingerprint already hashes the whole claim", async () => {
     // `container-orphan` has no DetailShape, so two different fingerprints for it are two different
     // asks, not one ask that moved — nothing here should ever close one for the other.
