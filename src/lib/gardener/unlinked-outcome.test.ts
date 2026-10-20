@@ -70,6 +70,52 @@ describe("unlinked-outcome (anton-vie0k)", () => {
     expect(detection.detail).toBe(UNKNOWN_OUTCOME);
   });
 
+  // PR #351 review: a parent epic's `outcome:<id>` label can name an id the project no longer
+  // defines (a typo, or one deleted from PRODUCT.md) — inheriting it unchecked would get the label
+  // written on approval, yet `groupFeatureCards` only groups under ids `readProjectOutcomes`
+  // returns, leaving the card unlinked forever with nothing left to re-ask.
+  describe("validating an inherited outcome against the project's configured set", () => {
+    it("asks the operator when the parent epic's single outcome isn't one the project defines", () => {
+      const index = indexWorkBoard([
+        epic("anton-epic", { labels: ["outcome:typo-dh"] }),
+        feature("anton-feat", { parent: "anton-epic" }),
+      ]);
+      const suggestion = suggestOutcome(
+        index,
+        index.byId.get("anton-feat")!,
+        new Set(["oriented-operator", "codebase-health"]),
+      );
+
+      expect(suggestion.outcome).toBe(UNKNOWN_OUTCOME);
+      expect(suggestion.parent).toBe("anton-epic");
+      expect(suggestion.evidence.join("\n")).toContain("typo-dh");
+    });
+
+    it("still inherits when the parent epic's single outcome IS one the project defines", () => {
+      const index = indexWorkBoard([
+        epic("anton-epic", { labels: ["outcome:oriented-operator"] }),
+        feature("anton-feat", { parent: "anton-epic" }),
+      ]);
+      const suggestion = suggestOutcome(
+        index,
+        index.byId.get("anton-feat")!,
+        new Set(["oriented-operator", "codebase-health"]),
+      );
+
+      expect(suggestion.outcome).toBe("oriented-operator");
+    });
+
+    it("trusts the label unchecked when no valid set is given, same as before this validation existed", () => {
+      const index = indexWorkBoard([
+        epic("anton-epic", { labels: ["outcome:anything-at-all"] }),
+        feature("anton-feat", { parent: "anton-epic" }),
+      ]);
+      const suggestion = suggestOutcome(index, index.byId.get("anton-feat")!);
+
+      expect(suggestion.outcome).toBe("anything-at-all");
+    });
+  });
+
   it("suggests codebase-health for stringer-filed work with no epic outcome to inherit", () => {
     const detection = only([bead("anton-bug", { issue_type: "bug", labels: ["source:stringer"] })]);
 

@@ -41,6 +41,7 @@ import {
 } from "../gardener/emit";
 import { shadowProposals } from "../gardener/shadow";
 import { proposalTrackRecord } from "../gardener/track-record";
+import { allOutcomeIds, outcomesConfigured, parseOutcomes, readProductMd } from "../outcomes";
 import type { HygieneFinding } from "../hygiene";
 import type { PassScope } from "./pass-preamble";
 
@@ -284,9 +285,19 @@ export async function fileGardenerProposals(
   // measure. Re-asking nightly is not noise either: an ask already standing suppresses on its
   // fingerprint, and a declined one holds for the stated window (detections.ts `REASK_AFTER_DAYS`).
   const index = indexWorkBoard(board);
+  // Read alongside the board so `detectUnlinkedOutcomes` can validate an epic-inherited
+  // `outcome:<id>` against what PRODUCT.md actually defines (P2 review, PR #351) — a typo'd or
+  // since-deleted id falls through to `unknown` here rather than being proposed, approved, and
+  // written as a label `groupFeatureCards` will never recognize. Only once the project has actually
+  // declared `## Outcomes` (apply.ts `outcomeIdsIfNeeded`) — before that, every id stays unchecked
+  // rather than held to a set that predates the contract and was never meant to be exhaustive.
+  const productMd = await readProductMd(repo);
+  const validOutcomeIds = outcomesConfigured(productMd)
+    ? allOutcomeIds(parseOutcomes(productMd))
+    : undefined;
   const detections = [
     ...detectBoard({ board, hygiene: { findings: input.findings }, now }),
-    ...detectUnlinkedOutcomes(index, now),
+    ...detectUnlinkedOutcomes(index, now, validOutcomeIds),
     ...detectDeferredRejudgements(index, now),
   ];
   await ctx.heartbeat();

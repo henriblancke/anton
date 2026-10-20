@@ -27,6 +27,7 @@ import {
   sameCycles,
   sameTargetEligibilityState,
 } from "../beads/issues";
+import { allOutcomeIds, outcomesConfigured, parseOutcomes, readProductMd } from "../outcomes";
 import { CYCLE_AWARE_MOVES, planApply, toBdStampGrid, type ApplyMoment } from "./apply";
 import {
   autonomyFor,
@@ -264,10 +265,22 @@ export async function shadowProposals(input: ShadowInput): Promise<ShadowRecord[
     nowMs: input.nowMs,
     observedAtMs: input.observedAtMs === undefined ? undefined : toBdStampGrid(input.observedAtMs),
   };
+  // Fetched once, like `cycles` above, and only when a shadowed target actually consults it
+  // (`attach-outcome` — `planApply` only reaches `suggestOutcome`'s validation for that move), and
+  // only once the project has actually declared `## Outcomes` (apply.ts `outcomeIdsIfNeeded`):
+  // before that, every id stays unchecked rather than being held to a set that was never meant to
+  // be exhaustive. Never throws, so this never costs the shadow its other records the way a
+  // `depCycles` failure can.
+  let validOutcomeIds: ReadonlySet<string> | undefined;
+  if (targets.some(({ plan }) => plan.move === "attach-outcome")) {
+    const markdown = await readProductMd(input.repo);
+    if (outcomesConfigured(markdown)) validOutcomeIds = allOutcomeIds(parseOutcomes(markdown));
+  }
+
   const records: ShadowRecord[] = [];
   for (const { proposal, plan } of targets) {
     if (input.signal?.aborted) break;
-    const record = decide(proposal.id, plan, board, at);
+    const record = decide(proposal.id, plan, board, at, validOutcomeIds);
     records.push(record);
     await write(input, lineOf(record));
   }
@@ -280,6 +293,7 @@ function decide(
   plan: GardenerPlan,
   board: Bead[],
   at: ApplyMoment,
+  validOutcomeIds?: ReadonlySet<string>,
 ): ShadowRecord {
   const base = {
     proposal,
@@ -290,7 +304,7 @@ function decide(
     ...(plan.target ? { target: plan.target } : {}),
   };
   try {
-    const decision = planApply(plan, board, at);
+    const decision = planApply(plan, board, at, undefined, validOutcomeIds);
     // Verbatim on every branch, refusals most of all: an operator arms a kind on the strength of
     // these reasons, so a summarized one is a decision made on anton's paraphrase of itself.
     if (decision.status === "refuse") return { ...base, outcome: "refuse", detail: decision.reason };

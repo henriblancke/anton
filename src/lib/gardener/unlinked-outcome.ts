@@ -43,8 +43,20 @@ const MAX_GOAL_HINT_CHARS = 240;
  * target between this pass's read and approval leaves the proposal unappliable (`subjectBusy`
  * refuses it) for good once that run closes the target — a stale ask a human has to notice and
  * decline by hand rather than one the next pass simply stops re-raising.
+ *
+ * `validOutcomeIds`, when the caller can afford the read, is every id `readProjectOutcomes` still
+ * recognizes (`outcomes.ts` `allOutcomeIds`) — passed through to {@link suggestOutcome} so a parent
+ * epic's `outcome:<id>` label naming a typo'd or retired-past-recognition id is never inherited as
+ * if it still named something (PR #351 review): without it the suggestion would be proposed,
+ * approved, and written, yet `groupFeatureCards` would never recognize it, leaving the card
+ * unlinked forever with nothing left to re-ask. Undefined (a caller that cannot afford the read)
+ * keeps the old unchecked behavior rather than refusing to detect at all.
  */
-export function detectUnlinkedOutcomes(index: BoardIndex, nowMs: number): GardenerDetection[] {
+export function detectUnlinkedOutcomes(
+  index: BoardIndex,
+  nowMs: number,
+  validOutcomeIds?: ReadonlySet<string>,
+): GardenerDetection[] {
   const detections: GardenerDetection[] = [];
 
   for (const bead of index.all) {
@@ -53,7 +65,7 @@ export function detectUnlinkedOutcomes(index: BoardIndex, nowMs: number): Garden
     if (isInFlight(bead, nowMs) || isClaimed(bead)) continue;
     if (outcomeIdsOf(bead).length > 0) continue;
 
-    const suggestion = suggestOutcome(index, bead);
+    const suggestion = suggestOutcome(index, bead, validOutcomeIds);
     const goalHint = goalHintOf(bead);
     detections.push(
       makeDetection({
@@ -98,19 +110,42 @@ export interface Suggestion {
  * Exported so apply-plan.ts/apply-steps.ts can re-run the same guess against a FRESH board before
  * writing the label — the proposal's own `detail` is frozen at detection time, and a parent epic
  * relabelled between filing and approval must change the answer, not just the evidence text.
+ *
+ * `validOutcomeIds`, when passed, is every id the project still recognizes, retired included
+ * (`outcomes.ts` `allOutcomeIds`, read off `readProjectOutcomes`) — the epic-inheriting rung checks
+ * the parent's single `outcome:<id>` label against it before offering to inherit, so a
+ * syntactically valid but nonexistent id (a typo, or one deleted from `## Outcomes` outright, as
+ * opposed to merely marked `(retired)`) falls through to `unknown` instead of being inherited as if
+ * it still named a real outcome (P2 review, PR #351): `groupFeatureCards` only groups under ids
+ * `readProjectOutcomes` returns, so a bad id written here would leave the card unlinked forever
+ * with nothing left to re-ask. Omitted entirely, the rung trusts the label as before — callers that
+ * cannot afford the read still get the old guess rather than no detection at all.
  */
-export function suggestOutcome(index: BoardIndex, bead: Bead): Suggestion {
+export function suggestOutcome(
+  index: BoardIndex,
+  bead: Bead,
+  validOutcomeIds?: ReadonlySet<string>,
+): Suggestion {
   const parentId = beads.parentOf(bead);
   const parent = parentId ? index.byId.get(parentId) : undefined;
   const parentEpic = parent && beads.isEpic(parent) ? parent : undefined;
 
   if (parentEpic) {
     const epicOutcomes = epicOutcomeLabels(parentEpic);
-    if (epicOutcomes.length === 1) {
+    if (epicOutcomes.length === 1 && (!validOutcomeIds || validOutcomeIds.has(epicOutcomes[0]))) {
       return {
         outcome: epicOutcomes[0],
         evidence: [
           `its parent epic ${parentEpic.id} carries exactly one outcome:${epicOutcomes[0]} label — inherit it`,
+        ],
+        parent: parentEpic.id,
+      };
+    }
+    if (epicOutcomes.length === 1) {
+      return {
+        outcome: UNKNOWN_OUTCOME,
+        evidence: [
+          `its parent epic ${parentEpic.id} carries outcome:${epicOutcomes[0]}, but the project's PRODUCT.md no longer defines that outcome — ask the operator rather than inherit a dead id`,
         ],
         parent: parentEpic.id,
       };

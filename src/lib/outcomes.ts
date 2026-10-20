@@ -170,3 +170,11 @@ export async function projectOutcomesConfigured(repoPath: string): Promise<boole
 export function activeOutcomeIds(outcomes: ProjectOutcome[]): Set<string> {
   return new Set(outcomes.filter((o) => !o.retired).map((o) => o.id));
 }
+
+/** Every id the project recognizes at all, retired included — what a caller validating an EXISTING
+ * or INHERITED label (rather than offering a choice for new work) checks against: a retired
+ * outcome's prior labels stay valid ({@link ProjectOutcome.retired}), and inheriting one from a
+ * parent epic is the same kind of carry-over, not a new pick. */
+export function allOutcomeIds(outcomes: ProjectOutcome[]): Set<string> {
+  return new Set(outcomes.map((o) => o.id));
+}

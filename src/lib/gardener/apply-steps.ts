@@ -16,6 +16,7 @@ import { ownerOf as claimHolder, swapUnderLock, type SwapResult } from "../beads
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { resolveOperator } from "../operator";
+import { allOutcomeIds, outcomesConfigured, parseOutcomes, readProductMd } from "../outcomes";
 import {
   indexBoard,
   isInFlight,
@@ -461,7 +462,12 @@ async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> 
       `${step.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`,
     );
   }
-  const current = suggestOutcome(board, subject);
+  // Validation only fires once the project has actually declared `## Outcomes` — before that, a
+  // hand-labelled epic predating the contract would fail a check that was never meant to be
+  // exhaustive (see apply.ts `outcomeIdsIfNeeded`, which this mirrors).
+  const markdown = await readProductMd(repo);
+  const validOutcomeIds = outcomesConfigured(markdown) ? allOutcomeIds(parseOutcomes(markdown)) : undefined;
+  const current = suggestOutcome(board, subject, validOutcomeIds);
   if (current.parent !== step.parent) {
     throw new SubjectMovedError(
       `${step.id}'s determining parent has moved to ${current.parent ?? "none"} since this was decided — the board changed underneath this approval, so it refuses rather than write a guess nothing locked`,

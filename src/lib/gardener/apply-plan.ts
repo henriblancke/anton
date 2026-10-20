@@ -374,12 +374,18 @@ export interface ApplyMoment {
  * container bar to it ({@link heldCarriers}) — the same narrowing a step makes under its own locks
  * (apply-steps.ts `assertClusterHolds`). A caller holding no locks passes nothing and the bar counts
  * freely, which is right for a decision taken against a snapshot: it is deciding, not writing.
+ *
+ * `validOutcomeIds`, read by `attach-outcome` alone (`planAttachOutcome` → `suggestOutcome`), is
+ * every outcome id the project currently recognizes — a caller that can afford `readProjectOutcomes`
+ * passes it so an epic-inherited id that no longer exists is refused rather than written (P2 review,
+ * PR #351); omitted, that rung trusts the label unchecked, same as before this validation existed.
  */
 export function planApply(
   plan: GardenerPlan,
   board: Bead[],
   at: ApplyMoment,
   held?: CarriedPremise,
+  validOutcomeIds?: ReadonlySet<string>,
 ): ApplyDecision {
   const index = indexBoard(board);
   switch (plan.move) {
@@ -406,7 +412,7 @@ export function planApply(
     case "undefer":
       return planUndefer(plan, index, at);
     case "attach-outcome":
-      return planAttachOutcome(plan, index, at);
+      return planAttachOutcome(plan, index, at, validOutcomeIds);
   }
 }
 
@@ -1189,7 +1195,12 @@ const fromPriority = (subject: Bead): string =>
 
 // ── attach-outcome ──
 
-function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMoment): ApplyDecision {
+function planAttachOutcome(
+  plan: GardenerPlan,
+  index: BoardIndex,
+  at: ApplyMoment,
+  validOutcomeIds?: ReadonlySet<string>,
+): ApplyDecision {
   const [id] = plan.subjects;
   if (plan.subjects.length !== 1 || !id) {
     return { status: "refuse", reason: "an outcome proposal names exactly one bead" };
@@ -1218,7 +1229,7 @@ function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMomen
   // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
   // frozen at filing time, and a parent epic relabelled (or re-parented away) since then must change
   // the answer the write actually lands, not just the evidence text the approver saw.
-  const suggestion = suggestOutcome(index, subject);
+  const suggestion = suggestOutcome(index, subject, validOutcomeIds);
   // The literal answer `detectUnlinkedOutcomes` suggests when neither board signal fired — the ask
   // is "which outcome does this serve?", and only a human can answer it.
   if (suggestion.outcome === UNKNOWN_OUTCOME) {

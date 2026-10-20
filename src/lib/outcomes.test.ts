@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   activeOutcomeIds,
+  allOutcomeIds,
   outcomesConfigured,
   parseOutcomes,
   projectOutcomesConfigured,
@@ -216,6 +217,15 @@ describe("activeOutcomeIds", () => {
       ["## Outcomes", "- `live` — Still offered.", "- `dead` — Gone (retired)."].join("\n"),
     );
     expect(activeOutcomeIds(outcomes)).toEqual(new Set(["codebase-health", "live"]));
+  });
+});
+
+describe("allOutcomeIds", () => {
+  it("keeps retired ids too — an existing or inherited label referencing one still resolves", () => {
+    const outcomes = parseOutcomes(
+      ["## Outcomes", "- `live` — Still offered.", "- `dead` — Gone (retired)."].join("\n"),
+    );
+    expect(allOutcomeIds(outcomes)).toEqual(new Set(["codebase-health", "live", "dead"]));
   });
 });
 
