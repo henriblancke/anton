@@ -49,8 +49,13 @@ const MAX_GOAL_HINT_CHARS = 240;
  * epic's `outcome:<id>` label naming a typo'd or retired-past-recognition id is never inherited as
  * if it still named something (PR #351 review): without it the suggestion would be proposed,
  * approved, and written, yet `groupFeatureCards` would never recognize it, leaving the card
- * unlinked forever with nothing left to re-ask. Undefined (a caller that cannot afford the read)
- * keeps the old unchecked behavior rather than refusing to detect at all.
+ * unlinked forever with nothing left to re-ask. It is checked here too, against the SUBJECT's own
+ * `outcome:<id>` label, not only the parent epic's: a target can carry a syntactically valid but
+ * nonexistent id of its own (a typo, or one deleted from PRODUCT.md outright), which
+ * `groupFeatureCards` would still refuse to group under — the same dead end one layer closer, that
+ * this unconditional skip used to let through for good (P2 review, PR #351). Undefined (a caller
+ * that cannot afford the read) keeps the old unchecked behavior rather than refusing to detect at
+ * all.
  */
 export function detectUnlinkedOutcomes(
   index: BoardIndex,
@@ -63,7 +68,11 @@ export function detectUnlinkedOutcomes(
     if (!isOpenWork(bead) || beads.isDeferred(bead)) continue;
     if (!beads.isRunTarget(bead, index.all)) continue;
     if (isInFlight(bead, nowMs) || isClaimed(bead)) continue;
-    if (outcomeIdsOf(bead).length > 0) continue;
+    const ownOutcomeIds = outcomeIdsOf(bead);
+    const ownOutcomeRecognized = validOutcomeIds
+      ? ownOutcomeIds.some((id) => validOutcomeIds.has(id))
+      : ownOutcomeIds.length > 0;
+    if (ownOutcomeRecognized) continue;
 
     const suggestion = suggestOutcome(index, bead, validOutcomeIds);
     const goalHint = goalHintOf(bead);
@@ -76,6 +85,14 @@ export function detectUnlinkedOutcomes(
         summary: `${bead.id} carries no outcome:<id> — the digest cannot group it under any project outcome`,
         evidence: [
           `${bead.id} ("${bead.title}") is a ${bead.status} ${bead.issue_type ?? "bead"} and a run target, but no outcome:<id> label (or, for a standalone epic, ## Outcome IDs body) names what it serves`,
+          // Only reached when the bead's own label(s) exist but named nothing the project still
+          // recognizes — the dead-id case this validation exists to catch, distinct from carrying
+          // no label at all (the summary line above already covers that case).
+          ...(ownOutcomeIds.length > 0
+            ? [
+                `${bead.id} carries outcome:${ownOutcomeIds.join(", outcome:")} of its own, but the project's PRODUCT.md no longer defines ${ownOutcomeIds.length === 1 ? "that outcome" : "any of those outcomes"} — treated as unlinked rather than trusted`,
+              ]
+            : []),
           ...suggestion.evidence,
           // Read by the approver when the suggestion is `unknown`: the board gave no signal to
           // read, so the bead's own stated purpose is the only thing left to judge the outcome by.

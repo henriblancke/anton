@@ -1685,6 +1685,21 @@ describe("the gardener's outcome label", () => {
     expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
   });
 
+  // P2 review, PR #351: the "already carries an outcome" settle used to run BEFORE the manual
+  // check, so hand-labelling the subject and then clicking Approve on an `unknown` proposal closed
+  // it as settled — an applied founder verdict on an outcome Anton never proposed. Approve must
+  // refuse an `unknown` proposal outright, whatever the subject carries by the time of the click.
+  it("refuses an UNKNOWN proposal even when the operator hand-labelled the subject since filing", async () => {
+    const handLabelled = warm("anton-a", { labels: ["outcome:trustworthy-board"] });
+    const err = (await applyWith(proposalFor(UNKNOWN), [handLabelled]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/could not guess which outcome/);
+    expect(err.message).toMatch(/decline this proposal/);
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
   it("refuses at the write boundary when the subject stopped being a run target since the decision", async () => {
     // Open at the decision (a parentless task, a run target), then adopted under a feature before
     // the write's own locked board read — ceasing to be a run target without ceasing to be open

@@ -138,6 +138,42 @@ describe("unlinked-outcome (anton-vie0k)", () => {
     expect(detect([feature("anton-feat", { labels: ["outcome:oriented-operator"] })])).toEqual([]);
   });
 
+  // PR #351 review: the SUBJECT's own `outcome:<id>` label can itself name a dead id (a typo, or
+  // one deleted from PRODUCT.md) — the same validation `suggestOutcome` already applies to an
+  // INHERITED parent-epic label has to apply here too, or a target carrying only a dead id of its
+  // own stays "linked" forever with nothing left to re-ask.
+  describe("validating the subject's own label, not only an inherited one", () => {
+    const VALID = new Set(["oriented-operator", "codebase-health"]);
+
+    it("flags the run target when its own outcome label names nothing the project defines", () => {
+      const detections = detectUnlinkedOutcomes(
+        indexWorkBoard([feature("anton-feat", { labels: ["outcome:typo-dh"] })]),
+        NOW_MS,
+        VALID,
+      );
+
+      expect(detections).toHaveLength(1);
+      expect(detections[0].subjects).toEqual(["anton-feat"]);
+      expect(detections[0].evidence.join("\n")).toContain("outcome:typo-dh");
+    });
+
+    it("still stays silent when the subject's own label is one the project defines", () => {
+      const detections = detectUnlinkedOutcomes(
+        indexWorkBoard([feature("anton-feat", { labels: ["outcome:oriented-operator"] })]),
+        NOW_MS,
+        VALID,
+      );
+
+      expect(detections).toEqual([]);
+    });
+
+    it("trusts the subject's own label unchecked when no valid set is given, same as before", () => {
+      expect(
+        detect([feature("anton-feat", { labels: ["outcome:anything-at-all"] })]),
+      ).toEqual([]);
+    });
+  });
+
   it("stays silent for a standalone epic whose contract states its outcome as body text", () => {
     expect(
       detect([

@@ -1210,21 +1210,23 @@ function planAttachOutcome(
   }
   const subject = index.byId.get(id);
   if (!subject) return { status: "refuse", reason: missing(id) };
-  // Settled BEFORE the outcome is even re-derived — the same order `reprioritizeSubject` settles
-  // in, for the same reason: whoever labelled it, by hand or by a concurrent approval, produced the
-  // state this ask wanted, whatever outcome a fresh read would now suggest.
-  if (outcomeIdsOf(subject).length > 0) {
-    return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
-  }
-  // A manual `unknown` proposal is checked against its OWN frozen detail, not a fresh re-derivation:
-  // the card the operator approved said "could not guess" and promised Approve refuses it on that
-  // basis. Re-deriving first would let a board change since filing (a parent epic relabelled before
-  // the click) silently swap in an outcome the approver never saw, and apply it anyway.
+  // A manual `unknown` proposal is checked against its OWN frozen detail, not the subject's current
+  // state, and ALWAYS refuses — before the "already carries an outcome" settle below gets a chance
+  // to fire. Checking that settle first would let an operator who hand-labels the subject and then
+  // clicks Approve slip past the refusal (P2 review, PR #351): the card promised Approve refuses an
+  // `unknown` proposal outright, and a "settled" close still records a founder verdict on an outcome
+  // Anton never proposed — exactly what that promise exists to prevent.
   if (isManualProposal(plan)) {
     return {
       status: "refuse",
       reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
     };
+  }
+  // Settled BEFORE the outcome is even re-derived — the same order `reprioritizeSubject` settles
+  // in, for the same reason: whoever labelled it, by hand or by a concurrent approval, produced the
+  // state this ask wanted, whatever outcome a fresh read would now suggest.
+  if (outcomeIdsOf(subject).length > 0) {
+    return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
   }
   // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
   // frozen at filing time, and a parent epic relabelled (or re-parented away) since then must change
