@@ -43,8 +43,14 @@ const BUILT_IN_OUTCOME: ProjectOutcome = {
  * (`isManualProposal`, `planAttachOutcome`) reads that same string as "no suggestion" and refuses
  * the proposal forever — indistinguishable from the sentinel it was never meant to collide with
  * (P2 review, PR #351).
+ *
+ * Parsing PRODUCT.md is not the only place this has to hold: `backlog.ts`'s `assertOutcomeUsable`
+ * also rejects it unconditionally — even on a project with no `## Outcomes` section configured,
+ * where the active-id check below is skipped entirely — so a founder free-typing `unknown` into
+ * Add-work's outcome field can't land `outcome:unknown` on the board that way either (P2 review,
+ * PR #351 follow-up).
  */
-const RESERVED_OUTCOME_ID = "unknown";
+export const RESERVED_OUTCOME_ID = "unknown";
 
 const OUTCOMES_HEADING = /^##\s+Outcomes\s*$/i;
 const BULLET_PATTERN = /^-\s*`([^`]+)`\s*—\s*(.+)$/;

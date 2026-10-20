@@ -12,6 +12,7 @@ import {
   parseOutcomes,
   readProductMd,
   readProjectOutcomes,
+  RESERVED_OUTCOME_ID,
   type ProjectOutcome,
 } from "./outcomes";
 import type { Project } from "./types";
@@ -371,6 +372,16 @@ export function outcomeIdsOf(target: Bead): string[] {
  */
 async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise<void> {
   const outcomeId = draft.feature.outcomeId.trim();
+  // Checked before the `configured` gate below, not only inside it: `unknown` is gardener's
+  // no-suggestion sentinel (outcomes.ts RESERVED_OUTCOME_ID), reserved whether or not PRODUCT.md
+  // declares any outcomes — an unconfigured project must refuse it here, the only gate a founder's
+  // free-typed id passes through, or `outcome:unknown` lands on the board indistinguishable from
+  // the sentinel it was never meant to collide with (P2 review, PR #351).
+  if (outcomeId === RESERVED_OUTCOME_ID) {
+    throw new DraftOutcomeError(
+      `"${RESERVED_OUTCOME_ID}" is reserved for the gardener's own "no suggestion" marker — pick a real outcome`,
+    );
+  }
   const markdown = await readProductMd(project.repoPath);
   const active = activeOutcomeIds(parseOutcomes(markdown));
   // A missing `## Outcomes` section is an upgrade gap (anton-cdeki), not a deliberate choice to
@@ -398,6 +409,14 @@ async function assertOutcomeUsable(project: Project, draft: ShapeDraft): Promise
     if (malformed.length > 0) {
       throw new DraftOutcomeError(
         `the new epic's Outcome IDs name ${malformed.map((id) => `"${id}"`).join(", ")}, which can't be an \`outcome:<id>\` label (letters, digits, . _ - only) — fix the syntax or remove it`,
+      );
+    }
+    // Same reserved-id bar as the feature's own outcomeId above, checked unconditionally against
+    // every declared id — not just the one the feature uses — so `unknown` can't ride along as a
+    // secondary entry in the list (e.g. `real-id, unknown`) and later read back as a genuine outcome.
+    if (declared.includes(RESERVED_OUTCOME_ID)) {
+      throw new DraftOutcomeError(
+        `the new epic's Outcome IDs name "${RESERVED_OUTCOME_ID}", which is reserved for the gardener's own "no suggestion" marker — remove it`,
       );
     }
     // Every declared id is a real commitment the epic makes, not just the one the feature happens
