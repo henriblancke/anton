@@ -1670,6 +1670,21 @@ describe("the gardener's outcome label", () => {
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
   });
 
+  it("refuses an UNKNOWN proposal even when a fresh read would now suggest a real outcome", async () => {
+    // The proposal was filed as `unknown` because neither signal fired at the time — the card the
+    // operator approved said "could not guess". If the parent epic gains an outcome label before the
+    // click, re-deriving would now suggest a real outcome, but that outcome was never shown to the
+    // approver: the frozen `unknown` detail must still be the one Approve is refused against.
+    const epic = bead("anton-epic", { issue_type: "epic", labels: ["outcome:second-outcome"] });
+    const feature = bead("anton-a", { issue_type: "feature", parent: "anton-epic" });
+    const err = (await applyWith(proposalFor(UNKNOWN), [epic, feature]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/could not guess which outcome/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
   it("refuses at the write boundary when the subject stopped being a run target since the decision", async () => {
     // Open at the decision (a parentless task, a run target), then adopted under a feature before
     // the write's own locked board read — ceasing to be a run target without ceasing to be open

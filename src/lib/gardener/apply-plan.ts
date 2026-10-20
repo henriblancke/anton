@@ -27,6 +27,7 @@ import {
   type BoardIndex,
 } from "./board-index";
 import {
+  isManualProposal,
   namespaceOf,
   priorityOf,
   type GardenerDetectionKind,
@@ -1204,14 +1205,22 @@ function planAttachOutcome(plan: GardenerPlan, index: BoardIndex, at: ApplyMomen
   if (outcomeIdsOf(subject).length > 0) {
     return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
   }
+  // A manual `unknown` proposal is checked against its OWN frozen detail, not a fresh re-derivation:
+  // the card the operator approved said "could not guess" and promised Approve refuses it on that
+  // basis. Re-deriving first would let a board change since filing (a parent epic relabelled before
+  // the click) silently swap in an outcome the approver never saw, and apply it anyway.
+  if (isManualProposal(plan)) {
+    return {
+      status: "refuse",
+      reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
+    };
+  }
   // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
   // frozen at filing time, and a parent epic relabelled (or re-parented away) since then must change
   // the answer the write actually lands, not just the evidence text the approver saw.
   const suggestion = suggestOutcome(index, subject);
   // The literal answer `detectUnlinkedOutcomes` suggests when neither board signal fired — the ask
-  // is "which outcome does this serve?", and only a human can answer it. Refused here rather than
-  // left to the manual floor alone (autonomy.ts `isManualProposal`), which only ever keeps this OFF
-  // an armed pass's own writes; a human clicking Approve on it must be refused the same way.
+  // is "which outcome does this serve?", and only a human can answer it.
   if (suggestion.outcome === UNKNOWN_OUTCOME) {
     return {
       status: "refuse",
