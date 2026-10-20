@@ -16,6 +16,7 @@ import {
   isTicketTier,
   type ContractStatus,
 } from "./beads/contract";
+import { scanMarkdown } from "./beads/markdown";
 import { descendantsOf } from "./beads/subtree";
 import type {
   ChildReadiness,
@@ -100,6 +101,47 @@ export const parseGoal = (bead: Bead): string | undefined => goalBody(bead);
  * `## Success Criteria` renders it, and an authored `--acceptance` field wins over a description
  * section still holding the formula's TODO prompt — the two homes the gate already weighs together. */
 export const parseAcceptance = (bead: Bead): string | undefined => acceptanceBody(bead);
+
+/** Exact `## Why` heading only — `## Why now` / `## Why this approach` must stay out, same rule
+ * `sectionHeading` in ticket-dialog-utils.ts applies for the editable draft. */
+const WHY_HEADING = /^##\s*Why\s*$/i;
+
+/**
+ * A feature's own `## Why` — the rationale for the outcome it serves, quoted verbatim on its digest
+ * card (anton-y1uxp). Unlike Goal/Acceptance, Why carries no bd field of its own (backlog.ts's
+ * `FeatureDraft.why`), so it can only be read back out of the description markdown — there is no
+ * validator reader to delegate to the way {@link parseGoal}/{@link parseAcceptance} do.
+ *
+ * A repeated heading concatenates, mirroring `extractSection` in ticket-dialog-utils.ts (which this
+ * is the read-only, Bead-shaped twin of): an editor that only recovered the first occurrence let a
+ * later authored `## Why` silently vanish on the next save. Undefined when the bead carries none, so
+ * a card can tell "no Why authored" from "Why is empty".
+ */
+export function parseWhy(bead: Bead): string | undefined {
+  const description = bead.description ?? "";
+  if (!description) return undefined;
+  const lines = description.split(/\r?\n/);
+  const scanned = scanMarkdown(description);
+  const occurrences: string[] = [];
+  let body: string[] = [];
+  let inSection = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const heading = scanned[i]?.heading;
+    if (heading !== undefined && heading.depth <= 2) {
+      if (inSection) {
+        occurrences.push(body.join("\n").trim());
+        body = [];
+      }
+      inSection = WHY_HEADING.test(line.trim());
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  if (inSection) occurrences.push(body.join("\n").trim());
+  const text = occurrences.filter(Boolean).join("\n\n");
+  return text === "" ? undefined : text;
+}
 
 /** Map a bead to the shared Ticket view model (board cards, epic-detail children, etc.). */
 export function toTicket(bead: Bead, opts?: { includeAcceptance?: boolean }): Ticket {

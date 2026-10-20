@@ -23,7 +23,16 @@ import { act, cleanup, render, screen } from "@testing-library/react";
 
 import { BoardAttentionSlot } from "@/components/board/board-parts";
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
 import type { EscalationView } from "@/lib/types";
+
+const EMPTY_NEEDS_YOU_COUNTS: DigestNeedsYouSummary["counts"] = {
+  breaker: 0,
+  "parked-ask": 0,
+  "merge-ready-pr": 0,
+  proposal: 0,
+  "human-ticket": 0,
+};
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
@@ -116,6 +125,46 @@ describe("BoardAttentionSlot", () => {
     mount({ polled: { value: disarm }, streamed: Promise.resolve(hold) });
     expect(screen.getByText("Review scores fell below the floor")).toBeTruthy();
     expect(screen.queryByText("Review queue is full")).toBeNull();
+  });
+
+  it("renders the digest banner alongside the strip once the page's digest promise resolves", async () => {
+    // anton-16s0t's acceptance ("Board banner with counts linking to the digest") was never wired
+    // to anything on the board page — DigestBanner was defined but nothing rendered it. Fed through
+    // this slot's own `digest` prop now, same as `escalations`/`parks`.
+    //
+    // A promise, not a resolved value (PR #350 review): the banner must not gate the board on a
+    // read that awaits a breaker check that can take minutes, so it streams in behind its own
+    // boundary exactly like the breaker strip does.
+    await act(async () => {
+      mount({
+        digest: Promise.resolve({
+          needsYou: { items: [], counts: EMPTY_NEEDS_YOU_COUNTS, total: 2 },
+          activityCount: 5,
+        }),
+      });
+    });
+    expect(screen.getByText("5 things since you looked · 2 need you")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open digest" }).getAttribute("href")).toBe(
+      "/projects/anton/digest",
+    );
+  });
+
+  it("renders no digest banner when the page hands down no digest summary", () => {
+    mount();
+    expect(screen.queryByRole("link", { name: "Open digest" })).toBeNull();
+  });
+
+  it("renders no digest banner when the page's digest promise resolves to nothing", async () => {
+    await act(async () => {
+      mount({ digest: Promise.resolve(undefined) });
+    });
+    expect(screen.queryByRole("link", { name: "Open digest" })).toBeNull();
+  });
+
+  it("keeps the board unblocked while the digest summary is still outstanding", () => {
+    mount({ digest: new Promise<undefined>(() => {}) });
+    expect(screen.queryByText("the board, already rendered")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open digest" })).toBeNull();
   });
 
   it("never suspends the board around it, however slow the read is", () => {

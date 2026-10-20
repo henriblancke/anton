@@ -4,6 +4,7 @@ import {
   hasOpenBlockers,
   parseAcceptance,
   parseGoal,
+  parseWhy,
   resumeSkipped,
   runContractStatus,
   runTickets,
@@ -462,5 +463,48 @@ describe("parseGoal / parseAcceptance (the validator's own parser)", () => {
   it("still renders the prompt when no home is authored — the bead really has no rubric yet", () => {
     const bead = makeBead({ id: "t-1", description: "## Acceptance\n- [ ] TODO — a checkable statement" });
     expect(parseAcceptance(bead)).toBe("- [ ] TODO — a checkable statement");
+  });
+});
+
+describe("parseWhy", () => {
+  it("reads the ## Why section's body", () => {
+    const bead = makeBead({
+      id: "t-1",
+      description: "## Goal\n\nShip it.\n\n## Why\n\nServes oriented-operator.\n\n## Acceptance Criteria\n- [ ] done",
+    });
+    expect(parseWhy(bead)).toBe("Serves oriented-operator.");
+  });
+
+  it("is undefined when the bead authored no Why", () => {
+    const bead = makeBead({ id: "t-1", description: "## Goal\n\nShip it." });
+    expect(parseWhy(bead)).toBeUndefined();
+  });
+
+  it("is undefined for a bead with no description at all", () => {
+    expect(parseWhy(makeBead({ id: "t-1" }))).toBeUndefined();
+  });
+
+  it("matches the heading exactly — 'Why now' / 'Why this approach' stay out", () => {
+    const bead = makeBead({
+      id: "t-1",
+      description: "## Why now\n\nBecause the quarter ends.\n\n## Why this approach\n\nLeast risky.",
+    });
+    expect(parseWhy(bead)).toBeUndefined();
+  });
+
+  it("concatenates every occurrence rather than keeping only the first", () => {
+    const bead = makeBead({
+      id: "t-1",
+      description: "## Why\n\nFirst reason.\n\n## Goal\n\nSomething else.\n\n## Why\n\nSecond reason.",
+    });
+    expect(parseWhy(bead)).toBe("First reason.\n\nSecond reason.");
+  });
+
+  it("does not mistake a fenced example '## Why' for a real section boundary", () => {
+    const bead = makeBead({
+      id: "t-1",
+      description: "## Why\n\nReal reason.\n\n```\n## Why\nfenced, not real\n```",
+    });
+    expect(parseWhy(bead)).toBe("Real reason.\n\n```\n## Why\nfenced, not real\n```");
   });
 });

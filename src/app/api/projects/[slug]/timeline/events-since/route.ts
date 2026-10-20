@@ -1,24 +1,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import { refreshAllIssues } from "@/lib/beads/issues";
 import { getDb } from "@/lib/db";
-import type { AntonDb } from "@/lib/jobs/queue";
 import { systemClock } from "@/lib/jobs/queue";
-import { foldTimeline, type TimelineEvent } from "@/lib/timeline";
-import {
-  readAutopilotDisarmRows,
-  readBeadBoardRows,
-  readEscalationRows,
-  readPickerStartRows,
-  readPickerVerdictRows,
-  readProposalRows,
-  readRunAttemptRows,
-  readRunRows,
-  readScanSummaryRows,
-  type TimelineWindow,
-} from "@/lib/timeline-sources";
-import type { Project } from "@/lib/types";
+import type { TimelineEvent } from "@/lib/timeline";
+import { readTimelineEvents } from "@/lib/timeline-read";
 import { DEFAULT_VIEWER_ID, getViewerMark } from "@/lib/viewer-marks";
 import { withProject } from "../../resolve-project";
 
@@ -109,90 +95,3 @@ export const GET = withProject<{ slug: string }>(async (request, { project }) =>
     events,
   });
 });
-
-/**
- * Every event in `window`, off the project's bd board snapshot plus each anton.db source. The board
- * is read once and reused for both the bd-derived rows (readProposalRows, readBeadBoardRows) and
- * `foldTimeline`'s own feature resolution — the same one-read-per-request contract operator-queue.ts
- * and feature-ledger.ts hold.
- *
- * Propagates a `bd` failure rather than degrading to an empty board: the bd-derived rows are not an
- * enhancement to a DB-only timeline, they're entire event categories (proposals, bead closes, PR
- * merges) with no other source, and the caller above refuses to hand out a cursor an operator could
- * mark seen over a read that silently dropped all of them.
- *
- * Reads via `refreshAllIssues`, not `allIssues` (PR #346 review, P1): `allIssues` serves the
- * retained stale-while-revalidate snapshot (up to `ISSUE_SNAPSHOT_MAX_AGE_MS` old) and only
- * refreshes in the background, so a bead closed after that snapshot was cached but before this
- * request's `until` would be omitted here and then permanently stranded below the watermark once
- * the client marks `until` seen. `strictGates: true` for the same cursor-safety reason (PR #346
- * review, P1): a degraded gate listing would let `prActuallyMerged` read a merge-wait gate as
- * absent and silently suppress a `pr.merged` event behind that same irreversible cursor.
- *
- * `requireFreshRead: true` for the same reason again (PR #346 review, round 2): `refreshAllIssues`
- * is otherwise single-flight and loader-blind — if a refresh was already running when this request
- * minted `until` above, a plain call here would join THAT read instead of starting its own. If the
- * in-flight read had snapshotted the board before a bead closed but the closure landed before this
- * request's `until`, the response would omit the closure while still handing out a cursor that
- * permanently strands it once marked seen. `requireFreshRead` waits out any in-flight read first,
- * then always starts a new one — guaranteeing this call's own board read began no earlier than the
- * `until` minted above.
- *
- * `readRunRows` and `readEscalationRows` widen their SQL seek with an OR against `updatedAt` (see
- * the module header on timeline-sources.ts), which can hand back a row whose OWN `startedAt`/
- * `raisedAt` sits outside `window` — fetched only because its lifecycle's other half landed inside
- * it. `foldTimeline` has no window to filter against (it's pure over rows, by design), so the final
- * filter here is what turns that overfetch back into exactly the events `[since, until)` asked for.
- */
-async function readTimelineEvents(
-  db: AntonDb,
-  project: Pick<Project, "id" | "repoPath">,
-  window: TimelineWindow,
-): Promise<TimelineEvent[]> {
-  const board = await refreshAllIssues(project.repoPath, {
-    strictGates: true,
-    requireFreshRead: true,
-  });
-
-  const [
-    runRows,
-    runAttemptRows,
-    escalationRows,
-    pickerStartRows,
-    pickerVerdictRows,
-    autopilotDisarmRows,
-    scanSummaryRows,
-  ] = await Promise.all([
-    readRunRows(db, project.id, window, board),
-    readRunAttemptRows(db, project.id, window),
-    readEscalationRows(db, project.id, window),
-    readPickerStartRows(db, project.id, window),
-    readPickerVerdictRows(db, project.id, window),
-    readAutopilotDisarmRows(db, project.id, window),
-    readScanSummaryRows(db, project.id, window),
-  ]);
-
-  const proposalRows = readProposalRows(board, project.id, window);
-  const { closed: beadClosedRows, merged: prMergedRows } = readBeadBoardRows(
-    board,
-    project.id,
-    window,
-  );
-
-  const events = foldTimeline(
-    [
-      ...runRows,
-      ...runAttemptRows,
-      ...escalationRows,
-      ...pickerStartRows,
-      ...pickerVerdictRows,
-      ...autopilotDisarmRows,
-      ...scanSummaryRows,
-      ...proposalRows,
-      ...beadClosedRows,
-      ...prMergedRows,
-    ],
-    board,
-  );
-  return events.filter((e) => e.at >= window.since && e.at < window.until);
-}

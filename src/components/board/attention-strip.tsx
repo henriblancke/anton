@@ -7,6 +7,7 @@ import { MetaChip } from "@/components/atoms";
 import { ArmWatcherButton } from "@/components/board/arm-watcher-button";
 import { ReArmButton } from "@/components/board/re-arm-button";
 import { buttonVariants } from "@/components/ui/button";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
 import {
   BREAKER_HEADLINE,
   BREAKER_REASON_LABEL,
@@ -134,6 +135,72 @@ export function AttentionStrip({
           Open
         </Link>
       </div>
+    </section>
+  );
+}
+
+/**
+ * The board's pointer to the digest (anton-16s0t): what changed since the viewer last looked, and
+ * how much of it only the operator can act on — counted but not listed, the same trade this file's
+ * `AttentionStrip` already makes, for the same reason. The rows themselves, with their
+ * Resolve-and-resume / Dismiss / Mark done / re-arm, live on the digest page (`DigestNeedsYou`,
+ * needs-you-section.tsx); this is one click away from them.
+ *
+ * Visible whenever EITHER count is nonzero: a window with substantial new activity but nothing
+ * actionable is still news worth a link, even though `digestNeedsYou` alone would say nothing. Only
+ * when both are zero — nothing happened and nothing needs the operator — does it render NOTHING,
+ * same honesty contract as every other band here: a standing banner on a clean board is an ornament.
+ */
+export function DigestBanner({
+  slug,
+  needsYou,
+  activityCount,
+}: {
+  slug: string;
+  needsYou: DigestNeedsYouSummary;
+  /** `events.length` for the same since-you-looked window (anton-rokar's `projectDigest`). */
+  activityCount: number;
+}) {
+  if (activityCount === 0 && needsYou.total === 0) return null;
+  const { counts } = needsYou;
+
+  return (
+    <section
+      aria-labelledby="digest-banner-heading"
+      className={cn(
+        "mb-3 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-xl border px-3 py-2",
+        REGISTER_STYLE.request,
+      )}
+    >
+      <HandIcon className="size-3.5 shrink-0 text-stage-in-review" aria-hidden="true" />
+      <h2 id="digest-banner-heading" className="text-xs font-medium text-foreground">
+        {activityCount} thing{activityCount === 1 ? "" : "s"} since you looked · {needsYou.total} need you
+      </h2>
+      {counts.breaker > 0 ? <MetaChip tone="risk-high">autopilot stopped</MetaChip> : null}
+      {counts["merge-ready-pr"] > 0 ? (
+        // "stale", not "to merge" (PR #350 review): the underlying finding (`detectStalePrs`,
+        // run-health.ts) only knows the PR is open and idle, not that it's approved, passing, or
+        // mergeable — drafts and failing/conflicted PRs raise it too. The honest claim is the same
+        // one `ESCALATION_LABELS["stale-pr"]` already makes on the Health page: it's stale, not
+        // ready.
+        <MetaChip tone="pr">
+          {counts["merge-ready-pr"]} stale PR{counts["merge-ready-pr"] === 1 ? "" : "s"}
+        </MetaChip>
+      ) : null}
+      {counts.proposal > 0 ? (
+        <MetaChip tone="pr">
+          {counts.proposal} proposal{counts.proposal === 1 ? "" : "s"}
+        </MetaChip>
+      ) : null}
+
+      <span className="flex-1" />
+
+      <Link
+        href={`/projects/${slug}/digest`}
+        className={buttonVariants({ size: "xs", variant: "outline" })}
+      >
+        Open digest
+      </Link>
     </section>
   );
 }

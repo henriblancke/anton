@@ -18,12 +18,17 @@ export interface ProjectOutcome {
   retired: boolean;
 }
 
+/** The one outcome id every project carries without authoring it — named so a caller that needs to
+ * tell it apart from a founder-declared outcome (the digest's housekeeping group, anton-y1uxp) does
+ * not re-spell the string. */
+export const CODEBASE_HEALTH_OUTCOME_ID = "codebase-health";
+
 /**
  * Every project has this outcome whether or not PRODUCT.md lists it — scan-triage-produced work
  * (anton-42zmh) always has somewhere to point.
  */
 const BUILT_IN_OUTCOME: ProjectOutcome = {
-  id: "codebase-health",
+  id: CODEBASE_HEALTH_OUTCOME_ID,
   summary: "Tests, types, and lint stay green as the code changes; found debt gets paid down.",
   retired: false,
 };

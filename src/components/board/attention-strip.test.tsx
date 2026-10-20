@@ -11,7 +11,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import { AttentionStrip } from "@/components/board/attention-strip";
+import { AttentionStrip, DigestBanner } from "@/components/board/attention-strip";
+import type { DigestNeedsYouSummary } from "@/lib/attention";
 import type { AutopilotBreaker } from "@/lib/autopilot-breaker";
 import type { EscalationView, UnwatchedParks } from "@/lib/types";
 
@@ -136,5 +137,62 @@ describe("AttentionStrip", () => {
   it("says how much is parked, and that nothing is watching it", () => {
     mount({ parks });
     expect(screen.getByText("13 parked, unwatched")).toBeTruthy();
+  });
+});
+
+const EMPTY_COUNTS: DigestNeedsYouSummary["counts"] = {
+  breaker: 0,
+  "parked-ask": 0,
+  "merge-ready-pr": 0,
+  proposal: 0,
+  "human-ticket": 0,
+};
+
+function needsYou(o: Partial<DigestNeedsYouSummary["counts"]> = {}, total?: number): DigestNeedsYouSummary {
+  const counts = { ...EMPTY_COUNTS, ...o };
+  return { items: [], counts, total: total ?? Object.values(counts).reduce((a, b) => a + b, 0) };
+}
+
+describe("DigestBanner", () => {
+  it("renders nothing when nothing changed and nothing needs you", () => {
+    const { container } = render(
+      <DigestBanner slug="anton" needsYou={needsYou()} activityCount={0} />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("states both counts in the acceptance's own format, and links to the digest", () => {
+    render(<DigestBanner slug="anton" needsYou={needsYou({ "parked-ask": 2 })} activityCount={5} />);
+    expect(screen.getByText("5 things since you looked · 2 need you")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Open digest" }).getAttribute("href")).toBe(
+      "/projects/anton/digest",
+    );
+  });
+
+  it("stays visible on substantial activity with nothing actionable, unlike digestNeedsYou alone", () => {
+    render(<DigestBanner slug="anton" needsYou={needsYou()} activityCount={12} />);
+    expect(screen.getByText("12 things since you looked · 0 need you")).toBeTruthy();
+  });
+
+  it("stays visible with nothing new but something needing you", () => {
+    render(
+      <DigestBanner slug="anton" needsYou={needsYou({ "parked-ask": 1 })} activityCount={0} />,
+    );
+    expect(screen.getByText("0 things since you looked · 1 need you")).toBeTruthy();
+  });
+
+  it("breaks out stale PRs, proposals and a stopped autopilot apart from the total", () => {
+    render(
+      <DigestBanner
+        slug="anton"
+        needsYou={needsYou({ "merge-ready-pr": 1, proposal: 2, breaker: 1 })}
+        activityCount={3}
+      />,
+    );
+    // "stale", not "to merge" (PR #350 review): the underlying finding only knows the PR is idle,
+    // not that it's actually mergeable — see attention-strip.tsx.
+    expect(screen.getByText("1 stale PR")).toBeTruthy();
+    expect(screen.getByText("2 proposals")).toBeTruthy();
+    expect(screen.getByText("autopilot stopped")).toBeTruthy();
   });
 });
