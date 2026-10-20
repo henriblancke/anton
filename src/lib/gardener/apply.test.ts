@@ -83,6 +83,8 @@ vi.mock("../beads/bd", async () => {
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
       tag: (_cwd: string, id: string, labels: string[]) => record("tag", id, labels.join(",")),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
+      changeLabels: (_cwd: string, id: string, add: string[], remove: string[]) =>
+        record("changeLabels", id, `add:${add.join(",")}`, `remove:${remove.join(",")}`),
       approve: (_cwd: string, id: string) => record("approve", id),
       assign: (_cwd: string, id: string, actor: string) => record("assign", id, actor),
       unassign: (_cwd: string, id: string) => record("assign", id, ""),
@@ -1634,7 +1636,7 @@ describe("the gardener's outcome label", () => {
     const subject = cold("anton-a", { labels: ["source:stringer"] });
     const result = await applyWith(proposalFor(OUTCOME), [subject]);
     expect(calls).toEqual([
-      "tag anton-a outcome:codebase-health",
+      "changeLabels anton-a add:outcome:codebase-health remove:",
       "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
       "close anton-p1 applied: labelled anton-a outcome:codebase-health",
     ]);
@@ -1665,8 +1667,7 @@ describe("the gardener's outcome label", () => {
     const subject = cold("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
     const result = await applyWith(proposalFor(OUTCOME), [subject]);
     expect(calls).toEqual([
-      "untag anton-a outcome:typo-dh",
-      "tag anton-a outcome:codebase-health",
+      "changeLabels anton-a add:outcome:codebase-health remove:outcome:typo-dh",
       "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
       "close anton-p1 applied: labelled anton-a outcome:codebase-health",
     ]);
@@ -1686,8 +1687,7 @@ describe("the gardener's outcome label", () => {
     });
     const result = await applyWith(proposalFor(OUTCOME), [subject]);
     expect(calls).toEqual([
-      "untag anton-a outcome:typo-dh",
-      "tag anton-a outcome:codebase-health",
+      "changeLabels anton-a add:outcome:codebase-health remove:outcome:typo-dh",
       "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
       "close anton-p1 applied: labelled anton-a outcome:codebase-health",
     ]);
@@ -1814,25 +1814,26 @@ describe("the gardener's outcome label", () => {
     expect(calls.filter((c) => c.startsWith("tag") || c.startsWith("untag"))).toEqual([]);
   });
 
-  // P2 review, PR #351: removing the stale label and then having the tag write reject (a `bd`
-  // subprocess that times out or exits nonzero) used to throw the raw error, which leaves the
-  // subject off `applySteps`' `changed` prefix as if nothing were written — even though the stale
-  // label is already gone. Name the subject as stranded instead.
-  it("names the stranded subject when the outcome tag write fails after the stale label is already removed", async () => {
+  // P2 review, PR #351: the outcome label change used to be two writes (untag, then tag), so a `bd`
+  // subprocess rejecting between them left the untag landed and the tag unattempted — a bare error
+  // that left the subject off `applySteps`' `changed` prefix as if nothing were written. A single
+  // atomic `changeLabels` call removes that window, but the SAME ambiguity still applies to one
+  // write exactly as it did to two: a `bd` subprocess can commit its label delta and only then time
+  // out or exit nonzero. Name the subject as stranded rather than assume the commit never landed.
+  it("names the stranded subject when the outcome label change commits but then reports failure", async () => {
     productMarkdown = "## Outcomes\n- `oriented-operator` — Users feel oriented.\n";
     const subject = cold("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
-    failOn.set("tag:anton-a", 1);
+    failAfterWrite.set("changeLabels:anton-a", 1);
     const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
       typeof ProposalApplyError
     >;
     expect(err.failure).toBe("failed");
     expect(err.message).toMatch(
-      /anton-a had its stale outcome label\(s\) removed but could not be tagged outcome:codebase-health/,
+      /anton-a's outcome label change landed despite .+ — report it as applied/,
     );
     expect(err.changed).toEqual(["anton-a"]);
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([
-      "untag anton-a outcome:typo-dh",
-      "tag anton-a outcome:codebase-health",
+      "changeLabels anton-a add:outcome:codebase-health remove:outcome:typo-dh",
     ]);
   });
 

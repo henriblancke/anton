@@ -88,6 +88,8 @@ vi.mock("../beads/bd", async () => {
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
       tag: (_cwd: string, id: string, labels: string[]) => record("tag", id, labels.join(",")),
+      changeLabels: (_cwd: string, id: string, add: string[], remove: string[]) =>
+        record("changeLabels", id, `add:${add.join(",")}`, `remove:${remove.join(",")}`),
     },
   };
 });

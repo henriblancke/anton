@@ -437,6 +437,18 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
 }
 
 /**
+ * Every outcome id `repo`'s PRODUCT.md still recognizes, fresh — or undefined before the project has
+ * declared `## Outcomes` at all, the same guard `outcomesConfigured` gates everywhere else an
+ * `attach-outcome` write checks against it (`apply.ts` `outcomeIdsIfNeeded`, this module's own
+ * {@link assertOutcomeHolds} and `runStep`'s own write): a hand-labelled epic predating the contract
+ * would otherwise fail a check that was never meant to be exhaustive.
+ */
+async function validOutcomeIdsOf(repo: string): Promise<ReadonlySet<string> | undefined> {
+  const markdown = await readProductMd(repo);
+  return outcomesConfigured(markdown) ? allOutcomeIds(parseOutcomes(markdown)) : undefined;
+}
+
+/**
  * What an OUTCOME LABEL owes a fresh board before it writes: the subject is still a run target, and
  * the suggestion is still the one the current board derives — both re-derived rather than carried
  * from the decision, the same treatment `assertHomeHolds`/`assertOrderingStated` give the gardener's
@@ -462,11 +474,7 @@ async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> 
       `${step.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`,
     );
   }
-  // Validation only fires once the project has actually declared `## Outcomes` — before that, a
-  // hand-labelled epic predating the contract would fail a check that was never meant to be
-  // exhaustive (see apply.ts `outcomeIdsIfNeeded`, which this mirrors).
-  const markdown = await readProductMd(repo);
-  const validOutcomeIds = outcomesConfigured(markdown) ? allOutcomeIds(parseOutcomes(markdown)) : undefined;
+  const validOutcomeIds = await validOutcomeIdsOf(repo);
   // Mirrors `planAttachOutcome`'s own settle, re-asked against THIS read: a recognized label the
   // subject already carries — placed by hand, or by a concurrent approval, in the window between
   // the decision and this lock — is a live decision, not a stale guess to overwrite. Checked
@@ -972,17 +980,31 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
       const subject = await reread(repo, step.id);
       const ownFirstId = subject ? outcomeIdsOf(subject)[0] : undefined;
       const stale = ownFirstId !== undefined && ownFirstId !== step.outcome ? [`outcome:${ownFirstId}`] : [];
-      if (stale.length > 0) await beads.untag(repo, step.id, stale);
+
+      // bd returns a bead's `outcome:<id>` labels sorted by value on every read (confirmed against
+      // the live board), never in add/remove order — so once a surviving SECOND label is itself
+      // still recognized, which of it and `step.outcome` sorts first is a property of the two id
+      // strings, not something any write ordering here can steer. Tagging `step.outcome` regardless
+      // keeps the one guarantee this step CAN make — the bead carries `outcome:step.outcome` — true;
+      // the one it cannot make is which of two valid outcomes the digest groups the card under, and
+      // a survivor winning that slot is not a regression, since any recognized id there already
+      // satisfies `detectUnlinkedOutcomes`' own bar (P2 review, PR #351 — left as a known limit of
+      // keying selection off raw label order rather than an explicit primary marker).
       try {
-        await beads.tag(repo, step.id, [`outcome:${step.outcome}`]);
+        // One write, not two: a `bd update` that commits its label delta and only then times out or
+        // exits nonzero used to leave the untag landed and the tag unattempted — a bare throw
+        // `applySteps` never credits to `changed` (P2 review, PR #351). A single atomic call removes
+        // the window such a failure could land inside.
+        await beads.changeLabels(repo, step.id, [`outcome:${step.outcome}`], stale);
       } catch (err) {
-        // The untag already landed, so a rejected/timed-out tag leaves the subject carrying no
-        // outcome label at all — invisible to `applySteps`' `changed` prefix (this step never
-        // returns) and to every caller that walks that list to report what the apply moved. Name
-        // it as stranded rather than let the bare error read as "nothing was written".
-        if (stale.length === 0) throw err;
+        // The same commits-then-reports-failure risk applies to one write exactly as it did to two,
+        // so reconcile with a fresh read rather than assume the label change never landed.
+        const after = await beads.show(repo, step.id).catch(() => undefined);
+        const labels = after?.labels ?? [];
+        const landed = labels.includes(`outcome:${step.outcome}`) && stale.every((label) => !labels.includes(label));
+        if (!landed) throw err;
         throw new StrandedWriteError(
-          `${step.id} had its stale outcome label(s) removed but could not be tagged outcome:${step.outcome} (${messageOf(err)}) — it is left carrying no outcome label at all until a human re-tags it`,
+          `${step.id}'s outcome label change landed despite ${messageOf(err)} — report it as applied`,
           [step.id],
         );
       }

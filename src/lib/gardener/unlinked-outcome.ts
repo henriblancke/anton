@@ -16,12 +16,13 @@ import { beads, labelValueOf, labelValuesOf, type Bead } from "../beads/bd";
 import { outcomeIdsOf } from "../backlog";
 import { goalBody, isAuthoredBody, preambleOf } from "../beads/contract";
 import { AREA_SHAPE } from "../epic-patch";
+import { CODEBASE_HEALTH_OUTCOME_ID } from "../outcomes";
 import { isClaimed, isInFlight, isOpenWork, type BoardIndex } from "./board-index";
 import { makeDetection, type GardenerDetection } from "./detections";
 
-/** What scan-triage-produced work always serves (outcomes.ts's built-in) — stringer's own beads
- * carry no product outcome of their own to inherit. */
-export const STRINGER_OUTCOME = "codebase-health";
+/** What scan-triage-produced work always serves — stringer's own beads carry no product outcome of
+ * their own to inherit. */
+export const STRINGER_OUTCOME = CODEBASE_HEALTH_OUTCOME_ID;
 
 /** The suggestion that asks the operator rather than guessing — neither signal below fired. */
 export const UNKNOWN_OUTCOME = "unknown";
