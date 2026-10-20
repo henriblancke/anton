@@ -1229,10 +1229,14 @@ function planAttachOutcome(
   // #351): a syntactically valid but nonexistent id (a typo, or one deleted from PRODUCT.md
   // outright) must NOT settle here, or the digest keeps treating the subject as unlinked while this
   // check keeps declaring it already done — the same proposal filed again every patrol with no path
-  // to ever landing a label `groupFeatureCards` recognizes.
+  // to ever landing a label `groupFeatureCards` recognizes. Checked against the FIRST id alone, not
+  // `.some()` across all of them: `featureCardOf` only ever reads `outcomeIdsOf(subject)[0]`, so a
+  // valid second label must not settle this away while a dead first one is still what the digest
+  // reads — the same mismatch `detectUnlinkedOutcomes` guards against on the detection side.
   const ownOutcomeIds = outcomeIdsOf(subject);
+  const selectedOutcomeId = ownOutcomeIds[0];
   const ownOutcomeRecognized = validOutcomeIds
-    ? ownOutcomeIds.some((outcomeId) => validOutcomeIds.has(outcomeId))
+    ? selectedOutcomeId !== undefined && validOutcomeIds.has(selectedOutcomeId)
     : ownOutcomeIds.length > 0;
   if (ownOutcomeRecognized) {
     return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };

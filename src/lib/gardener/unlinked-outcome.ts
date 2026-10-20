@@ -50,12 +50,15 @@ const MAX_GOAL_HINT_CHARS = 240;
  * if it still named something (PR #351 review): without it the suggestion would be proposed,
  * approved, and written, yet `groupFeatureCards` would never recognize it, leaving the card
  * unlinked forever with nothing left to re-ask. It is checked here too, against the SUBJECT's own
- * `outcome:<id>` label, not only the parent epic's: a target can carry a syntactically valid but
- * nonexistent id of its own (a typo, or one deleted from PRODUCT.md outright), which
+ * FIRST `outcome:<id>` label, not only the parent epic's: a target can carry a syntactically valid
+ * but nonexistent id of its own (a typo, or one deleted from PRODUCT.md outright), which
  * `groupFeatureCards` would still refuse to group under — the same dead end one layer closer, that
- * this unconditional skip used to let through for good (P2 review, PR #351). Undefined (a caller
- * that cannot afford the read) keeps the old unchecked behavior rather than refusing to detect at
- * all.
+ * this unconditional skip used to let through for good (P2 review, PR #351). The FIRST id
+ * specifically, not any of them: `featureCardOf` only ever reads `outcomeIdsOf(bead)[0]`, so
+ * recognizing a later, valid label here would suppress this detector while the digest still shows
+ * the card unlinked under its dead first label — a proposal that will never fire again to fix it.
+ * Undefined (a caller that cannot afford the read) keeps the old unchecked behavior rather than
+ * refusing to detect at all.
  */
 export function detectUnlinkedOutcomes(
   index: BoardIndex,
@@ -69,8 +72,13 @@ export function detectUnlinkedOutcomes(
     if (!beads.isRunTarget(bead, index.all)) continue;
     if (isInFlight(bead, nowMs) || isClaimed(bead)) continue;
     const ownOutcomeIds = outcomeIdsOf(bead);
+    // The digest only ever groups a card under its FIRST outcome id (feature-cards.ts
+    // `featureCardOf`'s `outcomeIdsOf(bead)[0]`) — checking any later id as "recognized" would let
+    // a valid secondary label mask a dead first one forever: the digest would still show the card
+    // unlinked, but this detector would never re-propose it since SOME id passed.
+    const selectedOutcomeId = ownOutcomeIds[0];
     const ownOutcomeRecognized = validOutcomeIds
-      ? ownOutcomeIds.some((id) => validOutcomeIds.has(id))
+      ? selectedOutcomeId !== undefined && validOutcomeIds.has(selectedOutcomeId)
       : ownOutcomeIds.length > 0;
     if (ownOutcomeRecognized) continue;
 

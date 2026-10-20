@@ -93,11 +93,20 @@ vi.mock("../beads/bd", async () => {
 /** The machine identity an approve auto-claims under — resolved from git/env in production. */
 vi.mock("../operator", () => ({ resolveOperator: async () => "operator-1" }));
 
+/** `.product/PRODUCT.md`'s raw text, as `outcomeIdsIfNeeded` reads it — "" (not configured, the
+ * default for every test but the outcome-validation ones below) unless a test sets it. */
+let productMarkdown = "";
+vi.mock("../outcomes", async () => {
+  const actual = await vi.importActual<typeof import("../outcomes")>("../outcomes");
+  return { ...actual, readProductMd: async () => productMarkdown };
+});
+
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
 beforeEach(() => {
   resetSeam();
   onShow = undefined;
+  productMarkdown = "";
 });
 
 describe("the plan a proposal carries — read strictly, because it decides what gets mutated", () => {
@@ -1640,6 +1649,28 @@ describe("the gardener's outcome label", () => {
     expect(calls).toContain(
       "close anton-p1 applied: anton-a already carries an outcome — nothing to add",
     );
+  });
+
+  // Claude review, PR #351: `alreadySatisfied`'s attach-outcome branch used to short-circuit on ANY
+  // existing `outcome:<id>` label, dead ones included, without checking it against `validOutcomeIds`
+  // the way the decision's own settle above does — so a bead carrying only a dead label never
+  // reached the write at all: `applyStep` returned false before `assertOutcomeHolds` or `beads.tag`
+  // ever ran, yet `applySteps` still closed the proposal as applied, leaving the dead label standing
+  // and nothing left to re-propose. Drives the FULL write path (decide, then `applyStep`/`runStep`),
+  // not just `decide()` directly, since that is exactly where the old bug lived.
+  it("corrects a dead outcome label through the full write path, not settling on it unwritten", async () => {
+    productMarkdown = "## Outcomes\n- `oriented-operator` — Users feel oriented.\n";
+    // source:stringer so the re-derived suggestion is deterministic once the dead label is
+    // rejected (codebase-health), matching what the OUTCOME plan above was filed with.
+    const subject = cold("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
+    const result = await applyWith(proposalFor(OUTCOME), [subject]);
+    expect(calls).toEqual([
+      "untag anton-a outcome:typo-dh",
+      "tag anton-a outcome:codebase-health",
+      "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
+      "close anton-p1 applied: labelled anton-a outcome:codebase-health",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
   });
 
   it("refuses to label a bead a run has claimed since the filing", async () => {

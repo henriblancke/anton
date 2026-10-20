@@ -122,9 +122,9 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * `implied-order` and the gardener's two re-parents resolve to no premise in
  * {@link EVIDENCE_PREMISE} and are re-derived from the board instead ({@link assertOrderingStated},
  * apply-plan.ts `reparentPremiseGone`). `attach-outcome` is the same shape as those two: its premise
- * resolves to none either — "already labelled" is re-derived from the board by
- * {@link alreadySatisfied}, and "still a run target, still the right outcome" by
- * {@link assertOutcomeHolds}.
+ * resolves to none either — "still a run target, still the right outcome" is re-derived from the
+ * board by {@link assertOutcomeHolds} alone, unconditionally, since a raw "already labelled" check
+ * cannot tell a valid label from a dead one (see {@link alreadySatisfied}).
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -559,9 +559,13 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // the filing, so an unguarded evidence check would refuse the very state the ask was after (the
   // same order `planUndefer` reads its settled states in).
   if (step.verb === "undefer") return !beads.isDeferred(subject);
-  // Somebody labelled it by hand, or a concurrent approval already did — the outcome this ask
-  // wanted is on the board, whoever wrote it, so there is nothing left to write and nothing to undo.
-  if (step.verb === "attach-outcome") return outcomeIdsOf(subject).length > 0;
+  // No idempotent-skip for attach-outcome, on purpose: a raw `outcomeIdsOf(subject).length > 0`
+  // used to short-circuit here on ANY existing label, dead ones included, so a bead carrying only
+  // a typo'd id read as already satisfied and the write — the one place validity against
+  // `validOutcomeIds` is actually checked — never ran (P2 review, PR #351). `assertOutcomeHolds`
+  // re-derives the right outcome and refuses a stale one before every write, so falling through
+  // to it and `runStep` unconditionally is the only way a dead label still gets corrected; a tag
+  // add that happens to repeat an already-correct label is harmless.
   return false;
 }
 
@@ -894,8 +898,10 @@ function ownerStarted(
 /**
  * The bd verb each step resolves to — the only place this module spawns a write. Answers whether it
  * LANDED one: only an approve can reach here and find nothing left to write (see
- * {@link grantApproval}); every other verb writes unconditionally, because the states that make them
- * no-ops are caught by {@link alreadySatisfied} before the fences ever run.
+ * {@link grantApproval}); every other verb writes unconditionally — most because the states that
+ * make them no-ops are caught by {@link alreadySatisfied} before the fences ever run, `attach-outcome`
+ * because re-tagging an already-correctly-labelled bead is harmless and the only way to also catch a
+ * dead one.
  */
 async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
   switch (step.verb) {
@@ -933,9 +939,26 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
     case "undefer":
       await beads.undefer(repo, step.id);
       return true;
-    case "attach-outcome":
+    case "attach-outcome": {
+      // Replace, never append: adding the right label alongside a dead one it never removes would
+      // leave `outcomeIdsOf(subject)[0]` still the dead id — the exact id `featureCardOf` reads —
+      // so the digest keeps the card unlinked forever with the proposal now closed as applied (P2
+      // review, PR #351). Re-read rather than trusted from the plan: the subject's labels are what
+      // this write is about to change, and nothing upstream locked them against drifting further.
+      //
+      // The stale label comes off BEFORE the right one goes on, not after: dying between the two
+      // writes leaves the bead with no outcome label at all, which reads as unlinked again next
+      // patrol — the same self-healing state this system already re-asks for — rather than leaving
+      // the dead label standing ALONGSIDE the new one, which reproduces the exact bug this write
+      // exists to fix.
+      const subject = await reread(repo, step.id);
+      const stale = (subject ? outcomeIdsOf(subject) : [])
+        .filter((id) => id !== step.outcome)
+        .map((id) => `outcome:${id}`);
+      if (stale.length > 0) await beads.untag(repo, step.id, stale);
       await beads.tag(repo, step.id, [`outcome:${step.outcome}`]);
       return true;
+    }
   }
 }
 
