@@ -49,7 +49,7 @@ import { isPipelineArtifact } from "./beads/contract";
 import * as schema from "./db/schema";
 import { toEpoch } from "./db/epoch";
 import { prNumberFromRef } from "./git/pr";
-import { isFoldReason } from "./gardener/emit";
+import { isFoldReason, isSupersededReason } from "./gardener/emit";
 import { isProposalBead, proposalPlanOf } from "./gardener/detections";
 import type { AntonDb } from "./jobs/queue";
 import type {
@@ -341,12 +341,12 @@ function proposalSubjectBeadId(bead: Bead): string | null {
  * nothing. Mirrors `gardener/track-record.ts`'s `settlementOf`, with one difference: that reader
  * excludes an unattended policy apply (it must not count anton agreeing with itself as a founder's
  * verdict), but the timeline reports what HAPPENED regardless of who decided it, so a policy apply
- * still reports `applied`. A fold reports nothing either way — it is a plain close that settled no
- * ask (see `isFoldReason`).
+ * still reports `applied`. A fold or a superseded close reports nothing either way — both are a
+ * plain close that settled no ask (see `isFoldReason`, `isSupersededReason`).
  */
 function proposalOutcomeOf(bead: Bead): "applied" | "refused" | undefined {
   if (beads.isAbandoned(bead)) return "refused";
-  if (isFoldReason(bead.close_reason)) return undefined;
+  if (isFoldReason(bead.close_reason) || isSupersededReason(bead.close_reason)) return undefined;
   return "applied";
 }
 

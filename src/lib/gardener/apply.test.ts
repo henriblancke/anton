@@ -81,7 +81,10 @@ vi.mock("../beads/bd", async () => {
       update: (_cwd: string, id: string, patch: { priority?: number }) =>
         record("update", id, `P${patch.priority}`),
       note: (_cwd: string, id: string, text: string) => record("note", id, text),
+      tag: (_cwd: string, id: string, labels: string[]) => record("tag", id, labels.join(",")),
       untag: (_cwd: string, id: string, labels: string[]) => record("untag", id, labels.join(",")),
+      changeLabels: (_cwd: string, id: string, add: string[], remove: string[]) =>
+        record("changeLabels", id, `add:${add.join(",")}`, `remove:${remove.join(",")}`),
       approve: (_cwd: string, id: string) => record("approve", id),
       assign: (_cwd: string, id: string, actor: string) => record("assign", id, actor),
       unassign: (_cwd: string, id: string) => record("assign", id, ""),
@@ -92,11 +95,20 @@ vi.mock("../beads/bd", async () => {
 /** The machine identity an approve auto-claims under — resolved from git/env in production. */
 vi.mock("../operator", () => ({ resolveOperator: async () => "operator-1" }));
 
+/** `.product/PRODUCT.md`'s raw text, as `outcomeIdsIfNeeded` reads it — "" (not configured, the
+ * default for every test but the outcome-validation ones below) unless a test sets it. */
+let productMarkdown = "";
+vi.mock("../outcomes", async () => {
+  const actual = await vi.importActual<typeof import("../outcomes")>("../outcomes");
+  return { ...actual, readProductMd: async () => productMarkdown };
+});
+
 const { ProposalApplyError, applyProposal, declineNote, planApply } = await import("./apply");
 
 beforeEach(() => {
   resetSeam();
   onShow = undefined;
+  productMarkdown = "";
 });
 
 describe("the plan a proposal carries — read strictly, because it decides what gets mutated", () => {
@@ -1594,5 +1606,240 @@ describe("the product master's moves", () => {
     expect(err.message).toMatch(/decline this proposal/);
     // Nothing but the refusal note: the board is untouched.
     expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+});
+
+/**
+ * Attach-outcome (anton-15xcn): the gardener's own write for `unlinked-outcome`, labelling a run
+ * target with the outcome `detectUnlinkedOutcomes` suggested. Mechanical and single-bead, like
+ * `reprioritize` above, with the same two shapes worth testing here: a board that already agrees
+ * SETTLES rather than writing twice, and `unknown` — the literal answer that means "neither board
+ * signal fired" — has no mechanical move at all, so Approve refuses it exactly like a split.
+ */
+describe("the gardener's outcome label", () => {
+  const OUTCOME = planFor({
+    kind: "unlinked-outcome",
+    move: "attach-outcome",
+    subjects: ["anton-a"],
+    detail: "codebase-health",
+  });
+  const UNKNOWN = planFor({
+    kind: "unlinked-outcome",
+    move: "attach-outcome",
+    subjects: ["anton-a"],
+    detail: "unknown",
+  });
+
+  it("writes the outcome label the plan names, and closes the proposal as applied", async () => {
+    // source:stringer so a fresh board re-derives the same "codebase-health" the plan was filed
+    // with — the write re-derives the outcome rather than trusting the plan's frozen `detail`.
+    const subject = cold("anton-a", { labels: ["source:stringer"] });
+    const result = await applyWith(proposalFor(OUTCOME), [subject]);
+    expect(calls).toEqual([
+      "changeLabels anton-a add:outcome:codebase-health remove:",
+      "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
+      "close anton-p1 applied: labelled anton-a outcome:codebase-health",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
+  });
+
+  it("settles rather than writing when the bead already carries an outcome", async () => {
+    // Warm on purpose: labelling it by hand IS a write since the filing, and the evidence fence
+    // must not turn the outcome the ask wanted into a refusal.
+    await applyWith(proposalFor(OUTCOME), [warm("anton-a", { labels: ["outcome:trustworthy-board"] })]);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+    expect(calls).toContain(
+      "close anton-p1 applied: anton-a already carries an outcome — nothing to add",
+    );
+  });
+
+  // Claude review, PR #351: `alreadySatisfied`'s attach-outcome branch used to short-circuit on ANY
+  // existing `outcome:<id>` label, dead ones included, without checking it against `validOutcomeIds`
+  // the way the decision's own settle above does — so a bead carrying only a dead label never
+  // reached the write at all: `applyStep` returned false before `assertOutcomeHolds` or `beads.tag`
+  // ever ran, yet `applySteps` still closed the proposal as applied, leaving the dead label standing
+  // and nothing left to re-propose. Drives the FULL write path (decide, then `applyStep`/`runStep`),
+  // not just `decide()` directly, since that is exactly where the old bug lived.
+  it("corrects a dead outcome label through the full write path, not settling on it unwritten", async () => {
+    productMarkdown = "## Outcomes\n- `oriented-operator` — Users feel oriented.\n";
+    // source:stringer so the re-derived suggestion is deterministic once the dead label is
+    // rejected (codebase-health), matching what the OUTCOME plan above was filed with.
+    const subject = cold("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
+    const result = await applyWith(proposalFor(OUTCOME), [subject]);
+    expect(calls).toEqual([
+      "changeLabels anton-a add:outcome:codebase-health remove:outcome:typo-dh",
+      "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
+      "close anton-p1 applied: labelled anton-a outcome:codebase-health",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
+  });
+
+  // Codex review, PR #351: the write used to treat every outcome label but the new one as stale,
+  // which also untagged a still-valid SECOND label — a target serving both `codebase-health` and a
+  // product outcome is a supported state. Only the dead FIRST id, the one `featureCardOf` reads,
+  // is ever stale by the time this reaches the write (`assertOutcomeHolds` already refused the
+  // write outright had a recognized first id disagreed with `step.outcome`).
+  it("repairs the dead first outcome label without touching a valid second one", async () => {
+    productMarkdown =
+      "## Outcomes\n- `oriented-operator` — Users feel oriented.\n- `codebase-health` — repo health.\n";
+    const subject = cold("anton-a", {
+      labels: ["outcome:typo-dh", "outcome:oriented-operator", "source:stringer"],
+    });
+    const result = await applyWith(proposalFor(OUTCOME), [subject]);
+    expect(calls).toEqual([
+      "changeLabels anton-a add:outcome:codebase-health remove:outcome:typo-dh",
+      "note anton-p1 gardener: applied — labelled anton-a outcome:codebase-health.",
+      "close anton-p1 applied: labelled anton-a outcome:codebase-health",
+    ]);
+    expect(result.changed).toEqual(["anton-a"]);
+  });
+
+  it("refuses to label a bead a run has claimed since the filing", async () => {
+    // source:stringer so the claim-busy refusal is the one that fires — without it, a fresh
+    // re-derive would find no signal at all and refuse as `unknown` before ever reaching the claim.
+    const claimed = warm("anton-a", {
+      status: "in_progress",
+      assignee: "runner-1",
+      labels: ["source:stringer"],
+    });
+    const err = (await applyWith(proposalFor(OUTCOME), [claimed]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  // `unknown` is the suggestion `detectUnlinkedOutcomes` files when neither board signal fired —
+  // the same shape as a split or a targetless re-parent, and refused the same way: approving it
+  // would have to invent an outcome rather than run a move anton actually knows how to make.
+  it("refuses an UNKNOWN suggestion with an answer, rather than guessing or writing nothing silently", async () => {
+    const err = (await applyWith(proposalFor(UNKNOWN), [cold("anton-a")]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/could not guess which outcome/);
+    expect(err.message).toMatch(/decline this proposal/);
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  it("refuses an UNKNOWN proposal even when a fresh read would now suggest a real outcome", async () => {
+    // The proposal was filed as `unknown` because neither signal fired at the time — the card the
+    // operator approved said "could not guess". If the parent epic gains an outcome label before the
+    // click, re-deriving would now suggest a real outcome, but that outcome was never shown to the
+    // approver: the frozen `unknown` detail must still be the one Approve is refused against.
+    const epic = bead("anton-epic", { issue_type: "epic", labels: ["outcome:second-outcome"] });
+    const feature = bead("anton-a", { issue_type: "feature", parent: "anton-epic" });
+    const err = (await applyWith(proposalFor(UNKNOWN), [epic, feature]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/could not guess which outcome/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  // P2 review, PR #351: the "already carries an outcome" settle used to run BEFORE the manual
+  // check, so hand-labelling the subject and then clicking Approve on an `unknown` proposal closed
+  // it as settled — an applied founder verdict on an outcome Anton never proposed. Approve must
+  // refuse an `unknown` proposal outright, whatever the subject carries by the time of the click.
+  it("refuses an UNKNOWN proposal even when the operator hand-labelled the subject since filing", async () => {
+    const handLabelled = warm("anton-a", { labels: ["outcome:trustworthy-board"] });
+    const err = (await applyWith(proposalFor(UNKNOWN), [handLabelled]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/could not guess which outcome/);
+    expect(err.message).toMatch(/decline this proposal/);
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([]);
+  });
+
+  it("refuses at the write boundary when the subject stopped being a run target since the decision", async () => {
+    // Open at the decision (a parentless task, a run target), then adopted under a feature before
+    // the write's own locked board read — ceasing to be a run target without ceasing to be open
+    // work, which the decide-time snapshot alone cannot see.
+    const subject = cold("anton-a", { labels: ["source:stringer"] });
+    liveBeads.set("anton-a", { ...subject, parent: "anton-feat" });
+    const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/no longer a run target/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  it("refuses at the write boundary when the suggested outcome has moved since the decision", async () => {
+    // The subject inherits its parent epic's single outcome label at the decision, then that label
+    // is relabelled before the write's own locked board read — the board now deterministically
+    // suggests a different outcome than the one the decision chose.
+    const epic = bead("anton-epic", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const feature = bead("anton-a", { issue_type: "feature", parent: "anton-epic" });
+    liveBeads.set("anton-epic", { ...epic, labels: ["outcome:second-outcome"] });
+    const err = (await applyWith(proposalFor(OUTCOME), [epic, feature]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/outcome has moved to second-outcome/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  it("refuses at the write boundary when the subject was re-parented onto a different epic, even one that currently suggests the same outcome", async () => {
+    // The decision reads the subject under epicA (inheriting its single outcome label). Before the
+    // write's own locked board read, the subject is re-parented onto epicB — a DIFFERENT determining
+    // epic that, by coincidence, carries the very same outcome label. The write locks epicA
+    // (`premiseBeadsOf`), never epicB, so comparing the outcome string alone would pass here on a
+    // parent nothing serialized against.
+    const epicA = bead("anton-epicA", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const epicB = bead("anton-epicB", { issue_type: "epic", labels: ["outcome:first-outcome"] });
+    const feature = bead("anton-a", { issue_type: "feature", parent: "anton-epicA" });
+    liveBeads.set("anton-a", { ...feature, parent: "anton-epicB" });
+    const err = (await applyWith(proposalFor(OUTCOME), [epicA, epicB, feature]).catch(
+      (e) => e,
+    )) as InstanceType<typeof ProposalApplyError>;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/determining parent has moved to anton-epicB/);
+    expect(calls.filter((c) => c.startsWith("tag"))).toEqual([]);
+  });
+
+  // P2 review, PR #351: a fresh board read saw a human's newer outcome label but categorized it as
+  // stale solely because it differed from `step.outcome` — `assertOutcomeHolds` only re-derived the
+  // parent/stringer suggestion and never checked the subject's own newly selected outcome, so the
+  // write would have removed the operator's live decision and replaced it with its own older guess.
+  it("refuses at the write boundary when the subject was hand-labelled with a different, recognized outcome since the decision", async () => {
+    const subject = cold("anton-a", { labels: ["source:stringer"] });
+    liveBeads.set("anton-a", { ...subject, labels: ["source:stringer", "outcome:trustworthy-board"] });
+    const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("refused");
+    expect(err.message).toMatch(/anton-a now carries outcome:trustworthy-board/);
+    expect(calls.filter((c) => c.startsWith("tag") || c.startsWith("untag"))).toEqual([]);
+  });
+
+  // P2 review, PR #351: the outcome label change used to be two writes (untag, then tag), so a `bd`
+  // subprocess rejecting between them left the untag landed and the tag unattempted — a bare error
+  // that left the subject off `applySteps`' `changed` prefix as if nothing were written. A single
+  // atomic `changeLabels` call removes that window, but the SAME ambiguity still applies to one
+  // write exactly as it did to two: a `bd` subprocess can commit its label delta and only then time
+  // out or exit nonzero. Name the subject as stranded rather than assume the commit never landed.
+  it("names the stranded subject when the outcome label change commits but then reports failure", async () => {
+    productMarkdown = "## Outcomes\n- `oriented-operator` — Users feel oriented.\n";
+    const subject = cold("anton-a", { labels: ["outcome:typo-dh", "source:stringer"] });
+    failAfterWrite.set("changeLabels:anton-a", 1);
+    const err = (await applyWith(proposalFor(OUTCOME), [subject]).catch((e) => e)) as InstanceType<
+      typeof ProposalApplyError
+    >;
+    expect(err.failure).toBe("failed");
+    expect(err.message).toMatch(
+      /anton-a's outcome label change landed despite .+ — report it as applied/,
+    );
+    expect(err.changed).toEqual(["anton-a"]);
+    expect(calls.filter((c) => !c.startsWith("note"))).toEqual([
+      "changeLabels anton-a add:outcome:codebase-health remove:outcome:typo-dh",
+    ]);
+  });
+
+  it("invalidates a plan whose outcome was edited after it was filed", () => {
+    const tampered = { ...OUTCOME, detail: "a-different-outcome" };
+    expect(parseGardenerPlan(tampered)).toBeUndefined();
+    expect(parseGardenerPlan(OUTCOME)).toEqual(OUTCOME);
   });
 });

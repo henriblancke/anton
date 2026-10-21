@@ -79,6 +79,7 @@ import {
   readProposalPlan,
   type GardenerPlan,
 } from "./detections";
+import { allOutcomeIds, outcomesConfigured, parseOutcomes, readProductMd } from "../outcomes";
 
 export { planApply } from "./apply-plan";
 export type { ApplyDecision, ApplyMoment, ApplyStep } from "./apply-plan";
@@ -238,7 +239,14 @@ async function applyApproved(
   // the moment the patrol judged the board, which is what every "has this moved since we asked"
   // check compares to.
   const at: ApplyMoment = { nowMs: Date.now(), observedAtMs: observedAtOf(proposal) };
-  const decision = planApply(plan, await withCycleEvidenceIfNeeded(repo, plan, board), at);
+  const validOutcomeIds = await outcomeIdsIfNeeded(repo, plan);
+  const decision = planApply(
+    plan,
+    await withCycleEvidenceIfNeeded(repo, plan, board),
+    at,
+    undefined,
+    validOutcomeIds,
+  );
   if (decision.status === "refuse") {
     throw await attachFailure(
       repo,
@@ -259,6 +267,33 @@ async function applyApproved(
  * drifts from this one.
  */
 export const CYCLE_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["approve", "unapprove"]);
+
+/** The one move whose decision validates an inherited outcome id (`planAttachOutcome` →
+ * `suggestOutcome`) — gates the `readProjectOutcomes` read below the same way `CYCLE_AWARE_MOVES`
+ * gates `bd dep cycles`, so every other move skips a file read it never consults. */
+const OUTCOME_AWARE_MOVES: ReadonlySet<GardenerPlan["move"]> = new Set(["attach-outcome"]);
+
+/**
+ * Every outcome id `repo`'s PRODUCT.md recognizes, read only for `attach-outcome` — or undefined
+ * when there is nothing to validate against at all.
+ *
+ * Gated on {@link projectOutcomesConfigured}, not just "the read didn't throw": a project that
+ * predates the outcome contract (anton-cdeki, unlinked-outcome.ts's own opening comment) has no
+ * `## Outcomes` section, so `readProjectOutcomes` resolves to just the built-in `codebase-health` —
+ * and an epic hand-labelled `outcome:<id>` before that contract existed would then fail validation
+ * against a set that was never meant to be exhaustive, refusing perfectly good old work. Validation
+ * only means something once a project has actually declared its outcomes; before that, every id is
+ * unchecked, same as before this validation existed.
+ */
+async function outcomeIdsIfNeeded(
+  repo: string,
+  plan: GardenerPlan,
+): Promise<ReadonlySet<string> | undefined> {
+  if (!OUTCOME_AWARE_MOVES.has(plan.move)) return undefined;
+  const markdown = await readProductMd(repo);
+  if (!outcomesConfigured(markdown)) return undefined;
+  return allOutcomeIds(parseOutcomes(markdown));
+}
 
 /**
  * `bd dep cycles` evidence, fetched only for the moves that consume it — `unapprove`, via
@@ -692,7 +727,8 @@ async function settledDrifted(
     // Same rule as `reread`'s: a board we could not read says nothing, so the proposal stays open.
     return `the board could not be re-read to confirm the move is already applied (${messageOf(e)}) — nothing was written`;
   }
-  const now = planApply(plan, board, { ...at, nowMs: Date.now() }, carried);
+  const validOutcomeIds = await outcomeIdsIfNeeded(repo, plan);
+  const now = planApply(plan, board, { ...at, nowMs: Date.now() }, carried, validOutcomeIds);
   switch (now.status) {
     case "settled":
       return undefined;

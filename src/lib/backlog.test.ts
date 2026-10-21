@@ -630,6 +630,26 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
     ).resolves.toMatchObject({ id: "p-9", epicId: "p-1" });
   });
 
+  // `unknown` is the gardener's own "no suggestion" sentinel (unlinked-outcome.ts UNKNOWN_OUTCOME) —
+  // the unconfigured-project exemption above must not let a founder free-type it into the Add-work
+  // outcome field, since `configured` is false here and would otherwise skip the active-id check
+  // entirely, landing `outcome:unknown` on the board indistinguishable from the sentinel (P2 review,
+  // PR #351).
+  it("refuses the reserved `unknown` outcome id even when PRODUCT.md has no ## Outcomes section", async () => {
+    boardIs(bead({ id: "p-1", issue_type: "epic" }));
+    const create = vi.spyOn(beads, "create");
+
+    const rejection = await createDraftFeature(unconfiguredProject(), {
+      feature: { ...FEATURE, outcomeId: "unknown" },
+      epic: { kind: "existing", id: "p-1" },
+    }).then(
+      () => undefined,
+      (e: unknown) => e as Error,
+    );
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+    expect(create).not.toHaveBeenCalled();
+  });
+
   it("accepts a new epic's Outcome IDs against PRODUCT.md's active set when it has no ## Outcomes section — syntax is still checked", async () => {
     const createGraph = graphLands();
 
@@ -654,6 +674,19 @@ describe("createDraftFeature — what the Add-work commit lands", () => {
       epic: {
         kind: "new",
         epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:bad!" },
+      },
+    }).catch((e) => e);
+    expect(rejection).toBeInstanceOf(DraftOutcomeError);
+  });
+
+  // The reserved sentinel can also ride along as a SECONDARY id in the new epic's declared list,
+  // never used by the feature itself — this must be caught too, not just the feature's own id.
+  it("refuses a new epic's Outcome IDs naming `unknown` as a secondary id, even when PRODUCT.md has no ## Outcomes section", async () => {
+    const rejection = await createDraftFeature(unconfiguredProject(), {
+      feature: FEATURE,
+      epic: {
+        kind: "new",
+        epic: { ...EPIC, outcomeIds: "outcome:reports-are-shareable, outcome:unknown" },
       },
     }).catch((e) => e);
     expect(rejection).toBeInstanceOf(DraftOutcomeError);

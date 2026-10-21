@@ -72,6 +72,11 @@ export {
   RETIRE_STALE_IN_PROGRESS_DAYS,
   RETIRE_STALE_OPEN_DAYS,
 } from "./retire";
+// Deliberately NOT part of {@link detectBoard}: it asks about a label the outcome contract
+// predates rather than about how the board hangs together, so the pass that turns this claim into
+// a decidable proposal composes `detectUnlinkedOutcomes` itself (gardener-proposals.ts), the same
+// way `detectDeferredRejudgements` is composed on its own cadence below.
+export { detectUnlinkedOutcomes, STRINGER_OUTCOME, UNKNOWN_OUTCOME } from "./unlinked-outcome";
 // Deliberately NOT part of {@link detectBoard}: re-judgement asks about a decision the board's own
 // tiers made rather than about its shape, and it runs on its own cadence (anton-30vo) — so the pass
 // that schedules it composes `detectDeferredRejudgements`, which is the claim with its verb already

@@ -74,6 +74,16 @@ describe("the approve move (anton-1ivg)", () => {
   });
 });
 
+describe("the attach-outcome move (anton-15xcn)", () => {
+  // The literal `detectUnlinkedOutcomes` suggests when neither board signal fired is the same shape
+  // as a split or a targetless re-parent: the ask is real, but only a human can answer it.
+  it("is manual exactly when the suggestion is unknown — a real outcome id has a mechanical answer", () => {
+    expect(isManualProposal({ move: "attach-outcome", detail: "unknown" })).toBe(true);
+    expect(isManualProposal({ move: "attach-outcome", detail: "codebase-health" })).toBe(false);
+    expect(isManualProposal({ move: "attach-outcome" })).toBe(false);
+  });
+});
+
 describe("its fingerprint", () => {
   it("is the pm-namespaced label every other proposal carries, and is stable", () => {
     // Pinned rather than recomputed: the label is what a re-run recognises its own ask by, so a

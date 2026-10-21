@@ -19,7 +19,12 @@ const listMock = vi.fn<(cwd: string, extra?: string[]) => Promise<Bead[]>>();
 const showMock = vi.fn<(cwd: string, id: string) => Promise<Bead>>();
 const closeMock = vi.fn<(cwd: string, id: string, reason?: string) => Promise<string>>();
 const createMock =
-  vi.fn<(cwd: string, opts: { title: string; labels?: string[] }) => Promise<string>>();
+  vi.fn<
+    (
+      cwd: string,
+      opts: { title: string; labels?: string[]; metadata?: Record<string, unknown> },
+    ) => Promise<string>
+  >();
 const pushMock = vi.fn<(cwd: string) => Promise<SyncOutcome>>();
 const pullMock = vi.fn<(cwd: string) => Promise<void>>();
 const cyclesMock = vi.fn<(cwd: string) => Promise<unknown[]>>();
@@ -54,11 +59,14 @@ const ORPHAN_FINDING: HygieneFinding = {
   detail: "named by a commit (abc1234) but still open",
 };
 
+// `outcome:` labelled by default so a fixture bead stays out of the unlinked-outcome detector
+// unless a test means to exercise it — that detector has its own suite (unlinked-outcome.test.ts).
 const bead = (id: string, o: Partial<Bead> = {}): Bead => ({
   id,
   title: id,
   status: "open",
   issue_type: "task",
+  labels: ["outcome:test"],
   ...o,
 });
 
@@ -225,6 +233,63 @@ describe("fileGardenerProposals", () => {
       "[gardener] SHADOW p-1 (shipped-orphan) retire/close t-4 — WOULD APPLY: closed t-4 as shipped\n",
     );
     expect(closeMock).not.toHaveBeenCalled();
+  });
+
+  it("asks about a run target carrying no outcome:<id> label (anton-vie0k)", async () => {
+    // t-4 here carries no `outcome:` label, unlike the default `bead()` fixture — the composed
+    // `detectUnlinkedOutcomes` has to be the one that notices, since no hygiene finding can.
+    listMock.mockResolvedValue([bead("t-4", { title: "untracked", labels: [] })]);
+    const scope = fakeScope(REPO);
+
+    expect(await file(scope, [])).toBe(1);
+    const [, draft] = createMock.mock.calls[0];
+    expect(draft.title).toContain("t-4");
+    expect(draft.labels?.some((l) => l.startsWith("gardener:unlinked-outcome:"))).toBe(true);
+    // The move is the approver's: the tier only asks, it never labels t-4 itself.
+    expect(closeMock).not.toHaveBeenCalled();
+    expect(scope.nudged).toEqual([scope.project]);
+  });
+
+  it("nudges on a retry-only pass that closes a stale sibling but files nothing new (PR #351)", async () => {
+    // t-4's suggested outcome flips from "unknown" to the stringer outcome once it picks up
+    // `source:stringer`, which changes `unlinked-outcome`'s fingerprint — so the fresh ask
+    // supersedes the earlier one. The first close attempt fails, so the stale sibling is left
+    // standing; a later pass finds the fresh ask already on the board (nothing to create) and
+    // only retries that close. That retry is still a board write another machine has to see.
+    listMock.mockResolvedValue([bead("t-4", { title: "untracked", labels: [] })]);
+    const pass1 = fakeScope(REPO);
+    await file(pass1, []);
+    const [, draft0] = createMock.mock.calls[0];
+    createMock.mockClear();
+
+    const stale = bead("p-0", { title: draft0.title, labels: draft0.labels, metadata: draft0.metadata });
+    showMock.mockImplementation(async (_cwd, id) => {
+      if (id === stale.id) return stale;
+      throw new Error("no such bead");
+    });
+    closeMock.mockRejectedValueOnce(new Error("transient dolt write failure"));
+    listMock.mockResolvedValue([bead("t-4", { title: "untracked", labels: ["source:stringer"] }), stale]);
+    const pass2 = fakeScope(REPO);
+    await file(pass2, []);
+    expect(createMock).toHaveBeenCalledTimes(1);
+    const [, draft1] = createMock.mock.calls[0];
+    expect(draft1.labels).not.toEqual(draft0.labels); // the fresh ask outgrew the stale one
+    expect(closeMock).toHaveBeenCalledTimes(1); // attempted, and failed
+    createMock.mockClear();
+    closeMock.mockClear();
+
+    const fresh = bead("p-1", { title: draft1.title, labels: draft1.labels, metadata: draft1.metadata });
+    listMock.mockResolvedValue([
+      bead("t-4", { title: "untracked", labels: ["source:stringer"] }),
+      stale,
+      fresh,
+    ]);
+    const pass3 = fakeScope(REPO);
+    await file(pass3, []);
+
+    expect(createMock).not.toHaveBeenCalled(); // the fresh ask already stands
+    expect(closeMock).toHaveBeenCalledTimes(1); // the retry succeeds this time
+    expect(pass3.nudged).toEqual([pass3.project]);
   });
 });
 

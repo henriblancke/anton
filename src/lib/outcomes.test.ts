@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   activeOutcomeIds,
+  allOutcomeIds,
   outcomesConfigured,
   parseOutcomes,
   projectOutcomesConfigured,
@@ -115,6 +116,19 @@ describe("parseOutcomes", () => {
     expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "valid-id"]);
   });
 
+  // Gardener's no-suggestion sentinel (unlinked-outcome.ts UNKNOWN_OUTCOME) must never double as a
+  // real, choosable outcome — a founder declaring one would make an inherited `unknown` outcome
+  // indistinguishable from "could not guess" to every downstream caller (P2 review, PR #351).
+  it("reserves `unknown` — it can never be configured as a real outcome", () => {
+    const markdown = [
+      "## Outcomes",
+      "- `unknown` — Reserved by gardener; must not parse as a real outcome.",
+      "- `valid-id` — This one is a real outcome.",
+    ].join("\n");
+
+    expect(parseOutcomes(markdown).map((o) => o.id)).toEqual(["codebase-health", "valid-id"]);
+  });
+
   it("does not parse an example bullet embedded inside a multi-line HTML comment", () => {
     const markdown = [
       "## Outcomes",
@@ -216,6 +230,15 @@ describe("activeOutcomeIds", () => {
       ["## Outcomes", "- `live` — Still offered.", "- `dead` — Gone (retired)."].join("\n"),
     );
     expect(activeOutcomeIds(outcomes)).toEqual(new Set(["codebase-health", "live"]));
+  });
+});
+
+describe("allOutcomeIds", () => {
+  it("keeps retired ids too — an existing or inherited label referencing one still resolves", () => {
+    const outcomes = parseOutcomes(
+      ["## Outcomes", "- `live` — Still offered.", "- `dead` — Gone (retired)."].join("\n"),
+    );
+    expect(allOutcomeIds(outcomes)).toEqual(new Set(["codebase-health", "live", "dead"]));
   });
 });
 

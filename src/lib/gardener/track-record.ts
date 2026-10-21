@@ -10,12 +10,15 @@
  * aggregate. This module is that read, and the floor it feeds is what makes the aggregate binding
  * rather than advisory.
  *
- * Two things it must get right, or it inverts:
+ * Three things it must get right, or it inverts:
  *
  *   • A FOLD IS NOT AN APPLY. `reconcileDuplicateProposals` PLAINLY closes folded duplicates,
  *     deliberately, so that folding does not poison the survivor's fingerprint. Counting those as
  *     applies would score every duplicate as a success — precision inflating exactly when a detector
  *     is at its noisiest. The fold's own close reason is the tell ({@link isFoldReason}).
+ *   • NEITHER IS A SUPERSEDED CLOSE. `emit.ts`'s `staleSiblingsOf` closes a proposal whose own
+ *     suggestion changed before anyone decided it — nobody answered that ask either, so it must not
+ *     count as a verdict any more than a fold does ({@link isSupersededReason}).
  *   • AN UNATTENDED APPLY IS NOT A VERDICT. An armed kind closes its own proposals through the same
  *     `applyProposal` a founder-approved one does, so counting those would let a kind ratchet its own
  *     record to 100% the moment it was armed — the floor could never re-engage on a detector that
@@ -37,7 +40,7 @@ import {
   type ProposalTrackRecord,
 } from "./autonomy";
 import { fingerprintLabelOf, kindOfFingerprint, type GardenerDetectionKind } from "./detections";
-import { isFoldReason } from "./emit";
+import { isFoldReason, isSupersededReason } from "./emit";
 
 /** One settled proposal, reduced to the two facts the record counts. */
 interface Settlement {
@@ -67,11 +70,13 @@ function settledAt(bead: Bead): number {
  * How this proposal settled, or undefined when it did not settle — or when nothing about it should
  * count.
  *
- * The three outcomes, in the order they have to be tested:
+ * The four outcomes, in the order they have to be tested:
  *   • ABANDONED is a decline. It is the founder's recorded won't-do and the verb the decline route
  *     writes, and it is tested FIRST because an abandoned bead is also closed.
  *   • A FOLD is neither. Nobody answered it; an overlapping patrol filed the same claim twice and
  *     this is the copy that was withdrawn.
+ *   • A SUPERSEDED close is neither either, for the mirror reason: nobody answered it, the claim
+ *     itself changed underneath the ask before anyone decided it (see `emit.ts` `staleSiblingsOf`).
  *   • AN UNATTENDED APPLY is neither. The kind was armed, so anton wrote it and nobody was asked —
  *     a count of what the founder decided cannot include anton's own writes.
  *   • Any other plain close is an apply — the move landed, and a human said so.
@@ -80,6 +85,7 @@ function settlementOf(bead: Bead): Settlement | undefined {
   if (beads.isAbandoned(bead)) return { applied: false, atMs: settledAt(bead) };
   if (bead.status !== "closed") return undefined;
   if (isFoldReason(bead.close_reason)) return undefined;
+  if (isSupersededReason(bead.close_reason)) return undefined;
   if (isPolicyApplyReason(bead.close_reason)) return undefined;
   return { applied: true, atMs: settledAt(bead) };
 }

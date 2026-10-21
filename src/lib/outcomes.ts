@@ -33,6 +33,25 @@ const BUILT_IN_OUTCOME: ProjectOutcome = {
   retired: false,
 };
 
+/**
+ * Reserved: the gardener's `detectUnlinkedOutcomes` (unlinked-outcome.ts `UNKNOWN_OUTCOME`) suggests
+ * the literal `unknown` when neither board signal fires — a sentinel meaning "could not guess",
+ * never a real outcome. Restated here rather than imported (this module sits below gardener, which
+ * already depends on it) so a PRODUCT.md bullet naming it is skipped at parse time, the same way an
+ * un-label-safe id is skipped below. Without this, `unknown` could be declared as a genuine outcome
+ * and legitimately inherited from a parent epic's label, yet every downstream caller
+ * (`isManualProposal`, `planAttachOutcome`) reads that same string as "no suggestion" and refuses
+ * the proposal forever — indistinguishable from the sentinel it was never meant to collide with
+ * (P2 review, PR #351).
+ *
+ * Parsing PRODUCT.md is not the only place this has to hold: `backlog.ts`'s `assertOutcomeUsable`
+ * also rejects it unconditionally — even on a project with no `## Outcomes` section configured,
+ * where the active-id check below is skipped entirely — so a founder free-typing `unknown` into
+ * Add-work's outcome field can't land `outcome:unknown` on the board that way either (P2 review,
+ * PR #351 follow-up).
+ */
+export const RESERVED_OUTCOME_ID = "unknown";
+
 const OUTCOMES_HEADING = /^##\s+Outcomes\s*$/i;
 const BULLET_PATTERN = /^-\s*`([^`]+)`\s*—\s*(.+)$/;
 const RETIRED_MARKER = /\s*\(retired\)\.?\s*$/i;
@@ -82,6 +101,8 @@ function parseBullet(line: string): ProjectOutcome | undefined {
   // offered here yet rejected by the Add-work schema (AREA_SHAPE) the moment it's chosen — treat
   // it the same as any other malformed bullet, and skip it, rather than advertise a dead end.
   if (!AREA_SHAPE.test(id)) return undefined;
+  // See RESERVED_OUTCOME_ID: `unknown` is gardener's no-suggestion sentinel, not a choosable outcome.
+  if (id === RESERVED_OUTCOME_ID) return undefined;
   return { id, summary, retired };
 }
 
@@ -169,4 +190,12 @@ export async function projectOutcomesConfigured(repoPath: string): Promise<boole
  * offered here (see {@link ProjectOutcome.retired}). */
 export function activeOutcomeIds(outcomes: ProjectOutcome[]): Set<string> {
   return new Set(outcomes.filter((o) => !o.retired).map((o) => o.id));
+}
+
+/** Every id the project recognizes at all, retired included — what a caller validating an EXISTING
+ * or INHERITED label (rather than offering a choice for new work) checks against: a retired
+ * outcome's prior labels stay valid ({@link ProjectOutcome.retired}), and inheriting one from a
+ * parent epic is the same kind of carry-over, not a new pick. */
+export function allOutcomeIds(outcomes: ProjectOutcome[]): Set<string> {
+  return new Set(outcomes.map((o) => o.id));
 }

@@ -74,6 +74,7 @@ export const DEFAULT_PROPOSAL_AUTONOMY_POLICY: ProposalAutonomyPolicy = {
   "degraded-approval": "propose",
   "withheld-approval": "propose",
   "aged-defer": "propose",
+  "unlinked-outcome": "propose",
 };
 
 function isAutonomy(value: unknown): value is ProposalAutonomy {
@@ -186,6 +187,10 @@ export function autonomyTierOf(plan: { move: GardenerMove; retireAs?: RetireVerb
       // and what follows is the run `approve` is priced for. A tier read off the common case would
       // arm the uncommon one at the cheapest bar.
       return "history";
+    case "attach-outcome":
+      // Writes one label, undone by one `bd update` the same way a re-parent or a priority is —
+      // nothing else on the bead moves, and no run starts from it.
+      return "reversible";
   }
 }
 
@@ -462,12 +467,12 @@ export function pickerApplyVerdict(
  * The kind, the move and the record arrive separately because they answer different halves: the
  * policy is a decision about the KIND, the manual floor a fact about the MOVE, the earned floor a
  * count of what the FOUNDER decided. Both shapes that consult this — a detection about to be filed, a
- * plan read back off a proposal bead — carry the move/target/retireAs triple, so neither has to be
- * converted into the other first.
+ * plan read back off a proposal bead — carry the move/target/retireAs/detail quadruple, so neither
+ * has to be converted into the other first.
  */
 export function autonomyFor(
   kind: GardenerDetectionKind,
-  plan: { move: GardenerMove; target?: string; retireAs?: RetireVerb },
+  plan: { move: GardenerMove; target?: string; retireAs?: RetireVerb; detail?: string },
   policy: ProposalAutonomyPolicy,
   record: ProposalTrackRecord,
 ): ProposalAutonomy {

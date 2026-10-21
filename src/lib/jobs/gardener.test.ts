@@ -145,8 +145,10 @@ const nudge = vi.fn();
 const pushMock = vi.fn<(cwd: string) => Promise<SyncOutcome>>();
 const arbitration = { push: (...a: [string]) => pushMock(...a), sleep: async () => {} };
 
+// `outcome:` labelled by default so a fixture bead stays out of the unlinked-outcome detector
+// (anton-vie0k) unless a test means to exercise it — that detector has its own suite.
 function bead(id: string, o: Partial<Bead> = {}): Bead {
-  return { id, title: id, status: "open", issue_type: "task", ...o };
+  return { id, title: id, status: "open", issue_type: "task", labels: ["outcome:test"], ...o };
 }
 
 /** One patrol, driven to settlement. Returns the job id so a caller can read its row/report. */

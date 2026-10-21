@@ -10,11 +10,13 @@
  * decision held the snapshot to.
  */
 import { approvalGaps, formatApprovalGaps, onlyMissingEvidence, type ApprovalGap } from "../approval-gate";
+import { outcomeIdsOf } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { ownerOf as claimHolder, swapUnderLock, type SwapResult } from "../beads/claim";
 import { withBeadWriteLocks } from "../beads/claim-lock";
 import { loadAllIssues } from "../beads/issues";
 import { resolveOperator } from "../operator";
+import { allOutcomeIds, outcomesConfigured, parseOutcomes, readProductMd } from "../outcomes";
 import {
   indexBoard,
   isInFlight,
@@ -52,6 +54,7 @@ import {
   type TicketOwner,
 } from "./apply-plan";
 import { impliesOrdering } from "./relink";
+import { suggestOutcome } from "./unlinked-outcome";
 
 /** A subject the board moved on between the decision and the write. Never a bd failure. */
 export class SubjectMovedError extends Error {}
@@ -118,7 +121,10 @@ function counterpartOf(step: ApplyStep): string | undefined {
  * `link` is here for its `missing-order` half alone and `reparent` for its `misfiled` half alone; an
  * `implied-order` and the gardener's two re-parents resolve to no premise in
  * {@link EVIDENCE_PREMISE} and are re-derived from the board instead ({@link assertOrderingStated},
- * apply-plan.ts `reparentPremiseGone`).
+ * apply-plan.ts `reparentPremiseGone`). `attach-outcome` is the same shape as those two: its premise
+ * resolves to none either — "still a run target, still the right outcome" is re-derived from the
+ * board by {@link assertOutcomeHolds} alone, unconditionally, since a raw "already labelled" check
+ * cannot tell a valid label from a dead one (see {@link alreadySatisfied}).
  */
 function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
   switch (step.verb) {
@@ -130,6 +136,7 @@ function evidenceOf(step: ApplyStep): EvidenceFence | undefined {
     case "reparent":
     case "approve":
     case "undefer":
+    case "attach-outcome":
       return { kind: step.kind, observedAtMs: step.observedAtMs };
     default:
       return undefined;
@@ -162,10 +169,20 @@ function ownerOf(step: ApplyStep): TicketOwner["owner"] {
  * across an intermediate is only as durable as that intermediate. None is written to, and none is
  * derivable from the step's ends — which is why the decision carries them (apply-plan.ts
  * `ClusterPremise`) and why they are locked (see {@link lockedBeads}).
+ *
+ * An `attach-outcome` step owes its own premise bead the same lock, for the mirror reason: when the
+ * decided outcome was inherited from a parent epic's label, `assertOutcomeHolds` re-derives it by
+ * reading THAT epic, not the subject — so without locking it here, a concurrent relabel of the
+ * parent can land between the read and this write, and the recheck would pass by reading a parent
+ * nothing actually serializes against the write.
  */
 function premiseBeadsOf(step: ApplyStep): string[] {
-  const cluster = step.verb === "reparent" ? step.cluster : undefined;
-  return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
+  if (step.verb === "reparent") {
+    const cluster = step.cluster;
+    return cluster ? [...cluster.members, ...cluster.carriers, ...cluster.carrierPaths] : [];
+  }
+  if (step.verb === "attach-outcome") return step.parent ? [step.parent] : [];
+  return [];
 }
 
 /**
@@ -270,6 +287,7 @@ export async function applyStep(
     await assertRetirementHolds(repo, step);
     await assertHomeHolds(repo, step);
     await assertEvidenceHolds(repo, step);
+    await assertOutcomeHolds(repo, step);
     await assertStartHolds(repo, step);
     const write = await lockedWrite(repo, step);
     signal?.throwIfAborted();
@@ -419,6 +437,74 @@ async function assertEvidenceHolds(repo: string, step: ApplyStep): Promise<void>
 }
 
 /**
+ * Every outcome id `repo`'s PRODUCT.md still recognizes, fresh — or undefined before the project has
+ * declared `## Outcomes` at all, the same guard `outcomesConfigured` gates everywhere else an
+ * `attach-outcome` write checks against it (`apply.ts` `outcomeIdsIfNeeded`, this module's own
+ * {@link assertOutcomeHolds} and `runStep`'s own write): a hand-labelled epic predating the contract
+ * would otherwise fail a check that was never meant to be exhaustive.
+ */
+async function validOutcomeIdsOf(repo: string): Promise<ReadonlySet<string> | undefined> {
+  const markdown = await readProductMd(repo);
+  return outcomesConfigured(markdown) ? allOutcomeIds(parseOutcomes(markdown)) : undefined;
+}
+
+/**
+ * What an OUTCOME LABEL owes a fresh board before it writes: the subject is still a run target, and
+ * the suggestion is still the one the current board derives — both re-derived rather than carried
+ * from the decision, the same treatment `assertHomeHolds`/`assertOrderingStated` give the gardener's
+ * own re-parents and the `implied-order` link.
+ *
+ * Covers three drifts the lock window can introduce between `planAttachOutcome`'s read and this
+ * write: a parentless task adopted under a feature (or a standalone epic that grew a feature
+ * child) stops being a run target without closing; a parent epic relabelled since the decision
+ * changes which outcome the board now says to inherit; and the subject itself re-parented onto a
+ * DIFFERENT determining epic that, by coincidence, currently suggests the same outcome string —
+ * `premiseBeadsOf` only locks `step.parent`, the epic the decision read, so a re-parent swaps in a
+ * new determining epic this write holds no lock on at all. Without comparing parents too, that
+ * swap passes here on the outcome matching alone, and a relabel of the NEW epic landing right after
+ * this check (and before `beads.tag`) writes a guess nothing serialized against.
+ */
+async function assertOutcomeHolds(repo: string, step: ApplyStep): Promise<void> {
+  if (step.verb !== "attach-outcome") return;
+  const board = await lockedBoard(repo, `before labelling ${step.id} outcome:${step.outcome}`, false);
+  const subject = board.byId.get(step.id);
+  if (!subject) throw new SubjectMovedError(missing(step.id));
+  if (!beads.isRunTarget(subject, board.all)) {
+    throw new SubjectMovedError(
+      `${step.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`,
+    );
+  }
+  const validOutcomeIds = await validOutcomeIdsOf(repo);
+  // Mirrors `planAttachOutcome`'s own settle, re-asked against THIS read: a recognized label the
+  // subject already carries — placed by hand, or by a concurrent approval, in the window between
+  // the decision and this lock — is a live decision, not a stale guess to overwrite. Checked
+  // against the FIRST id alone, the one `featureCardOf` reads, and ahead of the parent/outcome
+  // re-derivation below: without this, a fresh human pick that happens to leave the parent-derived
+  // suggestion unchanged for THIS subject would sail through and `runStep` would untag it in favor
+  // of the older guess this step was decided with (P2 review, PR #351).
+  const ownFirstId = outcomeIdsOf(subject)[0];
+  const ownFirstRecognized = validOutcomeIds
+    ? ownFirstId !== undefined && validOutcomeIds.has(ownFirstId)
+    : ownFirstId !== undefined;
+  if (ownFirstRecognized && ownFirstId !== step.outcome) {
+    throw new SubjectMovedError(
+      `${step.id} now carries outcome:${ownFirstId} — labelled since this was decided, so the apply refuses rather than replace a recognized outcome with its own older guess`,
+    );
+  }
+  const current = suggestOutcome(board, subject, validOutcomeIds);
+  if (current.parent !== step.parent) {
+    throw new SubjectMovedError(
+      `${step.id}'s determining parent has moved to ${current.parent ?? "none"} since this was decided — the board changed underneath this approval, so it refuses rather than write a guess nothing locked`,
+    );
+  }
+  if (current.outcome !== step.outcome) {
+    throw new SubjectMovedError(
+      `${step.id}'s suggested outcome has moved to ${current.outcome} since this was decided — the board changed underneath this approval, so it refuses rather than write a stale guess`,
+    );
+  }
+}
+
+/**
  * What an APPROVE owes the target it is about to release a run on — the evidence fence of the one
  * move that starts work, re-asked from a board read taken INSIDE the subject's own write lock.
  *
@@ -497,6 +583,13 @@ function alreadySatisfied(step: ApplyStep, subject: Bead): boolean {
   // the filing, so an unguarded evidence check would refuse the very state the ask was after (the
   // same order `planUndefer` reads its settled states in).
   if (step.verb === "undefer") return !beads.isDeferred(subject);
+  // No idempotent-skip for attach-outcome, on purpose: a raw `outcomeIdsOf(subject).length > 0`
+  // used to short-circuit here on ANY existing label, dead ones included, so a bead carrying only
+  // a typo'd id read as already satisfied and the write — the one place validity against
+  // `validOutcomeIds` is actually checked — never ran (P2 review, PR #351). `assertOutcomeHolds`
+  // re-derives the right outcome and refuses a stale one before every write, so falling through
+  // to it and `runStep` unconditionally is the only way a dead label still gets corrected; a tag
+  // add that happens to repeat an already-correct label is harmless.
   return false;
 }
 
@@ -829,8 +922,10 @@ function ownerStarted(
 /**
  * The bd verb each step resolves to — the only place this module spawns a write. Answers whether it
  * LANDED one: only an approve can reach here and find nothing left to write (see
- * {@link grantApproval}); every other verb writes unconditionally, because the states that make them
- * no-ops are caught by {@link alreadySatisfied} before the fences ever run.
+ * {@link grantApproval}); every other verb writes unconditionally — most because the states that
+ * make them no-ops are caught by {@link alreadySatisfied} before the fences ever run, `attach-outcome`
+ * because re-tagging an already-correctly-labelled bead is harmless and the only way to also catch a
+ * dead one.
  */
 async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
   switch (step.verb) {
@@ -868,6 +963,53 @@ async function runStep(repo: string, step: ApplyStep): Promise<boolean> {
     case "undefer":
       await beads.undefer(repo, step.id);
       return true;
+    case "attach-outcome": {
+      // Replace, never append: adding the right label alongside a dead one it never removes would
+      // leave `outcomeIdsOf(subject)[0]` still the dead id — the exact id `featureCardOf` reads —
+      // so the digest keeps the card unlinked forever with the proposal now closed as applied (P2
+      // review, PR #351). Re-read rather than trusted from the plan: the subject's labels are what
+      // this write is about to change, and nothing upstream locked them against drifting further.
+      //
+      // Only the FIRST id is ever stale here, never every id but the new one: `assertOutcomeHolds`
+      // (run under the same lock, just before this) already refused the write outright if the first
+      // id were a still-recognized outcome other than `step.outcome`, so by the time this runs it is
+      // either already `step.outcome` (nothing to strip) or the obsolete guess this step exists to
+      // replace. A still-valid SECOND label — a target serving both `codebase-health` and a product
+      // outcome is a supported state — sits at index 1+ and must survive; treating it as stale too
+      // deletes a legitimate association while repairing the digest-selected one (P2 review, PR #351).
+      const subject = await reread(repo, step.id);
+      const ownFirstId = subject ? outcomeIdsOf(subject)[0] : undefined;
+      const stale = ownFirstId !== undefined && ownFirstId !== step.outcome ? [`outcome:${ownFirstId}`] : [];
+
+      // bd returns a bead's `outcome:<id>` labels sorted by value on every read (confirmed against
+      // the live board), never in add/remove order — so once a surviving SECOND label is itself
+      // still recognized, which of it and `step.outcome` sorts first is a property of the two id
+      // strings, not something any write ordering here can steer. Tagging `step.outcome` regardless
+      // keeps the one guarantee this step CAN make — the bead carries `outcome:step.outcome` — true;
+      // the one it cannot make is which of two valid outcomes the digest groups the card under, and
+      // a survivor winning that slot is not a regression, since any recognized id there already
+      // satisfies `detectUnlinkedOutcomes`' own bar (P2 review, PR #351 — left as a known limit of
+      // keying selection off raw label order rather than an explicit primary marker).
+      try {
+        // One write, not two: a `bd update` that commits its label delta and only then times out or
+        // exits nonzero used to leave the untag landed and the tag unattempted — a bare throw
+        // `applySteps` never credits to `changed` (P2 review, PR #351). A single atomic call removes
+        // the window such a failure could land inside.
+        await beads.changeLabels(repo, step.id, [`outcome:${step.outcome}`], stale);
+      } catch (err) {
+        // The same commits-then-reports-failure risk applies to one write exactly as it did to two,
+        // so reconcile with a fresh read rather than assume the label change never landed.
+        const after = await beads.show(repo, step.id).catch(() => undefined);
+        const labels = after?.labels ?? [];
+        const landed = labels.includes(`outcome:${step.outcome}`) && stale.every((label) => !labels.includes(label));
+        if (!landed) throw err;
+        throw new StrandedWriteError(
+          `${step.id}'s outcome label change landed despite ${messageOf(err)} — report it as applied`,
+          [step.id],
+        );
+      }
+      return true;
+    }
   }
 }
 

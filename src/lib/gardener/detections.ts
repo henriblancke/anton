@@ -61,7 +61,8 @@ export type GardenerMove =
   | "split"
   | "unapprove"
   | "approve"
-  | "undefer";
+  | "undefer"
+  | "attach-outcome";
 
 /**
  * The claims the two producers know how to name.
@@ -104,6 +105,11 @@ export type GardenerMove =
  *                             human's act, and that reversibility is worth nothing unless something
  *                             comes back to ask. Mechanical, like `stale`, and for the same reason —
  *                             the claim is a duration, and a duration costs no session to measure.
+ *   • `unlinked-outcome`    — an open run target the digest cannot group under any project outcome
+ *                             because it carries no readable `outcome:<id>` (anton-vie0k). Mechanical
+ *                             like the rest of this tier: the suggestion is read off the board alone
+ *                             (a parent epic's own label, then stringer's default, then `unknown`),
+ *                             never judged.
  */
 export type GardenerDetectionKind =
   | "container-orphan"
@@ -119,7 +125,8 @@ export type GardenerDetectionKind =
   | "low-value"
   | "degraded-approval"
   | "withheld-approval"
-  | "aged-defer";
+  | "aged-defer"
+  | "unlinked-outcome";
 
 export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "container-orphan",
@@ -136,6 +143,7 @@ export const GARDENER_DETECTION_KINDS: readonly GardenerDetectionKind[] = [
   "degraded-approval",
   "withheld-approval",
   "aged-defer",
+  "unlinked-outcome",
 ];
 
 /**
@@ -151,14 +159,27 @@ export type RetireVerb = "close" | "supersede" | "defer";
  * The shape of the one PARAMETER a move can take that is not a bead id — carried in
  * {@link GardenerDetection.detail} and validated against this pattern at both ends.
  *
- * Only `reprioritize` needs one today: "which priority" is neither a subject nor a target, and it is
- * the whole content of the ask. It is part of the fingerprinted identity (see
- * {@link detectionSubjectKey}) precisely because it decides what gets written — without that, a
- * hand-edited bead could keep its label and its hash while swapping P3 for P0.
+ * `reprioritize` needs one — "which priority" is neither a subject nor a target, and it is the
+ * whole content of the ask. `attach-outcome` needs one for the same reason: "which outcome" is the
+ * whole ask, whether that is an id read off the board or the literal `unknown` that asks the
+ * operator instead of guessing. Both are part of the fingerprinted identity (see
+ * {@link detectionSubjectKey}) precisely because the detail decides what gets written — without
+ * that, a hand-edited bead could keep its label and its hash while swapping P3 for P0, or one
+ * outcome id for another.
  */
-export type DetailShape = "priority";
+export type DetailShape = "priority" | "outcome";
 
-const DETAIL_PATTERN: Record<DetailShape, RegExp> = { priority: /^P[0-4]$/ };
+/**
+ * `outcome` matches the same label-safe shape `AREA_SHAPE` (epic-patch.ts) holds an `outcome:<id>`
+ * value to, plus the literal `unknown` {@link detectUnlinkedOutcomes} suggests when neither signal
+ * fires — which already satisfies that shape, so no second case is needed for it. Restated here
+ * rather than imported: this module stays free of every other layer's imports on purpose (see the
+ * header), and a regex is cheap to keep in step with the one real definition.
+ */
+const DETAIL_PATTERN: Record<DetailShape, RegExp> = {
+  priority: /^P[0-4]$/,
+  outcome: /^[A-Za-z0-9][A-Za-z0-9._-]*$/,
+};
 
 /**
  * What a kind's fingerprint stands for — which fields are the CLAIM and which are only how it is
@@ -231,6 +252,7 @@ export const KINDS: Record<GardenerDetectionKind, KindSpec> = {
   "degraded-approval": { namespace: "pm", move: "unapprove" },
   "withheld-approval": { namespace: "pm", move: "approve" },
   "aged-defer": { namespace: "gardener", move: "undefer", reask: REASK_AFTER_DAYS },
+  "unlinked-outcome": { namespace: "gardener", move: "attach-outcome", detail: "outcome" },
 };
 
 /** Which producer files this kind — the fingerprint's prefix and the proposal's `source:` label. */
@@ -241,18 +263,30 @@ export function namespaceOf(kind: GardenerDetectionKind): ProposalNamespace {
 /**
  * Does this proposal name a move anton can RUN, or only a question a human can answer?
  *
- * Two shapes reach here. A `split` never has a mechanical answer — decomposing a ticket writes new
- * contracts, which is `/shape`'s work. A container orphan with no single open feature home files
- * WITHOUT a target on purpose (see reparent.ts): the ask is real, but the answer is a choice.
+ * Three shapes reach here. A `split` never has a mechanical answer — decomposing a ticket writes
+ * new contracts, which is `/shape`'s work. A container orphan with no single open feature home
+ * files WITHOUT a target on purpose (see reparent.ts): the ask is real, but the answer is a choice.
+ * An `attach-outcome` suggesting `unknown` is the same shape a third time: neither signal
+ * `detectUnlinkedOutcomes` reads (a parent epic's own outcome, a `source:stringer` default) fired,
+ * so the detail names no outcome to write — the literal string this module restates rather than
+ * imports, for the reason `DETAIL_PATTERN` does above.
  *
- * Both are filed anyway, because the ASK belongs on the board with its evidence and its fingerprint;
- * what changes is how it settles. Approve refuses, and DECLINING is what records the answer — which
- * both the proposal's own prose (emit.ts) and the apply's refusal have to say out loud, or a card
- * that reads "approving applies the move" while Approve always refuses is worse than the bead it is
- * about.
+ * All three are filed anyway, because the ASK belongs on the board with its evidence and its
+ * fingerprint; what changes is how it settles. Approve refuses, and DECLINING is what records the
+ * answer — which both the proposal's own prose (emit.ts) and the apply's refusal have to say out
+ * loud, or a card that reads "approving applies the move" while Approve always refuses is worse than
+ * the bead it is about.
  */
-export function isManualProposal(plan: { move: GardenerMove; target?: string }): boolean {
-  return plan.move === "split" || (plan.move === "reparent" && !plan.target);
+export function isManualProposal(plan: {
+  move: GardenerMove;
+  target?: string;
+  detail?: string;
+}): boolean {
+  return (
+    plan.move === "split" ||
+    (plan.move === "reparent" && !plan.target) ||
+    (plan.move === "attach-outcome" && plan.detail === "unknown")
+  );
 }
 
 /**
@@ -621,6 +655,7 @@ const GARDENER_MOVES: readonly GardenerMove[] = [
   "unapprove",
   "approve",
   "undefer",
+  "attach-outcome",
 ];
 const RETIRE_VERBS: readonly RetireVerb[] = ["close", "supersede", "defer"];
 

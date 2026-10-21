@@ -103,8 +103,9 @@ export const AUTONOMY_GROUPS: {
       "Armed, a pass re-shapes the graph overnight without asking. A wrong one costs you the one " +
       "write that puts it back — the cheapest group to arm first.",
     floor:
-      "A re-parent filed without a target names no home — the ask is “which feature?”, and only " +
-      "you can answer it. Those are never applied, whatever this says.",
+      "A re-parent filed without a target names no home, and an outcome proposal suggesting " +
+      "`unknown` names no outcome — both ask “which one?”, and only you can answer. Those are " +
+      "never applied, whatever this says.",
     kinds: [
       {
         id: "container-orphan",
@@ -120,6 +121,10 @@ export const AUTONOMY_GROUPS: {
       {
         id: "misfiled",
         does: "re-parents a bead whose home is the wrong one under the epic or card its contract belongs to",
+      },
+      {
+        id: "unlinked-outcome",
+        does: "labels a run target with the project outcome it serves, inherited from its epic or stringer, so the digest can group it",
       },
     ],
   },

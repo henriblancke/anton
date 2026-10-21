@@ -13,6 +13,7 @@
  * apply.ts carries the three properties this whole layer rests on and why each exists.
  */
 import { approvalGaps, formatApprovalGaps, onlyMissingEvidence, type ApprovalGap } from "../approval-gate";
+import { outcomeIdsOf } from "../backlog";
 import { beads, LABELS, type Bead } from "../beads/bd";
 import { isTicketTier } from "../beads/contract";
 import {
@@ -26,6 +27,7 @@ import {
   type BoardIndex,
 } from "./board-index";
 import {
+  isManualProposal,
   namespaceOf,
   priorityOf,
   type GardenerDetectionKind,
@@ -42,6 +44,7 @@ import {
   MIN_CARRIED_TICKETS,
   MIN_CLUSTER_SIZE,
 } from "./reparent";
+import { suggestOutcome, UNKNOWN_OUTCOME, type Suggestion } from "./unlinked-outcome";
 
 /**
  * The `notes` prefix an apply writes under — one line, like anton's other job notes, and named for
@@ -159,7 +162,32 @@ export type ApplyStep =
    * because the whole claim is "nothing has touched this since it was parked", which a write since
    * the filing is precisely what falsifies.
    */
-  | (StepSubject & TicketOwner & EvidenceFence & { verb: "undefer" });
+  | (StepSubject & TicketOwner & EvidenceFence & { verb: "undefer" })
+  /**
+   * Labels a run target with the outcome it serves (anton-15xcn) — mechanical and single-bead, like
+   * `reprioritize`, and fenced for the same reason: a fresh board read cannot tell whether the
+   * approver's own judgment (reading the Goal hint on an `unknown` ask, or simply agreeing with the
+   * guess) still holds, so the evidence fence stands in — except `unlinked-outcome` resolves to no
+   * premise at all ({@link EVIDENCE_PREMISE}), because the claim it rests on ("no outcome:<id> yet")
+   * is re-derivable from the board exactly like the gardener's own re-parents. The outcome VALUE and
+   * the subject's run-target status are the same kind of claim and get the same treatment: both are
+   * re-derived from a fresh board rather than carried from the proposal (`planAttachOutcome`,
+   * `attachOutcomeBarred`, and apply-steps.ts's write-time re-check), so `outcome` here is only ever
+   * the freshly-derived value a step is about to write, never the detection's frozen guess.
+   */
+  | (StepSubject &
+      EvidenceFence & {
+        verb: "attach-outcome";
+        outcome: string;
+        /**
+         * The epic whose own label DETERMINED `outcome` (unlinked-outcome.ts `Suggestion.parent`),
+         * or undefined when the guess came from `source:stringer` or named no signal at all. Locked
+         * alongside the subject (apply-steps.ts `premiseBeadsOf`) so the write-time re-check of
+         * `suggestOutcome` cannot land between a concurrent relabel of the parent and this write —
+         * without it, the recheck reads a parent `lockedBeads(step)` never actually holds.
+         */
+        parent?: string;
+      });
 
 /** The one verb whose steps come in clusters — the shape both halves of the move are written in. */
 export type ReparentStep = Extract<ApplyStep, { verb: "reparent" }>;
@@ -346,12 +374,18 @@ export interface ApplyMoment {
  * container bar to it ({@link heldCarriers}) — the same narrowing a step makes under its own locks
  * (apply-steps.ts `assertClusterHolds`). A caller holding no locks passes nothing and the bar counts
  * freely, which is right for a decision taken against a snapshot: it is deciding, not writing.
+ *
+ * `validOutcomeIds`, read by `attach-outcome` alone (`planAttachOutcome` → `suggestOutcome`), is
+ * every outcome id the project currently recognizes — a caller that can afford `readProjectOutcomes`
+ * passes it so an epic-inherited id that no longer exists is refused rather than written (P2 review,
+ * PR #351); omitted, that rung trusts the label unchecked, same as before this validation existed.
  */
 export function planApply(
   plan: GardenerPlan,
   board: Bead[],
   at: ApplyMoment,
   held?: CarriedPremise,
+  validOutcomeIds?: ReadonlySet<string>,
 ): ApplyDecision {
   const index = indexBoard(board);
   switch (plan.move) {
@@ -377,6 +411,8 @@ export function planApply(
       return planApprove(plan, index, at);
     case "undefer":
       return planUndefer(plan, index, at);
+    case "attach-outcome":
+      return planAttachOutcome(plan, index, at, validOutcomeIds);
   }
 }
 
@@ -1156,6 +1192,120 @@ function reprioritizeBarred(
 /** Where the bead is ranked now, as the summary reads it — omitted when it carries no priority. */
 const fromPriority = (subject: Bead): string =>
   typeof subject.priority === "number" ? `from P${subject.priority} ` : "";
+
+// ── attach-outcome ──
+
+function planAttachOutcome(
+  plan: GardenerPlan,
+  index: BoardIndex,
+  at: ApplyMoment,
+  validOutcomeIds?: ReadonlySet<string>,
+): ApplyDecision {
+  const [id] = plan.subjects;
+  if (plan.subjects.length !== 1 || !id) {
+    return { status: "refuse", reason: "an outcome proposal names exactly one bead" };
+  }
+  if (!plan.detail) {
+    return { status: "refuse", reason: "this proposal names no outcome to add" };
+  }
+  const subject = index.byId.get(id);
+  if (!subject) return { status: "refuse", reason: missing(id) };
+  // A manual `unknown` proposal is checked against its OWN frozen detail, not the subject's current
+  // state, and ALWAYS refuses — before the "already carries an outcome" settle below gets a chance
+  // to fire. Checking that settle first would let an operator who hand-labels the subject and then
+  // clicks Approve slip past the refusal (P2 review, PR #351): the card promised Approve refuses an
+  // `unknown` proposal outright, and a "settled" close still records a founder verdict on an outcome
+  // Anton never proposed — exactly what that promise exists to prevent.
+  if (isManualProposal(plan)) {
+    return {
+      status: "refuse",
+      reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
+    };
+  }
+  // Settled BEFORE the outcome is even re-derived — the same order `reprioritizeSubject` settles
+  // in, for the same reason: whoever labelled it, by hand or by a concurrent approval, produced the
+  // state this ask wanted, whatever outcome a fresh read would now suggest. Checked against
+  // `validOutcomeIds`, same as `detectUnlinkedOutcomes`'s own `ownOutcomeRecognized` (P2 review, PR
+  // #351): a syntactically valid but nonexistent id (a typo, or one deleted from PRODUCT.md
+  // outright) must NOT settle here, or the digest keeps treating the subject as unlinked while this
+  // check keeps declaring it already done — the same proposal filed again every patrol with no path
+  // to ever landing a label `groupFeatureCards` recognizes. Checked against the FIRST id alone, not
+  // `.some()` across all of them: `featureCardOf` only ever reads `outcomeIdsOf(subject)[0]`, so a
+  // valid second label must not settle this away while a dead first one is still what the digest
+  // reads — the same mismatch `detectUnlinkedOutcomes` guards against on the detection side.
+  const ownOutcomeIds = outcomeIdsOf(subject);
+  const selectedOutcomeId = ownOutcomeIds[0];
+  const ownOutcomeRecognized = validOutcomeIds
+    ? selectedOutcomeId !== undefined && validOutcomeIds.has(selectedOutcomeId)
+    : ownOutcomeIds.length > 0;
+  if (ownOutcomeRecognized) {
+    return { status: "settled", summary: `${subject.id} already carries an outcome — nothing to add` };
+  }
+  // Re-derived against THIS read rather than trusted from `plan.detail`: the proposal's guess was
+  // frozen at filing time, and a parent epic relabelled (or re-parented away) since then must change
+  // the answer the write actually lands, not just the evidence text the approver saw.
+  const suggestion = suggestOutcome(index, subject, validOutcomeIds);
+  // The literal answer `detectUnlinkedOutcomes` suggests when neither board signal fired — the ask
+  // is "which outcome does this serve?", and only a human can answer it.
+  if (suggestion.outcome === UNKNOWN_OUTCOME) {
+    return {
+      status: "refuse",
+      reason: `this proposal could not guess which outcome ${id} serves — label it \`outcome:<id>\` by hand (its own Goal, quoted in the Evidence above, is the starting point) and decline this proposal`,
+    };
+  }
+  return attachOutcomeSubject(plan, subject, suggestion, index, at);
+}
+
+/** The label decided against the bead itself, once {@link planAttachOutcome} has settled the
+ * already-labelled case and re-derived a real outcome to write. */
+function attachOutcomeSubject(
+  plan: GardenerPlan,
+  subject: Bead,
+  suggestion: Suggestion,
+  index: BoardIndex,
+  at: ApplyMoment,
+): ApplyDecision {
+  const barred = attachOutcomeBarred(plan, subject, index, at);
+  if (barred) return { status: "refuse", reason: barred };
+  return {
+    status: "apply",
+    steps: [
+      {
+        verb: "attach-outcome",
+        id: subject.id,
+        claim: runClaimOf(subject),
+        outcome: suggestion.outcome,
+        parent: suggestion.parent,
+        kind: plan.kind,
+        observedAtMs: at.observedAtMs,
+      },
+    ],
+    summary: `labelled ${subject.id} outcome:${suggestion.outcome}`,
+  };
+}
+
+/** Why this bead cannot be labelled, or undefined. */
+function attachOutcomeBarred(
+  plan: GardenerPlan,
+  subject: Bead,
+  index: BoardIndex,
+  at: ApplyMoment,
+): string | undefined {
+  if (!isOpenWork(subject)) {
+    return `${subject.id} is ${settledWord(subject)} — an outcome label would group nothing`;
+  }
+  // Re-asked rather than trusted from the detection: a parentless task adopted under a feature, or a
+  // standalone epic that gained a feature child, stops being a run target without ceasing to be open
+  // work — and an outcome label on a container or a child ticket would group a card the digest never
+  // reads as a run target to begin with.
+  if (!beads.isRunTarget(subject, index.all)) {
+    return `${subject.id} is no longer a run target (a container epic or a child ticket) — an outcome label would group nothing`;
+  }
+  return (
+    subjectBusy(subject, at, DOING["attach-outcome"]) ??
+    premiseTouched(subject, EVIDENCE_PREMISE[plan.kind], at.observedAtMs)
+  );
+}
 
 // ── unapprove ──
 
@@ -1968,6 +2118,11 @@ export const EVIDENCE_PREMISE: Record<GardenerDetectionKind, EvidencePremise | u
     still: "the parked bead nobody had been back to",
     harm: "returning it to the board now would answer a question somebody has since looked at themselves",
   },
+  // No fence, for the same reason as `degraded-approval`: the whole claim is "this run target
+  // carries no outcome:<id> to group under", which is re-derivable from the fresh board at apply
+  // time ({@link attachOutcomeSubject}'s own settled check) rather than something an edit since
+  // the filing could falsify unnoticed.
+  "unlinked-outcome": undefined,
 };
 
 /**
@@ -2152,6 +2307,7 @@ export const DOING: Record<ApplyStep["verb"], string> = {
   supersede: "retiring it",
   defer: "retiring it",
   undefer: "returning it to the board",
+  "attach-outcome": "labelling it",
 };
 
 /**

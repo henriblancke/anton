@@ -20,7 +20,12 @@ import type { Bead } from "../beads/bd";
 import { loadAllIssues } from "../beads/issues";
 import { applyArmedProposals, reportUnsettledProposals } from "../gardener/armed";
 import type { ProposalTrackRecord } from "../gardener/autonomy";
-import { detectBoard, detectDeferredRejudgements, indexWorkBoard } from "../gardener/detect";
+import {
+  detectBoard,
+  detectDeferredRejudgements,
+  detectUnlinkedOutcomes,
+  indexWorkBoard,
+} from "../gardener/detect";
 import {
   arbitrateEmission,
   emitProposals,
@@ -36,6 +41,7 @@ import {
 } from "../gardener/emit";
 import { shadowProposals } from "../gardener/shadow";
 import { proposalTrackRecord } from "../gardener/track-record";
+import { allOutcomeIds, outcomesConfigured, parseOutcomes, readProductMd } from "../outcomes";
 import type { HygieneFinding } from "../hygiene";
 import type { PassScope } from "./pass-preamble";
 
@@ -93,7 +99,6 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
         `(${emission.created.map((p) => p.id).join(", ")})` +
         `${emission.suppressed > 0 ? `, ${emission.suppressed} already on the board` : ""}`,
     );
-    scope.nudge(scope.project);
   }
   // Never a silent cap: the overflow is deterministic and the next pass files it, but a reader has
   // to be able to tell "the board is this clean" from "we stopped at ten".
@@ -102,6 +107,17 @@ function reportEmission(scope: PassScope, emission: EmissionResult): void {
       `[gardener] ${scope.project.id}: held back ${emission.deferred} proposal(s) — one pass files ` +
         `at most ${MAX_PROPOSALS_PER_PASS}; the next patrol picks them up`,
     );
+  }
+  if (emission.superseded.length > 0) {
+    console.log(
+      `[gardener] ${scope.project.id}: superseded ${emission.superseded.length} stale proposal(s) ` +
+        `whose own suggestion had changed (${emission.superseded.map((p) => p.id).join(", ")})`,
+    );
+  }
+  // A retry-only pass can close stale siblings with nothing new created; those closes are still
+  // board writes another machine needs to see, so propagation can't gate on created alone.
+  if (emission.created.length > 0 || emission.superseded.length > 0) {
+    scope.nudge(scope.project);
   }
 }
 
@@ -254,12 +270,13 @@ export async function fileGardenerProposals(
   // where the board is — rather than read again by the walks that consult it.
   const record = proposalTrackRecord(board);
   const now = scope.clock.now();
-  // Board SHAPE, then the one RE-JUDGEMENT (anton-30vo) — appended rather than merged into
-  // `detectBoard`, because it asks about a decision anton's own tiers made rather than about how the
-  // board hangs together (gardener/detect.ts).
+  // Board SHAPE, then the UNLINKED OUTCOMES (anton-vie0k) and the one RE-JUDGEMENT (anton-30vo) —
+  // both appended rather than merged into `detectBoard`, because neither asks about the board's
+  // shape: one asks about a decision anton's own tiers made, the other about a label the outcome
+  // contract predates (gardener/detect.ts).
   //
-  // The order is the write budget's. Both lists are internally deterministic, so concatenating them
-  // keeps two passes over an unchanged board agreeing on which claims fit under
+  // The order is the write budget's. All three lists are internally deterministic, so concatenating
+  // them keeps two passes over an unchanged board agreeing on which claims fit under
   // `MAX_PROPOSALS_PER_PASS` — and putting the re-judgements last means a neglected board spends its
   // cap on work that is still live before it spends any on work parked a quarter ago. What overflows
   // is not lost: the next patrol files it.
@@ -267,9 +284,21 @@ export async function fileGardenerProposals(
   // Every pass, on the patrol's own cadence, because the claim is a duration and costs no session to
   // measure. Re-asking nightly is not noise either: an ask already standing suppresses on its
   // fingerprint, and a declined one holds for the stated window (detections.ts `REASK_AFTER_DAYS`).
+  const index = indexWorkBoard(board);
+  // Read alongside the board so `detectUnlinkedOutcomes` can validate an epic-inherited
+  // `outcome:<id>` against what PRODUCT.md actually defines (P2 review, PR #351) — a typo'd or
+  // since-deleted id falls through to `unknown` here rather than being proposed, approved, and
+  // written as a label `groupFeatureCards` will never recognize. Only once the project has actually
+  // declared `## Outcomes` (apply.ts `outcomeIdsIfNeeded`) — before that, every id stays unchecked
+  // rather than held to a set that predates the contract and was never meant to be exhaustive.
+  const productMd = await readProductMd(repo);
+  const validOutcomeIds = outcomesConfigured(productMd)
+    ? allOutcomeIds(parseOutcomes(productMd))
+    : undefined;
   const detections = [
     ...detectBoard({ board, hygiene: { findings: input.findings }, now }),
-    ...detectDeferredRejudgements(indexWorkBoard(board), now),
+    ...detectUnlinkedOutcomes(index, now, validOutcomeIds),
+    ...detectDeferredRejudgements(index, now),
   ];
   await ctx.heartbeat();
   // Re-check RIGHT before the first write. The board read and detection above take real time, and a

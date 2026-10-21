@@ -37,6 +37,7 @@ import { ageInDays, isClaimed, isOpenWork } from "./board-index";
 import {
   canonicalFingerprintOf,
   concernedBeads,
+  detectionSubjectKey,
   fingerprintLabelOf,
   GARDENER_OBSERVED_AT_KEY,
   GARDENER_PLAN_KEY,
@@ -46,6 +47,7 @@ import {
   KINDS,
   namespaceOf,
   planOf,
+  proposalPlanOf,
   type GardenerDetection,
   type GardenerDetectionKind,
   type GardenerPlan,
@@ -154,6 +156,12 @@ export interface EmissionPlan {
   suppressed: GardenerDetection[];
   /** Fresh claims over the cap. Not dropped: the next pass sees the same detections. */
   deferred: GardenerDetection[];
+  /**
+   * Open siblings an `emit`-ted detection's claim has OUTGROWN, keyed by that detection's
+   * fingerprint — see {@link staleSiblingsOf}. Closed by {@link emitProposals} once the fresh
+   * proposal lands; empty for every detection whose kind has no {@link DetailShape} to outgrow.
+   */
+  supersedes: Map<string, ProposalTwin[]>;
 }
 
 export interface EmissionInput {
@@ -198,7 +206,53 @@ export function planEmission(input: EmissionInput): EmissionPlan {
     else fresh.push(detection);
   }
 
-  return { emit: fresh.slice(0, limit), suppressed, deferred: fresh.slice(limit) };
+  const emit = fresh.slice(0, limit);
+  const supersedes = new Map<string, ProposalTwin[]>();
+  for (const detection of emit) {
+    const stale = staleSiblingsOf(input.board, detection);
+    if (stale.length > 0) supersedes.set(detection.fingerprint, stale);
+  }
+  // A SUPPRESSED claim's own ask already stands on the board, but a stale sibling from before that
+  // ask landed can still be open too — the close that should have retired it may have failed
+  // transiently (closeStaleSiblings catches and leaves it standing rather than losing the fresh
+  // ask over it). Checking suppressed claims here as well is what lets emitProposals retry that
+  // close on every later pass, not just the one pass that happened to create the fresh ask.
+  for (const detection of suppressed) {
+    const stale = staleSiblingsOf(input.board, detection);
+    if (stale.length > 0) supersedes.set(detection.fingerprint, stale);
+  }
+
+  return { emit, suppressed, deferred: fresh.slice(limit), supersedes };
+}
+
+/**
+ * Open proposals a fresh detection's claim has OUTGROWN: the same kind and subjects (and target,
+ * for a kind whose identity is its target), but a different `detail` — the board moved under the
+ * first ask (a parent epic relabelled, say) before anyone decided it, and the suggestion changed.
+ * Not a {@link planReconciliation} duplicate: the two proposals never asked the same question, the
+ * question itself changed.
+ *
+ * Scoped to kinds that declare a {@link DetailShape} ({@link KINDS}) — `mispriority` and
+ * `unlinked-outcome` today. Every other kind's fingerprint already hashes its whole claim, so two
+ * different fingerprints there are two different asks, not one ask that moved — nothing to fold.
+ *
+ * Unclaimed and unapproved only, the same bar {@link unclaimedTwin} holds a fold to: closing an
+ * approved sibling would discard a decision, and closing a claimed one would race the apply that
+ * holds it. Either is left for a human to resolve by hand.
+ */
+function staleSiblingsOf(board: Bead[], detection: GardenerDetection): ProposalTwin[] {
+  if (!KINDS[detection.kind].detail) return [];
+  const claimKey = detectionSubjectKey(detection.kind, detection.subjects, detection.target, undefined);
+  const stale: ProposalTwin[] = [];
+  for (const bead of board) {
+    const label = fingerprintLabelOf(bead);
+    if (!label || !isProposalBead(bead) || !isOpenWork(bead) || !unclaimedTwin(bead)) continue;
+    const plan = proposalPlanOf(bead);
+    if (!plan || plan.kind !== detection.kind || plan.fingerprint === detection.fingerprint) continue;
+    if (detectionSubjectKey(plan.kind, plan.subjects, plan.target, undefined) !== claimKey) continue;
+    stale.push({ id: bead.id, label });
+  }
+  return stale;
 }
 
 /** Exactly the `beads.create` options a proposal is made of — built pure so a test can read them. */
@@ -270,6 +324,8 @@ export interface EmissionResult {
   suppressed: number;
   /** Fresh claims held back by the cap, for the caller to log. Never silently dropped. */
   deferred: number;
+  /** Stale siblings closed because a fresh ask's claim outgrew them — see {@link staleSiblingsOf}. */
+  superseded: ProposalTwin[];
 }
 
 /**
@@ -304,10 +360,12 @@ export class PartialEmissionError extends Error {
 export async function emitProposals(repo: string, input: EmissionInput): Promise<EmissionResult> {
   const plan = planEmission(input);
   const created: EmittedProposal[] = [];
+  const superseded: ProposalTwin[] = [];
   const sofar = (): EmissionResult => ({
     created,
     suppressed: plan.suppressed.length,
     deferred: plan.deferred.length,
+    superseded,
   });
 
   for (const detection of plan.emit) {
@@ -323,9 +381,89 @@ export async function emitProposals(repo: string, input: EmissionInput): Promise
       throw new PartialEmissionError(sofar(), e);
     }
     created.push({ id, fingerprint: detection.fingerprint, detection });
+
+    // Right alongside the create, not a separate pass: the bead this fresh ask just outgrew should
+    // never stand open a whole patrol cycle longer than it has to.
+    const stale = plan.supersedes.get(detection.fingerprint);
+    if (stale) superseded.push(...(await closeStaleSiblings(repo, id, detection.fingerprint, stale)));
+  }
+
+  // A SUPPRESSED claim's fresh ask already stands — nothing to create — but its own stale sibling
+  // may still be open from a close that failed on an earlier pass (see planEmission). Retrying here
+  // is what actually makes good on closeStaleSiblings' claim that "the next pass retries": without
+  // this loop, a suppressed claim's stale sibling is never looked at again, because it only ever
+  // reaches staleSiblingsOf by way of a detection that is about to be freshly created.
+  //
+  // The claim's own ask may itself be DECLINED by now rather than open — suppression keys on "not
+  // settled", not "open" (see suppressedFingerprints) — and the stale sibling is just as obsolete
+  // either way: the board moved under it before anyone decided anything, which has nothing to do
+  // with what the operator later decided about the fresh ask. Requiring an open `answering` bead
+  // here would skip the retry for as long as the decline suppresses the fingerprint, leaving the
+  // stale sibling open and approvable indefinitely.
+  for (const detection of plan.suppressed) {
+    if (input.signal?.aborted) throw new PartialEmissionError(sofar(), input.signal.reason);
+    const stale = plan.supersedes.get(detection.fingerprint);
+    if (!stale) continue;
+    const answering = answeringProposalIdFor(input.board, detection.fingerprint);
+    if (!answering) continue;
+    superseded.push(...(await closeStaleSiblings(repo, answering, detection.fingerprint, stale)));
   }
 
   return sofar();
+}
+
+/**
+ * The id of the proposal already on the board answering for `fingerprint`, if any — the `keep` a
+ * retried {@link closeStaleSiblings} supersedes stale siblings in favor of, when the fresh ask that
+ * outgrew them was created on an earlier pass rather than this one.
+ *
+ * Open OR declined-and-still-suppressing: the only caller reaches this from `plan.suppressed`, where
+ * `suppressedFingerprints` has already proven some bead currently answers for this fingerprint one
+ * way or the other. Requiring the bead be open missed the declined case — a stale sibling whose
+ * replacement was declined before this retry ran would never be found again.
+ */
+function answeringProposalIdFor(board: Bead[], fingerprint: string): string | undefined {
+  return board.find(
+    (bead) =>
+      (isOpenWork(bead) || beads.isAbandoned(bead)) &&
+      (fingerprintLabelOf(bead) === fingerprint || canonicalFingerprintOf(bead) === fingerprint),
+  )?.id;
+}
+
+/**
+ * Close the open siblings a fresh proposal's claim just outgrew — see {@link staleSiblingsOf} for
+ * what makes a sibling stale rather than a duplicate.
+ *
+ * Re-reads each sibling under its own write lock before closing, the same bar {@link
+ * reconcileDuplicateProposals} holds a fold to: an approval or a claim landing between the plan's
+ * board read and this close makes the sibling untouchable. A skipped or failed close is left
+ * standing, never thrown — the fresh ask that just landed matters more than tidying the stale one,
+ * and the next pass's own plan sees the same sibling and retries — via {@link emitProposals}'
+ * suppressed-claim loop, since the claim that outgrew this sibling is suppressed (its own ask
+ * already stands) on every pass after this one, not just this one.
+ */
+async function closeStaleSiblings(
+  repo: string,
+  keep: string,
+  keepFingerprint: string,
+  stale: ProposalTwin[],
+): Promise<ProposalTwin[]> {
+  const closed: ProposalTwin[] = [];
+  for (const twin of stale) {
+    try {
+      await withBeadWriteLocks(repo, [twin.id], async () => {
+        const live = await beads.show(repo, twin.id);
+        const staleStill =
+          fingerprintLabelOf(live) === twin.label && isOpenWork(live) && unclaimedTwin(live);
+        if (!staleStill) return;
+        await beads.close(repo, twin.id, supersededReason(keep, keepFingerprint));
+        closed.push(twin);
+      });
+    } catch {
+      // Left standing — see the function doc.
+    }
+  }
+  return closed;
 }
 
 // ── reconciling duplicate claims ──
@@ -485,6 +623,30 @@ export function foldReason(keep: string, fingerprint: string): string {
 /** Was this close a {@link foldReason} — a duplicate withdrawn — rather than an apply or a decline? */
 export function isFoldReason(reason: unknown): boolean {
   return typeof reason === "string" && reason.trimStart().startsWith(FOLD_REASON_PREFIX);
+}
+
+/** The one phrase that marks a close as a stale sibling superseded by a fresh ask about the same
+ * subject — written by {@link supersededReason}. Distinct from {@link FOLD_REASON_PREFIX}: a fold
+ * withdraws a DUPLICATE of the same claim, this withdraws a claim the board moved out from under. */
+const SUPERSEDED_REASON_PREFIX = "superseded by ";
+
+/**
+ * Why a stale sibling was closed — the mirror of {@link foldReason} for {@link staleSiblingsOf}.
+ * A PLAIN close, for the same reason a fold is: nothing about the bead's status should read as a
+ * founder's decline, and the settled-proposal record (track-record.ts) must not score it as a
+ * verdict either way ({@link isSupersededReason}).
+ */
+export function supersededReason(keep: string, fingerprint: string): string {
+  return (
+    `${SUPERSEDED_REASON_PREFIX}${keep}: the suggestion this proposal asked for no longer holds ` +
+    `— ${fingerprint} is the current ask, and ${keep} carries it`
+  );
+}
+
+/** Was this close a {@link supersededReason} — a changed suggestion withdrawn — rather than an
+ * apply, a decline, or a {@link foldReason} duplicate? */
+export function isSupersededReason(reason: unknown): boolean {
+  return typeof reason === "string" && reason.trimStart().startsWith(SUPERSEDED_REASON_PREFIX);
 }
 
 export interface ReconcileOptions {
@@ -702,6 +864,8 @@ function moveClause(detection: GardenerDetection): string {
       return `approve ${subjects} so a run can start on ${pronoun(detection)}`;
     case "undefer":
       return `return ${subjects} to the board, or leave ${pronoun(detection)} parked`;
+    case "attach-outcome":
+      return `add outcome:${detection.detail ?? "?"} to ${subjects}`;
   }
 }
 
@@ -761,6 +925,15 @@ function appliedState(detection: GardenerDetection): string {
       // one, and no claim is written over their write (apply-plan.ts `planApprove`). The gate alone
       // is what every applied outcome guarantees, so the gate alone is what the box asserts.
       return `${subjects} ${is} approved — the gate is granted, which is the state a run starts from`;
+    case "attach-outcome":
+      // `unknown` is a sentinel for "no signal suggested one" (unlinked-outcome.ts), never a label
+      // anton writes (apply-plan.ts `planAttachOutcome` refuses it). Asserting it here would tell
+      // the operator that labelling the bead `outcome:unknown` is the done state, which both
+      // contradicts MANUAL_INSTRUCTIONS' "pick a real id" and would pass outcomeIdsOf's regex if
+      // someone followed it literally, suppressing this gap instead of resolving it.
+      return isManualProposal(detection)
+        ? `${subjects} ${is} labelled with the real outcome:<id> chosen by hand, so the digest groups ${detection.subjects.length === 1 ? "it" : "them"} under that outcome — never \`outcome:unknown\``
+        : `${subjects} ${is} labelled outcome:${detection.detail}, so the digest groups ${detection.subjects.length === 1 ? "it" : "them"} under that outcome`;
   }
 }
 
@@ -777,6 +950,13 @@ const MANUAL_INSTRUCTIONS: Partial<Record<GardenerDetection["move"], string[]>> 
     "is `/shape`'s work, so **Approve is refused**. Run `/shape` (or split it by hand) using the",
     "sketch below as a starting point, then DECLINE this proposal — declining is what settles it and",
     "stops the pass re-asking.",
+  ],
+  "attach-outcome": [
+    "This bead is a DECISION only a human can make: neither signal this patrol reads (a parent",
+    "epic's own outcome label, a `source:stringer` default) suggested one, so the proposal names",
+    "`unknown` and **Approve is refused**. Read the Goal hint in the Evidence below, label the",
+    "bead by hand (`bd update <id> --add-label outcome:<id>`), then DECLINE this proposal —",
+    "declining is what settles it and stops the patrol re-asking.",
   ],
 };
 

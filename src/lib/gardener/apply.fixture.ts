@@ -98,6 +98,14 @@ export function record(verb: string, ...args: string[]): Promise<string> {
   // so a board that never reflected `approved` would answer that assertion with pre-write state.
   if (verb === "approve") setLive(args[0] as string, { labels: withLabel(args[0] as string) });
   if (verb === "untag") setLive(args[0] as string, { labels: withoutLabels(args[0] as string, (args[1] ?? "").split(",")) });
+  // `changeLabels` is the atomic add+remove — reflect both deltas in one go, the same way `untag`
+  // reflects its removal, so a stranded-write reconciliation's `bd show` sees the commit.
+  if (verb === "changeLabels") {
+    const id = args[0] as string;
+    const added = (args[1] ?? "").replace(/^add:/, "").split(",").filter(Boolean);
+    const removed = (args[2] ?? "").replace(/^remove:/, "").split(",").filter(Boolean);
+    setLive(id, { labels: [...new Set([...withoutLabels(id, removed), ...added])] });
+  }
   afterWrite?.(call);
   if (committed) return Promise.reject(new Error(`bd ${verb} timed out`));
   return Promise.resolve("");
