@@ -94,3 +94,28 @@ export function buildBdEnv(
   if (!(TLS_VAR in overrides)) applyBoardTls(env, board);
   return env;
 }
+
+/**
+ * Every `BEADS_DOLT_*` var set in `parentEnv`, mapped to `undefined` so spreading this into a
+ * spawn's env deletes them (Node drops undefined-valued keys — the same convention {@link
+ * buildBdEnv} relies on).
+ *
+ * Unlike {@link buildBdEnv}, this strips the WHOLE namespace — host, port, user, database, mode,
+ * password (including the per-user/per-server scoped forms `resolveBdPassword` reads, which are
+ * dynamically named and so cannot be enumerated by {@link PROJECT_SCOPED_BD_ENV} alone), and
+ * transport — because there is no "target project" here to scope a connection to: this is for a
+ * process that must not be able to reach ANY Dolt server, ambient or declared, at all. The review
+ * gate's reviewer session is exactly that: `readBoardMode` deliberately resolves a project with a
+ * missing/unreadable/malformed `.beads/metadata.json` as `embedded` (the safe default for sync),
+ * which leaves that reviewer's `Bash` enabled — and `spawnClaude` inherits `process.env` in full, so
+ * an ambient `BEADS_DOLT_SERVER_*` (a real incident: see the header above) would otherwise let a
+ * `bd` command the reviewer runs reach a shared server this project's board never declared.
+ * Scrubbing the namespace closes that regardless of what `.beads/metadata.json` says.
+ */
+export function scrubBdServerEnv(parentEnv: NodeJS.ProcessEnv = process.env): Record<string, undefined> {
+  const scrub: Record<string, undefined> = {};
+  for (const key of Object.keys(parentEnv)) {
+    if (key.startsWith("BEADS_DOLT_")) scrub[key] = undefined;
+  }
+  return scrub;
+}

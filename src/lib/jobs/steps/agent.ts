@@ -44,6 +44,8 @@ export async function implementStep(ctx: StepContext): Promise<StepResultWith<"s
     const appendSystemPrompt = await buildExecutionSystemPrompt({
       agentPrompt: await loadAgentPrompt(agentTag, { projectDir: ctx.worktreePath }),
       seedPrompt: ctx.settings.seedPrompt,
+      boardOnly: ctx.boardOnly,
+      repoPath: ctx.repoPath,
     });
     const dispatched = await readForDispatch(ctx.repoPath, ticket);
     // Asked per ticket, not once per run: the answer is about THIS bead's own preserved commit, and
@@ -104,7 +106,11 @@ export async function claudeStep(ctx: StepContext): Promise<StepResult> {
       "",
       stepTaskBlock({ ...ctx, tickets: dispatchedTickets }, stepId, preserved),
     ].join("\n"),
-    appendSystemPrompt: await buildExecutionSystemPrompt({ seedPrompt: ctx.settings.seedPrompt }),
+    appendSystemPrompt: await buildExecutionSystemPrompt({
+      seedPrompt: ctx.settings.seedPrompt,
+      boardOnly: ctx.boardOnly,
+      repoPath: ctx.repoPath,
+    }),
     // The instruction this dispatch actually resolved, at the version it resolved to — carried from
     // the resolution above, never re-resolved: an edit between the two would attribute the run to
     // text that never ran.

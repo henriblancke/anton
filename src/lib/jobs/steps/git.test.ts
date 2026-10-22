@@ -26,7 +26,7 @@ const ops = vi.hoisted(() => ({
 }));
 vi.mock("../../git/ops", () => ops);
 
-const { commitStep, prStep } = await import("./git");
+const { commitStep, prStep, recordBoardOnlyAttribution } = await import("./git");
 
 let sandbox: Awaited<ReturnType<typeof openSandbox>>;
 
@@ -144,6 +144,48 @@ describe("step:commit", () => {
       expect.any(String),
       expect.objectContaining({ hooksPath: "/base/repo/.githooks" }),
     );
+  });
+});
+
+describe("recordBoardOnlyAttribution", () => {
+  // PR #284 review round 5: an unbounded idempotency check reads a STALE `<id>:` commit sitting in
+  // base history (e.g. from an earlier delivery of a board-only ticket reopened under the same id)
+  // as "already recorded" and skips writing this run's marker, leaving the branch byte-identical to
+  // its base with nothing for step:pr to open against. Bounding the lookup to this run's own delta
+  // closes that gap — assert the call is actually bounded, not just that some call happened.
+  //
+  // Bounded against `alreadyShippedBase`, not the movable `baseRef` (PR #284 review, "Exclude the
+  // refreshed base from attribution scans") — the fixture pins them to different values precisely so
+  // a regression back to `baseRef` fails this assertion instead of passing by coincidence.
+  it("bounds the idempotency lookup to this run's delta, not full branch history", async () => {
+    ops.worktreeHasCommitFor.mockResolvedValue(false);
+
+    const ctx = sandbox.context();
+    await recordBoardOnlyAttribution(ctx);
+
+    expect(ops.worktreeHasCommitFor).toHaveBeenCalledWith(sandbox.dir, target.id, {
+      base: ctx.baseForkSha,
+      excludeBase: ctx.alreadyShippedBase,
+    });
+    expect(ops.commitMarker).toHaveBeenCalled();
+  });
+
+  // The stale-marker case this bound exists to fix: a commit under this ticket's id in BASE history
+  // must not suppress writing this run's own marker.
+  it("still writes the marker when only a stale attribution commit exists outside this run's delta", async () => {
+    ops.worktreeHasCommitFor.mockResolvedValue(false);
+
+    await recordBoardOnlyAttribution(sandbox.context());
+
+    expect(ops.commitMarker).toHaveBeenCalled();
+  });
+
+  it("skips writing a second marker when this run's own delta already carries one", async () => {
+    ops.worktreeHasCommitFor.mockResolvedValue(true);
+
+    await recordBoardOnlyAttribution(sandbox.context());
+
+    expect(ops.commitMarker).not.toHaveBeenCalled();
   });
 });
 

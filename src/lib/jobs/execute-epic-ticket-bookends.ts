@@ -633,6 +633,11 @@ export function narrowToTicket(
   session: JobSession,
   budget: TicketBudget,
   baseline: WorktreeState | null,
+  /** Whether THIS ticket's delivery is board-only ({@link
+   * import("./execute-epic-board-evidence").isBoardOnlyRun}), already decided by the caller —
+   * carried onto the context so a dispatching step's system prompt can tell the agent (anton-fc5x
+   * PR #284 review). See {@link StepContext.boardOnly}. */
+  boardOnly?: boolean,
 ): StepContext {
   return {
     ...run,
@@ -642,6 +647,7 @@ export function narrowToTicket(
     tickets: [ticket],
     session,
     ...(baseline ? { ticketStartHead: baseline.head } : {}),
+    ...(boardOnly ? { boardOnly: true } : {}),
   };
 }
 
@@ -652,6 +658,13 @@ export function narrowToTicket(
  * Answers whether the bead actually CLOSED (PR #253 review): the close is best-effort, so a bd that
  * refuses the write leaves the ticket open, and the run's ledger has to carry that fact rather than
  * infer a close from the run's shape. A standalone target is never closed here, so it answers false.
+ *
+ * Also answers whether the requested TRANSITION landed at all (PR #284 review round 7) — `closed`
+ * alone cannot say this for a standalone target, which is never closed here by design and so would
+ * always read `closed: false` even when its `stage:in-review` move succeeded. A caller holding a
+ * board-only ticket's pending-evidence marker needs the honest answer: releasing that marker before
+ * the close OR the in-review move is confirmed would strand the recovery record on a write bd
+ * refused, exactly the crash-window loss {@link clearBoardEvidencePending} exists to avoid.
  */
 export async function finishTicket(
   run: Omit<StepContext, "tickets">,
@@ -659,7 +672,7 @@ export async function finishTicket(
   sessionId: string,
   closeOnDone: boolean,
   settlement: TicketSettlement = { how: "committed" },
-): Promise<{ closed: boolean }> {
+): Promise<{ closed: boolean; transitioned: boolean }> {
   const { db, clock } = run;
   const repo = run.repoPath;
   // A satisfied step closes exactly as a committed one does, so the bead has to say which it was
@@ -709,14 +722,19 @@ export async function finishTicket(
   // resume marker, so a retry after a failed PR step skips it rather than re-running claude on
   // committed work. endSession still records the work done either way.
   let closed = false;
+  let transitioned: boolean;
   if (closeOnDone) {
     closed = await safe(() => beads.close(repo, ticket.id));
+    transitioned = closed;
   } else {
-    await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("in-review")]));
+    // The `in-review` tag is the transition of record; the `implementing` untag is tidy-up on top
+    // of it, so a caller deciding whether the handoff landed reads the former alone (PR #284 review
+    // round 7) — an untag bd refused after a landed tag is not a reason to treat the move as failed.
+    transitioned = await safe(() => beads.tag(repo, ticket.id, [LABELS.stage("in-review")]));
     await safe(() => beads.untag(repo, ticket.id, [LABELS.stage("implementing")]));
   }
   await endSession(db, clock, sessionId, "done");
-  return { closed };
+  return { closed, transitioned };
 }
 
 /**
